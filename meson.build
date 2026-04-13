@@ -93,6 +93,7 @@ core_inc = include_directories('src/core')
 
 # ── libmetadesk (shared core library) ───────────────────────────────────────
 core_sources = files(
+  'src/core/agent.c',
   'src/core/action.c',
   'src/core/capture.c',
   'src/core/encode.c',
@@ -206,6 +207,12 @@ test_input = executable('test_input',
   dependencies : [dep_metadesk],
 )
 test('uinput injection', test_input)
+
+test_agent = executable('test_agent',
+  files('tests/test_agent.c'),
+  dependencies : [dep_metadesk],
+)
+test('agent action handler', test_agent)
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 capture_frame = executable('capture_frame',

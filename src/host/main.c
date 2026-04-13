@@ -19,6 +19,7 @@
 #include "session.h"
 #include "packet.h"
 #include "stream.h"
+#include "agent.h"
 #include "nostr.h"
 #include "secrets.h"
 
@@ -42,6 +43,7 @@ static void signal_handler(int sig) {
 typedef struct {
     MdEncoder    *encoder;
     MdStream     *client;
+    MdAgent      *agent;
     uint32_t      frame_seq;
     uint32_t      pkt_seq;
     int64_t       total_encode_us;
@@ -112,8 +114,12 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         break;
 
     case MD_PKT_ACTION:
-        /* TODO: parse action JSON and inject via uinput (M1.5/M1.7) */
-        fprintf(stderr, "host: received action (%u bytes)\n", hdr->payload_len);
+        if (ctx->agent) {
+            md_agent_handle_action(ctx->agent, ctx->client, &ctx->pkt_seq,
+                                   payload, hdr->payload_len);
+        } else {
+            fprintf(stderr, "host: received action but no agent handler\n");
+        }
         break;
 
     case MD_PKT_SESSION_INFO:
@@ -231,11 +237,47 @@ int main(int argc, char **argv) {
     printf("host: encoder ready (%s)\n",
            md_encoder_is_hw(encoder) ? "NVENC" : "x264");
 
+    /* Initialize input injection (uinput virtual devices) */
+    MdInputConfig input_cfg = {
+        .screen_width  = 1920,
+        .screen_height = 1080,
+    };
+    MdInput *input = md_input_create(&input_cfg);
+    if (!input || !md_input_is_ready(input)) {
+        fprintf(stderr, "WARNING: uinput unavailable — input injection disabled\n");
+    } else {
+        printf("host: uinput devices ready\n");
+    }
+
+    /* Initialize AT-SPI2 tree walker */
+    MdAtspiTree *atspi = md_atspi_create();
+    if (!atspi) {
+        fprintf(stderr, "WARNING: AT-SPI2 unavailable — agent mode disabled\n");
+    } else {
+        printf("host: AT-SPI2 connected\n");
+    }
+
+    /* Initialize agent action handler */
+    MdAgentConfig agent_cfg = {
+        .atspi       = atspi,
+        .input       = input,
+        .tree_format = session.tree_format,
+        .settle_ms   = MD_AGENT_DEFAULT_SETTLE_MS,
+    };
+    MdAgent *agent = md_agent_create(&agent_cfg);
+
     /* Set up host context */
     HostCtx ctx = {
         .encoder = encoder,
         .client  = client,
+        .agent   = agent,
     };
+
+    /* Send initial UI tree to client */
+    if (agent && atspi) {
+        md_agent_send_tree(agent, client, &ctx.pkt_seq);
+        printf("host: sent initial UI tree\n");
+    }
 
     /* Start PipeWire capture */
     MdCapture *capture = NULL;
@@ -319,6 +361,16 @@ int main(int argc, char **argv) {
 
     md_encoder_flush(encoder, on_encoded, &ctx);
     md_encoder_destroy(encoder);
+
+    if (agent) {
+        printf("host: handled %u agent actions\n", md_agent_get_action_count(agent));
+        md_agent_destroy(agent);
+    }
+    if (atspi)
+        md_atspi_destroy(atspi);
+    if (input)
+        md_input_destroy(input);
+
     md_stream_destroy(client);
     md_stream_server_destroy(srv);
 
