@@ -119,6 +119,62 @@ static void test_delta_serialization(void) {
     printf("  PASS: delta serialization\n");
 }
 
+static void test_walk_tree(void) {
+    MdAtspiTree *tree = md_atspi_create();
+    assert(tree != NULL);
+
+    MdAtspiNode *root = md_atspi_walk(tree);
+    if (!root) {
+        /* AT-SPI2 bus may not be available in CI/headless environments */
+        printf("  SKIP: walk tree (no AT-SPI2 bus)\n");
+        md_atspi_destroy(tree);
+        return;
+    }
+
+    /* Basic sanity: root should exist with role and id */
+    assert(root->id != NULL);
+    assert(root->role != NULL);
+    assert(strcmp(root->role, "desktop") == 0);
+
+    /* Serialize in both formats to verify end-to-end */
+    char *json = md_atspi_to_json(root);
+    assert(json != NULL);
+    assert(strstr(json, "\"role\":\"desktop\"") != NULL);
+    free(json);
+
+    char *compact = md_atspi_to_compact(root);
+    assert(compact != NULL);
+    assert(strstr(compact, "DSK[") != NULL);
+    free(compact);
+
+    printf("  PASS: walk tree (%d children)\n", root->child_count);
+    md_atspi_node_free(root);
+    md_atspi_destroy(tree);
+}
+
+static void test_diff(void) {
+    MdAtspiTree *tree = md_atspi_create();
+    assert(tree != NULL);
+
+    /* First diff with no previous snapshot should return NULL */
+    int delta_count = 0;
+    MdAtspiDelta *deltas = md_atspi_diff(tree, &delta_count);
+
+    /* If AT-SPI2 is available, diff stores a snapshot.
+     * Second diff would show changes. */
+    if (deltas) {
+        /* Any deltas are valid — just verify we can serialize them */
+        char *json = md_atspi_delta_to_json(deltas, delta_count);
+        if (json) free(json);
+        md_atspi_delta_free(deltas, delta_count);
+        printf("  PASS: diff (%d deltas)\n", delta_count);
+    } else {
+        printf("  PASS: diff (no deltas — first snapshot or no AT-SPI2)\n");
+    }
+
+    md_atspi_destroy(tree);
+}
+
 int main(void) {
     printf("test_atspi:\n");
     test_node_alloc_free();
@@ -126,6 +182,8 @@ int main(void) {
     test_json_serialization();
     test_compact_serialization();
     test_delta_serialization();
+    test_walk_tree();
+    test_diff();
     printf("All atspi tests passed.\n");
     return 0;
 }

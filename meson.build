@@ -219,3 +219,9 @@ encode_roundtrip = executable('encode_roundtrip',
   dependencies : [dep_metadesk],
   install : false,
 )
+
+atspi_dump = executable('atspi_dump',
+  files('tools/atspi_dump.c'),
+  dependencies : [dep_metadesk],
+  install : false,
+)
