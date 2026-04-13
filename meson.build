@@ -135,6 +135,7 @@ core_sources = files(
   'src/core/a11y.c',
   'src/core/a11y_atspi.c',
   'src/core/input.c',
+  'src/core/input_uinput.c',
   'src/core/session.c',
   'src/core/nostr.c',
   'src/core/packet.c',

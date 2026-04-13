@@ -320,16 +320,16 @@ int main(int argc, char **argv) {
     printf("host: encoder ready (%s)\n",
            md_encoder_is_hw(encoder) ? "NVENC" : "x264");
 
-    /* Initialize input injection (uinput virtual devices) */
+    /* Initialize input injection */
     MdInputConfig input_cfg = {
         .screen_width  = 1920,
         .screen_height = 1080,
     };
     MdInput *input = md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
-        fprintf(stderr, "WARNING: uinput unavailable — input injection disabled\n");
+        fprintf(stderr, "WARNING: input injection unavailable\n");
     } else {
-        printf("host: uinput devices ready\n");
+        printf("host: input injection ready\n");
     }
 
     /* Initialize accessibility tree walker */
