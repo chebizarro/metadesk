@@ -284,3 +284,17 @@ test_signer = executable('test_signer',
   dependencies : [dep_metadesk],
 )
 test('signer abstraction', test_signer)
+
+if enable_nip46
+  # NIP-46 test needs nip04 for transport encryption (mock relay)
+  dep_nip04_test = dependency('nostr-nip04', required : false)
+  if not dep_nip04_test.found()
+    dep_nip04_test = meson.get_compiler('c').find_library('nip04', required : true)
+  endif
+  test_signer_nip46 = executable('test_signer_nip46',
+    files('tests/test_signer_nip46.c'),
+    dependencies : [dep_metadesk, dep_nip46, dep_nip04_test],
+    c_args : ['-DMD_SIGNER_ENABLE_NIP46'],
+  )
+  test('NIP-46 signer integration', test_signer_nip46)
+endif

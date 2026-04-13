@@ -362,12 +362,45 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     return s;
 }
 
+/* Test-only constructor: wraps a pre-configured session without
+ * connecting to relays. Always compiled when NIP-46 is enabled
+ * so the symbol is available to test binaries. */
+MdSigner *md_signer_create_nip46_from_session(
+    NostrNip46Session *session,
+    const char *remote_pubkey_hex) {
+    if (!session || !remote_pubkey_hex) return NULL;
+
+    Nip46State *st = calloc(1, sizeof(Nip46State));
+    if (!st) return NULL;
+    st->session = session;
+    st->remote_pubkey_hex = strdup(remote_pubkey_hex);
+
+    MdSigner *s = calloc(1, sizeof(MdSigner));
+    if (!s) {
+        free(st->remote_pubkey_hex);
+        free(st);
+        return NULL;
+    }
+    s->type    = MD_SIGNER_NIP46;
+    s->ops     = &nip46_ops;
+    s->backend = st;
+    return s;
+}
+
 #else /* !MD_SIGNER_ENABLE_NIP46 */
 
 MdSigner *md_signer_create_nip46(const char *bunker_uri,
                                  uint32_t timeout_ms) {
     (void)bunker_uri; (void)timeout_ms;
     fprintf(stderr, "signer: NIP-46 backend not compiled\n");
+    return NULL;
+}
+
+MdSigner *md_signer_create_nip46_from_session(
+    struct NostrNip46Session *session,
+    const char *remote_pubkey_hex) {
+    (void)session; (void)remote_pubkey_hex;
+    fprintf(stderr, "signer: NIP-46 backend not compiled (test path)\n");
     return NULL;
 }
 

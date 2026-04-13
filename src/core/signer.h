@@ -191,6 +191,23 @@ int md_signer_nip44_encrypt(MdSigner *s, const char *peer_pubkey_hex,
 int md_signer_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
                             const char *ciphertext, char **out_plaintext);
 
+/* ── Testing / advanced constructors ──────────────────────────── */
+
+/*
+ * Create a NIP-46 signer from a pre-configured nostrc session.
+ * Intended for testing: bypasses URI parsing, relay connection,
+ * and the connect RPC handshake. The signer takes ownership
+ * of the session and will free it on destroy.
+ *
+ * Requires MD_SIGNER_ENABLE_NIP46 at compile time.
+ * session: an already-configured NostrNip46Session (client mode).
+ * remote_pubkey_hex: the remote signer's pubkey (copied internally).
+ */
+struct NostrNip46Session;
+MdSigner *md_signer_create_nip46_from_session(
+    struct NostrNip46Session *session,
+    const char *remote_pubkey_hex);
+
 /* Get the signer backend type. */
 MdSignerType md_signer_get_type(const MdSigner *s);
 
