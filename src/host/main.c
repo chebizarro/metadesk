@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
+#include <pthread.h>
 
 static volatile int g_running = 1;
 
@@ -67,38 +68,61 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
         ctx->frames_sent++;
 }
 
-/* ── Capture callback: encode each frame ─────────────────────── */
+/* ── Map capture pixel format to encoder pixel format ────────── */
 
-static void on_frame(const MdFrame *frame, void *userdata) {
-    HostCtx *ctx = userdata;
-    if (!ctx->encoder || !ctx->client)
-        return;
-
-    /* Map PipeWire SPA format to our pixel format enum */
-    MdPixFmt fmt;
-    switch (frame->format) {
-    /* SPA_VIDEO_FORMAT_BGRx = 16, BGRA = 20, RGBx = 15, RGBA = 4 (approx) */
-    default: fmt = MD_PIX_FMT_BGRX; break;
+static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
+    switch (cfmt) {
+    case MD_PIX_CAPTURE_BGRA: return MD_PIX_FMT_BGRA;
+    case MD_PIX_CAPTURE_NV12: return MD_PIX_FMT_NV12;
+    default:                  return MD_PIX_FMT_BGRX;
     }
+}
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    int64_t start_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+/* ── Capture thread: pull frames and encode ──────────────────── */
 
-    int ret = md_encoder_submit(ctx->encoder, frame->data,
-                                frame->stride, fmt,
-                                (int64_t)frame->seq,
-                                on_encoded, ctx);
+typedef struct {
+    HostCtx      *host;
+    MdCaptureCtx *capture;
+} CaptureThread;
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    int64_t elapsed_us = (ts.tv_sec * 1000000LL + ts.tv_nsec / 1000) - start_us;
+static void *capture_thread_func(void *arg) {
+    CaptureThread *ct  = arg;
+    HostCtx       *ctx = ct->host;
+    MdCaptureCtx  *cap = ct->capture;
 
-    if (ret == 0) {
-        ctx->total_encode_us += elapsed_us;
-        ctx->frames_encoded++;
+    while (md_capture_is_active(cap) && g_running) {
+        MdFrame frame;
+        if (md_capture_get_frame(cap, &frame) != 0)
+            break;
+
+        if (!ctx->encoder || !ctx->client) {
+            md_capture_release_frame(cap, &frame);
+            continue;
+        }
+
+        MdPixFmt fmt = capture_fmt_to_enc(frame.format);
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t start_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+        int ret = md_encoder_submit(ctx->encoder, frame.data,
+                                    frame.stride, fmt,
+                                    (int64_t)frame.seq,
+                                    on_encoded, ctx);
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t elapsed_us = (ts.tv_sec * 1000000LL + ts.tv_nsec / 1000) - start_us;
+
+        if (ret == 0) {
+            ctx->total_encode_us += elapsed_us;
+            ctx->frames_encoded++;
+        }
+        ctx->frame_seq++;
+
+        md_capture_release_frame(cap, &frame);
     }
-
-    ctx->frame_seq++;
+    return NULL;
 }
 
 /* ── Handle incoming packets from client ─────────────────────── */
@@ -148,7 +172,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
     fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
-    fprintf(stderr, "  --no-capture     Skip PipeWire capture (test mode)\n");
+    fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "\nSigner options (choose one):\n");
     fprintf(stderr, "  --bunker URI     NIP-46 Nostr Connect bunker URI\n");
@@ -214,7 +238,7 @@ int main(int argc, char **argv) {
     printf("  fps:       %u\n", fps);
     printf("  bitrate:   %u bps\n", bitrate);
     printf("  encoder:   %s\n", use_nvenc ? "NVENC (preferred)" : "x264");
-    printf("  capture:   %s\n", do_capture ? "PipeWire" : "disabled");
+    printf("  capture:   %s\n", do_capture ? "enabled" : "disabled");
     if (fips_npub)
         printf("  fips:      %.*s...\n", 12, fips_npub);
     printf("\n");
@@ -338,24 +362,31 @@ int main(int argc, char **argv) {
         printf("host: sent initial UI tree\n");
     }
 
-    /* Start PipeWire capture */
-    MdCapture *capture = NULL;
+    /* Start screen capture */
+    MdCaptureCtx *capture = NULL;
+    pthread_t cap_thread = 0;
+    bool cap_thread_started = false;
+    CaptureThread cap_thr_ctx = {0};
     if (do_capture) {
         MdCaptureConfig cap_cfg = {
-            .target_fps   = fps,
-            .prefer_dmabuf = false,  /* SHM for Phase 1 — DMA-BUF path in Phase 2 */
-            .show_cursor  = true,
+            .target_fps  = fps,
+            .show_cursor = true,
         };
         capture = md_capture_create(&cap_cfg);
         if (!capture) {
-            fprintf(stderr, "WARNING: PipeWire capture unavailable\n");
+            fprintf(stderr, "WARNING: screen capture unavailable\n");
         } else {
-            if (md_capture_start(capture, on_frame, &ctx) < 0) {
+            if (md_capture_start(capture) < 0) {
                 fprintf(stderr, "WARNING: failed to start capture\n");
                 md_capture_destroy(capture);
                 capture = NULL;
             } else {
-                printf("host: PipeWire capture started\n");
+                printf("host: capture started\n");
+                /* Spawn a thread to pull frames and encode */
+                cap_thr_ctx.host    = &ctx;
+                cap_thr_ctx.capture = capture;
+                if (pthread_create(&cap_thread, NULL, capture_thread_func, &cap_thr_ctx) == 0)
+                    cap_thread_started = true;
             }
         }
     }
@@ -415,6 +446,8 @@ int main(int argc, char **argv) {
 
     if (capture) {
         md_capture_stop(capture);
+        if (cap_thread_started)
+            pthread_join(cap_thread, NULL);
         md_capture_destroy(capture);
     }
 

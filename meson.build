@@ -129,6 +129,7 @@ core_sources = files(
   'src/core/fips_addr.c',
   'src/core/signer.c',
   'src/core/capture.c',
+  'src/core/capture_pipewire.c',
   'src/core/encode.c',
   'src/core/decode.c',
   'src/core/atspi.c',
