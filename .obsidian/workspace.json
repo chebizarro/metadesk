@@ -1,0 +1,204 @@
+{
+  "main": {
+    "id": "0ccc788daa7f614a",
+    "type": "split",
+    "children": [
+      {
+        "id": "fd20d01244e4119a",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "d8f80df7afc6a2c8",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "docs/metadesk-spec.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "metadesk-spec"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "78319ab75227d880",
+    "type": "split",
+    "children": [
+      {
+        "id": "6008a57857c47272",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5e53a1f8db54dbca",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "36e78caa3375d026",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "741ffc160852e162",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "2a86fb7a806d51ba",
+    "type": "split",
+    "children": [
+      {
+        "id": "4ba2b6d24f5ddc6f",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "a83149c3547efbe8",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "docs/metadesk-spec.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for metadesk-spec"
+            }
+          },
+          {
+            "id": "887acecdc0ae1742",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "docs/metadesk-spec.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from metadesk-spec"
+            }
+          },
+          {
+            "id": "8a7a4ad585b36bba",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "2c3f72456a72ded0",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "190481aea7a537e0",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "docs/metadesk-spec.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of metadesk-spec"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "d8f80df7afc6a2c8",
+  "lastOpenFiles": [
+    "tools/capture_frame.c",
+    "tools",
+    "AGENTS.md",
+    "src/core/action.c",
+    "src/core/action.h",
+    "SPEC.md",
+    "subprojects/imgui",
+    "subprojects",
+    "docs/AGENT_API.md",
+    "config/metadesk.toml.example",
+    "config",
+    "tests/test_nostr.c",
+    "tests/test_atspi.c",
+    "tests/test_packet.c",
+    "docs/metadesk-spec.md"
+  ]
+}

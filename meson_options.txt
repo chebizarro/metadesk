@@ -1,0 +1,6 @@
+option('nvenc',    type : 'boolean', value : true,
+       description : 'Enable NVENC hardware encoding (requires NVIDIA GPU + drivers)')
+option('client',   type : 'boolean', value : true,
+       description : 'Build the human video client (requires SDL2 + Dear ImGui)')
+option('fips_nat', type : 'boolean', value : true,
+       description : 'Build the fips-nat NAT traversal daemon (requires libnice)')

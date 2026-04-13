@@ -1,0 +1,33 @@
+# metadesk configuration
+# See docs/metadesk-spec.md for full specification.
+#
+# IMPORTANT: No secrets in this file. All cryptographic material is
+# retrieved at startup from 1Password Connect. See spec §7.
+
+[secrets]
+# 1Password Connect endpoint
+connect_url = "http://localhost:8080"
+# Item reference for the FIPS node nsec
+nsec_ref = "op://metadesk/fips-node/nsec"
+# Item reference for the 1Password Connect token
+token_ref = "op://metadesk/1pc/token"
+
+[host]
+# TCP listen port for frame channel (over FIPS TUN)
+port = 7700
+# Default bitrate (bits/sec) — adaptive in Phase 2
+bitrate = 8000000
+# Frames per second target
+fps = 60
+# Prefer NVENC if available, fallback to x264
+nvenc = true
+
+[nostr]
+# Relay URLs for session signaling
+relays = ["wss://relay.damus.io", "wss://nos.lol"]
+
+[fips_nat]
+# STUN server for address discovery
+stun_server = "stun:stun.l.google.com:19302"
+# UDP port for FIPS daemon transport
+fips_port = 2121
