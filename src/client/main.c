@@ -19,6 +19,7 @@
 #include "stream.h"
 #include "decode.h"
 #include "render.h"
+#include "signer.h"
 #include "ui.h"
 
 #include <stdio.h>
@@ -76,6 +77,11 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
     fprintf(stderr, "  --timeout MS       Connect timeout (default: 5000)\n");
+    fprintf(stderr, "\nSigner options (choose one):\n");
+    fprintf(stderr, "  --bunker URI       NIP-46 Nostr Connect bunker URI\n");
+    fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
+    fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
+    fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
     fprintf(stderr, "  -h, --help         Show this help\n");
 }
 
@@ -96,6 +102,10 @@ int main(int argc, char **argv) {
     /* Default options */
     const char *host = NULL;
     const char *npub = NULL;
+    const char *bunker_uri = NULL;
+    const char *socket_path = NULL;
+    bool use_dbus_signer = false;
+    bool auto_signer = false;
     uint16_t port = MD_STREAM_PORT;
     bool do_display = true;
     uint32_t timeout_ms = 5000;
@@ -110,6 +120,16 @@ int main(int argc, char **argv) {
             timeout_ms = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             npub = argv[++i];
+        else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
+            bunker_uri = argv[++i];
+        else if (strcmp(argv[i], "--dbus-signer") == 0)
+            use_dbus_signer = true;
+        else if (strcmp(argv[i], "--socket-signer") == 0) {
+            socket_path = (i + 1 < argc && argv[i + 1][0] != '-')
+                ? argv[++i] : NULL;
+        }
+        else if (strcmp(argv[i], "--auto-signer") == 0)
+            auto_signer = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -133,6 +153,32 @@ int main(int argc, char **argv) {
     printf("  display:   %s\n", do_display ? "SDL2" : "disabled");
     printf("  timeout:   %u ms\n", timeout_ms);
     printf("\n");
+
+    /* ── Signer initialization ─────────────────────────────── */
+    MdSigner *signer = NULL;
+    if (bunker_uri) {
+        printf("client: connecting to NIP-46 bunker...\n");
+        signer = md_signer_create_nip46(bunker_uri, 30000);
+    } else if (use_dbus_signer) {
+        printf("client: connecting to NIP-55L D-Bus signer...\n");
+        signer = md_signer_create_nip55l();
+    } else if (socket_path || auto_signer) {
+        if (socket_path) {
+            printf("client: connecting to NIP-5F socket signer...\n");
+            signer = md_signer_create_nip5f(socket_path);
+        }
+        if (!signer && auto_signer) {
+            printf("client: auto-detecting signer...\n");
+            signer = md_signer_auto_detect();
+        }
+    }
+    if (signer) {
+        printf("client: signer ready (%s)\n",
+               md_signer_type_name(md_signer_get_type(signer)));
+    } else if (bunker_uri || use_dbus_signer) {
+        fprintf(stderr, "ERROR: requested signer backend not available\n");
+        return 1;
+    }
 
     /* Initialize session state */
     MdSession session;
@@ -311,6 +357,8 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
+    if (signer)
+        md_signer_destroy(signer);
     if (ctx.overlay)
         md_overlay_destroy(ctx.overlay);
     if (ctx.renderer)

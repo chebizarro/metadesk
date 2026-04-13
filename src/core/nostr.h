@@ -20,6 +20,8 @@
 #ifndef MD_NOSTR_H
 #define MD_NOSTR_H
 
+#include "signer.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -47,9 +49,19 @@ extern "C" {
  */
 typedef struct MdNostr MdNostr;
 
-/* Configuration for the Nostr bridge */
+/* Configuration for the Nostr bridge.
+ *
+ * Authentication: provide EITHER signer OR sk_hex (not both).
+ *   - signer:  MdSigner* from any backend (NIP-46/55L/5F/direct-key).
+ *              MdNostr borrows the pointer — caller retains ownership.
+ *   - sk_hex:  64-char hex secret key (legacy). MdNostr creates an
+ *              internal direct-key signer and takes ownership of it.
+ *
+ * If both are provided, signer takes precedence and sk_hex is ignored.
+ */
 typedef struct {
-    const char  *sk_hex;          /* 64-char hex secret key            */
+    MdSigner    *signer;          /* pluggable signer (preferred)      */
+    const char  *sk_hex;          /* 64-char hex secret key (fallback) */
     const char **relay_urls;      /* NULL-terminated array of relay URLs */
     int          relay_count;
 } MdNostrConfig;
@@ -90,6 +102,9 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs);
 
 /* Get the local pubkey hex string (owned by MdNostr, do not free). */
 const char *md_nostr_get_npub(const MdNostr *n);
+
+/* Get the signer used by this Nostr bridge (borrowed reference). */
+MdSigner *md_nostr_get_signer(MdNostr *n);
 
 /* Destroy Nostr bridge: close subscriptions, disconnect relays, zero key material. */
 void md_nostr_destroy(MdNostr *n);
@@ -146,7 +161,8 @@ int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex);
 /* Generate a new random Nostr keypair. Caller frees both strings. */
 int md_nostr_generate_keypair(char **sk_hex_out, char **pk_hex_out);
 
-/* Get public key hex from secret key hex. Caller frees. */
+/* Get public key hex from secret key hex. Caller frees.
+ * Note: prefer md_signer_get_pubkey() for signer-based auth. */
 char *md_nostr_get_pubkey(const char *sk_hex);
 
 #ifdef __cplusplus

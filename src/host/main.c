@@ -23,6 +23,7 @@
 #include "fips_addr.h"
 #include "nostr.h"
 #include "secrets.h"
+#include "signer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +150,11 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
     fprintf(stderr, "  --no-capture     Skip PipeWire capture (test mode)\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
+    fprintf(stderr, "\nSigner options (choose one):\n");
+    fprintf(stderr, "  --bunker URI     NIP-46 Nostr Connect bunker URI\n");
+    fprintf(stderr, "  --dbus-signer    Use NIP-55L D-Bus signer daemon\n");
+    fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
+    fprintf(stderr, "  --auto-signer    Auto-detect local signer (NIP-5F, NIP-55L)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -162,6 +168,10 @@ int main(int argc, char **argv) {
     uint16_t port = MD_STREAM_PORT;
     const char *bind_addr = NULL;
     const char *fips_npub = NULL;  /* expected client npub (FIPS auth) */
+    const char *bunker_uri = NULL;
+    const char *socket_path = NULL;
+    bool use_dbus_signer = false;
+    bool auto_signer = false;
     uint32_t fps = 60;
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
@@ -183,6 +193,16 @@ int main(int argc, char **argv) {
             do_capture = false;
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             fips_npub = argv[++i];
+        else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
+            bunker_uri = argv[++i];
+        else if (strcmp(argv[i], "--dbus-signer") == 0)
+            use_dbus_signer = true;
+        else if (strcmp(argv[i], "--socket-signer") == 0) {
+            socket_path = (i + 1 < argc && argv[i + 1][0] != '-')
+                ? argv[++i] : NULL;
+        }
+        else if (strcmp(argv[i], "--auto-signer") == 0)
+            auto_signer = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -199,10 +219,35 @@ int main(int argc, char **argv) {
         printf("  fips:      %.*s...\n", 12, fips_npub);
     printf("\n");
 
+    /* ── Signer initialization ────────────────────────────────── */
+    MdSigner *signer = NULL;
+    if (bunker_uri) {
+        printf("host: connecting to NIP-46 bunker...\n");
+        signer = md_signer_create_nip46(bunker_uri, 30000);
+    } else if (use_dbus_signer) {
+        printf("host: connecting to NIP-55L D-Bus signer...\n");
+        signer = md_signer_create_nip55l();
+    } else if (socket_path || auto_signer) {
+        if (socket_path) {
+            printf("host: connecting to NIP-5F socket signer...\n");
+            signer = md_signer_create_nip5f(socket_path);
+        }
+        if (!signer && auto_signer) {
+            printf("host: auto-detecting signer...\n");
+            signer = md_signer_auto_detect();
+        }
+    }
+    /* If no signer from CLI, log that Nostr features require a signer */
+    if (signer) {
+        printf("host: signer ready (%s)\n",
+               md_signer_type_name(md_signer_get_type(signer)));
+    } else if (bunker_uri || use_dbus_signer) {
+        fprintf(stderr, "ERROR: requested signer backend not available\n");
+        return 1;
+    }
+
     /* If FIPS npub specified, bind to FIPS address */
     if (fips_npub && !bind_addr) {
-        /* In FIPS mode, we listen on all interfaces (fips0 TUN included).
-         * The FIPS TUN adapter routes fd00::/8 traffic transparently. */
         printf("host: FIPS mode — accepting connections via fips0 TUN\n");
     }
 
@@ -387,6 +432,9 @@ int main(int argc, char **argv) {
 
     md_stream_destroy(client);
     md_stream_server_destroy(srv);
+
+    if (signer)
+        md_signer_destroy(signer);
 
     printf("host: done. sent %u frames in %u packets\n",
            ctx.frames_encoded, ctx.frames_sent);
