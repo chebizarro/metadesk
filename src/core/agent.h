@@ -4,10 +4,10 @@
  *
  * This module orchestrates the agent interaction loop on the host side:
  *   1. Parse incoming MD_PKT_ACTION JSON
- *   2. Resolve target_id to screen coordinates via AT-SPI2 tree
- *   3. Inject the action via uinput (mouse/keyboard) or AT-SPI2 API
+ *   2. Resolve target_id to screen coordinates via accessibility tree
+ *   3. Inject the action via input injection backend
  *   4. Wait briefly for the UI to settle
- *   5. Walk the AT-SPI2 tree for deltas
+ *   5. Walk the accessibility tree for deltas
  *   6. Send MD_PKT_UI_TREE or MD_PKT_UI_TREE_DELTA back to client
  *
  * See spec §10.2 for the interaction loop and §3.2 for action format.
@@ -16,7 +16,7 @@
 #define MD_AGENT_H
 
 #include "action.h"
-#include "atspi.h"
+#include "a11y.h"
 #include "input.h"
 #include "stream.h"
 #include "packet.h"
@@ -34,8 +34,8 @@ typedef struct MdAgent MdAgent;
 
 /* Agent configuration */
 typedef struct {
-    MdAtspiTree  *atspi;        /* shared AT-SPI2 tree context         */
-    MdInput      *input;        /* shared uinput context               */
+    MdA11yCtx    *a11y;         /* shared accessibility tree context    */
+    MdInput      *input;        /* shared input injection context       */
     MdTreeFormat  tree_format;  /* negotiated tree format for client   */
     uint32_t      settle_ms;    /* ms to wait after injection (default: 100) */
 } MdAgentConfig;

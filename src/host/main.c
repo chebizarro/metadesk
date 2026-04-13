@@ -14,7 +14,7 @@
  */
 #include "capture.h"
 #include "encode.h"
-#include "atspi.h"
+#include "a11y.h"
 #include "input.h"
 #include "session.h"
 #include "packet.h"
@@ -332,17 +332,17 @@ int main(int argc, char **argv) {
         printf("host: uinput devices ready\n");
     }
 
-    /* Initialize AT-SPI2 tree walker */
-    MdAtspiTree *atspi = md_atspi_create();
-    if (!atspi) {
-        fprintf(stderr, "WARNING: AT-SPI2 unavailable — agent mode disabled\n");
+    /* Initialize accessibility tree walker */
+    MdA11yCtx *a11y = md_a11y_create();
+    if (!a11y) {
+        fprintf(stderr, "WARNING: accessibility tree unavailable — agent mode disabled\n");
     } else {
-        printf("host: AT-SPI2 connected\n");
+        printf("host: accessibility tree connected\n");
     }
 
     /* Initialize agent action handler */
     MdAgentConfig agent_cfg = {
-        .atspi       = atspi,
+        .a11y        = a11y,
         .input       = input,
         .tree_format = session.tree_format,
         .settle_ms   = MD_AGENT_DEFAULT_SETTLE_MS,
@@ -357,7 +357,7 @@ int main(int argc, char **argv) {
     };
 
     /* Send initial UI tree to client */
-    if (agent && atspi) {
+    if (agent && a11y) {
         md_agent_send_tree(agent, client, &ctx.pkt_seq);
         printf("host: sent initial UI tree\n");
     }
@@ -458,8 +458,8 @@ int main(int argc, char **argv) {
         printf("host: handled %u agent actions\n", md_agent_get_action_count(agent));
         md_agent_destroy(agent);
     }
-    if (atspi)
-        md_atspi_destroy(atspi);
+    if (a11y)
+        md_a11y_destroy(a11y);
     if (input)
         md_input_destroy(input);
 

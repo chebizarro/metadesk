@@ -1,21 +1,21 @@
 /*
  * metadesk — tools/atspi_dump.c
- * M1.6 verification tool: walk and print the AT-SPI2 accessibility tree.
+ * M1.6 verification tool: walk and print the accessibility tree.
  *
  * Usage: atspi_dump [--json | --compact]
  *
- * Connects to the AT-SPI2 D-Bus bus, walks the full accessibility tree,
+ * Connects to the platform accessibility service, walks the full tree,
  * and prints it in the requested format. Useful for verifying tree
  * coverage and testing serialization.
  */
-#include "atspi.h"
+#include "a11y.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-static void print_node_summary(const MdAtspiNode *node, int depth) {
+static void print_node_summary(const MdA11yNode *node, int depth) {
     if (!node) return;
 
     for (int i = 0; i < depth; i++) printf("  ");
@@ -42,7 +42,7 @@ static void print_node_summary(const MdAtspiNode *node, int depth) {
         print_node_summary(node->children[i], depth + 1);
 }
 
-static int count_nodes(const MdAtspiNode *node) {
+static int count_nodes(const MdA11yNode *node) {
     if (!node) return 0;
     int count = 1;
     for (int i = 0; i < node->child_count && node->children; i++)
@@ -62,18 +62,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    fprintf(stderr, "atspi_dump: connecting to AT-SPI2 bus...\n");
+    fprintf(stderr, "atspi_dump: connecting to accessibility service...\n");
 
-    MdAtspiTree *tree = md_atspi_create();
-    if (!tree) {
-        fprintf(stderr, "ERROR: failed to connect to AT-SPI2\n");
+    MdA11yCtx *ctx = md_a11y_create();
+    if (!ctx) {
+        fprintf(stderr, "ERROR: failed to connect to accessibility service\n");
         return 1;
     }
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    MdAtspiNode *root = md_atspi_walk(tree);
+    MdA11yNode *root = md_a11y_walk(ctx);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double walk_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
 
     if (!root) {
         fprintf(stderr, "ERROR: failed to walk accessibility tree\n");
-        md_atspi_destroy(tree);
+        md_a11y_destroy(ctx);
         return 1;
     }
 
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
         break;
 
     case FMT_JSON: {
-        char *json = md_atspi_to_json(root);
+        char *json = md_a11y_to_json(root);
         if (json) {
             printf("%s\n", json);
             free(json);
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     }
 
     case FMT_COMPACT: {
-        char *compact = md_atspi_to_compact(root);
+        char *compact = md_a11y_to_compact(root);
         if (compact) {
             printf("%s", compact);
             free(compact);
@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     }
     }
 
-    md_atspi_node_free(root);
-    md_atspi_destroy(tree);
+    md_a11y_node_free(root);
+    md_a11y_destroy(ctx);
     return 0;
 }

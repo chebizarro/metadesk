@@ -5,13 +5,13 @@
  * Flow per action:
  *   1. Parse MD_PKT_ACTION JSON → MdAction
  *   2. If action has target_id, resolve to screen coordinates by
- *      walking the AT-SPI2 tree and finding the matching node
+ *      walking the accessibility tree and finding the matching node
  *   3. Inject the action via md_input_execute_action()
  *   4. Wait settle_ms for the UI to update
- *   5. Compute AT-SPI2 tree delta
+ *   5. Compute accessibility tree delta
  *   6. Send MD_PKT_UI_TREE_DELTA (or full tree if delta is too large)
  *
- * Target resolution: AT-SPI2 nodes are identified by their node ID
+ * Target resolution: accessibility nodes are identified by their node ID
  * (e.g. "n42"). The agent handler searches the current tree snapshot
  * to find the node's bounding box center, then uses those coordinates
  * for mouse-based actions (click, dbl_click, right_click).
@@ -27,28 +27,28 @@
 #define MD_AGENT_MAX_DELTA_SIZE (64 * 1024)
 
 struct MdAgent {
-    MdAtspiTree  *atspi;
+    MdA11yCtx    *a11y;
     MdInput      *input;
     MdTreeFormat  tree_format;
     uint32_t      settle_ms;
     uint32_t      action_count;
 
     /* Cached last tree for target resolution */
-    MdAtspiNode  *cached_tree;
+    MdA11yNode   *cached_tree;
 };
 
 /* ── Target resolution ───────────────────────────────────────── */
 
 /* Recursively search for a node with matching ID. */
-static const MdAtspiNode *find_node_by_id(const MdAtspiNode *node,
-                                           const char *target_id) {
+static const MdA11yNode *find_node_by_id(const MdA11yNode *node,
+                                          const char *target_id) {
     if (!node || !target_id) return NULL;
 
     if (node->id && strcmp(node->id, target_id) == 0)
         return node;
 
     for (int i = 0; i < node->child_count && node->children; i++) {
-        const MdAtspiNode *found = find_node_by_id(node->children[i], target_id);
+        const MdA11yNode *found = find_node_by_id(node->children[i], target_id);
         if (found) return found;
     }
 
@@ -63,14 +63,14 @@ static int resolve_target(MdAgent *agent, const char *target_id,
         return -1;
 
     /* Ensure we have a cached tree */
-    if (!agent->cached_tree && agent->atspi) {
-        agent->cached_tree = md_atspi_walk(agent->atspi);
+    if (!agent->cached_tree && agent->a11y) {
+        agent->cached_tree = md_a11y_walk(agent->a11y);
     }
 
     if (!agent->cached_tree)
         return -1;
 
-    const MdAtspiNode *node = find_node_by_id(agent->cached_tree, target_id);
+    const MdA11yNode *node = find_node_by_id(agent->cached_tree, target_id);
     if (!node)
         return -1;
 
@@ -92,16 +92,16 @@ static void sleep_ms(uint32_t ms) {
 
 /* ── Serialize tree in the negotiated format ─────────────────── */
 
-static char *serialize_tree(const MdAtspiNode *root, MdTreeFormat fmt) {
+static char *serialize_tree(const MdA11yNode *root, MdTreeFormat fmt) {
     if (!root) return NULL;
 
     switch (fmt) {
     case MD_TREE_FORMAT_JSON:
-        return md_atspi_to_json(root);
+        return md_a11y_to_json(root);
     case MD_TREE_FORMAT_COMPACT:
-        return md_atspi_to_compact(root);
+        return md_a11y_to_compact(root);
     }
-    return md_atspi_to_json(root); /* default fallback */
+    return md_a11y_to_json(root); /* default fallback */
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -112,7 +112,7 @@ MdAgent *md_agent_create(const MdAgentConfig *cfg) {
     MdAgent *agent = calloc(1, sizeof(MdAgent));
     if (!agent) return NULL;
 
-    agent->atspi       = cfg->atspi;
+    agent->a11y        = cfg->a11y;
     agent->input       = cfg->input;
     agent->tree_format = cfg->tree_format;
     agent->settle_ms   = cfg->settle_ms > 0 ? cfg->settle_ms
@@ -187,18 +187,18 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
 
     /* 5. Invalidate cached tree (UI changed) */
     if (agent->cached_tree) {
-        md_atspi_node_free(agent->cached_tree);
+        md_a11y_node_free(agent->cached_tree);
         agent->cached_tree = NULL;
     }
 
     /* 6. Compute and send delta */
-    if (agent->atspi) {
+    if (agent->a11y) {
         int delta_count = 0;
-        MdAtspiDelta *deltas = md_atspi_diff(agent->atspi, &delta_count);
+        MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
 
         if (deltas && delta_count > 0) {
             /* Serialize delta */
-            char *delta_json = md_atspi_delta_to_json(deltas, delta_count);
+            char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
             if (delta_json) {
                 size_t len = strlen(delta_json);
 
@@ -210,12 +210,12 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
                     /* Delta too large — send full tree instead */
                     free(delta_json);
                     md_agent_send_tree(agent, stream, seq);
-                    md_atspi_delta_free(deltas, delta_count);
+                    md_a11y_delta_free(deltas, delta_count);
                     return 0;
                 }
                 free(delta_json);
             }
-            md_atspi_delta_free(deltas, delta_count);
+            md_a11y_delta_free(deltas, delta_count);
         } else {
             /* No delta available or no changes detected.
              * Send a full tree on the first interaction. */
@@ -227,23 +227,23 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
 }
 
 int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
-    if (!agent || !stream || !seq || !agent->atspi)
+    if (!agent || !stream || !seq || !agent->a11y)
         return -1;
 
     /* Walk the full tree */
-    MdAtspiNode *root = md_atspi_walk(agent->atspi);
+    MdA11yNode *root = md_a11y_walk(agent->a11y);
     if (!root)
         return -1;
 
     /* Update cached tree */
     if (agent->cached_tree)
-        md_atspi_node_free(agent->cached_tree);
+        md_a11y_node_free(agent->cached_tree);
     agent->cached_tree = NULL; /* walk returns a new tree; we don't cache it
                                   since the caller's tree is separate */
 
     /* Serialize in negotiated format */
     char *data = serialize_tree(root, agent->tree_format);
-    md_atspi_node_free(root);
+    md_a11y_node_free(root);
 
     if (!data)
         return -1;
@@ -257,17 +257,17 @@ int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
 }
 
 int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq) {
-    if (!agent || !stream || !seq || !agent->atspi)
+    if (!agent || !stream || !seq || !agent->a11y)
         return -1;
 
     int delta_count = 0;
-    MdAtspiDelta *deltas = md_atspi_diff(agent->atspi, &delta_count);
+    MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
 
     if (!deltas || delta_count == 0)
         return 0; /* no changes */
 
-    char *json = md_atspi_delta_to_json(deltas, delta_count);
-    md_atspi_delta_free(deltas, delta_count);
+    char *json = md_a11y_delta_to_json(deltas, delta_count);
+    md_a11y_delta_free(deltas, delta_count);
 
     if (!json)
         return -1;
@@ -287,7 +287,7 @@ void md_agent_destroy(MdAgent *agent) {
     if (!agent) return;
 
     if (agent->cached_tree)
-        md_atspi_node_free(agent->cached_tree);
+        md_a11y_node_free(agent->cached_tree);
 
     free(agent);
 }

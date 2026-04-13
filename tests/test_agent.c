@@ -7,7 +7,7 @@
  */
 #include "agent.h"
 #include "action.h"
-#include "atspi.h"
+#include "a11y.h"
 #include "input.h"
 #include "session.h"
 
@@ -22,7 +22,7 @@ static int test_create_destroy(void) {
     printf("  test_create_destroy... ");
 
     MdAgentConfig cfg = {
-        .atspi       = NULL,
+        .a11y        = NULL,
         .input       = NULL,
         .tree_format = MD_TREE_FORMAT_COMPACT,
         .settle_ms   = 50,
@@ -53,7 +53,7 @@ static int test_handle_action_no_deps(void) {
 
     /* Create agent with no AT-SPI2 or input — should still parse and not crash */
     MdAgentConfig cfg = {
-        .atspi       = NULL,
+        .a11y        = NULL,
         .input       = NULL,
         .tree_format = MD_TREE_FORMAT_JSON,
         .settle_ms   = 10,  /* short settle for test speed */
@@ -82,18 +82,18 @@ static int test_handle_action_no_deps(void) {
 static int test_with_live_deps(void) {
     printf("  test_with_live_deps... ");
 
-    /* Try to create real AT-SPI2 and input contexts */
-    MdAtspiTree *atspi = md_atspi_create();
+    /* Try to create real a11y and input contexts */
+    MdA11yCtx *a11y = md_a11y_create();
     MdInput *input = md_input_create(NULL);
 
-    if (!atspi) {
-        printf("SKIP (no AT-SPI2)\n");
+    if (!a11y) {
+        printf("SKIP (no accessibility bus)\n");
         if (input) md_input_destroy(input);
         return 0;
     }
 
     MdAgentConfig cfg = {
-        .atspi       = atspi,
+        .a11y        = a11y,
         .input       = input,
         .tree_format = MD_TREE_FORMAT_COMPACT,
         .settle_ms   = 10,
@@ -109,7 +109,7 @@ static int test_with_live_deps(void) {
     assert(ret == -1);
 
     md_agent_destroy(agent);
-    md_atspi_destroy(atspi);
+    md_a11y_destroy(a11y);
     if (input) md_input_destroy(input);
 
     printf("OK\n");

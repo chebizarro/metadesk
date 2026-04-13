@@ -1,76 +1,39 @@
 /*
  * metadesk — atspi.h
- * AT-SPI2 accessibility tree walker and delta generation.
- * See spec §3.3 for tree formats, §10 for agent API.
+ * COMPATIBILITY HEADER — redirects to a11y.h
+ *
+ * The accessibility tree interface has been generalised to support
+ * multiple platforms. Use a11y.h directly for new code.
+ *
+ * Type mapping:
+ *   MdAtspiTree  → MdA11yCtx
+ *   MdAtspiNode  → MdA11yNode
+ *   MdAtspiDelta → MdA11yDelta
+ *   MdAtspiOp    → MdA11yOp
  */
 #ifndef MD_ATSPI_H
 #define MD_ATSPI_H
 
-#include <stdint.h>
-#include <stdbool.h>
+#include "a11y.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* Legacy type aliases */
+typedef MdA11yCtx    MdAtspiTree;
+typedef MdA11yNode   MdAtspiNode;
+typedef MdA11yDelta  MdAtspiDelta;
 
-/* Opaque tree context */
-typedef struct MdAtspiTree MdAtspiTree;
+#define MD_ATSPI_OP_ADD    MD_A11Y_OP_ADD
+#define MD_ATSPI_OP_REMOVE MD_A11Y_OP_REMOVE
+#define MD_ATSPI_OP_UPDATE MD_A11Y_OP_UPDATE
 
-/* Single UI tree node */
-typedef struct MdAtspiNode {
-    char     *id;       /* stable node identifier, e.g. "node_42" */
-    char     *role;     /* AT-SPI2 role string                    */
-    char     *label;    /* accessible name/label                  */
-    char    **states;   /* NULL-terminated array of state strings  */
-    int       state_count;
-    int       x, y, w, h;  /* bounding box                       */
-    struct MdAtspiNode **children;
-    int       child_count;
-} MdAtspiNode;
-
-/* Delta operation types — spec §3.3.3 */
-typedef enum {
-    MD_ATSPI_OP_ADD,
-    MD_ATSPI_OP_REMOVE,
-    MD_ATSPI_OP_UPDATE,
-} MdAtspiOp;
-
-/* A single tree delta entry */
-typedef struct {
-    MdAtspiOp    op;
-    MdAtspiNode *node;
-    char        *parent_id; /* for ADD: parent to attach under */
-} MdAtspiDelta;
-
-/* Create tree context, connecting to AT-SPI2 bus. */
-MdAtspiTree *md_atspi_create(void);
-
-/* Walk the full accessibility tree. Returns root node, caller must free. */
-MdAtspiNode *md_atspi_walk(MdAtspiTree *tree);
-
-/* Compute delta between previous and current tree state. */
-MdAtspiDelta *md_atspi_diff(MdAtspiTree *tree, int *delta_count);
-
-/* Serialize node tree to full JSON (spec §3.3.1). Caller frees returned string. */
-char *md_atspi_to_json(const MdAtspiNode *root);
-
-/* Serialize node tree to compact format (spec §3.3.2). Caller frees. */
-char *md_atspi_to_compact(const MdAtspiNode *root);
-
-/* Serialize deltas to JSON. Caller frees. */
-char *md_atspi_delta_to_json(const MdAtspiDelta *deltas, int count);
-
-/* Free a node tree recursively. */
-void md_atspi_node_free(MdAtspiNode *node);
-
-/* Free delta array. */
-void md_atspi_delta_free(MdAtspiDelta *deltas, int count);
-
-/* Destroy tree context. */
-void md_atspi_destroy(MdAtspiTree *tree);
-
-#ifdef __cplusplus
-}
-#endif
+/* Legacy function aliases */
+#define md_atspi_create()          md_a11y_create()
+#define md_atspi_walk(t)           md_a11y_walk(t)
+#define md_atspi_diff(t, c)        md_a11y_diff((t), (c))
+#define md_atspi_to_json(r)        md_a11y_to_json(r)
+#define md_atspi_to_compact(r)     md_a11y_to_compact(r)
+#define md_atspi_delta_to_json(d,c) md_a11y_delta_to_json((d),(c))
+#define md_atspi_node_free(n)      md_a11y_node_free(n)
+#define md_atspi_delta_free(d,c)   md_a11y_delta_free((d),(c))
+#define md_atspi_destroy(t)        md_a11y_destroy(t)
 
 #endif /* MD_ATSPI_H */
