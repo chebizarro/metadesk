@@ -285,6 +285,15 @@ test_signer = executable('test_signer',
 )
 test('signer abstraction', test_signer)
 
+if enable_nip5f
+  test_signer_nip5f = executable('test_signer_nip5f',
+    files('tests/test_signer_nip5f.c'),
+    dependencies : [dep_metadesk, dep_nip5f],
+    c_args : ['-DMD_SIGNER_ENABLE_NIP5F'],
+  )
+  test('NIP-5F signer integration', test_signer_nip5f)
+endif
+
 if enable_nip55l
   dep_nip19_test = dependency('nostr-nip19', required : false)
   if not dep_nip19_test.found()
