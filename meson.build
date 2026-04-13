@@ -14,6 +14,9 @@ cmake = import('cmake')
 enable_nvenc   = get_option('nvenc')
 enable_client  = get_option('client')
 enable_fipsnat = get_option('fips_nat')
+enable_nip46   = get_option('signer_nip46')
+enable_nip55l  = get_option('signer_nip55l')
+enable_nip5f   = get_option('signer_nip5f')
 
 # ── System dependencies (pkg-config) ────────────────────────────────────────
 dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
@@ -64,6 +67,34 @@ if enable_fipsnat
   dep_nice = dependency('nice', version : '>=0.1.21')
 endif
 
+# Signer backend deps + compile flags
+signer_c_args = []
+if enable_nip46
+  dep_nip46 = dependency('nostr-nip46', required : false)
+  if not dep_nip46.found()
+    dep_nip46 = meson.get_compiler('c').find_library('nostr-nip46', required : true)
+  endif
+  core_deps += dep_nip46
+  signer_c_args += '-DMD_SIGNER_ENABLE_NIP46'
+endif
+if enable_nip55l
+  dep_nip55l = dependency('nostr-nip55l', required : false)
+  if not dep_nip55l.found()
+    dep_nip55l = meson.get_compiler('c').find_library('nostr-nip55l', required : true)
+  endif
+  dep_gio = dependency('gio-2.0', version : '>=2.76')
+  core_deps += [dep_nip55l, dep_gio]
+  signer_c_args += '-DMD_SIGNER_ENABLE_NIP55L'
+endif
+if enable_nip5f
+  dep_nip5f = dependency('nostr-nip5f', required : false)
+  if not dep_nip5f.found()
+    dep_nip5f = meson.get_compiler('c').find_library('nostr-nip5f', required : true)
+  endif
+  core_deps += dep_nip5f
+  signer_c_args += '-DMD_SIGNER_ENABLE_NIP5F'
+endif
+
 # ── Vendored subprojects ────────────────────────────────────────────────────
 # Dear ImGui — vendored header-only, built as a static convenience library
 if enable_client
@@ -96,6 +127,7 @@ core_sources = files(
   'src/core/agent.c',
   'src/core/action.c',
   'src/core/fips_addr.c',
+  'src/core/signer.c',
   'src/core/capture.c',
   'src/core/encode.c',
   'src/core/decode.c',
@@ -126,6 +158,7 @@ core_deps = [
 libmetadesk = shared_library('metadesk', core_sources,
   include_directories : core_inc,
   dependencies : core_deps,
+  c_args : signer_c_args,
   install : true,
   version : meson.project_version(),
 )
@@ -245,3 +278,9 @@ test_secrets = executable('test_secrets',
   dependencies : [dep_metadesk],
 )
 test('1Password Connect secrets', test_secrets)
+
+test_signer = executable('test_signer',
+  files('tests/test_signer.c'),
+  dependencies : [dep_metadesk],
+)
+test('signer abstraction', test_signer)
