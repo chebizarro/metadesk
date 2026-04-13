@@ -19,6 +19,7 @@
 #include "stream.h"
 #include "decode.h"
 #include "render.h"
+#include "ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@ static void signal_handler(int sig) {
 
 typedef struct {
     MdRenderer   *renderer;
+    MdOverlay    *overlay;
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
@@ -53,6 +55,12 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
                                       frame->width, frame->height);
         if (ret == 0)
             ctx->frames_displayed++;
+    }
+
+    /* Render overlay on top of the video frame */
+    if (ctx->overlay) {
+        md_overlay_new_frame(ctx->overlay);
+        /* Stats are updated from the main loop, overlay_render called there */
     }
 }
 
@@ -158,12 +166,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Create renderer (SDL2 window) */
+    /* Create renderer (SDL2 window) and overlay */
     ClientCtx ctx = { 0 };
     if (do_display) {
         ctx.renderer = md_renderer_create(1920, 1080, "metadesk");
         if (!ctx.renderer) {
             fprintf(stderr, "WARNING: SDL2 renderer unavailable, decode-only mode\n");
+        } else {
+            /* Create Dear ImGui overlay on top of the renderer */
+            ctx.overlay = md_overlay_create(
+                md_renderer_get_sdl_window(ctx.renderer),
+                md_renderer_get_sdl_renderer(ctx.renderer));
+            if (!ctx.overlay) {
+                fprintf(stderr, "WARNING: ImGui overlay unavailable\n");
+            }
         }
     }
 
@@ -240,6 +256,33 @@ int main(int argc, char **argv) {
 
         free(payload);
 
+        /* Update and render overlay */
+        if (ctx.overlay) {
+            MdStreamStats stream_stats;
+            md_stream_get_stats(stream, &stream_stats);
+
+            double avg_decode_ms = ctx.frames_decoded > 0
+                ? (double)ctx.total_decode_us / ctx.frames_decoded / 1000.0
+                : 0.0;
+
+            MdOverlayStats overlay_stats = {
+                .latency_ms   = (float)(avg_decode_ms + stream_stats.avg_rtt_ms),
+                .encode_ms    = 0.0f,  /* TODO: receive from host stats */
+                .decode_ms    = (float)avg_decode_ms,
+                .rtt_ms       = (float)stream_stats.avg_rtt_ms,
+                .connected    = md_stream_is_connected(stream),
+                .fps          = ctx.frames_decoded > 0
+                    ? (int)(ctx.frames_decoded * 1000.0 /
+                            (md_stream_now_ms() - last_stats_ms + 1)) : 0,
+                .bitrate_mbps = stream_stats.bytes_recv > 0
+                    ? (float)(stream_stats.bytes_recv * 8.0 / 1000000.0) : 0.0f,
+                .encoder_name = NULL,
+            };
+
+            md_overlay_new_frame(ctx.overlay);
+            md_overlay_render(ctx.overlay, &overlay_stats);
+        }
+
         /* Print stats every 5 seconds */
         uint32_t now = md_stream_now_ms();
         if (now - last_stats_ms >= 5000) {
@@ -268,6 +311,8 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
+    if (ctx.overlay)
+        md_overlay_destroy(ctx.overlay);
     if (ctx.renderer)
         md_renderer_destroy(ctx.renderer);
 
