@@ -88,6 +88,7 @@ elif host_os == 'darwin'
     '-framework', 'AppKit',
     '-framework', 'CoreMedia',
     '-framework', 'CoreVideo',
+    '-framework', 'ApplicationServices',
     language : ['c', 'cpp', 'objc'],
   )
 
