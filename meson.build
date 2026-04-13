@@ -9,6 +9,9 @@ project('metadesk', ['c', 'cpp'],
   meson_version : '>= 0.60.0',
 )
 
+# ── Platform detection ───────────────────────────────────────────────────────
+host_os = host_machine.system()  # 'linux', 'darwin', 'windows'
+
 # ── Options ──────────────────────────────────────────────────────────────────
 cmake = import('cmake')
 enable_nvenc   = get_option('nvenc')
@@ -18,26 +21,24 @@ enable_nip46   = get_option('signer_nip46')
 enable_nip55l  = get_option('signer_nip55l')
 enable_nip5f   = get_option('signer_nip5f')
 
-# ── System dependencies (pkg-config) ────────────────────────────────────────
-dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
+# ── Cross-platform dependencies (pkg-config) ────────────────────────────────
 dep_avcodec   = dependency('libavcodec',      version : '>=60.0.0', required : true)
 dep_avutil    = dependency('libavutil',        version : '>=58.0.0', required : true)
-dep_atspi     = dependency('atspi-2',         version : '>=2.48')
-dep_udev      = dependency('libudev',         version : '>=252')
 dep_cjson     = dependency('libcjson',        version : '>=1.7.17')
 dep_b2        = dependency('libb2',           version : '>=0.98')
 
+# Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
+dep_yuv = dependency('libyuv', required : false)
+if not dep_yuv.found()
+  dep_yuv = meson.get_compiler('c').find_library('yuv', required : true)
+endif
+
 # ── nostrc: Nostr C library (github.com/chebizarro/nostrc) ──────────────────
-# Provides: libnostr (events, relays, keys), nip44, nip51, nip17.
-# nostrc links libwebsockets, libsecp256k1, and libsodium internally.
-# Look for installed pkg-config first, fall back to CMake subproject.
 dep_nostr = dependency('nostr', required : false)
 if not dep_nostr.found()
-  # Try cmake subproject
   nostrc_proj = cmake.subproject('nostrc', required : true)
   dep_nostr = nostrc_proj.dependency('nostr')
 endif
-# NIP modules — try pkg-config, fall back to find_library
 dep_nip44 = dependency('nostr-nip44', required : false)
 if not dep_nip44.found()
   dep_nip44 = meson.get_compiler('c').find_library('nostr-nip44', required : true)
@@ -51,23 +52,89 @@ if not dep_nip17.found()
   dep_nip17 = meson.get_compiler('c').find_library('nostr-nip17', required : true)
 endif
 
-# Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
-dep_yuv = dependency('libyuv', required : false)
-if not dep_yuv.found()
-  dep_yuv = meson.get_compiler('c').find_library('yuv', required : true)
+# ── Platform HAL backend selection (spec §5.3) ──────────────────────────────
+# Each platform provides: capture, a11y, and input backend source files + deps.
+
+platform_hal_sources = []
+platform_hal_deps = []
+
+if host_os == 'linux'
+  dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
+  dep_atspi     = dependency('atspi-2',         version : '>=2.48')
+  dep_udev      = dependency('libudev',         version : '>=252')
+
+  platform_hal_sources += files(
+    'src/core/capture_pipewire.c',
+    'src/core/a11y_atspi.c',
+    'src/core/input_uinput.c',
+  )
+  platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev]
+
+elif host_os == 'darwin'
+  add_languages('objc', required : true)
+
+  platform_hal_sources += files(
+    'src/core/capture_screencapturekit.m',
+    'src/core/a11y_axui.m',
+    'src/core/input_cgevent.m',
+  )
+  # macOS uses system frameworks — link via add_project_link_arguments
+  add_project_link_arguments(
+    '-framework', 'ScreenCaptureKit',
+    '-framework', 'CoreGraphics',
+    '-framework', 'AppKit',
+    '-framework', 'CoreMedia',
+    '-framework', 'CoreVideo',
+    language : ['c', 'cpp', 'objc'],
+  )
+
+elif host_os == 'windows'
+  platform_hal_sources += files(
+    'src/core/capture_dxgi.cpp',
+    'src/core/a11y_uia.cpp',
+    'src/core/input_sendinput.cpp',
+  )
+  # Windows system libraries
+  cc = meson.get_compiler('c')
+  platform_hal_deps += [
+    cc.find_library('d3d11', required : true),
+    cc.find_library('dxgi', required : true),
+    cc.find_library('user32', required : true),
+    cc.find_library('ole32', required : true),
+    cc.find_library('oleaut32', required : true),
+  ]
+
+else
+  error('Unsupported platform: ' + host_os)
 endif
 
-# Client-only deps
+# ── Client-only deps ────────────────────────────────────────────────────────
 if enable_client
   dep_sdl2 = dependency('sdl2', version : '>=2.28')
 endif
 
-# fips-nat deps
+# ── fips-nat deps ───────────────────────────────────────────────────────────
 if enable_fipsnat
   dep_nice = dependency('nice', version : '>=0.1.21')
 endif
 
-# Signer backend deps + compile flags
+# ── Core include path ───────────────────────────────────────────────────────
+core_inc = include_directories('src/core')
+
+# ── Core dependencies (assembled before signer blocks can append) ───────────
+core_deps = [
+  dep_avcodec,
+  dep_avutil,
+  dep_yuv,
+  dep_nostr,
+  dep_nip44,
+  dep_nip51,
+  dep_nip17,
+  dep_cjson,
+  dep_b2,
+] + platform_hal_deps
+
+# ── Signer backend deps + compile flags ─────────────────────────────────────
 signer_c_args = []
 if enable_nip46
   dep_nip46 = dependency('nostr-nip46', required : false)
@@ -96,7 +163,6 @@ if enable_nip5f
 endif
 
 # ── Vendored subprojects ────────────────────────────────────────────────────
-# Dear ImGui — vendored header-only, built as a static convenience library
 if enable_client
   imgui_inc = include_directories('subprojects/imgui')
   imgui_sources = files(
@@ -119,23 +185,18 @@ if enable_client
   )
 endif
 
-# ── Core include path ───────────────────────────────────────────────────────
-core_inc = include_directories('src/core')
-
 # ── libmetadesk (shared core library) ───────────────────────────────────────
+# Platform-agnostic sources (compiled on all platforms)
 core_sources = files(
   'src/core/agent.c',
   'src/core/action.c',
   'src/core/fips_addr.c',
   'src/core/signer.c',
   'src/core/capture.c',
-  'src/core/capture_pipewire.c',
   'src/core/encode.c',
   'src/core/decode.c',
   'src/core/a11y.c',
-  'src/core/a11y_atspi.c',
   'src/core/input.c',
-  'src/core/input_uinput.c',
   'src/core/session.c',
   'src/core/nostr.c',
   'src/core/packet.c',
@@ -143,20 +204,8 @@ core_sources = files(
   'src/core/secrets.c',
 )
 
-core_deps = [
-  dep_pipewire,
-  dep_avcodec,
-  dep_avutil,
-  dep_yuv,
-  dep_nostr,
-  dep_nip44,
-  dep_nip51,
-  dep_nip17,
-  dep_atspi,
-  dep_udev,
-  dep_cjson,
-  dep_b2,
-]
+# Append platform HAL backend sources
+core_sources += platform_hal_sources
 
 libmetadesk = shared_library('metadesk', core_sources,
   include_directories : core_inc,
@@ -219,7 +268,7 @@ test_atspi = executable('test_atspi',
   files('tests/test_atspi.c'),
   dependencies : [dep_metadesk],
 )
-test('atspi tree serialisation', test_atspi)
+test('a11y tree serialisation', test_atspi)
 
 test_nostr = executable('test_nostr',
   files('tests/test_nostr.c'),
@@ -243,7 +292,7 @@ test_input = executable('test_input',
   files('tests/test_input.c'),
   dependencies : [dep_metadesk],
 )
-test('uinput injection', test_input)
+test('input injection', test_input)
 
 test_agent = executable('test_agent',
   files('tests/test_agent.c'),
@@ -311,7 +360,6 @@ if enable_nip55l
 endif
 
 if enable_nip46
-  # NIP-46 test needs nip04 for transport encryption (mock relay)
   dep_nip04_test = dependency('nostr-nip04', required : false)
   if not dep_nip04_test.found()
     dep_nip04_test = meson.get_compiler('c').find_library('nip04', required : true)
