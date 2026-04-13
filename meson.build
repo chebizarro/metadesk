@@ -239,3 +239,9 @@ test_fips_addr = executable('test_fips_addr',
   dependencies : [dep_metadesk],
 )
 test('FIPS address derivation', test_fips_addr)
+
+test_secrets = executable('test_secrets',
+  files('tests/test_secrets.c'),
+  dependencies : [dep_metadesk],
+)
+test('1Password Connect secrets', test_secrets)
