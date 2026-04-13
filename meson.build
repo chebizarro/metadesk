@@ -188,9 +188,21 @@ test_nostr = executable('test_nostr',
 )
 test('nostr NIP-44', test_nostr)
 
+test_encode = executable('test_encode',
+  files('tests/test_encode.c'),
+  dependencies : [dep_metadesk],
+)
+test('encode/decode round-trip', test_encode)
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 capture_frame = executable('capture_frame',
   files('tools/capture_frame.c'),
+  dependencies : [dep_metadesk],
+  install : false,
+)
+
+encode_roundtrip = executable('encode_roundtrip',
+  files('tools/encode_roundtrip.c'),
   dependencies : [dep_metadesk],
   install : false,
 )
