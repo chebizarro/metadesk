@@ -201,6 +201,12 @@ test_stream = executable('test_stream',
 )
 test('TCP stream transport', test_stream)
 
+test_input = executable('test_input',
+  files('tests/test_input.c'),
+  dependencies : [dep_metadesk],
+)
+test('uinput injection', test_input)
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 capture_frame = executable('capture_frame',
   files('tools/capture_frame.c'),
