@@ -18,6 +18,7 @@
 #define MD_STREAM_H
 
 #include "packet.h"
+#include "fips_addr.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -104,6 +105,20 @@ bool md_stream_is_connected(const MdStream *s);
 
 /* Close and destroy a stream. */
 void md_stream_destroy(MdStream *s);
+
+/* ── FIPS-aware connect ───────────────────────────────────────── */
+
+/* Connect to a host via FIPS mesh.
+ * npub: Nostr public key (bech32, e.g. "npub1abc...")
+ *
+ * Resolution order:
+ *   1. DNS lookup "npub1xxx.fips" (primes FIPS identity cache)
+ *   2. Fall back to direct fd00::/8 address computation
+ *   3. TCP connect to the resolved IPv6 via fips0 TUN
+ *
+ * Returns a connected MdStream, or NULL on failure. */
+MdStream *md_stream_connect_fips(const char *npub, uint16_t port,
+                                 uint32_t timeout_ms);
 
 /* ── Timestamp utility ───────────────────────────────────────── */
 

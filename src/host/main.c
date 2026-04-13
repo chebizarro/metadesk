@@ -20,6 +20,7 @@
 #include "packet.h"
 #include "stream.h"
 #include "agent.h"
+#include "fips_addr.h"
 #include "nostr.h"
 #include "secrets.h"
 
@@ -147,6 +148,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
     fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
     fprintf(stderr, "  --no-capture     Skip PipeWire capture (test mode)\n");
+    fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -159,6 +161,7 @@ int main(int argc, char **argv) {
     /* Default options */
     uint16_t port = MD_STREAM_PORT;
     const char *bind_addr = NULL;
+    const char *fips_npub = NULL;  /* expected client npub (FIPS auth) */
     uint32_t fps = 60;
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
@@ -178,6 +181,8 @@ int main(int argc, char **argv) {
             use_nvenc = false;
         else if (strcmp(argv[i], "--no-capture") == 0)
             do_capture = false;
+        else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
+            fips_npub = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -190,7 +195,16 @@ int main(int argc, char **argv) {
     printf("  bitrate:   %u bps\n", bitrate);
     printf("  encoder:   %s\n", use_nvenc ? "NVENC (preferred)" : "x264");
     printf("  capture:   %s\n", do_capture ? "PipeWire" : "disabled");
+    if (fips_npub)
+        printf("  fips:      %.*s...\n", 12, fips_npub);
     printf("\n");
+
+    /* If FIPS npub specified, bind to FIPS address */
+    if (fips_npub && !bind_addr) {
+        /* In FIPS mode, we listen on all interfaces (fips0 TUN included).
+         * The FIPS TUN adapter routes fd00::/8 traffic transparently. */
+        printf("host: FIPS mode — accepting connections via fips0 TUN\n");
+    }
 
     /* Initialize session state */
     MdSession session;

@@ -95,6 +95,7 @@ core_inc = include_directories('src/core')
 core_sources = files(
   'src/core/agent.c',
   'src/core/action.c',
+  'src/core/fips_addr.c',
   'src/core/capture.c',
   'src/core/encode.c',
   'src/core/decode.c',
@@ -232,3 +233,9 @@ atspi_dump = executable('atspi_dump',
   dependencies : [dep_metadesk],
   install : false,
 )
+
+test_fips_addr = executable('test_fips_addr',
+  files('tests/test_fips_addr.c'),
+  dependencies : [dep_metadesk],
+)
+test('FIPS address derivation', test_fips_addr)

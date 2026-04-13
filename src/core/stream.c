@@ -278,6 +278,29 @@ MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms
     return stream_from_fd(fd);
 }
 
+/* ── FIPS-aware connect ──────────────────────────────────────── */
+
+MdStream *md_stream_connect_fips(const char *npub, uint16_t port,
+                                 uint32_t timeout_ms) {
+    if (!npub || !md_fips_is_npub(npub))
+        return NULL;
+
+    /* Resolve npub → fd00::/8 IPv6 address.
+     * md_fips_resolve tries DNS first (primes identity cache),
+     * then falls back to direct computation. */
+    char ipv6_str[MD_FIPS_IPV6_STRLEN];
+    if (md_fips_resolve(npub, ipv6_str, sizeof(ipv6_str)) < 0) {
+        fprintf(stderr, "stream: failed to resolve FIPS address for npub\n");
+        return NULL;
+    }
+
+    fprintf(stderr, "stream: FIPS resolved %.*s... → %s\n",
+            12, npub, ipv6_str);
+
+    /* Connect using the resolved IPv6 address */
+    return md_stream_connect(ipv6_str, port, timeout_ms);
+}
+
 /* ── Stream I/O ──────────────────────────────────────────────── */
 
 int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,

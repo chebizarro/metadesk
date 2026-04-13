@@ -13,6 +13,7 @@
  *      d. Handle ping/pong keepalive
  *   5. Clean shutdown on SIGINT/SIGTERM or window close
  */
+#include "fips_addr.h"
 #include "session.h"
 #include "packet.h"
 #include "stream.h"
@@ -58,11 +59,12 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s HOST [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "Usage: %s HOST|--npub NPUB [OPTIONS]\n\n", argv0);
     fprintf(stderr, "Connect to a metadesk host and display remote desktop.\n\n");
     fprintf(stderr, "Arguments:\n");
     fprintf(stderr, "  HOST               Host address (IP or hostname)\n\n");
     fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --npub NPUB        Connect via FIPS mesh (npub1xxx)\n");
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
     fprintf(stderr, "  --timeout MS       Connect timeout (default: 5000)\n");
@@ -85,6 +87,7 @@ int main(int argc, char **argv) {
 
     /* Default options */
     const char *host = NULL;
+    const char *npub = NULL;
     uint16_t port = MD_STREAM_PORT;
     bool do_display = true;
     uint32_t timeout_ms = 5000;
@@ -97,6 +100,8 @@ int main(int argc, char **argv) {
             do_display = false;
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             timeout_ms = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
+            npub = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -105,14 +110,18 @@ int main(int argc, char **argv) {
             host = argv[i];
     }
 
-    if (!host) {
-        fprintf(stderr, "ERROR: host address required\n\n");
+    if (!host && !npub) {
+        fprintf(stderr, "ERROR: host address or --npub required\n\n");
         usage(argv[0]);
         return 1;
     }
 
     printf("metadesk-client v0.1.0\n");
-    printf("  host:      %s:%u\n", host, port);
+    if (npub) {
+        printf("  fips:      %.*s...\n", 12, npub);
+    } else {
+        printf("  host:      %s:%u\n", host, port);
+    }
     printf("  display:   %s\n", do_display ? "SDL2" : "disabled");
     printf("  timeout:   %u ms\n", timeout_ms);
     printf("\n");
@@ -122,11 +131,22 @@ int main(int argc, char **argv) {
     md_session_init(&session);
 
     /* Connect to host */
-    printf("client: connecting to %s:%u...\n", host, port);
-    MdStream *stream = md_stream_connect(host, port, timeout_ms);
-    if (!stream) {
-        fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
-        return 1;
+    MdStream *stream = NULL;
+    if (npub) {
+        /* FIPS mesh connect: resolve npub → fd00::/8 → TCP */
+        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
+        stream = md_stream_connect_fips(npub, port, timeout_ms);
+        if (!stream) {
+            fprintf(stderr, "ERROR: FIPS connect failed for %.*s...\n", 12, npub);
+            return 1;
+        }
+    } else {
+        printf("client: connecting to %s:%u...\n", host, port);
+        stream = md_stream_connect(host, port, timeout_ms);
+        if (!stream) {
+            fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
+            return 1;
+        }
     }
     printf("client: connected\n");
 
