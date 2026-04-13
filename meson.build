@@ -79,6 +79,9 @@ elif host_os == 'darwin'
     'src/core/input_cgevent.m',
   )
   # macOS uses system frameworks — link via add_project_link_arguments
+  # ObjC files use ARC for correct memory management of SCK/Foundation objects
+  add_project_arguments('-fobjc-arc', language : 'objc')
+
   add_project_link_arguments(
     '-framework', 'ScreenCaptureKit',
     '-framework', 'CoreGraphics',
