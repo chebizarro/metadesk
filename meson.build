@@ -102,6 +102,7 @@ core_sources = files(
   'src/core/session.c',
   'src/core/nostr.c',
   'src/core/packet.c',
+  'src/core/stream.c',
   'src/core/secrets.c',
 )
 
@@ -193,6 +194,12 @@ test_encode = executable('test_encode',
   dependencies : [dep_metadesk],
 )
 test('encode/decode round-trip', test_encode)
+
+test_stream = executable('test_stream',
+  files('tests/test_stream.c'),
+  dependencies : [dep_metadesk],
+)
+test('TCP stream transport', test_stream)
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 capture_frame = executable('capture_frame',

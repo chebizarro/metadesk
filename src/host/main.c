@@ -1,6 +1,16 @@
 /*
  * metadesk-host — main entry point.
- * Screen capture, encoding, AT-SPI2 tree, session management.
+ * Capture → encode → stream pipeline over TCP.
+ *
+ * Phase 1 flow:
+ *   1. Start TCP server on port 7700
+ *   2. Wait for client connection
+ *   3. Initialize PipeWire capture and NVENC encoder
+ *   4. For each captured frame:
+ *      a. Encode to H.264 via FFmpeg
+ *      b. Send encoded packet over TCP with MdPacketHeader framing
+ *   5. Handle ping/pong keepalive
+ *   6. Clean shutdown on SIGINT/SIGTERM
  */
 #include "capture.h"
 #include "encode.h"
@@ -8,12 +18,17 @@
 #include "input.h"
 #include "session.h"
 #include "packet.h"
+#include "stream.h"
 #include "nostr.h"
 #include "secrets.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#include <poll.h>
 
 static volatile int g_running = 1;
 
@@ -22,35 +37,292 @@ static void signal_handler(int sig) {
     g_running = 0;
 }
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+/* ── State shared between capture callback and main loop ─────── */
 
+typedef struct {
+    MdEncoder    *encoder;
+    MdStream     *client;
+    uint32_t      frame_seq;
+    uint32_t      pkt_seq;
+    int64_t       total_encode_us;
+    uint32_t      frames_encoded;
+    uint32_t      frames_sent;
+} HostCtx;
+
+/* ── Encode callback: send encoded packet to client ──────────── */
+
+static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
+    HostCtx *ctx = userdata;
+    if (!ctx->client || !md_stream_is_connected(ctx->client))
+        return;
+
+    int ret = md_stream_send(ctx->client, MD_PKT_VIDEO_FRAME,
+                             ctx->pkt_seq++,
+                             pkt->data, (uint32_t)pkt->size);
+    if (ret == 0)
+        ctx->frames_sent++;
+}
+
+/* ── Capture callback: encode each frame ─────────────────────── */
+
+static void on_frame(const MdFrame *frame, void *userdata) {
+    HostCtx *ctx = userdata;
+    if (!ctx->encoder || !ctx->client)
+        return;
+
+    /* Map PipeWire SPA format to our pixel format enum */
+    MdPixFmt fmt;
+    switch (frame->format) {
+    /* SPA_VIDEO_FORMAT_BGRx = 16, BGRA = 20, RGBx = 15, RGBA = 4 (approx) */
+    default: fmt = MD_PIX_FMT_BGRX; break;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t start_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+    int ret = md_encoder_submit(ctx->encoder, frame->data,
+                                frame->stride, fmt,
+                                (int64_t)frame->seq,
+                                on_encoded, ctx);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t elapsed_us = (ts.tv_sec * 1000000LL + ts.tv_nsec / 1000) - start_us;
+
+    if (ret == 0) {
+        ctx->total_encode_us += elapsed_us;
+        ctx->frames_encoded++;
+    }
+
+    ctx->frame_seq++;
+}
+
+/* ── Handle incoming packets from client ─────────────────────── */
+
+static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
+                                 const uint8_t *payload) {
+    switch (hdr->type) {
+    case MD_PKT_PING:
+        /* Reply with pong */
+        md_stream_send(ctx->client, MD_PKT_PONG, ctx->pkt_seq++, NULL, 0);
+        break;
+
+    case MD_PKT_PONG:
+        md_stream_handle_pong(ctx->client, hdr);
+        break;
+
+    case MD_PKT_ACTION:
+        /* TODO: parse action JSON and inject via uinput (M1.5/M1.7) */
+        fprintf(stderr, "host: received action (%u bytes)\n", hdr->payload_len);
+        break;
+
+    case MD_PKT_SESSION_INFO:
+        fprintf(stderr, "host: received session info\n");
+        /* TODO: negotiate session (M2.1) */
+        /* Echo back as ack */
+        md_stream_send(ctx->client, MD_PKT_SESSION_INFO, ctx->pkt_seq++,
+                       payload, hdr->payload_len);
+        break;
+
+    default:
+        fprintf(stderr, "host: unknown packet type 0x%02x\n", hdr->type);
+        break;
+    }
+}
+
+/* ── Usage ───────────────────────────────────────────────────── */
+
+static void usage(const char *argv0) {
+    fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --port PORT      Listen port (default: %d)\n", MD_STREAM_PORT);
+    fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
+    fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
+    fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
+    fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
+    fprintf(stderr, "  --no-capture     Skip PipeWire capture (test mode)\n");
+    fprintf(stderr, "  -h, --help       Show this help\n");
+}
+
+/* ── Main ────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv) {
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("metadesk-host v0.1.0 starting...\n");
+    /* Default options */
+    uint16_t port = MD_STREAM_PORT;
+    const char *bind_addr = NULL;
+    uint32_t fps = 60;
+    uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
+    bool use_nvenc = true;
+    bool do_capture = true;
 
-    /* TODO: Initialize subsystems
-     * 1. Load config
-     * 2. Retrieve secrets from 1Password Connect
-     * 3. Initialize session state machine
-     * 4. Start PipeWire capture
-     * 5. Initialize encoder
-     * 6. Start AT-SPI2 tree walker
-     * 7. Listen on port 7700 for client connections
-     * 8. Main loop: capture → encode → send frames
-     */
+    /* Parse args */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
+            bind_addr = argv[++i];
+        else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
+            fps = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc)
+            bitrate = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--no-nvenc") == 0)
+            use_nvenc = false;
+        else if (strcmp(argv[i], "--no-capture") == 0)
+            do_capture = false;
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+    }
 
+    printf("metadesk-host v0.1.0\n");
+    printf("  port:      %u\n", port);
+    printf("  fps:       %u\n", fps);
+    printf("  bitrate:   %u bps\n", bitrate);
+    printf("  encoder:   %s\n", use_nvenc ? "NVENC (preferred)" : "x264");
+    printf("  capture:   %s\n", do_capture ? "PipeWire" : "disabled");
+    printf("\n");
+
+    /* Initialize session state */
     MdSession session;
     md_session_init(&session);
 
-    printf("metadesk-host: session initialized, waiting for connections on :7700\n");
+    /* Create TCP server */
+    MdStreamServer *srv = md_stream_server_create(bind_addr, port);
+    if (!srv) {
+        fprintf(stderr, "ERROR: failed to bind TCP server on port %u\n", port);
+        return 1;
+    }
+    printf("host: listening on port %u\n", port);
 
-    while (g_running) {
-        /* TODO: event loop (M1.3+) */
-        break; /* stub: exit immediately */
+    /* Wait for client connection */
+    printf("host: waiting for client...\n");
+    MdStream *client = NULL;
+    while (g_running && !client) {
+        client = md_stream_server_accept(srv, 1000);
+    }
+    if (!client || !g_running) {
+        md_stream_server_destroy(srv);
+        return g_running ? 1 : 0;
+    }
+    printf("host: client connected\n");
+
+    /* Initialize encoder */
+    /* Note: dimensions are set after first capture frame. For Phase 1,
+     * we use a default 1920x1080 and resize if needed. */
+    MdEncoderConfig enc_cfg = {
+        .width        = 1920,
+        .height       = 1080,
+        .bitrate      = bitrate,
+        .fps          = fps,
+        .prefer_nvenc = use_nvenc,
+    };
+
+    MdEncoder *encoder = md_encoder_create(&enc_cfg);
+    if (!encoder) {
+        fprintf(stderr, "ERROR: failed to create encoder\n");
+        md_stream_destroy(client);
+        md_stream_server_destroy(srv);
+        return 1;
+    }
+    printf("host: encoder ready (%s)\n",
+           md_encoder_is_hw(encoder) ? "NVENC" : "x264");
+
+    /* Set up host context */
+    HostCtx ctx = {
+        .encoder = encoder,
+        .client  = client,
+    };
+
+    /* Start PipeWire capture */
+    MdCapture *capture = NULL;
+    if (do_capture) {
+        MdCaptureConfig cap_cfg = {
+            .target_fps   = fps,
+            .prefer_dmabuf = false,  /* SHM for Phase 1 — DMA-BUF path in Phase 2 */
+            .show_cursor  = true,
+        };
+        capture = md_capture_create(&cap_cfg);
+        if (!capture) {
+            fprintf(stderr, "WARNING: PipeWire capture unavailable\n");
+        } else {
+            if (md_capture_start(capture, on_frame, &ctx) < 0) {
+                fprintf(stderr, "WARNING: failed to start capture\n");
+                md_capture_destroy(capture);
+                capture = NULL;
+            } else {
+                printf("host: PipeWire capture started\n");
+            }
+        }
     }
 
-    printf("metadesk-host shutting down.\n");
+    /* ── Main loop ───────────────────────────────────────────── */
+    printf("host: streaming... (Ctrl+C to stop)\n\n");
+
+    uint32_t last_stats_ms = md_stream_now_ms();
+    uint32_t last_ping_ms = last_stats_ms;
+
+    while (g_running && md_stream_is_connected(client)) {
+        /* Check for incoming packets from client (non-blocking) */
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
+
+        if (ret == 0) {
+            handle_client_packet(&ctx, &hdr, payload);
+            free(payload);
+        } else if (ret < 0) {
+            /* Connection lost */
+            break;
+        }
+        /* ret == 1: timeout, no data — continue */
+
+        uint32_t now = md_stream_now_ms();
+
+        /* Send periodic ping for RTT measurement */
+        if (now - last_ping_ms >= 1000) {
+            md_stream_send_ping(client);
+            last_ping_ms = now;
+        }
+
+        /* Print stats every 5 seconds */
+        if (now - last_stats_ms >= 5000) {
+            MdStreamStats stats;
+            md_stream_get_stats(client, &stats);
+
+            double avg_encode_ms = ctx.frames_encoded > 0
+                ? (double)ctx.total_encode_us / ctx.frames_encoded / 1000.0
+                : 0.0;
+
+            printf("host: frames=%u sent=%u encode_avg=%.1fms "
+                   "rtt=%ums rtt_avg=%ums tx=%.1fMB rx=%.1fKB\n",
+                   ctx.frames_encoded, ctx.frames_sent,
+                   avg_encode_ms,
+                   stats.last_rtt_ms, stats.avg_rtt_ms,
+                   (double)stats.bytes_sent / (1024.0 * 1024.0),
+                   (double)stats.bytes_recv / 1024.0);
+
+            last_stats_ms = now;
+        }
+    }
+
+    /* ── Shutdown ────────────────────────────────────────────── */
+    printf("\nhost: shutting down...\n");
+
+    if (capture) {
+        md_capture_stop(capture);
+        md_capture_destroy(capture);
+    }
+
+    md_encoder_flush(encoder, on_encoded, &ctx);
+    md_encoder_destroy(encoder);
+    md_stream_destroy(client);
+    md_stream_server_destroy(srv);
+
+    printf("host: done. sent %u frames in %u packets\n",
+           ctx.frames_encoded, ctx.frames_sent);
     return 0;
 }
