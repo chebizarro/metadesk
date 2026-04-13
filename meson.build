@@ -285,6 +285,19 @@ test_signer = executable('test_signer',
 )
 test('signer abstraction', test_signer)
 
+if enable_nip55l
+  dep_nip19_test = dependency('nostr-nip19', required : false)
+  if not dep_nip19_test.found()
+    dep_nip19_test = meson.get_compiler('c').find_library('nip19', required : true)
+  endif
+  test_signer_nip55l = executable('test_signer_nip55l',
+    files('tests/test_signer_nip55l.c'),
+    dependencies : [dep_metadesk, dep_nip55l, dep_nip19_test],
+    c_args : ['-DMD_SIGNER_ENABLE_NIP55L'],
+  )
+  test('NIP-55L signer integration', test_signer_nip55l)
+endif
+
 if enable_nip46
   # NIP-46 test needs nip04 for transport encryption (mock relay)
   dep_nip04_test = dependency('nostr-nip04', required : false)

@@ -22,12 +22,25 @@
 #include <nostr-event.h>
 #include <nostr-keys.h>
 #include <nostr/nip44/nip44.h>
+#include <json.h>
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <errno.h>
+
+/* ── Hex utilities ───────────────────────────────────────────── */
+
+static int hex_to_bin(const char *hex, uint8_t *out, size_t out_len) {
+    if (!hex || strlen(hex) != out_len * 2) return -1;
+    for (size_t i = 0; i < out_len; i++) {
+        unsigned int byte;
+        if (sscanf(hex + 2*i, "%2x", &byte) != 1) return -1;
+        out[i] = (uint8_t)byte;
+    }
+    return 0;
+}
 
 /* ══════════════════════════════════════════════════════════════
  * Direct-key backend
@@ -61,13 +74,19 @@ static int direct_sign_event(MdSigner *s, const char *event_json,
     DirectKeyState *dk = s->backend;
 
     /* Parse JSON into a NostrEvent */
-    NostrEvent *ev = nostr_event_from_json(event_json);
-    if (!ev)
+    NostrEvent *ev = nostr_event_new();
+    if (!ev) return MD_SIGNER_ERR_INTERNAL;
+
+    if (nostr_event_deserialize(ev, event_json) != 0) {
+        nostr_event_free(ev);
         return MD_SIGNER_ERR_INVALID;
+    }
 
     /* Ensure pubkey is set */
-    if (!nostr_event_get_pubkey(ev) || strlen(nostr_event_get_pubkey(ev)) == 0)
-        nostr_event_set_pubkey(ev, dk->pk_hex);
+    if (!ev->pubkey || strlen(ev->pubkey) == 0) {
+        free(ev->pubkey);
+        ev->pubkey = strdup(dk->pk_hex);
+    }
 
     /* Sign the event (computes id and sig) */
     int ret = nostr_event_sign(ev, dk->sk_hex);
@@ -77,7 +96,7 @@ static int direct_sign_event(MdSigner *s, const char *event_json,
     }
 
     /* Serialize back to JSON */
-    char *json = nostr_event_to_json(ev);
+    char *json = nostr_event_serialize(ev);
     nostr_event_free(ev);
 
     if (!json)
@@ -94,9 +113,17 @@ static int direct_nip44_encrypt(MdSigner *s, const char *peer_pubkey_hex,
 
     DirectKeyState *dk = s->backend;
 
+    /* Convert hex keys to binary for NIP-44 v2 API */
+    uint8_t sk[32], pk[32];
+    if (hex_to_bin(dk->sk_hex, sk, 32) != 0 ||
+        hex_to_bin(peer_pubkey_hex, pk, 32) != 0)
+        return MD_SIGNER_ERR_INVALID;
+
     char *cipher = NULL;
-    int ret = nostr_nip44_encrypt(dk->sk_hex, peer_pubkey_hex,
-                                  plaintext, &cipher);
+    int ret = nostr_nip44_encrypt_v2(sk, pk,
+                                     (const uint8_t *)plaintext,
+                                     strlen(plaintext), &cipher);
+    memset(sk, 0, sizeof(sk));
     if (ret != 0 || !cipher)
         return MD_SIGNER_ERR_CRYPTO;
 
@@ -111,11 +138,25 @@ static int direct_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
 
     DirectKeyState *dk = s->backend;
 
-    char *plain = NULL;
-    int ret = nostr_nip44_decrypt(dk->sk_hex, peer_pubkey_hex,
-                                  ciphertext, &plain);
-    if (ret != 0 || !plain)
+    /* Convert hex keys to binary for NIP-44 v2 API */
+    uint8_t sk[32], pk[32];
+    if (hex_to_bin(dk->sk_hex, sk, 32) != 0 ||
+        hex_to_bin(peer_pubkey_hex, pk, 32) != 0)
+        return MD_SIGNER_ERR_INVALID;
+
+    uint8_t *pt = NULL;
+    size_t pt_len = 0;
+    int ret = nostr_nip44_decrypt_v2(sk, pk, ciphertext, &pt, &pt_len);
+    memset(sk, 0, sizeof(sk));
+    if (ret != 0 || !pt)
         return MD_SIGNER_ERR_CRYPTO;
+
+    /* Convert to null-terminated string */
+    char *plain = malloc(pt_len + 1);
+    if (!plain) { free(pt); return MD_SIGNER_ERR_INTERNAL; }
+    memcpy(plain, pt, pt_len);
+    plain[pt_len] = '\0';
+    free(pt);
 
     *out_plaintext = plain;
     return MD_SIGNER_OK;
@@ -413,6 +454,27 @@ MdSigner *md_signer_create_nip46_from_session(
 
 #ifdef MD_SIGNER_ENABLE_NIP55L
 #include <nostr/nip55l/signer_ops.h>
+#include <nostr/nip19/nip19.h>
+#include <nostr-event.h>
+#include <json.h>
+
+/* Helper: convert npub (bech32) to 64-char hex string.
+ * Returns malloc'd hex on success, NULL on failure. */
+static char *npub_to_hex(const char *npub) {
+    if (!npub) return NULL;
+    uint8_t pk[32];
+    if (nostr_nip19_decode_npub(npub, pk) != 0)
+        return NULL;
+    static const char hexd[] = "0123456789abcdef";
+    char *hex = malloc(65);
+    if (!hex) return NULL;
+    for (int i = 0; i < 32; i++) {
+        hex[2*i]     = hexd[(pk[i] >> 4) & 0xF];
+        hex[2*i + 1] = hexd[pk[i] & 0xF];
+    }
+    hex[64] = '\0';
+    return hex;
+}
 
 static int nip55l_get_pubkey(MdSigner *s, char **out) {
     (void)s;
@@ -423,7 +485,12 @@ static int nip55l_get_pubkey(MdSigner *s, char **out) {
     if (ret != 0 || !npub)
         return MD_SIGNER_ERR_CONNECT;
 
-    *out = npub;
+    /* Convert npub bech32 → 64-char hex (MdSigner contract) */
+    char *hex = npub_to_hex(npub);
+    free(npub);
+    if (!hex) return MD_SIGNER_ERR_CRYPTO;
+
+    *out = hex;
     return MD_SIGNER_OK;
 }
 
@@ -433,12 +500,33 @@ static int nip55l_sign_event(MdSigner *s, const char *event_json,
     if (!event_json || !out_signed_json)
         return MD_SIGNER_ERR_INVALID;
 
-    char *signed_json = NULL;
-    int ret = nostr_nip55l_sign_event(event_json, "", "", &signed_json);
-    if (ret != 0 || !signed_json)
+    /* nostr_nip55l_sign_event returns only the signature string,
+     * not the full signed event JSON. Reconstruct the full event:
+     * deserialize → set sig from NIP-55L → re-serialize. */
+    char *sig = NULL;
+    int ret = nostr_nip55l_sign_event(event_json, "", "", &sig);
+    if (ret != 0 || !sig)
         return MD_SIGNER_ERR_CONNECT;
 
-    *out_signed_json = signed_json;
+    /* Deserialize the original event, stamp the signature, re-serialize */
+    NostrEvent *ev = nostr_event_new();
+    if (!ev) { free(sig); return MD_SIGNER_ERR_INTERNAL; }
+
+    if (nostr_event_deserialize(ev, event_json) != 0) {
+        nostr_event_free(ev);
+        free(sig);
+        return MD_SIGNER_ERR_INVALID;
+    }
+
+    /* Replace sig field */
+    free(ev->sig);
+    ev->sig = sig;  /* ownership transferred */
+
+    char *result = nostr_event_serialize(ev);
+    nostr_event_free(ev);
+    if (!result) return MD_SIGNER_ERR_INTERNAL;
+
+    *out_signed_json = result;
     return MD_SIGNER_OK;
 }
 
@@ -485,10 +573,18 @@ static const MdSignerOps nip55l_ops = {
 
 MdSigner *md_signer_create_nip55l(void) {
     /* Probe: try to get pubkey to verify daemon is running */
-    char *pk = NULL;
-    int ret = nostr_nip55l_get_public_key(&pk);
-    if (ret != 0 || !pk) {
+    char *npub = NULL;
+    int ret = nostr_nip55l_get_public_key(&npub);
+    if (ret != 0 || !npub) {
         fprintf(stderr, "signer: NIP-55L D-Bus signer not available\n");
+        return NULL;
+    }
+
+    /* Convert npub → hex for MdSigner contract */
+    char *pk = npub_to_hex(npub);
+    free(npub);
+    if (!pk) {
+        fprintf(stderr, "signer: NIP-55L npub decode failed\n");
         return NULL;
     }
 
