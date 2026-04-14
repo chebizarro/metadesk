@@ -18,14 +18,30 @@
  * Field fetch:  GET /v1/vaults/{id}/items/{id} → find field by label → return value
  */
 #include "secrets.h"
+#include "platform.h"
 
 #include <cjson/cJSON.h>
 
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+   typedef SOCKET sock_t;
+#  define SOCK_INVALID INVALID_SOCKET
+#  define sock_close(s) closesocket(s)
+#  define sock_read(s,b,n) recv((s),(b),(int)(n),0)
+#  define sock_write(s,b,n) send((s),(b),(int)(n),0)
+#else
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <netdb.h>
+#  include <unistd.h>
+   typedef int sock_t;
+#  define SOCK_INVALID (-1)
+#  define sock_close(s) close(s)
+#  define sock_read(s,b,n) read((s),(b),(n))
+#  define sock_write(s,b,n) write((s),(b),(n))
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -146,21 +162,27 @@ static char *http_get(MdSecrets *s, const char *path, size_t *body_len) {
     if (getaddrinfo(s->host, port_str, &hints, &res) != 0)
         return NULL;
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
+    sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd == SOCK_INVALID) {
         freeaddrinfo(res);
         return NULL;
     }
 
     /* Set socket timeout */
+#ifdef _WIN32
+    DWORD timeout_ms = MD_SECRETS_TIMEOUT_MS;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
     struct timeval tv;
     tv.tv_sec = MD_SECRETS_TIMEOUT_MS / 1000;
     tv.tv_usec = (MD_SECRETS_TIMEOUT_MS % 1000) * 1000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        close(fd);
+    if (connect(fd, res->ai_addr, (int)res->ai_addrlen) < 0) {
+        sock_close(fd);
         freeaddrinfo(res);
         return NULL;
     }
@@ -184,13 +206,13 @@ static char *http_get(MdSecrets *s, const char *path, size_t *body_len) {
     }
 
     /* Send request */
-    if (write(fd, request, (size_t)req_len) != req_len) {
-        close(fd);
+    if (sock_write(fd, request, (size_t)req_len) != req_len) {
+        sock_close(fd);
         return NULL;
     }
 
     /* Zero the request buffer (contained the token) */
-    memset(request, 0, sizeof(request));
+    md_secure_zero(request, sizeof(request));
 
     /* Read response */
     char *response = calloc(1, MD_SECRETS_MAX_RESPONSE + 1);
@@ -201,12 +223,12 @@ static char *http_get(MdSecrets *s, const char *path, size_t *body_len) {
 
     size_t total = 0;
     while (total < MD_SECRETS_MAX_RESPONSE) {
-        ssize_t n = read(fd, response + total,
-                         MD_SECRETS_MAX_RESPONSE - total);
+        int n = (int)sock_read(fd, response + total,
+                               MD_SECRETS_MAX_RESPONSE - total);
         if (n <= 0) break;
         total += (size_t)n;
     }
-    close(fd);
+    sock_close(fd);
 
     if (total == 0) {
         free(response);
@@ -319,8 +341,8 @@ static char *get_field_value(MdSecrets *s, const char *vault_id,
 
     cJSON *root = cJSON_Parse(body);
 
-    /* Zero the body — it contained the secret field values */
-    memset(body, 0, body_len);
+    /* Securely zero the body — it contained the secret field values */
+    md_secure_zero(body, body_len);
     free(body);
 
     if (!root) return NULL;
@@ -402,10 +424,9 @@ MdSecrets *md_secrets_create(const char *connect_url, const char *token) {
     memcpy(s->token, token, token_len);
     s->token_len = token_len;
 
-    /* mlock the token to prevent swapping (best-effort) */
-    if (mlock(s->token, sizeof(s->token)) < 0) {
-        fprintf(stderr, "secrets: WARNING — mlock failed: %s (secrets may swap)\n",
-                strerror(errno));
+    /* Lock the token in memory to prevent swapping (best-effort) */
+    if (md_mem_lock(s->token, sizeof(s->token)) < 0) {
+        fprintf(stderr, "secrets: WARNING — memory lock failed (secrets may swap)\n");
     }
 
     return s;
@@ -463,8 +484,8 @@ int md_secrets_get(MdSecrets *s, const char *item_ref,
         result = (int)value_len;
     }
 
-    /* Zero and free the value */
-    memset(value, 0, value_len);
+    /* Securely zero and free the value */
+    md_secure_zero(value, value_len);
     free(value);
 
 cleanup:
@@ -488,13 +509,13 @@ bool md_secrets_is_connected(MdSecrets *s) {
 void md_secrets_destroy(MdSecrets *s) {
     if (!s) return;
 
-    /* Zero sensitive data */
-    memset(s->token, 0, sizeof(s->token));
-    munlock(s->token, sizeof(s->token));
+    /* Securely zero sensitive data */
+    md_secure_zero(s->token, sizeof(s->token));
+    md_mem_unlock(s->token, sizeof(s->token));
 
     free(s->connect_url);
     free(s->host);
 
-    memset(s, 0, sizeof(MdSecrets));
+    md_secure_zero(s, sizeof(MdSecrets));
     free(s);
 }
