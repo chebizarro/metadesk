@@ -149,6 +149,14 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
 
         /* Tell FFmpeg we're okay with delay=0 output */
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    } else if (strcmp(codec_name, "h264_amf") == 0) {
+        /* AMF: spec §9 — AMD hardware encoder */
+        av_opt_set(ctx->priv_data, "usage",       "ultralowlatency", 0);
+        av_opt_set(ctx->priv_data, "quality",     "speed", 0);
+        av_opt_set(ctx->priv_data, "rc",          "cbr",  0);
+        av_opt_set_int(ctx->priv_data, "header_spacing", -1, 0); /* SPS/PPS with every IDR */
+
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "h264_videotoolbox") == 0) {
         /* VideoToolbox: spec §9.2 parameters */
         av_opt_set(ctx->priv_data, "realtime",    "true", 0);
@@ -204,9 +212,16 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
         }
     }
 
-    /* Try VideoToolbox on macOS (or any platform where it's available) */
+    /* Try VideoToolbox on macOS */
     if (!enc->ctx) {
         if (try_open_encoder(enc, "h264_videotoolbox") == 0) {
+            enc->is_hw = true;
+        }
+    }
+
+    /* Try AMF on Windows/AMD */
+    if (!enc->ctx) {
+        if (try_open_encoder(enc, "h264_amf") == 0) {
             enc->is_hw = true;
         }
     }
