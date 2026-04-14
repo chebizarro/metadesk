@@ -1,0 +1,35 @@
+# Build output
+build/
+builddir/
+
+# Meson subprojects (fetched at configure time)
+subprojects/*/
+subprojects/.wraplock
+subprojects/nostrc
+
+# Vendored source copied into build tree
+imgui_vendor/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Obsidian
+.obsidian/
+
+# Compiled objects / libs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Debug
+*.dSYM/
+
+# OS junk
+Thumbs.db
