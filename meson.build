@@ -30,12 +30,9 @@ dep_b2        = dependency('libb2',           version : '>=0.98')
 # Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
 dep_yuv = dependency('libyuv', required : false)
 if not dep_yuv.found()
-  _yuv_lib = meson.get_compiler('c').find_library('yuv', required : false)
-  if not _yuv_lib.found()
-    _yuv_lib = meson.get_compiler('c').find_library('yuv',
-      dirs : ['/opt/homebrew/lib', '/usr/local/lib'],
-      required : true)
-  endif
+  _yuv_lib = meson.get_compiler('c').find_library('yuv',
+    dirs : ['/opt/homebrew/lib', '/usr/local/lib'],
+    required : true)
   dep_yuv = declare_dependency(
     dependencies : _yuv_lib,
     include_directories : include_directories('/opt/homebrew/include'),
