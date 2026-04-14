@@ -26,6 +26,53 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <json.h>
+
+/* ── Hex ↔ bytes helpers (nostr keys are hex, NIP-44 wants uint8_t[32]) ── */
+static int hex_char_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_len) {
+    if (!hex) return -1;
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = hex_char_val(hex[2 * i]);
+        int lo = hex_char_val(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+/* Helper: parse JSON into a new NostrEvent (replaces old nostr_event_from_json) */
+static NostrEvent *event_from_json(const char *json) {
+    if (!json) return NULL;
+    NostrEvent *ev = nostr_event_new();
+    if (!ev) return NULL;
+    if (nostr_event_deserialize(ev, json) != 0) {
+        nostr_event_free(ev);
+        return NULL;
+    }
+    return ev;
+}
+
+/* Helper: publish an event to all relays in the pool */
+static int pool_publish_all(NostrSimplePool *pool, NostrEvent *ev) {
+    if (!pool || !ev) return -1;
+    int published = 0;
+    pthread_mutex_lock(&pool->pool_mutex);
+    for (size_t i = 0; i < pool->relay_count; i++) {
+        nostr_relay_publish(pool->relays[i], ev);
+        published++;
+    }
+    pthread_mutex_unlock(&pool->pool_mutex);
+    return published > 0 ? 0 : -1;
+}
 
 struct MdNostr {
     MdSigner          *signer;       /* signing backend                     */
@@ -78,7 +125,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
         if (ret != 0 || !seal_json) return;
 
         /* Step 2: Parse seal to get sender pubkey and encrypted content */
-        NostrEvent *seal = nostr_event_from_json(seal_json);
+        NostrEvent *seal = event_from_json(seal_json);
         free(seal_json);
         if (!seal) return;
 
@@ -97,7 +144,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
         if (ret != 0 || !rumor_json) return;
 
         /* Step 4: Parse rumor to get DM content */
-        NostrEvent *rumor = nostr_event_from_json(rumor_json);
+        NostrEvent *rumor = event_from_json(rumor_json);
         free(rumor_json);
         if (!rumor) return;
 
@@ -266,7 +313,7 @@ static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev) {
     if (!signer || !ev) return NULL;
 
     /* Serialize unsigned event to JSON */
-    char *unsigned_json = nostr_event_to_json(ev);
+    char *unsigned_json = nostr_event_serialize(ev);
     if (!unsigned_json) return NULL;
 
     /* Sign through the signer abstraction */
@@ -278,7 +325,7 @@ static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev) {
         return NULL;
 
     /* Parse signed JSON back to NostrEvent */
-    NostrEvent *signed_ev = nostr_event_from_json(signed_json);
+    NostrEvent *signed_ev = event_from_json(signed_json);
     free(signed_json);
 
     return signed_ev;
@@ -315,7 +362,7 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     nostr_event_set_created_at(rumor, (int64_t)time(NULL));
     /* Rumor is NOT signed per NIP-17 */
 
-    char *rumor_json = nostr_event_to_json(rumor);
+    char *rumor_json = nostr_event_serialize(rumor);
     nostr_event_free(rumor);
     if (!rumor_json) return -1;
 
@@ -342,7 +389,7 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     nostr_event_free(seal);
     if (!signed_seal) return -1;
 
-    char *seal_json = nostr_event_to_json(signed_seal);
+    char *seal_json = nostr_event_serialize(signed_seal);
     nostr_event_free(signed_seal);
     if (!seal_json) return -1;
 
@@ -359,9 +406,20 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     }
 
     /* Step 5: NIP-44 encrypt seal with ephemeral key → gift-wrap content */
+    uint8_t eph_sk_bytes[32], recip_pk_bytes[32];
+    if (hex_to_bytes(eph_sk, eph_sk_bytes, 32) != 0 ||
+        hex_to_bytes(recipient_pubkey_hex, recip_pk_bytes, 32) != 0) {
+        memset(eph_sk, 0, strlen(eph_sk));
+        free(eph_sk);
+        free(eph_pk);
+        free(seal_json);
+        return -1;
+    }
     char *encrypted_seal = NULL;
-    ret = nostr_nip44_encrypt(eph_sk, recipient_pubkey_hex,
-                              seal_json, &encrypted_seal);
+    ret = nostr_nip44_encrypt_v2(eph_sk_bytes, recip_pk_bytes,
+                                 (const uint8_t *)seal_json, strlen(seal_json),
+                                 &encrypted_seal);
+    memset(eph_sk_bytes, 0, sizeof(eph_sk_bytes));
     free(seal_json);
     if (ret != 0 || !encrypted_seal) {
         memset(eph_sk, 0, strlen(eph_sk));
@@ -395,7 +453,7 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     free(eph_pk);
 
     /* Step 7: Publish gift-wrap to all connected relays */
-    ret = nostr_simple_pool_publish(n->pool, gift_wrap);
+    ret = pool_publish_all(n->pool, gift_wrap);
     nostr_event_free(gift_wrap);
 
     return ret < 0 ? -1 : 0;

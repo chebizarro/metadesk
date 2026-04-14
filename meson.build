@@ -30,27 +30,57 @@ dep_b2        = dependency('libb2',           version : '>=0.98')
 # Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
 dep_yuv = dependency('libyuv', required : false)
 if not dep_yuv.found()
-  dep_yuv = meson.get_compiler('c').find_library('yuv', required : true)
+  _yuv_lib = meson.get_compiler('c').find_library('yuv', required : false)
+  if not _yuv_lib.found()
+    _yuv_lib = meson.get_compiler('c').find_library('yuv',
+      dirs : ['/opt/homebrew/lib', '/usr/local/lib'],
+      required : true)
+  endif
+  dep_yuv = declare_dependency(
+    dependencies : _yuv_lib,
+    include_directories : include_directories('/opt/homebrew/include'),
+  )
 endif
 
-# ── nostrc: Nostr C library (github.com/chebizarro/nostrc) ──────────────────
-dep_nostr = dependency('nostr', required : false)
-if not dep_nostr.found()
-  nostrc_proj = cmake.subproject('nostrc', required : true)
-  dep_nostr = nostrc_proj.dependency('nostr')
-endif
-dep_nip44 = dependency('nostr-nip44', required : false)
-if not dep_nip44.found()
-  dep_nip44 = meson.get_compiler('c').find_library('nostr-nip44', required : true)
-endif
-dep_nip51 = dependency('nostr-nip51', required : false)
-if not dep_nip51.found()
-  dep_nip51 = meson.get_compiler('c').find_library('nostr-nip51', required : true)
-endif
-dep_nip17 = dependency('nostr-nip17', required : false)
-if not dep_nip17.found()
-  dep_nip17 = meson.get_compiler('c').find_library('nostr-nip17', required : true)
-endif
+# ── nostrc: Nostr C library (installed from nostrc/_build) ──────────────────
+cc = meson.get_compiler('c')
+nostrc_inc = include_directories(
+  '/opt/homebrew/include/nostr',
+  '/Users/bizarro/Documents/Projects/nostrc/libgo/include',
+)
+dep_nostr_lib = cc.find_library('nostr', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_nostr = declare_dependency(
+  dependencies : dep_nostr_lib,
+  include_directories : nostrc_inc,
+)
+dep_nip44 = cc.find_library('nostr_nip44_core', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_nip51 = declare_dependency(
+  link_args : ['/Users/bizarro/Documents/Projects/nostrc/build/nips/nip51/CMakeFiles/nostr_nip51_core.dir/src/nip51.c.o'],
+)
+dep_nip17 = cc.find_library('nostr', required : false,
+  dirs : ['/opt/homebrew/lib'])
+
+# nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
+dep_libgo = declare_dependency(
+  link_args : [
+    '/Users/bizarro/Documents/Projects/nostrc/build/libgo/liblibgo.a',
+    '/Users/bizarro/Documents/Projects/nostrc/build/libgo/libgo_fiber.a',
+  ],
+)
+dep_secp256k1 = cc.find_library('secp256k1', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_websockets = cc.find_library('websockets', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_ssl = cc.find_library('ssl', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_crypto = cc.find_library('crypto', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_nsync = cc.find_library('nsync', required : true,
+  dirs : ['/opt/homebrew/lib'])
+dep_nostr_json = cc.find_library('nostr_json', required : true,
+  dirs : ['/opt/homebrew/lib'])
 
 # ── Platform HAL backend selection (spec §5.3) ──────────────────────────────
 # Each platform provides: capture, a11y, and input backend source files + deps.
@@ -139,6 +169,13 @@ core_deps = [
   dep_nip44,
   dep_nip51,
   dep_nip17,
+  dep_libgo,
+  dep_secp256k1,
+  dep_websockets,
+  dep_ssl,
+  dep_crypto,
+  dep_nsync,
+  dep_nostr_json,
   dep_cjson,
   dep_b2,
 ] + platform_hal_deps
@@ -173,15 +210,15 @@ endif
 
 # ── Vendored subprojects ────────────────────────────────────────────────────
 if enable_client
-  imgui_inc = include_directories('subprojects/imgui')
+  imgui_inc = include_directories('imgui_vendor')
   imgui_sources = files(
-    'subprojects/imgui/imgui.cpp',
-    'subprojects/imgui/imgui_demo.cpp',
-    'subprojects/imgui/imgui_draw.cpp',
-    'subprojects/imgui/imgui_tables.cpp',
-    'subprojects/imgui/imgui_widgets.cpp',
-    'subprojects/imgui/backends/imgui_impl_sdl2.cpp',
-    'subprojects/imgui/backends/imgui_impl_sdlrenderer2.cpp',
+    'imgui_vendor/imgui.cpp',
+    'imgui_vendor/imgui_demo.cpp',
+    'imgui_vendor/imgui_draw.cpp',
+    'imgui_vendor/imgui_tables.cpp',
+    'imgui_vendor/imgui_widgets.cpp',
+    'imgui_vendor/backends/imgui_impl_sdl2.cpp',
+    'imgui_vendor/backends/imgui_impl_sdlrenderer2.cpp',
   )
   imgui_lib = static_library('imgui', imgui_sources,
     include_directories : imgui_inc,

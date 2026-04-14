@@ -42,7 +42,7 @@ int md_renderer_poll_events(MdRenderer *r);
 int md_renderer_get_window_size(const MdRenderer *r, uint32_t *w, uint32_t *h);
 
 /* Get the SDL window and renderer handles (for ImGui integration).
- * Returns opaque pointers — caller casts to SDL_Window*/SDL_Renderer*.
+ * Returns opaque pointers — caller casts to SDL_Window* / SDL_Renderer*.
  * Returns NULL if renderer is not initialized. */
 void *md_renderer_get_sdl_window(MdRenderer *r);
 void *md_renderer_get_sdl_renderer(MdRenderer *r);

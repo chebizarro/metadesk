@@ -16,6 +16,11 @@
 #define MD_PLATFORM_H
 
 #include <stddef.h>
+
+/* Enable C11 Annex K (memset_s) where available */
+#ifndef __STDC_WANT_LIB_EXT1__
+#define __STDC_WANT_LIB_EXT1__ 1
+#endif
 #include <string.h>
 
 #ifdef _WIN32

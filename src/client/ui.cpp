@@ -147,8 +147,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
         /* Finalize and render */
         ImGui::Render();
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(),
-                                               o->renderer);
+        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
         return;
     }
 
@@ -240,8 +239,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
     /* Finalize and render */
     ImGui::Render();
-    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(),
-                                           o->renderer);
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
 }
 
 bool md_overlay_wants_input(const MdOverlay *o) {

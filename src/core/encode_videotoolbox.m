@@ -27,7 +27,7 @@
 #include <stdio.h>
 
 /* libyuv for colorspace conversion (BGRA/RGBA → NV12) */
-#include <libyuv/libyuv.h>
+#include <libyuv.h>
 
 /* ── Native VT encoder context ───────────────────────────────── */
 

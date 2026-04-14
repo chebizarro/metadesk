@@ -30,7 +30,7 @@ typedef enum {
 #define MD_MAX_KEYS 8
 
 /* Parsed action */
-typedef struct {
+typedef struct MdAction {
     MdActionType type;
     char         target_id[64]; /* empty for key_combo */
 

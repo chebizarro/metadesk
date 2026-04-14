@@ -9,6 +9,7 @@
  */
 #include "input.h"
 #include "action.h"
+#include "action.h"
 
 #include <stdlib.h>
 #include <string.h>
