@@ -77,6 +77,7 @@ elif host_os == 'darwin'
     'src/core/capture_screencapturekit.m',
     'src/core/a11y_axui.m',
     'src/core/input_cgevent.m',
+    'src/core/encode_videotoolbox.m',
   )
   # macOS uses system frameworks — link via add_project_link_arguments
   # ObjC files use ARC for correct memory management of SCK/Foundation objects
@@ -89,6 +90,7 @@ elif host_os == 'darwin'
     '-framework', 'CoreMedia',
     '-framework', 'CoreVideo',
     '-framework', 'ApplicationServices',
+    '-framework', 'VideoToolbox',
     language : ['c', 'cpp', 'objc'],
   )
 

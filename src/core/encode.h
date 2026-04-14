@@ -91,6 +91,26 @@ int md_encoder_get_size(const MdEncoder *enc, uint32_t *width, uint32_t *height)
 /* Destroy encoder and free resources. */
 void md_encoder_destroy(MdEncoder *enc);
 
+/* ── Native VideoToolbox encoder (macOS only) ────────────────── */
+/* These provide a direct VTCompressionSession path without FFmpeg.
+ * Use when FFmpeg is unavailable or for lowest-overhead encoding. */
+
+#ifdef __APPLE__
+
+typedef struct MdVTEncoder MdVTEncoder;
+
+MdVTEncoder *md_vt_encoder_create(const MdEncoderConfig *cfg);
+int md_vt_encoder_submit(MdVTEncoder *enc, const uint8_t *data,
+                         uint32_t stride, MdPixFmt input_fmt,
+                         int64_t pts,
+                         MdEncodeCallback cb, void *userdata);
+int md_vt_encoder_flush(MdVTEncoder *enc, MdEncodeCallback cb, void *userdata);
+bool md_vt_encoder_is_hw(const MdVTEncoder *enc);
+int md_vt_encoder_get_size(const MdVTEncoder *enc, uint32_t *width, uint32_t *height);
+void md_vt_encoder_destroy(MdVTEncoder *enc);
+
+#endif /* __APPLE__ */
+
 #ifdef __cplusplus
 }
 #endif

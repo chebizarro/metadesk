@@ -149,6 +149,13 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
 
         /* Tell FFmpeg we're okay with delay=0 output */
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    } else if (strcmp(codec_name, "h264_videotoolbox") == 0) {
+        /* VideoToolbox: spec §9.2 parameters */
+        av_opt_set(ctx->priv_data, "realtime",    "true", 0);
+        av_opt_set(ctx->priv_data, "allow_sw",    "0",    0);
+        av_opt_set(ctx->priv_data, "profile",     "high", 0);
+
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "libx264") == 0) {
         /* x264 software fallback: ultrafast + zerolatency */
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
@@ -189,13 +196,22 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
 
     enc->config = *cfg;
 
-    /* Try NVENC first if requested, fall back to x264 */
+    /* Try hardware encoders first, fall back to x264 software.
+     * Cascade: NVENC (Linux/Windows NVIDIA) → VideoToolbox (macOS) → x264 */
     if (cfg->prefer_nvenc) {
         if (try_open_encoder(enc, "h264_nvenc") == 0) {
             enc->is_hw = true;
         }
     }
 
+    /* Try VideoToolbox on macOS (or any platform where it's available) */
+    if (!enc->ctx) {
+        if (try_open_encoder(enc, "h264_videotoolbox") == 0) {
+            enc->is_hw = true;
+        }
+    }
+
+    /* Software fallback */
     if (!enc->ctx) {
         if (try_open_encoder(enc, "libx264") < 0) {
             free(enc);
