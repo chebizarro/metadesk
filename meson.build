@@ -67,6 +67,7 @@ if host_os == 'linux'
     'src/core/capture_pipewire.c',
     'src/core/a11y_atspi.c',
     'src/core/input_uinput.c',
+    'src/core/ipc_unix.c',
   )
   platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev]
 
@@ -78,6 +79,7 @@ elif host_os == 'darwin'
     'src/core/a11y_axui.m',
     'src/core/input_cgevent.m',
     'src/core/encode_videotoolbox.m',
+    'src/core/ipc_unix.c',
   )
   # macOS uses system frameworks — link via add_project_link_arguments
   # ObjC files use ARC for correct memory management of SCK/Foundation objects
@@ -99,6 +101,7 @@ elif host_os == 'windows'
     'src/core/capture_dxgi.cpp',
     'src/core/a11y_uia.cpp',
     'src/core/input_sendinput.cpp',
+    'src/core/ipc_win32.c',
   )
   # Windows system libraries
   cc = meson.get_compiler('c')
