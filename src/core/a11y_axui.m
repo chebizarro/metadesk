@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 /* Maximum tree depth to prevent infinite recursion */
 #define MD_AX_MAX_DEPTH 32
@@ -49,50 +50,8 @@ static char *make_node_id(AXUIState *st) {
     return strdup(buf);
 }
 
-/* Get a string attribute from an AXUIElement, or NULL. Caller frees. */
-static char *ax_get_string(AXUIElementRef elem, CFStringRef attr) {
-    CFTypeRef value = NULL;
-    AXError err = AXUIElementCopyAttributeValue(elem, attr, &value);
-    if (err != kAXErrorSuccess || !value)
-        return NULL;
 
-    if (CFGetTypeID(value) != CFStringGetTypeID()) {
-        CFRelease(value);
-        return NULL;
-    }
 
-    CFStringRef str = (CFStringRef)value;
-    CFIndex len = CFStringGetMaximumSizeForEncoding(
-        CFStringGetLength(str), kCFStringEncodingUTF8) + 1;
-    char *buf = malloc((size_t)len);
-    if (!buf) { CFRelease(value); return NULL; }
-
-    if (!CFStringGetCString(str, buf, len, kCFStringEncodingUTF8)) {
-        free(buf);
-        CFRelease(value);
-        return NULL;
-    }
-
-    CFRelease(value);
-    return buf;
-}
-
-/* Get a boolean attribute, returns -1 on error, 0 or 1 otherwise. */
-static int ax_get_bool(AXUIElementRef elem, CFStringRef attr) {
-    CFTypeRef value = NULL;
-    AXError err = AXUIElementCopyAttributeValue(elem, attr, &value);
-    if (err != kAXErrorSuccess || !value)
-        return -1;
-
-    if (CFGetTypeID(value) != CFBooleanGetTypeID()) {
-        CFRelease(value);
-        return -1;
-    }
-
-    int result = CFBooleanGetValue((CFBooleanRef)value) ? 1 : 0;
-    CFRelease(value);
-    return result;
-}
 
 /* Normalize AX role strings to platform-neutral names matching AT-SPI2 */
 static const char *normalize_role(const char *ax_role) {
@@ -135,91 +94,55 @@ static const char *normalize_role(const char *ax_role) {
     if (strcmp(ax_role, "AXOutlineRow") == 0)   return "tree item";
     if (strcmp(ax_role, "AXHeading") == 0)      return "heading";
 
-    /* Strip "AX" prefix for anything else */
-    if (strncmp(ax_role, "AX", 2) == 0 && ax_role[2] != '\0')
-        return ax_role + 2;
+    /* Fallback: strip "AX" prefix and lowercase for unrecognized roles.
+     * e.g. "AXSystemWide" → "systemwide", "AXBrowser" → "browser" */
+    if (strncmp(ax_role, "AX", 2) == 0 && ax_role[2] != '\0') {
+        static _Thread_local char fallback[128];
+        const char *src = ax_role + 2;
+        size_t i = 0;
+        for (; src[i] && i < sizeof(fallback) - 1; i++)
+            fallback[i] = (char)tolower((unsigned char)src[i]);
+        fallback[i] = '\0';
+        return fallback;
+    }
 
     return ax_role;
 }
 
-/* Extract states from AX attributes → state string array */
-static void extract_states(AXUIElementRef elem, MdA11yNode *node) {
-    /* Collect up to 8 states */
-    char *states[8];
-    int count = 0;
 
-    int val;
 
-    val = ax_get_bool(elem, kAXEnabledAttribute);
-    if (val == 1) states[count++] = strdup("enabled");
 
-    val = ax_get_bool(elem, kAXFocusedAttribute);
-    if (val == 1) states[count++] = strdup("focused");
-
-    /* Check if element is the frontmost/selected */
-    val = ax_get_bool(elem, kAXSelectedAttribute);
-    if (val == 1) states[count++] = strdup("selected");
-
-    /* Check for expanded state (disclosure triangles, menus, etc.) */
-    CFTypeRef expandedValue = NULL;
-    if (AXUIElementCopyAttributeValue(elem, CFSTR("AXExpanded"), &expandedValue)
-        == kAXErrorSuccess && expandedValue) {
-        if (CFGetTypeID(expandedValue) == CFBooleanGetTypeID()) {
-            states[count++] = strdup("expandable");
-            if (CFBooleanGetValue((CFBooleanRef)expandedValue))
-                states[count++] = strdup("expanded");
-        }
-        CFRelease(expandedValue);
-    }
-
-    /* Visibility: if element has a position and size, it's showing */
-    CFTypeRef posValue = NULL;
-    if (AXUIElementCopyAttributeValue(elem, kAXPositionAttribute, &posValue)
-        == kAXErrorSuccess && posValue) {
-        states[count++] = strdup("visible");
-        states[count++] = strdup("showing");
-        CFRelease(posValue);
-    }
-
-    if (count > 0) {
-        node->states = calloc((size_t)count, sizeof(char *));
-        if (node->states) {
-            memcpy(node->states, states, (size_t)count * sizeof(char *));
-            node->state_count = count;
-        } else {
-            for (int i = 0; i < count; i++) free(states[i]);
-        }
-    }
-}
-
-/* Extract bounding box from AXPosition + AXSize */
-static void extract_bounds(AXUIElementRef elem, MdA11yNode *node) {
-    CFTypeRef posValue = NULL, sizeValue = NULL;
-
-    AXError err = AXUIElementCopyAttributeValue(elem, kAXPositionAttribute, &posValue);
-    if (err != kAXErrorSuccess || !posValue) return;
-
-    err = AXUIElementCopyAttributeValue(elem, kAXSizeAttribute, &sizeValue);
-    if (err != kAXErrorSuccess || !sizeValue) {
-        CFRelease(posValue);
-        return;
-    }
-
-    CGPoint pos;
-    CGSize size;
-    if (AXValueGetValue(posValue, kAXValueCGPointType, &pos) &&
-        AXValueGetValue(sizeValue, kAXValueCGSizeType, &size)) {
-        node->x = (int)pos.x;
-        node->y = (int)pos.y;
-        node->w = (int)size.width;
-        node->h = (int)size.height;
-    }
-
-    CFRelease(posValue);
-    CFRelease(sizeValue);
-}
 
 /* ── Tree walking ────────────────────────────────────────────── */
+
+/* Batch-fetch multiple AX attributes in one IPC round-trip.
+ * Returns a CFArrayRef of attribute values (caller must CFRelease).
+ * Missing/errored attributes appear as kCFNull in the array. */
+static CFArrayRef ax_copy_multi(AXUIElementRef elem, CFArrayRef attrs) {
+    CFArrayRef values = NULL;
+    AXError err = AXUIElementCopyMultipleAttributeValues(elem, attrs,
+                      0 /* options */, &values);
+    if (err != kAXErrorSuccess) return NULL;
+    return values;
+}
+
+/* Extract a CFStringRef from a batch result array at index, or NULL. */
+static char *batch_get_string(CFArrayRef values, CFIndex idx) {
+    if (!values || idx >= CFArrayGetCount(values)) return NULL;
+    CFTypeRef val = CFArrayGetValueAtIndex(values, idx);
+    if (!val || val == kCFNull) return NULL;
+    if (CFGetTypeID(val) != CFStringGetTypeID()) return NULL;
+    CFStringRef str = (CFStringRef)val;
+    CFIndex len = CFStringGetMaximumSizeForEncoding(
+        CFStringGetLength(str), kCFStringEncodingUTF8) + 1;
+    char *buf = malloc((size_t)len);
+    if (!buf) return NULL;
+    if (!CFStringGetCString(str, buf, len, kCFStringEncodingUTF8)) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
 
 static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
     if (!elem || depth > MD_AX_MAX_DEPTH)
@@ -230,34 +153,110 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
 
     node->id = make_node_id(st);
 
+    /* Batch-request all scalar attributes in one IPC call.
+     * Indices: 0=Role, 1=Title, 2=Description, 3=Value,
+     *          4=Enabled, 5=Focused, 6=Selected, 7=Position, 8=Size */
+    CFStringRef attr_keys[] = {
+        kAXRoleAttribute,          /* 0 */
+        kAXTitleAttribute,         /* 1 */
+        kAXDescriptionAttribute,   /* 2 */
+        kAXValueAttribute,         /* 3 */
+        kAXEnabledAttribute,       /* 4 */
+        kAXFocusedAttribute,       /* 5 */
+        kAXSelectedAttribute,      /* 6 */
+        kAXPositionAttribute,      /* 7 */
+        kAXSizeAttribute,          /* 8 */
+    };
+    enum { AX_ROLE=0, AX_TITLE, AX_DESC, AX_VALUE,
+           AX_ENABLED, AX_FOCUSED, AX_SELECTED, AX_POS, AX_SIZE,
+           AX_ATTR_COUNT };
+    CFArrayRef attr_names = CFArrayCreate(NULL, (const void **)attr_keys,
+                                         AX_ATTR_COUNT,
+                                         &kCFTypeArrayCallBacks);
+    CFArrayRef vals = ax_copy_multi(elem, attr_names);
+    CFRelease(attr_names);
+
     /* Role */
-    char *raw_role = ax_get_string(elem, kAXRoleAttribute);
+    char *raw_role = vals ? batch_get_string(vals, AX_ROLE) : NULL;
     const char *normalized = normalize_role(raw_role);
     node->role = strdup(normalized);
     free(raw_role);
 
-    /* Label: try AXTitle first, fall back to AXDescription */
-    node->label = ax_get_string(elem, kAXTitleAttribute);
+    /* Label: try Title, then Description, then Value for text roles */
+    node->label = vals ? batch_get_string(vals, AX_TITLE) : NULL;
     if (!node->label || node->label[0] == '\0') {
         free(node->label);
-        node->label = ax_get_string(elem, kAXDescriptionAttribute);
+        node->label = vals ? batch_get_string(vals, AX_DESC) : NULL;
     }
-    /* Last resort: AXValue for text fields */
     if (!node->label || node->label[0] == '\0') {
-        char *role_str = ax_get_string(elem, kAXRoleAttribute);
-        if (role_str && (strcmp(role_str, "AXStaticText") == 0 ||
-                         strcmp(role_str, "AXTextField") == 0)) {
+        if (node->role && (strcmp(node->role, "label") == 0 ||
+                          strcmp(node->role, "text") == 0)) {
             free(node->label);
-            node->label = ax_get_string(elem, kAXValueAttribute);
+            node->label = vals ? batch_get_string(vals, AX_VALUE) : NULL;
         }
-        free(role_str);
     }
 
-    /* States */
-    extract_states(elem, node);
+    /* States — extract from batch results instead of per-attribute IPC */
+    {
+        char *states[8];
+        int scount = 0;
 
-    /* Bounds */
-    extract_bounds(elem, node);
+        if (vals) {
+            /* Enabled */
+            CFTypeRef v = CFArrayGetValueAtIndex(vals, AX_ENABLED);
+            if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
+                && CFBooleanGetValue((CFBooleanRef)v))
+                states[scount++] = strdup("enabled");
+
+            /* Focused */
+            v = CFArrayGetValueAtIndex(vals, AX_FOCUSED);
+            if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
+                && CFBooleanGetValue((CFBooleanRef)v))
+                states[scount++] = strdup("focused");
+
+            /* Selected */
+            v = CFArrayGetValueAtIndex(vals, AX_SELECTED);
+            if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
+                && CFBooleanGetValue((CFBooleanRef)v))
+                states[scount++] = strdup("selected");
+
+            /* Visible/showing if position exists */
+            v = CFArrayGetValueAtIndex(vals, AX_POS);
+            if (v && v != kCFNull) {
+                states[scount++] = strdup("visible");
+                states[scount++] = strdup("showing");
+            }
+        }
+
+        if (scount > 0) {
+            node->states = calloc((size_t)scount, sizeof(char *));
+            if (node->states) {
+                memcpy(node->states, states, (size_t)scount * sizeof(char *));
+                node->state_count = scount;
+            } else {
+                for (int i = 0; i < scount; i++) free(states[i]);
+            }
+        }
+    }
+
+    /* Bounds — extract from batch position/size */
+    if (vals) {
+        CFTypeRef posValue = CFArrayGetValueAtIndex(vals, AX_POS);
+        CFTypeRef sizeValue = CFArrayGetValueAtIndex(vals, AX_SIZE);
+        if (posValue && posValue != kCFNull && sizeValue && sizeValue != kCFNull) {
+            CGPoint pos;
+            CGSize size;
+            if (AXValueGetValue(posValue, kAXValueCGPointType, &pos) &&
+                AXValueGetValue(sizeValue, kAXValueCGSizeType, &size)) {
+                node->x = (int)pos.x;
+                node->y = (int)pos.y;
+                node->w = (int)size.width;
+                node->h = (int)size.height;
+            }
+        }
+    }
+
+    if (vals) CFRelease(vals);
 
     /* Children */
     CFTypeRef childrenRef = NULL;
