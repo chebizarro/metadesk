@@ -169,6 +169,22 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
         const char *content = nostr_event_get_content(ev);
         if (pubkey && content)
             n->cbs.on_transport(pubkey, content, n->cbs.transport_userdata);
+    } else if (kind == 30000) {
+        /* NIP-51 categorized people list — check if it's our allowlist.
+         * Parse public entries (no sk_hex for private entry decryption
+         * through the signer abstraction in Phase 2.1). */
+        NostrList *list = nostr_nip51_parse_list(ev, NULL);
+        if (list && list->identifier &&
+            strcmp(list->identifier, "metadesk-allowlist") == 0) {
+            /* Replace cached allowlist */
+            if (n->allowlist)
+                nostr_nip51_list_free(n->allowlist);
+            n->allowlist = list;
+            fprintf(stderr, "nostr: refreshed allowlist (%zu entries)\n",
+                    list->count);
+        } else {
+            nostr_nip51_list_free(list);
+        }
     }
 }
 
@@ -489,8 +505,43 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
 }
 
 int md_nostr_refresh_allowlist(MdNostr *n) {
-    if (!n) return -1;
-    /* TODO: Subscribe to kind:30000, authors:[our_pk], #d:["metadesk-allowlist"] */
+    if (!n || !n->pool || !n->pk_hex) return -1;
+
+    /* Subscribe to kind:30000, authors:[our_pk], #d:["metadesk-allowlist"] */
+    NostrFilter *f = nostr_filter_builder_build(
+        nostr_filter_builder_tag(
+            nostr_filter_builder_authors(
+                nostr_filter_builder_kinds(
+                    nostr_filter_builder_new(),
+                    30000, -1),
+                n->pk_hex, NULL),
+            "d", "metadesk-allowlist"));
+    if (!f) return -1;
+
+    NostrFilters *filters = nostr_filters_new();
+    if (!filters) { nostr_filter_free(f); return -1; }
+    nostr_filters_add(filters, f);
+    nostr_filter_free(f);
+
+    /* Collect relay URLs */
+    pthread_mutex_lock(&n->pool->pool_mutex);
+    size_t relay_count = n->pool->relay_count;
+    const char **urls = malloc(relay_count * sizeof(char *));
+    if (!urls) {
+        pthread_mutex_unlock(&n->pool->pool_mutex);
+        nostr_filters_free(filters);
+        return -1;
+    }
+    for (size_t i = 0; i < relay_count; i++)
+        urls[i] = n->pool->relays[i]->url;
+
+    nostr_simple_pool_subscribe(n->pool, urls, relay_count, *filters, true);
+    pthread_mutex_unlock(&n->pool->pool_mutex);
+
+    free(urls);
+    nostr_filters_free(filters);
+
+    fprintf(stderr, "nostr: subscribed to allowlist updates\n");
     return 0;
 }
 
