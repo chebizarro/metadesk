@@ -561,23 +561,51 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
     nostr_nip51_list_add_entry(n->allowlist, entry);
     nostr_nip51_list_set_identifier(n->allowlist, "metadesk-allowlist");
 
-    /* Build unsigned list event (kind:30000) */
+    /* Build list event (kind:30000) with entries as tags */
     NostrEvent *list_event = nostr_event_new();
     if (!list_event) return -1;
 
     nostr_event_set_kind(list_event, 30000);
     nostr_event_set_pubkey(list_event, n->pk_hex);
     nostr_event_set_created_at(list_event, (int64_t)time(NULL));
-    /* TODO: serialize allowlist entries as tags + set d-tag */
+
+    /* Serialize allowlist entries as NIP-51 tags:
+     *   ["d", "metadesk-allowlist"]  — addressable d-tag
+     *   ["p", "<pubkey>", "<caps>"]  — one per allowlist entry */
+    NostrTags *tags = nostr_tags_new(0);
+    if (!tags) { nostr_event_free(list_event); return -1; }
+
+    /* d-tag */
+    NostrTag *d_tag = nostr_tag_new("d", "metadesk-allowlist", NULL);
+    if (d_tag) nostr_tags_append(tags, d_tag);
+
+    /* Entry tags */
+    for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *e = n->allowlist->entries[i];
+        if (!e || !e->tag_name || !e->value) continue;
+        NostrTag *t = e->extra
+            ? nostr_tag_new(e->tag_name, e->value, e->extra, NULL)
+            : nostr_tag_new(e->tag_name, e->value, NULL);
+        if (t) nostr_tags_append(tags, t);
+    }
+
+    nostr_event_set_tags(list_event, tags); /* takes ownership */
 
     /* Sign via signer abstraction */
     NostrEvent *signed_event = sign_event_via_signer(n->signer, list_event);
     nostr_event_free(list_event);
     if (!signed_event) return -1;
 
-    /* TODO: publish to all relays via pool */
+    /* Publish to all connected relays */
+    int ret = pool_publish_all(n->pool, signed_event);
     nostr_event_free(signed_event);
-    return 0;
+
+    if (ret == 0) {
+        fprintf(stderr, "nostr: published allowlist (%zu entries)\n",
+                n->allowlist->count);
+    }
+
+    return ret;
 }
 
 int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
