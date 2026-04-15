@@ -21,6 +21,20 @@ extern "C" {
 /* Opaque renderer context */
 typedef struct MdRenderer MdRenderer;
 
+/* Input event types for MdInputCallback */
+typedef enum {
+    MD_INPUT_KEY,            /* a=scancode, b=pressed (1=down, 0=up)   */
+    MD_INPUT_MOUSE_MOVE,     /* a=x, b=y (window coordinates)          */
+    MD_INPUT_MOUSE_BUTTON,   /* a=button (SDL button id), b=pressed    */
+    MD_INPUT_SCROLL,         /* a=scroll_x, b=scroll_y                 */
+} MdInputType;
+
+/* Callback invoked for keyboard and mouse events.
+ * type: one of MdInputType.
+ * a, b: type-specific parameters (see enum comments).
+ * userdata: opaque pointer passed to md_renderer_set_input_callback. */
+typedef void (*MdInputCallback)(int type, int a, int b, void *userdata);
+
 /* Create renderer with initial window size.
  * title: window title string.
  * Returns NULL on failure (SDL2 not available, etc.). */
@@ -49,6 +63,15 @@ void *md_renderer_get_sdl_renderer(MdRenderer *r);
 
 /* Check if window is still open. */
 bool md_renderer_is_open(const MdRenderer *r);
+
+/* Register a callback for keyboard/mouse input events.
+ * The callback fires during md_renderer_poll_events() for every
+ * key, mouse move, mouse button, and scroll event. */
+void md_renderer_set_input_callback(MdRenderer *r, MdInputCallback cb, void *userdata);
+
+/* Set the host screen dimensions for coordinate scaling.
+ * Mouse coordinates are scaled from client window to host screen. */
+void md_renderer_set_host_size(MdRenderer *r, uint32_t host_w, uint32_t host_h);
 
 /* Destroy renderer, close window, free SDL resources. */
 void md_renderer_destroy(MdRenderer *r);

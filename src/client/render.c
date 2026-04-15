@@ -28,8 +28,13 @@ struct MdRenderer {
     uint32_t      tex_height;
     uint32_t      win_width;     /* current window dimensions      */
     uint32_t      win_height;
+    uint32_t      host_width;    /* host screen dimensions for scaling */
+    uint32_t      host_height;
     bool          open;          /* false after window close event  */
     bool          sdl_inited;    /* true if we called SDL_Init      */
+
+    MdInputCallback input_cb;    /* keyboard/mouse event callback   */
+    void           *input_userdata;
 };
 
 /* ── Internal helpers ────────────────────────────────────────── */
@@ -162,11 +167,17 @@ int md_renderer_poll_events(MdRenderer *r) {
             return -1;
 
         case SDL_KEYDOWN:
-            if (event.key.keysym.sym == SDLK_ESCAPE) {
+        case SDL_KEYUP:
+            if (event.key.keysym.sym == SDLK_ESCAPE && event.type == SDL_KEYDOWN) {
                 r->open = false;
                 return -1;
             }
-            /* TODO: forward keyboard events to host (M1.5) */
+            if (r->input_cb) {
+                r->input_cb(MD_INPUT_KEY,
+                            event.key.keysym.scancode,
+                            event.type == SDL_KEYDOWN ? 1 : 0,
+                            r->input_userdata);
+            }
             break;
 
         case SDL_WINDOWEVENT:
@@ -180,11 +191,35 @@ int md_renderer_poll_events(MdRenderer *r) {
             }
             break;
 
+        case SDL_MOUSEMOTION:
+            if (r->input_cb) {
+                int mx = event.motion.x;
+                int my = event.motion.y;
+                /* Scale from client window to host screen coordinates */
+                if (r->host_width && r->host_height &&
+                    r->win_width && r->win_height) {
+                    mx = (int)((int64_t)mx * r->host_width / r->win_width);
+                    my = (int)((int64_t)my * r->host_height / r->win_height);
+                }
+                r->input_cb(MD_INPUT_MOUSE_MOVE, mx, my,
+                            r->input_userdata);
+            }
+            break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
-        case SDL_MOUSEMOTION:
+            if (r->input_cb) {
+                r->input_cb(MD_INPUT_MOUSE_BUTTON,
+                            event.button.button,
+                            event.type == SDL_MOUSEBUTTONDOWN ? 1 : 0,
+                            r->input_userdata);
+            }
+            break;
         case SDL_MOUSEWHEEL:
-            /* TODO: forward mouse events to host (M1.5) */
+            if (r->input_cb) {
+                r->input_cb(MD_INPUT_SCROLL,
+                            event.wheel.x, event.wheel.y,
+                            r->input_userdata);
+            }
             break;
 
         default:
@@ -212,6 +247,18 @@ void *md_renderer_get_sdl_renderer(MdRenderer *r) {
 
 bool md_renderer_is_open(const MdRenderer *r) {
     return r ? r->open : false;
+}
+
+void md_renderer_set_input_callback(MdRenderer *r, MdInputCallback cb, void *userdata) {
+    if (!r) return;
+    r->input_cb = cb;
+    r->input_userdata = userdata;
+}
+
+void md_renderer_set_host_size(MdRenderer *r, uint32_t host_w, uint32_t host_h) {
+    if (!r) return;
+    r->host_width = host_w;
+    r->host_height = host_h;
 }
 
 void md_renderer_destroy(MdRenderer *r) {
