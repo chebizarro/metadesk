@@ -20,6 +20,7 @@
 #include "decode.h"
 #include "render.h"
 #include "signer.h"
+#include "nostr.h"
 #include "ui.h"
 
 #include <stdio.h>
@@ -27,6 +28,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <unistd.h>
 
 static volatile int g_running = 1;
 
@@ -43,6 +45,13 @@ typedef struct {
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
+
+    /* Nostr session negotiation state */
+    char          transport_addr[256]; /* FIPS addr from on_transport     */
+    volatile int  transport_ready;     /* set by on_transport callback    */
+    char          accepted_session_id[64]; /* from session_accept DM     */
+    uint32_t      granted_caps;       /* from session_accept DM          */
+    volatile int  session_accepted;   /* set by on_dm callback           */
 } ClientCtx;
 
 /* ── Decode callback: display frame ──────────────────────────── */
@@ -65,6 +74,34 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
     }
 }
 
+/* ── Nostr callbacks for --npub session negotiation ──────────── */
+
+static void on_transport(const char *pubkey_hex, const char *fips_addr,
+                         void *userdata) {
+    ClientCtx *ctx = userdata;
+    if (!ctx || !fips_addr) return;
+    strncpy(ctx->transport_addr, fips_addr, sizeof(ctx->transport_addr) - 1);
+    ctx->transport_addr[sizeof(ctx->transport_addr) - 1] = '\0';
+    ctx->transport_ready = 1;
+    (void)pubkey_hex;
+}
+
+static void on_session_dm(const char *sender_pubkey_hex, const char *content,
+                          void *userdata) {
+    ClientCtx *ctx = userdata;
+    if (!ctx || !content) return;
+
+    /* Try to parse as session_accept */
+    MdSessionAccept acc;
+    if (md_session_accept_from_json(content, &acc) == 0) {
+        strncpy(ctx->accepted_session_id, acc.session_id,
+                sizeof(ctx->accepted_session_id) - 1);
+        ctx->granted_caps = acc.granted;
+        ctx->session_accepted = 1;
+    }
+    (void)sender_pubkey_hex;
+}
+
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
@@ -82,6 +119,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
+    fprintf(stderr, "  --relay URL        Relay URL (default: wss://relay.sharegap.net)\n");
     fprintf(stderr, "  -h, --help         Show this help\n");
 }
 
@@ -109,6 +147,8 @@ int main(int argc, char **argv) {
     uint16_t port = MD_STREAM_PORT;
     bool do_display = true;
     uint32_t timeout_ms = 5000;
+    const char *relay_urls[16];
+    int relay_count = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -130,6 +170,10 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--auto-signer") == 0)
             auto_signer = true;
+        else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
+            if (relay_count < 16)
+                relay_urls[relay_count++] = argv[++i];
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -184,17 +228,146 @@ int main(int argc, char **argv) {
     MdSession session;
     md_session_init(&session);
 
+    /* Client context (needed before connect for nostr callbacks) */
+    ClientCtx ctx = { 0 };
+
     /* Connect to host */
     MdStream *stream = NULL;
+    MdNostr *nostr = NULL;
+
     if (npub) {
-        /* FIPS mesh connect: resolve npub → fd00::/8 → TCP */
-        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
-        stream = md_stream_connect_fips(npub, port, timeout_ms);
-        if (!stream) {
-            fprintf(stderr, "ERROR: FIPS connect failed for %.*s...\n", 12, npub);
+        /* ── Nostr-signaled FIPS connect (Phase 2.1) ──────────── */
+
+        /* Ensure we have a signer for NIP-17 DMs */
+        if (!signer) {
+            /* Generate ephemeral key if no signer configured */
+            char *eph_sk = NULL, *eph_pk = NULL;
+            if (md_nostr_generate_keypair(&eph_sk, &eph_pk) != 0) {
+                fprintf(stderr, "ERROR: failed to generate ephemeral keypair\n");
+                return 1;
+            }
+            signer = md_signer_create_direct(eph_sk);
+            memset(eph_sk, 0, strlen(eph_sk));
+            free(eph_sk);
+            free(eph_pk);
+            if (!signer) {
+                fprintf(stderr, "ERROR: failed to create ephemeral signer\n");
+                return 1;
+            }
+            printf("client: using ephemeral signer\n");
+        }
+
+        /* Default relay if none specified */
+        if (relay_count == 0) {
+            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_count = 1;
+        }
+
+        /* Transport + DM callbacks */
+        MdNostrCallbacks nostr_cbs = { 0 };
+
+        nostr_cbs.on_transport = on_transport;
+        nostr_cbs.transport_userdata = &ctx;
+        nostr_cbs.on_dm = on_session_dm;
+        nostr_cbs.dm_userdata = &ctx;
+
+        MdNostrConfig nostr_cfg = {
+            .signer = signer,
+            .relay_urls = relay_urls,
+            .relay_count = relay_count,
+        };
+
+        nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
+        if (!nostr) {
+            fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
+            if (signer) md_signer_destroy(signer);
             return 1;
         }
+
+        /* Step 1: Subscribe to host's transport address */
+        printf("client: looking up transport addr for %.*s...\n", 12, npub);
+        if (md_nostr_subscribe_transport(nostr, npub) != 0) {
+            fprintf(stderr, "ERROR: failed to subscribe to transport\n");
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+
+        /* Step 2: Wait for on_transport callback (with timeout) */
+        int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+        while (!ctx.transport_ready && now_us() < deadline && g_running) {
+            usleep(50000); /* 50ms poll */
+        }
+        if (!ctx.transport_ready) {
+            fprintf(stderr, "ERROR: timed out waiting for host transport addr\n");
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+        printf("client: found host transport addr: %s\n", ctx.transport_addr);
+
+        /* Step 3: Send session request DM */
+        MdSessionRequest req = {
+            .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
+            .tree_format = MD_TREE_FORMAT_COMPACT,
+        };
+        const char *our_pk = md_nostr_get_npub(nostr);
+        if (our_pk)
+            strncpy(req.fips_addr, our_pk, sizeof(req.fips_addr) - 1);
+
+        char *req_json = md_session_request_to_json(&req);
+        if (!req_json) {
+            fprintf(stderr, "ERROR: failed to serialize session request\n");
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+
+        printf("client: sending session request DM...\n");
+        if (md_nostr_send_session_request(nostr, npub, req_json) != 0) {
+            fprintf(stderr, "ERROR: failed to send session request\n");
+            free(req_json);
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+        free(req_json);
+
+        /* Step 4: Wait for session accept DM */
+        deadline = now_us() + (int64_t)timeout_ms * 2 * 1000;
+        while (!ctx.session_accepted && now_us() < deadline && g_running) {
+            usleep(50000); /* 50ms poll */
+        }
+        if (!ctx.session_accepted) {
+            fprintf(stderr, "ERROR: timed out waiting for session accept\n");
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+        printf("client: session accepted (id=%s)\n", ctx.accepted_session_id);
+
+        /* Step 5: Connect via FIPS */
+        printf("client: connecting via FIPS to %s...\n", ctx.transport_addr);
+        stream = md_stream_connect_fips(npub, port, timeout_ms);
+        if (!stream) {
+            fprintf(stderr, "ERROR: FIPS connect failed\n");
+            md_nostr_destroy(nostr);
+            return 1;
+        }
+
+        /* Step 6: Send MD_PKT_SESSION_INFO with session_id + capabilities */
+        MdSessionAccept acc;
+        strncpy(acc.session_id, ctx.accepted_session_id, sizeof(acc.session_id) - 1);
+        acc.granted = ctx.granted_caps;
+        char *info_json = md_session_accept_to_json(&acc);
+        if (info_json) {
+            md_stream_send(stream, MD_PKT_SESSION_INFO, 0,
+                           (const uint8_t *)info_json, (uint32_t)strlen(info_json));
+            free(info_json);
+        }
+
+        /* Update session state */
+        md_session_request(&session, npub, req.capabilities, req.tree_format);
+        md_session_accept(&session, ctx.accepted_session_id, ctx.granted_caps);
+        md_session_activate(&session);
+
     } else {
+        /* ── Direct IP/hostname connect (existing path) ───────── */
         printf("client: connecting to %s:%u...\n", host, port);
         stream = md_stream_connect(host, port, timeout_ms);
         if (!stream) {
@@ -213,7 +386,6 @@ int main(int argc, char **argv) {
     }
 
     /* Create renderer (SDL2 window) and overlay */
-    ClientCtx ctx = { 0 };
     if (do_display) {
         ctx.renderer = md_renderer_create(1920, 1080, "metadesk");
         if (!ctx.renderer) {
@@ -357,8 +529,10 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
-    if (signer)
-        md_signer_destroy(signer);
+    if (nostr)
+        md_nostr_destroy(nostr);
+    else if (signer)
+        md_signer_destroy(signer); /* only if nostr didn't borrow it */
     if (ctx.overlay)
         md_overlay_destroy(ctx.overlay);
     if (ctx.renderer)
