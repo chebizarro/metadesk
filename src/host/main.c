@@ -47,11 +47,18 @@ typedef struct {
     MdEncoder    *encoder;
     MdStream     *client;
     MdAgent      *agent;
+    MdNostr      *nostr;
+    MdSession    *session;
     uint32_t      frame_seq;
     uint32_t      pkt_seq;
     int64_t       total_encode_us;
     uint32_t      frames_encoded;
     uint32_t      frames_sent;
+
+    /* Nostr session negotiation */
+    char          pending_client_pk[128]; /* pubkey of requesting client */
+    MdSessionRequest pending_req;         /* parsed session request      */
+    volatile int  session_requested;      /* set by on_dm callback       */
 } HostCtx;
 
 /* ── Encode callback: send encoded packet to client ──────────── */
@@ -68,7 +75,33 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
         ctx->frames_sent++;
 }
 
-/* ── Map capture pixel format to encoder pixel format ────────── */
+/* ── Nostr callbacks for session negotiation ──────────────── */
+
+static void host_on_dm(const char *sender_pubkey_hex, const char *content,
+                       void *userdata) {
+    HostCtx *ctx = userdata;
+    if (!ctx || !content || ctx->session_requested) return;
+
+    /* Try to parse as session_request */
+    MdSessionRequest req;
+    if (md_session_request_from_json(content, &req) == 0) {
+        /* Check allowlist if available */
+        if (ctx->nostr && !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
+            fprintf(stderr, "host: session request from non-allowlisted %.*s... (accepting for Phase 2.1)\n",
+                    8, sender_pubkey_hex);
+            /* Phase 2.1: accept anyway; Phase 2.3 will enforce */
+        }
+
+        strncpy(ctx->pending_client_pk, sender_pubkey_hex,
+                sizeof(ctx->pending_client_pk) - 1);
+        ctx->pending_req = req;
+        ctx->session_requested = 1;
+        fprintf(stderr, "host: received session request from %.*s...\n",
+                8, sender_pubkey_hex);
+    }
+}
+
+/* ── Map capture pixel format to encoder pixel format ──────────── */
 
 static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
     switch (cfmt) {
@@ -148,13 +181,27 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         }
         break;
 
-    case MD_PKT_SESSION_INFO:
+    case MD_PKT_SESSION_INFO: {
         fprintf(stderr, "host: received session info\n");
-        /* TODO: negotiate session (M2.1) */
+        /* Parse session info and ack with granted capabilities */
+        if (payload && hdr->payload_len > 0) {
+            MdSessionAccept acc;
+            char json_buf[4096];
+            size_t len = hdr->payload_len < sizeof(json_buf) - 1
+                         ? hdr->payload_len : sizeof(json_buf) - 1;
+            memcpy(json_buf, payload, len);
+            json_buf[len] = '\0';
+            if (md_session_accept_from_json(json_buf, &acc) == 0) {
+                fprintf(stderr, "host: session_id=%s\n", acc.session_id);
+                if (ctx->session)
+                    md_session_activate(ctx->session);
+            }
+        }
         /* Echo back as ack */
         md_stream_send(ctx->client, MD_PKT_SESSION_INFO, ctx->pkt_seq++,
                        payload, hdr->payload_len);
         break;
+    }
 
     default:
         fprintf(stderr, "host: unknown packet type 0x%02x\n", hdr->type);
@@ -179,6 +226,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer    Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer    Auto-detect local signer (NIP-5F, NIP-55L)\n");
+    fprintf(stderr, "  --relay URL      Relay URL (default: wss://relay.sharegap.net)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -200,6 +248,8 @@ int main(int argc, char **argv) {
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
     bool do_capture = true;
+    const char *relay_urls[16];
+    int relay_count = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -227,6 +277,10 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--auto-signer") == 0)
             auto_signer = true;
+        else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
+            if (relay_count < 16)
+                relay_urls[relay_count++] = argv[++i];
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -278,6 +332,90 @@ int main(int argc, char **argv) {
     /* Initialize session state */
     MdSession session;
     md_session_init(&session);
+
+    /* Host context (needed before TCP for nostr callbacks) */
+    HostCtx ctx = {
+        .session = &session,
+    };
+
+    /* ── Nostr bridge (if signer available) ───────────────── */
+    MdNostr *nostr = NULL;
+    if (signer) {
+        if (relay_count == 0) {
+            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_count = 1;
+        }
+
+        MdNostrCallbacks nostr_cbs = { 0 };
+        nostr_cbs.on_dm = host_on_dm;
+        nostr_cbs.dm_userdata = &ctx;
+
+        MdNostrConfig nostr_cfg = {
+            .signer = signer,
+            .relay_urls = relay_urls,
+            .relay_count = relay_count,
+        };
+
+        nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
+        if (nostr) {
+            ctx.nostr = nostr;
+
+            /* Publish our transport address */
+            char *our_pk = NULL;
+            if (md_signer_get_pubkey(signer, &our_pk) == MD_SIGNER_OK && our_pk) {
+                /* Use pubkey as FIPS address placeholder */
+                md_nostr_publish_transport(nostr, our_pk);
+                free(our_pk);
+            }
+
+            /* Subscribe to allowlist updates */
+            md_nostr_refresh_allowlist(nostr);
+
+            printf("host: nostr bridge ready, waiting for session requests...\n");
+
+            /* Wait for a session request DM (with timeout) */
+            int wait_count = 0;
+            while (!ctx.session_requested && g_running && wait_count < 600) {
+                usleep(100000); /* 100ms poll */
+                wait_count++;
+            }
+
+            if (ctx.session_requested) {
+                /* Generate session ID */
+                char session_id[64];
+                snprintf(session_id, sizeof(session_id), "%08x-%04x-%04x",
+                         (uint32_t)time(NULL), (uint32_t)(rand() & 0xFFFF),
+                         (uint32_t)(rand() & 0xFFFF));
+
+                /* Determine granted capabilities */
+                uint32_t granted = ctx.pending_req.capabilities &
+                                   (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
+
+                /* Send session accept DM */
+                MdSessionAccept acc = { .granted = granted };
+                strncpy(acc.session_id, session_id, sizeof(acc.session_id) - 1);
+
+                char *acc_json = md_session_accept_to_json(&acc);
+                if (acc_json) {
+                    md_nostr_send_session_accept(nostr, ctx.pending_client_pk,
+                                                acc_json);
+                    free(acc_json);
+                    printf("host: sent session accept to %.*s... (session=%s)\n",
+                           8, ctx.pending_client_pk, session_id);
+                }
+
+                /* Update session state */
+                md_session_request(&session, ctx.pending_client_pk,
+                                   ctx.pending_req.capabilities,
+                                   ctx.pending_req.tree_format);
+                md_session_accept(&session, session_id, granted);
+            } else if (g_running) {
+                printf("host: no session request received, accepting direct TCP\n");
+            }
+        } else {
+            fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
+        }
+    }
 
     /* Create TCP server */
     MdStreamServer *srv = md_stream_server_create(bind_addr, port);
@@ -349,12 +487,10 @@ int main(int argc, char **argv) {
     };
     MdAgent *agent = md_agent_create(&agent_cfg);
 
-    /* Set up host context */
-    HostCtx ctx = {
-        .encoder = encoder,
-        .client  = client,
-        .agent   = agent,
-    };
+    /* Set up host context (update fields set after TCP connect) */
+    ctx.encoder = encoder;
+    ctx.client  = client;
+    ctx.agent   = agent;
 
     /* Send initial UI tree to client */
     if (agent && a11y) {
@@ -466,7 +602,9 @@ int main(int argc, char **argv) {
     md_stream_destroy(client);
     md_stream_server_destroy(srv);
 
-    if (signer)
+    if (nostr)
+        md_nostr_destroy(nostr);
+    else if (signer)
         md_signer_destroy(signer);
 
     printf("host: done. sent %u frames in %u packets\n",
