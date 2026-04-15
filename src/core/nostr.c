@@ -552,16 +552,28 @@ int md_nostr_publish_transport(MdNostr *n, const char *fips_addr) {
     nostr_event_set_content(event, fips_addr);
     nostr_event_set_pubkey(event, n->pk_hex);
     nostr_event_set_created_at(event, (int64_t)time(NULL));
-    /* TODO: add d-tag ["d", "fips-transport"] via nostr_tags API */
+
+    /* Add d-tag ["d", "fips-transport"] — makes this an addressable event (NIP-33) */
+    NostrTag *d_tag = nostr_tag_new("d", "fips-transport", NULL);
+    if (!d_tag) { nostr_event_free(event); return -1; }
+    NostrTags *tags = nostr_tags_new(1, d_tag);
+    if (!tags) { nostr_tag_free(d_tag); nostr_event_free(event); return -1; }
+    nostr_event_set_tags(event, tags); /* takes ownership */
 
     /* Sign via signer abstraction */
     NostrEvent *signed_event = sign_event_via_signer(n->signer, event);
     nostr_event_free(event);
     if (!signed_event) return -1;
 
-    /* TODO: publish to all pool relays */
+    /* Publish to all connected relays */
+    int ret = pool_publish_all(n->pool, signed_event);
     nostr_event_free(signed_event);
-    return 0;
+
+    if (ret == 0) {
+        fprintf(stderr, "nostr: published transport addr %s\n", fips_addr);
+    }
+
+    return ret;
 }
 
 int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
