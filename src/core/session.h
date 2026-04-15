@@ -78,6 +78,49 @@ void md_session_on_pong(MdSession *s, uint32_t timestamp_ms);
 /* Check if the session has timed out (missed keepalives) */
 bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 
+/* ── Session signaling JSON payloads (spec §4, Phase 2.1) ──────
+ *
+ * These are the NIP-17 DM content payloads exchanged during session
+ * negotiation, and the MD_PKT_SESSION_INFO wire payloads.
+ *
+ * Request (client → host DM):
+ *   {"type":"session_request","v":1,"capabilities":["video","agent","input"],
+ *    "tree_format":"compact","fips_addr":"npub1..."}
+ *
+ * Accept (host → client DM):
+ *   {"type":"session_accept","v":1,"session_id":"<uuid>",
+ *    "granted":["video","agent"]}
+ */
+
+/* Parsed session request from client */
+typedef struct {
+    uint32_t    capabilities;      /* bitwise OR of MdCapability */
+    MdTreeFormat tree_format;
+    char         fips_addr[128];   /* client's npub / FIPS addr  */
+} MdSessionRequest;
+
+/* Parsed session accept from host */
+typedef struct {
+    char         session_id[64];   /* UUID assigned by host      */
+    uint32_t     granted;          /* bitwise OR of MdCapability */
+} MdSessionAccept;
+
+/* Serialize a session request to a newly-allocated JSON string. Caller frees. */
+char *md_session_request_to_json(const MdSessionRequest *req);
+
+/* Parse a session request from JSON. Returns 0 on success, -1 on error. */
+int md_session_request_from_json(const char *json, MdSessionRequest *out);
+
+/* Serialize a session accept to a newly-allocated JSON string. Caller frees. */
+char *md_session_accept_to_json(const MdSessionAccept *acc);
+
+/* Parse a session accept from JSON. Returns 0 on success, -1 on error. */
+int md_session_accept_from_json(const char *json, MdSessionAccept *out);
+
+/* Helper: convert capability bitfield to/from JSON array of strings. */
+uint32_t md_caps_from_strings(const char **strs, int count);
+int md_caps_to_strings(uint32_t caps, const char **out, int max_out);
+
 #ifdef __cplusplus
 }
 #endif
