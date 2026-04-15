@@ -577,8 +577,48 @@ int md_nostr_publish_transport(MdNostr *n, const char *fips_addr) {
 }
 
 int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
-    if (!n || !host_pubkey_hex)
+    if (!n || !n->pool || !host_pubkey_hex)
         return -1;
-    /* TODO: Build filter and subscribe */
+
+    /* Build filter: kind:30078, authors:[host_pubkey], #d:["fips-transport"] */
+    NostrFilter *f = nostr_filter_builder_build(
+        nostr_filter_builder_tag(
+            nostr_filter_builder_authors(
+                nostr_filter_builder_kinds(
+                    nostr_filter_builder_new(),
+                    30078, -1),
+                host_pubkey_hex, NULL),
+            "d", "fips-transport"));
+    if (!f) return -1;
+
+    /* Wrap in NostrFilters (by-value struct for pool_subscribe) */
+    NostrFilters *filters = nostr_filters_new();
+    if (!filters) { nostr_filter_free(f); return -1; }
+    nostr_filters_add(filters, f);
+    /* f contents moved into filters; f is zeroed but still needs freeing */
+    nostr_filter_free(f);
+
+    /* Collect relay URLs */
+    pthread_mutex_lock(&n->pool->pool_mutex);
+    size_t relay_count = n->pool->relay_count;
+    const char **urls = malloc(relay_count * sizeof(char *));
+    if (!urls) {
+        pthread_mutex_unlock(&n->pool->pool_mutex);
+        nostr_filters_free(filters);
+        return -1;
+    }
+    for (size_t i = 0; i < relay_count; i++)
+        urls[i] = n->pool->relays[i]->url;
+
+    /* Subscribe — incoming kind:30078 events route through
+     * md_nostr_event_handler() which calls cbs.on_transport */
+    nostr_simple_pool_subscribe(n->pool, urls, relay_count, *filters, true);
+    pthread_mutex_unlock(&n->pool->pool_mutex);
+
+    free(urls);
+    nostr_filters_free(filters);
+
+    fprintf(stderr, "nostr: subscribed to transport addr for %.8s...\n",
+            host_pubkey_hex);
     return 0;
 }
