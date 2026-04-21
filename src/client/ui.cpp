@@ -50,6 +50,9 @@ struct MdOverlay {
     /* Allowlist add form state */
     char           add_npub_buf[130];    /* input: hex npub to add */
     char           add_caps_buf[64];     /* input: capabilities    */
+
+    /* Approval popup state */
+    bool           approval_add_to_allowlist; /* checkbox: also add to allowlist */
 };
 
 /* Exponential moving average smoothing factor */
@@ -473,6 +476,112 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
         }
 
         ImGui::End();
+    }
+
+    /* ── Approval popup (modal) ──────────────────────────── */
+    if (stats->pending_approval && stats->on_approval) {
+        const MdOverlayApprovalRequest *req = stats->pending_approval;
+        const char *popup_id = "Session Request##approval";
+
+        ImGui::OpenPopup(popup_id);
+
+        ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(400, 0), ImGuiCond_Appearing);
+
+        if (ImGui::BeginPopupModal(popup_id, nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                               "\xE2\x9A\xa0 Unknown peer requesting session");  /* ⚠ */
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            /* Requester info */
+            ImGui::Text("npub:");
+            ImGui::SameLine();
+            if (req->pubkey_hex && std::strlen(req->pubkey_hex) >= 16) {
+                char trunc[24];
+                std::snprintf(trunc, sizeof(trunc), "%.8s...%.8s",
+                              req->pubkey_hex,
+                              req->pubkey_hex + std::strlen(req->pubkey_hex) - 8);
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%s", trunc);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", req->pubkey_hex);
+            } else {
+                ImGui::TextUnformatted(req->pubkey_hex ? req->pubkey_hex : "?");
+            }
+
+            if (req->fips_addr && req->fips_addr[0]) {
+                ImGui::Text("Address:");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                                   "%s", req->fips_addr);
+            }
+
+            /* Requested capabilities */
+            ImGui::Spacing();
+            ImGui::Text("Requested capabilities:");
+            ImGui::Indent(10.0f);
+            if (req->requested_caps & 0x01)
+                ImGui::BulletText("View (screen capture)");
+            if (req->requested_caps & 0x02)
+                ImGui::BulletText("Keyboard input");
+            if (req->requested_caps & 0x04)
+                ImGui::BulletText("Mouse input");
+            if (req->requested_caps & 0x08)
+                ImGui::BulletText("Accessibility tree");
+            if (req->requested_caps == 0)
+                ImGui::BulletText("(all capabilities)");
+            ImGui::Unindent(10.0f);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            /* Add-to-allowlist checkbox */
+            ImGui::Checkbox("Remember (add to allowlist)",
+                            &o->approval_add_to_allowlist);
+
+            ImGui::Spacing();
+
+            /* Allow / Deny buttons */
+            float avail = ImGui::GetContentRegionAvail().x;
+            float btn_w = (avail - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.1f, 0.5f, 0.1f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                  ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                  ImVec4(0.05f, 0.4f, 0.05f, 1.0f));
+            if (ImGui::Button("Allow", ImVec2(btn_w, 0))) {
+                stats->on_approval(req->pubkey_hex, true,
+                                   o->approval_add_to_allowlist,
+                                   stats->approval_userdata);
+                o->approval_add_to_allowlist = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.5f, 0.1f, 0.1f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                  ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                  ImVec4(0.4f, 0.05f, 0.05f, 1.0f));
+            if (ImGui::Button("Deny", ImVec2(btn_w, 0))) {
+                stats->on_approval(req->pubkey_hex, false, false,
+                                   stats->approval_userdata);
+                o->approval_add_to_allowlist = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::EndPopup();
+        }
     }
 
     /* Finalize and render */

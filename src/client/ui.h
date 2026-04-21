@@ -40,6 +40,20 @@ typedef void (*MdOverlayAllowlistAddFn)(const char *pubkey_hex,
 typedef void (*MdOverlayAllowlistRemoveFn)(const char *pubkey_hex,
                                            void *userdata);
 
+/* Callback for session approval decision (true = allow, false = deny).
+ * add_to_allowlist: if true, also add the npub to the persistent allowlist. */
+typedef void (*MdOverlayApprovalFn)(const char *pubkey_hex,
+                                    bool approved,
+                                    bool add_to_allowlist,
+                                    void *userdata);
+
+/* Pending approval request shown in the popup */
+typedef struct {
+    const char *pubkey_hex;      /* requesting peer's npub          */
+    uint32_t    requested_caps;  /* capability bits they want       */
+    const char *fips_addr;       /* requester's FIPS address        */
+} MdOverlayApprovalRequest;
+
 /* Peer connection info for peer list panel */
 typedef struct {
     const char *pubkey_hex;  /* 64-char hex npub of the peer       */
@@ -71,6 +85,11 @@ typedef struct {
     MdOverlayAllowlistAddFn    on_allowlist_add;
     MdOverlayAllowlistRemoveFn on_allowlist_remove;
     void  *allowlist_userdata;
+
+    /* Approval popup data (NULL hides popup) */
+    const MdOverlayApprovalRequest *pending_approval;
+    MdOverlayApprovalFn on_approval;
+    void  *approval_userdata;
 } MdOverlayStats;
 
 /* Create ImGui overlay attached to an SDL window/renderer.
