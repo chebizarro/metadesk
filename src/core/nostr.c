@@ -572,6 +572,10 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
     return false;
 }
 
+bool md_nostr_has_allowlist(const MdNostr *n) {
+    return n && n->allowlist && n->allowlist->count > 0;
+}
+
 int md_nostr_refresh_allowlist(MdNostr *n) {
     if (!n || !n->pool || !n->pk_hex) return -1;
 

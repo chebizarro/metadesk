@@ -133,6 +133,11 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 /* Check if pubkey_hex is on the cached allowlist. */
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
 
+/* Check if an allowlist has been loaded (with at least one entry).
+ * When false, the host has no access control configured (open mode).
+ * When true, only clients on the list should be accepted. */
+bool md_nostr_has_allowlist(const MdNostr *n);
+
 /* Refresh the allowlist from relays (subscribe, wait for EOSE). */
 int md_nostr_refresh_allowlist(MdNostr *n);
 

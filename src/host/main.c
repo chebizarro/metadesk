@@ -85,11 +85,15 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
     /* Try to parse as session_request */
     MdSessionRequest req;
     if (md_session_request_from_json(content, &req) == 0) {
-        /* Check allowlist if available */
-        if (ctx->nostr && !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
-            fprintf(stderr, "host: session request from non-allowlisted %.*s... (accepting for Phase 2.1)\n",
+        /* Enforce allowlist: if an allowlist is configured, reject
+         * clients that are not on it. If no allowlist is configured
+         * (open mode), accept all clients. */
+        if (ctx->nostr && md_nostr_has_allowlist(ctx->nostr)
+            && !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
+            fprintf(stderr, "host: REJECTED session request from "
+                    "non-allowlisted pubkey %.*s...\n",
                     8, sender_pubkey_hex);
-            /* Phase 2.1: accept anyway; Phase 2.3 will enforce */
+            return;
         }
 
         strncpy(ctx->pending_client_pk, sender_pubkey_hex,
