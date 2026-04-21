@@ -61,19 +61,6 @@ static NostrEvent *event_from_json(const char *json) {
     return ev;
 }
 
-/* Helper: publish an event to all relays in the pool */
-static int pool_publish_all(NostrSimplePool *pool, NostrEvent *ev) {
-    if (!pool || !ev) return -1;
-    int published = 0;
-    pthread_mutex_lock(&pool->pool_mutex);
-    for (size_t i = 0; i < pool->relay_count; i++) {
-        nostr_relay_publish(pool->relays[i], ev);
-        published++;
-    }
-    pthread_mutex_unlock(&pool->pool_mutex);
-    return published > 0 ? 0 : -1;
-}
-
 struct MdNostr {
     MdSigner          *signer;       /* signing backend                     */
     bool               owns_signer;  /* true if we created it (from sk_hex) */
@@ -81,7 +68,22 @@ struct MdNostr {
     NostrSimplePool   *pool;         /* nostrc relay pool — persistent conns */
     NostrList         *allowlist;    /* cached NIP-51 allowlist             */
     MdNostrCallbacks   cbs;          /* event callbacks                     */
+
+    /* Cached relay snapshot — avoids direct access to pool struct internals.
+     * Populated once in md_nostr_create() after ensure_relay, before start.
+     * Replace with nostrc accessor APIs when available. */
+    NostrRelay       **relays;       /* borrowed relay pointers (not owned) */
+    size_t             relay_count;
+    char             **relay_urls;   /* owned copies of URL strings         */
 };
+
+/* Helper: publish an event to all cached relays */
+static int publish_all(MdNostr *n, NostrEvent *ev) {
+    if (!n || !ev || n->relay_count == 0) return -1;
+    for (size_t i = 0; i < n->relay_count; i++)
+        nostr_relay_publish(n->relays[i], ev);
+    return 0;
+}
 
 /* ── Instance registry ─────────────────────────────────────────
  * Maps NostrSimplePool* → MdNostr* so the event middleware can
@@ -139,10 +141,10 @@ static MdNostr *registry_find_by_relay(NostrRelay *relay) {
     MdNostr *found = NULL;
     pthread_mutex_lock(&g_registry.lock);
     for (size_t i = 0; i < g_registry.count; i++) {
-        NostrSimplePool *pool = g_registry.entries[i].pool;
-        for (size_t j = 0; j < pool->relay_count; j++) {
-            if (pool->relays[j] == relay) {
-                found = g_registry.entries[i].ctx;
+        MdNostr *ctx = g_registry.entries[i].ctx;
+        for (size_t j = 0; j < ctx->relay_count; j++) {
+            if (ctx->relays[j] == relay) {
+                found = ctx;
                 goto done;
             }
         }
@@ -318,6 +320,22 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         nostr_simple_pool_ensure_relay(n->pool, cfg->relay_urls[i]);
     }
 
+    /* Snapshot relay pointers and URLs from pool.
+     * This is the ONLY place we access pool struct internals.
+     * TODO: Replace with nostr_simple_pool_get_relays() when nostrc
+     * provides an accessor API. */
+    n->relay_count = (size_t)cfg->relay_count;
+    n->relays = malloc(n->relay_count * sizeof(NostrRelay *));
+    n->relay_urls = malloc(n->relay_count * sizeof(char *));
+    if (n->relays && n->relay_urls) {
+        pthread_mutex_lock(&n->pool->pool_mutex);
+        for (size_t i = 0; i < n->relay_count && i < n->pool->relay_count; i++) {
+            n->relays[i] = n->pool->relays[i];
+            n->relay_urls[i] = strdup(nostr_relay_get_url_const(n->pool->relays[i]));
+        }
+        pthread_mutex_unlock(&n->pool->pool_mutex);
+    }
+
     /* Start pool worker threads */
     nostr_simple_pool_start(n->pool);
 
@@ -349,6 +367,14 @@ void md_nostr_destroy(MdNostr *n) {
     }
     if (n->allowlist)
         nostr_nip51_list_free(n->allowlist);
+
+    /* Free cached relay snapshot */
+    if (n->relay_urls) {
+        for (size_t i = 0; i < n->relay_count; i++)
+            free(n->relay_urls[i]);
+        free(n->relay_urls);
+    }
+    free(n->relays);
 
     /* Only destroy signer if we created it (from sk_hex fallback) */
     if (n->owns_signer && n->signer)
@@ -537,7 +563,7 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     free(eph_pk);
 
     /* Step 7: Publish gift-wrap to all connected relays */
-    ret = pool_publish_all(n->pool, gift_wrap);
+    ret = publish_all(n, gift_wrap);
     nostr_event_free(gift_wrap);
 
     return ret < 0 ? -1 : 0;
@@ -595,22 +621,10 @@ int md_nostr_refresh_allowlist(MdNostr *n) {
     nostr_filters_add(filters, f);
     nostr_filter_free(f);
 
-    /* Collect relay URLs */
-    pthread_mutex_lock(&n->pool->pool_mutex);
-    size_t relay_count = n->pool->relay_count;
-    const char **urls = malloc(relay_count * sizeof(char *));
-    if (!urls) {
-        pthread_mutex_unlock(&n->pool->pool_mutex);
-        nostr_filters_free(filters);
-        return -1;
-    }
-    for (size_t i = 0; i < relay_count; i++)
-        urls[i] = n->pool->relays[i]->url;
+    /* Use cached relay URLs for subscription */
+    nostr_simple_pool_subscribe(n->pool, (const char **)n->relay_urls,
+                                n->relay_count, *filters, true);
 
-    nostr_simple_pool_subscribe(n->pool, urls, relay_count, *filters, true);
-    pthread_mutex_unlock(&n->pool->pool_mutex);
-
-    free(urls);
     nostr_filters_free(filters);
 
     fprintf(stderr, "nostr: subscribed to allowlist updates\n");
@@ -669,7 +683,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
     if (!signed_event) return -1;
 
     /* Publish to all connected relays */
-    int ret = pool_publish_all(n->pool, signed_event);
+    int ret = publish_all(n, signed_event);
     nostr_event_free(signed_event);
 
     if (ret == 0) {
@@ -732,7 +746,7 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     nostr_event_free(list_event);
     if (!signed_event) return -1;
 
-    int ret = pool_publish_all(n->pool, signed_event);
+    int ret = publish_all(n, signed_event);
     nostr_event_free(signed_event);
 
     if (ret == 0) {
@@ -773,7 +787,7 @@ int md_nostr_publish_transport(MdNostr *n, const char *fips_addr) {
     if (!signed_event) return -1;
 
     /* Publish to all connected relays */
-    int ret = pool_publish_all(n->pool, signed_event);
+    int ret = publish_all(n, signed_event);
     nostr_event_free(signed_event);
 
     if (ret == 0) {
@@ -805,24 +819,12 @@ int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
     /* f contents moved into filters; f is zeroed but still needs freeing */
     nostr_filter_free(f);
 
-    /* Collect relay URLs */
-    pthread_mutex_lock(&n->pool->pool_mutex);
-    size_t relay_count = n->pool->relay_count;
-    const char **urls = malloc(relay_count * sizeof(char *));
-    if (!urls) {
-        pthread_mutex_unlock(&n->pool->pool_mutex);
-        nostr_filters_free(filters);
-        return -1;
-    }
-    for (size_t i = 0; i < relay_count; i++)
-        urls[i] = n->pool->relays[i]->url;
-
-    /* Subscribe — incoming kind:30078 events route through
+    /* Use cached relay URLs for subscription.
+     * Incoming kind:30078 events route through
      * md_nostr_event_handler() which calls cbs.on_transport */
-    nostr_simple_pool_subscribe(n->pool, urls, relay_count, *filters, true);
-    pthread_mutex_unlock(&n->pool->pool_mutex);
+    nostr_simple_pool_subscribe(n->pool, (const char **)n->relay_urls,
+                                n->relay_count, *filters, true);
 
-    free(urls);
     nostr_filters_free(filters);
 
     fprintf(stderr, "nostr: subscribed to transport addr for %.8s...\n",
