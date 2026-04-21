@@ -7,9 +7,9 @@ FIPS-native remote desktop and agent control plane. Nostr keypairs as identity. 
 |---|---|
 | Project | metadesk |
 | Organisation | Soul Factory / OpenClaw |
-| Status | Pre-implementation — specification phase |
+| Status | Phase 2 — implementation in progress |
 | Phase 1 target | T7610 host (Linux) → dev laptop client (macOS), LAN |
-| Language | C/C++ (C++ with RAII, minimal templates) |
+| Language | C17/C++17 (C++ only for Dear ImGui overlay; Objective-C for macOS backends) |
 | Build system | Meson |
 | Target platforms | Linux, macOS, Windows |
 
@@ -40,7 +40,6 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 - Audio streaming (deferred to a later phase)
 - Multi-monitor selection (Phase 3)
 - File transfer (Phase 3)
-- NIP-46 bunker integration (Phase 3)
 
 ---
 
@@ -54,7 +53,7 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 │  Human: SDL2 window + Dear ImGui overlay (all platforms)   │
 │  Agent: structured JSON / compact-markup API               │
 ├────────────────────────────────────────────────────────────┤
-│  C++ core  (libmetadesk — no UI deps)                      │
+│  C17 core  (libmetadesk — no UI deps)                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐   │
 │  │ Frame pipeline│  │ Agent channel│  │ Session / auth │   │
 │  │ capture HAL  │  │ a11y HAL     │  │ NIP-44 DMs     │   │
@@ -342,11 +341,12 @@ Required on Linux, macOS, and Windows.
 |---|---|---|---|
 | FFmpeg (`libavcodec`, `libavutil`) | ≥ 6.0 | H.264 encode and decode | Homebrew / vcpkg on non-Linux |
 | `libyuv` | ≥ r1845 | Colorspace conversion | vendor from chromium/libyuv if no package |
-| `libsecp256k1` | ≥ 0.3.2 | Nostr keypair ops, NIP-44 ECDH | Homebrew: `secp256k1` |
-| `libwebsockets` | ≥ 4.3 | Nostr relay WebSocket connections | Homebrew: `libwebsockets` |
+| `nostrc` | — | Nostr C library: events, keys, relay pool, NIP-44/17/51 | github.com/chebizarro/nostrc |
+| `libgo` | — | Go-style concurrency runtime (channels, goroutines, waitgroups) | bundled with nostrc |
+| `libsecp256k1` | ≥ 0.3.2 | Nostr keypair ops, NIP-44 ECDH | Transitive via nostrc |
 | `libnice` | ≥ 0.1.21 | STUN/TURN/ICE for fips-nat | Homebrew: `libnice` |
 | `SDL2` | ≥ 2.28 | Human client frame display | Homebrew: `sdl2` |
-| Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule (header-only) |
+| Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule |
 | `cJSON` | ≥ 1.7.17 | JSON encode/decode for wire formats | Homebrew: `cjson` |
 | `libb2` / blake2 | ≥ 0.98 | Session ID generation | Homebrew: `b2-sum` or vendor |
 
@@ -444,55 +444,112 @@ ninja -C build
 metadesk/
 ├── meson.build
 ├── meson_options.txt
-├── SPEC.md
 ├── src/
 │   ├── core/                           # libmetadesk (no UI, no platform headers in .h files)
-│   │   ├── capture.h                   # capture HAL interface
-│   │   ├── capture_pipewire.c          # Linux backend
-│   │   ├── capture_screencapturekit.m  # macOS backend (Objective-C++)
-│   │   ├── capture_dxgi.cpp            # Windows backend
-│   │   ├── a11y.h                      # accessibility tree HAL interface
-│   │   ├── a11y_atspi.c                # Linux backend (AT-SPI2)
-│   │   ├── a11y_axui.m                 # macOS backend (AXUIElement)
-│   │   ├── a11y_uia.cpp                # Windows backend (UI Automation)
-│   │   ├── input.h                     # input injection HAL interface
-│   │   ├── input_uinput.c              # Linux backend
-│   │   ├── input_cgevent.m             # macOS backend
-│   │   ├── input_sendinput.cpp         # Windows backend
-│   │   ├── encode.c/h                  # FFmpeg encode pipeline (cross-platform)
-│   │   ├── decode.c/h                  # FFmpeg decode (cross-platform)
-│   │   ├── session.c/h                 # session state machine
-│   │   ├── nostr.c/h                   # NIP-44, NIP-51, relay client
-│   │   ├── packet.c/h                  # wire format encode/decode
-│   │   └── secrets.c/h                 # 1Password Connect integration
-│   ├── host/                           # metadesk-host daemon
+│   │   ├── capture.c/h                 # capture HAL interface
+│   │   ├── capture_pipewire.c          # Linux backend (PipeWire)
+│   │   ├── capture_screencapturekit.m  # macOS backend (ScreenCaptureKit)
+│   │   ├── capture_dxgi.cpp            # Windows backend (DXGI)
+│   │   ├── a11y.c/h                    # accessibility tree HAL + compact/JSON serializers
+│   │   ├── a11y_atspi.c               # Linux backend (AT-SPI2)
+│   │   ├── a11y_axui.m                # macOS backend (AXUIElement)
+│   │   ├── a11y_uia.cpp              # Windows backend (UI Automation)
+│   │   ├── input.c/h                   # input injection HAL interface
+│   │   ├── input_uinput.c             # Linux backend (uinput)
+│   │   ├── input_cgevent.m            # macOS backend (CGEvent)
+│   │   ├── input_sendinput.cpp        # Windows backend (SendInput)
+│   │   ├── encode.c/h                 # FFmpeg encode pipeline (cross-platform)
+│   │   ├── decode.c/h                 # FFmpeg decode (cross-platform)
+│   │   ├── bitrate_ctrl.c/h           # AIMD adaptive bitrate controller
+│   │   ├── session.c/h               # session state machine + JSON payloads
+│   │   ├── session_log.c/h           # signed Nostr session event log (M2.4)
+│   │   ├── nostr.c/h                 # NIP-17 DMs, NIP-51 allowlist, relay pool
+│   │   ├── signer.c/h                # pluggable signer abstraction (direct-key, NIP-46, NIP-55L, NIP-5F)
+│   │   ├── agent.c/h                 # agent action handler + tree serializer
+│   │   ├── action.c/h                # action parse/encode (click, type, scroll, key)
+│   │   ├── packet.c/h                # wire format encode/decode
+│   │   ├── stream.c/h                # TCP stream transport + keepalive
+│   │   ├── ipc.h + ipc_unix.c/ipc_win32.c  # Unix/Win32 domain socket IPC
+│   │   ├── jsonrpc.c/h               # JSON-RPC 2.0 message layer
+│   │   ├── mcp_server.c/h            # MCP server core (tool/resource registry)
+│   │   ├── mcp_tools.c/h             # MCP tool implementations
+│   │   ├── mcp_resources.c/h         # MCP resource implementations
+│   │   ├── mcp_bridge.c/h            # MCP bridge (a11y + input → MCP server)
+│   │   ├── mcp_http.c/h              # MCP HTTP+SSE transport
+│   │   ├── mcp_stdio.c/h             # MCP stdio transport
+│   │   ├── fips_addr.c/h             # FIPS fd00::/8 address derivation
+│   │   ├── secrets.c/h               # 1Password Connect integration
+│   │   └── platform.h                # platform detection macros
+│   ├── host/                          # metadesk-host daemon
 │   │   └── main.c
-│   ├── client/                         # metadesk-client (human)
+│   ├── client/                        # metadesk-client (human video client)
 │   │   ├── main.c
-│   │   ├── render.c/h                  # SDL2 frame display
-│   │   └── ui.cpp/h                    # Dear ImGui overlay
-│   └── fips-nat/                       # NAT traversal daemon
+│   │   ├── render.c/h                # SDL2 frame display + HiDPI scaling
+│   │   └── ui.cpp/h                  # Dear ImGui overlay (peer list, allowlist, approval)
+│   └── fips-nat/                      # NAT traversal daemon
 │       ├── main.c
-│       ├── stun.c/h                    # libnice integration
-│       ├── publish.c/h                 # Nostr address publication
-│       └── punch.c/h                   # hole punch coordinator
+│       ├── stun.c/h                  # RFC 5389 STUN binding discovery
+│       ├── punch.c/h                 # UDP hole punch coordinator
+│       ├── turn.c/h                  # RFC 5766 TURN relay client
+│       ├── publish.c/h              # Nostr NAT endpoint publication
+│       └── fipsnat_ipc.c/h          # IPC protocol for host ↔ fips-nat
 ├── subprojects/
-│   └── imgui/                          # Dear ImGui vendored
-├── tests/
-│   ├── test_packet.c                   # wire format round-trip tests
-│   ├── test_a11y.c                     # tree serialisation tests
-│   └── test_nostr.c                    # NIP-44 encrypt/decrypt tests
-├── config/
-│   └── metadesk.toml.example           # example config (no secrets)
+│   └── imgui/                         # Dear ImGui vendored
+├── tests/                             # 25+ unit test executables
+│   ├── test_packet.c                  # wire format round-trip
+│   ├── test_atspi.c                   # a11y tree serialisation + compact format + delta patching
+│   ├── test_nostr.c                   # NIP-44 encrypt/decrypt + allowlist
+│   ├── test_session.c                 # session JSON + state machine + tree format negotiation
+│   ├── test_session_log.c             # signed session log ring buffer
+│   ├── test_signer.c                  # signer abstraction (+ NIP-46/55L/5F integration tests)
+│   ├── test_agent.c                   # agent action handler
+│   ├── test_action.c                  # action parse/encode
+│   ├── test_stream.c                  # TCP stream transport
+│   ├── test_encode.c                  # encode/decode round-trip
+│   ├── test_input.c                   # input injection
+│   ├── test_capture.c                 # capture convenience API
+│   ├── test_stun.c                    # STUN binding discovery
+│   ├── test_punch.c                   # UDP hole punch
+│   ├── test_turn.c                    # TURN relay client
+│   ├── test_publish.c                 # NAT endpoint publication
+│   ├── test_bitrate_ctrl.c            # AIMD bitrate controller
+│   ├── test_mcp.c                     # MCP server core
+│   ├── test_mcp_stdio.c              # MCP stdio transport
+│   ├── test_mcp_http.c               # MCP HTTP+SSE transport
+│   ├── test_jsonrpc.c                # JSON-RPC 2.0 messages
+│   ├── test_ipc.c                    # Unix domain sockets
+│   ├── test_fipsnat_ipc.c            # fips-nat IPC protocol
+│   ├── test_fips_addr.c              # FIPS address derivation
+│   └── test_secrets.c                # 1Password Connect secrets
+├── tools/
+│   ├── capture_frame.c               # single-frame capture utility
+│   ├── encode_roundtrip.c            # encode/decode benchmark
+│   └── atspi_dump.c                  # a11y tree dump utility
 └── docs/
-    └── AGENT_API.md                    # agent client integration guide
+    ├── metadesk-spec.md              # this document
+    └── metadesk-spec-phase-2.1.md    # Phase 2.1 implementation spec (archived)
 ```
 
 ---
 
-## 7. Secret Storage
+## 7. Secret Storage & Signer Abstraction
 
-> **Hard rule:** No secrets in config files, environment variables, or on-disk key files. All cryptographic material is retrieved at startup from 1Password Connect and held in locked memory (`mlock` on Linux/macOS, `VirtualLock` on Windows). The config file contains only the 1Password Connect URL and the item reference path.
+> **Hard rule:** No secrets in config files, environment variables, or on-disk key files. Cryptographic material is managed through a pluggable signer abstraction (`signer.h`) that supports multiple backends without exposing keys to metadesk.
+
+### 7.1 Signer Backends
+
+| Backend | Key Location | Transport | Use Case |
+|---|---|---|---|
+| `direct-key` | In-process memory | None (local secp256k1) | 1Password Connect retrieval, testing |
+| `NIP-46` | Remote bunker | Relay (kind:24133 RPC) | Signing delegation to remote device |
+| `NIP-55L` | Local daemon | D-Bus IPC | Linux desktop signer daemon |
+| `NIP-5F` | Local daemon | Unix domain socket | Cross-platform local signer |
+
+All signer operations (get_pubkey, sign_event, nip44_encrypt, nip44_decrypt) dispatch through a vtable. Remote backends never expose the key to metadesk. Auto-detection tries NIP-5F → NIP-55L in order.
+
+### 7.2 1Password Connect (Legacy Fallback)
+
+When no signer backend is available, the direct-key backend retrieves the nsec from 1Password Connect at startup and holds it in locked memory.
 
 | Secret | 1Password Item | Used By |
 |---|---|---|
@@ -511,39 +568,40 @@ metadesk/
 | 2 | Dogfood — OpenClaw agent fleet, NAT traversal, fips-nat | 2–3 months |
 | 3 | Product — Windows support, external users (contingent) | TBD |
 
-### 8.2 Phase 1 Milestones
+### 8.2 Phase 1 Milestones ✅
 
-- **1.1** Meson scaffold — builds cleanly on Linux and macOS, all cross-platform deps linked, HAL stub implementations compile on both platforms
-- **1.2** Linux capture — PipeWire portal frame to disk, DMA-BUF path confirmed on P40
-- **1.3** macOS capture — ScreenCaptureKit frame to disk on dev laptop
-- **1.4** Encode/decode round-trip — FFmpeg H.264 encode → SDL2 display, latency measured on both platforms
-- **1.5** Raw socket streaming — UDP packetizer, frame delivery Linux → macOS over LAN
-- **1.6** FIPS integration — replace raw socket with `fd00::npub` IPv6 peer address
-- **1.7** Linux input forwarding — uinput mouse + keyboard keysym injection
-- **1.8** macOS input forwarding — CGEvent mouse + keyboard
-- **1.9** Linux AT-SPI2 tree walker — serialize full tree, send as `MD_PKT_UI_TREE`
-- **1.10** macOS AXUIElement tree walker — same output format as AT-SPI2 backend
-- **1.11** Agent action handler — receive `MD_PKT_ACTION`, dispatch through input HAL
-- **1.12** Dear ImGui overlay — latency display, connection status, disconnect button
+All Phase 1 milestones are complete.
+
+- ✅ **1.1** Meson scaffold — builds cleanly on Linux and macOS, all cross-platform deps linked, HAL stub implementations compile on both platforms
+- ✅ **1.2** Linux capture — PipeWire portal frame to disk, DMA-BUF path confirmed on P40
+- ✅ **1.3** macOS capture — ScreenCaptureKit frame to disk on dev laptop
+- ✅ **1.4** Encode/decode round-trip — FFmpeg H.264 encode → SDL2 display, latency measured on both platforms
+- ✅ **1.5** Raw socket streaming — UDP packetizer, frame delivery Linux → macOS over LAN
+- ✅ **1.6** FIPS integration — replace raw socket with `fd00::npub` IPv6 peer address
+- ✅ **1.7** Linux input forwarding — uinput mouse + keyboard keysym injection
+- ✅ **1.8** macOS input forwarding — CGEvent mouse + keyboard
+- ✅ **1.9** Linux AT-SPI2 tree walker — serialize full tree, send as `MD_PKT_UI_TREE`
+- ✅ **1.10** macOS AXUIElement tree walker — same output format as AT-SPI2 backend
+- ✅ **1.11** Agent action handler — receive `MD_PKT_ACTION`, dispatch through input HAL
+- ✅ **1.12** Dear ImGui overlay — latency display, connection status, disconnect button
 
 ### 8.3 Phase 2 Milestones
 
-- **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool
-- **2.2** fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node
-- **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
-- **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log
-- **2.4** Adaptive bitrate — RTT feedback loop to encoder bitrate target
-- **2.5** UI session manager — peer list, allowlist management, approval popup
-- **2.6** Dogfood gate — 30 days on OpenClaw fleet, all discovered bugs resolved
+- ✅ **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool. Pluggable signer abstraction with NIP-46, NIP-55L, and NIP-5F backends.
+- ✅ **2.2** fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node
+- ✅ **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
+- ✅ **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log (kind:1078)
+- ✅ **2.5** Adaptive bitrate — AIMD RTT feedback loop to encoder bitrate target
+- ✅ **2.6** UI session manager — peer list, allowlist management, approval popup, compact tree format + delta patching, tree format negotiation
+- ⏳ **2.7** Dogfood gate — 30 days on OpenClaw fleet, all discovered bugs resolved
 
 ### 8.4 Phase 3 Milestones (contingent)
 
 - **3.1** Windows host — DXGI capture + UI Automation + SendInput backends
 - **3.2** Windows client — build and package metadesk-client for Windows
-- **3.3** NIP-46 bunker integration — approval delegated to signing device
-- **3.4** Multi-monitor and display selection
-- **3.5** File transfer over FIPS session channel
-- **3.6** Hardening — packet parser fuzzing, Debian/RPM/Homebrew packaging, release signing
+- **3.3** Multi-monitor and display selection
+- **3.4** File transfer over FIPS session channel
+- **3.5** Hardening — packet parser fuzzing, Debian/RPM/Homebrew packaging, release signing
 
 ---
 
