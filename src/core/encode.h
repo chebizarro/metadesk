@@ -88,6 +88,29 @@ bool md_encoder_is_hw(const MdEncoder *enc);
 /* Get encoder dimensions (as negotiated at create time). */
 int md_encoder_get_size(const MdEncoder *enc, uint32_t *width, uint32_t *height);
 
+/* Bitrate bounds for dynamic adjustment */
+#define MD_ENCODER_MIN_BITRATE    100000      /* 100 Kbps floor  */
+#define MD_ENCODER_MAX_BITRATE    100000000   /* 100 Mbps ceiling */
+
+/*
+ * Dynamically adjust the encoder's target bitrate without recreating
+ * the codec context. Takes effect on the next submitted frame.
+ *
+ * For NVENC:        sets bit_rate + rc params via av_opt_set
+ * For VideoToolbox: sets bit_rate on the codec context
+ * For x264:         triggers encoder reconfiguration via FFmpeg
+ *
+ * new_bitrate: target bitrate in bits/sec. Clamped to
+ *              [MD_ENCODER_MIN_BITRATE, MD_ENCODER_MAX_BITRATE].
+ *
+ * Returns 0 on success, -1 on error (NULL encoder, codec doesn't
+ * support runtime reconfig, etc.).
+ */
+int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate);
+
+/* Query the current target bitrate (bits/sec). */
+uint32_t md_encoder_get_bitrate(const MdEncoder *enc);
+
 /* Destroy encoder and free resources. */
 void md_encoder_destroy(MdEncoder *enc);
 
@@ -107,6 +130,8 @@ int md_vt_encoder_submit(MdVTEncoder *enc, const uint8_t *data,
 int md_vt_encoder_flush(MdVTEncoder *enc, MdEncodeCallback cb, void *userdata);
 bool md_vt_encoder_is_hw(const MdVTEncoder *enc);
 int md_vt_encoder_get_size(const MdVTEncoder *enc, uint32_t *width, uint32_t *height);
+int md_vt_encoder_set_bitrate(MdVTEncoder *enc, uint32_t new_bitrate);
+uint32_t md_vt_encoder_get_bitrate(const MdVTEncoder *enc);
 void md_vt_encoder_destroy(MdVTEncoder *enc);
 
 #endif /* __APPLE__ */

@@ -379,6 +379,211 @@ static int test_decode_from_encoded(void) {
     return 0;
 }
 
+/* ── Test: get_bitrate ────────────────────────────────────────── */
+
+static int test_encoder_get_bitrate(void) {
+    printf("  test_encoder_get_bitrate... ");
+
+    /* NULL encoder should return 0 */
+    assert(md_encoder_get_bitrate(NULL) == 0);
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 5000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    /* Should return the configured bitrate */
+    assert(md_encoder_get_bitrate(enc) == 5000000);
+
+    md_encoder_destroy(enc);
+
+    /* Zero bitrate in config → should return default */
+    cfg.bitrate = 0;
+    enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_DEFAULT_BITRATE);
+    md_encoder_destroy(enc);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: set_bitrate basic ─────────────────────────────────── */
+
+static int test_encoder_set_bitrate(void) {
+    printf("  test_encoder_set_bitrate... ");
+
+    /* NULL encoder should fail */
+    assert(md_encoder_set_bitrate(NULL, 4000000) == -1);
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 8000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    /* Set a new bitrate */
+    assert(md_encoder_set_bitrate(enc, 4000000) == 0);
+    assert(md_encoder_get_bitrate(enc) == 4000000);
+
+    /* Set again */
+    assert(md_encoder_set_bitrate(enc, 12000000) == 0);
+    assert(md_encoder_get_bitrate(enc) == 12000000);
+
+    md_encoder_destroy(enc);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: set_bitrate clamping ──────────────────────────────── */
+
+static int test_encoder_set_bitrate_clamp(void) {
+    printf("  test_encoder_set_bitrate_clamp... ");
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 8000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    /* Below minimum → clamped to MIN */
+    assert(md_encoder_set_bitrate(enc, 1000) == 0);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+
+    /* Zero → clamped to MIN */
+    assert(md_encoder_set_bitrate(enc, 0) == 0);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+
+    /* Above maximum → clamped to MAX */
+    assert(md_encoder_set_bitrate(enc, 500000000) == 0);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
+
+    /* Exactly at bounds */
+    assert(md_encoder_set_bitrate(enc, MD_ENCODER_MIN_BITRATE) == 0);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+
+    assert(md_encoder_set_bitrate(enc, MD_ENCODER_MAX_BITRATE) == 0);
+    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
+
+    md_encoder_destroy(enc);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: encode frames after bitrate change ────────────────── */
+
+static int test_encode_after_bitrate_change(void) {
+    printf("  test_encode_after_bitrate_change... ");
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 8000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    uint32_t stride = TEST_W * 4;
+    uint8_t *buf = malloc((size_t)stride * TEST_H);
+    assert(buf != NULL);
+
+    g_encoded_count = 0;
+
+    /* Encode 5 frames at 8 Mbps */
+    for (int i = 0; i < 5; i++) {
+        fill_solid(buf, TEST_W, TEST_H, stride, 200, 100, 50);
+        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+                                 (int64_t)i, on_encode, NULL) == 0);
+    }
+    int before = g_encoded_count;
+
+    /* Change bitrate to 2 Mbps */
+    assert(md_encoder_set_bitrate(enc, 2000000) == 0);
+    assert(md_encoder_get_bitrate(enc) == 2000000);
+
+    /* Encode 5 more frames at 2 Mbps */
+    for (int i = 5; i < 10; i++) {
+        fill_solid(buf, TEST_W, TEST_H, stride, 50, 200, 100);
+        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+                                 (int64_t)i, on_encode, NULL) == 0);
+    }
+
+    /* Change bitrate to 16 Mbps */
+    assert(md_encoder_set_bitrate(enc, 16000000) == 0);
+    assert(md_encoder_get_bitrate(enc) == 16000000);
+
+    /* Encode 5 more frames at 16 Mbps */
+    for (int i = 10; i < 15; i++) {
+        fill_solid(buf, TEST_W, TEST_H, stride, 100, 50, 200);
+        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+                                 (int64_t)i, on_encode, NULL) == 0);
+    }
+
+    md_encoder_flush(enc, on_encode, NULL);
+
+    /* Should have encoded packets across all three bitrate settings */
+    assert(g_encoded_count > before);
+
+    printf("OK (%d packets from 15 frames, 3 bitrate levels)\n", g_encoded_count);
+
+    free(buf);
+    md_encoder_destroy(enc);
+    return 0;
+}
+
+/* ── Test: rapid bitrate oscillation ─────────────────────────── */
+
+static int test_bitrate_rapid_changes(void) {
+    printf("  test_bitrate_rapid_changes... ");
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 4000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    uint32_t stride = TEST_W * 4;
+    uint8_t *buf = malloc((size_t)stride * TEST_H);
+    assert(buf != NULL);
+
+    g_encoded_count = 0;
+
+    /* Change bitrate before every frame */
+    uint32_t bitrates[] = {1000000, 8000000, 500000, 20000000, 3000000,
+                           100000, 50000000, 2000000, 10000000, 4000000};
+
+    for (int i = 0; i < 10; i++) {
+        assert(md_encoder_set_bitrate(enc, bitrates[i]) == 0);
+        fill_solid(buf, TEST_W, TEST_H, stride,
+                   (uint8_t)(i * 25), (uint8_t)(255 - i * 25), 128);
+        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+                                 (int64_t)i, on_encode, NULL) == 0);
+    }
+
+    md_encoder_flush(enc, on_encode, NULL);
+    assert(g_encoded_count > 0);
+
+    printf("OK (%d packets, 10 bitrate changes)\n", g_encoded_count);
+
+    free(buf);
+    md_encoder_destroy(enc);
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -395,6 +600,11 @@ int main(void) {
     failures += test_decoder_flush_empty();
     failures += test_encoder_get_size_null();
     failures += test_decode_from_encoded();
+    failures += test_encoder_get_bitrate();
+    failures += test_encoder_set_bitrate();
+    failures += test_encoder_set_bitrate_clamp();
+    failures += test_encode_after_bitrate_change();
+    failures += test_bitrate_rapid_changes();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return failures;

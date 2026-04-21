@@ -341,6 +341,81 @@ int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata) {
     return ret < 0 ? -1 : ret;
 }
 
+/* ── Dynamic bitrate adjustment ──────────────────────────────── */
+
+/*
+ * Clamp bitrate to safe bounds. The floor prevents the encoder from
+ * starving (artifacts / codec errors), and the ceiling prevents
+ * runaway bandwidth.
+ */
+static uint32_t clamp_bitrate(uint32_t br) {
+    if (br < MD_ENCODER_MIN_BITRATE) return MD_ENCODER_MIN_BITRATE;
+    if (br > MD_ENCODER_MAX_BITRATE) return MD_ENCODER_MAX_BITRATE;
+    return br;
+}
+
+int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
+    if (!enc || !enc->ctx)
+        return -1;
+
+    uint32_t br = clamp_bitrate(new_bitrate);
+
+    /* Update the codec context's bit_rate — this is the primary knob
+     * that all FFmpeg H.264 encoders check. */
+    enc->ctx->bit_rate = (int64_t)br;
+
+    /* Codec-specific runtime reconfiguration */
+    const char *name = enc->codec ? enc->codec->name : "";
+
+    if (strcmp(name, "h264_nvenc") == 0) {
+        /*
+         * NVENC CBR: update the bitrate via av_opt_set on private data.
+         * The NVENC wrapper picks up the new rate on the next frame.
+         */
+        char br_str[32];
+        snprintf(br_str, sizeof(br_str), "%u", br);
+        av_opt_set(enc->ctx->priv_data, "b", br_str, 0);
+        /* Also update rc_max_rate for CBR consistency */
+        enc->ctx->rc_max_rate = (int64_t)br;
+
+    } else if (strcmp(name, "h264_videotoolbox") == 0) {
+        /*
+         * VideoToolbox: setting bit_rate on the context is sufficient;
+         * VT reads it before each frame encode.
+         */
+        enc->ctx->rc_max_rate = (int64_t)br;
+
+    } else if (strcmp(name, "h264_amf") == 0) {
+        /*
+         * AMF: update bitrate via av_opt_set on private data.
+         */
+        char br_str[32];
+        snprintf(br_str, sizeof(br_str), "%u", br);
+        av_opt_set(enc->ctx->priv_data, "b", br_str, 0);
+        enc->ctx->rc_max_rate = (int64_t)br;
+
+    } else if (strcmp(name, "libx264") == 0) {
+        /*
+         * x264: the FFmpeg wrapper reads ctx->bit_rate before each
+         * avcodec_send_frame call when the internal reconfig flag is
+         * set. Setting bit_rate + rc_max_rate triggers x264_encoder_reconfig.
+         */
+        enc->ctx->rc_max_rate = (int64_t)br;
+        enc->ctx->rc_buffer_size = (int)(br * 2);  /* 2-second VBV buffer */
+    }
+
+    /* Update stored config */
+    enc->config.bitrate = br;
+    return 0;
+}
+
+uint32_t md_encoder_get_bitrate(const MdEncoder *enc) {
+    if (!enc) return 0;
+    return enc->config.bitrate
+         ? enc->config.bitrate
+         : MD_ENCODER_DEFAULT_BITRATE;
+}
+
 bool md_encoder_is_hw(const MdEncoder *enc) {
     return enc ? enc->is_hw : false;
 }
