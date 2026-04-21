@@ -112,8 +112,8 @@ typedef struct {
  * All subscriptions persist until md_nostr_destroy().
  */
 
-/* Create Nostr bridge. Connects to relays, derives pubkey,
- * subscribes to kind:1059 gift-wraps if on_dm callback is set. */
+/* Create Nostr bridge. Connects to relays, probes NIP-11 relay info,
+ * derives pubkey, subscribes to kind:1059 gift-wraps if on_dm is set. */
 MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs);
 
 /* Get the local pubkey hex string (owned by MdNostr, do not free). */

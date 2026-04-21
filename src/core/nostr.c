@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <json.h>
+#include <nip11.h>
 
 /* ── Hex ↔ bytes helpers (nostr keys are hex, NIP-44 wants uint8_t[32]) ── */
 static int hex_char_val(char c) {
@@ -396,6 +397,88 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
     }
 }
 
+/* ── NIP-11 relay capability probing ──────────────────────────
+ * Fetch the NIP-11 relay information document for each relay URL.
+ * This is an HTTPS GET to the same URL (with wss:// → https://).
+ *
+ * We log capabilities and warn about:
+ *   - auth_required relays (NIP-42 handler must be wired up)
+ *   - relays that don't list NIP-17 in supported_nips
+ *   - max_content_length or max_message_length limits
+ *
+ * This runs synchronously during create — relay info documents are
+ * typically tiny (~1 KB) and returned in < 500ms.
+ */
+static void probe_relay_nip11(const char *wss_url) {
+    if (!wss_url) return;
+
+    /* Convert wss:// to https:// (or ws:// to http://) for NIP-11 */
+    char http_url[512];
+    if (strncmp(wss_url, "wss://", 6) == 0) {
+        snprintf(http_url, sizeof(http_url), "https://%s", wss_url + 6);
+    } else if (strncmp(wss_url, "ws://", 5) == 0) {
+        snprintf(http_url, sizeof(http_url), "http://%s", wss_url + 5);
+    } else {
+        snprintf(http_url, sizeof(http_url), "%s", wss_url);
+    }
+
+    RelayInformationDocument *info = nostr_nip11_fetch_info(http_url);
+    if (!info) {
+        fprintf(stderr, "nostr: NIP-11 probe failed for %s (relay may not support NIP-11)\n",
+                wss_url);
+        return;
+    }
+
+    /* Log relay identity */
+    fprintf(stderr, "nostr: NIP-11 %s — %s",
+            wss_url, info->name ? info->name : "(unnamed)");
+    if (info->software)
+        fprintf(stderr, " [%s%s%s]",
+                info->software,
+                info->version ? " " : "",
+                info->version ? info->version : "");
+    fprintf(stderr, "\n");
+
+    /* Check supported NIPs */
+    bool has_nip17 = false;
+    bool has_nip42 = false;
+    if (info->supported_nips && info->supported_nips_count > 0) {
+        fprintf(stderr, "nostr:   supported NIPs:");
+        for (int i = 0; i < info->supported_nips_count; i++) {
+            fprintf(stderr, " %d", info->supported_nips[i]);
+            if (info->supported_nips[i] == 17) has_nip17 = true;
+            if (info->supported_nips[i] == 42) has_nip42 = true;
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (!has_nip17) {
+        fprintf(stderr, "nostr:   WARNING: relay does not advertise NIP-17 "
+                "(gift-wrapped DMs may not be supported)\n");
+    }
+
+    /* Check limitations */
+    if (info->limitation) {
+        if (info->limitation->auth_required) {
+            fprintf(stderr, "nostr:   NOTE: relay requires NIP-42 authentication%s\n",
+                    has_nip42 ? " (handler installed)" : " (WARNING: NIP-42 not advertised)");
+        }
+        if (info->limitation->max_content_length > 0) {
+            fprintf(stderr, "nostr:   max content length: %d bytes\n",
+                    info->limitation->max_content_length);
+        }
+        if (info->limitation->max_message_length > 0) {
+            fprintf(stderr, "nostr:   max message length: %d bytes\n",
+                    info->limitation->max_message_length);
+        }
+        if (info->limitation->payment_required) {
+            fprintf(stderr, "nostr:   WARNING: relay requires payment\n");
+        }
+    }
+
+    nostr_nip11_free_info(info);
+}
+
 /* ── Lifecycle ────────────────────────────────────────────── */
 
 MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) {
@@ -457,6 +540,12 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     /* Add all relay URLs — pool manages reconnection with backoff */
     for (int i = 0; i < cfg->relay_count; i++) {
         nostr_simple_pool_ensure_relay(n->pool, cfg->relay_urls[i]);
+    }
+
+    /* Probe each relay's NIP-11 info document for capability detection.
+     * This runs before pool start so we log any warnings early. */
+    for (int i = 0; i < cfg->relay_count; i++) {
+        probe_relay_nip11(cfg->relay_urls[i]);
     }
 
     /* Snapshot relay pointers and URLs from pool.

@@ -78,6 +78,7 @@ foreach d : _sys_inc_dirs
 endforeach
 if _nostrc_root != ''
   _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
 endif
 nostrc_inc = include_directories(_nostrc_inc_paths)
 
@@ -126,6 +127,19 @@ dep_ssl = cc.find_library('ssl', required : true, dirs : _sys_lib_dirs)
 dep_crypto = cc.find_library('crypto', required : true, dirs : _sys_lib_dirs)
 dep_nsync = cc.find_library('nsync', required : true, dirs : _sys_lib_dirs)
 dep_nostr_json = cc.find_library('nostr_json', required : true, dirs : _sys_lib_dirs)
+
+# NIP-11 relay information document (requires libcurl for HTTP fetch)
+dep_curl = dependency('libcurl', version : '>=7.80', required : true)
+dep_nip11_lib = cc.find_library('nip11', required : false, dirs : _sys_lib_dirs)
+if dep_nip11_lib.found()
+  dep_nip11 = dep_nip11_lib
+elif _nostrc_build != ''
+  _nip11_obj = _nostrc_build / 'nips' / 'nip11' / 'CMakeFiles' / 'nip11.dir' / 'src' / 'nip11.c.o'
+  dep_nip11 = declare_dependency(link_args : [_nip11_obj])
+  message('nip11: using build-tree object: ' + _nip11_obj)
+else
+  error('nip11 not found. Install nostrc or set -Dnostrc_root=<path>')
+endif
 
 # ── Platform HAL backend selection (spec §5.3) ──────────────────────────────
 # Each platform provides: capture, a11y, and input backend source files + deps.
@@ -215,6 +229,8 @@ core_deps = [
   dep_nip44,
   dep_nip51,
   dep_nip17,
+  dep_nip11,
+  dep_curl,
   dep_libgo,
   dep_secp256k1,
   dep_websockets,
