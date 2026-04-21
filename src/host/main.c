@@ -454,21 +454,7 @@ int main(int argc, char **argv) {
     }
     printf("host: listening on port %u\n", port);
 
-    /* Wait for client connection */
-    printf("host: waiting for client...\n");
-    MdStream *client = NULL;
-    while (g_running && !client) {
-        client = md_stream_server_accept(srv, 1000);
-    }
-    if (!client || !g_running) {
-        md_stream_server_destroy(srv);
-        return g_running ? 1 : 0;
-    }
-    printf("host: client connected\n");
-
-    /* Initialize encoder */
-    /* Note: dimensions are set after first capture frame. For Phase 1,
-     * we use a default 1920x1080 and resize if needed. */
+    /* Initialize encoder (persistent across reconnections) */
     MdEncoderConfig enc_cfg = {
         .width        = 1920,
         .height       = 1080,
@@ -480,14 +466,13 @@ int main(int argc, char **argv) {
     MdEncoder *encoder = md_encoder_create(&enc_cfg);
     if (!encoder) {
         fprintf(stderr, "ERROR: failed to create encoder\n");
-        md_stream_destroy(client);
         md_stream_server_destroy(srv);
         return 1;
     }
     printf("host: encoder ready (%s)\n",
            md_encoder_is_hw(encoder) ? "NVENC" : "x264");
 
-    /* Initialize input injection */
+    /* Initialize input injection (persistent) */
     MdInputConfig input_cfg = {
         .screen_width  = 1920,
         .screen_height = 1080,
@@ -499,7 +484,7 @@ int main(int argc, char **argv) {
         printf("host: input injection ready\n");
     }
 
-    /* Initialize accessibility tree walker */
+    /* Initialize accessibility tree walker (persistent) */
     MdA11yCtx *a11y = md_a11y_create();
     if (!a11y) {
         fprintf(stderr, "WARNING: accessibility tree unavailable — agent mode disabled\n");
@@ -507,7 +492,7 @@ int main(int argc, char **argv) {
         printf("host: accessibility tree connected\n");
     }
 
-    /* Initialize agent action handler */
+    /* Initialize agent action handler (persistent) */
     MdAgentConfig agent_cfg = {
         .a11y        = a11y,
         .input       = input,
@@ -516,18 +501,11 @@ int main(int argc, char **argv) {
     };
     MdAgent *agent = md_agent_create(&agent_cfg);
 
-    /* Set up host context (update fields set after TCP connect) */
+    /* Set persistent host context fields */
     ctx.encoder = encoder;
-    ctx.client  = client;
     ctx.agent   = agent;
 
-    /* Send initial UI tree to client */
-    if (agent && a11y) {
-        md_agent_send_tree(agent, client, &ctx.pkt_seq);
-        printf("host: sent initial UI tree\n");
-    }
-
-    /* Start screen capture */
+    /* Start screen capture (persistent — runs independently of clients) */
     MdCaptureCtx *capture = NULL;
     pthread_t cap_thread = 0;
     bool cap_thread_started = false;
@@ -547,7 +525,6 @@ int main(int argc, char **argv) {
                 capture = NULL;
             } else {
                 printf("host: capture started\n");
-                /* Spawn a thread to pull frames and encode */
                 cap_thr_ctx.host    = &ctx;
                 cap_thr_ctx.capture = capture;
                 if (pthread_create(&cap_thread, NULL, capture_thread_func, &cap_thr_ctx) == 0)
@@ -556,57 +533,108 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ── Main loop ───────────────────────────────────────────── */
-    printf("host: streaming... (Ctrl+C to stop)\n\n");
+    /* ══════════════════════════════════════════════════════════════
+     * Client accept + stream loop
+     *
+     * The host accepts a client, streams until disconnect, then
+     * loops back to accept the next connection.  Persistent resources
+     * (encoder, capture, a11y, agent) stay alive across reconnections.
+     * ══════════════════════════════════════════════════════════════ */
+    uint32_t client_num = 0;
 
-    uint32_t last_stats_ms = md_stream_now_ms();
-    uint32_t last_ping_ms = last_stats_ms;
-
-    while (g_running && md_stream_is_connected(client)) {
-        /* Check for incoming packets from client (non-blocking) */
-        MdPacketHeader hdr;
-        uint8_t *payload = NULL;
-        int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
-
-        if (ret == 0) {
-            handle_client_packet(&ctx, &hdr, payload);
-            free(payload);
-        } else if (ret < 0) {
-            /* Connection lost */
-            break;
+    while (g_running) {
+        /* Wait for client connection */
+        printf("host: waiting for client...\n");
+        MdStream *client = NULL;
+        while (g_running && !client) {
+            client = md_stream_server_accept(srv, 1000);
         }
-        /* ret == 1: timeout, no data — continue */
+        if (!client || !g_running) break;
 
-        uint32_t now = md_stream_now_ms();
+        client_num++;
+        printf("host: client #%u connected\n", client_num);
 
-        /* Send periodic ping for RTT measurement */
-        if (now - last_ping_ms >= 1000) {
-            md_stream_send_ping(client);
-            last_ping_ms = now;
+        /* Reset per-connection state */
+        ctx.client     = client;
+        ctx.pkt_seq    = 0;
+        ctx.frames_sent = 0;
+        ctx.total_encode_us = 0;
+        ctx.frames_encoded  = 0;
+
+        /* Send initial UI tree to new client */
+        if (agent && a11y) {
+            md_agent_send_tree(agent, client, &ctx.pkt_seq);
+            printf("host: sent initial UI tree to client #%u\n", client_num);
         }
 
-        /* Print stats every 5 seconds */
-        if (now - last_stats_ms >= 5000) {
-            MdStreamStats stats;
-            md_stream_get_stats(client, &stats);
+        /* ── Streaming loop ─────────────────────────────────────── */
+        printf("host: streaming to client #%u (Ctrl+C to stop)\n", client_num);
 
-            double avg_encode_ms = ctx.frames_encoded > 0
-                ? (double)ctx.total_encode_us / ctx.frames_encoded / 1000.0
-                : 0.0;
+        uint32_t last_stats_ms = md_stream_now_ms();
+        uint32_t last_ping_ms = last_stats_ms;
 
-            printf("host: frames=%u sent=%u encode_avg=%.1fms "
-                   "rtt=%ums rtt_avg=%ums tx=%.1fMB rx=%.1fKB\n",
-                   ctx.frames_encoded, ctx.frames_sent,
-                   avg_encode_ms,
-                   stats.last_rtt_ms, stats.avg_rtt_ms,
-                   (double)stats.bytes_sent / (1024.0 * 1024.0),
-                   (double)stats.bytes_recv / 1024.0);
+        while (g_running && md_stream_is_connected(client)) {
+            /* Check for incoming packets from client (non-blocking) */
+            MdPacketHeader hdr;
+            uint8_t *payload = NULL;
+            int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
 
-            last_stats_ms = now;
+            if (ret == 0) {
+                handle_client_packet(&ctx, &hdr, payload);
+                free(payload);
+            } else if (ret < 0) {
+                /* Connection lost */
+                break;
+            }
+            /* ret == 1: timeout, no data — continue */
+
+            uint32_t now = md_stream_now_ms();
+
+            /* Send periodic ping for RTT measurement */
+            if (now - last_ping_ms >= 1000) {
+                md_stream_send_ping(client);
+                last_ping_ms = now;
+            }
+
+            /* Print stats every 5 seconds */
+            if (now - last_stats_ms >= 5000) {
+                MdStreamStats stats;
+                md_stream_get_stats(client, &stats);
+
+                double avg_encode_ms = ctx.frames_encoded > 0
+                    ? (double)ctx.total_encode_us / ctx.frames_encoded / 1000.0
+                    : 0.0;
+
+                printf("host: [#%u] frames=%u sent=%u encode_avg=%.1fms "
+                       "rtt=%ums rtt_avg=%ums tx=%.1fMB rx=%.1fKB\n",
+                       client_num,
+                       ctx.frames_encoded, ctx.frames_sent,
+                       avg_encode_ms,
+                       stats.last_rtt_ms, stats.avg_rtt_ms,
+                       (double)stats.bytes_sent / (1024.0 * 1024.0),
+                       (double)stats.bytes_recv / 1024.0);
+
+                last_stats_ms = now;
+            }
         }
+
+        /* Client disconnected — clean up per-connection resources */
+        printf("host: client #%u disconnected (sent %u frames)\n",
+               client_num, ctx.frames_sent);
+
+        /* Flush any buffered encoder output before destroying the stream */
+        md_encoder_flush(encoder, on_encoded, &ctx);
+
+        /* Null out client before destroying so capture thread stops sending */
+        ctx.client = NULL;
+        md_stream_destroy(client);
+
+        if (!g_running) break;
+
+        printf("host: ready for next connection\n");
     }
 
-    /* ── Shutdown ────────────────────────────────────────────── */
+    /* ── Shutdown ────────────────────────────────────────────────── */
     printf("\nhost: shutting down...\n");
 
     if (capture) {
@@ -616,7 +644,6 @@ int main(int argc, char **argv) {
         md_capture_destroy(capture);
     }
 
-    md_encoder_flush(encoder, on_encoded, &ctx);
     md_encoder_destroy(encoder);
 
     if (agent) {
@@ -628,7 +655,6 @@ int main(int argc, char **argv) {
     if (input)
         md_input_destroy(input);
 
-    md_stream_destroy(client);
     md_stream_server_destroy(srv);
 
     if (nostr)
@@ -636,7 +662,6 @@ int main(int argc, char **argv) {
     else if (signer)
         md_signer_destroy(signer);
 
-    printf("host: done. sent %u frames in %u packets\n",
-           ctx.frames_encoded, ctx.frames_sent);
+    printf("host: done. served %u client(s)\n", client_num);
     return 0;
 }
