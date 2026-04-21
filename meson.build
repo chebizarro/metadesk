@@ -543,3 +543,9 @@ test_stun = executable('test_stun',
   include_directories : [include_directories('src/fips-nat')],
 )
 test('STUN binding discovery', test_stun)
+
+test_punch = executable('test_punch',
+  files('tests/test_punch.c', 'src/fips-nat/punch.c', 'src/fips-nat/stun.c'),
+  include_directories : [include_directories('src/fips-nat')],
+)
+test('UDP hole punch', test_punch, timeout : 10)
