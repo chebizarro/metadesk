@@ -549,3 +549,10 @@ test_punch = executable('test_punch',
   include_directories : [include_directories('src/fips-nat')],
 )
 test('UDP hole punch', test_punch, timeout : 10)
+
+test_publish = executable('test_publish',
+  files('tests/test_publish.c', 'src/fips-nat/publish.c', 'src/fips-nat/stun.c'),
+  include_directories : [core_inc, include_directories('src/fips-nat')],
+  dependencies : [dep_metadesk],
+)
+test('NAT endpoint publication', test_publish)
