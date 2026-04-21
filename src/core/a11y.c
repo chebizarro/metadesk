@@ -163,6 +163,22 @@ char *md_a11y_to_json(const MdA11yNode *root) {
 
 /* ── Compact format (spec §3.3.2) ──────────────────────────── */
 
+/*
+ * Compact interactable list — token-efficient format for agent clients.
+ *
+ * Only interactable elements are emitted (buttons, text entries, menus,
+ * checkboxes, etc.). Container nodes (windows, dialogs, apps) provide
+ * structural context. Decorative/structural nodes (panels, separators,
+ * scroll bars, images, labels) are skipped but their children are still
+ * walked — an interactable nested under a panel still appears.
+ *
+ * Format per spec §3.3.2:
+ *   WIN[1] gedit - untitled
+ *     BTN[42] Save *enabled*
+ *     TXT[44] <focused> 'Hello world...'
+ *     MNU[45] File
+ */
+
 /* Role abbreviation map */
 static const char *role_abbrev(const char *role) {
     if (!role) return "???";
@@ -200,6 +216,49 @@ static const char *role_abbrev(const char *role) {
     return "UNK";
 }
 
+/*
+ * Interactable classification. Returns true if the node should be
+ * emitted in compact output. Container roles (WIN, APP, DSK, DLG)
+ * are always emitted for structural context. Leaf interactable roles
+ * (BTN, TXT, MNU, CHK, etc.) are the primary targets. Decorative
+ * roles (PNL, SCR, SEP, IMG, LBL, STS) are skipped — but their
+ * children are still walked.
+ */
+static bool is_interactable(const char *role) {
+    if (!role) return false;
+    /* Containers — always show for context */
+    if (strcmp(role, "frame") == 0 || strcmp(role, "window") == 0) return true;
+    if (strcmp(role, "application") == 0) return true;
+    if (strcmp(role, "desktop frame") == 0 || strcmp(role, "desktop") == 0) return true;
+    if (strcmp(role, "dialog") == 0) return true;
+    /* Interactive controls — the primary targets */
+    if (strcmp(role, "push button") == 0 || strcmp(role, "button") == 0) return true;
+    if (strcmp(role, "toggle button") == 0) return true;
+    if (strcmp(role, "text") == 0 || strcmp(role, "entry") == 0) return true;
+    if (strcmp(role, "menu") == 0 || strcmp(role, "menu bar") == 0) return true;
+    if (strcmp(role, "menu item") == 0) return true;
+    if (strcmp(role, "check box") == 0) return true;
+    if (strcmp(role, "radio button") == 0) return true;
+    if (strcmp(role, "combo box") == 0) return true;
+    if (strcmp(role, "list item") == 0) return true;
+    if (strcmp(role, "tab") == 0) return true;
+    if (strcmp(role, "page tab") == 0) return true;
+    if (strcmp(role, "link") == 0) return true;
+    if (strcmp(role, "slider") == 0) return true;
+    if (strcmp(role, "spin button") == 0) return true;
+    if (strcmp(role, "tree") == 0) return true;
+    if (strcmp(role, "table") == 0) return true;
+    if (strcmp(role, "list") == 0) return true;
+    /* Everything else is decorative / structural — skip it */
+    return false;
+}
+
+/* Returns true if the role is a text input (content should be quoted) */
+static bool is_text_role(const char *role) {
+    if (!role) return false;
+    return strcmp(role, "text") == 0 || strcmp(role, "entry") == 0;
+}
+
 static int has_state(const MdA11yNode *node, const char *state) {
     if (!node->states) return 0;
     for (int i = 0; i < node->state_count; i++) {
@@ -209,45 +268,98 @@ static int has_state(const MdA11yNode *node, const char *state) {
     return 0;
 }
 
-/* Append a node in compact format. Returns chars written. */
+/* Append state annotations. Returns chars written. */
+static int compact_states(const MdA11yNode *node, char *buf, size_t buf_len) {
+    size_t written = 0;
+    int n;
+
+    /* State annotations in priority order */
+    static const struct { const char *state; const char *fmt; } state_map[] = {
+        { "focused",  " <focused>" },
+        { "enabled",  " *enabled*" },
+        { "disabled", " *disabled*" },
+        { "checked",  " *checked*" },
+        { "selected", " *selected*" },
+        { "pressed",  " *pressed*" },
+        { "expanded", " *expanded*" },
+    };
+
+    for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++) {
+        if (has_state(node, state_map[i].state)) {
+            n = snprintf(buf + written, buf_len - written, "%s", state_map[i].fmt);
+            if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+        }
+    }
+    return (int)written;
+}
+
+/*
+ * Append a node in compact format. Applies interactable filtering:
+ * non-interactable nodes are skipped but their children are still
+ * walked (so interactive elements nested under panels still appear).
+ *
+ * Returns chars written.
+ */
 static int compact_node(const MdA11yNode *node, int depth, char *buf, size_t buf_len) {
     if (!node || buf_len == 0) return 0;
 
     size_t written = 0;
     int n;
+    bool emit = is_interactable(node->role);
 
-    /* Indentation */
-    for (int i = 0; i < depth; i++) {
-        n = snprintf(buf + written, buf_len - written, "  ");
+    if (emit) {
+        /* Indentation */
+        for (int i = 0; i < depth; i++) {
+            n = snprintf(buf + written, buf_len - written, "  ");
+            if (n < 0 || (size_t)n >= buf_len - written) return (int)written;
+            written += (size_t)n;
+        }
+
+        /* ROLE[id] */
+        const char *abbr = role_abbrev(node->role);
+        const char *id = node->id ? node->id : "?";
+        n = snprintf(buf + written, buf_len - written, "%s[%s]", abbr, id);
         if (n < 0 || (size_t)n >= buf_len - written) return (int)written;
         written += (size_t)n;
-    }
 
-    /* ROLE[id] label *states* */
-    const char *abbr = role_abbrev(node->role);
-    const char *id = node->id ? node->id : "?";
-    const char *label = node->label ? node->label : "";
+        /* For text entries: <focused> before quoted content (spec §3.3.2) */
+        if (is_text_role(node->role)) {
+            if (has_state(node, "focused")) {
+                n = snprintf(buf + written, buf_len - written, " <focused>");
+                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+            }
+            /* Quote text content with single quotes */
+            const char *label = node->label ? node->label : "";
+            n = snprintf(buf + written, buf_len - written, " '%s'", label);
+            if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+            /* Remaining states (exclude focused — already emitted) */
+            if (has_state(node, "enabled")) {
+                n = snprintf(buf + written, buf_len - written, " *enabled*");
+                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+            }
+            if (has_state(node, "disabled")) {
+                n = snprintf(buf + written, buf_len - written, " *disabled*");
+                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+            }
+        } else {
+            /* Non-text: label then states */
+            const char *label = node->label ? node->label : "";
+            if (label[0]) {
+                n = snprintf(buf + written, buf_len - written, " %s", label);
+                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+            }
+            written += (size_t)compact_states(node, buf + written, buf_len - written);
+        }
 
-    n = snprintf(buf + written, buf_len - written, "%s[%s] %s", abbr, id, label);
-    if (n < 0 || (size_t)n >= buf_len - written) return (int)written;
-    written += (size_t)n;
-
-    /* State annotations */
-    if (has_state(node, "focused")) {
-        n = snprintf(buf + written, buf_len - written, " <focused>");
+        n = snprintf(buf + written, buf_len - written, "\n");
         if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
     }
-    if (has_state(node, "enabled")) {
-        n = snprintf(buf + written, buf_len - written, " *enabled*");
-        if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-    }
 
-    n = snprintf(buf + written, buf_len - written, "\n");
-    if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-
-    /* Recurse children */
+    /* Always recurse children — interactables under skipped nodes still show.
+     * When a node is skipped, children inherit the parent's depth. */
+    int child_depth = emit ? depth + 1 : depth;
     for (int i = 0; i < node->child_count && node->children; i++) {
-        int child_written = compact_node(node->children[i], depth + 1,
+        int child_written = compact_node(node->children[i], child_depth,
                                          buf + written, buf_len - written);
         written += (size_t)child_written;
     }

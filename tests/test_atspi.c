@@ -94,9 +94,87 @@ static void test_compact_serialization(void) {
     assert(strstr(compact, "TXT[44]") != NULL);
     assert(strstr(compact, "<focused>") != NULL);
 
+    /* §3.3.2: Text entries get quoted content with single quotes */
+    assert(strstr(compact, "'Hello'") != NULL);
+    /* §3.3.2: <focused> appears before quoted content for text entries */
+    {
+        const char *focused = strstr(compact, "<focused>");
+        const char *quoted = strstr(compact, "'Hello'");
+        assert(focused != NULL && quoted != NULL);
+        assert(focused < quoted);  /* <focused> before 'Hello' */
+    }
+
     free(compact);
     md_a11y_node_free(root);
     printf("  PASS: compact serialization\n");
+}
+
+/* §3.3.2: Interactable filtering — decorative nodes are skipped but their
+ * interactable children still appear. */
+static void test_compact_interactable_filtering(void) {
+    MdA11yNode *root = make_node("1", "window", "App",
+                                  0, 0, 1920, 1080);
+    /* Panel is decorative — should be skipped */
+    MdA11yNode *panel = make_node("10", "panel", "", 0, 0, 500, 500);
+    node_add_child(root, panel);
+
+    /* Button nested under panel — should still appear */
+    MdA11yNode *btn = make_node("20", "button", "OK", 10, 10, 80, 30);
+    node_add_child(panel, btn);
+
+    /* Label is decorative — should be skipped entirely */
+    MdA11yNode *lbl = make_node("30", "label", "Status", 100, 10, 80, 20);
+    node_add_child(root, lbl);
+
+    /* Dialog is a container — should appear */
+    MdA11yNode *dlg = make_node("40", "dialog", "Confirm", 200, 200, 400, 300);
+    node_add_child(root, dlg);
+
+    MdA11yNode *chk = make_node("50", "check box", "Remember", 210, 250, 120, 20);
+    node_add_state(chk, "checked");
+    node_add_child(dlg, chk);
+
+    char *compact = md_a11y_to_compact(root);
+    assert(compact != NULL);
+
+    /* Window (container) present */
+    assert(strstr(compact, "WIN[1]") != NULL);
+    /* Button under decorative panel still present */
+    assert(strstr(compact, "BTN[20] OK") != NULL);
+    /* Decorative nodes skipped */
+    assert(strstr(compact, "PNL") == NULL);   /* panel filtered out */
+    assert(strstr(compact, "LBL") == NULL);   /* label filtered out */
+    /* Dialog container present */
+    assert(strstr(compact, "DLG[40]") != NULL);
+    /* Check box with state */
+    assert(strstr(compact, "CHK[50] Remember") != NULL);
+    assert(strstr(compact, "*checked*") != NULL);
+
+    free(compact);
+    md_a11y_node_free(root);
+    printf("  PASS: compact interactable filtering\n");
+}
+
+/* §3.3.2: Text entry with no content and multiple states */
+static void test_compact_text_empty(void) {
+    MdA11yNode *root = make_node("1", "window", "Editor",
+                                  0, 0, 800, 600);
+    MdA11yNode *txt = make_node("5", "entry", "", 10, 10, 200, 20);
+    node_add_state(txt, "focused");
+    node_add_state(txt, "enabled");
+    node_add_child(root, txt);
+
+    char *compact = md_a11y_to_compact(root);
+    assert(compact != NULL);
+
+    /* Empty text gets quoted empty string */
+    assert(strstr(compact, "TXT[5] <focused> ''") != NULL);
+    /* enabled state still appended after quoted content */
+    assert(strstr(compact, "*enabled*") != NULL);
+
+    free(compact);
+    md_a11y_node_free(root);
+    printf("  PASS: compact text empty content\n");
 }
 
 static void test_delta_serialization(void) {
@@ -178,6 +256,8 @@ int main(void) {
     test_create_destroy();
     test_json_serialization();
     test_compact_serialization();
+    test_compact_interactable_filtering();
+    test_compact_text_empty();
     test_delta_serialization();
     test_walk_tree();
     test_diff();
