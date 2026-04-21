@@ -1,13 +1,44 @@
 /*
  * fips-nat — NAT traversal daemon.
- * STUN + Nostr signaling for hole punching.
+ * STUN discovery + Nostr signaling + UDP hole punching.
+ *
+ * Lifecycle:
+ *   1. Parse CLI args (signer, relays, stun server, ports)
+ *   2. Initialize signer → Nostr bridge
+ *   3. Run STUN discovery to find our reflexive address
+ *   4. Publish NAT endpoint to Nostr (kind:30078, d:"fips-nat-endpoint")
+ *   5. Listen on local IPC for commands from metadesk-host
+ *   6. Handle punch requests, re-discovery, status queries
+ *
+ * IPC protocol (JSON over md_ipc_*):
+ *   Commands (host → fips-nat):
+ *     {"cmd":"status"}
+ *     {"cmd":"discover"}
+ *     {"cmd":"punch","peer_ip":"...","peer_port":N,"session_id":"hex32"}
+ *     {"cmd":"shutdown"}
+ *
+ *   Responses (fips-nat → host):
+ *     {"ok":true, ...}     (fields vary by command)
+ *     {"ok":false,"error":"reason"}
  */
 #include "stun.h"
 #include "publish.h"
 #include "punch.h"
+#include "fipsnat_ipc.h"
+
+#include "nostr.h"
+#include "signer.h"
+#include "ipc.h"
+
+#include <cjson/cJSON.h>
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <signal.h>
+#include <unistd.h>
+
+/* ── Globals ─────────────────────────────────────────────────── */
 
 static volatile int g_running = 1;
 
@@ -16,15 +47,334 @@ static void signal_handler(int sig) {
     g_running = 0;
 }
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+/* ── Daemon state ────────────────────────────────────────────── */
 
+typedef struct {
+    MdStunResult    stun;           /* current reflexive address       */
+    MdNatEndpoint   endpoint;       /* published NAT endpoint          */
+    bool            stun_ok;        /* true if STUN succeeded          */
+    bool            published;      /* true if endpoint published      */
+    MdNostr        *nostr;          /* Nostr bridge (may be NULL)      */
+    const char     *stun_server;    /* STUN server hostname            */
+    uint16_t        stun_port;      /* STUN server port                */
+    uint16_t        fips_port;      /* FIPS daemon port                */
+    uint16_t        punch_port;     /* local punch bind port           */
+} FipsNatCtx;
+
+/* ── IPC command dispatch ────────────────────────────────────── */
+
+static char *handle_status(FipsNatCtx *ctx) {
+    return md_fipsnat_ipc_status_response(
+        ctx->stun_ok, ctx->published, &ctx->endpoint);
+}
+
+static char *handle_discover(FipsNatCtx *ctx) {
+    int rc = md_stun_discover_full(
+        ctx->stun_server, ctx->stun_port,
+        &ctx->stun, MD_STUN_DEFAULT_TIMEOUT);
+
+    if (rc < 0) {
+        ctx->stun_ok = false;
+        return md_fipsnat_ipc_error_response("STUN discovery failed");
+    }
+
+    ctx->stun_ok = true;
+    ctx->endpoint.stun = ctx->stun;
+    ctx->endpoint.fips_port = ctx->fips_port;
+    ctx->endpoint.punch_port = ctx->punch_port;
+
+    /* Re-publish updated endpoint */
+    if (ctx->nostr) {
+        if (md_publish_nat_endpoint(ctx->nostr, &ctx->endpoint) == 0)
+            ctx->published = true;
+    }
+
+    return md_fipsnat_ipc_discover_response(&ctx->stun);
+}
+
+static char *handle_punch(FipsNatCtx *ctx, const MdFipsnatPunchReq *req) {
+    (void)ctx;
+
+    MdPunchConfig cfg = {0};
+    strncpy(cfg.peer_ip, req->peer_ip, sizeof(cfg.peer_ip) - 1);
+    cfg.peer_port = req->peer_port;
+    cfg.local_bind_port = 0;  /* ephemeral */
+    cfg.timeout_ms = req->timeout_ms > 0 ? req->timeout_ms : MD_PUNCH_DEFAULT_TIMEOUT;
+    cfg.probe_interval_ms = MD_PUNCH_DEFAULT_INTERVAL;
+    memcpy(cfg.session_id, req->session_id, 16);
+
+    MdPunchResult result = {0};
+    int rc = md_punch_execute(&cfg, &result);
+
+    if (rc < 0) {
+        return md_fipsnat_ipc_error_response("hole punch failed (timeout or error)");
+    }
+
+    return md_fipsnat_ipc_punch_response(&result);
+}
+
+static char *dispatch_command(FipsNatCtx *ctx, const char *json) {
+    MdFipsnatCmd cmd;
+    int rc = md_fipsnat_ipc_parse_command(json, &cmd);
+    if (rc < 0) {
+        return md_fipsnat_ipc_error_response("invalid command JSON");
+    }
+
+    switch (cmd.type) {
+    case MD_FIPSNAT_CMD_STATUS:
+        return handle_status(ctx);
+
+    case MD_FIPSNAT_CMD_DISCOVER:
+        return handle_discover(ctx);
+
+    case MD_FIPSNAT_CMD_PUNCH:
+        return handle_punch(ctx, &cmd.punch);
+
+    case MD_FIPSNAT_CMD_SHUTDOWN:
+        g_running = 0;
+        return md_fipsnat_ipc_ok_response("shutting down");
+
+    default:
+        return md_fipsnat_ipc_error_response("unknown command");
+    }
+}
+
+/* ── Usage ───────────────────────────────────────────────────── */
+
+static void usage(const char *argv0) {
+    fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "NAT traversal daemon for metadesk.\n\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --stun-server HOST  STUN server (default: %s)\n",
+            MD_STUN_DEFAULT_SERVER);
+    fprintf(stderr, "  --stun-port PORT    STUN port (default: %d)\n",
+            MD_STUN_DEFAULT_PORT);
+    fprintf(stderr, "  --fips-port PORT    FIPS daemon port (default: 2121)\n");
+    fprintf(stderr, "  --punch-port PORT   Local punch port (default: ephemeral)\n");
+    fprintf(stderr, "  --ipc-name NAME     IPC endpoint name (default: fips-nat)\n");
+    fprintf(stderr, "\nSigner options (choose one):\n");
+    fprintf(stderr, "  --bunker URI        NIP-46 Nostr Connect bunker URI\n");
+    fprintf(stderr, "  --dbus-signer       Use NIP-55L D-Bus signer daemon\n");
+    fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
+    fprintf(stderr, "  --auto-signer       Auto-detect local signer\n");
+    fprintf(stderr, "  --relay URL         Relay URL (repeatable)\n");
+    fprintf(stderr, "  --no-publish        Skip Nostr publication (STUN only)\n");
+    fprintf(stderr, "  -h, --help          Show this help\n");
+}
+
+/* ── Main ────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv) {
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    fprintf(stderr, "fips-nat v0.1.0\n");
-    fprintf(stderr, "ERROR: NAT traversal daemon not yet implemented (Phase 2).\n");
-    fprintf(stderr, "  STUN discovery, Nostr signaling, and UDP hole punching\n");
-    fprintf(stderr, "  are planned for a future release.\n");
-    return 1;
+    /* Defaults */
+    const char *stun_server = NULL;   /* NULL → default */
+    uint16_t    stun_port = 0;        /* 0 → default    */
+    uint16_t    fips_port = 2121;
+    uint16_t    punch_port = 0;       /* 0 → ephemeral  */
+    const char *ipc_name = "fips-nat";
+    const char *bunker_uri = NULL;
+    const char *socket_path = NULL;
+    bool        use_dbus_signer = false;
+    bool        auto_signer = false;
+    bool        no_publish = false;
+    const char *relay_urls[16];
+    int         relay_count = 0;
+
+    /* Parse args */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--stun-server") == 0 && i + 1 < argc)
+            stun_server = argv[++i];
+        else if (strcmp(argv[i], "--stun-port") == 0 && i + 1 < argc)
+            stun_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fips-port") == 0 && i + 1 < argc)
+            fips_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--punch-port") == 0 && i + 1 < argc)
+            punch_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ipc-name") == 0 && i + 1 < argc)
+            ipc_name = argv[++i];
+        else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
+            bunker_uri = argv[++i];
+        else if (strcmp(argv[i], "--dbus-signer") == 0)
+            use_dbus_signer = true;
+        else if (strcmp(argv[i], "--socket-signer") == 0) {
+            socket_path = (i + 1 < argc && argv[i + 1][0] != '-')
+                ? argv[++i] : NULL;
+        }
+        else if (strcmp(argv[i], "--auto-signer") == 0)
+            auto_signer = true;
+        else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
+            if (relay_count < 16)
+                relay_urls[relay_count++] = argv[++i];
+        }
+        else if (strcmp(argv[i], "--no-publish") == 0)
+            no_publish = true;
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+        else {
+            fprintf(stderr, "fips-nat: unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    /* ── Banner ──────────────────────────────────────────────── */
+    printf("fips-nat v0.1.0\n");
+    printf("  stun:     %s:%u\n",
+           stun_server ? stun_server : MD_STUN_DEFAULT_SERVER,
+           stun_port   ? stun_port   : MD_STUN_DEFAULT_PORT);
+    printf("  fips:     port %u\n", fips_port);
+    printf("  punch:    port %s\n", punch_port ? "fixed" : "ephemeral");
+    printf("  ipc:      %s\n", ipc_name);
+    printf("\n");
+
+    /* ── Daemon context ──────────────────────────────────────── */
+    FipsNatCtx ctx = {
+        .stun_server = stun_server,
+        .stun_port   = stun_port,
+        .fips_port   = fips_port,
+        .punch_port  = punch_port,
+    };
+
+    /* ── Signer initialization ───────────────────────────────── */
+    MdSigner *signer = NULL;
+    if (bunker_uri) {
+        printf("fips-nat: connecting to NIP-46 bunker...\n");
+        signer = md_signer_create_nip46(bunker_uri, 30000);
+    } else if (use_dbus_signer) {
+        printf("fips-nat: connecting to NIP-55L D-Bus signer...\n");
+        signer = md_signer_create_nip55l();
+    } else if (socket_path || auto_signer) {
+        if (socket_path) {
+            printf("fips-nat: connecting to NIP-5F socket signer...\n");
+            signer = md_signer_create_nip5f(socket_path);
+        }
+        if (!signer && auto_signer) {
+            printf("fips-nat: auto-detecting signer...\n");
+            signer = md_signer_auto_detect();
+        }
+    }
+
+    if (signer) {
+        printf("fips-nat: signer ready (%s)\n",
+               md_signer_type_name(md_signer_get_type(signer)));
+    } else if (bunker_uri || use_dbus_signer) {
+        fprintf(stderr, "fips-nat: ERROR: requested signer backend not available\n");
+        return 1;
+    }
+
+    /* ── Nostr bridge (if signer available and publish enabled) ─ */
+    MdNostr *nostr = NULL;
+    if (signer && !no_publish) {
+        if (relay_count == 0) {
+            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_count = 1;
+        }
+
+        MdNostrCallbacks nostr_cbs = {0};
+        MdNostrConfig nostr_cfg = {
+            .signer     = signer,
+            .relay_urls = relay_urls,
+            .relay_count = relay_count,
+        };
+
+        nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
+        if (nostr) {
+            ctx.nostr = nostr;
+            printf("fips-nat: nostr bridge ready (%d relay%s)\n",
+                   relay_count, relay_count != 1 ? "s" : "");
+        } else {
+            fprintf(stderr, "fips-nat: WARNING: nostr bridge creation failed, "
+                    "STUN-only mode\n");
+        }
+    } else if (!signer) {
+        printf("fips-nat: no signer — running in STUN-only mode "
+               "(no Nostr publication)\n");
+    }
+
+    /* ── STUN discovery ──────────────────────────────────────── */
+    printf("fips-nat: discovering reflexive address via STUN...\n");
+    int stun_rc = md_stun_discover_full(
+        stun_server, stun_port, &ctx.stun, MD_STUN_DEFAULT_TIMEOUT);
+
+    if (stun_rc == 0) {
+        ctx.stun_ok = true;
+        printf("fips-nat: reflexive address: %s:%u%s\n",
+               ctx.stun.ip, ctx.stun.port,
+               ctx.stun.is_ipv6 ? " (IPv6)" : "");
+
+        /* Build endpoint */
+        ctx.endpoint.stun = ctx.stun;
+        ctx.endpoint.fips_port = fips_port;
+        ctx.endpoint.punch_port = punch_port;
+
+        /* Publish to Nostr */
+        if (nostr) {
+            if (md_publish_nat_endpoint(nostr, &ctx.endpoint) == 0) {
+                ctx.published = true;
+                printf("fips-nat: NAT endpoint published to relays\n");
+            } else {
+                fprintf(stderr, "fips-nat: WARNING: failed to publish NAT endpoint\n");
+            }
+        }
+    } else {
+        fprintf(stderr, "fips-nat: WARNING: STUN discovery failed — "
+                "NAT traversal may not work\n");
+    }
+
+    /* ── IPC server ──────────────────────────────────────────── */
+    MdIpcServer *ipc = md_ipc_listen(ipc_name);
+    if (!ipc) {
+        fprintf(stderr, "fips-nat: ERROR: failed to create IPC server '%s'\n",
+                ipc_name);
+        if (nostr) md_nostr_destroy(nostr);
+        else if (signer) md_signer_destroy(signer);
+        return 1;
+    }
+    printf("fips-nat: IPC listening on %s\n", md_ipc_server_path(ipc));
+    printf("fips-nat: ready (Ctrl+C to stop)\n\n");
+
+    /* ── Main loop: accept IPC connections, dispatch commands ── */
+    while (g_running) {
+        /* Accept with 1-second timeout so we can check g_running */
+        MdIpcConn *conn = md_ipc_accept(ipc, 1000);
+        if (!conn)
+            continue;
+
+        printf("fips-nat: IPC client connected\n");
+
+        /* Handle commands on this connection until disconnect */
+        while (g_running && md_ipc_is_connected(conn)) {
+            char buf[MD_IPC_MAX_MSG];
+            int n = md_ipc_recv(conn, buf, sizeof(buf) - 1, 1000);
+
+            if (n <= 0) {
+                if (n == 0) break;  /* peer disconnect */
+                continue;           /* timeout, retry  */
+            }
+            buf[n] = '\0';
+
+            /* Dispatch and respond */
+            char *resp = dispatch_command(&ctx, buf);
+            if (resp) {
+                md_ipc_send(conn, resp, strlen(resp));
+                free(resp);
+            }
+        }
+
+        md_ipc_close(conn);
+        printf("fips-nat: IPC client disconnected\n");
+    }
+
+    /* ── Shutdown ────────────────────────────────────────────── */
+    printf("\nfips-nat: shutting down...\n");
+    md_ipc_server_destroy(ipc);
+    if (nostr) md_nostr_destroy(nostr);
+    else if (signer) md_signer_destroy(signer);
+
+    printf("fips-nat: done.\n");
+    return 0;
 }

@@ -26,6 +26,8 @@
 #include "signer.h"
 #include "mcp_bridge.h"
 #include "mcp_http.h"
+#include "ipc.h"
+#include "fipsnat_ipc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +241,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
+    fprintf(stderr, "\nNAT traversal:\n");
+    fprintf(stderr, "  --fips-nat [NAME] Connect to fips-nat daemon IPC (default: fips-nat)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -263,6 +267,8 @@ int main(int argc, char **argv) {
     bool mcp_stdio = false;
     bool mcp_http = false;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
+    bool use_fipsnat = false;
+    const char *fipsnat_ipc_name = "fips-nat";
     const char *relay_urls[16];
     int relay_count = 0;
 
@@ -302,6 +308,11 @@ int main(int argc, char **argv) {
             mcp_http = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 mcp_http_port = (uint16_t)atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--fips-nat") == 0) {
+            use_fipsnat = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                fipsnat_ipc_name = argv[++i];
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -464,6 +475,39 @@ int main(int argc, char **argv) {
             }
         } else {
             fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
+        }
+    }
+
+    /* ── fips-nat IPC connection ──────────────────────────────── */
+    MdIpcConn *fipsnat_conn = NULL;
+    if (use_fipsnat) {
+        printf("host: connecting to fips-nat daemon (%s)...\n", fipsnat_ipc_name);
+        fipsnat_conn = md_ipc_connect(fipsnat_ipc_name, 5000);
+        if (fipsnat_conn) {
+            /* Query daemon status */
+            char *cmd = md_fipsnat_ipc_cmd_status();
+            if (cmd) {
+                md_ipc_send(fipsnat_conn, cmd, strlen(cmd));
+                free(cmd);
+
+                char resp_buf[MD_IPC_MAX_MSG];
+                int n = md_ipc_recv(fipsnat_conn, resp_buf, sizeof(resp_buf) - 1, 5000);
+                if (n > 0) {
+                    resp_buf[n] = '\0';
+                    MdFipsnatStatusResp st;
+                    if (md_fipsnat_ipc_parse_status_response(resp_buf, &st) == 0) {
+                        printf("host: fips-nat status: stun=%s published=%s",
+                               st.stun_ok ? "ok" : "fail",
+                               st.published ? "yes" : "no");
+                        if (st.stun_ok)
+                            printf(" addr=%s:%u", st.ip, st.port);
+                        printf("\n");
+                    }
+                }
+            }
+        } else {
+            fprintf(stderr, "host: WARNING: could not connect to fips-nat daemon\n");
+            fprintf(stderr, "  Ensure fips-nat is running: fips-nat --auto-signer\n");
         }
     }
 
@@ -747,6 +791,9 @@ int main(int argc, char **argv) {
         md_input_destroy(input);
 
     md_stream_server_destroy(srv);
+
+    if (fipsnat_conn)
+        md_ipc_close(fipsnat_conn);
 
     if (nostr) {
         go_channel_close(ctx.session_req_ch);

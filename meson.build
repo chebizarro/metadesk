@@ -340,7 +340,8 @@ dep_metadesk = declare_dependency(
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
 executable('metadesk-host',
-  files('src/host/main.c'),
+  files('src/host/main.c', 'src/fips-nat/fipsnat_ipc.c', 'src/fips-nat/stun.c'),
+  include_directories : [core_inc, include_directories('src/fips-nat')],
   dependencies : [dep_metadesk],
   install : true,
 )
@@ -366,6 +367,7 @@ if enable_fipsnat
     'src/fips-nat/stun.c',
     'src/fips-nat/publish.c',
     'src/fips-nat/punch.c',
+    'src/fips-nat/fipsnat_ipc.c',
   )
   executable('fips-nat', fipsnat_sources,
     include_directories : [core_inc],
@@ -556,3 +558,11 @@ test_publish = executable('test_publish',
   dependencies : [dep_metadesk],
 )
 test('NAT endpoint publication', test_publish)
+
+test_fipsnat_ipc = executable('test_fipsnat_ipc',
+  files('tests/test_fipsnat_ipc.c', 'src/fips-nat/fipsnat_ipc.c',
+        'src/fips-nat/stun.c'),
+  include_directories : [core_inc, include_directories('src/fips-nat')],
+  dependencies : [dep_metadesk],
+)
+test('fips-nat IPC protocol', test_fipsnat_ipc)
