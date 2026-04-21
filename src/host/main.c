@@ -25,6 +25,7 @@
 #include "secrets.h"
 #include "signer.h"
 #include "mcp_bridge.h"
+#include "mcp_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,10 +263,8 @@ int main(int argc, char **argv) {
     bool use_nvenc = true;
     bool do_capture = true;
     bool mcp_stdio = false;
-    bool mcp_http = false;       /* TODO: Phase 2 — HTTP+SSE transport */
+    bool mcp_http = false;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
-    (void)mcp_http;
-    (void)mcp_http_port;
     const char *relay_urls[16];
     int relay_count = 0;
 
@@ -477,8 +476,9 @@ int main(int argc, char **argv) {
     }
 
     /* ── MCP agent interface ──────────────────────────────────── */
-    if (mcp_stdio) {
-        printf("host: starting MCP server on stdio\n");
+    if (mcp_stdio || mcp_http) {
+        const char *mode = mcp_stdio ? "stdio" : "http";
+        printf("host: starting MCP server on %s\n", mode);
 
         /* Initialize a11y + input for MCP mode */
         MdA11yCtx *mcp_a11y = md_a11y_create();
@@ -501,8 +501,8 @@ int main(int argc, char **argv) {
             .input = mcp_input,
             .tree_format = MD_TREE_FORMAT_JSON,
             .settle_ms = 100,
-            .stdio_in_fd = STDIN_FILENO,
-            .stdio_out_fd = STDOUT_FILENO,
+            .stdio_in_fd = mcp_stdio ? STDIN_FILENO : -1,
+            .stdio_out_fd = mcp_stdio ? STDOUT_FILENO : -1,
         };
 
         MdMcpBridge *mcp_bridge = md_mcp_bridge_create(&mcp_cfg);
@@ -511,8 +511,31 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Run MCP event loop (blocking — exits on EOF or shutdown) */
-        int mcp_rc = md_mcp_bridge_run(mcp_bridge);
+        int mcp_rc = 0;
+
+        if (mcp_http) {
+            /* HTTP+SSE transport */
+            MdMcpHttpConfig http_cfg = {
+                .server = md_mcp_bridge_get_server(mcp_bridge),
+                .port = mcp_http_port,
+            };
+            MdMcpHttp *http = md_mcp_http_create(&http_cfg);
+            if (!http) {
+                fprintf(stderr, "ERROR: failed to create MCP HTTP server\n");
+                md_mcp_bridge_destroy(mcp_bridge);
+                return 1;
+            }
+            uint16_t actual_port = mcp_http_port > 0
+                                   ? mcp_http_port
+                                   : MD_MCP_HTTP_DEFAULT_PORT;
+            printf("host[mcp]: HTTP+SSE listening on port %u\n", actual_port);
+            mcp_rc = md_mcp_http_run(http);
+            md_mcp_http_destroy(http);
+        } else {
+            /* stdio transport (blocking — exits on EOF or shutdown) */
+            mcp_rc = md_mcp_bridge_run(mcp_bridge);
+        }
+
         md_mcp_bridge_destroy(mcp_bridge);
 
         if (signer) md_signer_destroy(signer);

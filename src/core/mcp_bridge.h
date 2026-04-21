@@ -18,6 +18,11 @@
 #include "input.h"
 #include "session.h"
 
+/* Version string — set by meson via -DMD_MCP_BRIDGE_VERSION=... */
+#ifndef MD_MCP_BRIDGE_VERSION
+#define MD_MCP_BRIDGE_VERSION "0.1.0"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

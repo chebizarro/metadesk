@@ -158,12 +158,18 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 
 static void handle_client(MdMcpHttp *h, int client_fd)
 {
-    char buf[READ_BUF_SIZE * 4];
+    /* Heap-allocate the request buffer to handle larger payloads */
+    size_t buf_cap = READ_BUF_SIZE * 4;
+    char *buf = malloc(buf_cap);
+    if (!buf) {
+        close(client_fd);
+        return;
+    }
     size_t total = 0;
 
-    /* Read the full request (simple: read until we have headers + body) */
-    while (total < sizeof(buf) - 1) {
-        ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+    /* Read the full request — headers + body */
+    while (total < buf_cap - 1) {
+        ssize_t n = read(client_fd, buf + total, buf_cap - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
@@ -171,12 +177,36 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         /* Check if we have complete headers */
         char *body_start = strstr(buf, "\r\n\r\n");
         if (body_start) {
-            /* Check if we have the full body */
+            /* Check Content-Length and enforce limit */
             const char *cl = strcasestr(buf, "Content-Length:");
             size_t content_len = 0;
             if (cl) content_len = (size_t)atol(cl + 15);
 
+            /* Reject oversized requests */
+            if (content_len > MAX_REQUEST_SIZE) {
+                send_http_response(client_fd, 413,
+                                   "Content Too Large",
+                                   "text/plain",
+                                   "Request body too large\n", 23);
+                free(buf);
+                close(client_fd);
+                return;
+            }
+
+            /* Grow buffer if needed for the body */
             size_t headers_end = (size_t)(body_start + 4 - buf);
+            size_t needed = headers_end + content_len + 1;
+            if (needed > buf_cap) {
+                buf_cap = needed;
+                char *new_buf = realloc(buf, buf_cap);
+                if (!new_buf) {
+                    free(buf);
+                    close(client_fd);
+                    return;
+                }
+                buf = new_buf;
+            }
+
             if (total >= headers_end + content_len)
                 break;  /* Have full request */
         }
@@ -186,9 +216,11 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     if (parse_http_request(buf, total, &req) != 0) {
         send_http_response(client_fd, 400, "Bad Request",
                            "text/plain", "Bad request\n", 12);
+        free(buf);
         close(client_fd);
         return;
     }
+    free(buf);
 
     /* Route by method + path */
     if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "POST") == 0) {

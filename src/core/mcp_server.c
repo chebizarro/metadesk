@@ -58,7 +58,29 @@ static int send_error(MdMcpServer *s, const MdJsonRpcId *id,
 static int handle_initialize(MdMcpServer *s, const MdJsonRpcId *id,
                              const cJSON *params)
 {
-    (void)params;  /* client info — logged but not used in Phase 1 */
+    /* Validate client protocolVersion if provided */
+    if (params && cJSON_IsObject(params)) {
+        cJSON *pv = cJSON_GetObjectItemCaseSensitive(params, "protocolVersion");
+        if (cJSON_IsString(pv)) {
+            /* MCP spec: server should check compatibility */
+            if (strcmp(pv->valuestring, MCP_PROTOCOL_VERSION) != 0) {
+                fprintf(stderr, "mcp: client protocol version '%s' "
+                        "(server supports '%s')\n",
+                        pv->valuestring, MCP_PROTOCOL_VERSION);
+                /* Continue anyway — respond with our version per spec */
+            }
+        }
+
+        /* Log client info */
+        cJSON *ci = cJSON_GetObjectItemCaseSensitive(params, "clientInfo");
+        if (ci && cJSON_IsObject(ci)) {
+            cJSON *name = cJSON_GetObjectItemCaseSensitive(ci, "name");
+            cJSON *ver = cJSON_GetObjectItemCaseSensitive(ci, "version");
+            fprintf(stderr, "mcp: client=%s/%s\n",
+                    cJSON_IsString(name) ? name->valuestring : "unknown",
+                    cJSON_IsString(ver)  ? ver->valuestring  : "?");
+        }
+    }
 
     cJSON *result = cJSON_CreateObject();
 
@@ -288,11 +310,14 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     if (!server || !json || len == 0)
         return -1;
 
+    pthread_mutex_lock(&server->mu);
+
     MdJsonRpcRequest req;
     if (md_jsonrpc_parse_request(&req, json, len) != 0) {
         /* Can't parse — send parse error with null id */
         MdJsonRpcId null_id = { .type = MD_JSONRPC_ID_NULL };
         send_error(server, &null_id, MD_JSONRPC_PARSE_ERROR, "Parse error");
+        pthread_mutex_unlock(&server->mu);
         return -1;
     }
 
@@ -303,6 +328,7 @@ int md_mcp_server_handle_message(MdMcpServer *server,
         strcmp(req.method, "initialized") == 0) {
         rc = handle_initialized(server);
         md_jsonrpc_request_free(&req);
+        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
@@ -310,6 +336,7 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     if (strcmp(req.method, "initialize") == 0) {
         rc = handle_initialize(server, &req.id, req.params);
         md_jsonrpc_request_free(&req);
+        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
@@ -320,6 +347,7 @@ int md_mcp_server_handle_message(MdMcpServer *server,
                             "Server not initialized");
         }
         md_jsonrpc_request_free(&req);
+        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
@@ -347,6 +375,7 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     }
 
     md_jsonrpc_request_free(&req);
+    pthread_mutex_unlock(&server->mu);
     return rc;
 }
 

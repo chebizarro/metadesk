@@ -592,6 +592,7 @@ static void test_9_tools_register(void)
     }
     cJSON_Delete(resp);
 
+    md_mcp_tools_cleanup(&tool_ctx);
     md_mcp_server_destroy(s);
     PASS("9 tools register with schemas");
 }
@@ -611,19 +612,19 @@ static void test_tool_call_click_no_agent(void)
 
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
+    /* No agent → isError=true with descriptive message */
+    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON *content = cJSON_GetObjectItem(result, "content");
     assert(cJSON_IsArray(content));
     assert(cJSON_GetArraySize(content) == 1);
-    /* Should return the encoded action JSON since no agent is connected */
     cJSON *text_item = cJSON_GetArrayItem(content, 0);
     const char *text = cJSON_GetObjectItem(text_item, "text")->valuestring;
-    assert(strstr(text, "click") != NULL);
-    assert(strstr(text, "btn_ok") != NULL);
-    assert(!cJSON_HasObjectItem(result, "isError"));
+    assert(strstr(text, "no agent") != NULL);
     cJSON_Delete(resp);
 
+    md_mcp_tools_cleanup(&tool_ctx);
     md_mcp_server_destroy(s);
-    PASS("tool call click (no agent) returns encoded action");
+    PASS("tool call click (no agent) returns isError");
 }
 
 static void test_tool_call_missing_target(void)
@@ -645,6 +646,7 @@ static void test_tool_call_missing_target(void)
     assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON_Delete(resp);
 
+    md_mcp_tools_cleanup(&tool_ctx);
     md_mcp_server_destroy(s);
     PASS("tool call missing target_id → isError");
 }
@@ -664,14 +666,16 @@ static void test_tool_call_key_combo(void)
 
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
-    assert(!cJSON_HasObjectItem(result, "isError"));
+    /* No agent → isError=true */
+    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON *content = cJSON_GetObjectItem(result, "content");
     const char *text = cJSON_GetObjectItem(cJSON_GetArrayItem(content, 0), "text")->valuestring;
-    assert(strstr(text, "key_combo") != NULL);
+    assert(strstr(text, "no agent") != NULL);
     cJSON_Delete(resp);
 
+    md_mcp_tools_cleanup(&tool_ctx);
     md_mcp_server_destroy(s);
-    PASS("tool call key_combo (no target needed)");
+    PASS("tool call key_combo (no agent) returns isError");
 }
 
 /* ── Main ────────────────────────────────────────────────────── */

@@ -322,10 +322,12 @@ core_sources = files(
 # Append platform HAL backend sources
 core_sources += platform_hal_sources
 
+mcp_c_args = ['-DMD_MCP_BRIDGE_VERSION="' + meson.project_version() + '"']
+
 libmetadesk = shared_library('metadesk', core_sources,
   include_directories : core_inc,
   dependencies : core_deps,
-  c_args : signer_c_args,
+  c_args : signer_c_args + mcp_c_args,
   install : true,
   version : meson.project_version(),
 )

@@ -79,7 +79,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     /* 3. Create MCP server */
     MdMcpServerConfig srv_cfg = {
         .server_name = "metadesk",
-        .server_version = "0.1.0",
+        .server_version = MD_MCP_BRIDGE_VERSION,
         .write_fn = bridge_stdio_write,
         .write_userdata = b,
     };
@@ -165,6 +165,10 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
 
     if (bridge->stdio_ctx)
         md_mcp_stdio_destroy(bridge->stdio_ctx);
+
+    /* Free heap-allocated per-tool handler contexts before destroying server */
+    md_mcp_tools_cleanup(&bridge->tool_ctx);
+
     if (bridge->server)
         md_mcp_server_destroy(bridge->server);
     if (bridge->agent)

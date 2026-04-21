@@ -92,9 +92,6 @@ typedef struct {
     MdActionType   action_type;
 } ToolHandlerCtx;
 
-/* We allocate these during registration — they live as long as the server. */
-static ToolHandlerCtx g_handler_ctxs[9];
-
 static cJSON *make_text_content(const char *text)
 {
     cJSON *arr = cJSON_CreateArray();
@@ -201,23 +198,12 @@ static cJSON *tool_handler(const cJSON *arguments,
         return make_text_content("Error: action encode failed");
     }
 
-    /*
-     * In the full integration (with MdAgent wired up), we'd call:
-     *   md_agent_handle_action(ctx->agent, ...)
-     * and return the resulting UI tree delta.
-     *
-     * For now, when no agent is connected, return the encoded action
-     * as confirmation that the tool call was parsed correctly.
-     */
     if (!ctx->agent) {
-        /* No agent — return the parsed action as confirmation */
-        cJSON *arr = cJSON_CreateArray();
-        cJSON *item = cJSON_CreateObject();
-        cJSON_AddStringToObject(item, "type", "text");
-        cJSON_AddStringToObject(item, "text", action_json);
-        cJSON_AddItemToArray(arr, item);
+        *is_error = true;
+        *error_msg = strdup("No agent session active");
         free(action_json);
-        return arr;
+        return make_text_content("Error: no agent session active — "
+                                 "the MCP bridge was created without an agent");
     }
 
     /* Full path: dispatch through agent pipeline and return delta */
@@ -351,21 +337,37 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
 {
     if (!server || !tool_ctx) return -1;
 
+    /* Allocate handler contexts on the heap — one per tool.
+     * These are owned by the caller via tool_ctx and must outlive the server. */
+    ToolHandlerCtx *hctxs = calloc(TOOL_DEF_COUNT, sizeof(ToolHandlerCtx));
+    if (!hctxs) return -1;
+    tool_ctx->_handler_ctxs = hctxs;
+
     for (size_t i = 0; i < TOOL_DEF_COUNT; i++) {
-        g_handler_ctxs[i].ctx = tool_ctx;
-        g_handler_ctxs[i].action_type = tool_defs[i].action_type;
+        hctxs[i].ctx = tool_ctx;
+        hctxs[i].action_type = tool_defs[i].action_type;
 
         MdMcpTool tool = {
             .name = tool_defs[i].name,
             .description = tool_defs[i].description,
             .input_schema = tool_defs[i].make_schema(),
             .handler = tool_handler,
-            .userdata = &g_handler_ctxs[i],
+            .userdata = &hctxs[i],
         };
 
-        if (md_mcp_server_register_tool(server, &tool) != 0)
+        if (md_mcp_server_register_tool(server, &tool) != 0) {
+            free(hctxs);
+            tool_ctx->_handler_ctxs = NULL;
             return -1;
+        }
     }
 
     return 0;
+}
+
+void md_mcp_tools_cleanup(MdMcpToolCtx *tool_ctx)
+{
+    if (!tool_ctx) return;
+    free(tool_ctx->_handler_ctxs);
+    tool_ctx->_handler_ctxs = NULL;
 }
