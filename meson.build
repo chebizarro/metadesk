@@ -315,6 +315,7 @@ core_sources = files(
   'src/core/mcp_bridge.c',
   'src/core/mcp_http.c',
   'src/core/nostr.c',
+  'src/core/session_log.c',
   'src/core/packet.c',
   'src/core/stream.c',
   'src/core/secrets.c',
@@ -580,3 +581,9 @@ test_bitrate_ctrl = executable('test_bitrate_ctrl',
   include_directories : [core_inc],
 )
 test('bitrate controller AIMD', test_bitrate_ctrl)
+
+test_session_log = executable('test_session_log',
+  files('tests/test_session_log.c'),
+  dependencies : [dep_metadesk],
+)
+test('signed session log', test_session_log)

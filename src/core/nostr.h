@@ -193,6 +193,18 @@ int md_nostr_publish_transport(MdNostr *n, const char *fips_addr);
  * Results arrive asynchronously via the on_transport callback. */
 int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex);
 
+/* ── Generic event publishing ─────────────────────────────── */
+
+/*
+ * Publish an already-signed event (JSON string) to all connected relays.
+ * The JSON must contain a valid signed Nostr event with id, pubkey, sig.
+ * Returns 0 on success, -1 on error.
+ *
+ * Use this to publish arbitrary signed events (e.g. session log entries)
+ * without going through the kind-specific helpers above.
+ */
+int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json);
+
 /* ── Key utilities (delegates to nostrc) ──────────────────── */
 
 /* Generate a new random Nostr keypair. Caller frees both strings. */

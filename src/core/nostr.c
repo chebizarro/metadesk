@@ -1211,6 +1211,29 @@ int md_nostr_publish_transport(MdNostr *n, const char *fips_addr) {
     return ret;
 }
 
+/* ── Generic event publishing ────────────────────────────────── */
+
+int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json) {
+    if (!n || !signed_event_json || n->relay_count == 0)
+        return -1;
+
+    /* Parse the JSON into a NostrEvent for publish_all */
+    NostrEvent *ev = event_from_json(signed_event_json);
+    if (!ev) {
+        fprintf(stderr, "nostr: publish_signed_json: failed to parse event\n");
+        return -1;
+    }
+
+    int ret = publish_all(n, ev);
+    nostr_event_free(ev);
+
+    if (ret == 0) {
+        fprintf(stderr, "nostr: published signed event\n");
+    }
+
+    return ret;
+}
+
 int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
     if (!n || !n->pool || !host_pubkey_hex)
         return -1;

@@ -29,6 +29,7 @@
 #include "ipc.h"
 #include "fipsnat_ipc.h"
 #include "bitrate_ctrl.h"
+#include "session_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@ typedef struct {
     int64_t       total_encode_us;
     uint32_t      frames_encoded;
     uint32_t      frames_sent;
+
+    /* Session log for agent monitoring (M2.4) */
+    MdSessionLog *session_log;
 
     /* Nostr session negotiation */
     char          pending_client_pk[128]; /* pubkey of requesting client */
@@ -110,6 +114,12 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
         go_channel_try_send(ctx->session_req_ch, (void *)(uintptr_t)1);
         fprintf(stderr, "host: received session request from %.*s...\n",
                 8, sender_pubkey_hex);
+
+        /* Log the request event */
+        if (ctx->session_log)
+            md_session_log_event(ctx->session_log, MD_SESSION_LOG_REQUEST,
+                                 NULL, sender_pubkey_hex,
+                                 "session request via NIP-17 DM");
     }
 }
 
@@ -367,9 +377,19 @@ int main(int argc, char **argv) {
     MdSession session;
     md_session_init(&session);
 
+    /* Session log for agent monitoring (M2.4) */
+    MdSessionLogConfig slog_cfg = {
+        .signer  = signer,
+        .publish = (signer != NULL),  /* publish if signer available */
+    };
+    MdSessionLog *session_log = md_session_log_create(&slog_cfg);
+    if (session_log)
+        printf("host: session log ready\n");
+
     /* Host context (needed before TCP for nostr callbacks) */
     HostCtx ctx = {
-        .session = &session,
+        .session     = &session,
+        .session_log = session_log,
     };
 
     /* ── Nostr bridge (if signer available) ───────────────── */
@@ -393,6 +413,10 @@ int main(int argc, char **argv) {
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (nostr) {
             ctx.nostr = nostr;
+
+            /* Wire nostr into session log for relay publishing */
+            if (session_log)
+                md_session_log_set_nostr(session_log, nostr);
 
             /* Publish our transport address (FIPS IPv6 derived from pubkey) */
             char *our_pk = NULL;
@@ -464,6 +488,12 @@ int main(int argc, char **argv) {
                     free(acc_json);
                     printf("host: sent session accept to %.*s... (session=%s)\n",
                            8, ctx.pending_client_pk, session_id);
+
+                    /* Log session accept */
+                    if (session_log)
+                        md_session_log_event(session_log, MD_SESSION_LOG_ACCEPT,
+                                             session_id, ctx.pending_client_pk,
+                                             "session accepted");
                 }
 
                 /* Update session state */
@@ -690,6 +720,13 @@ int main(int argc, char **argv) {
         client_num++;
         printf("host: client #%u connected\n", client_num);
 
+        /* Log connection */
+        if (session_log)
+            md_session_log_event(session_log, MD_SESSION_LOG_CONNECT,
+                                 session.session_id,
+                                 session.peer_npub[0] ? session.peer_npub : NULL,
+                                 "TCP client connected");
+
         /* Reset per-connection state */
         ctx.client     = client;
         ctx.pkt_seq    = 0;
@@ -793,6 +830,17 @@ int main(int argc, char **argv) {
         if (encoder)
             md_encoder_set_bitrate(encoder, bitrate);
 
+        /* Log disconnection */
+        if (session_log) {
+            char disc_detail[128];
+            snprintf(disc_detail, sizeof(disc_detail),
+                     "disconnected after %u frames", ctx.frames_sent);
+            md_session_log_event(session_log, MD_SESSION_LOG_DISCONNECT,
+                                 session.session_id,
+                                 session.peer_npub[0] ? session.peer_npub : NULL,
+                                 disc_detail);
+        }
+
         printf("host: client #%u disconnected (sent %u frames)\n",
                client_num, ctx.frames_sent);
 
@@ -830,6 +878,9 @@ int main(int argc, char **argv) {
         md_input_destroy(input);
 
     md_stream_server_destroy(srv);
+
+    if (session_log)
+        md_session_log_destroy(session_log);
 
     if (fipsnat_conn)
         md_ipc_close(fipsnat_conn);
