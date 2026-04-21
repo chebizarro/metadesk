@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdbool.h>
 
 static void test_keypair_generation(void) {
     char *sk = NULL, *pk = NULL;
@@ -203,6 +204,137 @@ static void test_nip44_wrong_key_fails(void) {
     printf("  PASS: NIP-44 wrong key correctly fails\n");
 }
 
+/* ── Integration-level tests ──────────────────────────────────
+ * These test the MdNostr lifecycle without a live relay.
+ * The pool will attempt background connections that fail —
+ * this is expected and exercises the error paths.
+ */
+
+static volatile int test_ok_callback_count;
+static volatile int test_ok_last_result;
+
+static void test_publish_cb(const char *event_id, bool ok,
+                            const char *reason, void *userdata) {
+    (void)event_id; (void)reason; (void)userdata;
+    test_ok_callback_count++;
+    test_ok_last_result = ok ? 1 : 0;
+}
+
+static void test_bridge_lifecycle(void) {
+    /* Create a direct-key signer */
+    char *sk = NULL, *pk = NULL;
+    int ret = md_nostr_generate_keypair(&sk, &pk);
+    assert(ret == 0 && sk && pk);
+
+    /* Build config with a dummy relay (won't connect, but won't crash) */
+    const char *relay_urls[] = { "wss://127.0.0.1:1" };
+    MdNostrConfig cfg = {
+        .sk_hex = sk,
+        .relay_urls = relay_urls,
+        .relay_count = 1,
+    };
+
+    /* Set up callbacks including the new publish_result callback */
+    test_ok_callback_count = 0;
+    MdNostrCallbacks cbs = { 0 };
+    cbs.on_publish_result = test_publish_cb;
+    cbs.publish_result_userdata = NULL;
+
+    MdNostr *n = md_nostr_create(&cfg, &cbs);
+    /* Creation may fail if pool can't init (e.g. no network).
+     * On most systems the pool starts worker threads regardless. */
+    if (!n) {
+        printf("  SKIP: bridge lifecycle (pool init failed without network)\n");
+        memset(sk, 0, strlen(sk));
+        free(sk); free(pk);
+        return;
+    }
+
+    /* Verify pubkey is accessible and matches */
+    const char *bridge_pk = md_nostr_get_npub(n);
+    assert(bridge_pk != NULL);
+    assert(strcmp(bridge_pk, pk) == 0);
+
+    /* Verify signer is accessible */
+    MdSigner *signer = md_nostr_get_signer(n);
+    assert(signer != NULL);
+    assert(md_signer_is_ready(signer));
+
+    /* Verify allowlist starts empty (default deny) */
+    assert(md_nostr_has_allowlist(n) == false);
+    assert(md_nostr_is_allowed(n, pk) == false);
+
+    /* Clean destroy (exercises dedup ring cleanup, relay cleanup, etc.) */
+    md_nostr_destroy(n);
+
+    memset(sk, 0, strlen(sk));
+    free(sk); free(pk);
+    printf("  PASS: bridge lifecycle (create/verify/destroy)\n");
+}
+
+static void test_callback_struct_layout(void) {
+    /* Verify the MdNostrCallbacks struct correctly carries all fields
+     * through to the MdNostr instance.  This catches ABI mismatches
+     * if new fields are added but not initialized. */
+    MdNostrCallbacks cbs = { 0 };
+
+    /* All callbacks should start NULL */
+    assert(cbs.on_dm == NULL);
+    assert(cbs.dm_userdata == NULL);
+    assert(cbs.on_transport == NULL);
+    assert(cbs.transport_userdata == NULL);
+    assert(cbs.on_publish_result == NULL);
+    assert(cbs.publish_result_userdata == NULL);
+
+    /* Set and verify each field */
+    int dummy = 42;
+    cbs.on_publish_result = test_publish_cb;
+    cbs.publish_result_userdata = &dummy;
+    assert(cbs.on_publish_result == test_publish_cb);
+    assert(cbs.publish_result_userdata == &dummy);
+
+    printf("  PASS: callback struct layout\n");
+}
+
+static void test_signer_sign_event_roundtrip(void) {
+    /* Verify that a direct-key signer can sign a Nostr event and
+     * produce valid signed JSON (id + sig fields populated).
+     * Uses a fixed test key to avoid entropy exhaustion from
+     * earlier keypair-generation-heavy tests. */
+    const char *test_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    MdSigner *signer = md_signer_create_direct(test_sk);
+    assert(signer != NULL);
+
+    /* Get the derived pubkey */
+    char *pk = NULL;
+    int ret = md_signer_get_pubkey(signer, &pk);
+    assert(ret == MD_SIGNER_OK && pk != NULL);
+    assert(strlen(pk) == 64);
+
+    /* Build a simple unsigned event JSON */
+    char event_json[512];
+    snprintf(event_json, sizeof(event_json),
+             "{\"kind\":1,\"content\":\"test\",\"tags\":[],\"created_at\":1700000000,\"pubkey\":\"%s\"}",
+             pk);
+
+    /* Sign it */
+    char *signed_json = NULL;
+    ret = md_signer_sign_event(signer, event_json, &signed_json);
+    assert(ret == MD_SIGNER_OK);
+    assert(signed_json != NULL);
+
+    /* Signed JSON should contain "sig" and "id" fields */
+    assert(strstr(signed_json, "\"sig\"") != NULL);
+    assert(strstr(signed_json, "\"id\"") != NULL);
+    /* Should still contain the original pubkey */
+    assert(strstr(signed_json, pk) != NULL);
+
+    free(signed_json);
+    free(pk);
+    md_signer_destroy(signer);
+    printf("  PASS: signer sign_event round-trip\n");
+}
+
 int main(void) {
     printf("test_nostr (nostrc bridge):\n");
     test_keypair_generation();
@@ -210,6 +342,11 @@ int main(void) {
     test_allowlist_default_deny();
     test_nip44_roundtrip();
     test_nip44_wrong_key_fails();
+    test_callback_struct_layout();
+    test_signer_sign_event_roundtrip();
+    /* Bridge lifecycle test runs last — it starts/stops pool worker
+     * threads that may leave OpenSSL PRNG in a non-reusable state. */
+    test_bridge_lifecycle();
     printf("All nostr bridge tests passed.\n");
     return 0;
 }

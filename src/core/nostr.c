@@ -49,6 +49,9 @@ static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_len) {
     return 0;
 }
 
+/* Forward declaration — defined after DM helpers, used by auth handler */
+static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev);
+
 /* Helper: parse JSON into a new NostrEvent (replaces old nostr_event_from_json) */
 static NostrEvent *event_from_json(const char *json) {
     if (!json) return NULL;
@@ -60,6 +63,12 @@ static NostrEvent *event_from_json(const char *json) {
     }
     return ev;
 }
+
+/* Application-layer event dedup ring.  nostrc's pool-level dedup (unique=true)
+ * catches most duplicates, but reconnect replays and cross-relay overlap can
+ * still deliver the same event twice.  This is a small fixed-size ring that
+ * tracks recent event IDs to guarantee idempotent processing. */
+#define MD_DEDUP_RING_CAP 64
 
 struct MdNostr {
     MdSigner          *signer;       /* signing backend                     */
@@ -75,7 +84,43 @@ struct MdNostr {
     NostrRelay       **relays;       /* borrowed relay pointers (not owned) */
     size_t             relay_count;
     char             **relay_urls;   /* owned copies of URL strings         */
+
+    /* Application-layer dedup ring (defense-in-depth over pool dedup) */
+    char              *dedup_ids[MD_DEDUP_RING_CAP]; /* ring of event IDs   */
+    size_t             dedup_head;                    /* next write slot     */
+    size_t             dedup_len;                     /* entries used        */
+    pthread_mutex_t    dedup_mu;                      /* guards ring access  */
 };
+
+/* ── Dedup ring helpers ─────────────────────────────────────────
+ * Returns true if the event ID was already seen (duplicate).
+ * On first sight, records the ID and returns false.
+ * Thread-safe: called from pool worker threads.
+ */
+static bool dedup_is_seen(MdNostr *n, const char *event_id) {
+    if (!n || !event_id) return false;
+
+    pthread_mutex_lock(&n->dedup_mu);
+
+    /* Linear scan — ring is small (64 entries), O(n) is fine */
+    size_t cap = n->dedup_len < MD_DEDUP_RING_CAP ? n->dedup_len : MD_DEDUP_RING_CAP;
+    for (size_t i = 0; i < cap; i++) {
+        if (n->dedup_ids[i] && strcmp(n->dedup_ids[i], event_id) == 0) {
+            pthread_mutex_unlock(&n->dedup_mu);
+            return true; /* duplicate */
+        }
+    }
+
+    /* Not seen — insert at head, overwriting oldest if full */
+    free(n->dedup_ids[n->dedup_head]); /* NULL-safe */
+    n->dedup_ids[n->dedup_head] = strdup(event_id);
+    n->dedup_head = (n->dedup_head + 1) % MD_DEDUP_RING_CAP;
+    if (n->dedup_len < MD_DEDUP_RING_CAP)
+        n->dedup_len++;
+
+    pthread_mutex_unlock(&n->dedup_mu);
+    return false;
+}
 
 /* Helper: publish an event to all cached relays */
 static int publish_all(MdNostr *n, NostrEvent *ev) {
@@ -83,6 +128,91 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
     for (size_t i = 0; i < n->relay_count; i++)
         nostr_relay_publish(n->relays[i], ev);
     return 0;
+}
+
+/* ── NIP-42 AUTH callback ──────────────────────────────────────
+ * Fires on the relay worker thread when a relay sends an AUTH
+ * challenge.  We respond by building a kind:22242 event with the
+ * relay URL and challenge string, signing it via the signer
+ * abstraction, and publishing it back to the relay.
+ *
+ * This is required for relays that gate subscriptions or event
+ * storage behind authentication.
+ */
+static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
+                                  void *user_data) {
+    MdNostr *n = user_data;
+    if (!n || !n->signer || !relay || !challenge)
+        return;
+
+    const char *relay_url = nostr_relay_get_url_const(relay);
+    fprintf(stderr, "nostr: NIP-42 AUTH challenge from %s\n",
+            relay_url ? relay_url : "(unknown)");
+
+    /* Build kind:22242 auth event with relay + challenge tags */
+    NostrEvent *ev = nostr_event_new();
+    if (!ev) return;
+
+    nostr_event_set_kind(ev, 22242);
+    nostr_event_set_content(ev, "");
+    nostr_event_set_pubkey(ev, n->pk_hex);
+    nostr_event_set_created_at(ev, (int64_t)time(NULL));
+
+    NostrTag *challenge_tag = nostr_tag_new("challenge", challenge, NULL);
+    NostrTag *relay_tag = nostr_tag_new("relay", relay_url ? relay_url : "", NULL);
+    if (!challenge_tag || !relay_tag) {
+        if (challenge_tag) nostr_tag_free(challenge_tag);
+        if (relay_tag) nostr_tag_free(relay_tag);
+        nostr_event_free(ev);
+        return;
+    }
+    NostrTags *tags = nostr_tags_new(2, relay_tag, challenge_tag);
+    if (!tags) {
+        nostr_tag_free(challenge_tag);
+        nostr_tag_free(relay_tag);
+        nostr_event_free(ev);
+        return;
+    }
+    nostr_event_set_tags(ev, tags); /* takes ownership */
+
+    /* Sign via signer abstraction (may block for remote signers) */
+    NostrEvent *signed_ev = sign_event_via_signer(n->signer, ev);
+    nostr_event_free(ev);
+    if (!signed_ev) {
+        fprintf(stderr, "nostr: AUTH sign failed for %s\n",
+                relay_url ? relay_url : "(unknown)");
+        return;
+    }
+
+    /* Send the signed auth event back to the relay */
+    nostr_relay_publish(relay, signed_ev);
+    nostr_event_free(signed_ev);
+    fprintf(stderr, "nostr: AUTH response sent to %s\n",
+            relay_url ? relay_url : "(unknown)");
+}
+
+/* ── Relay OK callback ─────────────────────────────────────────
+ * Fires on the relay worker thread when a relay sends an OK
+ * response (["OK","<event_id>",true/false,"<reason>"]) after we
+ * publish an event.  We log rejections and forward to the
+ * caller-provided callback if one is registered.
+ */
+static void md_nostr_ok_handler(const char *event_id, bool ok,
+                                const char *reason, void *user_data) {
+    MdNostr *n = user_data;
+    if (!n) return;
+
+    if (!ok) {
+        fprintf(stderr, "nostr: relay REJECTED event %.16s%s — %s\n",
+                event_id ? event_id : "(null)",
+                event_id && strlen(event_id) > 16 ? "..." : "",
+                reason ? reason : "(no reason)");
+    }
+
+    if (n->cbs.on_publish_result) {
+        n->cbs.on_publish_result(event_id, ok, reason,
+                                 n->cbs.publish_result_userdata);
+    }
 }
 
 /* ── Instance registry ─────────────────────────────────────────
@@ -170,6 +300,13 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
     if (!n)
         return;
     NostrEvent *ev = incoming->event;
+
+    /* Application-layer dedup: skip events we've already processed.
+     * This is defense-in-depth over nostrc's pool-level dedup ring. */
+    const char *ev_id = nostr_event_get_id(ev);
+    if (ev_id && dedup_is_seen(n, ev_id))
+        return;
+
     int kind = nostr_event_get_kind(ev);
 
     if (kind == 1059 && n->cbs.on_dm && n->signer) {
@@ -272,6 +409,8 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     MdNostr *n = calloc(1, sizeof(MdNostr));
     if (!n) return NULL;
 
+    pthread_mutex_init(&n->dedup_mu, NULL);
+
     /* Set up signer: use provided signer, or create direct-key from sk_hex */
     if (cfg->signer) {
         n->signer = cfg->signer;
@@ -334,10 +473,52 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
             n->relay_urls[i] = strdup(nostr_relay_get_url_const(n->pool->relays[i]));
         }
         pthread_mutex_unlock(&n->pool->pool_mutex);
+
+        /* Register per-relay callbacks.  Both have a user_data parameter
+         * (unlike event_middleware), so we pass MdNostr directly. */
+        for (size_t i = 0; i < n->relay_count; i++) {
+            nostr_relay_set_ok_callback(n->relays[i],
+                                        md_nostr_ok_handler, n);
+            nostr_relay_set_auth_callback(n->relays[i],
+                                          md_nostr_auth_handler, n);
+        }
     }
 
     /* Start pool worker threads */
     nostr_simple_pool_start(n->pool);
+
+    /* Subscribe to incoming NIP-17 gift-wrapped DMs (kind:1059) addressed
+     * to our pubkey.  This is the live subscription that allows the host
+     * and client to receive session-negotiation DMs without polling.
+     * Events arrive via md_nostr_event_handler() → cbs.on_dm.
+     *
+     * since = now - 300s: catch DMs that arrived in the last 5 minutes
+     * while we were offline, but avoid replaying ancient gift-wraps. */
+    if (n->cbs.on_dm) {
+        NostrFilter *f = nostr_filter_builder_build(
+            nostr_filter_builder_since(
+                nostr_filter_builder_tag(
+                    nostr_filter_builder_kinds(
+                        nostr_filter_builder_new(),
+                        1059, -1),
+                    "p", n->pk_hex),
+                (int64_t)time(NULL) - 300));
+        if (f) {
+            NostrFilters *filters = nostr_filters_new();
+            if (filters) {
+                nostr_filters_add(filters, f);
+                nostr_filter_free(f);
+                nostr_simple_pool_subscribe(n->pool,
+                                            (const char **)n->relay_urls,
+                                            n->relay_count, *filters, true);
+                nostr_filters_free(filters);
+                fprintf(stderr, "nostr: subscribed to kind:1059 gift-wraps "
+                                "for %.8s...\n", n->pk_hex);
+            } else {
+                nostr_filter_free(f);
+            }
+        }
+    }
 
     fprintf(stderr, "nostr: bridge ready (signer=%s, pk=%.*s..., relays=%d)\n",
             md_signer_type_name(md_signer_get_type(n->signer)),
@@ -375,6 +556,11 @@ void md_nostr_destroy(MdNostr *n) {
         free(n->relay_urls);
     }
     free(n->relays);
+
+    /* Free dedup ring */
+    for (size_t i = 0; i < MD_DEDUP_RING_CAP; i++)
+        free(n->dedup_ids[i]);
+    pthread_mutex_destroy(&n->dedup_mu);
 
     /* Only destroy signer if we created it (from sk_hex fallback) */
     if (n->owns_signer && n->signer)
@@ -605,15 +791,19 @@ bool md_nostr_has_allowlist(const MdNostr *n) {
 int md_nostr_refresh_allowlist(MdNostr *n) {
     if (!n || !n->pool || !n->pk_hex) return -1;
 
-    /* Subscribe to kind:30000, authors:[our_pk], #d:["metadesk-allowlist"] */
+    /* Subscribe to kind:30000, authors:[our_pk], #d:["metadesk-allowlist"].
+     * limit:1 — this is an addressable event (NIP-33) so only the latest
+     * version exists; the subscription stays open for live replacements. */
     NostrFilter *f = nostr_filter_builder_build(
-        nostr_filter_builder_tag(
-            nostr_filter_builder_authors(
-                nostr_filter_builder_kinds(
-                    nostr_filter_builder_new(),
-                    30000, -1),
-                n->pk_hex, NULL),
-            "d", "metadesk-allowlist"));
+        nostr_filter_builder_limit(
+            nostr_filter_builder_tag(
+                nostr_filter_builder_authors(
+                    nostr_filter_builder_kinds(
+                        nostr_filter_builder_new(),
+                        30000, -1),
+                    n->pk_hex, NULL),
+                "d", "metadesk-allowlist"),
+            1));
     if (!f) return -1;
 
     NostrFilters *filters = nostr_filters_new();
@@ -801,15 +991,19 @@ int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
     if (!n || !n->pool || !host_pubkey_hex)
         return -1;
 
-    /* Build filter: kind:30078, authors:[host_pubkey], #d:["fips-transport"] */
+    /* Build filter: kind:30078, authors:[host_pubkey], #d:["fips-transport"].
+     * limit:1 — addressable event (NIP-33), only the latest version exists;
+     * subscription stays open for live replacements. */
     NostrFilter *f = nostr_filter_builder_build(
-        nostr_filter_builder_tag(
-            nostr_filter_builder_authors(
-                nostr_filter_builder_kinds(
-                    nostr_filter_builder_new(),
-                    30078, -1),
-                host_pubkey_hex, NULL),
-            "d", "fips-transport"));
+        nostr_filter_builder_limit(
+            nostr_filter_builder_tag(
+                nostr_filter_builder_authors(
+                    nostr_filter_builder_kinds(
+                        nostr_filter_builder_new(),
+                        30078, -1),
+                    host_pubkey_hex, NULL),
+                "d", "fips-transport"),
+            1));
     if (!f) return -1;
 
     /* Wrap in NostrFilters (by-value struct for pool_subscribe) */

@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static volatile int g_running = 1;
 
@@ -58,6 +59,8 @@ typedef struct {
     char          accepted_session_id[64]; /* from session_accept DM     */
     uint32_t      granted_caps;       /* from session_accept DM          */
     volatile int  session_accepted;   /* set by on_dm callback           */
+    pthread_mutex_t nostr_mu;         /* protects nostr signal state     */
+    pthread_cond_t  nostr_cv;         /* signaled on nostr events        */
 } ClientCtx;
 
 /* ── Decode callback: display frame ──────────────────────────── */
@@ -97,7 +100,10 @@ static void on_transport(const char *pubkey_hex, const char *fips_addr,
 
     strncpy(ctx->transport_addr, fips_addr, sizeof(ctx->transport_addr) - 1);
     ctx->transport_addr[sizeof(ctx->transport_addr) - 1] = '\0';
+    pthread_mutex_lock(&ctx->nostr_mu);
     ctx->transport_ready = 1;
+    pthread_cond_signal(&ctx->nostr_cv);
+    pthread_mutex_unlock(&ctx->nostr_mu);
 }
 
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
@@ -119,7 +125,10 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         strncpy(ctx->accepted_session_id, acc.session_id,
                 sizeof(ctx->accepted_session_id) - 1);
         ctx->granted_caps = acc.granted;
+        pthread_mutex_lock(&ctx->nostr_mu);
         ctx->session_accepted = 1;
+        pthread_cond_signal(&ctx->nostr_cv);
+        pthread_mutex_unlock(&ctx->nostr_mu);
     }
 }
 
@@ -298,9 +307,15 @@ int main(int argc, char **argv) {
             .relay_count = relay_count,
         };
 
+        /* Init condvar before create — callbacks fire on worker threads */
+        pthread_mutex_init(&ctx.nostr_mu, NULL);
+        pthread_cond_init(&ctx.nostr_cv, NULL);
+
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (!nostr) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
+            pthread_cond_destroy(&ctx.nostr_cv);
+            pthread_mutex_destroy(&ctx.nostr_mu);
             if (signer) md_signer_destroy(signer);
             return 1;
         }
@@ -317,10 +332,20 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Step 2: Wait for on_transport callback (with timeout) */
-        int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
-        while (!ctx.transport_ready && now_us() < deadline && g_running) {
-            usleep(50000); /* 50ms poll */
+        /* Step 2: Wait for on_transport callback (event-driven with timeout) */
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += timeout_ms / 1000;
+            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_mutex_lock(&ctx.nostr_mu);
+            while (!ctx.transport_ready && g_running) {
+                if (pthread_cond_timedwait(&ctx.nostr_cv,
+                                          &ctx.nostr_mu, &ts) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&ctx.nostr_mu);
         }
         if (!ctx.transport_ready) {
             fprintf(stderr, "ERROR: timed out waiting for host transport addr\n");
@@ -354,10 +379,21 @@ int main(int argc, char **argv) {
         }
         free(req_json);
 
-        /* Step 4: Wait for session accept DM */
-        deadline = now_us() + (int64_t)timeout_ms * 2 * 1000;
-        while (!ctx.session_accepted && now_us() < deadline && g_running) {
-            usleep(50000); /* 50ms poll */
+        /* Step 4: Wait for session accept DM (event-driven with timeout) */
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            long accept_ms = timeout_ms * 2;
+            ts.tv_sec  += accept_ms / 1000;
+            ts.tv_nsec += (accept_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_mutex_lock(&ctx.nostr_mu);
+            while (!ctx.session_accepted && g_running) {
+                if (pthread_cond_timedwait(&ctx.nostr_cv,
+                                          &ctx.nostr_mu, &ts) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&ctx.nostr_mu);
         }
         if (!ctx.session_accepted) {
             fprintf(stderr, "ERROR: timed out waiting for session accept\n");
@@ -579,9 +615,11 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
-    if (nostr)
+    if (nostr) {
+        pthread_cond_destroy(&ctx.nostr_cv);
+        pthread_mutex_destroy(&ctx.nostr_mu);
         md_nostr_destroy(nostr);
-    else if (signer)
+    } else if (signer)
         md_signer_destroy(signer); /* only if nostr didn't borrow it */
     free(ctx.ui_tree_json);
     if (ctx.overlay)

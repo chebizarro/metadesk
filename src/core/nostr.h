@@ -81,23 +81,39 @@ typedef void (*MdNostrTransportCallback)(const char *pubkey_hex,
                                          const char *fips_addr,
                                          void *userdata);
 
+/* Called when a relay responds to an event we published (OK frame).
+ * `ok` is true on acceptance, false on rejection.
+ * `reason` may be NULL; common values include "blocked:", "duplicate:",
+ * "pow:", "rate-limited:", "invalid:", "error:" (NIP-20 machine-readable). */
+typedef void (*MdNostrPublishResultCallback)(const char *event_id,
+                                             bool ok,
+                                             const char *reason,
+                                             void *userdata);
+
 /* Callback table registered at creation time */
 typedef struct {
-    MdNostrDmCallback         on_dm;           /* incoming session DMs     */
-    void                     *dm_userdata;
-    MdNostrTransportCallback  on_transport;    /* transport addr updates   */
-    void                     *transport_userdata;
+    MdNostrDmCallback              on_dm;              /* incoming session DMs     */
+    void                          *dm_userdata;
+    MdNostrTransportCallback       on_transport;       /* transport addr updates   */
+    void                          *transport_userdata;
+    MdNostrPublishResultCallback   on_publish_result;  /* relay OK/rejection       */
+    void                          *publish_result_userdata;
 } MdNostrCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────
  * Create sets up the relay pool, connects to all relays, and
- * registers live subscriptions for:
- *   - kind:1059 (NIP-17 gift-wraps addressed to our pubkey)
- *   - kind:30078 (FIPS transport address publications)
- * These subscriptions persist until md_nostr_destroy().
+ * if an on_dm callback is provided, subscribes to kind:1059
+ * NIP-17 gift-wraps addressed to our pubkey.
+ *
+ * Additional subscriptions are started on demand:
+ *   - kind:30078 via md_nostr_subscribe_transport()
+ *   - kind:30000 via md_nostr_refresh_allowlist()
+ *
+ * All subscriptions persist until md_nostr_destroy().
  */
 
-/* Create Nostr bridge. Connects to relays, derives pubkey, starts subscriptions. */
+/* Create Nostr bridge. Connects to relays, derives pubkey,
+ * subscribes to kind:1059 gift-wraps if on_dm callback is set. */
 MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs);
 
 /* Get the local pubkey hex string (owned by MdNostr, do not free). */
@@ -138,7 +154,7 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
  * When true, only clients on the list should be accepted. */
 bool md_nostr_has_allowlist(const MdNostr *n);
 
-/* Refresh the allowlist from relays (subscribe, wait for EOSE). */
+/* Subscribe to allowlist updates from relays (limit:1 for latest). */
 int md_nostr_refresh_allowlist(MdNostr *n);
 
 /* Add pubkey_hex to allowlist with capabilities, publish updated list. */

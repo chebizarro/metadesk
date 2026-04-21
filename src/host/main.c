@@ -59,6 +59,8 @@ typedef struct {
     char          pending_client_pk[128]; /* pubkey of requesting client */
     MdSessionRequest pending_req;         /* parsed session request      */
     volatile int  session_requested;      /* set by on_dm callback       */
+    pthread_mutex_t nostr_mu;             /* protects nostr signal state */
+    pthread_cond_t  nostr_cv;             /* signaled on nostr events    */
 } HostCtx;
 
 /* ── Encode callback: send encoded packet to client ──────────── */
@@ -99,7 +101,10 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
         strncpy(ctx->pending_client_pk, sender_pubkey_hex,
                 sizeof(ctx->pending_client_pk) - 1);
         ctx->pending_req = req;
+        pthread_mutex_lock(&ctx->nostr_mu);
         ctx->session_requested = 1;
+        pthread_cond_signal(&ctx->nostr_cv);
+        pthread_mutex_unlock(&ctx->nostr_mu);
         fprintf(stderr, "host: received session request from %.*s...\n",
                 8, sender_pubkey_hex);
     }
@@ -381,11 +386,20 @@ int main(int argc, char **argv) {
 
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
-            /* Wait for a session request DM (with timeout) */
-            int wait_count = 0;
-            while (!ctx.session_requested && g_running && wait_count < 600) {
-                usleep(100000); /* 100ms poll */
-                wait_count++;
+            /* Wait for a session request DM (event-driven with timeout) */
+            pthread_mutex_init(&ctx.nostr_mu, NULL);
+            pthread_cond_init(&ctx.nostr_cv, NULL);
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 60; /* 60s timeout */
+                pthread_mutex_lock(&ctx.nostr_mu);
+                while (!ctx.session_requested && g_running) {
+                    if (pthread_cond_timedwait(&ctx.nostr_cv,
+                                              &ctx.nostr_mu, &ts) != 0)
+                        break; /* ETIMEDOUT or error */
+                }
+                pthread_mutex_unlock(&ctx.nostr_mu);
             }
 
             if (ctx.session_requested) {
@@ -657,9 +671,11 @@ int main(int argc, char **argv) {
 
     md_stream_server_destroy(srv);
 
-    if (nostr)
+    if (nostr) {
+        pthread_cond_destroy(&ctx.nostr_cv);
+        pthread_mutex_destroy(&ctx.nostr_mu);
         md_nostr_destroy(nostr);
-    else if (signer)
+    } else if (signer)
         md_signer_destroy(signer);
 
     printf("host: done. served %u client(s)\n", client_num);
