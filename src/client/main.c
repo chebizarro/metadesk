@@ -46,6 +46,11 @@ typedef struct {
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
 
+    /* UI tree state (received from host agent) */
+    char         *ui_tree_json;         /* latest full UI tree JSON (owned)   */
+    size_t        ui_tree_len;          /* byte length of ui_tree_json        */
+    uint32_t      tree_updates;         /* count of tree/delta packets recv'd */
+
     /* Nostr session negotiation state */
     char          expected_host_pk[128]; /* pubkey of host we're connecting to */
     char          transport_addr[256]; /* FIPS addr from on_transport     */
@@ -479,8 +484,33 @@ int main(int argc, char **argv) {
             break;
 
         case MD_PKT_UI_TREE:
+            /* Full UI tree snapshot from host agent.
+             * Store the JSON for agent interaction / overlay display. */
+            if (payload && hdr.payload_len > 0) {
+                free(ctx.ui_tree_json);
+                ctx.ui_tree_json = malloc(hdr.payload_len + 1);
+                if (ctx.ui_tree_json) {
+                    memcpy(ctx.ui_tree_json, payload, hdr.payload_len);
+                    ctx.ui_tree_json[hdr.payload_len] = '\0';
+                    ctx.ui_tree_len = hdr.payload_len;
+                }
+                ctx.tree_updates++;
+                if (ctx.tree_updates <= 3 || (ctx.tree_updates % 100) == 0) {
+                    fprintf(stderr, "client: received UI tree (%u bytes, update #%u)\n",
+                            hdr.payload_len, ctx.tree_updates);
+                }
+            }
+            break;
+
         case MD_PKT_UI_TREE_DELTA:
-            /* TODO: parse and display UI tree (M1.6/M1.7) */
+            /* Incremental UI tree delta from host agent.
+             * For now, apply by requesting a full tree on next action.
+             * TODO: parse delta JSON and patch ui_tree_json in-place. */
+            ctx.tree_updates++;
+            if (ctx.tree_updates <= 3 || (ctx.tree_updates % 100) == 0) {
+                fprintf(stderr, "client: received UI tree delta (%u bytes, update #%u)\n",
+                        hdr.payload_len, ctx.tree_updates);
+            }
             break;
 
         case MD_PKT_SESSION_INFO:
@@ -553,12 +583,13 @@ int main(int argc, char **argv) {
         md_nostr_destroy(nostr);
     else if (signer)
         md_signer_destroy(signer); /* only if nostr didn't borrow it */
+    free(ctx.ui_tree_json);
     if (ctx.overlay)
         md_overlay_destroy(ctx.overlay);
     if (ctx.renderer)
         md_renderer_destroy(ctx.renderer);
 
-    printf("client: done. decoded %u frames, displayed %u\n",
-           ctx.frames_decoded, ctx.frames_displayed);
+    printf("client: done. decoded %u frames, displayed %u, tree updates %u\n",
+           ctx.frames_decoded, ctx.frames_displayed, ctx.tree_updates);
     return 0;
 }
