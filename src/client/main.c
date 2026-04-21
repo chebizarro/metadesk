@@ -21,6 +21,7 @@
 #include "render.h"
 #include "signer.h"
 #include "nostr.h"
+#include "a11y.h"
 #include "ui.h"
 
 #include <stdio.h>
@@ -524,11 +525,26 @@ int main(int argc, char **argv) {
 
         case MD_PKT_UI_TREE_DELTA:
             /* Incremental UI tree delta from host agent.
-             * For now, apply by requesting a full tree on next action.
-             * TODO: parse delta JSON and patch ui_tree_json in-place. */
+             * Parse delta JSON and patch ui_tree_json in-place. */
+            if (payload && hdr.payload_len > 0 && ctx.ui_tree_json) {
+                char *delta_str = malloc(hdr.payload_len + 1);
+                if (delta_str) {
+                    memcpy(delta_str, payload, hdr.payload_len);
+                    delta_str[hdr.payload_len] = '\0';
+
+                    char *patched = md_a11y_tree_patch(ctx.ui_tree_json, delta_str);
+                    free(delta_str);
+
+                    if (patched) {
+                        free(ctx.ui_tree_json);
+                        ctx.ui_tree_json = patched;
+                        ctx.ui_tree_len = strlen(patched);
+                    }
+                }
+            }
             ctx.tree_updates++;
             if (ctx.tree_updates <= 3 || (ctx.tree_updates % 100) == 0) {
-                fprintf(stderr, "client: received UI tree delta (%u bytes, update #%u)\n",
+                fprintf(stderr, "client: applied UI tree delta (%u bytes, update #%u)\n",
                         hdr.payload_len, ctx.tree_updates);
             }
             break;

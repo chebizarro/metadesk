@@ -250,6 +250,180 @@ static void test_diff(void) {
     md_a11y_destroy(ctx);
 }
 
+/* ── Tree patch tests (§3.3.3 in-place delta application) ──── */
+
+static void test_tree_patch_add(void) {
+    /* Build a tree, serialize, then add a node via delta */
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *btn = make_node("b1", "button", "OK", 10, 10, 80, 30);
+    node_add_child(root, btn);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Delta: add a new button under root */
+    const char *delta = "[{\"op\":\"add\",\"parent_id\":\"r1\","
+        "\"node\":{\"id\":\"b2\",\"role\":\"button\",\"label\":\"Cancel\","
+        "\"bounds\":{\"x\":100,\"y\":10,\"w\":80,\"h\":30},\"children\":[]}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    /* Verify the new node appears */
+    assert(strstr(patched, "\"b2\"") != NULL);
+    assert(strstr(patched, "Cancel") != NULL);
+    /* Original node still present */
+    assert(strstr(patched, "\"b1\"") != NULL);
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch add\n");
+}
+
+static void test_tree_patch_remove(void) {
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *b1 = make_node("b1", "button", "OK", 10, 10, 80, 30);
+    MdA11yNode *b2 = make_node("b2", "button", "Cancel", 100, 10, 80, 30);
+    node_add_child(root, b1);
+    node_add_child(root, b2);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Delta: remove b1 */
+    const char *delta = "[{\"op\":\"remove\",\"node\":{\"id\":\"b1\"}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    /* b1 should be gone, b2 still present */
+    assert(strstr(patched, "\"b1\"") == NULL);
+    assert(strstr(patched, "\"b2\"") != NULL);
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch remove\n");
+}
+
+static void test_tree_patch_update(void) {
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *btn = make_node("b1", "button", "OK", 10, 10, 80, 30);
+    node_add_child(root, btn);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Delta: update b1's label */
+    const char *delta = "[{\"op\":\"update\","
+        "\"node\":{\"id\":\"b1\",\"label\":\"Confirm\"}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    /* New label should appear, old should not */
+    assert(strstr(patched, "Confirm") != NULL);
+    /* node id still present */
+    assert(strstr(patched, "\"b1\"") != NULL);
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch update\n");
+}
+
+static void test_tree_patch_multiple_ops(void) {
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *b1 = make_node("b1", "button", "A", 10, 10, 80, 30);
+    MdA11yNode *b2 = make_node("b2", "button", "B", 100, 10, 80, 30);
+    node_add_child(root, b1);
+    node_add_child(root, b2);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Multiple ops: remove b1, update b2, add b3 */
+    const char *delta =
+        "[{\"op\":\"remove\",\"node\":{\"id\":\"b1\"}},"
+        "{\"op\":\"update\",\"node\":{\"id\":\"b2\",\"label\":\"Updated\"}},"
+        "{\"op\":\"add\",\"parent_id\":\"r1\","
+        "\"node\":{\"id\":\"b3\",\"role\":\"button\",\"label\":\"New\","
+        "\"bounds\":{\"x\":0,\"y\":0,\"w\":80,\"h\":30},\"children\":[]}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    assert(strstr(patched, "\"b1\"") == NULL);     /* removed */
+    assert(strstr(patched, "Updated") != NULL);     /* updated */
+    assert(strstr(patched, "\"b3\"") != NULL);       /* added */
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch multiple ops\n");
+}
+
+static void test_tree_patch_null_safety(void) {
+    assert(md_a11y_tree_patch(NULL, "[]") == NULL);
+    assert(md_a11y_tree_patch("{}", NULL) == NULL);
+    assert(md_a11y_tree_patch("not json", "[]") == NULL);
+    assert(md_a11y_tree_patch("{\"v\":1}", "not json") == NULL);
+
+    printf("  PASS: tree patch null safety\n");
+}
+
+static void test_tree_patch_deep_add(void) {
+    /* Add a node under a nested child, not the root */
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *panel = make_node("p1", "panel", "Menu", 0, 0, 200, 600);
+    node_add_child(root, panel);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Add button under panel (p1), not root */
+    const char *delta = "[{\"op\":\"add\",\"parent_id\":\"p1\","
+        "\"node\":{\"id\":\"m1\",\"role\":\"menu item\",\"label\":\"File\","
+        "\"bounds\":{\"x\":5,\"y\":5,\"w\":100,\"h\":20},\"children\":[]}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    assert(strstr(patched, "\"m1\"") != NULL);
+    assert(strstr(patched, "File") != NULL);
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch deep add\n");
+}
+
+static void test_tree_patch_update_state(void) {
+    MdA11yNode *root = make_node("r1", "window", "App", 0, 0, 800, 600);
+    MdA11yNode *btn = make_node("b1", "button", "OK", 10, 10, 80, 30);
+    node_add_state(btn, "enabled");
+    node_add_child(root, btn);
+
+    char *tree = md_a11y_to_json(root);
+    assert(tree != NULL);
+
+    /* Update b1's state to focused */
+    const char *delta = "[{\"op\":\"update\","
+        "\"node\":{\"id\":\"b1\",\"state\":[\"focused\",\"pressed\"]}}]";
+
+    char *patched = md_a11y_tree_patch(tree, delta);
+    assert(patched != NULL);
+
+    assert(strstr(patched, "focused") != NULL);
+    assert(strstr(patched, "pressed") != NULL);
+
+    free(patched);
+    free(tree);
+    md_a11y_node_free(root);
+    printf("  PASS: tree patch update state\n");
+}
+
 int main(void) {
     printf("test_a11y:\n");
     test_node_alloc_free();
@@ -259,6 +433,13 @@ int main(void) {
     test_compact_interactable_filtering();
     test_compact_text_empty();
     test_delta_serialization();
+    test_tree_patch_add();
+    test_tree_patch_remove();
+    test_tree_patch_update();
+    test_tree_patch_multiple_ops();
+    test_tree_patch_null_safety();
+    test_tree_patch_deep_add();
+    test_tree_patch_update_state();
     test_walk_tree();
     test_diff();
     printf("All a11y tests passed.\n");

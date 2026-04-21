@@ -417,3 +417,179 @@ char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count) {
     cJSON_Delete(arr);
     return str;
 }
+
+/* ── Delta application (spec §3.3.3, in-place patching) ────── */
+
+/*
+ * Find a node by "id" field in a JSON tree (recursive DFS).
+ * Returns the cJSON object with matching id, or NULL.
+ */
+static cJSON *find_node_by_id(cJSON *node, const char *id) {
+    if (!node || !id) return NULL;
+
+    cJSON *node_id = cJSON_GetObjectItem(node, "id");
+    if (node_id && cJSON_IsString(node_id) &&
+        strcmp(node_id->valuestring, id) == 0) {
+        return node;
+    }
+
+    cJSON *children = cJSON_GetObjectItem(node, "children");
+    if (children && cJSON_IsArray(children)) {
+        int count = cJSON_GetArraySize(children);
+        for (int i = 0; i < count; i++) {
+            cJSON *found = find_node_by_id(cJSON_GetArrayItem(children, i), id);
+            if (found) return found;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Remove a child node by id from a parent's children array.
+ * Searches recursively — removes from wherever it's found.
+ * Returns true if found and removed.
+ */
+static bool remove_node_by_id(cJSON *node, const char *id) {
+    if (!node || !id) return false;
+
+    cJSON *children = cJSON_GetObjectItem(node, "children");
+    if (!children || !cJSON_IsArray(children)) return false;
+
+    int count = cJSON_GetArraySize(children);
+    for (int i = 0; i < count; i++) {
+        cJSON *child = cJSON_GetArrayItem(children, i);
+        cJSON *child_id = cJSON_GetObjectItem(child, "id");
+        if (child_id && cJSON_IsString(child_id) &&
+            strcmp(child_id->valuestring, id) == 0) {
+            cJSON_DeleteItemFromArray(children, i);
+            return true;
+        }
+        /* Recurse into subtree */
+        if (remove_node_by_id(child, id))
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * Update fields of an existing node with values from delta node.
+ * Only updates fields that are present in the delta (partial update).
+ */
+static void update_node_fields(cJSON *target, const cJSON *source) {
+    if (!target || !source) return;
+
+    /* Update scalar fields if present in source */
+    static const char *fields[] = {"role", "label"};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        cJSON *src_field = cJSON_GetObjectItem(source, fields[i]);
+        if (src_field && cJSON_IsString(src_field)) {
+            cJSON_DeleteItemFromObject(target, fields[i]);
+            cJSON_AddStringToObject(target, fields[i], src_field->valuestring);
+        }
+    }
+
+    /* Update state array if present */
+    cJSON *src_state = cJSON_GetObjectItem(source, "state");
+    if (src_state && cJSON_IsArray(src_state)) {
+        cJSON_DeleteItemFromObject(target, "state");
+        cJSON_AddItemToObject(target, "state", cJSON_Duplicate(src_state, true));
+    }
+
+    /* Update bounds if present */
+    cJSON *src_bounds = cJSON_GetObjectItem(source, "bounds");
+    if (src_bounds && cJSON_IsObject(src_bounds)) {
+        cJSON_DeleteItemFromObject(target, "bounds");
+        cJSON_AddItemToObject(target, "bounds",
+                              cJSON_Duplicate(src_bounds, true));
+    }
+
+    /* Update children if present (full replacement) */
+    cJSON *src_children = cJSON_GetObjectItem(source, "children");
+    if (src_children && cJSON_IsArray(src_children)) {
+        cJSON_DeleteItemFromObject(target, "children");
+        cJSON_AddItemToObject(target, "children",
+                              cJSON_Duplicate(src_children, true));
+    }
+}
+
+char *md_a11y_tree_patch(const char *tree_json, const char *delta_json) {
+    if (!tree_json || !delta_json) return NULL;
+
+    /* Parse tree document */
+    cJSON *doc = cJSON_Parse(tree_json);
+    if (!doc) return NULL;
+
+    cJSON *root = cJSON_GetObjectItem(doc, "root");
+    if (!root) {
+        cJSON_Delete(doc);
+        return NULL;
+    }
+
+    /* Parse delta array */
+    cJSON *deltas = cJSON_Parse(delta_json);
+    if (!deltas || !cJSON_IsArray(deltas)) {
+        cJSON_Delete(deltas);
+        cJSON_Delete(doc);
+        return NULL;
+    }
+
+    /* Apply each delta operation */
+    int delta_count = cJSON_GetArraySize(deltas);
+    for (int i = 0; i < delta_count; i++) {
+        cJSON *delta = cJSON_GetArrayItem(deltas, i);
+        if (!delta) continue;
+
+        cJSON *op = cJSON_GetObjectItem(delta, "op");
+        if (!op || !cJSON_IsString(op)) continue;
+
+        cJSON *delta_node = cJSON_GetObjectItem(delta, "node");
+        const char *op_s = op->valuestring;
+
+        if (strcmp(op_s, "add") == 0) {
+            /* Add: insert node under parent_id */
+            cJSON *parent_id_j = cJSON_GetObjectItem(delta, "parent_id");
+            if (!parent_id_j || !cJSON_IsString(parent_id_j)) continue;
+            if (!delta_node) continue;
+
+            cJSON *parent = find_node_by_id(root, parent_id_j->valuestring);
+            if (!parent) continue;
+
+            cJSON *children = cJSON_GetObjectItem(parent, "children");
+            if (!children) {
+                children = cJSON_CreateArray();
+                cJSON_AddItemToObject(parent, "children", children);
+            }
+            cJSON_AddItemToArray(children, cJSON_Duplicate(delta_node, true));
+
+        } else if (strcmp(op_s, "remove") == 0) {
+            /* Remove: delete node by id */
+            if (!delta_node) continue;
+            cJSON *del_id = cJSON_GetObjectItem(delta_node, "id");
+            if (!del_id || !cJSON_IsString(del_id)) continue;
+
+            remove_node_by_id(root, del_id->valuestring);
+
+        } else if (strcmp(op_s, "update") == 0) {
+            /* Update: modify existing node's fields */
+            if (!delta_node) continue;
+            cJSON *upd_id = cJSON_GetObjectItem(delta_node, "id");
+            if (!upd_id || !cJSON_IsString(upd_id)) continue;
+
+            cJSON *target = find_node_by_id(root, upd_id->valuestring);
+            if (!target) continue;
+
+            update_node_fields(target, delta_node);
+        }
+    }
+
+    /* Update timestamp */
+    cJSON_DeleteItemFromObject(doc, "ts");
+    cJSON_AddNumberToObject(doc, "ts", (double)now_ms());
+
+    char *result = cJSON_PrintUnformatted(doc);
+    cJSON_Delete(deltas);
+    cJSON_Delete(doc);
+    return result;
+}

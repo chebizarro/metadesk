@@ -110,6 +110,23 @@ char *md_a11y_to_compact(const MdA11yNode *root);
 /* Serialize deltas to JSON (spec §3.3.3). Caller frees. */
 char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count);
 
+/*
+ * Apply a delta JSON array to an existing tree JSON document in-place.
+ *
+ * tree_json: full tree JSON string ({"v":1,"ts":...,"root":{...}})
+ * delta_json: delta array ([{"op":"add/remove/update","node":{...},...}])
+ *
+ * Returns a newly-allocated JSON string with the patched tree.
+ * The timestamp ("ts") is updated. Caller frees the result.
+ * Returns NULL on error (invalid JSON, missing fields, etc.).
+ *
+ * Operations:
+ *   add:    insert node under parent_id (appended to children)
+ *   remove: delete node by id (and all its descendants)
+ *   update: replace node fields (id must match an existing node)
+ */
+char *md_a11y_tree_patch(const char *tree_json, const char *delta_json);
+
 /* ── Memory management ───────────────────────────────────────── */
 
 /* Free a node tree recursively. */
