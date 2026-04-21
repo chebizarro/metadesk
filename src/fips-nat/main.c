@@ -24,6 +24,7 @@
 #include "stun.h"
 #include "publish.h"
 #include "punch.h"
+#include "turn.h"
 #include "fipsnat_ipc.h"
 
 #include "nostr.h"
@@ -59,6 +60,8 @@ typedef struct {
     uint16_t        stun_port;      /* STUN server port                */
     uint16_t        fips_port;      /* FIPS daemon port                */
     uint16_t        punch_port;     /* local punch bind port           */
+    MdTurnConfig    turn;           /* TURN relay config (may be empty)*/
+    bool            turn_enabled;   /* true if TURN credentials given  */
 } FipsNatCtx;
 
 /* ── IPC command dispatch ────────────────────────────────────── */
@@ -93,8 +96,6 @@ static char *handle_discover(FipsNatCtx *ctx) {
 }
 
 static char *handle_punch(FipsNatCtx *ctx, const MdFipsnatPunchReq *req) {
-    (void)ctx;
-
     MdPunchConfig cfg = {0};
     strncpy(cfg.peer_ip, req->peer_ip, sizeof(cfg.peer_ip) - 1);
     cfg.peer_port = req->peer_port;
@@ -103,12 +104,51 @@ static char *handle_punch(FipsNatCtx *ctx, const MdFipsnatPunchReq *req) {
     cfg.probe_interval_ms = MD_PUNCH_DEFAULT_INTERVAL;
     memcpy(cfg.session_id, req->session_id, 16);
 
+    /* Try direct UDP hole punch first */
     MdPunchResult result = {0};
     int rc = md_punch_execute(&cfg, &result);
 
-    if (rc < 0) {
-        return md_fipsnat_ipc_error_response("hole punch failed (timeout or error)");
+    if (rc == 0) {
+        return md_fipsnat_ipc_punch_response(&result);
     }
+
+    /* Direct punch failed — try TURN relay fallback */
+    if (!ctx->turn_enabled) {
+        return md_fipsnat_ipc_error_response(
+            "hole punch failed and no TURN relay configured");
+    }
+
+    fprintf(stderr, "fips-nat: direct punch failed, trying TURN relay...\n");
+
+    MdTurnConfig turn_cfg = ctx->turn;
+    strncpy(turn_cfg.peer_ip, req->peer_ip, sizeof(turn_cfg.peer_ip) - 1);
+    turn_cfg.peer_port = req->peer_port;
+
+    MdTurnAlloc turn_alloc = {0};
+    rc = md_turn_allocate(&turn_cfg, &turn_alloc);
+
+    if (rc < 0) {
+        return md_fipsnat_ipc_error_response(
+            "hole punch and TURN relay both failed");
+    }
+
+    /* Build a result from the TURN allocation.
+     * The fd is the TCP socket to the TURN server — data flows
+     * through ChannelData framing, but the host can still use it
+     * as a connected transport. */
+    result.fd = turn_alloc.fd;
+    strncpy(result.peer_ip, turn_alloc.relay_ip, sizeof(result.peer_ip) - 1);
+    result.peer_port = turn_alloc.relay_port;
+    result.local_port = 0;
+    result.rtt_ms = 0; /* relay RTT not measured here */
+
+    /* Detach fd so md_turn_close doesn't close it */
+    turn_alloc.fd = -1;
+    turn_alloc.allocated = false; /* prevent release on close */
+    md_turn_close(&turn_alloc);
+
+    fprintf(stderr, "fips-nat: TURN relay active: %s:%u\n",
+            result.peer_ip, result.peer_port);
 
     return md_fipsnat_ipc_punch_response(&result);
 }
@@ -159,6 +199,12 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --auto-signer       Auto-detect local signer\n");
     fprintf(stderr, "  --relay URL         Relay URL (repeatable)\n");
     fprintf(stderr, "  --no-publish        Skip Nostr publication (STUN only)\n");
+    fprintf(stderr, "\nTURN relay fallback:\n");
+    fprintf(stderr, "  --turn-server HOST  TURN server (e.g. turn.sharegap.net)\n");
+    fprintf(stderr, "  --turn-port PORT    TURN port (default: %d)\n",
+            MD_TURN_DEFAULT_PORT);
+    fprintf(stderr, "  --turn-user USER    TURN username\n");
+    fprintf(stderr, "  --turn-pass PASS    TURN password\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
 
@@ -181,6 +227,10 @@ int main(int argc, char **argv) {
     bool        no_publish = false;
     const char *relay_urls[16];
     int         relay_count = 0;
+    const char *turn_server = NULL;
+    uint16_t    turn_port = 0;
+    const char *turn_user = NULL;
+    const char *turn_pass = NULL;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -210,6 +260,14 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--no-publish") == 0)
             no_publish = true;
+        else if (strcmp(argv[i], "--turn-server") == 0 && i + 1 < argc)
+            turn_server = argv[++i];
+        else if (strcmp(argv[i], "--turn-port") == 0 && i + 1 < argc)
+            turn_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--turn-user") == 0 && i + 1 < argc)
+            turn_user = argv[++i];
+        else if (strcmp(argv[i], "--turn-pass") == 0 && i + 1 < argc)
+            turn_pass = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -238,6 +296,19 @@ int main(int argc, char **argv) {
         .fips_port   = fips_port,
         .punch_port  = punch_port,
     };
+
+    /* ── TURN relay config ────────────────────────────────────── */
+    if (turn_server) {
+        strncpy(ctx.turn.server, turn_server, sizeof(ctx.turn.server) - 1);
+        ctx.turn.port = turn_port;
+        if (turn_user)
+            strncpy(ctx.turn.username, turn_user, sizeof(ctx.turn.username) - 1);
+        if (turn_pass)
+            strncpy(ctx.turn.password, turn_pass, sizeof(ctx.turn.password) - 1);
+        ctx.turn_enabled = true;
+        printf("fips-nat: TURN fallback: %s:%u\n",
+               turn_server, turn_port ? turn_port : MD_TURN_DEFAULT_PORT);
+    }
 
     /* ── Signer initialization ───────────────────────────────── */
     MdSigner *signer = NULL;
