@@ -28,6 +28,7 @@
 #include "mcp_http.h"
 #include "ipc.h"
 #include "fipsnat_ipc.h"
+#include "bitrate_ctrl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -708,6 +709,15 @@ int main(int argc, char **argv) {
         uint32_t last_stats_ms = md_stream_now_ms();
         uint32_t last_ping_ms = last_stats_ms;
 
+        /* Adaptive bitrate controller for this connection */
+        MdBitrateCtrlConfig br_cfg = {
+            .max_bitrate = bitrate,
+            .min_bitrate = bitrate / 16,  /* 1/16 of max as floor */
+            .initial_bitrate = bitrate,
+        };
+        MdBitrateCtrl *br_ctrl = md_bitrate_ctrl_create(&br_cfg);
+        uint32_t last_br = bitrate;
+
         while (g_running && md_stream_is_connected(client)) {
             /* Check for incoming packets from client (non-blocking) */
             MdPacketHeader hdr;
@@ -729,6 +739,28 @@ int main(int argc, char **argv) {
             if (now - last_ping_ms >= 1000) {
                 md_stream_send_ping(client);
                 last_ping_ms = now;
+
+                /* Feed RTT to bitrate controller */
+                if (br_ctrl && encoder) {
+                    MdStreamStats st;
+                    md_stream_get_stats(client, &st);
+                    if (st.avg_rtt_ms > 0) {
+                        uint32_t new_br = md_bitrate_ctrl_update(
+                            br_ctrl, st.avg_rtt_ms, now);
+                        if (new_br != last_br) {
+                            md_encoder_set_bitrate(encoder, new_br);
+                            last_br = new_br;
+                            printf("host: bitrate adjusted to %u bps "
+                                   "(rtt_avg=%ums, action=%s)\n",
+                                   new_br, st.avg_rtt_ms,
+                                   md_bitrate_ctrl_get_action(br_ctrl)
+                                       == MD_BITRATE_DECREASE ? "decrease"
+                                   : md_bitrate_ctrl_get_action(br_ctrl)
+                                       == MD_BITRATE_INCREASE ? "increase"
+                                   : "hold");
+                        }
+                    }
+                }
             }
 
             /* Print stats every 5 seconds */
@@ -754,6 +786,13 @@ int main(int argc, char **argv) {
         }
 
         /* Client disconnected — clean up per-connection resources */
+        md_bitrate_ctrl_destroy(br_ctrl);
+        br_ctrl = NULL;
+
+        /* Restore original bitrate for next connection */
+        if (encoder)
+            md_encoder_set_bitrate(encoder, bitrate);
+
         printf("host: client #%u disconnected (sent %u frames)\n",
                client_num, ctx.frames_sent);
 

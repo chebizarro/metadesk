@@ -302,7 +302,8 @@ core_sources = files(
   'src/core/signer.c',
   'src/core/capture.c',
   'src/core/encode.c',
-  'src/core/decode.c',
+    'src/core/bitrate_ctrl.c',
+    'src/core/decode.c',
   'src/core/a11y.c',
   'src/core/input.c',
   'src/core/session.c',
@@ -566,3 +567,9 @@ test_fipsnat_ipc = executable('test_fipsnat_ipc',
   dependencies : [dep_metadesk],
 )
 test('fips-nat IPC protocol', test_fipsnat_ipc)
+
+test_bitrate_ctrl = executable('test_bitrate_ctrl',
+  files('tests/test_bitrate_ctrl.c', 'src/core/bitrate_ctrl.c'),
+  include_directories : [core_inc],
+)
+test('bitrate controller AIMD', test_bitrate_ctrl)
