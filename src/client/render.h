@@ -73,6 +73,11 @@ void md_renderer_set_input_callback(MdRenderer *r, MdInputCallback cb, void *use
  * Mouse coordinates are scaled from client window to host screen. */
 void md_renderer_set_host_size(MdRenderer *r, uint32_t host_w, uint32_t host_h);
 
+/* Recompute HiDPI scale factors (output pixels vs window points).
+ * Called automatically on create and window resize; may also be called
+ * manually after display changes. */
+void md_renderer_update_hidpi_scale(MdRenderer *r);
+
 /* Destroy renderer, close window, free SDL resources. */
 void md_renderer_destroy(MdRenderer *r);
 

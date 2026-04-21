@@ -26,10 +26,14 @@ struct MdRenderer {
 
     uint32_t      tex_width;     /* current texture dimensions     */
     uint32_t      tex_height;
-    uint32_t      win_width;     /* current window dimensions      */
+    uint32_t      win_width;     /* current window dimensions (points) */
     uint32_t      win_height;
+    uint32_t      out_width;     /* renderer output size (pixels)      */
+    uint32_t      out_height;
     uint32_t      host_width;    /* host screen dimensions for scaling */
     uint32_t      host_height;
+    float         hidpi_scale_x; /* pixels / points (1.0 on non-HiDPI) */
+    float         hidpi_scale_y;
     bool          open;          /* false after window close event  */
     bool          sdl_inited;    /* true if we called SDL_Init      */
 
@@ -127,6 +131,9 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
     r->win_height = height;
     r->open = true;
 
+    /* Compute HiDPI scale factor: renderer pixels vs window points */
+    md_renderer_update_hidpi_scale(r);
+
     return r;
 }
 
@@ -188,6 +195,8 @@ int md_renderer_poll_events(MdRenderer *r) {
             if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 r->win_width  = (uint32_t)event.window.data1;
                 r->win_height = (uint32_t)event.window.data2;
+                /* Recompute HiDPI scale on resize */
+                md_renderer_update_hidpi_scale(r);
             }
             break;
 
@@ -195,11 +204,19 @@ int md_renderer_poll_events(MdRenderer *r) {
             if (r->input_cb) {
                 int mx = event.motion.x;
                 int my = event.motion.y;
-                /* Scale from client window to host screen coordinates */
+                /* Scale from client window points to host screen coordinates.
+                 * SDL mouse events are in window-coordinate points.
+                 * On HiDPI/Retina displays, we first convert points to pixels
+                 * (via hidpi_scale), then scale to host coordinates using the
+                 * renderer output size (pixels) to ensure correct mapping
+                 * regardless of display scaling. (OQ-10 fix) */
                 if (r->host_width && r->host_height &&
-                    r->win_width && r->win_height) {
-                    mx = (int)((int64_t)mx * r->host_width / r->win_width);
-                    my = (int)((int64_t)my * r->host_height / r->win_height);
+                    r->out_width && r->out_height) {
+                    /* Convert points → pixels, then scale to host */
+                    float px = (float)mx * r->hidpi_scale_x;
+                    float py = (float)my * r->hidpi_scale_y;
+                    mx = (int)(px * (float)r->host_width  / (float)r->out_width);
+                    my = (int)(py * (float)r->host_height / (float)r->out_height);
                 }
                 r->input_cb(MD_INPUT_MOUSE_MOVE, mx, my,
                             r->input_userdata);
@@ -235,6 +252,27 @@ int md_renderer_get_window_size(const MdRenderer *r, uint32_t *w, uint32_t *h) {
     *w = r->win_width;
     *h = r->win_height;
     return 0;
+}
+
+void md_renderer_update_hidpi_scale(MdRenderer *r) {
+    if (!r || !r->sdl_renderer || !r->window) return;
+
+    int out_w = 0, out_h = 0;
+    SDL_GetRendererOutputSize(r->sdl_renderer, &out_w, &out_h);
+    r->out_width  = (uint32_t)(out_w > 0 ? out_w : r->win_width);
+    r->out_height = (uint32_t)(out_h > 0 ? out_h : r->win_height);
+
+    r->hidpi_scale_x = r->win_width  > 0
+        ? (float)r->out_width  / (float)r->win_width  : 1.0f;
+    r->hidpi_scale_y = r->win_height > 0
+        ? (float)r->out_height / (float)r->win_height : 1.0f;
+
+    if (r->hidpi_scale_x != 1.0f || r->hidpi_scale_y != 1.0f) {
+        fprintf(stderr, "render: HiDPI scale %.2fx%.2f (window %ux%u, output %ux%u)\n",
+                r->hidpi_scale_x, r->hidpi_scale_y,
+                r->win_width, r->win_height,
+                r->out_width, r->out_height);
+    }
 }
 
 void *md_renderer_get_sdl_window(MdRenderer *r) {
