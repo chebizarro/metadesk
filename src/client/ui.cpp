@@ -35,6 +35,7 @@ struct MdOverlay {
     bool           wants_input;
     bool           disconnect_requested;
     bool           show_allowlist;       /* allowlist panel toggled on */
+    bool           show_peers;           /* peer list panel toggled on */
     SDL_Window    *window;
     SDL_Renderer  *renderer;
 
@@ -235,6 +236,16 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
     ImGui::PopStyleColor(3);
 
+    /* ── Peer list toggle ─────────────────────────────────── */
+    if (stats->peers && stats->peer_count > 0) {
+        ImGui::Separator();
+        ImGui::Spacing();
+        if (ImGui::Button(o->show_peers ? "Hide Peers" : "Peers",
+                          ImVec2(button_width, 0))) {
+            o->show_peers = !o->show_peers;
+        }
+    }
+
     /* ── Allowlist toggle ─────────────────────────────────── */
     if (stats->allowlist_entries || stats->on_allowlist_add) {
         ImGui::Separator();
@@ -251,6 +262,106 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
                        "F1: toggle overlay");
 
     ImGui::End();
+
+    /* ── Peer list panel (separate window) ────────────────── */
+    if (o->show_peers && stats->peers && stats->peer_count > 0) {
+        ImGui::SetNextWindowPos(ImVec2(280, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(440, 0), ImGuiCond_FirstUseEver);
+
+        ImGui::Begin("Connected Peers", &o->show_peers,
+                     ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::Text("Peers: %d", stats->peer_count);
+        ImGui::Separator();
+
+        if (ImGui::BeginTable("##peers", 4,
+                              ImGuiTableFlags_Borders |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("npub", 0, 3.0f);
+            ImGui::TableSetupColumn("Status", 0, 1.2f);
+            ImGui::TableSetupColumn("RTT", 0, 0.8f);
+            ImGui::TableSetupColumn("Caps", 0, 1.0f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < stats->peer_count; i++) {
+                const MdOverlayPeerInfo *p = &stats->peers[i];
+                ImGui::TableNextRow();
+
+                /* npub column — truncate */
+                ImGui::TableNextColumn();
+                if (p->pubkey_hex && std::strlen(p->pubkey_hex) >= 16) {
+                    char trunc[24];
+                    std::snprintf(trunc, sizeof(trunc), "%.8s...%.8s",
+                                  p->pubkey_hex,
+                                  p->pubkey_hex + std::strlen(p->pubkey_hex) - 8);
+                    ImGui::TextUnformatted(trunc);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::Text("npub: %s", p->pubkey_hex);
+                        if (p->session_id)
+                            ImGui::Text("Session: %s", p->session_id);
+                        ImGui::EndTooltip();
+                    }
+                } else {
+                    ImGui::TextUnformatted(p->pubkey_hex ? p->pubkey_hex : "?");
+                }
+
+                /* Status column — color-coded */
+                ImGui::TableNextColumn();
+                if (p->status) {
+                    ImVec4 status_color;
+                    if (std::strcmp(p->status, "active") == 0)
+                        status_color = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
+                    else if (std::strcmp(p->status, "negotiating") == 0)
+                        status_color = ImVec4(0.9f, 0.9f, 0.2f, 1.0f);
+                    else
+                        status_color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+                    ImGui::TextColored(status_color, "%s", p->status);
+                } else {
+                    ImGui::TextUnformatted("?");
+                }
+
+                /* RTT column */
+                ImGui::TableNextColumn();
+                if (p->rtt_ms > 0.0f) {
+                    ImVec4 rtt_color;
+                    if (p->rtt_ms < 50.0f)
+                        rtt_color = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
+                    else if (p->rtt_ms < 150.0f)
+                        rtt_color = ImVec4(0.9f, 0.9f, 0.2f, 1.0f);
+                    else
+                        rtt_color = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);
+                    ImGui::TextColored(rtt_color, "%.0f ms", p->rtt_ms);
+                } else {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "—");
+                }
+
+                /* Caps column */
+                ImGui::TableNextColumn();
+                if (p->capabilities) {
+                    /* Decode capability bits into short labels */
+                    char caps_str[64] = {0};
+                    int pos = 0;
+                    if (p->capabilities & 0x01) pos += std::snprintf(caps_str + pos, sizeof(caps_str) - pos, "V"); /* view */
+                    if (p->capabilities & 0x02) pos += std::snprintf(caps_str + pos, sizeof(caps_str) - pos, "K"); /* keyboard */
+                    if (p->capabilities & 0x04) pos += std::snprintf(caps_str + pos, sizeof(caps_str) - pos, "M"); /* mouse */
+                    if (p->capabilities & 0x08) pos += std::snprintf(caps_str + pos, sizeof(caps_str) - pos, "A"); /* a11y */
+                    if (pos == 0) std::snprintf(caps_str, sizeof(caps_str), "none");
+                    ImGui::TextUnformatted(caps_str);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("V=view K=keyboard M=mouse A=a11y (0x%04x)",
+                                          p->capabilities);
+                    }
+                } else {
+                    ImGui::TextUnformatted("all");
+                }
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::End();
+    }
 
     /* ── Allowlist panel (separate window) ────────────────── */
     if (o->show_allowlist && (stats->allowlist_entries || stats->on_allowlist_add)) {

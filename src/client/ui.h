@@ -16,6 +16,7 @@
 #define MD_UI_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,16 @@ typedef void (*MdOverlayAllowlistAddFn)(const char *pubkey_hex,
 typedef void (*MdOverlayAllowlistRemoveFn)(const char *pubkey_hex,
                                            void *userdata);
 
+/* Peer connection info for peer list panel */
+typedef struct {
+    const char *pubkey_hex;  /* 64-char hex npub of the peer       */
+    const char *session_id;  /* session UUID (may be NULL)         */
+    const char *status;      /* "active", "negotiating", etc.      */
+    float       rtt_ms;      /* round-trip time to this peer       */
+    uint32_t    capabilities; /* granted capability bits            */
+    uint64_t    connected_since_ms; /* timestamp (0 = not connected) */
+} MdOverlayPeerInfo;
+
 /* Overlay stats shown to user */
 typedef struct {
     float  latency_ms;       /* total pipeline latency             */
@@ -49,6 +60,10 @@ typedef struct {
     int    fps;              /* current display FPS                */
     float  bitrate_mbps;     /* current bitrate in Mbps            */
     const char *encoder_name; /* "NVENC" or "x264"                */
+
+    /* Peer list panel data (NULL/0 hides panel) */
+    const MdOverlayPeerInfo *peers;
+    int    peer_count;
 
     /* Allowlist panel data (host mode only — NULL for client) */
     const MdOverlayAllowlistEntry *allowlist_entries;
