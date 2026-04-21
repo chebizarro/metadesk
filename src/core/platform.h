@@ -82,15 +82,18 @@ static inline void md_secure_zero(void *ptr, size_t size) {
 
 #if defined(_WIN32)
     SecureZeroMemory(ptr, size);
-#elif defined(__APPLE__)
-    /* macOS always provides memset_s via <string.h> */
+#elif defined(__APPLE__) && defined(__STDC_LIB_EXT1__)
+    /* memset_s available when __STDC_WANT_LIB_EXT1__ was set before
+     * <string.h> was first included.  Fragile in practice — fall through
+     * to the portable fallback when the macro wasn't early enough. */
     memset_s(ptr, size, 0, size);
 #elif defined(__GLIBC__) && defined(__GLIBC_MINOR__) && \
       (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
     explicit_bzero(ptr, size);
 #else
     /* Portable fallback: volatile function pointer prevents
-     * dead-store elimination by the compiler. */
+     * dead-store elimination by the compiler.  Works on all
+     * platforms including macOS when memset_s isn't declared. */
     static void *(*const volatile memset_func)(void *, int, size_t) = memset;
     memset_func(ptr, 0, size);
 #endif

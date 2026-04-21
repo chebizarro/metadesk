@@ -27,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <sys/mman.h>
+#include "platform.h"
 #include <errno.h>
 
 /* ── Hex utilities ───────────────────────────────────────────── */
@@ -123,7 +123,7 @@ static int direct_nip44_encrypt(MdSigner *s, const char *peer_pubkey_hex,
     int ret = nostr_nip44_encrypt_v2(sk, pk,
                                      (const uint8_t *)plaintext,
                                      strlen(plaintext), &cipher);
-    memset(sk, 0, sizeof(sk));
+    md_secure_zero(sk, sizeof(sk));
     if (ret != 0 || !cipher)
         return MD_SIGNER_ERR_CRYPTO;
 
@@ -147,7 +147,7 @@ static int direct_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
     uint8_t *pt = NULL;
     size_t pt_len = 0;
     int ret = nostr_nip44_decrypt_v2(sk, pk, ciphertext, &pt, &pt_len);
-    memset(sk, 0, sizeof(sk));
+    md_secure_zero(sk, sizeof(sk));
     if (ret != 0 || !pt)
         return MD_SIGNER_ERR_CRYPTO;
 
@@ -168,12 +168,12 @@ static void direct_destroy(MdSigner *s) {
     DirectKeyState *dk = s->backend;
 
     /* Zero secret key before freeing */
-    memset(dk->sk_hex, 0, sizeof(dk->sk_hex));
-    munlock(dk->sk_hex, sizeof(dk->sk_hex));
+    md_secure_zero(dk->sk_hex, sizeof(dk->sk_hex));
+    md_mem_unlock(dk->sk_hex, sizeof(dk->sk_hex));
 
     free(dk->pk_hex);
 
-    memset(dk, 0, sizeof(DirectKeyState));
+    md_secure_zero(dk, sizeof(DirectKeyState));
     free(dk);
 }
 
@@ -196,21 +196,21 @@ MdSigner *md_signer_create_direct(const char *sk_hex) {
     memcpy(dk->sk_hex, sk_hex, 64);
     dk->sk_hex[64] = '\0';
 
-    if (mlock(dk->sk_hex, sizeof(dk->sk_hex)) < 0) {
-        fprintf(stderr, "signer: WARNING — mlock failed: %s\n", strerror(errno));
+    if (md_mem_lock(dk->sk_hex, sizeof(dk->sk_hex)) < 0) {
+        fprintf(stderr, "signer: WARNING — md_mem_lock failed: %s\n", strerror(errno));
     }
 
     /* Derive public key */
     dk->pk_hex = nostr_key_get_public(dk->sk_hex);
     if (!dk->pk_hex) {
-        memset(dk->sk_hex, 0, sizeof(dk->sk_hex));
+        md_secure_zero(dk->sk_hex, sizeof(dk->sk_hex));
         free(dk);
         return NULL;
     }
 
     MdSigner *s = calloc(1, sizeof(MdSigner));
     if (!s) {
-        memset(dk->sk_hex, 0, sizeof(dk->sk_hex));
+        md_secure_zero(dk->sk_hex, sizeof(dk->sk_hex));
         free(dk->pk_hex);
         free(dk);
         return NULL;
