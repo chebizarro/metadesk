@@ -137,6 +137,7 @@ if host_os == 'linux'
   dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
   dep_atspi     = dependency('atspi-2',         version : '>=2.48')
   dep_udev      = dependency('libudev',         version : '>=252')
+  dep_dbus      = dependency('dbus-1',          version : '>=1.14')
 
   platform_hal_sources += files(
     'src/core/capture_pipewire.c',
@@ -144,7 +145,7 @@ if host_os == 'linux'
     'src/core/input_uinput.c',
     'src/core/ipc_unix.c',
   )
-  platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev]
+  platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus]
 
 elif host_os == 'darwin'
   add_languages('objc', required : true)
