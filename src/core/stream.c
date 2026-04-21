@@ -30,12 +30,22 @@
 #include <string.h>
 #include <stdio.h>
 
+/* TLS via OpenSSL */
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/evp.h>
+
 /* ── Structures ──────────────────────────────────────────────── */
 
 struct MdStream {
     int          fd;
     bool         connected;
     uint32_t     send_seq;       /* monotonic sequence for sent packets    */
+
+    /* TLS (NULL when plaintext) */
+    SSL         *ssl;
 
     /* Latency tracking */
     uint32_t     ping_send_ms;   /* timestamp when last ping was sent      */
@@ -52,6 +62,7 @@ struct MdStream {
 struct MdStreamServer {
     int          fd;
     uint16_t     port;
+    SSL_CTX     *ssl_ctx;        /* NULL when plaintext */
 };
 
 /* ── Timestamp utility ───────────────────────────────────────── */
@@ -64,12 +75,23 @@ uint32_t md_stream_now_ms(void) {
 
 /* ── Internal helpers ────────────────────────────────────────── */
 
-/* Read exactly n bytes from fd, handling partial reads.
- * Returns 0 on success, -1 on error/EOF. */
-static int read_exact(int fd, uint8_t *buf, size_t n, uint32_t timeout_ms) {
+/* Read exactly n bytes, handling partial reads.
+ * Uses SSL_read when TLS is active, raw read() otherwise.
+ * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
+static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) {
     size_t total = 0;
+    int fd = s->fd;
 
     while (total < n) {
+        /* For TLS streams, check SSL_pending before polling.
+         * OpenSSL may have buffered data internally. */
+        if (s->ssl && SSL_pending(s->ssl) > 0) {
+            int r = SSL_read(s->ssl, buf + total, (int)(n - total));
+            if (r <= 0) return -1;
+            total += (size_t)r;
+            continue;
+        }
+
         if (timeout_ms > 0) {
             struct pollfd pfd = { .fd = fd, .events = POLLIN };
             int pr = poll(&pfd, 1, (int)timeout_ms);
@@ -82,27 +104,40 @@ static int read_exact(int fd, uint8_t *buf, size_t n, uint32_t timeout_ms) {
                 return -1;
         }
 
-        ssize_t r = read(fd, buf + total, n - total);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
-            return -1;  /* EOF or error */
+        if (s->ssl) {
+            int r = SSL_read(s->ssl, buf + total, (int)(n - total));
+            if (r <= 0) return -1;
+            total += (size_t)r;
+        } else {
+            ssize_t r = read(fd, buf + total, n - total);
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR) continue;
+                return -1;
+            }
+            total += (size_t)r;
         }
-        total += (size_t)r;
     }
     return 0;
 }
 
-/* Write exactly n bytes to fd, handling partial writes. */
-static int write_exact(int fd, const uint8_t *buf, size_t n) {
+/* Write exactly n bytes, handling partial writes.
+ * Uses SSL_write when TLS is active, raw write() otherwise. */
+static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
     size_t total = 0;
 
     while (total < n) {
-        ssize_t w = write(fd, buf + total, n - total);
-        if (w <= 0) {
-            if (w < 0 && errno == EINTR) continue;
-            return -1;
+        if (s->ssl) {
+            int w = SSL_write(s->ssl, buf + total, (int)(n - total));
+            if (w <= 0) return -1;
+            total += (size_t)w;
+        } else {
+            ssize_t w = write(s->fd, buf + total, n - total);
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR) continue;
+                return -1;
+            }
+            total += (size_t)w;
         }
-        total += (size_t)w;
     }
     return 0;
 }
@@ -113,22 +148,105 @@ static void set_tcp_nodelay(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 }
 
-/* Create an MdStream from a connected fd. */
-static MdStream *stream_from_fd(int fd) {
+/* Create an MdStream from a connected fd (optionally with TLS). */
+static MdStream *stream_from_fd(int fd, SSL *ssl) {
     MdStream *s = calloc(1, sizeof(MdStream));
     if (!s) {
+        if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
     }
     s->fd = fd;
+    s->ssl = ssl;
     s->connected = true;
     set_tcp_nodelay(fd);
     return s;
 }
 
+/* ── TLS helpers ─────────────────────────────────────────────── */
+
+/* Generate a self-signed EC certificate + key for ephemeral TLS.
+ * Used when the server has no cert_path configured. */
+static SSL_CTX *tls_server_ctx_self_signed(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) return NULL;
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+
+    /* Generate ephemeral EC key (P-256) */
+    EVP_PKEY *pkey = EVP_EC_gen("prime256v1");
+    if (!pkey) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    /* Self-signed X509 certificate, valid for 24h */
+    X509 *cert = X509_new();
+    if (!cert) {
+        EVP_PKEY_free(pkey);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), 86400L);
+    X509_set_pubkey(cert, pkey);
+
+    X509_NAME *name = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               (unsigned char *)"metadesk", -1, -1, 0);
+    X509_set_issuer_name(cert, name);
+    X509_sign(cert, pkey, EVP_sha256());
+
+    SSL_CTX_use_certificate(ctx, cert);
+    SSL_CTX_use_PrivateKey(ctx, pkey);
+
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
+    return ctx;
+}
+
+static SSL_CTX *tls_server_ctx_from_files(const char *cert_path,
+                                          const char *key_path) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) return NULL;
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1) {
+        fprintf(stderr, "stream: failed to load TLS cert/key from %s / %s\n",
+                cert_path, key_path);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static SSL_CTX *tls_client_ctx(bool verify_peer) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+
+    if (verify_peer) {
+        SSL_CTX_set_default_verify_paths(ctx);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+    return ctx;
+}
+
 /* ── Server API ──────────────────────────────────────────────── */
 
 MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port) {
+    return md_stream_server_create_tls(bind_addr, port, NULL);
+}
+
+MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port,
+                                            const MdStreamTlsConfig *tls) {
     /* Create IPv6 socket with dual-stack (accepts IPv4 too) */
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0)
@@ -174,6 +292,26 @@ MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port) {
 
     srv->fd = fd;
     srv->port = port;
+
+    /* Set up TLS context if requested */
+    if (tls && tls->enabled) {
+        if (tls->cert_path && tls->key_path) {
+            srv->ssl_ctx = tls_server_ctx_from_files(tls->cert_path,
+                                                     tls->key_path);
+        } else {
+            srv->ssl_ctx = tls_server_ctx_self_signed();
+            if (srv->ssl_ctx)
+                fprintf(stderr, "stream: using ephemeral self-signed TLS cert\n");
+        }
+        if (!srv->ssl_ctx) {
+            fprintf(stderr, "stream: ERROR — failed to initialize TLS context\n");
+            close(fd);
+            free(srv);
+            return NULL;
+        }
+        fprintf(stderr, "stream: TLS enabled (TLS 1.3)\n");
+    }
+
     return srv;
 }
 
@@ -197,11 +335,32 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
     inet_ntop(AF_INET6, &client_addr.sin6_addr, addr_str, sizeof(addr_str));
     fprintf(stderr, "stream: accepted connection from %s\n", addr_str);
 
-    return stream_from_fd(client_fd);
+    /* TLS handshake if server has a TLS context */
+    SSL *ssl = NULL;
+    if (srv->ssl_ctx) {
+        ssl = SSL_new(srv->ssl_ctx);
+        if (!ssl) {
+            close(client_fd);
+            return NULL;
+        }
+        SSL_set_fd(ssl, client_fd);
+        if (SSL_accept(ssl) != 1) {
+            fprintf(stderr, "stream: TLS handshake failed for %s\n", addr_str);
+            SSL_free(ssl);
+            close(client_fd);
+            return NULL;
+        }
+        fprintf(stderr, "stream: TLS handshake complete (%s)\n",
+                SSL_get_version(ssl));
+    }
+
+    return stream_from_fd(client_fd, ssl);
 }
 
 void md_stream_server_destroy(MdStreamServer *srv) {
     if (!srv) return;
+    if (srv->ssl_ctx)
+        SSL_CTX_free(srv->ssl_ctx);
     close(srv->fd);
     free(srv);
 }
@@ -275,7 +434,48 @@ MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms
     if (fd < 0)
         return NULL;
 
-    return stream_from_fd(fd);
+    return stream_from_fd(fd, NULL);
+}
+
+MdStream *md_stream_connect_tls(const char *host, uint16_t port,
+                                uint32_t timeout_ms,
+                                const MdStreamTlsConfig *tls) {
+    /* First establish the TCP connection */
+    MdStream *s = md_stream_connect(host, port, timeout_ms);
+    if (!s) return NULL;
+
+    if (!tls || !tls->enabled)
+        return s;
+
+    /* Set up client TLS context */
+    SSL_CTX *ctx = tls_client_ctx(tls->verify_peer);
+    if (!ctx) {
+        md_stream_destroy(s);
+        return NULL;
+    }
+
+    SSL *ssl = SSL_new(ctx);
+    SSL_CTX_free(ctx); /* SSL retains a ref; ctx can be freed */
+    if (!ssl) {
+        md_stream_destroy(s);
+        return NULL;
+    }
+
+    SSL_set_fd(ssl, s->fd);
+    /* Set SNI for certificate verification */
+    SSL_set_tlsext_host_name(ssl, host);
+
+    if (SSL_connect(ssl) != 1) {
+        fprintf(stderr, "stream: TLS handshake failed connecting to %s:%u\n",
+                host, port);
+        SSL_free(ssl);
+        md_stream_destroy(s);
+        return NULL;
+    }
+
+    s->ssl = ssl;
+    fprintf(stderr, "stream: TLS connected (%s)\n", SSL_get_version(ssl));
+    return s;
 }
 
 /* ── FIPS-aware connect ──────────────────────────────────────── */
@@ -323,14 +523,14 @@ int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,
         return -1;
 
     /* Send header */
-    if (write_exact(s->fd, hdr_buf, MD_PACKET_HEADER_SIZE) < 0) {
+    if (write_exact(s, hdr_buf, MD_PACKET_HEADER_SIZE) < 0) {
         s->connected = false;
         return -1;
     }
 
     /* Send payload */
     if (payload && payload_len > 0) {
-        if (write_exact(s->fd, payload, payload_len) < 0) {
+        if (write_exact(s, payload, payload_len) < 0) {
             s->connected = false;
             return -1;
         }
@@ -348,7 +548,7 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
 
     /* Read header */
     uint8_t hdr_buf[MD_PACKET_HEADER_SIZE];
-    int ret = read_exact(s->fd, hdr_buf, MD_PACKET_HEADER_SIZE, timeout_ms);
+    int ret = read_exact(s, hdr_buf, MD_PACKET_HEADER_SIZE, timeout_ms);
     if (ret != 0) {
         if (ret < 0) s->connected = false;
         return ret;  /* -1 = error, 1 = timeout */
@@ -372,7 +572,7 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
         if (!payload)
             return -1;
 
-        ret = read_exact(s->fd, payload, hdr->payload_len, timeout_ms);
+        ret = read_exact(s, payload, hdr->payload_len, timeout_ms);
         if (ret != 0) {
             free(payload);
             if (ret < 0) s->connected = false;
@@ -433,8 +633,16 @@ bool md_stream_is_connected(const MdStream *s) {
     return s ? s->connected : false;
 }
 
+bool md_stream_is_tls(const MdStream *s) {
+    return s && s->ssl != NULL;
+}
+
 void md_stream_destroy(MdStream *s) {
     if (!s) return;
+    if (s->ssl) {
+        SSL_shutdown(s->ssl);
+        SSL_free(s->ssl);
+    }
     if (s->fd >= 0)
         close(s->fd);
     free(s);

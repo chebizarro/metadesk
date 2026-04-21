@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
 
 /* Use a high ephemeral port to avoid conflicts */
 #define TEST_PORT 17700
@@ -242,9 +243,92 @@ static int test_recv_timeout(void) {
     return 0;
 }
 
+/* ── Test: TLS server/client round-trip ───────────────────────── */
+
+static int test_tls_roundtrip(void) {
+    printf("  test_tls_roundtrip... ");
+
+    /* Create TLS server with ephemeral self-signed cert */
+    MdStreamTlsConfig tls_cfg = { .enabled = true };
+    MdStreamServer *srv = md_stream_server_create_tls(NULL, TEST_PORT + 10, &tls_cfg);
+    assert(srv != NULL);
+
+    ServerThread st = { .srv = srv };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &st);
+
+    usleep(50000);
+
+    /* TLS client (no peer verification for self-signed) */
+    MdStreamTlsConfig client_tls = { .enabled = true, .verify_peer = false };
+    MdStream *client = md_stream_connect_tls("127.0.0.1", TEST_PORT + 10,
+                                             5000, &client_tls);
+    assert(client != NULL);
+    assert(md_stream_is_tls(client));
+
+    pthread_join(tid, NULL);
+    assert(st.client != NULL);
+    assert(md_stream_is_tls(st.client));
+
+    /* Send a packet through TLS and verify */
+    const char *msg = "hello-tls";
+    int ret = md_stream_send(client, MD_PKT_SESSION_INFO, 1,
+                             (const uint8_t *)msg, (uint32_t)strlen(msg));
+    assert(ret == 0);
+
+    MdPacketHeader hdr;
+    uint8_t *payload = NULL;
+    ret = md_stream_recv(st.client, &hdr, &payload, 5000);
+    assert(ret == 0);
+    assert(hdr.type == MD_PKT_SESSION_INFO);
+    assert(hdr.payload_len == strlen(msg));
+    assert(payload != NULL);
+    assert(memcmp(payload, msg, strlen(msg)) == 0);
+    free(payload);
+
+    md_stream_destroy(client);
+    md_stream_destroy(st.client);
+    md_stream_server_destroy(srv);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: plaintext stream reports no TLS ───────────────────── */
+
+static int test_plaintext_no_tls(void) {
+    printf("  test_plaintext_no_tls... ");
+
+    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 11);
+    assert(srv != NULL);
+
+    ServerThread st = { .srv = srv };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &st);
+    usleep(50000);
+
+    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 11, 5000);
+    assert(client != NULL);
+    assert(!md_stream_is_tls(client));
+
+    pthread_join(tid, NULL);
+    assert(st.client != NULL);
+    assert(!md_stream_is_tls(st.client));
+
+    md_stream_destroy(client);
+    md_stream_destroy(st.client);
+    md_stream_server_destroy(srv);
+
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
+    /* Ignore SIGPIPE — normal for socket tests where peers disconnect */
+    signal(SIGPIPE, SIG_IGN);
+
     printf("test_stream: TCP stream transport tests\n");
 
     int failures = 0;
@@ -253,6 +337,8 @@ int main(void) {
     failures += test_ping_pong();
     failures += test_empty_payload();
     failures += test_recv_timeout();
+    failures += test_tls_roundtrip();
+    failures += test_plaintext_no_tls();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return failures;

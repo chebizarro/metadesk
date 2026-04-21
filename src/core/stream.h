@@ -23,6 +23,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Forward-declare OpenSSL types to avoid pulling in the full header. */
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_st SSL;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,9 +55,25 @@ typedef struct {
 
 /* ── Server API ──────────────────────────────────────────────── */
 
+/* TLS configuration for stream server/client.
+ * Pass NULL for plaintext (localhost/FIPS tunnel mode).
+ * The server generates a self-signed cert at startup if
+ * cert_path/key_path are NULL. */
+typedef struct {
+    bool         enabled;      /* true to enable TLS on this stream       */
+    const char  *cert_path;    /* PEM certificate path (server, optional) */
+    const char  *key_path;     /* PEM private key path (server, optional) */
+    bool         verify_peer;  /* client: verify server certificate       */
+} MdStreamTlsConfig;
+
 /* Create a TCP server listening on the given port (IPv6 + IPv4 dual-stack).
  * bind_addr: NULL for any address, or a specific address string.
+ * tls: TLS configuration, or NULL for plaintext.
  * Returns NULL on failure. */
+MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port,
+                                            const MdStreamTlsConfig *tls);
+
+/* Convenience: create a plaintext TCP server (no TLS). */
 MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port);
 
 /* Accept a single client connection (blocking).
@@ -70,6 +90,13 @@ void md_stream_server_destroy(MdStreamServer *srv);
  * timeout_ms: 0 = OS default, >0 = connect timeout.
  * Returns a connected MdStream, or NULL on failure. */
 MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms);
+
+/* Connect to a host with TLS.
+ * tls: TLS configuration (must have enabled=true).
+ * Returns a connected + TLS-wrapped MdStream, or NULL on failure. */
+MdStream *md_stream_connect_tls(const char *host, uint16_t port,
+                                uint32_t timeout_ms,
+                                const MdStreamTlsConfig *tls);
 
 /* ── Stream I/O ──────────────────────────────────────────────── */
 
@@ -102,6 +129,9 @@ int md_stream_get_fd(const MdStream *s);
 
 /* Check if the stream is still connected. */
 bool md_stream_is_connected(const MdStream *s);
+
+/* Check if the stream has TLS enabled. */
+bool md_stream_is_tls(const MdStream *s);
 
 /* Close and destroy a stream. */
 void md_stream_destroy(MdStream *s);
