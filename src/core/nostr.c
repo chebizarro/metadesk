@@ -83,6 +83,75 @@ struct MdNostr {
     MdNostrCallbacks   cbs;          /* event callbacks                     */
 };
 
+/* ── Instance registry ─────────────────────────────────────────
+ * Maps NostrSimplePool* → MdNostr* so the event middleware can
+ * route events to the correct instance without a global singleton.
+ *
+ * nostrc's event_middleware callback signature has no user_data
+ * parameter, so we identify the owning MdNostr by matching the
+ * incoming relay pointer against each registered pool's relay list.
+ *
+ * The relay array is populated in md_nostr_create() before
+ * nostr_simple_pool_start(), and is not modified during runtime,
+ * so reading it without pool_mutex from the worker thread is safe.
+ */
+#define MD_NOSTR_MAX_INSTANCES 16
+
+static struct {
+    pthread_mutex_t  lock;
+    struct {
+        NostrSimplePool *pool;
+        MdNostr         *ctx;
+    } entries[MD_NOSTR_MAX_INSTANCES];
+    size_t count;
+} g_registry = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .count = 0,
+};
+
+static void registry_add(NostrSimplePool *pool, MdNostr *ctx) {
+    pthread_mutex_lock(&g_registry.lock);
+    if (g_registry.count < MD_NOSTR_MAX_INSTANCES) {
+        g_registry.entries[g_registry.count].pool = pool;
+        g_registry.entries[g_registry.count].ctx  = ctx;
+        g_registry.count++;
+    } else {
+        fprintf(stderr, "nostr: WARNING — instance registry full (%d)\n",
+                MD_NOSTR_MAX_INSTANCES);
+    }
+    pthread_mutex_unlock(&g_registry.lock);
+}
+
+static void registry_remove(MdNostr *ctx) {
+    pthread_mutex_lock(&g_registry.lock);
+    for (size_t i = 0; i < g_registry.count; i++) {
+        if (g_registry.entries[i].ctx == ctx) {
+            for (size_t j = i; j + 1 < g_registry.count; j++)
+                g_registry.entries[j] = g_registry.entries[j + 1];
+            g_registry.count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_registry.lock);
+}
+
+static MdNostr *registry_find_by_relay(NostrRelay *relay) {
+    MdNostr *found = NULL;
+    pthread_mutex_lock(&g_registry.lock);
+    for (size_t i = 0; i < g_registry.count; i++) {
+        NostrSimplePool *pool = g_registry.entries[i].pool;
+        for (size_t j = 0; j < pool->relay_count; j++) {
+            if (pool->relays[j] == relay) {
+                found = g_registry.entries[i].ctx;
+                goto done;
+            }
+        }
+    }
+done:
+    pthread_mutex_unlock(&g_registry.lock);
+    return found;
+}
+
 /* ── Event middleware ─────────────────────────────────────────
  * nostrc's NostrSimplePool invokes the event_middleware callback
  * for every incoming event across all subscriptions. We route
@@ -91,13 +160,13 @@ struct MdNostr {
  * This runs on the pool's worker thread — callbacks must be
  * thread-safe or dispatch to the main thread.
  */
-static MdNostr *g_nostr_ctx = NULL;
-
 static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
-    if (!incoming || !incoming->event || !g_nostr_ctx)
+    if (!incoming || !incoming->event)
         return;
 
-    MdNostr *n = g_nostr_ctx;
+    MdNostr *n = registry_find_by_relay(incoming->relay);
+    if (!n)
+        return;
     NostrEvent *ev = incoming->event;
     int kind = nostr_event_get_kind(ev);
 
@@ -238,8 +307,8 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         return NULL;
     }
 
-    /* Store file-scope context for event middleware routing */
-    g_nostr_ctx = n;
+    /* Register instance in static registry for event routing */
+    registry_add(n->pool, n);
 
     /* Register event middleware for incoming event routing */
     nostr_simple_pool_set_event_middleware(n->pool, md_nostr_event_handler);
@@ -270,9 +339,8 @@ MdSigner *md_nostr_get_signer(MdNostr *n) {
 void md_nostr_destroy(MdNostr *n) {
     if (!n) return;
 
-    /* Clear file-scope context if it points to us */
-    if (g_nostr_ctx == n)
-        g_nostr_ctx = NULL;
+    /* Remove from instance registry */
+    registry_remove(n);
 
     /* Stop pool — closes all subscriptions, disconnects relays */
     if (n->pool) {
