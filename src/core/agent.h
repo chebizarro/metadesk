@@ -68,6 +68,13 @@ int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq);
  * Computes diff against the previous snapshot. */
 int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq);
 
+/* Handle an action and return the result as a string (for MCP integration).
+ * Unlike md_agent_handle_action(), this does NOT write to a stream.
+ * Returns a newly-allocated JSON string with the UI tree delta (or full tree),
+ * or NULL on error. Caller must free(). */
+char *md_agent_handle_action_mcp(MdAgent *agent,
+                                 const uint8_t *payload, uint32_t payload_len);
+
 /* Get the number of actions handled. */
 uint32_t md_agent_get_action_count(const MdAgent *agent);
 

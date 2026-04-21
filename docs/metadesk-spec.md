@@ -1,16 +1,17 @@
 # metadesk — Project Specification
-**v0.1 — DRAFT**
+**v0.2 — DRAFT**
 
-FIPS-native remote desktop and agent control plane. Nostr keypairs as identity. AT-SPI2 semantic UI tree for agent clients. H.264/NVENC video for human clients. Zero central authority.
+FIPS-native remote desktop and agent control plane. Nostr keypairs as identity. Platform-native accessibility trees for agent clients. H.264 video for human clients. Zero central authority.
 
 | Field | Value |
 |---|---|
 | Project | metadesk |
 | Organisation | Soul Factory / OpenClaw |
 | Status | Pre-implementation — specification phase |
-| Phase 1 target | T7610 host → dev laptop client, LAN |
+| Phase 1 target | T7610 host (Linux) → dev laptop client (macOS), LAN |
 | Language | C/C++ (C++ with RAII, minimal templates) |
 | Build system | Meson |
+| Target platforms | Linux, macOS, Windows |
 
 ---
 
@@ -18,11 +19,13 @@ FIPS-native remote desktop and agent control plane. Nostr keypairs as identity. 
 
 metadesk is a FIPS-native remote desktop system with two parallel client modes: a human video client and an agent semantic client. It uses Nostr keypairs (secp256k1) as the sole identity and access control mechanism, with FIPS providing encrypted mesh transport. There are no accounts, no central servers, no shared secrets beyond the node nsec.
 
+The codebase is cross-platform from day one. Platform-specific functionality (screen capture, accessibility trees, input injection) is isolated behind stable C interfaces with per-platform backend implementations selected at compile time.
+
 ### 1.1 What This Project Is
 
-- A screen capture and streaming host daemon for Linux
-- A human video client (SDL2 + Dear ImGui, Linux-first)
-- An agent semantic client consuming AT-SPI2 accessibility trees over FIPS
+- A screen capture and streaming host daemon (Linux, macOS, Windows)
+- A human video client (SDL2 + Dear ImGui, all platforms)
+- An agent semantic client consuming native accessibility trees over FIPS
 - A NAT traversal companion daemon (`fips-nat`) using STUN + Nostr signaling
 - A Nostr-based session negotiation layer (NIP-44 encrypted DMs, NIP-51 allowlists)
 
@@ -30,15 +33,14 @@ metadesk is a FIPS-native remote desktop system with two parallel client modes: 
 
 - A general-purpose VPN (FIPS handles that layer)
 - A replacement for FIPS itself (metadesk runs on top of the FIPS TUN interface)
-- A cross-platform product in Phase 1 or 2 (Linux only until dogfood gate)
-- A vision-model computer use system (AT-SPI2 tree is the primary agent interface; screenshots are fallback only)
+- A vision-model computer use system (native accessibility tree is the primary agent interface; screenshots are fallback only)
 
 ### 1.3 Non-Goals
 
-- Audio streaming (Phase 1 and 2 scope excludes audio)
+- Audio streaming (deferred to a later phase)
 - Multi-monitor selection (Phase 3)
 - File transfer (Phase 3)
-- Windows or macOS support (Phase 3, contingent on dogfood outcome)
+- NIP-46 bunker integration (Phase 3)
 
 ---
 
@@ -49,43 +51,118 @@ metadesk is a FIPS-native remote desktop system with two parallel client modes: 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  Platform UI layer                                         │
-│  Human: SDL2 window + Dear ImGui overlay                   │
+│  Human: SDL2 window + Dear ImGui overlay (all platforms)   │
 │  Agent: structured JSON / compact-markup API               │
 ├────────────────────────────────────────────────────────────┤
-│  C++ core  (libmetadesk — no UI, no platform deps)        │
+│  C++ core  (libmetadesk — no UI deps)                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐   │
 │  │ Frame pipeline│  │ Agent channel│  │ Session / auth │   │
-│  │ PipeWire      │  │ AT-SPI2 walk │  │ nostrc: NIP-44  │   │
-│  │ libyuv        │  │ tree delta   │  │ nostrc: NIP-51  │   │
-│  │ FFmpeg NVENC  │  │ uinput inject│  │ nostrc: NIP-17  │   │
+│  │ capture HAL  │  │ a11y HAL     │  │ NIP-44 DMs     │   │
+│  │ libyuv        │  │ tree delta   │  │ NIP-51 allowlst│   │
+│  │ FFmpeg        │  │ input HAL    │  │ libsecp256k1   │   │
 │  └──────────────┘  └──────────────┘  └────────────────┘   │
 ├────────────────────────────────────────────────────────────┤
+│  Platform HAL backends (compile-time selected)             │
+│  Capture:  PipeWire (Linux) │ ScreenCaptureKit (macOS)     │
+│            DXGI (Windows)                                   │
+│  A11y:     AT-SPI2 (Linux) │ AXUIElement (macOS)           │
+│            UI Automation (Windows)                          │
+│  Input:    uinput (Linux)  │ CGEvent (macOS)                │
+│            SendInput (Windows)                              │
+├────────────────────────────────────────────────────────────┤
 │  Transport                                                  │
-│  BSD sockets → FIPS TUN fips0 (fd00::/8 ULA, SHA-256 of   │
-│    pubkey → node_addr → IPv6 addr, see fips-ipv6-adapter)  │
-│  DNS: npub1xxx.fips → fd00:: addr (primes identity cache)  │
+│  BSD sockets → FIPS TUN (fd00::/8 npub-derived IPv6)       │
 │  fips-nat companion: STUN + Nostr hole-punch signaling      │
 ├────────────────────────────────────────────────────────────┤
 │  Identity                                                   │
 │  secp256k1 keypair (Nostr nsec/npub)                        │
-│  FIPS addr: fd + SHA-256(pubkey)[0..15] → fd00::/8 ULA     │
 │  Stored in 1Password Connect — never in config files        │
 └────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 Process Model
 
-Three daemons run on the host machine. They are independent processes communicating via Unix domain sockets and shared configuration.
+Three daemons run on the host machine. They are independent processes communicating via Unix domain sockets (Linux/macOS) or named pipes (Windows) and shared configuration.
 
 | Process | Role | Key Dependencies |
 |---|---|---|
-| `fipsd` | FIPS mesh daemon (reference impl in `fips/` workspace dir). Manages TUN `fips0`, peer auth (Noise IK), mesh routing (spanning tree + bloom filters), end-to-end sessions (Noise XK). See `fips/docs/design/` for canonical protocol docs. | Rust — run as system service |
-| `metadesk-host` | Capture, encode, AT-SPI2 walk, session auth | PipeWire, FFmpeg, AT-SPI2, libsecp256k1 |
+| `fipsd` | FIPS mesh daemon (upstream project) | Rust — run as system service |
+| `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends |
 | `fips-nat` | NAT traversal: STUN + Nostr signaling | libnice, libwebsockets, libsecp256k1 |
 
-### 2.3 Component Boundary
+### 2.3 Platform HAL Interfaces
 
-The C++ core (`libmetadesk`) exposes a callback interface upward to the UI layer and a command interface downward to the OS. No UI framework headers are included in the core. This boundary allows headless operation for agent-only deployments and enables future UI layer replacement without touching the pipeline.
+Three hardware abstraction interfaces isolate all platform-specific code. No platform headers appear outside their respective backend files.
+
+#### 2.3.1 Capture HAL
+
+```c
+// src/core/capture.h
+typedef struct MdCaptureBackend {
+    int   (*init)(MdCaptureCtx *ctx, MdCaptureConfig *cfg);
+    int   (*start)(MdCaptureCtx *ctx);
+    int   (*get_frame)(MdCaptureCtx *ctx, MdFrame *out);
+    void  (*release_frame)(MdCaptureCtx *ctx, MdFrame *frame);
+    void  (*stop)(MdCaptureCtx *ctx);
+    void  (*destroy)(MdCaptureCtx *ctx);
+} MdCaptureBackend;
+
+// Implemented by each backend:
+MdCaptureBackend *md_capture_backend_create(void);
+```
+
+| Platform | Backend file | API used |
+|---|---|---|
+| Linux | `capture_pipewire.c` | PipeWire xdg-desktop-portal, DMA-BUF |
+| macOS | `capture_screencapturekit.m` | ScreenCaptureKit (macOS 13+), Objective-C++ |
+| Windows | `capture_dxgi.cpp` | DXGI Desktop Duplication, Direct3D 11 |
+
+#### 2.3.2 Accessibility Tree HAL
+
+```c
+// src/core/a11y.h
+typedef struct MdA11yBackend {
+    int   (*init)(MdA11yCtx *ctx);
+    int   (*get_tree)(MdA11yCtx *ctx, MdA11yTree *out);
+    int   (*subscribe_changes)(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
+    void  (*destroy)(MdA11yCtx *ctx);
+} MdA11yBackend;
+
+MdA11yBackend *md_a11y_backend_create(void);
+```
+
+| Platform | Backend file | API used |
+|---|---|---|
+| Linux | `a11y_atspi.c` | AT-SPI2 (`libatspi-2.0`) |
+| macOS | `a11y_axui.m` | `AXUIElement` / NSAccessibility (Objective-C++) |
+| Windows | `a11y_uia.cpp` | UI Automation (`UIAutomationClient`) |
+
+#### 2.3.3 Input Injection HAL
+
+```c
+// src/core/input.h
+typedef struct MdInputBackend {
+    int   (*init)(MdInputCtx *ctx);
+    int   (*mouse_move)(MdInputCtx *ctx, int x, int y);
+    int   (*mouse_button)(MdInputCtx *ctx, int button, int pressed);
+    int   (*mouse_scroll)(MdInputCtx *ctx, int dx, int dy);
+    int   (*key_event)(MdInputCtx *ctx, uint32_t keysym, int pressed);
+    int   (*type_text)(MdInputCtx *ctx, const char *utf8);
+    void  (*destroy)(MdInputCtx *ctx);
+} MdInputBackend;
+
+MdInputBackend *md_input_backend_create(void);
+```
+
+| Platform | Backend file | API used |
+|---|---|---|
+| Linux | `input_uinput.c` | uinput (`/dev/uinput`) via ioctl |
+| macOS | `input_cgevent.m` | `CGEventCreateMouseEvent` / `CGEventCreateKeyboardEvent` |
+| Windows | `input_sendinput.cpp` | `SendInput` |
+
+### 2.4 Component Boundary
+
+The C++ core (`libmetadesk`) exposes a callback interface upward to the UI layer and calls downward only through the HAL interfaces. No platform headers appear in core headers. This allows headless operation for agent-only deployments and future UI layer replacement without touching the pipeline.
 
 ```c
 // Core → UI callbacks (host side)
@@ -162,7 +239,7 @@ Valid action values: `click`, `dbl_click`, `right_click`, `type`, `key_combo`, `
 
 ### 3.3 UI Tree Formats
 
-Two formats are defined. The host sends whichever the client negotiated during session setup.
+Two formats are defined. The host sends whichever the client negotiated during session setup. Both formats are platform-agnostic — the HAL normalises all platform accessibility APIs into a common node model before serialisation.
 
 #### 3.3.1 Full tree (structured JSON) — `MD_PKT_UI_TREE`
 
@@ -203,44 +280,25 @@ Delta packets carry only changed nodes using the same formats above, with an add
 
 ### 4.1 Flow
 
-> **Nostr protocol model:** Nostr is an event-driven pub/sub protocol over persistent
-> WebSocket connections (see NIP-01). Relay connections are stateful and last for the
-> application's lifetime. Clients send `["REQ", sub_id, filter...]` to subscribe and
-> `["EVENT", event]` to publish. Relays push matching events asynchronously, signal
-> end-of-stored-events with `["EOSE", sub_id]`, and may close subscriptions with
-> `["CLOSED", sub_id, reason]`. metadesk uses the nostrc `NostrSimplePool` which
-> manages these connections, subscriptions, and message routing internally.
-
 ```
 Client                                    Host
 ──────                                    ────
+1. Query Nostr relay for host npub
+   kind:30078 tag:d=fips-transport   →
+                                     ←   Current FIPS transport address
 
-0. Both client and host maintain persistent WebSocket connections
-   to their configured Nostr relays (via nostrc NostrSimplePool).
-   Subscriptions are live for the app lifetime.
-
-1. Client subscribes to kind:30078 from host pubkey:
-   REQ [kinds:[30078], authors:[host_pk], #d:["fips-transport"]]
-   Relay sends matching events; EOSE signals end of stored events.
-   Client extracts FIPS transport address from event content.
-
-2. Client sends NIP-17 gift-wrapped DM to host npub:
-   (rumor kind:14 → seal kind:13 → gift-wrap kind:1059)
+2. Send NIP-44 DM to host npub:
    { "type": "session_request",
      "v": 1,
      "capabilities": ["video","agent","input"],
      "tree_format": "compact",
      "fips_addr": "npub1client..." }  →
 
-   Host has a live subscription for kind:1059 addressed to its pubkey.
-   On receiving the gift-wrap, host unwraps via NIP-17 + NIP-44.
-
-                                     ←   Check NIP-51 allowlist (kind:30000)
+                                     ←   Check NIP-51 allowlist
                                      ←   If not listed: emit approval event
                                          (human or bunker approves)
 
-                                     ←   Host sends NIP-17 gift-wrapped DM:
-                                         { "type": "session_accept",
+                                     ←   { "type": "session_accept",
                                            "session_id": "<uuid>",
                                            "fips_addr": "npub1host...",
                                            "granted": ["video","agent"] }
@@ -254,68 +312,128 @@ Client                                    Host
 
 ### 4.2 Access Control
 
-- Host maintains a NIP-51 list (kind:30000, addressable) of authorised client npubs. As an addressable event, relays retain only the latest version for the (pubkey, kind, d-tag) tuple.
+- Host maintains a NIP-51 list (kind:30000) of authorised client npubs
 - List entries carry a `caps` tag limiting granted capabilities per npub
 - Unlisted npubs trigger an approval event; host daemon emits a kind:30078 event that the UI or bunker listens for
-- Session tokens are NIP-44 encrypted via NIP-17 gift-wrapping; relay cannot read session content
-- Revocation is immediate: host publishes updated NIP-51 list (replacing the old one on relays), active sessions receive a disconnect packet within one keepalive interval
-- The host subscribes to its own allowlist (REQ kind:30000) to stay in sync with edits from other clients (e.g. bunker approval)
+- Session tokens are NIP-44 encrypted; relay cannot read session content
+- Revocation is immediate: remove from NIP-51 list, active sessions receive a disconnect packet within one keepalive interval
 
-### 4.3 Ports and Transport
-
-> **FIPS transport model:** metadesk runs on top of the FIPS TUN interface (`fips0`).
-> Applications use standard BSD sockets to `fd00::/8` addresses — the FIPS IPv6 adapter
-> (FSP port 256) handles address derivation, header compression, and MTU enforcement
-> transparently. DNS resolution via `npub1xxx.fips` primes the identity cache so FIPS
-> can route packets. FIPS provides hop-by-hop (Noise IK) and end-to-end (Noise XK)
-> encryption — metadesk does not add its own encryption layer. The effective IPv6 MTU
-> is `transport_mtu - 77` (FIPS_IPV6_OVERHEAD). See `fips/docs/design/fips-ipv6-adapter.md`.
+### 4.3 Ports
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 7700 | TCP over FIPS TUN (`fips0`) | Frame channel (video + agent tree + actions) |
-| 7701 | UDP over FIPS TUN (`fips0`) | Reserved for future low-latency action channel |
-| 2121 | UDP | FIPS daemon transport (default, configurable) |
+| 7700 | TCP over FIPS | Frame channel (video + agent tree + actions) |
+| 7701 | UDP over FIPS | Reserved for future low-latency action channel |
+| 2121 | UDP | FIPS daemon transport (upstream default) |
 
 ---
 
 ## 5. Dependencies
 
-> **Version policy:** All versions below are minimum versions tested against the T7610 Ubuntu 24.04 environment. Vendor or pin only if a system package is unavailable or outdated.
+Dependencies are grouped by scope: cross-platform (required on all targets) and platform-specific (compiled only on the relevant platform).
+
+> **Version policy:** All versions below are minimum versions tested against the Phase 1 target environments (T7610 Ubuntu 24.04, macOS 13 Ventura). Vendor or pin only if a system package is unavailable or outdated.
+
+### 5.1 Cross-Platform Dependencies
+
+Required on Linux, macOS, and Windows.
+
+| Library | Min Version | Role | Notes |
+|---|---|---|---|
+| FFmpeg (`libavcodec`, `libavutil`) | ≥ 6.0 | H.264 encode and decode | Homebrew / vcpkg on non-Linux |
+| `libyuv` | ≥ r1845 | Colorspace conversion | vendor from chromium/libyuv if no package |
+| `libsecp256k1` | ≥ 0.3.2 | Nostr keypair ops, NIP-44 ECDH | Homebrew: `secp256k1` |
+| `libwebsockets` | ≥ 4.3 | Nostr relay WebSocket connections | Homebrew: `libwebsockets` |
+| `libnice` | ≥ 0.1.21 | STUN/TURN/ICE for fips-nat | Homebrew: `libnice` |
+| `SDL2` | ≥ 2.28 | Human client frame display | Homebrew: `sdl2` |
+| Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule (header-only) |
+| `cJSON` | ≥ 1.7.17 | JSON encode/decode for wire formats | Homebrew: `cjson` |
+| `libb2` / blake2 | ≥ 0.98 | Session ID generation | Homebrew: `b2-sum` or vendor |
+
+### 5.2 Platform-Specific Dependencies
+
+#### Linux
 
 | Library | Min Version | Role | Acquire |
 |---|---|---|---|
-| `libpipewire-0.3` | ≥ 0.3.65 | Screen capture via PipeWire portal (DMA-BUF) | `apt: libpipewire-0.3-dev` |
-| `libavcodec` / FFmpeg | ≥ 6.0 | H.264 encode (NVENC) and decode | `apt: libavcodec-dev libavutil-dev` |
-| `libyuv` | ≥ r1845 | Colorspace conversion (I420, NV12, RGBA) | apt or vendor from chromium/libyuv |
-| `libnostr` (nostrc) | HEAD | Nostr event types, relay connections, key management | github.com/chebizarro/nostrc — CMake, links libwebsockets + libsecp256k1 |
-| `nip44` (nostrc) | HEAD | NIP-44 v2 encryption/decryption for session DMs | Part of nostrc nips/ — links libsodium |
-| `nip51` (nostrc) | HEAD | NIP-51 categorized people lists (allowlists) | Part of nostrc nips/ |
-| `nip17` (nostrc) | HEAD | NIP-17 gift-wrapped private DMs | Part of nostrc nips/ |
-| `libnice` | ≥ 0.1.21 | STUN/TURN/ICE for fips-nat | `apt: libnice-dev` |
-| `libatspi-2.0` | ≥ 2.48 | AT-SPI2 accessibility tree walking | `apt: libatspi2.0-dev` |
-| `libudev` | ≥ 252 | uinput device creation for input injection | `apt: libudev-dev` |
-| `SDL2` | ≥ 2.28 | Human client frame display window | `apt: libsdl2-dev` |
-| Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule (header-only) |
-| `cJSON` | ≥ 1.7.17 | JSON encode/decode for wire formats | `apt: libcjson-dev` |
-| `libb2` / blake2 | ≥ 0.98 | Session ID generation | `apt: libb2-dev` |
+| `libpipewire-0.3` | ≥ 0.3.65 | Screen capture (capture HAL backend) | `apt: libpipewire-0.3-dev` |
+| `libatspi-2.0` | ≥ 2.48 | Accessibility tree (a11y HAL backend) | `apt: libatspi2.0-dev` |
+| `libudev` | ≥ 252 | uinput device creation (input HAL backend) | `apt: libudev-dev` |
 
-> **nostrc dependency:** The `nostrc` library (github.com/chebizarro/nostrc) provides all Nostr protocol primitives. metadesk does NOT implement its own Nostr event handling, key generation, encryption, relay connections, or NIP logic. Instead, metadesk links against `libnostr`, `nip44`, `nip51`, and `nip17` from the nostrc workspace. nostrc is a CMake project; metadesk integrates it via Meson subproject or system install.
+#### macOS
 
-### 5.1 Build System
+| Framework | Min OS | Role | Notes |
+|---|---|---|---|
+| ScreenCaptureKit | macOS 13.0 | Screen capture (capture HAL backend) | System framework, no install needed |
+| NSAccessibility / AXUIElement | macOS 10.10 | Accessibility tree (a11y HAL backend) | System framework, no install needed |
+| CGEvent / CoreGraphics | macOS 10.6 | Input injection (input HAL backend) | System framework, no install needed |
 
-Meson with a single top-level `meson.build`. Subprojects for vendored dependencies (Dear ImGui). pkg-config for system libraries. The build must succeed with only system packages on Ubuntu 24.04 LTS; vendoring is a fallback, not default.
+macOS backend files are Objective-C++ (`.m` / `.mm`). Meson must enable `objcpp` for these targets.
+
+> **macOS permission requirements:** ScreenCaptureKit requires Screen Recording permission. AXUIElement requires Accessibility permission. Both must be granted to `metadesk-host` in System Settings. For headless daemon use, see OQ-6 and OQ-7.
+
+#### Windows
+
+| API | Min OS | Role | Notes |
+|---|---|---|---|
+| DXGI Desktop Duplication | Windows 8 | Screen capture (capture HAL backend) | System API, no install needed |
+| UI Automation | Windows 7 | Accessibility tree (a11y HAL backend) | System API, no install needed |
+| `SendInput` (Win32) | Windows XP | Input injection (input HAL backend) | System API, no install needed |
+
+### 5.3 Meson Platform Selection
+
+```meson
+# Platform HAL backend selection
+if host_machine.system() == 'linux'
+  capture_src  = 'src/core/capture_pipewire.c'
+  capture_deps = [dependency('libpipewire-0.3')]
+  a11y_src     = 'src/core/a11y_atspi.c'
+  a11y_deps    = [dependency('atspi-2')]
+  input_src    = 'src/core/input_uinput.c'
+  input_deps   = [dependency('libudev')]
+
+elif host_machine.system() == 'darwin'
+  add_languages('objcpp', required: true)
+  capture_src  = 'src/core/capture_screencapturekit.m'
+  capture_deps = []
+  a11y_src     = 'src/core/a11y_axui.m'
+  a11y_deps    = []
+  input_src    = 'src/core/input_cgevent.m'
+  input_deps   = []
+  add_project_link_arguments(
+    '-framework', 'ScreenCaptureKit',
+    '-framework', 'CoreGraphics',
+    '-framework', 'AppKit',
+    language: ['c', 'cpp', 'objcpp']
+  )
+
+elif host_machine.system() == 'windows'
+  capture_src  = 'src/core/capture_dxgi.cpp'
+  capture_deps = []
+  a11y_src     = 'src/core/a11y_uia.cpp'
+  a11y_deps    = []
+  input_src    = 'src/core/input_sendinput.cpp'
+  input_deps   = []
+endif
+```
+
+### 5.4 Build Invocation
 
 ```bash
-# Target build invocation
+# Linux
 meson setup build --buildtype=debugoptimized
 ninja -C build
 
-# Produces:
+# macOS (Homebrew deps)
+PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig" \
+  meson setup build --buildtype=debugoptimized
+ninja -C build
+
+# Produces (all platforms):
 #   build/metadesk-host    — host daemon
 #   build/metadesk-client  — human video client
 #   build/fips-nat         — NAT traversal daemon
-#   build/libmetadesk.so   — shared core library
+#   build/libmetadesk.so   — shared core (.dylib on macOS, .dll on Windows)
 ```
 
 ---
@@ -328,44 +446,53 @@ metadesk/
 ├── meson_options.txt
 ├── SPEC.md
 ├── src/
-│   ├── core/                   # libmetadesk (no UI, no platform deps)
-│   │   ├── capture.c/h         # PipeWire capture
-│   │   ├── encode.c/h          # FFmpeg NVENC pipeline
-│   │   ├── decode.c/h          # FFmpeg decode
-│   │   ├── atspi.c/h           # AT-SPI2 tree walker + delta
-│   │   ├── input.c/h           # uinput injection
-│   │   ├── session.c/h         # session state machine
-│   │   ├── nostr_bridge.c/h    # Thin bridge to nostrc (libnostr, nip44, nip51, nip17)
-│   │   ├── packet.c/h          # wire format encode/decode
-│   │   └── secrets.c/h         # 1Password Connect integration
-│   ├── host/                   # metadesk-host daemon
+│   ├── core/                           # libmetadesk (no UI, no platform headers in .h files)
+│   │   ├── capture.h                   # capture HAL interface
+│   │   ├── capture_pipewire.c          # Linux backend
+│   │   ├── capture_screencapturekit.m  # macOS backend (Objective-C++)
+│   │   ├── capture_dxgi.cpp            # Windows backend
+│   │   ├── a11y.h                      # accessibility tree HAL interface
+│   │   ├── a11y_atspi.c                # Linux backend (AT-SPI2)
+│   │   ├── a11y_axui.m                 # macOS backend (AXUIElement)
+│   │   ├── a11y_uia.cpp                # Windows backend (UI Automation)
+│   │   ├── input.h                     # input injection HAL interface
+│   │   ├── input_uinput.c              # Linux backend
+│   │   ├── input_cgevent.m             # macOS backend
+│   │   ├── input_sendinput.cpp         # Windows backend
+│   │   ├── encode.c/h                  # FFmpeg encode pipeline (cross-platform)
+│   │   ├── decode.c/h                  # FFmpeg decode (cross-platform)
+│   │   ├── session.c/h                 # session state machine
+│   │   ├── nostr.c/h                   # NIP-44, NIP-51, relay client
+│   │   ├── packet.c/h                  # wire format encode/decode
+│   │   └── secrets.c/h                 # 1Password Connect integration
+│   ├── host/                           # metadesk-host daemon
 │   │   └── main.c
-│   ├── client/                 # metadesk-client (human)
+│   ├── client/                         # metadesk-client (human)
 │   │   ├── main.c
-│   │   ├── render.c/h          # SDL2 frame display
-│   │   └── ui.cpp/h            # Dear ImGui overlay
-│   └── fips-nat/               # NAT traversal daemon
+│   │   ├── render.c/h                  # SDL2 frame display
+│   │   └── ui.cpp/h                    # Dear ImGui overlay
+│   └── fips-nat/                       # NAT traversal daemon
 │       ├── main.c
-│       ├── stun.c/h            # libnice integration
-│       ├── publish.c/h         # Nostr address publication
-│       └── punch.c/h           # hole punch coordinator
+│       ├── stun.c/h                    # libnice integration
+│       ├── publish.c/h                 # Nostr address publication
+│       └── punch.c/h                   # hole punch coordinator
 ├── subprojects/
-│   └── imgui/                  # Dear ImGui vendored
+│   └── imgui/                          # Dear ImGui vendored
 ├── tests/
-│   ├── test_packet.c           # wire format round-trip tests
-│   ├── test_atspi.c            # tree serialisation tests
-│   └── test_nostr.c            # NIP-44 encrypt/decrypt tests
+│   ├── test_packet.c                   # wire format round-trip tests
+│   ├── test_a11y.c                     # tree serialisation tests
+│   └── test_nostr.c                    # NIP-44 encrypt/decrypt tests
 ├── config/
-│   └── metadesk.toml.example   # example config (no secrets)
+│   └── metadesk.toml.example           # example config (no secrets)
 └── docs/
-    └── AGENT_API.md            # agent client integration guide
+    └── AGENT_API.md                    # agent client integration guide
 ```
 
 ---
 
 ## 7. Secret Storage
 
-> **Hard rule:** No secrets in config files, environment variables, or on-disk key files. All cryptographic material is retrieved at startup from 1Password Connect and held in locked memory (`mlock`). The config file contains only the 1Password Connect URL and the item reference path.
+> **Hard rule:** No secrets in config files, environment variables, or on-disk key files. All cryptographic material is retrieved at startup from 1Password Connect and held in locked memory (`mlock` on Linux/macOS, `VirtualLock` on Windows). The config file contains only the 1Password Connect URL and the item reference path.
 
 | Secret | 1Password Item | Used By |
 |---|---|---|
@@ -380,71 +507,95 @@ metadesk/
 
 | Phase | Goal | Timeline |
 |---|---|---|
-| 1 | PoC — T7610 host to dev laptop, LAN only | 3–6 weeks |
+| 1 | PoC — T7610 Linux host, macOS laptop client, LAN | 3–6 weeks |
 | 2 | Dogfood — OpenClaw agent fleet, NAT traversal, fips-nat | 2–3 months |
-| 3 | Product — multi-platform, external users (contingent) | TBD |
+| 3 | Product — Windows support, external users (contingent) | TBD |
 
 ### 8.2 Phase 1 Milestones
 
-- **1.1** PipeWire capture — single frame to disk, DMA-BUF path confirmed on P40
-- **1.2** Encode/decode round-trip — NVENC → H.264 → SDL2 display on localhost
-- **1.3** Raw socket streaming — UDP packetizer, latency measurement
-- **1.4** FIPS integration — replace raw socket with `fd00::npub` IPv6 peer address
-- **1.5** Basic input forwarding — uinput mouse + keyboard keysym injection
-- **1.6** AT-SPI2 tree walker — serialize full tree, send as `MD_PKT_UI_TREE`
-- **1.7** Agent action handler — receive `MD_PKT_ACTION`, inject via uinput/AT-SPI2
-- **1.8** Dear ImGui overlay — latency display, connection status, disconnect button
+- **1.1** Meson scaffold — builds cleanly on Linux and macOS, all cross-platform deps linked, HAL stub implementations compile on both platforms
+- **1.2** Linux capture — PipeWire portal frame to disk, DMA-BUF path confirmed on P40
+- **1.3** macOS capture — ScreenCaptureKit frame to disk on dev laptop
+- **1.4** Encode/decode round-trip — FFmpeg H.264 encode → SDL2 display, latency measured on both platforms
+- **1.5** Raw socket streaming — UDP packetizer, frame delivery Linux → macOS over LAN
+- **1.6** FIPS integration — replace raw socket with `fd00::npub` IPv6 peer address
+- **1.7** Linux input forwarding — uinput mouse + keyboard keysym injection
+- **1.8** macOS input forwarding — CGEvent mouse + keyboard
+- **1.9** Linux AT-SPI2 tree walker — serialize full tree, send as `MD_PKT_UI_TREE`
+- **1.10** macOS AXUIElement tree walker — same output format as AT-SPI2 backend
+- **1.11** Agent action handler — receive `MD_PKT_ACTION`, dispatch through input HAL
+- **1.12** Dear ImGui overlay — latency display, connection status, disconnect button
 
 ### 8.3 Phase 2 Milestones
 
 - **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool
 - **2.2** fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node
-- **2.3** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log
-- **2.4** Adaptive bitrate — RTT feedback loop to NVENC bitrate target
+- **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
+- **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log
+- **2.4** Adaptive bitrate — RTT feedback loop to encoder bitrate target
 - **2.5** UI session manager — peer list, allowlist management, approval popup
 - **2.6** Dogfood gate — 30 days on OpenClaw fleet, all discovered bugs resolved
 
 ### 8.4 Phase 3 Milestones (contingent)
 
-- **3.1** macOS client — ScreenCaptureKit + AppKit/Objective-C++ UI layer
-- **3.2** Windows client — DXGI Desktop Duplication + Win32 UI layer
+- **3.1** Windows host — DXGI capture + UI Automation + SendInput backends
+- **3.2** Windows client — build and package metadesk-client for Windows
 - **3.3** NIP-46 bunker integration — approval delegated to signing device
 - **3.4** Multi-monitor and display selection
 - **3.5** File transfer over FIPS session channel
-- **3.6** Hardening — packet parser fuzzing, Debian/RPM packaging, release signing
+- **3.6** Hardening — packet parser fuzzing, Debian/RPM/Homebrew packaging, release signing
 
 ---
 
 ## 9. Encoder Configuration
 
-Phase 1 and 2 assume NVENC is available on the host (T7610 with P40). Software fallback (libx264 with ultrafast preset) must compile and link but is not the performance target.
+Hardware encoder availability varies by platform. The encoder module selects the best available backend at runtime, falling back to software if hardware is unavailable.
+
+| Platform | Hardware path | Software fallback |
+|---|---|---|
+| Linux (P40 / 3090) | NVENC via FFmpeg CUDA | libx264 ultrafast |
+| macOS | VideoToolbox H.264 | libx264 ultrafast |
+| Windows (NVIDIA) | NVENC via FFmpeg CUDA | libx264 ultrafast |
+| Windows (AMD) | AMF via FFmpeg | libx264 ultrafast |
+
+### 9.1 NVENC Parameters (Linux / Windows — NVIDIA)
 
 ```
-# Target NVENC parameters (FFmpeg AVCodecContext)
 codec_id        = AV_CODEC_ID_H264
-pix_fmt         = AV_PIX_FMT_CUDA    # stay on GPU, no copy
+pix_fmt         = AV_PIX_FMT_CUDA    # stay on GPU, no copy (when CUDA surface available)
+                  AV_PIX_FMT_NV12    # CPU copy fallback if no CUDA surface
 bit_rate        = 8000000             # 8 Mbps initial, adaptive
 gop_size        = 0                   # no keyframes; use intra refresh
 max_b_frames    = 0                   # no B-frames (latency)
-
-# NVENC private options
 preset          = p1                  # lowest latency
 tune            = ull                 # ultra-low latency
-rc              = cbr                 # constant bitrate
+rc              = cbr
 intra-refresh   = 1
 b_adapt         = 0
 zerolatency     = 1
 ```
 
-### 9.1 Latency Budget
+### 9.2 VideoToolbox Parameters (macOS)
+
+```
+codec_id           = AV_CODEC_ID_H264
+pix_fmt            = AV_PIX_FMT_VIDEOTOOLBOX
+bit_rate           = 8000000
+max_b_frames       = 0
+realtime           = true
+allow_sw           = false            # fail hard if HW unavailable; fall back to libx264
+profile            = high
+```
+
+### 9.3 Latency Budget
 
 | Stage | Target | Notes |
 |---|---|---|
-| PipeWire capture → DMA-BUF | < 2ms | Portal latency on idle desktop |
-| libyuv colorspace conversion | < 1ms | SIMD path, GPU frame stays on device |
-| NVENC encode | < 5ms | P40, 1080p, ULL preset |
+| Platform capture → buffer | < 2ms | PipeWire / ScreenCaptureKit / DXGI on idle desktop |
+| Colorspace conversion (libyuv) | < 1ms | SIMD path |
+| Hardware encode | < 5ms | NVENC / VideoToolbox, 1080p |
 | Network (LAN) | < 1ms | Phase 1 target environment |
-| FFmpeg decode (client) | < 5ms | Software decode on laptop acceptable |
+| FFmpeg decode (client) | < 5ms | Software decode acceptable for Phase 1 |
 | SDL2 present | < 2ms | vsync disabled in Phase 1 |
 | **Total** | **< 16ms** | **One frame at 60fps — Phase 1 goal** |
 
@@ -463,7 +614,7 @@ An agent connects by initiating a standard metadesk session with capability `age
 2. Negotiate: capabilities=["agent"], tree_format="compact"
 3. Receive MD_PKT_UI_TREE (full tree on connect)
 4. Agent reasons about tree, emits MD_PKT_ACTION
-5. Host injects action, waits for AT-SPI2 change event
+5. Host injects action via input HAL, waits for a11y change event
 6. Host emits MD_PKT_UI_TREE_DELTA
 7. Agent receives delta, updates local tree model, repeat
 
@@ -474,11 +625,32 @@ Host responds: MD_PKT_SCREENSHOT (annotated JPEG, node IDs overlaid)
 
 ### 10.3 Accessibility Coverage Tiers
 
+The a11y HAL normalises all platform accessibility APIs into the same tree format. Coverage quality varies by application type, not by platform.
+
 | Tier | Applications | Agent Strategy |
 |---|---|---|
-| Full tree | GTK4, Qt, Electron, web browsers | AT-SPI2 tree only — no screenshots needed |
-| Partial tree | Some Java apps, legacy GTK2 | Tree + targeted region screenshots |
-| No tree | Games, custom GPU UIs | Full screenshot fallback, vision model |
+| Full tree | GTK4, Qt, Electron, web browsers, most native apps | a11y tree only — no screenshots needed |
+| Partial tree | Some Java apps, legacy toolkits, complex custom widgets | Tree + targeted region screenshots |
+| No tree | Games, custom GPU UIs, fully custom-rendered apps | Full screenshot fallback, vision model |
+
+### 10.4 MCP Interface (Model Context Protocol)
+
+In addition to the binary packet protocol (§3.1), metadesk provides an MCP server for AI agent integration via standard JSON-RPC 2.0 tooling.
+
+**Transport options:**
+- `metadesk-host --mcp` — stdio transport (newline-delimited JSON on stdin/stdout)
+- `metadesk-host --mcp-http [PORT]` — HTTP+SSE on port 7710 (Phase 2)
+
+**Tools exposed** (9 total, matching the action types in §3.2):
+`metadesk_click`, `metadesk_dbl_click`, `metadesk_right_click`, `metadesk_type`, `metadesk_key_combo`, `metadesk_scroll`, `metadesk_focus`, `metadesk_set_value`, `metadesk_screenshot`
+
+**Resources exposed:**
+- `metadesk://ui-tree` — full accessibility tree (JSON or compact format)
+- `metadesk://session-info` — session state, capabilities, action count
+
+**Resource subscriptions:** Agents can subscribe to `metadesk://ui-tree` to receive `notifications/resources/updated` when the UI changes.
+
+See `docs/AGENT_API.md` for the full integration guide with examples.
 
 ---
 
@@ -486,9 +658,9 @@ Host responds: MD_PKT_SCREENSHOT (annotated JPEG, node IDs overlaid)
 
 > These questions are intentionally deferred until Phase 1 empirical results are available. Do not resolve by assumption.
 
-- **OQ-1** AT-SPI2 change events vs polling — does subscribing to AT-SPI2 state-change events give sufficient fidelity, or is periodic full-tree polling required for some applications?
+- **OQ-1** A11y change events vs polling — do AT-SPI2 and AXUIElement change event subscriptions give sufficient fidelity across both platforms, or is periodic full-tree polling required for some applications?
 
-- **OQ-2** GPU frame path — can a DMA-BUF handle be passed directly to NVENC without a CPU copy on the T7610/P40 hardware combination? Requires empirical test in Milestone 1.1.
+- **OQ-2** GPU frame path — can a DMA-BUF handle be passed directly to NVENC without a CPU copy on the T7610/P40 combination? ScreenCaptureKit on macOS delivers frames via `CVPixelBuffer`; is a VideoToolbox-direct encode path feasible to avoid the CPU copy there?
 
 - **OQ-3** fips-nat integration point — should fips-nat write directly to the FIPS daemon config and signal reload, or does FIPS v0.1.x expose a dynamic peer API via `fipsctl`?
 
@@ -496,6 +668,10 @@ Host responds: MD_PKT_SCREENSHOT (annotated JPEG, node IDs overlaid)
 
 - **OQ-5** Tree format negotiation — is it worth supporting both compact and JSON formats simultaneously, or should compact be the only agent format?
 
+- **OQ-6** macOS accessibility permissions — `AXUIElement` requires Accessibility access granted in System Settings. What is the correct UX for a headless daemon to request or detect this permission, and is a privileged helper process required?
+
+- **OQ-7** macOS screen recording permissions — ScreenCaptureKit requires Screen Recording permission for the capturing process. Same question as OQ-6 for the headless daemon context. Determine whether `CGRequestScreenCaptureAccess()` is callable from a daemon and what happens when it is denied.
+
 ---
 
-*metadesk project specification — Soul Factory / OpenClaw — DRAFT — not for external distribution*
+*metadesk project specification v0.2 — Soul Factory / OpenClaw — DRAFT — not for external distribution*

@@ -306,6 +306,13 @@ core_sources = files(
   'src/core/a11y.c',
   'src/core/input.c',
   'src/core/session.c',
+  'src/core/jsonrpc.c',
+  'src/core/mcp_server.c',
+  'src/core/mcp_tools.c',
+  'src/core/mcp_stdio.c',
+  'src/core/mcp_resources.c',
+  'src/core/mcp_bridge.c',
+  'src/core/mcp_http.c',
   'src/core/nostr.c',
   'src/core/packet.c',
   'src/core/stream.c',
@@ -450,6 +457,24 @@ test_session = executable('test_session',
   dependencies : [dep_metadesk],
 )
 test('session JSON + state machine', test_session)
+
+test_jsonrpc = executable('test_jsonrpc',
+  files('tests/test_jsonrpc.c'),
+  dependencies : [dep_metadesk],
+)
+test('JSON-RPC 2.0 message layer', test_jsonrpc)
+
+test_mcp = executable('test_mcp',
+  files('tests/test_mcp.c'),
+  dependencies : [dep_metadesk],
+)
+test('MCP server core', test_mcp)
+
+test_mcp_stdio = executable('test_mcp_stdio',
+  files('tests/test_mcp_stdio.c'),
+  dependencies : [dep_metadesk],
+)
+test('MCP stdio transport', test_mcp_stdio, timeout : 10)
 
 if enable_nip5f
   test_signer_nip5f = executable('test_signer_nip5f',

@@ -24,6 +24,7 @@
 #include "nostr.h"
 #include "secrets.h"
 #include "signer.h"
+#include "mcp_bridge.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,6 +237,9 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer    Auto-detect local signer (NIP-5F, NIP-55L)\n");
     fprintf(stderr, "  --relay URL      Relay URL (default: wss://relay.sharegap.net)\n");
+    fprintf(stderr, "\nMCP agent interface:\n");
+    fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
+    fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -257,6 +261,11 @@ int main(int argc, char **argv) {
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
     bool do_capture = true;
+    bool mcp_stdio = false;
+    bool mcp_http = false;       /* TODO: Phase 2 — HTTP+SSE transport */
+    uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
+    (void)mcp_http;
+    (void)mcp_http_port;
     const char *relay_urls[16];
     int relay_count = 0;
 
@@ -289,6 +298,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
             if (relay_count < 16)
                 relay_urls[relay_count++] = argv[++i];
+        }
+        else if (strcmp(argv[i], "--mcp") == 0)
+            mcp_stdio = true;
+        else if (strcmp(argv[i], "--mcp-http") == 0) {
+            mcp_http = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                mcp_http_port = (uint16_t)atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -458,6 +474,52 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
         }
+    }
+
+    /* ── MCP agent interface ──────────────────────────────────── */
+    if (mcp_stdio) {
+        printf("host: starting MCP server on stdio\n");
+
+        /* Initialize a11y + input for MCP mode */
+        MdA11yCtx *mcp_a11y = md_a11y_create();
+        if (mcp_a11y)
+            printf("host[mcp]: accessibility tree connected\n");
+        else
+            fprintf(stderr, "host[mcp]: WARNING: a11y unavailable\n");
+
+        MdInputConfig mcp_input_cfg = {
+            .screen_width = 1920, .screen_height = 1080,
+        };
+        MdInput *mcp_input = md_input_create(&mcp_input_cfg);
+        if (mcp_input && md_input_is_ready(mcp_input))
+            printf("host[mcp]: input injection ready\n");
+        else
+            fprintf(stderr, "host[mcp]: WARNING: input unavailable\n");
+
+        MdMcpBridgeConfig mcp_cfg = {
+            .a11y = mcp_a11y,
+            .input = mcp_input,
+            .tree_format = MD_TREE_FORMAT_JSON,
+            .settle_ms = 100,
+            .stdio_in_fd = STDIN_FILENO,
+            .stdio_out_fd = STDOUT_FILENO,
+        };
+
+        MdMcpBridge *mcp_bridge = md_mcp_bridge_create(&mcp_cfg);
+        if (!mcp_bridge) {
+            fprintf(stderr, "ERROR: failed to create MCP bridge\n");
+            return 1;
+        }
+
+        /* Run MCP event loop (blocking — exits on EOF or shutdown) */
+        int mcp_rc = md_mcp_bridge_run(mcp_bridge);
+        md_mcp_bridge_destroy(mcp_bridge);
+
+        if (signer) md_signer_destroy(signer);
+        if (mcp_a11y) md_a11y_destroy(mcp_a11y);
+        if (mcp_input) md_input_destroy(mcp_input);
+        printf("host: MCP session ended (rc=%d)\n", mcp_rc);
+        return mcp_rc < 0 ? 1 : 0;
     }
 
     /* Create TCP server */

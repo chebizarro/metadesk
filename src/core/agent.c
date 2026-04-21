@@ -226,6 +226,94 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
     return 0;
 }
 
+/* ── MCP variant: returns delta as string instead of writing to stream ── */
+
+char *md_agent_handle_action_mcp(MdAgent *agent,
+                                 const uint8_t *payload, uint32_t payload_len) {
+    if (!agent || !payload || payload_len == 0)
+        return NULL;
+
+    /* 1. Parse the action JSON */
+    MdAction action;
+    memset(&action, 0, sizeof(action));
+
+    int ret = md_action_parse(&action, (const char *)payload, payload_len);
+    if (ret < 0) {
+        fprintf(stderr, "agent[mcp]: failed to parse action JSON\n");
+        return NULL;
+    }
+
+    fprintf(stderr, "agent[mcp]: action=%s target=%s\n",
+            md_action_type_str(action.type),
+            action.target_id[0] ? action.target_id : "(none)");
+
+    /* 2. Resolve target_id to screen coordinates if needed */
+    if (action.target_id[0] != '\0') {
+        int tx, ty;
+        if (resolve_target(agent, action.target_id, &tx, &ty) == 0) {
+            switch (action.type) {
+            case MD_ACTION_CLICK:
+            case MD_ACTION_DBL_CLICK:
+            case MD_ACTION_RIGHT_CLICK:
+                action.region[0] = tx;
+                action.region[1] = ty;
+                break;
+            case MD_ACTION_FOCUS:
+                action.region[0] = tx;
+                action.region[1] = ty;
+                action.type = MD_ACTION_CLICK;
+                break;
+            default:
+                break;
+            }
+        } else {
+            fprintf(stderr, "agent[mcp]: could not resolve target '%s'\n",
+                    action.target_id);
+        }
+    }
+
+    /* 3. Inject the action */
+    if (agent->input) {
+        ret = md_input_execute_action(agent->input, &action);
+        if (ret < 0)
+            fprintf(stderr, "agent[mcp]: action injection failed\n");
+    }
+
+    md_action_cleanup(&action);
+    agent->action_count++;
+
+    /* 4. Wait for UI to settle */
+    sleep_ms(agent->settle_ms);
+
+    /* 5. Invalidate cached tree */
+    if (agent->cached_tree) {
+        md_a11y_node_free(agent->cached_tree);
+        agent->cached_tree = NULL;
+    }
+
+    /* 6. Compute delta and return as string */
+    if (agent->a11y) {
+        int delta_count = 0;
+        MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
+
+        if (deltas && delta_count > 0) {
+            char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
+            md_a11y_delta_free(deltas, delta_count);
+            return delta_json;  /* caller frees */
+        }
+
+        /* No delta — return full tree */
+        MdA11yNode *root = md_a11y_walk(agent->a11y);
+        if (root) {
+            char *tree_json = serialize_tree(root, agent->tree_format);
+            md_a11y_node_free(root);
+            return tree_json;
+        }
+    }
+
+    return strdup("{\"status\":\"ok\"}");
+}
+
 int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
     if (!agent || !stream || !seq || !agent->a11y)
         return -1;
