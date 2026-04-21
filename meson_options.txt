@@ -10,3 +10,7 @@ option('signer_nip55l', type : 'boolean', value : false,
        description : 'Enable NIP-55L D-Bus local signer backend (requires nostrc nip55l + GIO)')
 option('signer_nip5f', type : 'boolean', value : false,
        description : 'Enable NIP-5F Unix socket signer backend (requires nostrc nip5f)')
+option('nostrc_root', type : 'string', value : '',
+       description : 'Path to nostrc project root (for uninstalled libgo/nip51; leave empty if fully installed)')
+option('nostrc_build_dir', type : 'string', value : '',
+       description : 'Path to nostrc CMake build dir (defaults to nostrc_root/build if nostrc_root is set)')

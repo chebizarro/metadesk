@@ -27,57 +27,105 @@ dep_avutil    = dependency('libavutil',        version : '>=58.0.0', required : 
 dep_cjson     = dependency('libcjson',        version : '>=1.7.17')
 dep_b2        = dependency('libb2',           version : '>=0.98')
 
+# ── System library prefix detection ──────────────────────────────────────────
+# Auto-detect Homebrew prefix on macOS (Apple Silicon: /opt/homebrew, Intel: /usr/local)
+cc = meson.get_compiler('c')
+_sys_lib_dirs = []
+_sys_inc_dirs = []
+
+if host_os == 'darwin'
+  _brew = run_command('brew', '--prefix', check : false)
+  if _brew.returncode() == 0
+    _brew_prefix = _brew.stdout().strip()
+  else
+    _brew_prefix = '/opt/homebrew'
+  endif
+  _sys_lib_dirs = [_brew_prefix / 'lib']
+  _sys_inc_dirs = [_brew_prefix / 'include']
+  message('Homebrew prefix: ' + _brew_prefix)
+endif
+
 # Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
 dep_yuv = dependency('libyuv', required : false)
 if not dep_yuv.found()
-  _yuv_lib = meson.get_compiler('c').find_library('yuv',
-    dirs : ['/opt/homebrew/lib', '/usr/local/lib'],
+  _yuv_lib = cc.find_library('yuv',
+    dirs : _sys_lib_dirs + ['/usr/local/lib'],
     required : true)
+  _yuv_incs = _sys_inc_dirs.length() > 0 ? include_directories(_sys_inc_dirs[0]) : include_directories()
   dep_yuv = declare_dependency(
     dependencies : _yuv_lib,
-    include_directories : include_directories('/opt/homebrew/include'),
+    include_directories : _yuv_incs,
   )
 endif
 
-# ── nostrc: Nostr C library (installed from nostrc/_build) ──────────────────
-cc = meson.get_compiler('c')
-nostrc_inc = include_directories(
-  '/opt/homebrew/include/nostr',
-  '/Users/bizarro/Documents/Projects/nostrc/libgo/include',
-)
-dep_nostr_lib = cc.find_library('nostr', required : true,
-  dirs : ['/opt/homebrew/lib'])
+# ── nostrc: Nostr C library ─────────────────────────────────────────────────
+# nostrc components:
+#   Installed (pkg-config/find_library): libnostr, nip44, secp256k1, etc.
+#   Not yet installed (build-tree only): libgo runtime, nip51
+#
+# Use -Dnostrc_root=<path> to specify the nostrc project root for uninstalled
+# components. Use -Dnostrc_build_dir=<path> to override the build directory.
+_nostrc_root = get_option('nostrc_root')
+_nostrc_build = get_option('nostrc_build_dir')
+if _nostrc_build == '' and _nostrc_root != ''
+  _nostrc_build = _nostrc_root / 'build'
+endif
+
+# nostrc installed headers + libgo headers (if from source tree)
+_nostrc_inc_paths = []
+foreach d : _sys_inc_dirs
+  _nostrc_inc_paths += d / 'nostr'
+endforeach
+if _nostrc_root != ''
+  _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
+endif
+nostrc_inc = include_directories(_nostrc_inc_paths)
+
+dep_nostr_lib = cc.find_library('nostr', required : true, dirs : _sys_lib_dirs)
 dep_nostr = declare_dependency(
   dependencies : dep_nostr_lib,
   include_directories : nostrc_inc,
 )
-dep_nip44 = cc.find_library('nostr_nip44_core', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_nip51 = declare_dependency(
-  link_args : ['/Users/bizarro/Documents/Projects/nostrc/build/nips/nip51/CMakeFiles/nostr_nip51_core.dir/src/nip51.c.o'],
-)
-dep_nip17 = cc.find_library('nostr', required : false,
-  dirs : ['/opt/homebrew/lib'])
+dep_nip44 = cc.find_library('nostr_nip44_core', required : true, dirs : _sys_lib_dirs)
+
+# nip51 — try installed library first, fallback to build-tree object
+dep_nip51_lib = cc.find_library('nostr_nip51_core', required : false, dirs : _sys_lib_dirs)
+if dep_nip51_lib.found()
+  dep_nip51 = dep_nip51_lib
+elif _nostrc_build != ''
+  _nip51_obj = _nostrc_build / 'nips' / 'nip51' / 'CMakeFiles' / 'nostr_nip51_core.dir' / 'src' / 'nip51.c.o'
+  dep_nip51 = declare_dependency(link_args : [_nip51_obj])
+  message('nip51: using build-tree object: ' + _nip51_obj)
+else
+  error('nostr_nip51_core not found. Install nostrc or set -Dnostrc_root=<path>')
+endif
+
+dep_nip17 = cc.find_library('nostr', required : false, dirs : _sys_lib_dirs)
 
 # nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
-dep_libgo = declare_dependency(
-  link_args : [
-    '/Users/bizarro/Documents/Projects/nostrc/build/libgo/liblibgo.a',
-    '/Users/bizarro/Documents/Projects/nostrc/build/libgo/libgo_fiber.a',
-  ],
-)
-dep_secp256k1 = cc.find_library('secp256k1', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_websockets = cc.find_library('websockets', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_ssl = cc.find_library('ssl', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_crypto = cc.find_library('crypto', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_nsync = cc.find_library('nsync', required : true,
-  dirs : ['/opt/homebrew/lib'])
-dep_nostr_json = cc.find_library('nostr_json', required : true,
-  dirs : ['/opt/homebrew/lib'])
+# libgo — try installed library first, fallback to build-tree static libs
+_libgo_lib = cc.find_library('libgo', required : false, dirs : _sys_lib_dirs)
+_go_fiber_lib = cc.find_library('go_fiber', required : false, dirs : _sys_lib_dirs)
+if _libgo_lib.found() and _go_fiber_lib.found()
+  dep_libgo = declare_dependency(dependencies : [_libgo_lib, _go_fiber_lib])
+elif _nostrc_build != ''
+  dep_libgo = declare_dependency(
+    link_args : [
+      _nostrc_build / 'libgo' / 'liblibgo.a',
+      _nostrc_build / 'libgo' / 'libgo_fiber.a',
+    ],
+  )
+  message('libgo: using build-tree static libs from ' + _nostrc_build / 'libgo')
+else
+  error('libgo/go_fiber not found. Install nostrc or set -Dnostrc_root=<path>')
+endif
+
+dep_secp256k1 = cc.find_library('secp256k1', required : true, dirs : _sys_lib_dirs)
+dep_websockets = cc.find_library('websockets', required : true, dirs : _sys_lib_dirs)
+dep_ssl = cc.find_library('ssl', required : true, dirs : _sys_lib_dirs)
+dep_crypto = cc.find_library('crypto', required : true, dirs : _sys_lib_dirs)
+dep_nsync = cc.find_library('nsync', required : true, dirs : _sys_lib_dirs)
+dep_nostr_json = cc.find_library('nostr_json', required : true, dirs : _sys_lib_dirs)
 
 # ── Platform HAL backend selection (spec §5.3) ──────────────────────────────
 # Each platform provides: capture, a11y, and input backend source files + deps.
