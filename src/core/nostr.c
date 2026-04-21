@@ -1152,6 +1152,25 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     return ret;
 }
 
+int md_nostr_allowlist_count(const MdNostr *n) {
+    if (!n || !n->allowlist) return 0;
+    return (int)n->allowlist->count;
+}
+
+int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
+                                 MdAllowlistEntry *out) {
+    if (!n || !out || !n->allowlist || index < 0 ||
+        (size_t)index >= n->allowlist->count)
+        return -1;
+
+    NostrListEntry *entry = n->allowlist->entries[index];
+    if (!entry) return -1;
+
+    out->pubkey_hex = entry->value;
+    out->caps = entry->extra;
+    return 0;
+}
+
 /* ── Transport address ────────────────────────────────────────
  *
  * kind:30078 is addressable, d-tag is "fips-transport".

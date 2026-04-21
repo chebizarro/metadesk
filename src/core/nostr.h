@@ -163,6 +163,22 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
 /* Remove pubkey_hex from allowlist, publish updated list. */
 int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex);
 
+/* Allowlist entry (read-only view for UI rendering) */
+typedef struct {
+    const char *pubkey_hex;  /* NUL-terminated npub hex (64 chars)  */
+    const char *caps;        /* capability string (may be NULL)     */
+} MdAllowlistEntry;
+
+/* Return number of entries on the current allowlist (0 if none). */
+int md_nostr_allowlist_count(const MdNostr *n);
+
+/*
+ * Copy entry at index into *out. Returns 0 on success, -1 if out of range.
+ * Pointers in *out are valid until the next allowlist mutation.
+ */
+int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
+                                 MdAllowlistEntry *out);
+
 /* ── Transport address publication ────────────────────────────
  * The host publishes its FIPS transport address as a kind:30078
  * addressable event with d-tag "fips-transport". Clients subscribe

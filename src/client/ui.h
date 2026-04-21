@@ -24,6 +24,21 @@ extern "C" {
 /* Opaque overlay context */
 typedef struct MdOverlay MdOverlay;
 
+/* Read-only view of an allowlist entry for the UI */
+typedef struct {
+    const char *pubkey_hex;  /* 64-char hex npub                   */
+    const char *caps;        /* capability string (may be NULL)    */
+} MdOverlayAllowlistEntry;
+
+/* Callback signatures for allowlist mutation from UI actions.
+ * The overlay itself doesn't touch Nostr — it invokes these
+ * callbacks which the host wires to md_nostr_allowlist_add/remove. */
+typedef void (*MdOverlayAllowlistAddFn)(const char *pubkey_hex,
+                                        const char *caps,
+                                        void *userdata);
+typedef void (*MdOverlayAllowlistRemoveFn)(const char *pubkey_hex,
+                                           void *userdata);
+
 /* Overlay stats shown to user */
 typedef struct {
     float  latency_ms;       /* total pipeline latency             */
@@ -34,6 +49,13 @@ typedef struct {
     int    fps;              /* current display FPS                */
     float  bitrate_mbps;     /* current bitrate in Mbps            */
     const char *encoder_name; /* "NVENC" or "x264"                */
+
+    /* Allowlist panel data (host mode only — NULL for client) */
+    const MdOverlayAllowlistEntry *allowlist_entries;
+    int    allowlist_count;  /* number of entries (0 hides panel)  */
+    MdOverlayAllowlistAddFn    on_allowlist_add;
+    MdOverlayAllowlistRemoveFn on_allowlist_remove;
+    void  *allowlist_userdata;
 } MdOverlayStats;
 
 /* Create ImGui overlay attached to an SDL window/renderer.

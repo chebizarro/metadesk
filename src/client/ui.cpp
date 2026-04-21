@@ -34,6 +34,7 @@ struct MdOverlay {
     bool           visible;
     bool           wants_input;
     bool           disconnect_requested;
+    bool           show_allowlist;       /* allowlist panel toggled on */
     SDL_Window    *window;
     SDL_Renderer  *renderer;
 
@@ -44,6 +45,10 @@ struct MdOverlay {
     float          smooth_rtt;
     float          smooth_fps;
     float          smooth_bitrate;
+
+    /* Allowlist add form state */
+    char           add_npub_buf[130];    /* input: hex npub to add */
+    char           add_caps_buf[64];     /* input: capabilities    */
 };
 
 /* Exponential moving average smoothing factor */
@@ -230,12 +235,134 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
     ImGui::PopStyleColor(3);
 
+    /* ── Allowlist toggle ─────────────────────────────────── */
+    if (stats->allowlist_entries || stats->on_allowlist_add) {
+        ImGui::Separator();
+        ImGui::Spacing();
+        if (ImGui::Button(o->show_allowlist ? "Hide Allowlist" : "Allowlist",
+                          ImVec2(button_width, 0))) {
+            o->show_allowlist = !o->show_allowlist;
+        }
+    }
+
     /* ── Footer hint ─────────────────────────────────────── */
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, 0.7f),
                        "F1: toggle overlay");
 
     ImGui::End();
+
+    /* ── Allowlist panel (separate window) ────────────────── */
+    if (o->show_allowlist && (stats->allowlist_entries || stats->on_allowlist_add)) {
+        ImGui::SetNextWindowPos(ImVec2(280, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
+
+        ImGui::Begin("Allowlist (NIP-51)", &o->show_allowlist,
+                     ImGuiWindowFlags_AlwaysAutoResize);
+
+        /* Current entries */
+        if (stats->allowlist_count > 0 && stats->allowlist_entries) {
+            ImGui::Text("Allowed peers: %d", stats->allowlist_count);
+            ImGui::Separator();
+
+            if (ImGui::BeginTable("##allowlist", 3,
+                                  ImGuiTableFlags_Borders |
+                                  ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("npub", 0, 3.0f);
+                ImGui::TableSetupColumn("Caps", 0, 1.5f);
+                ImGui::TableSetupColumn("##remove", 0, 0.5f);
+                ImGui::TableHeadersRow();
+
+                for (int i = 0; i < stats->allowlist_count; i++) {
+                    const MdOverlayAllowlistEntry *e = &stats->allowlist_entries[i];
+                    ImGui::TableNextRow();
+
+                    /* npub column — truncate to first/last 8 chars */
+                    ImGui::TableNextColumn();
+                    if (e->pubkey_hex && std::strlen(e->pubkey_hex) >= 16) {
+                        char trunc[24];
+                        std::snprintf(trunc, sizeof(trunc), "%.8s...%.8s",
+                                      e->pubkey_hex,
+                                      e->pubkey_hex + std::strlen(e->pubkey_hex) - 8);
+                        ImGui::TextUnformatted(trunc);
+                        /* Tooltip with full npub on hover */
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", e->pubkey_hex);
+                    } else {
+                        ImGui::TextUnformatted(e->pubkey_hex ? e->pubkey_hex : "?");
+                    }
+
+                    /* Caps column */
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(e->caps ? e->caps : "(all)");
+
+                    /* Remove button */
+                    ImGui::TableNextColumn();
+                    if (stats->on_allowlist_remove) {
+                        ImGui::PushID(i);
+                        ImGui::PushStyleColor(ImGuiCol_Button,
+                                              ImVec4(0.5f, 0.1f, 0.1f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                              ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                              ImVec4(0.4f, 0.05f, 0.05f, 1.0f));
+                        if (ImGui::SmallButton("\xC3\x97")) {  /* × */
+                            stats->on_allowlist_remove(e->pubkey_hex,
+                                                      stats->allowlist_userdata);
+                        }
+                        ImGui::PopStyleColor(3);
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                               "No allowlist entries (open mode)");
+        }
+
+        /* Add entry form */
+        if (stats->on_allowlist_add) {
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::Text("Add peer:");
+
+            ImGui::SetNextItemWidth(280);
+            ImGui::InputTextWithHint("##npub", "npub hex (64 chars)",
+                                     o->add_npub_buf, sizeof(o->add_npub_buf));
+
+            ImGui::SetNextItemWidth(140);
+            ImGui::SameLine();
+            ImGui::InputTextWithHint("##caps", "caps",
+                                     o->add_caps_buf, sizeof(o->add_caps_buf));
+
+            ImGui::SameLine();
+            bool valid = std::strlen(o->add_npub_buf) == 64;
+            if (!valid) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
+                ImGui::Button("Add");
+                ImGui::PopStyleVar();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImVec4(0.1f, 0.5f, 0.1f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                      ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                      ImVec4(0.05f, 0.4f, 0.05f, 1.0f));
+                if (ImGui::Button("Add")) {
+                    const char *caps = o->add_caps_buf[0] ? o->add_caps_buf : NULL;
+                    stats->on_allowlist_add(o->add_npub_buf, caps,
+                                            stats->allowlist_userdata);
+                    o->add_npub_buf[0] = '\0';
+                    o->add_caps_buf[0] = '\0';
+                }
+                ImGui::PopStyleColor(3);
+            }
+        }
+
+        ImGui::End();
+    }
 
     /* Finalize and render */
     ImGui::Render();

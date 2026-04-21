@@ -89,6 +89,12 @@ static void test_allowlist_default_deny(void) {
     /* Refresh with NULL → error */
     assert(md_nostr_refresh_allowlist(NULL) == -1);
 
+    /* Accessor functions with NULL nostr → safe defaults */
+    assert(md_nostr_allowlist_count(NULL) == 0);
+
+    MdAllowlistEntry entry_out;
+    assert(md_nostr_allowlist_get_entry(NULL, 0, &entry_out) == -1);
+
     memset(sk, 0, strlen(sk));
     free(sk);
     free(pk);
