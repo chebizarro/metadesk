@@ -72,12 +72,15 @@ static int parse_url(const char *url, char **host_out, uint16_t *port_out) {
     if (!url || !host_out || !port_out)
         return -1;
 
-    /* Skip "http://" */
+    /* Skip "http://" — reject https:// since TLS is not implemented */
     const char *p = url;
+    if (strncmp(p, "https://", 8) == 0) {
+        fprintf(stderr, "secrets: TLS not implemented — use http:// "
+                "(1Password Connect should be on localhost)\n");
+        return -1;
+    }
     if (strncmp(p, "http://", 7) == 0)
         p += 7;
-    else if (strncmp(p, "https://", 8) == 0)
-        p += 8;  /* Note: TLS not implemented, just skip prefix */
 
     /* Find port separator or end */
     const char *colon = strchr(p, ':');

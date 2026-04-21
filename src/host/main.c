@@ -360,11 +360,15 @@ int main(int argc, char **argv) {
         if (nostr) {
             ctx.nostr = nostr;
 
-            /* Publish our transport address */
+            /* Publish our transport address (FIPS IPv6 derived from pubkey) */
             char *our_pk = NULL;
             if (md_signer_get_pubkey(signer, &our_pk) == MD_SIGNER_OK && our_pk) {
-                /* Use pubkey as FIPS address placeholder */
-                md_nostr_publish_transport(nostr, our_pk);
+                char fips_ipv6[MD_FIPS_IPV6_STRLEN];
+                if (md_fips_addr_from_pubkey_hex(our_pk, fips_ipv6, sizeof(fips_ipv6)) == 0) {
+                    md_nostr_publish_transport(nostr, fips_ipv6);
+                } else {
+                    fprintf(stderr, "WARNING: failed to derive FIPS address from pubkey\n");
+                }
                 free(our_pk);
             }
 
@@ -381,11 +385,32 @@ int main(int argc, char **argv) {
             }
 
             if (ctx.session_requested) {
-                /* Generate session ID */
+                /* Generate cryptographically random session ID */
                 char session_id[64];
-                snprintf(session_id, sizeof(session_id), "%08x-%04x-%04x",
-                         (uint32_t)time(NULL), (uint32_t)(rand() & 0xFFFF),
-                         (uint32_t)(rand() & 0xFFFF));
+                {
+                    uint8_t rnd[16];
+    #if defined(__APPLE__) || defined(__FreeBSD__)
+                    arc4random_buf(rnd, sizeof(rnd));
+    #elif defined(__linux__)
+                    /* getrandom(2) — available since Linux 3.17 */
+                    extern long getrandom(void *buf, size_t buflen, unsigned int flags);
+                    if (getrandom(rnd, sizeof(rnd), 0) != sizeof(rnd)) {
+                        /* Fallback to /dev/urandom */
+                        FILE *f = fopen("/dev/urandom", "rb");
+                        if (f) { fread(rnd, 1, sizeof(rnd), f); fclose(f); }
+                        else memset(rnd, 0, sizeof(rnd));
+                    }
+    #else
+                    FILE *f = fopen("/dev/urandom", "rb");
+                    if (f) { fread(rnd, 1, sizeof(rnd), f); fclose(f); }
+                    else memset(rnd, 0, sizeof(rnd));
+    #endif
+                    snprintf(session_id, sizeof(session_id),
+                             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                             rnd[0],rnd[1],rnd[2],rnd[3], rnd[4],rnd[5],
+                             rnd[6],rnd[7], rnd[8],rnd[9],
+                             rnd[10],rnd[11],rnd[12],rnd[13],rnd[14],rnd[15]);
+                }
 
                 /* Determine granted capabilities */
                 uint32_t granted = ctx.pending_req.capabilities &

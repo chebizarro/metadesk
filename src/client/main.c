@@ -47,6 +47,7 @@ typedef struct {
     int64_t       total_decode_us;
 
     /* Nostr session negotiation state */
+    char          expected_host_pk[128]; /* pubkey of host we're connecting to */
     char          transport_addr[256]; /* FIPS addr from on_transport     */
     volatile int  transport_ready;     /* set by on_transport callback    */
     char          accepted_session_id[64]; /* from session_accept DM     */
@@ -79,17 +80,33 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
 static void on_transport(const char *pubkey_hex, const char *fips_addr,
                          void *userdata) {
     ClientCtx *ctx = userdata;
-    if (!ctx || !fips_addr) return;
+    if (!ctx || !fips_addr || !pubkey_hex) return;
+
+    /* Verify the transport address came from the expected host */
+    if (ctx->expected_host_pk[0] != '\0' &&
+        strcmp(pubkey_hex, ctx->expected_host_pk) != 0) {
+        fprintf(stderr, "client: ignoring transport addr from unexpected pubkey %.*s...\n",
+                8, pubkey_hex);
+        return;
+    }
+
     strncpy(ctx->transport_addr, fips_addr, sizeof(ctx->transport_addr) - 1);
     ctx->transport_addr[sizeof(ctx->transport_addr) - 1] = '\0';
     ctx->transport_ready = 1;
-    (void)pubkey_hex;
 }
 
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
                           void *userdata) {
     ClientCtx *ctx = userdata;
-    if (!ctx || !content) return;
+    if (!ctx || !content || !sender_pubkey_hex) return;
+
+    /* Verify the DM came from the expected host */
+    if (ctx->expected_host_pk[0] != '\0' &&
+        strcmp(sender_pubkey_hex, ctx->expected_host_pk) != 0) {
+        fprintf(stderr, "client: ignoring session DM from unexpected pubkey %.*s...\n",
+                8, sender_pubkey_hex);
+        return;
+    }
 
     /* Try to parse as session_accept */
     MdSessionAccept acc;
@@ -99,7 +116,6 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         ctx->granted_caps = acc.granted;
         ctx->session_accepted = 1;
     }
-    (void)sender_pubkey_hex;
 }
 
 /* ── Usage ───────────────────────────────────────────────────── */
@@ -283,6 +299,10 @@ int main(int argc, char **argv) {
             if (signer) md_signer_destroy(signer);
             return 1;
         }
+
+        /* Store expected host pubkey for callback verification */
+        strncpy(ctx.expected_host_pk, npub, sizeof(ctx.expected_host_pk) - 1);
+        ctx.expected_host_pk[sizeof(ctx.expected_host_pk) - 1] = '\0';
 
         /* Step 1: Subscribe to host's transport address */
         printf("client: looking up transport addr for %.*s...\n", 12, npub);

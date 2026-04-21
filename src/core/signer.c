@@ -384,7 +384,13 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
 
     MdSigner *s = calloc(1, sizeof(MdSigner));
     if (!s) {
-        nip46_destroy(s);
+        /* Clean up backend state directly — can't use nip46_destroy(NULL) */
+        if (st->session) {
+            nostr_nip46_client_stop(st->session);
+            nostr_nip46_session_free(st->session);
+        }
+        free(st->remote_pubkey_hex);
+        free(st);
         return NULL;
     }
     s->type    = MD_SIGNER_NIP46;
@@ -747,7 +753,11 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
 
     MdSigner *s = calloc(1, sizeof(MdSigner));
     if (!s) {
-        nip5f_destroy(s);
+        /* Clean up backend state directly — can't use nip5f_destroy(NULL) */
+        if (st->conn)
+            nostr_nip5f_client_close(st->conn);
+        free(st->socket_path);
+        free(st);
         free(pk);
         return NULL;
     }

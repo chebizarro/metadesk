@@ -212,7 +212,7 @@ static void *pw_thread_func(void *arg) {
 
 /* ── Backend vtable implementation ───────────────────────────── */
 
-static int pw_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
+static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     /* Initialize PipeWire (idempotent, safe to call multiple times) */
     pw_init(NULL, NULL);
 
@@ -401,7 +401,7 @@ static void pw_destroy(MdCaptureCtx *ctx) {
 /* ── Singleton vtable ────────────────────────────────────────── */
 
 static const MdCaptureBackend pipewire_backend = {
-    .init          = pw_init,
+    .init          = pw_backend_init,
     .start         = pw_start,
     .get_frame     = pw_get_frame,
     .release_frame = pw_release_frame,

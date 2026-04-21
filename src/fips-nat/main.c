@@ -22,13 +22,9 @@ int main(int argc, char **argv) {
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("fips-nat v0.1.0 starting...\n");
-    /* TODO: Phase 2 implementation */
-
-    while (g_running) {
-        break;
-    }
-
-    printf("fips-nat shutting down.\n");
-    return 0;
+    fprintf(stderr, "fips-nat v0.1.0\n");
+    fprintf(stderr, "ERROR: NAT traversal daemon not yet implemented (Phase 2).\n");
+    fprintf(stderr, "  STUN discovery, Nostr signaling, and UDP hole punching\n");
+    fprintf(stderr, "  are planned for a future release.\n");
+    return 1;
 }

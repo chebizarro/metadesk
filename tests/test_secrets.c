@@ -147,10 +147,12 @@ static void test_url_parsing(void) {
     if (!s3) { FAIL("IP address URL failed"); return; }
     md_secrets_destroy(s3);
 
-    /* HTTPS prefix (accepted but no TLS in Phase 1) */
+    /* HTTPS prefix is now rejected (TLS not implemented) */
     MdSecrets *s4 = md_secrets_create("https://secrets.local:443", "tok");
-    if (!s4) { FAIL("https URL failed"); return; }
-    md_secrets_destroy(s4);
+    if (s4) {
+        md_secrets_destroy(s4);
+        FAIL("https URL should have been rejected"); return;
+    }
 
     PASS();
 }

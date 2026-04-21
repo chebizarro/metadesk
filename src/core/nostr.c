@@ -611,8 +611,64 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
 int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex || !n->allowlist)
         return -1;
-    /* TODO: rebuild allowlist without the target pubkey, republish */
-    return 0;
+
+    /* Find and remove the entry matching pubkey_hex */
+    bool found = false;
+    for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *entry = n->allowlist->entries[i];
+        if (entry && entry->tag_name && strcmp(entry->tag_name, "p") == 0
+            && entry->value && strcmp(entry->value, pubkey_hex) == 0) {
+            /* Remove by shifting remaining entries down */
+            nostr_nip51_entry_free(entry);
+            for (size_t j = i; j + 1 < n->allowlist->count; j++)
+                n->allowlist->entries[j] = n->allowlist->entries[j + 1];
+            n->allowlist->count--;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+        return -1;
+
+    /* Republish the updated allowlist by rebuilding the kind:30000 event */
+    NostrEvent *list_event = nostr_event_new();
+    if (!list_event) return -1;
+
+    nostr_event_set_kind(list_event, 30000);
+    nostr_event_set_pubkey(list_event, n->pk_hex);
+    nostr_event_set_created_at(list_event, (int64_t)time(NULL));
+
+    NostrTags *tags = nostr_tags_new(0);
+    if (!tags) { nostr_event_free(list_event); return -1; }
+
+    NostrTag *d_tag = nostr_tag_new("d", "metadesk-allowlist", NULL);
+    if (d_tag) nostr_tags_append(tags, d_tag);
+
+    for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *e = n->allowlist->entries[i];
+        if (!e || !e->tag_name || !e->value) continue;
+        NostrTag *t = e->extra
+            ? nostr_tag_new(e->tag_name, e->value, e->extra, NULL)
+            : nostr_tag_new(e->tag_name, e->value, NULL);
+        if (t) nostr_tags_append(tags, t);
+    }
+
+    nostr_event_set_tags(list_event, tags);
+
+    NostrEvent *signed_event = sign_event_via_signer(n->signer, list_event);
+    nostr_event_free(list_event);
+    if (!signed_event) return -1;
+
+    int ret = pool_publish_all(n->pool, signed_event);
+    nostr_event_free(signed_event);
+
+    if (ret == 0) {
+        fprintf(stderr, "nostr: published updated allowlist (%zu entries)\n",
+                n->allowlist->count);
+    }
+
+    return ret;
 }
 
 /* ── Transport address ────────────────────────────────────────
