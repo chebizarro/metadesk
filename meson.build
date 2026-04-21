@@ -428,6 +428,12 @@ test_signer = executable('test_signer',
 )
 test('signer abstraction', test_signer)
 
+test_session = executable('test_session',
+  files('tests/test_session.c'),
+  dependencies : [dep_metadesk],
+)
+test('session JSON + state machine', test_session)
+
 if enable_nip5f
   test_signer_nip5f = executable('test_signer_nip5f',
     files('tests/test_signer_nip5f.c'),
