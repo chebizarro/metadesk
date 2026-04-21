@@ -213,6 +213,10 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
         cJSON_AddItemToArray(granted_arr, cJSON_CreateString(cap_strs[i]));
     cJSON_AddItemToObject(root, "granted", granted_arr);
 
+    /* tree_format — confirms which format the host will use */
+    cJSON_AddStringToObject(root, "tree_format",
+        acc->tree_format == MD_TREE_FORMAT_COMPACT ? "compact" : "json");
+
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return json;
@@ -231,6 +235,13 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
         cJSON_Delete(root);
         return -1;
     }
+
+    /* tree_format (optional — defaults to JSON for backwards compat) */
+    cJSON *tf = cJSON_GetObjectItem(root, "tree_format");
+    if (cJSON_IsString(tf) && strcmp(tf->valuestring, "compact") == 0)
+        out->tree_format = MD_TREE_FORMAT_COMPACT;
+    else
+        out->tree_format = MD_TREE_FORMAT_JSON;
 
     /* session_id */
     cJSON *sid = cJSON_GetObjectItem(root, "session_id");

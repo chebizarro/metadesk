@@ -60,6 +60,7 @@ typedef struct {
     volatile int  transport_ready;     /* set by on_transport callback    */
     char          accepted_session_id[64]; /* from session_accept DM     */
     uint32_t      granted_caps;       /* from session_accept DM          */
+    MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* set by on_dm callback           */
     GoChannel      *transport_ch;     /* signaled on transport ready     */
     GoChannel      *session_ch;       /* signaled on session accepted    */
@@ -125,6 +126,7 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         strncpy(ctx->accepted_session_id, acc.session_id,
                 sizeof(ctx->accepted_session_id) - 1);
         ctx->granted_caps = acc.granted;
+        ctx->accepted_tree_format = acc.tree_format;
         ctx->session_accepted = 1;
         go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
     }
@@ -397,7 +399,7 @@ int main(int argc, char **argv) {
         }
 
         /* Step 6: Send MD_PKT_SESSION_INFO with session_id + capabilities */
-        MdSessionAccept acc;
+        MdSessionAccept acc = { .tree_format = ctx.accepted_tree_format };
         strncpy(acc.session_id, ctx.accepted_session_id, sizeof(acc.session_id) - 1);
         acc.granted = ctx.granted_caps;
         char *info_json = md_session_accept_to_json(&acc);
@@ -407,8 +409,9 @@ int main(int argc, char **argv) {
             free(info_json);
         }
 
-        /* Update session state */
-        md_session_request(&session, npub, req.capabilities, req.tree_format);
+        /* Update session state — use confirmed tree format from host */
+        md_session_request(&session, npub, req.capabilities,
+                           ctx.accepted_tree_format);
         md_session_accept(&session, ctx.accepted_session_id, ctx.granted_caps);
         md_session_activate(&session);
 

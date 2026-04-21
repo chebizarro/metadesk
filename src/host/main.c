@@ -477,8 +477,11 @@ int main(int argc, char **argv) {
                 uint32_t granted = ctx.pending_req.capabilities &
                                    (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
 
-                /* Send session accept DM */
-                MdSessionAccept acc = { .granted = granted };
+                /* Send session accept DM — confirm the tree format we'll use */
+                MdSessionAccept acc = {
+                    .granted = granted,
+                    .tree_format = ctx.pending_req.tree_format,
+                };
                 strncpy(acc.session_id, session_id, sizeof(acc.session_id) - 1);
 
                 char *acc_json = md_session_accept_to_json(&acc);

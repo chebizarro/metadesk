@@ -47,6 +47,7 @@ static void test_request_roundtrip(void) {
 static void test_accept_roundtrip(void) {
     MdSessionAccept acc = {
         .granted = MD_CAP_VIDEO | MD_CAP_AGENT,
+        .tree_format = MD_TREE_FORMAT_COMPACT,
     };
     strncpy(acc.session_id, "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
             sizeof(acc.session_id) - 1);
@@ -63,6 +64,8 @@ static void test_accept_roundtrip(void) {
     assert(strstr(json, "\"agent\"") != NULL);
     /* input was NOT granted */
     assert(strstr(json, "\"input\"") == NULL);
+    /* tree_format confirmed as compact */
+    assert(strstr(json, "\"compact\"") != NULL);
 
     /* Parse back and verify */
     MdSessionAccept out;
@@ -70,6 +73,7 @@ static void test_accept_roundtrip(void) {
     assert(ret == 0);
     assert(out.granted == (MD_CAP_VIDEO | MD_CAP_AGENT));
     assert(strcmp(out.session_id, "a1b2c3d4-e5f6-7890-abcd-ef1234567890") == 0);
+    assert(out.tree_format == MD_TREE_FORMAT_COMPACT);
 
     free(json);
     printf("  PASS: accept round-trip\n");
@@ -348,6 +352,72 @@ static void test_null_session(void) {
     printf("  PASS: null session handling\n");
 }
 
+/* ── Tree format negotiation in accept ────────────────────────── */
+
+static void test_accept_tree_format_negotiation(void) {
+    /* Compact format round-trips through accept */
+    MdSessionAccept acc = {
+        .granted = MD_CAP_VIDEO,
+        .tree_format = MD_TREE_FORMAT_COMPACT,
+    };
+    strncpy(acc.session_id, "fmt-test-1", sizeof(acc.session_id) - 1);
+
+    char *json = md_session_accept_to_json(&acc);
+    assert(json != NULL);
+    assert(strstr(json, "\"compact\"") != NULL);
+
+    MdSessionAccept out;
+    assert(md_session_accept_from_json(json, &out) == 0);
+    assert(out.tree_format == MD_TREE_FORMAT_COMPACT);
+    free(json);
+
+    /* JSON format round-trips through accept */
+    acc.tree_format = MD_TREE_FORMAT_JSON;
+    json = md_session_accept_to_json(&acc);
+    assert(json != NULL);
+    assert(strstr(json, "\"json\"") != NULL);
+
+    assert(md_session_accept_from_json(json, &out) == 0);
+    assert(out.tree_format == MD_TREE_FORMAT_JSON);
+    free(json);
+
+    /* Missing tree_format in accept defaults to JSON (backwards compat) */
+    const char *no_tf = "{\"type\":\"session_accept\",\"v\":1,"
+                        "\"session_id\":\"test\",\"granted\":[\"video\"]}";
+    assert(md_session_accept_from_json(no_tf, &out) == 0);
+    assert(out.tree_format == MD_TREE_FORMAT_JSON);
+
+    /* Full negotiation flow: request compact → accept confirms compact */
+    MdSessionRequest req = {
+        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT,
+        .tree_format = MD_TREE_FORMAT_COMPACT,
+    };
+    char *req_json = md_session_request_to_json(&req);
+    assert(req_json != NULL);
+
+    MdSessionRequest parsed_req;
+    assert(md_session_request_from_json(req_json, &parsed_req) == 0);
+    assert(parsed_req.tree_format == MD_TREE_FORMAT_COMPACT);
+    free(req_json);
+
+    /* Host echoes back the format in accept */
+    MdSessionAccept host_acc = {
+        .granted = MD_CAP_VIDEO,
+        .tree_format = parsed_req.tree_format,  /* honour client's preference */
+    };
+    strncpy(host_acc.session_id, "negotiated-1", sizeof(host_acc.session_id) - 1);
+
+    char *acc_json = md_session_accept_to_json(&host_acc);
+    assert(acc_json != NULL);
+
+    MdSessionAccept client_acc;
+    assert(md_session_accept_from_json(acc_json, &client_acc) == 0);
+    assert(client_acc.tree_format == MD_TREE_FORMAT_COMPACT);
+    free(acc_json);
+
+    printf("  PASS: accept tree format negotiation\n");
+}
+
 int main(void) {
     printf("test_session (JSON + state machine):\n");
 
@@ -367,6 +437,7 @@ int main(void) {
     test_state_machine();
     test_keepalive_timeout();
     test_null_session();
+    test_accept_tree_format_negotiation();
 
     printf("All session tests passed.\n");
     return 0;

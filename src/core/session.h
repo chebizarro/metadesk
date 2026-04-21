@@ -103,6 +103,7 @@ typedef struct {
 typedef struct {
     char         session_id[64];   /* UUID assigned by host      */
     uint32_t     granted;          /* bitwise OR of MdCapability */
+    MdTreeFormat tree_format;      /* confirmed tree format       */
 } MdSessionAccept;
 
 /* Serialize a session request to a newly-allocated JSON string. Caller frees. */
