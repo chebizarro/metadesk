@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <json.h>
 #include <nip11.h>
+#include <go.h>
 
 /* ── Hex ↔ bytes helpers (nostr keys are hex, NIP-44 wants uint8_t[32]) ── */
 static int hex_char_val(char c) {
@@ -91,6 +92,10 @@ struct MdNostr {
     size_t             dedup_head;                    /* next write slot     */
     size_t             dedup_len;                     /* entries used        */
     pthread_mutex_t    dedup_mu;                      /* guards ring access  */
+
+    /* Tracks pending DM-unwrap goroutines so md_nostr_destroy() can
+     * wait for them to finish before freeing signer/callbacks. */
+    GoWaitGroup        dm_wg;
 };
 
 /* ── Dedup ring helpers ─────────────────────────────────────────
@@ -123,11 +128,45 @@ static bool dedup_is_seen(MdNostr *n, const char *event_id) {
     return false;
 }
 
-/* Helper: publish an event to all cached relays */
+/* ── Parallel relay publishing ──────────────────────────────── */
+typedef struct {
+    NostrRelay  *relay;
+    NostrEvent  *event;
+    GoWaitGroup *wg;
+} PublishArg;
+
+static void *publish_one_thread(void *arg) {
+    PublishArg *pa = arg;
+    nostr_relay_publish(pa->relay, pa->event);
+    go_wait_group_done(pa->wg);
+    free(pa);
+    return NULL;
+}
+
+/* Helper: publish an event to all cached relays in parallel.
+ * Each relay publish can block up to 5 s for enqueue confirmation,
+ * so we fan out with go() + GoWaitGroup to overlap the waits. */
 static int publish_all(MdNostr *n, NostrEvent *ev) {
     if (!n || !ev || n->relay_count == 0) return -1;
-    for (size_t i = 0; i < n->relay_count; i++)
-        nostr_relay_publish(n->relays[i], ev);
+
+    GoWaitGroup wg;
+    go_wait_group_init(&wg);
+
+    for (size_t i = 0; i < n->relay_count; i++) {
+        go_wait_group_add(&wg, 1);
+        PublishArg *pa = malloc(sizeof(PublishArg));
+        if (pa) {
+            pa->relay = n->relays[i];
+            pa->event = ev;
+            pa->wg    = &wg;
+            go(publish_one_thread, pa);
+        } else {
+            go_wait_group_done(&wg);
+        }
+    }
+
+    go_wait_group_wait(&wg);
+    go_wait_group_destroy(&wg);
     return 0;
 }
 
@@ -285,6 +324,79 @@ done:
     return found;
 }
 
+/* ── DM unwrap goroutine ──────────────────────────────────────
+ * Offloads the 4-step NIP-17 gift-wrap decrypt chain from the pool
+ * worker thread.  Each decrypt may involve IPC to a remote signer,
+ * so running them on dedicated OS threads prevents head-of-line
+ * blocking for other incoming events.
+ *
+ * Lifecycle safety: the caller increments dm_wg before spawning;
+ * md_nostr_destroy() waits on dm_wg before freeing signer/cbs. */
+typedef struct {
+    char        *ephemeral_pk; /* owned copy of gift-wrap sender pubkey */
+    char        *gw_content;   /* owned copy of gift-wrap ciphertext   */
+    MdSigner    *signer;       /* borrowed — safe while dm_wg pending  */
+    void       (*on_dm)(const char *, const char *, void *);
+    void        *dm_userdata;
+    GoWaitGroup *dm_wg;        /* decrement when done                  */
+} DmUnwrapArg;
+
+static void *dm_unwrap_thread(void *arg) {
+    DmUnwrapArg *ua = arg;
+
+    /* Step 1: Decrypt gift-wrap → seal JSON */
+    char *seal_json = NULL;
+    int ret = md_signer_nip44_decrypt(ua->signer, ua->ephemeral_pk,
+                                      ua->gw_content, &seal_json);
+    if (ret != 0 || !seal_json) goto done;
+
+    /* Step 2: Parse seal to get sender pubkey and encrypted content */
+    NostrEvent *seal = event_from_json(seal_json);
+    free(seal_json);
+    if (!seal) goto done;
+
+    const char *sender_pk = nostr_event_get_pubkey(seal);
+    const char *seal_content = nostr_event_get_content(seal);
+    if (!sender_pk || !seal_content) {
+        nostr_event_free(seal);
+        goto done;
+    }
+
+    /* Step 3: Decrypt seal content → rumor JSON */
+    char *rumor_json = NULL;
+    ret = md_signer_nip44_decrypt(ua->signer, sender_pk,
+                                  seal_content, &rumor_json);
+    nostr_event_free(seal);
+    if (ret != 0 || !rumor_json) goto done;
+
+    /* Step 4: Parse rumor to get DM content */
+    NostrEvent *rumor = event_from_json(rumor_json);
+    free(rumor_json);
+    if (!rumor) goto done;
+
+    const char *dm_content = nostr_event_get_content(rumor);
+    if (dm_content && sender_pk) {
+        char *sender_copy = strdup(sender_pk);
+        char *content_copy = strdup(dm_content);
+        nostr_event_free(rumor);
+
+        if (sender_copy && content_copy)
+            ua->on_dm(sender_copy, content_copy, ua->dm_userdata);
+
+        free(sender_copy);
+        free(content_copy);
+    } else {
+        nostr_event_free(rumor);
+    }
+
+done:
+    go_wait_group_done(ua->dm_wg);
+    free(ua->ephemeral_pk);
+    free(ua->gw_content);
+    free(ua);
+    return NULL;
+}
+
 /* ── Event middleware ─────────────────────────────────────────
  * nostrc's NostrSimplePool invokes the event_middleware callback
  * for every incoming event across all subscriptions. We route
@@ -311,67 +423,31 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
     int kind = nostr_event_get_kind(ev);
 
     if (kind == 1059 && n->cbs.on_dm && n->signer) {
-        /* NIP-17 gift-wrap: unwrap using signer.
-         *
-         * 1. NIP-44 decrypt gift-wrap content using our key
-         *    (the gift-wrap was encrypted to our pubkey by an ephemeral key)
-         * 2. Parse seal (kind:13)
-         * 3. NIP-44 decrypt seal content using our key
-         *    (the seal was encrypted by the sender to our pubkey)
-         * 4. Parse rumor (kind:14), extract content + sender pubkey
-         *
-         * For direct-key signers, this is straightforward NIP-44 decrypt.
-         * For remote signers, the signer daemon handles the decryption.
-         */
+        /* NIP-17 gift-wrap: offload the 4-step decrypt chain to a
+         * goroutine so the pool worker thread isn't blocked by
+         * potentially slow signer IPC (remote/daemon signers). */
         const char *ephemeral_pk = nostr_event_get_pubkey(ev);
         const char *gw_content = nostr_event_get_content(ev);
         if (!ephemeral_pk || !gw_content) return;
 
-        /* Step 1: Decrypt gift-wrap → seal JSON */
-        char *seal_json = NULL;
-        int ret = md_signer_nip44_decrypt(n->signer, ephemeral_pk,
-                                          gw_content, &seal_json);
-        if (ret != 0 || !seal_json) return;
+        DmUnwrapArg *ua = malloc(sizeof(DmUnwrapArg));
+        if (!ua) return;
+        ua->ephemeral_pk = strdup(ephemeral_pk);
+        ua->gw_content   = strdup(gw_content);
+        ua->signer       = n->signer;
+        ua->on_dm        = n->cbs.on_dm;
+        ua->dm_userdata  = n->cbs.dm_userdata;
+        ua->dm_wg        = &n->dm_wg;
 
-        /* Step 2: Parse seal to get sender pubkey and encrypted content */
-        NostrEvent *seal = event_from_json(seal_json);
-        free(seal_json);
-        if (!seal) return;
-
-        const char *sender_pk = nostr_event_get_pubkey(seal);
-        const char *seal_content = nostr_event_get_content(seal);
-        if (!sender_pk || !seal_content) {
-            nostr_event_free(seal);
+        if (!ua->ephemeral_pk || !ua->gw_content) {
+            free(ua->ephemeral_pk);
+            free(ua->gw_content);
+            free(ua);
             return;
         }
 
-        /* Step 3: Decrypt seal content → rumor JSON */
-        char *rumor_json = NULL;
-        ret = md_signer_nip44_decrypt(n->signer, sender_pk,
-                                      seal_content, &rumor_json);
-        nostr_event_free(seal);
-        if (ret != 0 || !rumor_json) return;
-
-        /* Step 4: Parse rumor to get DM content */
-        NostrEvent *rumor = event_from_json(rumor_json);
-        free(rumor_json);
-        if (!rumor) return;
-
-        const char *dm_content = nostr_event_get_content(rumor);
-        if (dm_content && sender_pk) {
-            /* Make copies since we're about to free the event */
-            char *sender_copy = strdup(sender_pk);
-            char *content_copy = strdup(dm_content);
-            nostr_event_free(rumor);
-
-            if (sender_copy && content_copy)
-                n->cbs.on_dm(sender_copy, content_copy, n->cbs.dm_userdata);
-
-            free(sender_copy);
-            free(content_copy);
-        } else {
-            nostr_event_free(rumor);
-        }
+        go_wait_group_add(&n->dm_wg, 1);
+        go(dm_unwrap_thread, ua);
     } else if (kind == 30078 && n->cbs.on_transport) {
         /* Transport address event — extract content (FIPS addr) */
         const char *pubkey = nostr_event_get_pubkey(ev);
@@ -406,10 +482,30 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
  *   - relays that don't list NIP-17 in supported_nips
  *   - max_content_length or max_message_length limits
  *
- * This runs synchronously during create — relay info documents are
- * typically tiny (~1 KB) and returned in < 500ms.
+ * Each probe runs as a goroutine; callers use GoWaitGroup to wait
+ * for all probes to complete. Startup latency is O(max_latency)
+ * instead of O(N * latency).
  */
-static void probe_relay_nip11(const char *wss_url) {
+
+static void probe_relay_nip11_impl(const char *wss_url);
+
+typedef struct {
+    const char  *wss_url;
+    GoWaitGroup *wg;
+} Nip11ProbeArg;
+
+static void *probe_relay_nip11_thread(void *arg) {
+    Nip11ProbeArg *pa = arg;
+    const char *wss_url = pa->wss_url;
+    GoWaitGroup *wg = pa->wg;
+    free(pa);
+
+    probe_relay_nip11_impl(wss_url);
+    go_wait_group_done(wg);
+    return NULL;
+}
+
+static void probe_relay_nip11_impl(const char *wss_url) {
     if (!wss_url) return;
 
     /* Convert wss:// to https:// (or ws:// to http://) for NIP-11 */
@@ -493,6 +589,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (!n) return NULL;
 
     pthread_mutex_init(&n->dedup_mu, NULL);
+    go_wait_group_init(&n->dm_wg);
 
     /* Set up signer: use provided signer, or create direct-key from sk_hex */
     if (cfg->signer) {
@@ -543,9 +640,24 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     }
 
     /* Probe each relay's NIP-11 info document for capability detection.
-     * This runs before pool start so we log any warnings early. */
-    for (int i = 0; i < cfg->relay_count; i++) {
-        probe_relay_nip11(cfg->relay_urls[i]);
+     * Fan-out: each probe runs concurrently via go(), collected by WaitGroup.
+     * Startup latency = max(per-relay latency) instead of sum. */
+    {
+        GoWaitGroup wg;
+        go_wait_group_init(&wg);
+        for (int i = 0; i < cfg->relay_count; i++) {
+            go_wait_group_add(&wg, 1);
+            Nip11ProbeArg *pa = malloc(sizeof(Nip11ProbeArg));
+            if (pa) {
+                pa->wss_url = cfg->relay_urls[i];
+                pa->wg = &wg;
+                go(probe_relay_nip11_thread, pa);
+            } else {
+                go_wait_group_done(&wg);  /* balance the add */
+            }
+        }
+        go_wait_group_wait(&wg);
+        go_wait_group_destroy(&wg);
     }
 
     /* Snapshot relay pointers and URLs from pool.
@@ -650,6 +762,10 @@ void md_nostr_destroy(MdNostr *n) {
     for (size_t i = 0; i < MD_DEDUP_RING_CAP; i++)
         free(n->dedup_ids[i]);
     pthread_mutex_destroy(&n->dedup_mu);
+
+    /* Wait for any pending DM-unwrap goroutines before freeing signer */
+    go_wait_group_wait(&n->dm_wg);
+    go_wait_group_destroy(&n->dm_wg);
 
     /* Only destroy signer if we created it (from sk_hex fallback) */
     if (n->owns_signer && n->signer)

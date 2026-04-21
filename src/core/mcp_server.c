@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* ── MCP protocol version ────────────────────────────────────── */
 
@@ -21,8 +22,8 @@ struct MdMcpServer {
     void            *write_userdata;
 
     /* State */
-    bool             initialized;
-    pthread_mutex_t  mu;
+    _Atomic bool     initialized;
+    pthread_mutex_t  sub_mu;   /* protects subscriptions only */
 
     /* Registered tools */
     MdMcpTool        tools[MD_MCP_MAX_TOOLS];
@@ -310,14 +311,11 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     if (!server || !json || len == 0)
         return -1;
 
-    pthread_mutex_lock(&server->mu);
-
     MdJsonRpcRequest req;
     if (md_jsonrpc_parse_request(&req, json, len) != 0) {
         /* Can't parse — send parse error with null id */
         MdJsonRpcId null_id = { .type = MD_JSONRPC_ID_NULL };
         send_error(server, &null_id, MD_JSONRPC_PARSE_ERROR, "Parse error");
-        pthread_mutex_unlock(&server->mu);
         return -1;
     }
 
@@ -328,7 +326,6 @@ int md_mcp_server_handle_message(MdMcpServer *server,
         strcmp(req.method, "initialized") == 0) {
         rc = handle_initialized(server);
         md_jsonrpc_request_free(&req);
-        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
@@ -336,22 +333,22 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     if (strcmp(req.method, "initialize") == 0) {
         rc = handle_initialize(server, &req.id, req.params);
         md_jsonrpc_request_free(&req);
-        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
-    /* All other methods require initialization */
+    /* All other methods require initialization (atomic read) */
     if (!server->initialized) {
         if (!md_jsonrpc_is_notification(&req)) {
             rc = send_error(server, &req.id, MD_JSONRPC_INTERNAL_ERROR,
                             "Server not initialized");
         }
         md_jsonrpc_request_free(&req);
-        pthread_mutex_unlock(&server->mu);
         return rc;
     }
 
-    /* Dispatch by method name */
+    /* Dispatch by method name.
+     * Tool/resource arrays are immutable after create, so most handlers
+     * need no lock. Only subscription mutations require sub_mu. */
     if (strcmp(req.method, "ping") == 0) {
         rc = handle_ping(server, &req.id);
     } else if (strcmp(req.method, "tools/list") == 0) {
@@ -363,9 +360,13 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     } else if (strcmp(req.method, "resources/read") == 0) {
         rc = handle_resources_read(server, &req.id, req.params);
     } else if (strcmp(req.method, "resources/subscribe") == 0) {
+        pthread_mutex_lock(&server->sub_mu);
         rc = handle_resources_subscribe(server, &req.id, req.params);
+        pthread_mutex_unlock(&server->sub_mu);
     } else if (strcmp(req.method, "resources/unsubscribe") == 0) {
+        pthread_mutex_lock(&server->sub_mu);
         rc = handle_resources_unsubscribe(server, &req.id, req.params);
+        pthread_mutex_unlock(&server->sub_mu);
     } else {
         /* Unknown method */
         if (!md_jsonrpc_is_notification(&req)) {
@@ -375,7 +376,6 @@ int md_mcp_server_handle_message(MdMcpServer *server,
     }
 
     md_jsonrpc_request_free(&req);
-    pthread_mutex_unlock(&server->mu);
     return rc;
 }
 
@@ -387,7 +387,8 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
     if (!server || !uri || !server->initialized)
         return -1;
 
-    /* Check if subscribed */
+    /* Check if subscribed (protected by sub_mu) */
+    pthread_mutex_lock(&server->sub_mu);
     bool subscribed = false;
     for (int i = 0; i < server->subscription_count; i++) {
         if (strcmp(server->subscriptions[i], uri) == 0) {
@@ -395,6 +396,7 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
             break;
         }
     }
+    pthread_mutex_unlock(&server->sub_mu);
     if (!subscribed) return 0;
 
     cJSON *params = cJSON_CreateObject();
@@ -419,7 +421,8 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->server_version = strdup(config->server_version ? config->server_version : "0.1.0");
     s->write_fn = config->write_fn;
     s->write_userdata = config->write_userdata;
-    pthread_mutex_init(&s->mu, NULL);
+    s->initialized = false;
+    pthread_mutex_init(&s->sub_mu, NULL);
 
     return s;
 }
@@ -438,7 +441,7 @@ void md_mcp_server_destroy(MdMcpServer *server)
     for (int i = 0; i < server->subscription_count; i++)
         free(server->subscriptions[i]);
 
-    pthread_mutex_destroy(&server->mu);
+    pthread_mutex_destroy(&server->sub_mu);
     free(server->server_name);
     free(server->server_version);
     free(server);

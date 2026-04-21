@@ -6,7 +6,9 @@
  *   POST /mcp — receives JSON-RPC, returns JSON-RPC response
  *   GET  /mcp — establishes SSE stream for notifications
  *
- * Single-threaded, uses select() for multiplexing.
+ * Concurrent: each accepted connection is handled by a go()
+ * goroutine so POST processing doesn't block the accept loop.
+ * Thread-local storage routes responses to the correct request.
  * Max 4 concurrent SSE clients.
  */
 #include "mcp_http.h"
@@ -19,7 +21,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <go.h>
 
 #define MAX_SSE_CLIENTS   4
 #define MAX_REQUEST_SIZE  (1024 * 1024)  /* 1 MB max request body */
@@ -38,25 +40,26 @@ struct MdMcpHttp {
     int             sse_count;
     pthread_mutex_t sse_mu;
 
-    /* For POST responses: the current response is captured here */
-    pthread_mutex_t response_mu;
-    char           *pending_response;
+    /* Tracks in-flight handler goroutines for graceful shutdown */
+    GoWaitGroup     handler_wg;
 };
 
-/* ── Write callback ──────────────────────────────────────────── */
+/* ── Thread-local response capture ───────────────────────────
+ * handle_message() calls write_fn synchronously on the calling
+ * thread, so TLS gives us per-request response isolation without
+ * any shared mutable state. */
+static _Thread_local char *tls_response = NULL;
 
 static int http_write_fn(const char *json, size_t len, void *userdata)
 {
     MdMcpHttp *h = (MdMcpHttp *)userdata;
     if (!h) return -1;
 
-    /* Store the response for the POST handler to pick up */
-    pthread_mutex_lock(&h->response_mu);
-    free(h->pending_response);
-    h->pending_response = strndup(json, len);
-    pthread_mutex_unlock(&h->response_mu);
+    /* Capture response for the calling POST handler (same thread) */
+    free(tls_response);
+    tls_response = strndup(json, len);
 
-    /* Also send as SSE to all subscribed clients */
+    /* Also broadcast as SSE to all subscribed clients */
     md_mcp_http_send_sse(h, "message", json, len);
 
     return 0;
@@ -229,20 +232,12 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             send_http_response(client_fd, 400, "Bad Request",
                                "text/plain", "Empty body\n", 11);
         } else {
-            /* Clear pending response */
-            pthread_mutex_lock(&h->response_mu);
-            free(h->pending_response);
-            h->pending_response = NULL;
-            pthread_mutex_unlock(&h->response_mu);
-
-            /* Dispatch to MCP server */
+            /* Dispatch to MCP server — write_fn stores response in TLS */
+            tls_response = NULL;
             md_mcp_server_handle_message(h->mcp_server, req.body, req.body_len);
 
-            /* Retrieve response */
-            pthread_mutex_lock(&h->response_mu);
-            char *resp = h->pending_response;
-            h->pending_response = NULL;
-            pthread_mutex_unlock(&h->response_mu);
+            char *resp = tls_response;
+            tls_response = NULL;
 
             if (resp) {
                 send_http_response(client_fd, 200, "OK",
@@ -276,6 +271,22 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         free(req.body);
         close(client_fd);
     }
+}
+
+/* ── Handler goroutine ───────────────────────────────────────── */
+
+typedef struct {
+    MdMcpHttp   *http;
+    int          client_fd;
+    GoWaitGroup *wg;
+} HandlerArg;
+
+static void *handle_client_thread(void *arg) {
+    HandlerArg *ha = arg;
+    handle_client(ha->http, ha->client_fd);
+    go_wait_group_done(ha->wg);
+    free(ha);
+    return NULL;
 }
 
 /* ── SSE send ────────────────────────────────────────────────── */
@@ -328,11 +339,12 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     h->port = config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT;
     h->shutdown = false;
     pthread_mutex_init(&h->sse_mu, NULL);
-    pthread_mutex_init(&h->response_mu, NULL);
+    go_wait_group_init(&h->handler_wg);
 
     /* Create listening socket */
     h->listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (h->listen_fd < 0) {
+        go_wait_group_destroy(&h->handler_wg);
         free(h);
         return NULL;
     }
@@ -356,12 +368,14 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
 
     if (bind(h->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(h->listen_fd);
+        go_wait_group_destroy(&h->handler_wg);
         free(h);
         return NULL;
     }
 
     if (listen(h->listen_fd, 8) < 0) {
         close(h->listen_fd);
+        go_wait_group_destroy(&h->handler_wg);
         free(h);
         return NULL;
     }
@@ -391,7 +405,18 @@ int md_mcp_http_run(MdMcpHttp *http)
         if (FD_ISSET(http->listen_fd, &readfds)) {
             int client = accept(http->listen_fd, NULL, NULL);
             if (client >= 0) {
-                handle_client(http, client);
+                /* Spawn a goroutine per connection so POST processing
+                 * doesn't block the accept loop. */
+                HandlerArg *ha = malloc(sizeof(HandlerArg));
+                if (ha) {
+                    ha->http      = http;
+                    ha->client_fd = client;
+                    ha->wg        = &http->handler_wg;
+                    go_wait_group_add(&http->handler_wg, 1);
+                    go(handle_client_thread, ha);
+                } else {
+                    close(client);
+                }
             }
         }
     }
@@ -419,6 +444,10 @@ void md_mcp_http_destroy(MdMcpHttp *http)
 {
     if (!http) return;
 
+    /* Wait for in-flight handler goroutines to finish */
+    go_wait_group_wait(&http->handler_wg);
+    go_wait_group_destroy(&http->handler_wg);
+
     /* Close SSE clients */
     pthread_mutex_lock(&http->sse_mu);
     for (int i = 0; i < http->sse_count; i++)
@@ -430,7 +459,5 @@ void md_mcp_http_destroy(MdMcpHttp *http)
         close(http->listen_fd);
 
     pthread_mutex_destroy(&http->sse_mu);
-    pthread_mutex_destroy(&http->response_mu);
-    free(http->pending_response);
     free(http);
 }

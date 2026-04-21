@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <pthread.h>
+#include <go.h>
 
 static volatile int g_running = 1;
 
@@ -61,8 +62,7 @@ typedef struct {
     char          pending_client_pk[128]; /* pubkey of requesting client */
     MdSessionRequest pending_req;         /* parsed session request      */
     volatile int  session_requested;      /* set by on_dm callback       */
-    pthread_mutex_t nostr_mu;             /* protects nostr signal state */
-    pthread_cond_t  nostr_cv;             /* signaled on nostr events    */
+    GoChannel      *session_req_ch;       /* signaled on session request */
 } HostCtx;
 
 /* ── Encode callback: send encoded packet to client ──────────── */
@@ -103,10 +103,8 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
         strncpy(ctx->pending_client_pk, sender_pubkey_hex,
                 sizeof(ctx->pending_client_pk) - 1);
         ctx->pending_req = req;
-        pthread_mutex_lock(&ctx->nostr_mu);
         ctx->session_requested = 1;
-        pthread_cond_signal(&ctx->nostr_cv);
-        pthread_mutex_unlock(&ctx->nostr_mu);
+        go_channel_try_send(ctx->session_req_ch, (void *)(uintptr_t)1);
         fprintf(stderr, "host: received session request from %.*s...\n",
                 8, sender_pubkey_hex);
     }
@@ -402,19 +400,13 @@ int main(int argc, char **argv) {
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
             /* Wait for a session request DM (event-driven with timeout) */
-            pthread_mutex_init(&ctx.nostr_mu, NULL);
-            pthread_cond_init(&ctx.nostr_cv, NULL);
+            ctx.session_req_ch = go_channel_create(1);
             {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += 60; /* 60s timeout */
-                pthread_mutex_lock(&ctx.nostr_mu);
-                while (!ctx.session_requested && g_running) {
-                    if (pthread_cond_timedwait(&ctx.nostr_cv,
-                                              &ctx.nostr_mu, &ts) != 0)
-                        break; /* ETIMEDOUT or error */
-                }
-                pthread_mutex_unlock(&ctx.nostr_mu);
+                void *dummy = NULL;
+                GoSelectCase cases[] = {
+                    { .op = GO_SELECT_RECEIVE, .chan = ctx.session_req_ch, .recv_buf = &dummy },
+                };
+                go_select_timeout(cases, 1, 60000); /* 60s timeout */
             }
 
             if (ctx.session_requested) {
@@ -757,8 +749,8 @@ int main(int argc, char **argv) {
     md_stream_server_destroy(srv);
 
     if (nostr) {
-        pthread_cond_destroy(&ctx.nostr_cv);
-        pthread_mutex_destroy(&ctx.nostr_mu);
+        go_channel_close(ctx.session_req_ch);
+        go_channel_unref(ctx.session_req_ch);
         md_nostr_destroy(nostr);
     } else if (signer)
         md_signer_destroy(signer);
