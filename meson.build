@@ -536,3 +536,10 @@ if enable_nip46
   )
   test('NIP-46 signer integration', test_signer_nip46)
 endif
+
+# ── STUN tests (no libnice needed — raw RFC 5389) ────────────────────────────
+test_stun = executable('test_stun',
+  files('tests/test_stun.c', 'src/fips-nat/stun.c'),
+  include_directories : [include_directories('src/fips-nat')],
+)
+test('STUN binding discovery', test_stun)
