@@ -231,6 +231,154 @@ static int test_decoder_create(void) {
     return 0;
 }
 
+/* ── Test: decoder destroy NULL is safe ───────────────────────── */
+
+static int test_decoder_destroy_null(void) {
+    printf("  test_decoder_destroy_null... ");
+    md_decoder_destroy(NULL); /* should not crash */
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: encoder destroy NULL is safe ──────────────────────── */
+
+static int test_encoder_destroy_null(void) {
+    printf("  test_encoder_destroy_null... ");
+    md_encoder_destroy(NULL); /* should not crash */
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: decoder poll with no submissions ──────────────────── */
+
+static int test_decoder_poll_empty(void) {
+    printf("  test_decoder_poll_empty... ");
+
+    MdDecoder *dec = md_decoder_create();
+    assert(dec != NULL);
+
+    g_decoded_count = 0;
+    int nframes = md_decoder_poll(dec, on_decode, NULL);
+    assert(nframes == 0);
+    assert(g_decoded_count == 0);
+
+    md_decoder_destroy(dec);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: decoder flush with no submissions ─────────────────── */
+
+static int test_decoder_flush_empty(void) {
+    printf("  test_decoder_flush_empty... ");
+
+    MdDecoder *dec = md_decoder_create();
+    assert(dec != NULL);
+
+    g_decoded_count = 0;
+    int nframes = md_decoder_flush(dec, on_decode, NULL);
+    /* Flush with no pending data should return 0 or succeed benignly */
+    assert(nframes >= 0);
+    assert(g_decoded_count == 0);
+
+    md_decoder_destroy(dec);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: encoder get_size with NULL args ────────────────────── */
+
+static int test_encoder_get_size_null(void) {
+    printf("  test_encoder_get_size_null... ");
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = MD_ENCODER_DEFAULT_BITRATE,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    /* NULL output params */
+    assert(md_encoder_get_size(enc, NULL, NULL) == -1);
+    uint32_t w;
+    assert(md_encoder_get_size(enc, &w, NULL) == -1);
+    uint32_t h;
+    assert(md_encoder_get_size(enc, NULL, &h) == -1);
+
+    /* Valid */
+    assert(md_encoder_get_size(enc, &w, &h) == 0);
+    assert(w == TEST_W && h == TEST_H);
+
+    md_encoder_destroy(enc);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: encode → decode isolated frames ───────────────────── */
+
+static int test_decode_from_encoded(void) {
+    printf("  test_decode_from_encoded... ");
+
+    MdEncoderConfig cfg = {
+        .width = TEST_W,
+        .height = TEST_H,
+        .bitrate = 2000000,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    MdDecoder *dec = md_decoder_create();
+    assert(dec != NULL);
+
+    uint32_t stride = TEST_W * 4;
+    uint8_t *buf = malloc((size_t)stride * TEST_H);
+    assert(buf != NULL);
+
+    g_encoded_count = 0;
+    g_decoded_count = 0;
+
+    /* Encode 5 frames, feed each to decoder */
+    for (int i = 0; i < 5; i++) {
+        fill_solid(buf, TEST_W, TEST_H, stride, (uint8_t)(i * 50), 100, 50);
+        free(g_last_encoded_data);
+        g_last_encoded_data = NULL;
+        g_last_encoded_size = 0;
+
+        md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+                          (int64_t)i, on_encode, NULL);
+
+        if (g_last_encoded_data && g_last_encoded_size > 0) {
+            int ret = md_decoder_submit(dec, g_last_encoded_data,
+                                        g_last_encoded_size, (int64_t)i);
+            assert(ret == 0);
+            md_decoder_poll(dec, on_decode, NULL);
+        }
+    }
+
+    /* Flush both */
+    free(g_last_encoded_data);
+    g_last_encoded_data = NULL;
+    g_last_encoded_size = 0;
+    md_encoder_flush(enc, on_encode, NULL);
+    if (g_last_encoded_data && g_last_encoded_size > 0) {
+        md_decoder_submit(dec, g_last_encoded_data, g_last_encoded_size, 0);
+        md_decoder_poll(dec, on_decode, NULL);
+    }
+    md_decoder_flush(dec, on_decode, NULL);
+
+    printf("OK (encoded=%d, decoded=%d)\n", g_encoded_count, g_decoded_count);
+
+    free(g_last_encoded_data);
+    g_last_encoded_data = NULL;
+    free(buf);
+    md_decoder_destroy(dec);
+    md_encoder_destroy(enc);
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -241,6 +389,12 @@ int main(void) {
     failures += test_encode_frames();
     failures += test_decoder_create();
     failures += test_roundtrip();
+    failures += test_decoder_destroy_null();
+    failures += test_encoder_destroy_null();
+    failures += test_decoder_poll_empty();
+    failures += test_decoder_flush_empty();
+    failures += test_encoder_get_size_null();
+    failures += test_decode_from_encoded();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return failures;

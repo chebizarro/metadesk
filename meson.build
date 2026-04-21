@@ -478,6 +478,30 @@ test_mcp_stdio = executable('test_mcp_stdio',
 )
 test('MCP stdio transport', test_mcp_stdio, timeout : 10)
 
+test_action = executable('test_action',
+  files('tests/test_action.c'),
+  dependencies : [dep_metadesk],
+)
+test('action parse/encode', test_action)
+
+test_capture = executable('test_capture',
+  files('tests/test_capture.c'),
+  dependencies : [dep_metadesk],
+)
+test('capture convenience API', test_capture)
+
+test_ipc = executable('test_ipc',
+  files('tests/test_ipc.c'),
+  dependencies : [dep_metadesk],
+)
+test('IPC Unix domain sockets', test_ipc, timeout : 15)
+
+test_mcp_http = executable('test_mcp_http',
+  files('tests/test_mcp_http.c'),
+  dependencies : [dep_metadesk],
+)
+test('MCP HTTP+SSE transport', test_mcp_http, timeout : 15)
+
 if enable_nip5f
   test_signer_nip5f = executable('test_signer_nip5f',
     files('tests/test_signer_nip5f.c'),
