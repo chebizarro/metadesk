@@ -8,6 +8,12 @@
 #include <string.h>
 #include <assert.h>
 
+static int live_a11y_tests_enabled(void) {
+    const char *v = getenv("MD_A11Y_LIVE_TESTS");
+    return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 ||
+                 strcmp(v, "yes") == 0 || strcmp(v, "on") == 0);
+}
+
 /* Helper: create a test node */
 static MdA11yNode *make_node(const char *id, const char *role, const char *label,
                               int x, int y, int w, int h) {
@@ -39,6 +45,11 @@ static void test_node_alloc_free(void) {
 }
 
 static void test_create_destroy(void) {
+    if (!live_a11y_tests_enabled()) {
+        printf("  SKIP: create/destroy live backend (set MD_A11Y_LIVE_TESTS=1)\n");
+        return;
+    }
+
     MdA11yCtx *ctx = md_a11y_create();
     assert(ctx != NULL);
     md_a11y_destroy(ctx);
@@ -198,6 +209,11 @@ static void test_delta_serialization(void) {
 }
 
 static void test_walk_tree(void) {
+    if (!live_a11y_tests_enabled()) {
+        printf("  SKIP: walk tree live backend (set MD_A11Y_LIVE_TESTS=1)\n");
+        return;
+    }
+
     MdA11yCtx *ctx = md_a11y_create();
     assert(ctx != NULL);
 
@@ -231,6 +247,11 @@ static void test_walk_tree(void) {
 }
 
 static void test_diff(void) {
+    if (!live_a11y_tests_enabled()) {
+        printf("  SKIP: diff live backend (set MD_A11Y_LIVE_TESTS=1)\n");
+        return;
+    }
+
     MdA11yCtx *ctx = md_a11y_create();
     assert(ctx != NULL);
 
@@ -426,6 +447,7 @@ static void test_tree_patch_update_state(void) {
 
 int main(void) {
     printf("test_a11y:\n");
+    printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
     test_node_alloc_free();
     test_create_destroy();
     test_json_serialization();
