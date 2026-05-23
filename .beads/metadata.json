@@ -1,6 +1,7 @@
 {
   "database": "dolt",
-  "jsonl_export": "issues.jsonl",
   "backend": "dolt",
-  "dolt_database": "beads_metadesk"
+  "dolt_mode": "embedded",
+  "dolt_database": "beads_metadesk",
+  "project_id": "b25398a4-6cae-402d-8bac-5f902e07cad2"
 }
