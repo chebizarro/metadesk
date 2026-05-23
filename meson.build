@@ -212,8 +212,11 @@ if enable_client
   dep_sdl2 = dependency('sdl2', version : '>=2.28')
 endif
 
-# ── fips-nat deps ───────────────────────────────────────────────────────────
+# ── legacy fips-nat deps ────────────────────────────────────────────────────
+# fips-nat is deprecated; FIPS daemon discovery/traversal is the supported path.
+# Keep this opt-in build target until the replacement path is verified in-tree.
 if enable_fipsnat
+  message('Building deprecated legacy fips-nat target; prefer the FIPS daemon control path')
   dep_nice = dependency('nice', version : '>=0.1.21')
 endif
 
@@ -299,6 +302,7 @@ core_sources = files(
   'src/core/agent.c',
   'src/core/action.c',
   'src/core/fips_addr.c',
+  'src/core/fips_control.c',
   'src/core/signer.c',
   'src/core/capture.c',
   'src/core/encode.c',
@@ -362,7 +366,7 @@ if enable_client
   )
 endif
 
-# ── fips-nat ────────────────────────────────────────────────────────────────
+# ── legacy fips-nat (deprecated, opt-in) ─────────────────────────────────────
 if enable_fipsnat
   fipsnat_sources = files(
     'src/fips-nat/main.c',
@@ -446,6 +450,12 @@ test_fips_addr = executable('test_fips_addr',
   dependencies : [dep_metadesk],
 )
 test('FIPS address derivation', test_fips_addr)
+
+test_fips_control = executable('test_fips_control',
+  files('tests/test_fips_control.c'),
+  dependencies : [dep_metadesk, dependency('threads')],
+)
+test('FIPS control socket client seam', test_fips_control, timeout : 10)
 
 test_secrets = executable('test_secrets',
   files('tests/test_secrets.c'),

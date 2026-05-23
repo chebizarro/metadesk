@@ -1,12 +1,16 @@
 /*
- * fips-nat — NAT traversal daemon.
+ * fips-nat — legacy NAT traversal daemon.
  * STUN discovery + Nostr signaling + UDP hole punching.
+ *
+ * DEPRECATED: FIPS v0.3+ owns discovery, STUN/TURN, and traversal.
+ * This daemon remains for legacy testing only and is not the recommended
+ * metadesk runtime path.
  *
  * Lifecycle:
  *   1. Parse CLI args (signer, relays, stun server, ports)
  *   2. Initialize signer → Nostr bridge
  *   3. Run STUN discovery to find our reflexive address
- *   4. Publish NAT endpoint to Nostr (kind:30078, d:"fips-nat-endpoint")
+ *   4. Optionally publish legacy NAT endpoint JSON to Nostr (kind:30078)
  *   5. Listen on local IPC for commands from metadesk-host
  *   6. Handle punch requests, re-discovery, status queries
  *
@@ -183,7 +187,8 @@ static char *dispatch_command(FipsNatCtx *ctx, const char *json) {
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
-    fprintf(stderr, "NAT traversal daemon for metadesk.\n\n");
+    fprintf(stderr, "Legacy NAT traversal daemon for metadesk (deprecated).\n");
+    fprintf(stderr, "FIPS daemon discovery/traversal is the supported runtime path.\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --stun-server HOST  STUN server (default: %s)\n",
             MD_STUN_DEFAULT_SERVER);
@@ -198,7 +203,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer       Auto-detect local signer\n");
     fprintf(stderr, "  --relay URL         Relay URL (repeatable)\n");
-    fprintf(stderr, "  --no-publish        Skip Nostr publication (STUN only)\n");
+    fprintf(stderr, "  --no-publish        Skip legacy kind:30078 NAT JSON publication (STUN only)\n");
     fprintf(stderr, "\nTURN relay fallback:\n");
     fprintf(stderr, "  --turn-server HOST  TURN server (e.g. turn.sharegap.net)\n");
     fprintf(stderr, "  --turn-port PORT    TURN port (default: %d)\n",

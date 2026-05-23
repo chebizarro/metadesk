@@ -6,8 +6,13 @@
  * Uses FFmpeg's libavutil SHA-256 implementation (already a dependency).
  *
  * The bech32 decoder handles npub → raw 32-byte pubkey conversion.
- * The address derivation matches the Rust reference implementation:
- *   FipsAddress = 0xfd || SHA-256(pubkey)[0..15]
+ * The address derivation matches the FIPS Rust identity implementation:
+ *   NodeAddr    = SHA-256(pubkey)[0..16]
+ *   FipsAddress = 0xfd || NodeAddr[0..15]
+ *
+ * Local derivation is only a deterministic fallback for address formatting when
+ * .fips DNS is unavailable; it does not prove FIPS peer discovery, routing, or
+ * reachability.
  */
 #include "fips_addr.h"
 
@@ -32,6 +37,40 @@ static int bech32_char_to_val(char c) {
     const char *p = strchr(BECH32_CHARSET, c);
     if (!p || c == '\0') return -1;
     return (int)(p - BECH32_CHARSET);
+}
+
+
+static uint32_t bech32_polymod_step(uint32_t chk, uint8_t value) {
+    static const uint32_t gen[5] = {
+        0x3b6a57b2u, 0x26508e6du, 0x1ea119fau, 0x3d4233ddu, 0x2a1462b3u,
+    };
+    uint8_t top = (uint8_t)(chk >> 25);
+    chk = ((chk & 0x1ffffffu) << 5) ^ value;
+    for (int i = 0; i < 5; i++) {
+        if ((top >> i) & 1u)
+            chk ^= gen[i];
+    }
+    return chk;
+}
+
+static int bech32_verify_checksum(const char *hrp,
+                                  const uint8_t *values, size_t values_len) {
+    if (!hrp || !values || values_len < 6) return -1;
+
+    uint32_t chk = 1;
+    for (size_t i = 0; hrp[i]; i++) {
+        unsigned char ch = (unsigned char)hrp[i];
+        if (ch < 33 || ch > 126) return -1;
+        chk = bech32_polymod_step(chk, (uint8_t)(ch >> 5));
+    }
+    chk = bech32_polymod_step(chk, 0);
+    for (size_t i = 0; hrp[i]; i++)
+        chk = bech32_polymod_step(chk, (uint8_t)(hrp[i] & 31));
+    for (size_t i = 0; i < values_len; i++)
+        chk = bech32_polymod_step(chk, values[i]);
+
+    /* NIP-19 bare npub uses original Bech32, whose checksum constant is 1. */
+    return chk == 1 ? 0 : -1;
 }
 
 /*
@@ -87,6 +126,11 @@ static int bech32_decode(const char *input,
             return -1;
         }
         vals[i] = (uint8_t)v;
+    }
+
+    if (bech32_verify_checksum(hrp_out, vals, total_vals) < 0) {
+        free(vals);
+        return -1;
     }
 
     /* Strip 6-byte checksum, output data values */
@@ -257,6 +301,24 @@ int md_fips_addr_from_pubkey_hex(const char *pk_hex,
     return md_fips_addr_to_string(addr, ipv6_out, ipv6_len);
 }
 
+int md_fips_npub_to_pubkey_hex(const char *npub,
+                               char *hex_out, size_t hex_len) {
+    if (!npub || !hex_out || hex_len < 65)
+        return -1;
+
+    uint8_t pubkey[32];
+    if (decode_npub(npub, pubkey) < 0)
+        return -1;
+
+    static const char hexd[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(pubkey); i++) {
+        hex_out[i * 2]     = hexd[(pubkey[i] >> 4) & 0x0f];
+        hex_out[i * 2 + 1] = hexd[pubkey[i] & 0x0f];
+    }
+    hex_out[64] = '\0';
+    return 0;
+}
+
 int md_fips_dns_name(const char *npub, char *dns_out, size_t dns_len) {
     if (!npub || !dns_out)
         return -1;
@@ -301,8 +363,9 @@ int md_fips_resolve(const char *npub,
         freeaddrinfo(res);
     }
 
-    /* Fall back to direct computation */
-    fprintf(stderr, "fips: DNS resolution failed for %s, computing directly\n",
+    /* Fall back to deterministic address computation only.  This does not
+     * prove that FIPS has discovered the peer or installed a usable route. */
+    fprintf(stderr, "fips: DNS resolution failed for %s, computing deterministic fallback address\n",
             dns_name);
     return md_fips_addr_from_npub(npub, ipv6_out, ipv6_len);
 }

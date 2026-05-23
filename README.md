@@ -45,14 +45,16 @@ Both modes connect to the same host daemon and can run simultaneously.
 |--------|-------------|
 | `metadesk-host` | Host daemon — captures screen, walks a11y tree, handles input injection |
 | `metadesk-client` | Human video client — SDL2 display with ImGui overlay |
-| `fips-nat` | NAT traversal — STUN discovery + Nostr signaling + UDP hole punch |
 | `libmetadesk` | Shared library — all core logic, no UI dependencies |
+| `fips-nat` | Legacy/deprecated NAT sidecar — not in the recommended FIPS runtime path |
 
 ## Building
 
 ### Prerequisites
 
 **All platforms:** FFmpeg (≥6.0), libyuv, libsecp256k1, libwebsockets, cJSON, libb2, [nostrc](https://github.com/chebizarro/nostrc)
+
+**FIPS runtime:** A current external FIPS daemon, tested against the v0.3.x runtime surface, with TUN enabled, `.fips` DNS/address derivation available, the control socket enabled, and peer discovery/reachability owned by FIPS.
 
 **Linux additionally:** PipeWire (≥0.3.65), AT-SPI2 (≥2.48), libudev (≥252), D-Bus  
 **macOS additionally:** ScreenCaptureKit (macOS 13+), Xcode command line tools
@@ -78,11 +80,39 @@ meson test -C build
 |--------|---------|-------------|
 | `nvenc` | `true` | NVENC hardware encoding (requires NVIDIA GPU) |
 | `client` | `true` | Build the human video client (requires SDL2) |
-| `fips_nat` | `true` | Build the fips-nat daemon (requires libnice) |
+| `fips_nat` | `false` | Build legacy fips-nat daemon (deprecated; requires libnice) |
 | `signer_nip46` | `false` | NIP-46 Nostr Connect remote signer |
 | `signer_nip55l` | `false` | NIP-55L D-Bus local signer |
 | `signer_nip5f` | `false` | NIP-5F Unix socket signer |
 | `nostrc_root` | `""` | Path to nostrc source tree (for uninstalled components) |
+
+## FIPS Runtime Setup
+
+metadesk does not run or manage FIPS. Start and configure the upstream FIPS daemon before starting `metadesk-host` or connecting with `metadesk-client`.
+
+Required daemon capabilities for the current metadesk path:
+
+- TUN adapter routing for `fd00::/8` and `.fips` address resolution.
+- Control socket enabled for `show_status`, `show_peers`, and `show_sessions` readiness checks.
+- Peer reachability configured in FIPS, either through static peers or Nostr overlay discovery (`node.discovery.nostr.enabled`, relay lists, `peers[].via_nostr`, and advertised UDP/TCP/Tor transports as appropriate).
+- STUN, traversal signaling, relay adverts, retry/cooldown, ACLs, and mesh route maintenance handled by FIPS, not metadesk.
+
+On Linux and macOS, metadesk looks for the daemon control socket in the FIPS client order unless overridden by metadesk configuration: `/run/fips/control.sock`, then `$XDG_RUNTIME_DIR/fips/control.sock`, then `/tmp/fips-control.sock`. The socket is normally mode `0770` and group `fips`; add the user running metadesk to that group and re-login if needed.
+
+Readiness failures are reported before the TCP stream is opened:
+
+- daemon unavailable or permission denied on the control socket;
+- daemon error or non-ready TUN/control state;
+- peer not configured or not discovered by the local FIPS daemon;
+- peer present but route/session still converging before the bounded retry expires.
+
+`fips-nat` is deprecated and off by default. It remains in-tree only for legacy experiments; do not use its kind `30078` NAT endpoint publication as the recommended bootstrap path.
+
+### Optional `fips-gateway`
+
+`fips-gateway` is optional FIPS-owned infrastructure for Linux LAN bridge deployments. It lets non-FIPS LAN hosts reach mesh destinations through a DNS proxy, virtual IPv6 pool, and nftables/proxy-NDP NAT rules managed by the FIPS gateway service. It is Linux-only, runs outside metadesk, reads FIPS `gateway.*` configuration, and has its own gateway control socket. metadesk does not start, stop, configure, or supervise `fips-gateway`, and does not assume ownership of its nftables or proxy-NDP lifecycle.
+
+For normal metadesk host/client sessions, run FIPS on each participating Linux or macOS machine and let metadesk open TCP over the daemon-managed FIPS route. Use `fips-gateway` only when an operator intentionally wants a LAN segment bridged into the mesh.
 
 ## Usage
 
@@ -159,11 +189,12 @@ See [docs/AGENT_API.md](docs/AGENT_API.md) for the complete integration guide.
 
 Sessions are established via Nostr DMs encrypted with NIP-44:
 
-1. Client discovers the host's FIPS transport address via Nostr relay
-2. Client sends a session request (NIP-44 encrypted DM) to the host's npub
-3. Host checks the NIP-51 allowlist — approved clients connect immediately; unknown clients require explicit approval
-4. Host replies with a session accept containing the granted capabilities
-5. Client opens a TCP connection over FIPS TUN to `fd00::<host-npub>:7700`
+1. Client verifies the local FIPS daemon is reachable and ready via the control socket
+2. Client verifies the host npub is configured/discovered and has a usable or converging FIPS route
+3. Client sends a session request (NIP-44 encrypted DM) to the host's npub
+4. Host checks the NIP-51 allowlist — approved clients connect immediately; unknown clients require explicit approval
+5. Host replies with a session accept containing the granted capabilities
+6. Client opens a TCP connection over the FIPS TUN route to the host on port `7700`
 
 Access control is managed entirely through Nostr identity — no accounts, no passwords, no central servers.
 
@@ -226,7 +257,7 @@ metadesk/
 │   │   └── stream.c/h  # TCP framed transport
 │   ├── host/           # metadesk-host daemon
 │   ├── client/         # metadesk-client (SDL2 + ImGui)
-│   └── fips-nat/       # NAT traversal daemon
+│   └── fips-nat/       # legacy deprecated NAT traversal daemon
 ├── tests/              # 18 test suites
 ├── tools/              # Diagnostic utilities
 ├── config/             # Example configuration

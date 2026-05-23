@@ -2,8 +2,8 @@ option('nvenc',    type : 'boolean', value : true,
        description : 'Enable NVENC hardware encoding (requires NVIDIA GPU + drivers)')
 option('client',   type : 'boolean', value : true,
        description : 'Build the human video client (requires SDL2 + Dear ImGui)')
-option('fips_nat', type : 'boolean', value : true,
-       description : 'Build the fips-nat NAT traversal daemon (requires libnice)')
+option('fips_nat', type : 'boolean', value : false,
+       description : 'Build legacy fips-nat NAT traversal daemon (deprecated; requires libnice)')
 option('signer_nip46', type : 'boolean', value : false,
        description : 'Enable NIP-46 Nostr Connect remote signer backend (requires nostrc nip46)')
 option('signer_nip55l', type : 'boolean', value : false,

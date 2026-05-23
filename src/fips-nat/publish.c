@@ -1,9 +1,13 @@
 /*
  * fips-nat — publish.c
- * NAT endpoint publication to Nostr relays.
+ * Legacy NAT endpoint publication to Nostr relays.
+ *
+ * DEPRECATED: kind:30078 NAT endpoint JSON is retained only for the
+ * legacy fips-nat path. FIPS v0.3+ overlay adverts and traversal
+ * signaling are the recommended discovery/reachability mechanism.
  *
  * Publishes the node's STUN-discovered reflexive address as a
- * kind:30078 addressable event with d-tag "fips-nat-endpoint".
+ * kind:30078 addressable event via the legacy transport publisher.
  *
  * The JSON content format:
  *   {
@@ -15,7 +19,7 @@
  *     "punch_port": 19800
  *   }
  *
- * Subscribing peers parse this to know where to send punch probes.
+ * Legacy subscribing peers parse this to know where to send punch probes.
  */
 #include "publish.h"
 
@@ -115,15 +119,10 @@ int md_publish_nat_endpoint(MdNostr *nostr, const MdNatEndpoint *ep) {
     if (!content)
         return -1;
 
-    /* Publish via the core transport publisher (kind:30078, d:"fips-transport").
-     *
-     * The content format (JSON with "v", "ip", "port" fields) distinguishes
-     * NAT endpoints from plain FIPS overlay addresses. Subscribing peers
-     * parse the content with md_nat_endpoint_from_json() and fall back to
-     * treating it as a raw IPv6 address if parsing fails.
-     *
-     * TODO: When core gains md_nostr_publish_event(), use a separate
-     * d-tag "fips-nat-endpoint" for cleaner separation. */
+    /* Deprecated legacy publication via the core transport publisher
+     * (kind:30078, d:"fips-transport"). Do not use this as the recommended
+     * metadesk/FIPS discovery path; the FIPS daemon owns overlay adverts,
+     * STUN/TURN, and traversal signaling. */
     int ret = md_nostr_publish_transport(nostr, content);
     free(content);
 

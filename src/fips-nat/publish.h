@@ -1,15 +1,13 @@
 /*
  * fips-nat — publish.h
- * NAT endpoint publication to Nostr relays.
+ * Legacy NAT endpoint publication to Nostr relays.
+ *
+ * DEPRECATED: retained only for the legacy fips-nat path. Current
+ * metadesk/FIPS deployments should use the FIPS daemon's discovery,
+ * STUN/TURN, and traversal signaling instead of kind:30078 NAT JSON.
  *
  * Publishes the node's STUN-discovered reflexive (public) address
- * as a kind:30078 addressable event with d-tag "fips-nat-endpoint".
- * Remote peers subscribe to this event to discover where to send
- * UDP hole punch probes.
- *
- * This complements md_nostr_publish_transport() in core, which
- * publishes the FIPS overlay address (fd00::/8). The fips-nat
- * endpoint is the underlay address for NAT traversal.
+ * as legacy kind:30078 JSON for old UDP hole-punch peers.
  *
  * Event content is JSON:
  *   { "v":1, "ip":"...", "port":N, "proto":"udp",
@@ -60,9 +58,8 @@ int md_nat_endpoint_from_json(const char *json, MdNatEndpoint *ep);
 /* ── Publication ─────────────────────────────────────────────── */
 
 /*
- * Publish our NAT endpoint to Nostr relays.
- * Creates a kind:30078 addressable event with d-tag "fips-nat-endpoint".
- * The content is the JSON-serialized endpoint.
+ * Publish our legacy NAT endpoint JSON to Nostr relays.
+ * This is not the recommended FIPS discovery/reachability path.
  *
  * nostr: active Nostr bridge (connected to relays with a signer)
  * ep:    endpoint to publish
@@ -72,7 +69,7 @@ int md_nat_endpoint_from_json(const char *json, MdNatEndpoint *ep);
 int md_publish_nat_endpoint(MdNostr *nostr, const MdNatEndpoint *ep);
 
 /*
- * Subscribe to a peer's NAT endpoint updates.
+ * Subscribe to a peer's legacy NAT endpoint updates.
  * Results arrive via the on_transport callback with the JSON content.
  *
  * nostr:          active Nostr bridge

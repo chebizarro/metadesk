@@ -8,6 +8,10 @@
  *   2. SHA-256(pubkey) → take first 16 bytes → node_addr
  *   3. FipsAddress = 0xfd || node_addr[0..15] → 128-bit IPv6
  *
+ * This local derivation is a deterministic DNS-unavailable fallback for address
+ * formatting. A computed address is not evidence that FIPS has discovered the
+ * peer or that a route is usable.
+ *
  * Applications connect to these fd00::/8 addresses via standard
  * BSD sockets. The FIPS TUN interface (fips0) handles routing,
  * Noise IK/XK encryption, and header compression transparently.
@@ -70,6 +74,10 @@ int md_fips_addr_from_npub(const char *npub,
 int md_fips_addr_from_pubkey_hex(const char *pk_hex,
                                  char *ipv6_out, size_t ipv6_len);
 
+/* Decode a bech32 npub to a 64-character lowercase hex public key. */
+int md_fips_npub_to_pubkey_hex(const char *npub,
+                               char *hex_out, size_t hex_len);
+
 /*
  * Derive FIPS address from raw 32-byte x-only public key.
  * Writes 16 bytes into addr_out.
@@ -107,7 +115,8 @@ int md_fips_dns_name(const char *npub, char *dns_out, size_t dns_len);
  *
  * Returns 0 on success, -1 on resolution failure.
  *
- * Note: Falls back to direct computation if DNS is unavailable.
+ * Note: Falls back to deterministic address computation if DNS is unavailable;
+ * this fallback does not prove peer reachability.
  */
 int md_fips_resolve(const char *npub,
                     char *ipv6_out, size_t ipv6_len);

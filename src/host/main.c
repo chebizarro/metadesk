@@ -21,6 +21,7 @@
 #include "stream.h"
 #include "agent.h"
 #include "fips_addr.h"
+#include "fips_control.h"
 #include "nostr.h"
 #include "secrets.h"
 #include "signer.h"
@@ -66,6 +67,7 @@ typedef struct {
     MdSessionLog *session_log;
 
     /* Nostr session negotiation */
+    char          expected_client_pk[128]; /* optional required client pubkey hex */
     char          pending_client_pk[128]; /* pubkey of requesting client */
     MdSessionRequest pending_req;         /* parsed session request      */
     volatile int  session_requested;      /* set by on_dm callback       */
@@ -96,6 +98,13 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
     /* Try to parse as session_request */
     MdSessionRequest req;
     if (md_session_request_from_json(content, &req) == 0) {
+        if (ctx->expected_client_pk[0] != '\0' &&
+            strcmp(sender_pubkey_hex, ctx->expected_client_pk) != 0) {
+            fprintf(stderr, "host: REJECTED session request from unexpected FIPS client %.*s...\n",
+                    8, sender_pubkey_hex);
+            return;
+        }
+
         /* Enforce allowlist: if an allowlist is configured, reject
          * clients that are not on it. If no allowlist is configured
          * (open mode), accept all clients. */
@@ -243,6 +252,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
     fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
+    fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
+    fprintf(stderr, "  --fips-ready-timeout MS  Peer readiness timeout (default: 10000)\n");
     fprintf(stderr, "\nSigner options (choose one):\n");
     fprintf(stderr, "  --bunker URI     NIP-46 Nostr Connect bunker URI\n");
     fprintf(stderr, "  --dbus-signer    Use NIP-55L D-Bus signer daemon\n");
@@ -252,9 +263,51 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
-    fprintf(stderr, "\nNAT traversal:\n");
-    fprintf(stderr, "  --fips-nat [NAME] Connect to fips-nat daemon IPC (default: fips-nat)\n");
+    fprintf(stderr, "\nLegacy NAT traversal (deprecated):\n");
+    fprintf(stderr, "  --fips-nat [NAME] Connect to legacy fips-nat IPC (not recommended; default: fips-nat)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
+}
+
+
+static void host_print_fips_setup_guidance(const char *npub,
+                                           const MdFipsPeerReadiness *ready) {
+    fprintf(stderr,
+            "ERROR: host: FIPS peer not configured or not discovered by local daemon (%.*s...)\n",
+            12, npub ? npub : "");
+    if (ready && ready->detail[0])
+        fprintf(stderr, "  FIPS detail: %s\n", ready->detail);
+    fprintf(stderr,
+            "  Configure this client peer in the FIPS daemon (via_nostr/auto_connect/peer discovery)\n"
+            "  and verify `fipsctl show peers` reports a connected peer before using metadesk-host --npub.\n");
+}
+
+static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) {
+    MdFipsControlResponse resp;
+    md_fips_control_response_init(&resp);
+    MdFipsControlResult r = md_fips_control_request(socket_path, "show_status",
+                                                    NULL, timeout_ms, &resp);
+    if (r != MD_FIPS_CONTROL_OK) {
+        fprintf(stderr, "ERROR: FIPS daemon health check failed: %s%s%s\n",
+                md_fips_control_result_string(r),
+                resp.message ? ": " : "",
+                resp.message ? resp.message : "");
+        if (resp.socket_path)
+            fprintf(stderr, "  control socket: %s\n", resp.socket_path);
+        fprintf(stderr,
+                "  Start and configure the FIPS daemon, or pass --fips-control PATH if it uses a custom socket.\n");
+        md_fips_control_response_free(&resp);
+        return -1;
+    }
+
+    cJSON *state = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "state") : NULL;
+    cJSON *npub = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "npub") : NULL;
+    printf("host: FIPS daemon ready");
+    if (resp.socket_path) printf(" (%s)", resp.socket_path);
+    if (cJSON_IsString(state) && state->valuestring) printf(" state=%s", state->valuestring);
+    if (cJSON_IsString(npub) && npub->valuestring) printf(" npub=%.*s...", 12, npub->valuestring);
+    printf("\n");
+    md_fips_control_response_free(&resp);
+    return 0;
 }
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -269,6 +322,7 @@ int main(int argc, char **argv) {
     const char *fips_npub = NULL;  /* expected client npub (FIPS auth) */
     const char *bunker_uri = NULL;
     const char *socket_path = NULL;
+    const char *fips_control_socket = NULL;
     bool use_dbus_signer = false;
     bool auto_signer = false;
     uint32_t fps = 60;
@@ -278,6 +332,7 @@ int main(int argc, char **argv) {
     bool mcp_stdio = false;
     bool mcp_http = false;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
+    uint32_t fips_ready_timeout_ms = 10000;
     bool use_fipsnat = false;
     const char *fipsnat_ipc_name = "fips-nat";
     const char *relay_urls[16];
@@ -299,6 +354,10 @@ int main(int argc, char **argv) {
             do_capture = false;
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             fips_npub = argv[++i];
+        else if (strcmp(argv[i], "--fips-control") == 0 && i + 1 < argc)
+            fips_control_socket = argv[++i];
+        else if (strcmp(argv[i], "--fips-ready-timeout") == 0 && i + 1 < argc)
+            fips_ready_timeout_ms = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
             bunker_uri = argv[++i];
         else if (strcmp(argv[i], "--dbus-signer") == 0)
@@ -367,10 +426,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: requested signer backend not available\n");
         return 1;
     }
+    if (fips_npub && !signer) {
+        fprintf(stderr, "ERROR: host --npub requires a signer for Nostr session authorization\n");
+        fprintf(stderr, "  Use --auto-signer, --socket-signer, --dbus-signer, or --bunker.\n");
+        return 1;
+    }
 
-    /* If FIPS npub specified, bind to FIPS address */
-    if (fips_npub && !bind_addr) {
-        printf("host: FIPS mode — accepting connections via fips0 TUN\n");
+    char expected_client_pk[65] = {0};
+    if (fips_npub) {
+        if (md_fips_npub_to_pubkey_hex(fips_npub, expected_client_pk,
+                                       sizeof(expected_client_pk)) != 0) {
+            fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
+            if (signer) md_signer_destroy(signer);
+            return 1;
+        }
+
+        if (!bind_addr)
+            printf("host: FIPS mode — accepting connections via fips0 TUN\n");
+
+        printf("host: checking FIPS daemon health...\n");
+        if (host_check_fips_daemon(fips_control_socket, 5000) != 0) {
+            if (signer) md_signer_destroy(signer);
+            return 1;
+        }
     }
 
     /* Initialize session state */
@@ -391,6 +469,8 @@ int main(int argc, char **argv) {
         .session     = &session,
         .session_log = session_log,
     };
+    if (expected_client_pk[0])
+        strncpy(ctx.expected_client_pk, expected_client_pk, sizeof(ctx.expected_client_pk) - 1);
 
     /* ── Nostr bridge (if signer available) ───────────────── */
     MdNostr *nostr = NULL;
@@ -418,17 +498,9 @@ int main(int argc, char **argv) {
             if (session_log)
                 md_session_log_set_nostr(session_log, nostr);
 
-            /* Publish our transport address (FIPS IPv6 derived from pubkey) */
-            char *our_pk = NULL;
-            if (md_signer_get_pubkey(signer, &our_pk) == MD_SIGNER_OK && our_pk) {
-                char fips_ipv6[MD_FIPS_IPV6_STRLEN];
-                if (md_fips_addr_from_pubkey_hex(our_pk, fips_ipv6, sizeof(fips_ipv6)) == 0) {
-                    md_nostr_publish_transport(nostr, fips_ipv6);
-                } else {
-                    fprintf(stderr, "WARNING: failed to derive FIPS address from pubkey\n");
-                }
-                free(our_pk);
-            }
+            /* FIPS reachability is now owned by the local FIPS daemon.
+             * Do not publish legacy kind:30078/d=fips-transport IPv6 adverts
+             * as the primary bootstrap signal. */
 
             /* Subscribe to allowlist updates */
             md_nostr_refresh_allowlist(nostr);
@@ -446,6 +518,31 @@ int main(int argc, char **argv) {
             }
 
             if (ctx.session_requested) {
+                if (fips_npub) {
+                    printf("host: waiting for FIPS peer readiness for %.*s...\n",
+                           12, fips_npub);
+                    MdFipsPeerReadiness ready;
+                    MdFipsPeerReadinessState rstate = md_fips_control_wait_peer_ready(
+                        fips_control_socket, fips_npub, fips_ready_timeout_ms,
+                        MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS, &ready);
+                    if (rstate != MD_FIPS_PEER_READY) {
+                        if (rstate == MD_FIPS_PEER_NOT_FOUND)
+                            host_print_fips_setup_guidance(fips_npub, &ready);
+                        else
+                            fprintf(stderr, "ERROR: FIPS route not ready (%s): %s\n",
+                                    md_fips_peer_readiness_string(rstate), ready.detail);
+                        if (ctx.session_req_ch) {
+                            go_channel_close(ctx.session_req_ch);
+                            go_channel_unref(ctx.session_req_ch);
+                            ctx.session_req_ch = NULL;
+                        }
+                        md_nostr_destroy(nostr);
+                        if (session_log) md_session_log_destroy(session_log);
+                        return 1;
+                    }
+                    printf("host: FIPS peer ready: %s\n", ready.detail);
+                }
+
                 /* Generate cryptographically random session ID */
                 char session_id[64];
                 {
@@ -505,14 +602,31 @@ int main(int argc, char **argv) {
                                    ctx.pending_req.tree_format);
                 md_session_accept(&session, session_id, granted);
             } else if (g_running) {
+                if (fips_npub) {
+                    fprintf(stderr, "ERROR: timed out waiting for authorized --npub session request; refusing direct TCP fallback\n");
+                    if (ctx.session_req_ch) {
+                        go_channel_close(ctx.session_req_ch);
+                        go_channel_unref(ctx.session_req_ch);
+                        ctx.session_req_ch = NULL;
+                    }
+                    md_nostr_destroy(nostr);
+                    if (session_log) md_session_log_destroy(session_log);
+                    return 1;
+                }
                 printf("host: no session request received, accepting direct TCP\n");
             }
         } else {
+            if (fips_npub) {
+                fprintf(stderr, "ERROR: nostr bridge creation failed; --npub cannot fall back to direct TCP\n");
+                if (session_log) md_session_log_destroy(session_log);
+                if (signer) md_signer_destroy(signer);
+                return 1;
+            }
             fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
         }
     }
 
-    /* ── fips-nat IPC connection ──────────────────────────────── */
+    /* ── legacy fips-nat IPC connection (deprecated) ───────────── */
     MdIpcConn *fipsnat_conn = NULL;
     if (use_fipsnat) {
         printf("host: connecting to fips-nat daemon (%s)...\n", fipsnat_ipc_name);
@@ -540,8 +654,9 @@ int main(int argc, char **argv) {
                 }
             }
         } else {
-            fprintf(stderr, "host: WARNING: could not connect to fips-nat daemon\n");
-            fprintf(stderr, "  Ensure fips-nat is running: fips-nat --auto-signer\n");
+            fprintf(stderr, "host: WARNING: could not connect to legacy fips-nat daemon\n");
+            fprintf(stderr, "  fips-nat is deprecated; prefer the FIPS daemon control path for discovery/readiness.\n");
+            fprintf(stderr, "  Only start fips-nat manually when testing the legacy NAT IPC path.\n");
         }
     }
 

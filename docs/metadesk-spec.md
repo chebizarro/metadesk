@@ -26,13 +26,13 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 - A screen capture and streaming host daemon (Linux, macOS, Windows)
 - A human video client (SDL2 + Dear ImGui, all platforms)
 - An agent semantic client consuming native accessibility trees over FIPS
-- A NAT traversal companion daemon (`fips-nat`) using STUN + Nostr signaling
 - A Nostr-based session negotiation layer (NIP-44 encrypted DMs, NIP-51 allowlists)
+- A thin integration with an external FIPS daemon for control-socket readiness checks and final TCP-over-FIPS stream transport
 
 ### 1.2 What This Project Is Not
 
 - A general-purpose VPN (FIPS handles that layer)
-- A replacement for FIPS itself (metadesk runs on top of the FIPS TUN interface)
+- A replacement for FIPS itself (metadesk runs on top of the FIPS TUN interface and control socket)
 - A vision-model computer use system (native accessibility tree is the primary agent interface; screenshots are fallback only)
 
 ### 1.3 Non-Goals
@@ -71,7 +71,7 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 ├────────────────────────────────────────────────────────────┤
 │  Transport                                                  │
 │  BSD sockets → FIPS TUN (fd00::/8 npub-derived IPv6)       │
-│  fips-nat companion: STUN + Nostr hole-punch signaling      │
+│  FIPS daemon owns discovery, STUN, traversal, routes         │
 ├────────────────────────────────────────────────────────────┤
 │  Identity                                                   │
 │  secp256k1 keypair (Nostr nsec/npub)                        │
@@ -81,13 +81,42 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 
 ### 2.2 Process Model
 
-Three daemons run on the host machine. They are independent processes communicating via Unix domain sockets (Linux/macOS) or named pipes (Windows) and shared configuration.
+The normal runtime uses an external FIPS daemon plus metadesk host/client processes. FIPS owns mesh discovery and reachability; metadesk owns remote-desktop capture, session authorization, packet formats, and the final TCP stream over the daemon-managed route.
 
 | Process | Role | Key Dependencies |
 |---|---|---|
-| `fipsd` | FIPS mesh daemon (upstream project) | Rust — run as system service |
-| `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends |
-| `fips-nat` | NAT traversal: STUN + Nostr signaling | libnice, libwebsockets, libsecp256k1 |
+| `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.3.x-era runtime, run as system service or operator-managed process |
+| `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends; local FIPS control socket access |
+| `metadesk-client` | Human video client and/or agent transport endpoint | SDL2/ImGui for video; local FIPS control socket access |
+| `fips-nat` | Legacy deprecated NAT sidecar, off by default | Not in the recommended runtime path |
+
+### 2.2.1 External FIPS Runtime Contract
+
+The first supported migration scope is Linux and macOS. Both platforms use a Unix-domain FIPS control socket; Windows and OpenWrt are outside this first-pass metadesk integration scope even though upstream FIPS supports them.
+
+metadesk requires a current FIPS daemon with these capabilities enabled or available:
+
+- TUN adapter routing for `fd00::/8` and `.fips` DNS/address derivation.
+- Control socket enabled, with `show_status`, `show_peers`, and `show_sessions` available for readiness checks.
+- Peer reachability configured in FIPS, either by static peers or by Nostr overlay discovery (`node.discovery.nostr.enabled`, operator-selected advert/DM relays, `peers[].via_nostr`, and appropriate UDP/TCP/Tor advert settings).
+- FIPS-owned overlay adverts, traversal signaling, STUN, UDP hole punching, retry/cooldown, ACLs, and mesh route maintenance.
+
+On Linux and macOS, metadesk follows the FIPS client-side socket discovery order unless explicitly overridden: `/run/fips/control.sock`, `$XDG_RUNTIME_DIR/fips/control.sock`, then `/tmp/fips-control.sock`. Packaged services normally create a mode `0770`, group `fips` socket; users running metadesk must have permission to connect.
+
+Before dialing the frame channel, metadesk distinguishes these readiness failures:
+
+- daemon unavailable, socket missing, or permission denied;
+- daemon returned an error or has non-ready TUN/control state;
+- target npub is not configured or not discovered by the local FIPS daemon;
+- target npub appears in FIPS state but has no usable link/session before the bounded readiness poll expires.
+
+A locally derived `fd00::/8` address is only a deterministic address fallback. It is not proof that the daemon has discovered the peer or installed a route. The final TCP dial happens only after the local daemon reports suitable peer/session readiness.
+
+### 2.2.2 Optional FIPS Gateway
+
+`fips-gateway` is FIPS-owned infrastructure, not a metadesk component. It is useful when an operator wants unmodified LAN hosts to reach mesh destinations through a Linux gateway using a DNS proxy, virtual IPv6 pool, and nftables/proxy-NDP NAT rules. It is Linux-only, reads FIPS `gateway.*` configuration, exposes its own gateway control socket, and must be installed, configured, started, monitored, and upgraded outside metadesk.
+
+Normal metadesk sessions do not require `fips-gateway`; run FIPS directly on the Linux or macOS machines participating in the metadesk session. metadesk must not add lifecycle control for `fips-gateway`, must not own gateway nftables/proxy-NDP setup, and must not treat a gateway as a substitute for local FIPS daemon readiness.
 
 ### 2.3 Platform HAL Interfaces
 
@@ -282,9 +311,9 @@ Delta packets carry only changed nodes using the same formats above, with an add
 ```
 Client                                    Host
 ──────                                    ────
-1. Query Nostr relay for host npub
-   kind:30078 tag:d=fips-transport   →
-                                     ←   Current FIPS transport address
+1. Query local FIPS control socket for daemon readiness
+   show_status / show_peers / show_sessions →
+                                     ←   daemon ready and host route usable or converging
 
 2. Send NIP-44 DM to host npub:
    { "type": "session_request",
@@ -313,7 +342,7 @@ Client                                    Host
 
 - Host maintains a NIP-51 list (kind:30000) of authorised client npubs
 - List entries carry a `caps` tag limiting granted capabilities per npub
-- Unlisted npubs trigger an approval event; host daemon emits a kind:30078 event that the UI or bunker listens for
+- Unlisted npubs trigger a metadesk approval notification that the UI or bunker listens for; this is separate from FIPS overlay discovery
 - Session tokens are NIP-44 encrypted; relay cannot read session content
 - Revocation is immediate: remove from NIP-51 list, active sessions receive a disconnect packet within one keepalive interval
 
@@ -344,7 +373,7 @@ Required on Linux, macOS, and Windows.
 | `nostrc` | — | Nostr C library: events, keys, relay pool, NIP-44/17/51 | github.com/chebizarro/nostrc |
 | `libgo` | — | Go-style concurrency runtime (channels, goroutines, waitgroups) | bundled with nostrc |
 | `libsecp256k1` | ≥ 0.3.2 | Nostr keypair ops, NIP-44 ECDH | Transitive via nostrc |
-| `libnice` | ≥ 0.1.21 | STUN/TURN/ICE for fips-nat | Homebrew: `libnice` |
+| `libnice` | ≥ 0.1.21 | Legacy `fips-nat` only | Optional; only needed with `-Dfips_nat=true` |
 | `SDL2` | ≥ 2.28 | Human client frame display | Homebrew: `sdl2` |
 | Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule |
 | `cJSON` | ≥ 1.7.17 | JSON encode/decode for wire formats | Homebrew: `cjson` |
@@ -432,8 +461,9 @@ ninja -C build
 # Produces (all platforms):
 #   build/metadesk-host    — host daemon
 #   build/metadesk-client  — human video client
-#   build/fips-nat         — NAT traversal daemon
 #   build/libmetadesk.so   — shared core (.dylib on macOS, .dll on Windows)
+# Optional legacy output with -Dfips_nat=true:
+#   build/fips-nat         — deprecated NAT traversal sidecar
 ```
 
 ---
@@ -486,7 +516,7 @@ metadesk/
 │   │   ├── main.c
 │   │   ├── render.c/h                # SDL2 frame display + HiDPI scaling
 │   │   └── ui.cpp/h                  # Dear ImGui overlay (peer list, allowlist, approval)
-│   └── fips-nat/                      # NAT traversal daemon
+│   └── fips-nat/                      # legacy deprecated NAT traversal sidecar
 │       ├── main.c
 │       ├── stun.c/h                  # RFC 5389 STUN binding discovery
 │       ├── punch.c/h                 # UDP hole punch coordinator
@@ -553,7 +583,7 @@ When no signer backend is available, the direct-key backend retrieves the nsec f
 
 | Secret | 1Password Item | Used By |
 |---|---|---|
-| FIPS node nsec | `op://metadesk/fips-node/nsec` | metadesk-host, fips-nat |
+| FIPS node nsec | `op://metadesk/fips-node/nsec` | metadesk-host legacy direct-key fallback |
 | 1Password Connect token | `op://metadesk/1pc/token` | secrets.c bootstrap only |
 
 ---
@@ -565,7 +595,7 @@ When no signer backend is available, the direct-key backend retrieves the nsec f
 | Phase | Goal | Timeline |
 |---|---|---|
 | 1 | PoC — T7610 Linux host, macOS laptop client, LAN | 3–6 weeks |
-| 2 | Dogfood — OpenClaw agent fleet, NAT traversal, fips-nat | 2–3 months |
+| 2 | Dogfood — OpenClaw agent fleet over external FIPS daemon reachability | 2–3 months |
 | 3 | Product — Windows support, external users (contingent) | TBD |
 
 ### 8.2 Phase 1 Milestones ✅
@@ -588,7 +618,7 @@ All Phase 1 milestones are complete.
 ### 8.3 Phase 2 Milestones
 
 - ✅ **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool. Pluggable signer abstraction with NIP-46, NIP-55L, and NIP-5F backends.
-- ✅ **2.2** fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node
+- ✅ **2.2** legacy fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node; superseded for the recommended path by FIPS-owned discovery/traversal
 - ✅ **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
 - ✅ **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log (kind:1078)
 - ✅ **2.5** Adaptive bitrate — AIMD RTT feedback loop to encoder bitrate target
@@ -668,7 +698,7 @@ An agent connects by initiating a standard metadesk session with capability `age
 ### 10.2 Interaction Loop
 
 ```
-1. Connect to host npub via fips-nat-resolved address
+1. Verify host npub readiness through the local FIPS daemon control socket
 2. Negotiate: capabilities=["agent"], tree_format="compact"
 3. Receive MD_PKT_UI_TREE (full tree on connect)
 4. Agent reasons about tree, emits MD_PKT_ACTION
@@ -720,7 +750,7 @@ See `docs/AGENT_API.md` for the full integration guide with examples.
 
 - **OQ-2** GPU frame path — can a DMA-BUF handle be passed directly to NVENC without a CPU copy on the T7610/P40 combination? ScreenCaptureKit on macOS delivers frames via `CVPixelBuffer`; is a VideoToolbox-direct encode path feasible to avoid the CPU copy there?
 
-- **OQ-3** fips-nat integration point — should fips-nat write directly to the FIPS daemon config and signal reload, or does FIPS v0.1.x expose a dynamic peer API via `fipsctl`?
+- **OQ-3** resolved by FIPS v0.3.x migration — metadesk does not wire `fips-nat` into the daemon. FIPS owns discovery/traversal, and metadesk uses the daemon control socket for readiness.
 
 - **OQ-4** Nostr relay selection — which relays should be configured as defaults for session signaling? Should metadesk run its own relay at sharegap.net?
 

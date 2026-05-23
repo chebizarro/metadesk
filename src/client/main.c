@@ -14,6 +14,7 @@
  *   5. Clean shutdown on SIGINT/SIGTERM or window close
  */
 #include "fips_addr.h"
+#include "fips_control.h"
 #include "session.h"
 #include "packet.h"
 #include "stream.h"
@@ -55,14 +56,11 @@ typedef struct {
     uint32_t      tree_updates;         /* count of tree/delta packets recv'd */
 
     /* Nostr session negotiation state */
-    char          expected_host_pk[128]; /* pubkey of host we're connecting to */
-    char          transport_addr[256]; /* FIPS addr from on_transport     */
-    volatile int  transport_ready;     /* set by on_transport callback    */
+    char          expected_host_pk[128]; /* pubkey hex of host we're connecting to */
     char          accepted_session_id[64]; /* from session_accept DM     */
     uint32_t      granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* set by on_dm callback           */
-    GoChannel      *transport_ch;     /* signaled on transport ready     */
     GoChannel      *session_ch;       /* signaled on session accepted    */
 } ClientCtx;
 
@@ -87,25 +85,6 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
 }
 
 /* ── Nostr callbacks for --npub session negotiation ──────────── */
-
-static void on_transport(const char *pubkey_hex, const char *fips_addr,
-                         void *userdata) {
-    ClientCtx *ctx = userdata;
-    if (!ctx || !fips_addr || !pubkey_hex) return;
-
-    /* Verify the transport address came from the expected host */
-    if (ctx->expected_host_pk[0] != '\0' &&
-        strcmp(pubkey_hex, ctx->expected_host_pk) != 0) {
-        fprintf(stderr, "client: ignoring transport addr from unexpected pubkey %.*s...\n",
-                8, pubkey_hex);
-        return;
-    }
-
-    strncpy(ctx->transport_addr, fips_addr, sizeof(ctx->transport_addr) - 1);
-    ctx->transport_addr[sizeof(ctx->transport_addr) - 1] = '\0';
-    ctx->transport_ready = 1;
-    go_channel_try_send(ctx->transport_ch, (void *)(uintptr_t)1);
-}
 
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
                           void *userdata) {
@@ -143,7 +122,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --npub NPUB        Connect via FIPS mesh (npub1xxx)\n");
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
-    fprintf(stderr, "  --timeout MS       Connect timeout (default: 5000)\n");
+    fprintf(stderr, "  --timeout MS       Connect/readiness timeout (default: 5000)\n");
+    fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
     fprintf(stderr, "\nSigner options (choose one):\n");
     fprintf(stderr, "  --bunker URI       NIP-46 Nostr Connect bunker URI\n");
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
@@ -161,6 +141,60 @@ static int64_t now_us(void) {
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+
+static void print_fips_setup_guidance(const char *prefix, const char *npub,
+                                      const MdFipsPeerReadiness *ready) {
+    fprintf(stderr,
+            "ERROR: %s: FIPS peer not configured or not discovered by local daemon (%.*s...)\n",
+            prefix, 12, npub ? npub : "");
+    if (ready && ready->detail[0])
+        fprintf(stderr, "  FIPS detail: %s\n", ready->detail);
+    fprintf(stderr,
+            "  Configure this peer in the FIPS daemon (via_nostr/auto_connect/peer discovery)\n"
+            "  and verify `fipsctl show peers` reports a connected peer before using metadesk --npub.\n");
+}
+
+static int check_fips_daemon(const char *socket_path, uint32_t timeout_ms) {
+    MdFipsControlResponse resp;
+    md_fips_control_response_init(&resp);
+    MdFipsControlResult r = md_fips_control_request(socket_path, "show_status",
+                                                    NULL, timeout_ms, &resp);
+    if (r != MD_FIPS_CONTROL_OK) {
+        fprintf(stderr, "ERROR: FIPS daemon health check failed: %s%s%s\n",
+                md_fips_control_result_string(r),
+                resp.message ? ": " : "",
+                resp.message ? resp.message : "");
+        if (resp.socket_path)
+            fprintf(stderr, "  control socket: %s\n", resp.socket_path);
+        fprintf(stderr,
+                "  Start and configure the FIPS daemon, or pass --fips-control PATH if it uses a custom socket.\n");
+        md_fips_control_response_free(&resp);
+        return -1;
+    }
+
+    cJSON *state = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "state") : NULL;
+    cJSON *npub = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "npub") : NULL;
+    printf("client: FIPS daemon ready");
+    if (resp.socket_path) printf(" (%s)", resp.socket_path);
+    if (cJSON_IsString(state) && state->valuestring) printf(" state=%s", state->valuestring);
+    if (cJSON_IsString(npub) && npub->valuestring) printf(" npub=%.*s...", 12, npub->valuestring);
+    printf("\n");
+    md_fips_control_response_free(&resp);
+    return 0;
+}
+
+static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
+    if (ctx && ctx->session_ch) {
+        go_channel_close(ctx->session_ch);
+        go_channel_unref(ctx->session_ch);
+        ctx->session_ch = NULL;
+    }
+    if (nostr && *nostr) {
+        md_nostr_destroy(*nostr);
+        *nostr = NULL;
+    }
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -172,6 +206,7 @@ int main(int argc, char **argv) {
     const char *npub = NULL;
     const char *bunker_uri = NULL;
     const char *socket_path = NULL;
+    const char *fips_control_socket = NULL;
     bool use_dbus_signer = false;
     bool auto_signer = false;
     uint16_t port = MD_STREAM_PORT;
@@ -188,6 +223,8 @@ int main(int argc, char **argv) {
             do_display = false;
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             timeout_ms = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fips-control") == 0 && i + 1 < argc)
+            fips_control_socket = argv[++i];
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             npub = argv[++i];
         else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
@@ -293,11 +330,11 @@ int main(int argc, char **argv) {
             relay_count = 1;
         }
 
-        /* Transport + DM callbacks */
+        /* Session DM callback. FIPS reachability is owned by the FIPS daemon
+         * and checked through fips_control; do not subscribe to legacy
+         * kind:30078 transport adverts here. */
         MdNostrCallbacks nostr_cbs = { 0 };
 
-        nostr_cbs.on_transport = on_transport;
-        nostr_cbs.transport_userdata = &ctx;
         nostr_cbs.on_dm = on_session_dm;
         nostr_cbs.dm_userdata = &ctx;
 
@@ -307,49 +344,52 @@ int main(int argc, char **argv) {
             .relay_count = relay_count,
         };
 
-        /* Create channels before nostr_create — callbacks fire on worker threads */
-        ctx.transport_ch = go_channel_create(1);
+        /* Create channel before nostr_create — callbacks fire on worker threads */
         ctx.session_ch = go_channel_create(1);
 
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (!nostr) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
-            go_channel_close(ctx.transport_ch);
-            go_channel_unref(ctx.transport_ch);
             go_channel_close(ctx.session_ch);
             go_channel_unref(ctx.session_ch);
             if (signer) md_signer_destroy(signer);
             return 1;
         }
 
-        /* Store expected host pubkey for callback verification */
-        strncpy(ctx.expected_host_pk, npub, sizeof(ctx.expected_host_pk) - 1);
+        char host_pubkey_hex[65];
+        if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
+            fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
+            cleanup_npub_nostr(&nostr, &ctx);
+            return 1;
+        }
+
+        /* Store expected host pubkey hex for callback verification */
+        strncpy(ctx.expected_host_pk, host_pubkey_hex, sizeof(ctx.expected_host_pk) - 1);
         ctx.expected_host_pk[sizeof(ctx.expected_host_pk) - 1] = '\0';
 
-        /* Step 1: Subscribe to host's transport address */
-        printf("client: looking up transport addr for %.*s...\n", 12, npub);
-        if (md_nostr_subscribe_transport(nostr, npub) != 0) {
-            fprintf(stderr, "ERROR: failed to subscribe to transport\n");
-            md_nostr_destroy(nostr);
+        printf("client: checking FIPS daemon health...\n");
+        if (check_fips_daemon(fips_control_socket, timeout_ms) != 0) {
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
 
-        /* Step 2: Wait for on_transport callback (channel-based with timeout) */
-        {
-            void *dummy = NULL;
-            GoSelectCase cases[] = {
-                { .op = GO_SELECT_RECEIVE, .chan = ctx.transport_ch, .recv_buf = &dummy },
-            };
-            go_select_timeout(cases, 1, (uint64_t)timeout_ms);
-        }
-        if (!ctx.transport_ready) {
-            fprintf(stderr, "ERROR: timed out waiting for host transport addr\n");
-            md_nostr_destroy(nostr);
+        printf("client: waiting for FIPS peer readiness for %.*s...\n", 12, npub);
+        MdFipsPeerReadiness ready;
+        MdFipsPeerReadinessState rstate = md_fips_control_wait_peer_ready(
+            fips_control_socket, npub, timeout_ms,
+            MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS, &ready);
+        if (rstate != MD_FIPS_PEER_READY) {
+            if (rstate == MD_FIPS_PEER_NOT_FOUND)
+                print_fips_setup_guidance("client", npub, &ready);
+            else
+                fprintf(stderr, "ERROR: FIPS route not ready (%s): %s\n",
+                        md_fips_peer_readiness_string(rstate), ready.detail);
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
-        printf("client: found host transport addr: %s\n", ctx.transport_addr);
+        printf("client: FIPS peer ready: %s\n", ready.detail);
 
-        /* Step 3: Send session request DM */
+        /* Step 1: Send session request DM */
         MdSessionRequest req = {
             .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
             .tree_format = MD_TREE_FORMAT_COMPACT,
@@ -361,20 +401,20 @@ int main(int argc, char **argv) {
         char *req_json = md_session_request_to_json(&req);
         if (!req_json) {
             fprintf(stderr, "ERROR: failed to serialize session request\n");
-            md_nostr_destroy(nostr);
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
 
         printf("client: sending session request DM...\n");
-        if (md_nostr_send_session_request(nostr, npub, req_json) != 0) {
+        if (md_nostr_send_session_request(nostr, host_pubkey_hex, req_json) != 0) {
             fprintf(stderr, "ERROR: failed to send session request\n");
             free(req_json);
-            md_nostr_destroy(nostr);
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
         free(req_json);
 
-        /* Step 4: Wait for session accept DM (channel-based with timeout) */
+        /* Step 2: Wait for session accept DM (channel-based with timeout) */
         {
             void *dummy = NULL;
             GoSelectCase cases[] = {
@@ -384,21 +424,21 @@ int main(int argc, char **argv) {
         }
         if (!ctx.session_accepted) {
             fprintf(stderr, "ERROR: timed out waiting for session accept\n");
-            md_nostr_destroy(nostr);
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
         printf("client: session accepted (id=%s)\n", ctx.accepted_session_id);
 
-        /* Step 5: Connect via FIPS */
-        printf("client: connecting via FIPS to %s...\n", ctx.transport_addr);
+        /* Step 3: Connect via FIPS over the daemon-managed route */
+        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
         stream = md_stream_connect_fips(npub, port, timeout_ms);
         if (!stream) {
             fprintf(stderr, "ERROR: FIPS connect failed\n");
-            md_nostr_destroy(nostr);
+            cleanup_npub_nostr(&nostr, &ctx);
             return 1;
         }
 
-        /* Step 6: Send MD_PKT_SESSION_INFO with session_id + capabilities */
+        /* Step 4: Send MD_PKT_SESSION_INFO with session_id + capabilities */
         MdSessionAccept acc = { .tree_format = ctx.accepted_tree_format };
         strncpy(acc.session_id, ctx.accepted_session_id, sizeof(acc.session_id) - 1);
         acc.granted = ctx.granted_caps;
@@ -619,8 +659,6 @@ int main(int argc, char **argv) {
     md_stream_destroy(stream);
 
     if (nostr) {
-        go_channel_close(ctx.transport_ch);
-        go_channel_unref(ctx.transport_ch);
         go_channel_close(ctx.session_ch);
         go_channel_unref(ctx.session_ch);
         md_nostr_destroy(nostr);

@@ -27,6 +27,36 @@ static int tests_failed = 0;
 #define FAIL(msg) \
     do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
 
+typedef struct FipsAddrVector {
+    const char *name;
+    const char *npub;
+    const char *pk_hex;
+    const char *fips_ipv6;
+} FipsAddrVector;
+
+/* Expected IPv6 outputs are derived from current FIPS identity rules:
+ * NodeAddr = SHA-256(pubkey)[0..16], FipsAddress = 0xfd || NodeAddr[0..15]. */
+static const FipsAddrVector FIPS_ADDR_VECTORS[] = {
+    {
+        "nostr test key",
+        "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6",
+        "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
+        "fd10:93b2:8586:6046:e42d:c089:3228:ccff",
+    },
+    {
+        "alternate x-only key",
+        "npub1az9xj85cmxv8e9j2k8y02n95nf9txmcv0wax3cqmxtkc6eldt82q8uf283",
+        "e88a691e98d9987c964ab1c8f54cb49a4ab36f0c7bba68e01b32ed8d67ed59d4",
+        "fd38:8c8c:5473:9616:4641:7f4c:44ac:832b",
+    },
+    {
+        "FIPS test mesh host",
+        "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98",
+        "06f11c31227938ab98ba982280d2826f66a063f9efe7e342e81d6a76c677d7ed",
+        "fd00:dc7a:5def:9255:b47f:79a7:199:3d8e",
+    },
+};
+
 /* ── Test: address derivation produces fd00::/8 prefix ─────── */
 
 static void test_addr_has_fips_prefix(void) {
@@ -67,30 +97,33 @@ static void test_addr_has_fips_prefix(void) {
     PASS();
 }
 
-/* ── Test: hex pubkey derivation matches npub derivation ───── */
+/* ── Test: FIPS identity/address vector compatibility ─────── */
 
-static void test_hex_matches_npub(void) {
-    TEST("hex pubkey matches npub derivation");
+static void test_fips_reference_vectors(void) {
+    TEST("FIPS-derived address vectors");
 
-    /* npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6
-     * decodes to hex pubkey:
-     * 3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d */
-    const char *npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
-    const char *pk_hex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
+    for (size_t i = 0; i < sizeof(FIPS_ADDR_VECTORS) / sizeof(FIPS_ADDR_VECTORS[0]); i++) {
+        const FipsAddrVector *v = &FIPS_ADDR_VECTORS[i];
+        char ipv6_npub[MD_FIPS_IPV6_STRLEN];
+        char ipv6_hex[MD_FIPS_IPV6_STRLEN];
 
-    char ipv6_npub[MD_FIPS_IPV6_STRLEN];
-    char ipv6_hex[MD_FIPS_IPV6_STRLEN];
+        int r1 = md_fips_addr_from_npub(v->npub, ipv6_npub, sizeof(ipv6_npub));
+        int r2 = md_fips_addr_from_pubkey_hex(v->pk_hex, ipv6_hex, sizeof(ipv6_hex));
 
-    int r1 = md_fips_addr_from_npub(npub, ipv6_npub, sizeof(ipv6_npub));
-    int r2 = md_fips_addr_from_pubkey_hex(pk_hex, ipv6_hex, sizeof(ipv6_hex));
+        if (r1 != 0) { printf("vector=%s ", v->name); FAIL("npub derivation failed"); return; }
+        if (r2 != 0) { printf("vector=%s ", v->name); FAIL("hex derivation failed"); return; }
 
-    if (r1 != 0) { FAIL("npub derivation failed"); return; }
-    if (r2 != 0) { FAIL("hex derivation failed"); return; }
+        if (strcmp(ipv6_npub, v->fips_ipv6) != 0) {
+            printf("vector=%s npub=%s expected=%s ", v->name, ipv6_npub, v->fips_ipv6);
+            FAIL("npub derivation does not match FIPS output");
+            return;
+        }
 
-    if (strcmp(ipv6_npub, ipv6_hex) != 0) {
-        printf("npub=%s hex=%s ", ipv6_npub, ipv6_hex);
-        FAIL("addresses don't match");
-        return;
+        if (strcmp(ipv6_hex, v->fips_ipv6) != 0) {
+            printf("vector=%s hex=%s expected=%s ", v->name, ipv6_hex, v->fips_ipv6);
+            FAIL("hex derivation does not match FIPS output");
+            return;
+        }
     }
 
     PASS();
@@ -258,6 +291,20 @@ static void test_error_handling(void) {
         FAIL("invalid npub accepted"); return;
     }
 
+    /* Checksum must be verified before using npub bytes for address/auth. */
+    if (md_fips_addr_from_npub(
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w7",
+            ipv6, sizeof(ipv6)) == 0) {
+        FAIL("bad checksum npub accepted"); return;
+    }
+
+    char pk_hex[65];
+    if (md_fips_npub_to_pubkey_hex(
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w7",
+            pk_hex, sizeof(pk_hex)) == 0) {
+        FAIL("bad checksum npub decoded to hex"); return;
+    }
+
     /* Buffer too small */
     char tiny[5];
     if (md_fips_addr_from_npub(
@@ -305,7 +352,7 @@ int main(void) {
     printf("test_fips_addr:\n");
 
     test_addr_has_fips_prefix();
-    test_hex_matches_npub();
+    test_fips_reference_vectors();
     test_deterministic();
     test_different_keys();
     test_raw_pubkey();
