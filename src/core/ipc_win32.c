@@ -25,8 +25,107 @@
 #define MD_IPC_PIPE_PREFIX "\\\\.\\pipe\\metadesk-"
 #define MD_IPC_PATH_MAX    256
 
-static void ipc_build_path(const char *name, char *path, size_t path_len) {
-    snprintf(path, path_len, "%s%s", MD_IPC_PIPE_PREFIX, name);
+static bool ipc_build_path(const char *name, char *path, size_t path_len) {
+    int ret = snprintf(path, path_len, "%s%s", MD_IPC_PIPE_PREFIX, name);
+    return ret >= 0 && (size_t)ret < path_len;
+}
+
+/* ── Pipe security ───────────────────────────────────────────── */
+
+typedef struct MdIpcSecurity {
+    SECURITY_ATTRIBUTES sa;
+    SECURITY_DESCRIPTOR sd;
+    PACL dacl;
+    PTOKEN_USER token_user;
+} MdIpcSecurity;
+
+static void ipc_security_destroy(MdIpcSecurity *sec) {
+    if (!sec) return;
+    free(sec->dacl);
+    free(sec->token_user);
+    memset(sec, 0, sizeof(*sec));
+}
+
+static bool ipc_security_init(MdIpcSecurity *sec) {
+    if (!sec) return false;
+    memset(sec, 0, sizeof(*sec));
+
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+
+    DWORD token_len = 0;
+    GetTokenInformation(token, TokenUser, NULL, 0, &token_len);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || token_len == 0) {
+        CloseHandle(token);
+        return false;
+    }
+
+    sec->token_user = (PTOKEN_USER)malloc(token_len);
+    if (!sec->token_user) {
+        CloseHandle(token);
+        return false;
+    }
+
+    if (!GetTokenInformation(token, TokenUser, sec->token_user, token_len, &token_len)) {
+        CloseHandle(token);
+        ipc_security_destroy(sec);
+        return false;
+    }
+    CloseHandle(token);
+
+    DWORD sid_len = GetLengthSid(sec->token_user->User.Sid);
+    DWORD acl_size = (DWORD)(sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + sid_len);
+    sec->dacl = (PACL)malloc(acl_size);
+    if (!sec->dacl) {
+        ipc_security_destroy(sec);
+        return false;
+    }
+
+    if (!InitializeAcl(sec->dacl, acl_size, ACL_REVISION)) {
+        ipc_security_destroy(sec);
+        return false;
+    }
+
+    if (!AddAccessAllowedAce(sec->dacl, ACL_REVISION, GENERIC_ALL,
+                             sec->token_user->User.Sid)) {
+        ipc_security_destroy(sec);
+        return false;
+    }
+
+    if (!InitializeSecurityDescriptor(&sec->sd, SECURITY_DESCRIPTOR_REVISION)) {
+        ipc_security_destroy(sec);
+        return false;
+    }
+
+    if (!SetSecurityDescriptorDacl(&sec->sd, TRUE, sec->dacl, FALSE)) {
+        ipc_security_destroy(sec);
+        return false;
+    }
+
+    sec->sa.nLength = sizeof(sec->sa);
+    sec->sa.lpSecurityDescriptor = &sec->sd;
+    sec->sa.bInheritHandle = FALSE;
+    return true;
+}
+
+static HANDLE ipc_create_named_pipe(const char *path, DWORD open_mode) {
+    MdIpcSecurity security;
+    if (!ipc_security_init(&security))
+        return INVALID_HANDLE_VALUE;
+
+    HANDLE pipe = CreateNamedPipeA(
+        path,
+        open_mode,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        MD_IPC_MAX_MSG,    /* output buffer size */
+        MD_IPC_MAX_MSG,    /* input buffer size  */
+        0,                 /* default timeout    */
+        &security.sa);     /* current-user DACL  */
+
+    ipc_security_destroy(&security);
+    return pipe;
 }
 
 /* ── Structures ──────────────────────────────────────────────── */
@@ -44,26 +143,22 @@ struct MdIpcConn {
 /* ── Server API ──────────────────────────────────────────────── */
 
 MdIpcServer *md_ipc_listen(const char *name) {
-    if (!name || name[0] == '\0') return NULL;
+    if (!md_ipc_name_is_valid(name)) return NULL;
 
     MdIpcServer *srv = calloc(1, sizeof(MdIpcServer));
     if (!srv) return NULL;
+    srv->pipe = INVALID_HANDLE_VALUE;
 
-    ipc_build_path(name, srv->path, sizeof(srv->path));
+    if (!ipc_build_path(name, srv->path, sizeof(srv->path))) {
+        free(srv);
+        return NULL;
+    }
 
     /* Create a named pipe instance.
      * PIPE_TYPE_BYTE | PIPE_READMODE_BYTE: byte-stream mode
      * PIPE_WAIT: blocking operations
      * Buffer sizes: 64 KB each direction */
-    srv->pipe = CreateNamedPipeA(
-        srv->path,
-        PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        PIPE_UNLIMITED_INSTANCES,
-        MD_IPC_MAX_MSG,    /* output buffer size */
-        MD_IPC_MAX_MSG,    /* input buffer size  */
-        0,                 /* default timeout    */
-        NULL);             /* default security   */
+    srv->pipe = ipc_create_named_pipe(srv->path, PIPE_ACCESS_DUPLEX);
 
     if (srv->pipe == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "ipc: CreateNamedPipe failed for '%s': %lu\n",
@@ -122,15 +217,9 @@ MdIpcConn *md_ipc_accept(MdIpcServer *srv, uint32_t timeout_ms) {
     conn->connected = true;
 
     /* Create a new pipe instance for the next accept */
-    srv->pipe = CreateNamedPipeA(
+    srv->pipe = ipc_create_named_pipe(
         srv->path,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        PIPE_UNLIMITED_INSTANCES,
-        MD_IPC_MAX_MSG,
-        MD_IPC_MAX_MSG,
-        0,
-        NULL);
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED);
 
     return conn;
 }
@@ -149,10 +238,10 @@ void md_ipc_server_destroy(MdIpcServer *srv) {
 /* ── Client API ──────────────────────────────────────────────── */
 
 MdIpcConn *md_ipc_connect(const char *name, uint32_t timeout_ms) {
-    if (!name || name[0] == '\0') return NULL;
+    if (!md_ipc_name_is_valid(name)) return NULL;
 
     char path[MD_IPC_PATH_MAX];
-    ipc_build_path(name, path, sizeof(path));
+    if (!ipc_build_path(name, path, sizeof(path))) return NULL;
 
     /* Wait for the pipe to become available */
     DWORD wait_ms = (timeout_ms > 0) ? timeout_ms : NMPWAIT_WAIT_FOREVER;

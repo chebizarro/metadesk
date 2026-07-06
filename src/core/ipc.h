@@ -12,7 +12,7 @@
  * listen/accept (server) and connect (client), then send/recv.
  *
  * Paths:
- *   POSIX:    /tmp/metadesk-<name>.sock  (or XDG_RUNTIME_DIR)
+ *   POSIX:    $XDG_RUNTIME_DIR/metadesk-<name>.sock
  *   Windows:  \\.\pipe\metadesk-<name>
  */
 #ifndef MD_IPC_H
@@ -26,8 +26,33 @@
 extern "C" {
 #endif
 
-/* Maximum IPC endpoint name length */
+/* Maximum IPC endpoint name length, excluding the trailing NUL. */
 #define MD_IPC_NAME_MAX 64
+
+/*
+ * Validate logical IPC endpoint names before mapping them to filesystem
+ * socket paths or named pipe paths. Names must be simple components:
+ * non-empty, at most MD_IPC_NAME_MAX bytes, no path separators, no ".."
+ * substring, and no ASCII control characters.
+ */
+static inline bool md_ipc_name_is_valid(const char *name)
+{
+    if (!name || name[0] == '\0') return false;
+
+    size_t len = 0;
+    bool prev_dot = false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        unsigned char c = *p;
+        len++;
+        if (len > MD_IPC_NAME_MAX) return false;
+        if (c < 0x20 || c == 0x7f) return false;
+        if (c == '/' || c == '\\') return false;
+        if (c == '.' && prev_dot) return false;
+        prev_dot = (c == '.');
+    }
+
+    return true;
+}
 
 /* Maximum data per single send/recv */
 #define MD_IPC_MAX_MSG  (64 * 1024)
@@ -41,9 +66,9 @@ typedef struct MdIpcConn   MdIpcConn;
 /*
  * Create an IPC server listening on the given name.
  *
- * name: Logical name (e.g. "host", "session"). The implementation
+ * name: Valid logical name (e.g. "host", "session"). The implementation
  *       maps this to a platform-appropriate path:
- *       - POSIX: $XDG_RUNTIME_DIR/metadesk-<name>.sock or /tmp/
+ *       - POSIX: $XDG_RUNTIME_DIR/metadesk-<name>.sock
  *       - Windows: \\.\pipe\metadesk-<name>
  *
  * Returns NULL on failure (permission, path conflict, etc.).

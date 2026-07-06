@@ -199,6 +199,7 @@ elif host_os == 'windows'
     cc.find_library('d3d11', required : true),
     cc.find_library('dxgi', required : true),
     cc.find_library('user32', required : true),
+    cc.find_library('advapi32', required : true),
     cc.find_library('ole32', required : true),
     cc.find_library('oleaut32', required : true),
   ]

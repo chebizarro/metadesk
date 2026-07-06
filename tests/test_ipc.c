@@ -13,14 +13,109 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define PASS(name) printf("  PASS  %s\n", name)
+
+static char g_runtime_dir[128];
+static char *g_old_runtime_dir = NULL;
+
+static void cleanup_runtime_dir(void)
+{
+    if (g_old_runtime_dir) {
+        setenv("XDG_RUNTIME_DIR", g_old_runtime_dir, 1);
+        free(g_old_runtime_dir);
+        g_old_runtime_dir = NULL;
+    } else {
+        unsetenv("XDG_RUNTIME_DIR");
+    }
+
+    if (g_runtime_dir[0] != '\0') {
+        rmdir(g_runtime_dir);
+        g_runtime_dir[0] = '\0';
+    }
+}
+
+static void setup_runtime_dir(void)
+{
+    const char *old_runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (old_runtime_dir) {
+        g_old_runtime_dir = malloc(strlen(old_runtime_dir) + 1);
+        assert(g_old_runtime_dir != NULL);
+        strcpy(g_old_runtime_dir, old_runtime_dir);
+    }
+
+    char tmpl[] = "/tmp/metadesk-ipc-test-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir != NULL);
+    assert(strlen(dir) < sizeof(g_runtime_dir));
+    strcpy(g_runtime_dir, dir);
+    chmod(g_runtime_dir, 0700);
+
+    assert(setenv("XDG_RUNTIME_DIR", g_runtime_dir, 1) == 0);
+    atexit(cleanup_runtime_dir);
+}
 
 /* Unique IPC name per test to avoid collisions */
 static int g_name_counter = 0;
 static void make_name(char *buf, size_t len)
 {
     snprintf(buf, len, "test-ipc-%d-%d", (int)getpid(), g_name_counter++);
+}
+
+/* ── Test: invalid endpoint names are rejected ───────────────── */
+
+static void test_invalid_names(void)
+{
+    char control_name[] = { 'b', 'a', 'd', '\n', 'n', 'a', 'm', 'e', '\0' };
+    char overlong[MD_IPC_NAME_MAX + 2];
+    memset(overlong, 'a', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+
+    const char *invalid_names[] = {
+        "",
+        "bad/name",
+        "bad\\name",
+        "bad..name",
+        "..",
+        control_name,
+        overlong,
+    };
+
+    assert(md_ipc_listen(NULL) == NULL);
+    assert(md_ipc_connect(NULL, 1) == NULL);
+
+    for (size_t i = 0; i < sizeof(invalid_names) / sizeof(invalid_names[0]); i++) {
+        assert(md_ipc_listen(invalid_names[i]) == NULL);
+        assert(md_ipc_connect(invalid_names[i], 1) == NULL);
+    }
+
+    PASS("invalid names rejected");
+}
+
+/* ── Test: existing non-socket endpoints are not unlinked ────── */
+
+static void test_refuse_existing_non_socket(void)
+{
+    char name[MD_IPC_NAME_MAX];
+    make_name(name, sizeof(name));
+
+    char path[256];
+    int n = snprintf(path, sizeof(path), "%s/metadesk-%s.sock", g_runtime_dir, name);
+    assert(n > 0 && (size_t)n < sizeof(path));
+
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fputs("not a socket", f);
+    fclose(f);
+
+    MdIpcServer *srv = md_ipc_listen(name);
+    assert(srv == NULL);
+    assert(access(path, F_OK) == 0);
+
+    unlink(path);
+
+    PASS("existing non-socket refused");
 }
 
 /* ── Test: server create and destroy ─────────────────────────── */
@@ -283,7 +378,10 @@ static void test_accept_timeout(void)
 int main(void)
 {
     printf("test_ipc: Unix domain socket IPC tests\n");
+    setup_runtime_dir();
 
+    test_invalid_names();
+    test_refuse_existing_non_socket();
     test_server_lifecycle();
     test_connect_no_server();
     test_connect_accept();

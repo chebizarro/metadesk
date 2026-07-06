@@ -2,11 +2,12 @@
  * metadesk — ipc_unix.c
  * Unix domain socket IPC backend (Linux / macOS).
  *
- * Endpoints are created as filesystem sockets under XDG_RUNTIME_DIR
- * (or /tmp as fallback). The socket path is:
+ * Endpoints are created as filesystem sockets under XDG_RUNTIME_DIR.
+ * The socket path is:
  *   $XDG_RUNTIME_DIR/metadesk-<name>.sock
  *
- * Unlinks any stale socket before binding.
+ * XDG_RUNTIME_DIR must be a private, user-owned directory. Only stale
+ * socket files are unlinked before binding; other existing path types fail.
  */
 #include "ipc.h"
 
@@ -28,13 +29,51 @@
 
 #define MD_IPC_PATH_MAX 256
 
-static void ipc_build_path(const char *name, char *path, size_t path_len) {
+static bool ipc_runtime_dir_is_private(const char *runtime_dir) {
+    if (!runtime_dir || runtime_dir[0] == '\0') return false;
+
+    struct stat st;
+    if (stat(runtime_dir, &st) < 0) return false;
+    if (!S_ISDIR(st.st_mode)) return false;
+    if (st.st_uid != getuid()) return false;
+    if ((st.st_mode & 0077) != 0) return false;
+
+    return true;
+}
+
+static bool ipc_build_path(const char *name, char *path, size_t path_len) {
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
-    if (runtime_dir && runtime_dir[0] != '\0') {
-        snprintf(path, path_len, "%s/metadesk-%s.sock", runtime_dir, name);
-    } else {
-        snprintf(path, path_len, "/tmp/metadesk-%s.sock", name);
+    if (!ipc_runtime_dir_is_private(runtime_dir)) return false;
+
+    int ret = snprintf(path, path_len, "%s/metadesk-%s.sock", runtime_dir, name);
+    return ret >= 0 && (size_t)ret < path_len;
+}
+
+static int ipc_fill_addr(const char *path, struct sockaddr_un *addr) {
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(addr->sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
     }
+
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    memcpy(addr->sun_path, path, path_len + 1);
+    return 0;
+}
+
+static int ipc_unlink_stale_socket(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    if (!S_ISSOCK(st.st_mode)) {
+        errno = EEXIST;
+        return -1;
+    }
+
+    return unlink(path);
 }
 
 /* ── Structures ──────────────────────────────────────────────── */
@@ -71,15 +110,23 @@ static int write_all(int fd, const void *data, size_t len) {
 /* ── Server API ──────────────────────────────────────────────── */
 
 MdIpcServer *md_ipc_listen(const char *name) {
-    if (!name || name[0] == '\0') return NULL;
+    if (!md_ipc_name_is_valid(name)) return NULL;
 
     MdIpcServer *srv = calloc(1, sizeof(MdIpcServer));
     if (!srv) return NULL;
+    srv->fd = -1;
 
-    ipc_build_path(name, srv->path, sizeof(srv->path));
+    if (!ipc_build_path(name, srv->path, sizeof(srv->path))) {
+        free(srv);
+        return NULL;
+    }
 
-    /* Remove stale socket if it exists */
-    unlink(srv->path);
+    if (ipc_unlink_stale_socket(srv->path) < 0) {
+        fprintf(stderr, "ipc: refusing to replace non-socket endpoint '%s': %s\n",
+                srv->path, strerror(errno));
+        free(srv);
+        return NULL;
+    }
 
     srv->fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv->fd < 0) {
@@ -88,19 +135,34 @@ MdIpcServer *md_ipc_listen(const char *name) {
     }
 
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, srv->path, sizeof(addr.sun_path) - 1);
+    if (ipc_fill_addr(srv->path, &addr) < 0) {
+        fprintf(stderr, "ipc: socket path too long for '%s'\n", srv->path);
+        close(srv->fd);
+        free(srv);
+        return NULL;
+    }
 
-    if (bind(srv->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    mode_t old_umask = umask(077);
+    int bind_ret = bind(srv->fd, (struct sockaddr *)&addr, sizeof(addr));
+    int bind_errno = errno;
+    umask(old_umask);
+
+    if (bind_ret < 0) {
+        errno = bind_errno;
         fprintf(stderr, "ipc: bind failed for '%s': %s\n", srv->path, strerror(errno));
         close(srv->fd);
         free(srv);
         return NULL;
     }
 
-    /* Restrict permissions: owner-only */
-    chmod(srv->path, 0600);
+    /* Ensure owner-only permissions even on platforms with unusual defaults. */
+    if (chmod(srv->path, 0600) < 0) {
+        fprintf(stderr, "ipc: chmod failed for '%s': %s\n", srv->path, strerror(errno));
+        close(srv->fd);
+        unlink(srv->path);
+        free(srv);
+        return NULL;
+    }
 
     if (listen(srv->fd, 4) < 0) {
         close(srv->fd);
@@ -150,18 +212,19 @@ void md_ipc_server_destroy(MdIpcServer *srv) {
 /* ── Client API ──────────────────────────────────────────────── */
 
 MdIpcConn *md_ipc_connect(const char *name, uint32_t timeout_ms) {
-    if (!name || name[0] == '\0') return NULL;
+    if (!md_ipc_name_is_valid(name)) return NULL;
 
     char path[MD_IPC_PATH_MAX];
-    ipc_build_path(name, path, sizeof(path));
+    if (!ipc_build_path(name, path, sizeof(path))) return NULL;
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
 
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (ipc_fill_addr(path, &addr) < 0) {
+        close(fd);
+        return NULL;
+    }
 
     /* Non-blocking connect with timeout */
     if (timeout_ms > 0) {
