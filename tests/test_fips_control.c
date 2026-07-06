@@ -101,6 +101,31 @@ static void test_parse_ok_response(void)
     PASS("parse ok response");
 }
 
+static void test_parse_show_metrics_response(void)
+{
+    const char *json = "{\"status\":\"ok\",\"data\":{\"forwarding\":{\"packets_sent\":100},\"errors\":{\"total\":0}}}\n";
+    MdFipsControlResponse resp = {0};
+    MdFipsControlResult r = md_fips_control_parse_response(json, strlen(json), &resp);
+    assert(r == MD_FIPS_CONTROL_OK);
+    assert(resp.result == MD_FIPS_CONTROL_OK);
+    assert(resp.data != NULL);
+
+    cJSON *forwarding = cJSON_GetObjectItemCaseSensitive(resp.data, "forwarding");
+    assert(cJSON_IsObject(forwarding));
+    cJSON *packets_sent = cJSON_GetObjectItemCaseSensitive(forwarding, "packets_sent");
+    assert(cJSON_IsNumber(packets_sent));
+    assert(packets_sent->valueint == 100);
+
+    cJSON *errors = cJSON_GetObjectItemCaseSensitive(resp.data, "errors");
+    assert(cJSON_IsObject(errors));
+    cJSON *total = cJSON_GetObjectItemCaseSensitive(errors, "total");
+    assert(cJSON_IsNumber(total));
+    assert(total->valueint == 0);
+
+    md_fips_control_response_free(&resp);
+    PASS("parse show_metrics response");
+}
+
 static void test_parse_daemon_error_response(void)
 {
     const char *json = "{\"status\":\"error\",\"message\":\"unknown command: nope\"}\n";
@@ -308,6 +333,7 @@ int main(void)
     test_path_override();
     test_default_path_order();
     test_parse_ok_response();
+    test_parse_show_metrics_response();
     test_parse_daemon_error_response();
     test_parse_invalid_response();
     test_response_reuse();

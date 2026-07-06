@@ -365,6 +365,39 @@ static void host_print_fips_setup_guidance(const char *npub,
             "  and verify `fipsctl show peers` reports a connected peer before using metadesk-host --npub.\n");
 }
 
+static uint64_t host_fips_metric_u64(cJSON *family, const char *key) {
+    cJSON *item = family ? cJSON_GetObjectItemCaseSensitive(family, key) : NULL;
+    return cJSON_IsNumber(item) && item->valuedouble >= 0.0
+         ? (uint64_t)item->valuedouble : 0u;
+}
+
+static void host_print_fips_metrics_summary(const char *socket_path, uint32_t timeout_ms) {
+    MdFipsControlResponse metrics;
+    md_fips_control_response_init(&metrics);
+    MdFipsControlResult r = md_fips_control_request(socket_path, "show_metrics",
+                                                    NULL, timeout_ms, &metrics);
+    if (r != MD_FIPS_CONTROL_OK) {
+        fprintf(stderr, "host: FIPS metrics unavailable: %s%s%s\n",
+                md_fips_control_result_string(r),
+                metrics.message ? ": " : "",
+                metrics.message ? metrics.message : "");
+        md_fips_control_response_free(&metrics);
+        return;
+    }
+
+    cJSON *forwarding = metrics.data ? cJSON_GetObjectItemCaseSensitive(metrics.data, "forwarding") : NULL;
+    cJSON *discovery = metrics.data ? cJSON_GetObjectItemCaseSensitive(metrics.data, "discovery") : NULL;
+    cJSON *errors = metrics.data ? cJSON_GetObjectItemCaseSensitive(metrics.data, "errors") : NULL;
+
+    printf("host: FIPS metrics forwarding sent=%llu recv=%llu discovery sent=%llu recv=%llu errors=%llu\n",
+           (unsigned long long)host_fips_metric_u64(forwarding, "packets_sent"),
+           (unsigned long long)host_fips_metric_u64(forwarding, "packets_recv"),
+           (unsigned long long)host_fips_metric_u64(discovery, "sent"),
+           (unsigned long long)host_fips_metric_u64(discovery, "recv"),
+           (unsigned long long)host_fips_metric_u64(errors, "total"));
+    md_fips_control_response_free(&metrics);
+}
+
 static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) {
     MdFipsControlResponse resp;
     md_fips_control_response_init(&resp);
@@ -383,6 +416,11 @@ static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) 
         return -1;
     }
 
+    /*
+     * `state` is an opaque diagnostic string from FIPS' format!("{}", node.state()).
+     * Do not branch on it. Future readiness checks should use stable documented
+     * fields like tun_state, peer_count, or structured show_peers/show_sessions data.
+     */
     cJSON *state = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "state") : NULL;
     cJSON *npub = resp.data ? cJSON_GetObjectItemCaseSensitive(resp.data, "npub") : NULL;
     printf("host: FIPS daemon ready");
@@ -391,6 +429,8 @@ static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) 
     if (cJSON_IsString(npub) && npub->valuestring) printf(" npub=%.*s...", 12, npub->valuestring);
     printf("\n");
     md_fips_control_response_free(&resp);
+
+    host_print_fips_metrics_summary(socket_path, timeout_ms);
     return 0;
 }
 
