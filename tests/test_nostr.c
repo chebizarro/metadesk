@@ -232,12 +232,13 @@ static void test_bridge_lifecycle(void) {
     int ret = md_nostr_generate_keypair(&sk, &pk);
     assert(ret == 0 && sk && pk);
 
-    /* Build config with a dummy relay (won't connect, but won't crash) */
-    const char *relay_urls[] = { "wss://127.0.0.1:1" };
+    /* Build config with dummy relays (won't connect, but won't crash).
+     * Multiple URLs exercise relay snapshot allocation/free loops. */
+    const char *relay_urls[] = { "wss://127.0.0.1:1", "wss://127.0.0.1:2" };
     MdNostrConfig cfg = {
         .sk_hex = sk,
         .relay_urls = relay_urls,
-        .relay_count = 1,
+        .relay_count = 2,
     };
 
     /* Set up callbacks including the new publish_result callback */

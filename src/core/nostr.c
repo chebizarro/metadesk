@@ -362,32 +362,45 @@ static void *dm_unwrap_thread(void *arg) {
         goto done;
     }
 
-    /* Step 3: Decrypt seal content → rumor JSON */
+    /* Step 3: Decrypt seal content → rumor JSON.
+     * sender_pk is borrowed from seal; keep an owned copy for the
+     * post-seal callback path before freeing seal below. */
+    char *sender_pk_copy = strdup(sender_pk);
+    if (!sender_pk_copy) {
+        nostr_event_free(seal);
+        goto done;
+    }
+
     char *rumor_json = NULL;
-    ret = md_signer_nip44_decrypt(ua->signer, sender_pk,
+    ret = md_signer_nip44_decrypt(ua->signer, sender_pk_copy,
                                   seal_content, &rumor_json);
     nostr_event_free(seal);
-    if (ret != 0 || !rumor_json) goto done;
+    if (ret != 0 || !rumor_json) {
+        free(sender_pk_copy);
+        goto done;
+    }
 
     /* Step 4: Parse rumor to get DM content */
     NostrEvent *rumor = event_from_json(rumor_json);
     free(rumor_json);
-    if (!rumor) goto done;
+    if (!rumor) {
+        free(sender_pk_copy);
+        goto done;
+    }
 
     const char *dm_content = nostr_event_get_content(rumor);
-    if (dm_content && sender_pk) {
-        char *sender_copy = strdup(sender_pk);
+    if (dm_content) {
         char *content_copy = strdup(dm_content);
         nostr_event_free(rumor);
 
-        if (sender_copy && content_copy)
-            ua->on_dm(sender_copy, content_copy, ua->dm_userdata);
+        if (content_copy)
+            ua->on_dm(sender_pk_copy, content_copy, ua->dm_userdata);
 
-        free(sender_copy);
         free(content_copy);
     } else {
         nostr_event_free(rumor);
     }
+    free(sender_pk_copy);
 
 done:
     go_wait_group_done(ua->dm_wg);
@@ -664,14 +677,19 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
      * This is the ONLY place we access pool struct internals.
      * TODO: Replace with nostr_simple_pool_get_relays() when nostrc
      * provides an accessor API. */
-    n->relay_count = (size_t)cfg->relay_count;
-    n->relays = malloc(n->relay_count * sizeof(NostrRelay *));
-    n->relay_urls = malloc(n->relay_count * sizeof(char *));
+    size_t relay_capacity = (size_t)cfg->relay_count;
+    n->relays = calloc(relay_capacity, sizeof(NostrRelay *));
+    n->relay_urls = calloc(relay_capacity, sizeof(char *));
     if (n->relays && n->relay_urls) {
         pthread_mutex_lock(&n->pool->pool_mutex);
-        for (size_t i = 0; i < n->relay_count && i < n->pool->relay_count; i++) {
-            n->relays[i] = n->pool->relays[i];
-            n->relay_urls[i] = strdup(nostr_relay_get_url_const(n->pool->relays[i]));
+        for (size_t i = 0; i < relay_capacity && i < n->pool->relay_count; i++) {
+            const char *url = nostr_relay_get_url_const(n->pool->relays[i]);
+            char *url_copy = strdup(url ? url : "");
+            if (!url_copy)
+                continue;
+            n->relays[n->relay_count] = n->pool->relays[i];
+            n->relay_urls[n->relay_count] = url_copy;
+            n->relay_count++;
         }
         pthread_mutex_unlock(&n->pool->pool_mutex);
 
