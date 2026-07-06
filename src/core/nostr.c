@@ -78,6 +78,8 @@ struct MdNostr {
     char              *pk_hex;       /* our public key, hex                 */
     NostrSimplePool   *pool;         /* nostrc relay pool — persistent conns */
     NostrList         *allowlist;    /* cached NIP-51 allowlist             */
+    bool               allowlist_refresh_requested;
+    bool               allowlist_refresh_loaded;
     MdNostrCallbacks   cbs;          /* event callbacks                     */
 
     /* Cached relay snapshot — avoids direct access to pool struct internals.
@@ -478,6 +480,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
             if (n->allowlist)
                 nostr_nip51_list_free(n->allowlist);
             n->allowlist = list;
+            n->allowlist_refresh_loaded = true;
             fprintf(stderr, "nostr: refreshed allowlist (%zu entries)\n",
                     list->count);
         } else {
@@ -964,7 +967,15 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     free(encrypted_seal);
 
     /* Sign gift-wrap with ephemeral key (local, not via signer) */
-    nostr_event_sign(gift_wrap, eph_sk);
+    ret = nostr_event_sign(gift_wrap, eph_sk);
+    if (ret != 0) {
+        fprintf(stderr, "nostr: failed to sign gift-wrap event\n");
+        nostr_event_free(gift_wrap);
+        memset(eph_sk, 0, strlen(eph_sk));
+        free(eph_sk);
+        free(eph_pk);
+        return -1;
+    }
 
     /* Zero and free ephemeral key */
     memset(eph_sk, 0, strlen(eph_sk));
@@ -990,9 +1001,21 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 
 /* ── Access control (NIP-51 allowlists) ─────────────────────── */
 
+static void warn_allowlist_startup_window(const MdNostr *n) {
+    if (!n || n->allowlist_refresh_loaded || n->allowlist)
+        return;
+
+    fprintf(stderr,
+            "nostr: WARNING: allowlist checked before first NIP-51 refresh (%s); "
+            "startup window remains open until relay data arrives\n",
+            n->allowlist_refresh_requested ? "waiting for relay data" : "refresh not requested");
+}
+
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex)
         return false;
+
+    warn_allowlist_startup_window(n);
 
     if (!n->allowlist)
         return false;
@@ -1008,11 +1031,22 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
 }
 
 bool md_nostr_has_allowlist(const MdNostr *n) {
-    return n && n->allowlist && n->allowlist->count > 0;
+    if (!n)
+        return false;
+
+    warn_allowlist_startup_window(n);
+
+    return n->allowlist && n->allowlist->count > 0;
 }
 
 int md_nostr_refresh_allowlist(MdNostr *n) {
     if (!n || !n->pool || !n->pk_hex) return -1;
+
+    /* This is asynchronous: the call below subscribes for the latest list,
+     * but md_nostr_has_allowlist() will remain false until a matching
+     * kind:30000 event arrives from a relay. During that startup window the
+     * host treats allowlist mode as open and logs a warning on checks. */
+    n->allowlist_refresh_requested = true;
 
     /* Subscribe to kind:30000, authors:[our_pk], #d:["metadesk-allowlist"].
      * limit:1 — this is an addressable event (NIP-33) so only the latest
@@ -1052,6 +1086,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
         n->allowlist = nostr_nip51_list_new();
     if (!n->allowlist)
         return -1;
+    n->allowlist_refresh_loaded = true;
 
     NostrListEntry *entry = nostr_nip51_entry_new("p", pubkey_hex, caps, false);
     if (!entry)

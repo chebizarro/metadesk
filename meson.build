@@ -348,10 +348,20 @@ dep_metadesk = declare_dependency(
 )
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
-executable('metadesk-host',
-  files('src/host/main.c', 'src/fips-nat/fipsnat_ipc.c', 'src/fips-nat/stun.c'),
-  include_directories : [core_inc, include_directories('src/fips-nat')],
+host_sources = files('src/host/main.c')
+host_includes = [core_inc]
+host_c_args = []
+
+if enable_fipsnat
+  host_sources += files('src/fips-nat/fipsnat_ipc.c', 'src/fips-nat/stun.c')
+  host_includes += include_directories('src/fips-nat')
+  host_c_args += ['-DMD_ENABLE_FIPSNAT']
+endif
+
+executable('metadesk-host', host_sources,
+  include_directories : host_includes,
   dependencies : [dep_metadesk],
+  c_args : host_c_args,
   install : true,
 )
 

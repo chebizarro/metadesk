@@ -150,7 +150,10 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
 
 /* Check if an allowlist has been loaded (with at least one entry).
- * When false, the host has no access control configured (open mode).
+ * md_nostr_refresh_allowlist() subscribes asynchronously; before the first
+ * matching relay event arrives this returns false and the host remains in the
+ * documented startup open window. A warning is logged if checked then.
+ * When false after refresh, the host has no access control configured (open mode).
  * When true, only clients on the list should be accepted. */
 bool md_nostr_has_allowlist(const MdNostr *n);
 

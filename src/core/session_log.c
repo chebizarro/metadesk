@@ -196,26 +196,42 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
     if (detail)
         strncpy(entry->detail, detail, sizeof(entry->detail) - 1);
 
-    /* Sign as Nostr event if signer is available */
+    /* Sign as Nostr event if signer is available.  A configured signer
+     * makes signing part of the audit guarantee: surface failures to the
+     * caller instead of silently recording an unsigned entry. */
     char *signed_json = NULL;
+    int sign_status = 0;
     if (log->signer) {
+        sign_status = -1;
         char *pk_hex = NULL;
-        if (md_signer_get_pubkey(log->signer, &pk_hex) == 0 && pk_hex) {
+        if (md_signer_get_pubkey(log->signer, &pk_hex) == MD_SIGNER_OK && pk_hex) {
             char *unsigned_json = build_unsigned_event_json(
                 pk_hex, content, session_id, peer_pubkey, ts);
             if (unsigned_json) {
-                md_signer_sign_event(log->signer, unsigned_json, &signed_json);
+                int sret = md_signer_sign_event(log->signer, unsigned_json, &signed_json);
+                if (sret == MD_SIGNER_OK && signed_json)
+                    sign_status = 0;
                 free(unsigned_json);
             }
             free(pk_hex);
+        }
+        if (sign_status != 0) {
+            fprintf(stderr, "session_log: ERROR: failed to sign %s event\n",
+                    md_session_log_event_name(type));
         }
     }
 
     entry->signed_json = signed_json;
 
-    /* Publish to relays if configured */
+    /* Publish to relays if configured. Publish failures are logged, but the
+     * return value reflects signing status so callers can distinguish audit
+     * signing failures from best-effort relay delivery. */
     if (log->publish && log->nostr && signed_json) {
-        md_nostr_publish_signed_json(log->nostr, signed_json);
+        int pret = md_nostr_publish_signed_json(log->nostr, signed_json);
+        if (pret != 0) {
+            fprintf(stderr, "session_log: WARNING: failed to publish signed %s event\n",
+                    md_session_log_event_name(type));
+        }
     }
 
     /* Advance ring buffer */
@@ -231,7 +247,7 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
             peer_pubkey ? peer_pubkey : "",
             detail ? detail : "(none)");
 
-    return 0;
+    return sign_status;
 }
 
 /* ── Query ───────────────────────────────────────────────────── */

@@ -27,8 +27,10 @@
 #include "signer.h"
 #include "mcp_bridge.h"
 #include "mcp_http.h"
+#ifdef MD_ENABLE_FIPSNAT
 #include "ipc.h"
 #include "fipsnat_ipc.h"
+#endif
 #include "bitrate_ctrl.h"
 #include "session_log.h"
 
@@ -283,8 +285,10 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
-    fprintf(stderr, "\nLegacy NAT traversal (deprecated):\n");
+#ifdef MD_ENABLE_FIPSNAT
+    fprintf(stderr, "\nLegacy NAT traversal (deprecated, compile-time opt-in):\n");
     fprintf(stderr, "  --fips-nat [NAME] Connect to legacy fips-nat IPC (not recommended; default: fips-nat)\n");
+#endif
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -352,8 +356,10 @@ int main(int argc, char **argv) {
     bool mcp_http = false;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
     uint32_t fips_ready_timeout_ms = 10000;
+#ifdef MD_ENABLE_FIPSNAT
     bool use_fipsnat = false;
     const char *fipsnat_ipc_name = "fips-nat";
+#endif
     const char *relay_urls[16];
     int relay_count = 0;
 
@@ -399,9 +405,16 @@ int main(int argc, char **argv) {
                 mcp_http_port = (uint16_t)atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "--fips-nat") == 0) {
+#ifdef MD_ENABLE_FIPSNAT
             use_fipsnat = true;
+            fprintf(stderr, "host: WARNING: --fips-nat is deprecated; prefer the FIPS daemon control path\n");
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 fipsnat_ipc_name = argv[++i];
+#else
+            fprintf(stderr, "ERROR: --fips-nat is deprecated and disabled in this build\n");
+            fprintf(stderr, "  Rebuild with MD_ENABLE_FIPSNAT only for legacy NAT IPC testing.\n");
+            return 1;
+#endif
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -646,6 +659,7 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef MD_ENABLE_FIPSNAT
     /* ── legacy fips-nat IPC connection (deprecated) ───────────── */
     MdIpcConn *fipsnat_conn = NULL;
     if (use_fipsnat) {
@@ -655,7 +669,9 @@ int main(int argc, char **argv) {
             /* Query daemon status */
             char *cmd = md_fipsnat_ipc_cmd_status();
             if (cmd) {
-                md_ipc_send(fipsnat_conn, cmd, strlen(cmd));
+                if (md_ipc_send(fipsnat_conn, cmd, strlen(cmd)) < 0) {
+                    fprintf(stderr, "host: WARNING: failed to send fips-nat status request\n");
+                }
                 free(cmd);
 
                 char resp_buf[MD_IPC_MAX_MSG];
@@ -679,6 +695,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Only start fips-nat manually when testing the legacy NAT IPC path.\n");
         }
     }
+#endif
 
     /* ── MCP agent interface ──────────────────────────────────── */
     if (mcp_stdio || mcp_http) {
@@ -1024,8 +1041,10 @@ int main(int argc, char **argv) {
     if (session_log)
         md_session_log_destroy(session_log);
 
+#ifdef MD_ENABLE_FIPSNAT
     if (fipsnat_conn)
         md_ipc_close(fipsnat_conn);
+#endif
 
     if (nostr) {
         go_channel_close(ctx.session_req_ch);

@@ -75,6 +75,31 @@ uint32_t md_stream_now_ms(void) {
 
 /* ── Internal helpers ────────────────────────────────────────── */
 
+static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
+    short events;
+
+    if (ssl_err == SSL_ERROR_WANT_READ) {
+        events = POLLIN;
+    } else if (ssl_err == SSL_ERROR_WANT_WRITE) {
+        events = POLLOUT;
+    } else {
+        return -1;
+    }
+
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = events };
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr == 0) return 1;   /* timeout */
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return -1;
+        return 0;
+    }
+}
+
 /* Read exactly n bytes, handling partial reads.
  * Uses SSL_read when TLS is active, raw read() otherwise.
  * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
@@ -87,7 +112,14 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
          * OpenSSL may have buffered data internally. */
         if (s->ssl && SSL_pending(s->ssl) > 0) {
             int r = SSL_read(s->ssl, buf + total, (int)(n - total));
-            if (r <= 0) return -1;
+            if (r <= 0) {
+                int err = SSL_get_error(s->ssl, r);
+                if (err == SSL_ERROR_ZERO_RETURN)
+                    return -1;  /* clean TLS close */
+                int wr = ssl_retry_wait(fd, err, timeout_ms > 0 ? (int)timeout_ms : -1);
+                if (wr != 0) return wr;
+                continue;
+            }
             total += (size_t)r;
             continue;
         }
@@ -106,7 +138,14 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
 
         if (s->ssl) {
             int r = SSL_read(s->ssl, buf + total, (int)(n - total));
-            if (r <= 0) return -1;
+            if (r <= 0) {
+                int err = SSL_get_error(s->ssl, r);
+                if (err == SSL_ERROR_ZERO_RETURN)
+                    return -1;  /* clean TLS close */
+                int wr = ssl_retry_wait(fd, err, timeout_ms > 0 ? (int)timeout_ms : -1);
+                if (wr != 0) return wr;
+                continue;
+            }
             total += (size_t)r;
         } else {
             ssize_t r = read(fd, buf + total, n - total);
@@ -128,7 +167,14 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
     while (total < n) {
         if (s->ssl) {
             int w = SSL_write(s->ssl, buf + total, (int)(n - total));
-            if (w <= 0) return -1;
+            if (w <= 0) {
+                int err = SSL_get_error(s->ssl, w);
+                if (err == SSL_ERROR_ZERO_RETURN)
+                    return -1;  /* clean TLS close */
+                int wr = ssl_retry_wait(s->fd, err, -1);
+                if (wr != 0) return -1;
+                continue;
+            }
             total += (size_t)w;
         } else {
             ssize_t w = write(s->fd, buf + total, n - total);
@@ -145,7 +191,10 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
 /* Set TCP_NODELAY to minimize latency (disable Nagle's algorithm). */
 static void set_tcp_nodelay(int fd) {
     int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
+        fprintf(stderr, "stream: warning: failed to set TCP_NODELAY: %s\n",
+                strerror(errno));
+    }
 }
 
 /* Create an MdStream from a connected fd (optionally with TLS). */
