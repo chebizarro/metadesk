@@ -140,12 +140,27 @@ static CGEventFlags modifier_flag_for_keysym(uint32_t keysym) {
 
 /* ── Vtable implementation ───────────────────────────────────── */
 
+static bool cg_dimensions_are_valid(const MdInputConfig *cfg) {
+    return cfg && cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+           cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
+}
+
 static int cg_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+    if (!cg_dimensions_are_valid(cfg)) {
+        fprintf(stderr,
+                "input_cgevent: ERROR — screen dimensions must be configured "
+                "and >= %u (got %ux%u)\n",
+                MD_INPUT_MIN_SCREEN_DIMENSION,
+                cfg ? cfg->screen_width : 0,
+                cfg ? cfg->screen_height : 0);
+        return -1;
+    }
+
     CGEventState *st = calloc(1, sizeof(CGEventState));
     if (!st) return -1;
 
-    st->screen_w = (cfg && cfg->screen_width  > 0) ? cfg->screen_width  : 1920;
-    st->screen_h = (cfg && cfg->screen_height > 0) ? cfg->screen_height : 1080;
+    st->screen_w = cfg->screen_width;
+    st->screen_h = cfg->screen_height;
     st->last_mouse = CGPointMake(0, 0);
 
     ctx->backend_data = st;

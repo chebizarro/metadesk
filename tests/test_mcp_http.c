@@ -43,6 +43,13 @@ static MdMcpServer *make_mcp_server(void)
     return md_mcp_server_create(&cfg);
 }
 
+static void wire_server_to_http(MdMcpServer *mcp, MdMcpHttp *http)
+{
+    assert(md_mcp_server_set_write_fn(mcp,
+                                      md_mcp_http_get_write_fn(http),
+                                      md_mcp_http_get_write_userdata(http)) == 0);
+}
+
 /* ── Helper: raw TCP connect to localhost ─────────────────────── */
 
 static int tcp_connect(uint16_t port)
@@ -187,27 +194,18 @@ static void *server_thread(void *arg)
 
 static void test_post_initialize(void)
 {
-    /* Create HTTP transport first with a temporary MCP server,
-     * then wire the write function properly.
-     * The HTTP handler dispatches to h->mcp_server, which must
-     * have http_write_fn set for TLS-based response routing. */
-    MdMcpServer *temp_mcp = make_mcp_server();
-    assert(temp_mcp != NULL);
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
-        .server = temp_mcp,
+        .server = mcp,
         .port   = port,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     assert(http != NULL);
-
-    /* Now create the real MCP server wired to the HTTP write function,
-     * and swap it in. Since the HTTP handler uses h->mcp_server, which
-     * is temp_mcp, we need to ensure temp_mcp has the right write_fn.
-     * We can't swap servers, so instead we test the lifecycle and
-     * HTTP routing at the transport level. */
+    wire_server_to_http(mcp, http);
 
     /* Start server in background */
     ServerArgs sa = { .http = http, .result = -1 };
@@ -215,10 +213,6 @@ static void test_post_initialize(void)
     pthread_create(&tid, NULL, server_thread, &sa);
     usleep(100000); /* wait for server to start */
 
-    /* Send initialize request — the MCP server dispatch happens inside
-     * handle_client which uses http_write_fn via TLS. But since the MCP
-     * server was created with dummy_write, responses route to dummy.
-     * The HTTP handler falls back to 202 Accepted when TLS has no response. */
     const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
                        "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
                        "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
@@ -235,20 +229,17 @@ static void test_post_initialize(void)
     char response[4096];
     int n = http_request(port, request, response, sizeof(response));
     assert(n > 0);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
-
-    /* The HTTP layer should return a valid HTTP response.
-     * With correct wiring we'd get 200 + JSON-RPC; with dummy write
-     * we get 202 Accepted (no TLS response captured). Either is valid
-     * for testing that the HTTP transport accepts and routes POST. */
-    assert(strstr(response, "HTTP/1.") != NULL);
+    assert(strstr(response, "\"result\"") != NULL);
+    assert(strstr(response, "\"protocolVersion\":\"2025-03-26\"") != NULL);
 
     /* Shutdown */
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
-    md_mcp_server_destroy(temp_mcp);
+    md_mcp_server_destroy(mcp);
 
     PASS("POST /mcp HTTP routing");
 }
@@ -545,6 +536,45 @@ static void test_shutdown(void)
     PASS("shutdown");
 }
 
+static void test_shutdown_closes_sse_clients(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .port   = port,
+    };
+
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    assert(http != NULL);
+
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    usleep(100000);
+
+    char headers[1024];
+    int fd = sse_connect(port, headers, sizeof(headers));
+    assert(fd >= 0);
+    assert(strstr(headers, "text/event-stream") != NULL);
+
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+    assert(sa.result == 0);
+
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    assert(n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET)));
+    close(fd);
+
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+
+    PASS("shutdown closes SSE clients");
+}
+
 /* ── Test: run with NULL returns error ───────────────────────── */
 
 static void test_run_null(void)
@@ -602,6 +632,7 @@ int main(void)
     test_sse_multiline_data();
     test_sse_max_clients_config();
     test_shutdown();
+    test_shutdown_closes_sse_clients();
 
     printf("\nAll HTTP transport tests passed.\n");
     return 0;

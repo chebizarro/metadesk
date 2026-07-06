@@ -117,6 +117,12 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
 
 bool md_mcp_server_is_initialized(const MdMcpServer *server);
 
+/* Update the server transport write callback. Intended for transports that
+ * must be created after the server/bridge exists (for example HTTP). */
+int md_mcp_server_set_write_fn(MdMcpServer *server,
+                               MdMcpWriteFn write_fn,
+                               void *write_userdata);
+
 #ifdef __cplusplus
 }
 #endif

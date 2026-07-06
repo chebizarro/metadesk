@@ -74,6 +74,7 @@ typedef struct {
     int64_t       total_encode_us;
     uint32_t      frames_encoded;
     uint32_t      frames_sent;
+    bool          frame_size_mismatch_warned;
 
     /* Session log for agent monitoring (M2.4) */
     MdSessionLog *session_log;
@@ -160,6 +161,51 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
     }
 }
 
+#define HOST_CAPTURE_SIZE_WAIT_MS 2000
+
+static bool host_dimensions_are_valid(uint32_t width, uint32_t height) {
+    return width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+           height >= MD_INPUT_MIN_SCREEN_DIMENSION;
+}
+
+static void host_apply_fallback_dimensions(uint32_t *width, uint32_t *height,
+                                           const char *reason) {
+    *width = MD_INPUT_FALLBACK_SCREEN_WIDTH;
+    *height = MD_INPUT_FALLBACK_SCREEN_HEIGHT;
+    fprintf(stderr,
+            "host: WARNING: using fallback display dimensions %ux%u (%s)\n",
+            *width, *height,
+            reason ? reason : "actual capture/display size unavailable");
+}
+
+static int host_wait_capture_dimensions(MdCaptureCtx *capture,
+                                        uint32_t *width, uint32_t *height) {
+    if (!capture || !width || !height)
+        return -1;
+
+    for (uint32_t waited_ms = 0; waited_ms <= HOST_CAPTURE_SIZE_WAIT_MS;
+         waited_ms += 10) {
+        uint32_t w = 0, h = 0;
+        if (md_capture_get_size(capture, &w, &h) == 0) {
+            if (host_dimensions_are_valid(w, h)) {
+                *width = w;
+                *height = h;
+                return 0;
+            }
+            fprintf(stderr,
+                    "host: WARNING: capture reported invalid dimensions %ux%u; "
+                    "minimum is %ux%u\n",
+                    w, h,
+                    MD_INPUT_MIN_SCREEN_DIMENSION,
+                    MD_INPUT_MIN_SCREEN_DIMENSION);
+            return -1;
+        }
+        usleep(10000);
+    }
+
+    return -1;
+}
+
 /* ── Capture thread: pull frames and encode ──────────────────── */
 
 typedef struct {
@@ -182,6 +228,20 @@ static void *capture_thread_func(void *arg) {
         pthread_mutex_unlock(&ctx->client_mu);
 
         if (!ctx->encoder || !has_client) {
+            md_capture_release_frame(cap, &frame);
+            continue;
+        }
+
+        uint32_t enc_w = 0, enc_h = 0;
+        if (md_encoder_get_size(ctx->encoder, &enc_w, &enc_h) == 0 &&
+            (frame.width != enc_w || frame.height != enc_h)) {
+            if (!ctx->frame_size_mismatch_warned) {
+                fprintf(stderr,
+                        "host: WARNING: dropping capture frames sized %ux%u; "
+                        "encoder is configured for %ux%u\n",
+                        frame.width, frame.height, enc_w, enc_h);
+                ctx->frame_size_mismatch_warned = true;
+            }
             md_capture_release_frame(cap, &frame);
             continue;
         }
@@ -709,8 +769,12 @@ int main(int argc, char **argv) {
         else
             fprintf(stderr, "host[mcp]: WARNING: a11y unavailable\n");
 
+        uint32_t mcp_screen_w = 0, mcp_screen_h = 0;
+        host_apply_fallback_dimensions(&mcp_screen_w, &mcp_screen_h,
+                                       "MCP mode has no capture pipeline");
         MdInputConfig mcp_input_cfg = {
-            .screen_width = 1920, .screen_height = 1080,
+            .screen_width = mcp_screen_w,
+            .screen_height = mcp_screen_h,
         };
         MdInput *mcp_input = md_input_create(&mcp_input_cfg);
         if (mcp_input && md_input_is_ready(mcp_input))
@@ -747,6 +811,14 @@ int main(int argc, char **argv) {
                 md_mcp_bridge_destroy(mcp_bridge);
                 return 1;
             }
+            if (md_mcp_server_set_write_fn(md_mcp_bridge_get_server(mcp_bridge),
+                                           md_mcp_http_get_write_fn(http),
+                                           md_mcp_http_get_write_userdata(http)) != 0) {
+                fprintf(stderr, "ERROR: failed to bind MCP HTTP transport\n");
+                md_mcp_http_destroy(http);
+                md_mcp_bridge_destroy(mcp_bridge);
+                return 1;
+            }
             uint16_t actual_port = mcp_http_port > 0
                                    ? mcp_http_port
                                    : MD_MCP_HTTP_DEFAULT_PORT;
@@ -775,10 +847,49 @@ int main(int argc, char **argv) {
     }
     printf("host: listening on port %u\n", port);
 
+    /* Start capture first so encoder/input dimensions match the negotiated
+     * capture size instead of assuming a fixed desktop resolution. */
+    MdCaptureCtx *capture = NULL;
+    pthread_t cap_thread = 0;
+    bool cap_thread_started = false;
+    CaptureThread cap_thr_ctx = {0};
+    uint32_t display_width = 0;
+    uint32_t display_height = 0;
+
+    if (do_capture) {
+        MdCaptureConfig cap_cfg = {
+            .target_fps  = fps,
+            .show_cursor = true,
+        };
+        capture = md_capture_create(&cap_cfg);
+        if (!capture) {
+            fprintf(stderr, "WARNING: screen capture unavailable\n");
+        } else if (md_capture_start(capture) < 0) {
+            fprintf(stderr, "WARNING: failed to start capture\n");
+            md_capture_destroy(capture);
+            capture = NULL;
+        } else if (host_wait_capture_dimensions(capture,
+                                                &display_width,
+                                                &display_height) == 0) {
+            printf("host: capture started (%ux%u)\n",
+                   display_width, display_height);
+        } else {
+            host_apply_fallback_dimensions(&display_width, &display_height,
+                                           "capture dimensions not negotiated");
+            printf("host: capture started\n");
+        }
+    }
+
+    if (!host_dimensions_are_valid(display_width, display_height)) {
+        host_apply_fallback_dimensions(&display_width, &display_height,
+                                       do_capture ? "capture unavailable"
+                                                  : "capture disabled");
+    }
+
     /* Initialize encoder (persistent across reconnections) */
     MdEncoderConfig enc_cfg = {
-        .width        = 1920,
-        .height       = 1080,
+        .width        = display_width,
+        .height       = display_height,
         .bitrate      = bitrate,
         .fps          = fps,
         .prefer_nvenc = use_nvenc,
@@ -787,22 +898,25 @@ int main(int argc, char **argv) {
     MdEncoder *encoder = md_encoder_create(&enc_cfg);
     if (!encoder) {
         fprintf(stderr, "ERROR: failed to create encoder\n");
+        if (capture) md_capture_destroy(capture);
         md_stream_server_destroy(srv);
         return 1;
     }
-    printf("host: encoder ready (%s)\n",
-           md_encoder_is_hw(encoder) ? "NVENC" : "x264");
+    printf("host: encoder ready (%s, %ux%u)\n",
+           md_encoder_is_hw(encoder) ? "NVENC" : "x264",
+           display_width, display_height);
 
     /* Initialize input injection (persistent) */
     MdInputConfig input_cfg = {
-        .screen_width  = 1920,
-        .screen_height = 1080,
+        .screen_width  = display_width,
+        .screen_height = display_height,
     };
     MdInput *input = md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
         fprintf(stderr, "WARNING: input injection unavailable\n");
     } else {
-        printf("host: input injection ready\n");
+        printf("host: input injection ready (%ux%u)\n",
+               display_width, display_height);
     }
 
     /* Initialize accessibility tree walker (persistent) */
@@ -826,31 +940,15 @@ int main(int argc, char **argv) {
     ctx.encoder = encoder;
     ctx.agent   = agent;
 
-    /* Start screen capture (persistent — runs independently of clients) */
-    MdCaptureCtx *capture = NULL;
-    pthread_t cap_thread = 0;
-    bool cap_thread_started = false;
-    CaptureThread cap_thr_ctx = {0};
-    if (do_capture) {
-        MdCaptureConfig cap_cfg = {
-            .target_fps  = fps,
-            .show_cursor = true,
-        };
-        capture = md_capture_create(&cap_cfg);
-        if (!capture) {
-            fprintf(stderr, "WARNING: screen capture unavailable\n");
+    /* Capture thread starts only after encoder/input are ready. */
+    if (capture) {
+        cap_thr_ctx.host    = &ctx;
+        cap_thr_ctx.capture = capture;
+        if (pthread_create(&cap_thread, NULL, capture_thread_func,
+                           &cap_thr_ctx) == 0) {
+            cap_thread_started = true;
         } else {
-            if (md_capture_start(capture) < 0) {
-                fprintf(stderr, "WARNING: failed to start capture\n");
-                md_capture_destroy(capture);
-                capture = NULL;
-            } else {
-                printf("host: capture started\n");
-                cap_thr_ctx.host    = &ctx;
-                cap_thr_ctx.capture = capture;
-                if (pthread_create(&cap_thread, NULL, capture_thread_func, &cap_thr_ctx) == 0)
-                    cap_thread_started = true;
-            }
+            fprintf(stderr, "WARNING: failed to start capture thread\n");
         }
     }
 
@@ -890,6 +988,7 @@ int main(int argc, char **argv) {
         ctx.frames_sent = 0;
         ctx.total_encode_us = 0;
         ctx.frames_encoded  = 0;
+        ctx.frame_size_mismatch_warned = false;
 
         /* Send initial UI tree to new client */
         if (agent && a11y) {

@@ -14,6 +14,12 @@
 
 /* ── Server struct ───────────────────────────────────────────── */
 
+typedef enum {
+    MD_MCP_INIT_STATE_NEW = 0,
+    MD_MCP_INIT_STATE_RESPONDED = 1,
+    MD_MCP_INIT_STATE_INITIALIZED = 2,
+} MdMcpInitState;
+
 struct MdMcpServer {
     /* Config */
     char            *server_name;
@@ -22,7 +28,7 @@ struct MdMcpServer {
     void            *write_userdata;
 
     /* State */
-    _Atomic bool     initialized;
+    _Atomic int      init_state;
     pthread_mutex_t  sub_mu;   /* protects subscriptions only */
     pthread_mutex_t  tool_mu;  /* serializes tool handlers with shared state */
 
@@ -105,14 +111,25 @@ static int handle_initialize(MdMcpServer *s, const MdJsonRpcId *id,
     }
     cJSON_AddItemToObject(result, "capabilities", caps);
 
-    return send_json(s, md_jsonrpc_make_response(id, result));
+    int rc = send_json(s, md_jsonrpc_make_response(id, result));
+    if (rc == 0 && atomic_load(&s->init_state) != MD_MCP_INIT_STATE_INITIALIZED)
+        atomic_store(&s->init_state, MD_MCP_INIT_STATE_RESPONDED);
+    return rc;
 }
 
 static int handle_initialized(MdMcpServer *s)
 {
-    /* "initialized" is a notification from the client — mark server ready */
-    s->initialized = true;
-    return 0;
+    /* "initialized" is valid only after we have replied to initialize. */
+    int state = atomic_load(&s->init_state);
+    if (state == MD_MCP_INIT_STATE_RESPONDED ||
+        state == MD_MCP_INIT_STATE_INITIALIZED) {
+        atomic_store(&s->init_state, MD_MCP_INIT_STATE_INITIALIZED);
+        return 0;
+    }
+
+    fprintf(stderr,
+            "mcp: ignoring initialized notification before initialize\n");
+    return -1;
 }
 
 static int handle_ping(MdMcpServer *s, const MdJsonRpcId *id)
@@ -325,7 +342,7 @@ int md_mcp_server_handle_message(MdMcpServer *server,
 
     int rc = 0;
 
-    /* "initialized" notification — always allowed */
+    /* "initialized" notification — accepted only after initialize response. */
     if (strcmp(req.method, "notifications/initialized") == 0 ||
         strcmp(req.method, "initialized") == 0) {
         rc = handle_initialized(server);
@@ -333,15 +350,15 @@ int md_mcp_server_handle_message(MdMcpServer *server,
         return rc;
     }
 
-    /* "initialize" — always allowed (it's what sets initialized=true) */
+    /* "initialize" starts the MCP handshake and is allowed before ready. */
     if (strcmp(req.method, "initialize") == 0) {
         rc = handle_initialize(server, &req.id, req.params);
         md_jsonrpc_request_free(&req);
         return rc;
     }
 
-    /* All other methods require initialization (atomic read) */
-    if (!server->initialized) {
+    /* All other methods require the full initialize → initialized handshake. */
+    if (atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED) {
         if (!md_jsonrpc_is_notification(&req)) {
             rc = send_error(server, &req.id, MD_JSONRPC_INTERNAL_ERROR,
                             "Server not initialized");
@@ -388,7 +405,8 @@ int md_mcp_server_handle_message(MdMcpServer *server,
 int md_mcp_server_notify_resource_updated(MdMcpServer *server,
                                           const char *uri)
 {
-    if (!server || !uri || !server->initialized)
+    if (!server || !uri ||
+        atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED)
         return -1;
 
     /* Check if subscribed (protected by sub_mu) */
@@ -425,7 +443,7 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->server_version = strdup(config->server_version ? config->server_version : "0.1.0");
     s->write_fn = config->write_fn;
     s->write_userdata = config->write_userdata;
-    s->initialized = false;
+    atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
     pthread_mutex_init(&s->sub_mu, NULL);
     pthread_mutex_init(&s->tool_mu, NULL);
 
@@ -520,5 +538,18 @@ int md_mcp_server_register_resource(MdMcpServer *server,
 
 bool md_mcp_server_is_initialized(const MdMcpServer *server)
 {
-    return server ? server->initialized : false;
+    return server &&
+           atomic_load(&server->init_state) == MD_MCP_INIT_STATE_INITIALIZED;
+}
+
+int md_mcp_server_set_write_fn(MdMcpServer *server,
+                               MdMcpWriteFn write_fn,
+                               void *write_userdata)
+{
+    if (!server || !write_fn)
+        return -1;
+
+    server->write_fn = write_fn;
+    server->write_userdata = write_userdata;
+    return 0;
 }

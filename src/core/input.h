@@ -16,6 +16,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Documented fallback used only when callers cannot provide/display-detect
+ * dimensions. Callers should pass the capture/display size whenever possible. */
+#define MD_INPUT_FALLBACK_SCREEN_WIDTH   1920u
+#define MD_INPUT_FALLBACK_SCREEN_HEIGHT  1080u
+#define MD_INPUT_MIN_SCREEN_DIMENSION    64u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -77,8 +83,9 @@ const MdInputBackend *md_input_backend_create(void);
 typedef MdInputCtx MdInput;
 
 /* Create and initialise an input context with the platform backend.
- * cfg may be NULL (defaults to 1920×1080).
- * Returns NULL on failure. */
+ * cfg may be NULL only for legacy callers; that uses the documented
+ * fallback dimensions above and logs a warning. Prefer passing actual
+ * capture/display dimensions. Returns NULL on failure. */
 MdInput *md_input_create(const MdInputConfig *cfg);
 
 /* ── Mouse injection ─────────────────────────────────────────── */

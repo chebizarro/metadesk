@@ -9,7 +9,6 @@
  */
 #include "input.h"
 #include "action.h"
-#include "action.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -138,6 +137,21 @@ uint32_t md_input_keysym_from_name(const char *name) {
 
 /* ── Public convenience API ──────────────────────────────────── */
 
+static bool input_dimensions_are_valid(uint32_t width, uint32_t height) {
+    return width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+           height >= MD_INPUT_MIN_SCREEN_DIMENSION;
+}
+
+static void input_apply_fallback_dimensions(MdInputConfig *cfg,
+                                            const char *reason) {
+    cfg->screen_width = MD_INPUT_FALLBACK_SCREEN_WIDTH;
+    cfg->screen_height = MD_INPUT_FALLBACK_SCREEN_HEIGHT;
+    fprintf(stderr,
+            "input: WARNING — using fallback screen dimensions %ux%u (%s)\n",
+            cfg->screen_width, cfg->screen_height,
+            reason ? reason : "actual display dimensions unavailable");
+}
+
 MdInput *md_input_create(const MdInputConfig *cfg) {
     const MdInputBackend *vtable = md_input_backend_create();
     if (!vtable) return NULL;
@@ -149,9 +163,13 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
 
     if (cfg) {
         inp->config = *cfg;
+        if (!input_dimensions_are_valid(inp->config.screen_width,
+                                        inp->config.screen_height)) {
+            input_apply_fallback_dimensions(&inp->config,
+                                            "configured dimensions below minimum");
+        }
     } else {
-        inp->config.screen_width  = 1920;
-        inp->config.screen_height = 1080;
+        input_apply_fallback_dimensions(&inp->config, "config is NULL");
     }
 
     if (inp->vtable->init(inp, &inp->config) != 0) {

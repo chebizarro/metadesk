@@ -156,6 +156,27 @@ static void test_reject_before_init(void)
     PASS("reject calls before initialize");
 }
 
+static void test_initialized_before_initialize_ignored(void)
+{
+    MdMcpServer *s = make_server();
+
+    const char *initialized = "{\"jsonrpc\":\"2.0\","
+                              "\"method\":\"notifications/initialized\"}";
+    md_mcp_server_handle_message(s, initialized, strlen(initialized));
+    assert(!md_mcp_server_is_initialized(s));
+    assert(g_response_count == 0);
+
+    const char *ping = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}";
+    md_mcp_server_handle_message(s, ping, strlen(ping));
+
+    cJSON *resp = last_response();
+    assert(cJSON_GetObjectItem(resp, "error") != NULL);
+    cJSON_Delete(resp);
+
+    md_mcp_server_destroy(s);
+    PASS("initialized notification before initialize is ignored");
+}
+
 static void test_ping(void)
 {
     MdMcpServer *s = make_server();
@@ -728,6 +749,7 @@ int main(void)
 
     test_initialize();
     test_reject_before_init();
+    test_initialized_before_initialize_ignored();
     test_ping();
     test_tools_list();
     test_tools_call();

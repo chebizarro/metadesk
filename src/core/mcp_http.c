@@ -50,22 +50,99 @@ struct MdMcpHttp {
 /* ── Thread-local response capture ───────────────────────────
  * handle_message() calls write_fn synchronously on the calling
  * thread, so TLS gives us per-request response isolation without
- * any shared mutable state. */
-static _Thread_local char *tls_response = NULL;
+ * shared mutable state. A request may write more than once (for
+ * example a response plus an immediate notification), so capture all
+ * writes and return a JSON array when multiple messages are emitted. */
+typedef struct {
+    char  **items;
+    size_t  count;
+    size_t  cap;
+    bool    failed;
+} HttpResponseCapture;
+
+static _Thread_local HttpResponseCapture *tls_capture = NULL;
+
+static int capture_append(HttpResponseCapture *cap, const char *json, size_t len)
+{
+    if (!cap)
+        return 0;
+
+    if (cap->count == cap->cap) {
+        size_t new_cap = cap->cap ? cap->cap * 2 : 4;
+        char **new_items = realloc(cap->items, new_cap * sizeof(*new_items));
+        if (!new_items) {
+            cap->failed = true;
+            return -1;
+        }
+        cap->items = new_items;
+        cap->cap = new_cap;
+    }
+
+    cap->items[cap->count] = strndup(json, len);
+    if (!cap->items[cap->count]) {
+        cap->failed = true;
+        return -1;
+    }
+    cap->count++;
+    return 0;
+}
+
+static char *capture_take_body(HttpResponseCapture *cap)
+{
+    if (!cap || cap->count == 0)
+        return NULL;
+
+    if (cap->count == 1) {
+        char *body = cap->items[0];
+        cap->items[0] = NULL;
+        return body;
+    }
+
+    size_t total = 3; /* '[' + ']' + NUL */
+    for (size_t i = 0; i < cap->count; i++)
+        total += strlen(cap->items[i]) + (i > 0 ? 1 : 0);
+
+    char *body = malloc(total);
+    if (!body) {
+        cap->failed = true;
+        return NULL;
+    }
+
+    char *p = body;
+    *p++ = '[';
+    for (size_t i = 0; i < cap->count; i++) {
+        if (i > 0)
+            *p++ = ',';
+        size_t len = strlen(cap->items[i]);
+        memcpy(p, cap->items[i], len);
+        p += len;
+    }
+    *p++ = ']';
+    *p = '\0';
+    return body;
+}
+
+static void capture_free(HttpResponseCapture *cap)
+{
+    if (!cap) return;
+    for (size_t i = 0; i < cap->count; i++)
+        free(cap->items[i]);
+    free(cap->items);
+    memset(cap, 0, sizeof(*cap));
+}
 
 static int http_write_fn(const char *json, size_t len, void *userdata)
 {
     MdMcpHttp *h = (MdMcpHttp *)userdata;
-    if (!h) return -1;
+    if (!h || !json) return -1;
 
-    /* Capture response for the calling POST handler (same thread) */
-    free(tls_response);
-    tls_response = strndup(json, len);
+    int rc = capture_append(tls_capture, json, len);
 
     /* Also broadcast as SSE to all subscribed clients */
-    md_mcp_http_send_sse(h, "message", json, len);
+    if (md_mcp_http_send_sse(h, "message", json, len) < 0)
+        rc = -1;
 
-    return 0;
+    return rc;
 }
 
 /* ── HTTP response helpers ───────────────────────────────────── */
@@ -330,14 +407,21 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             send_http_response(client_fd, 400, "Bad Request",
                                "text/plain", "Empty body\n", 11);
         } else {
-            /* Dispatch to MCP server — write_fn stores response in TLS */
-            tls_response = NULL;
+            /* Dispatch to MCP server — write_fn captures this request's
+             * synchronous response(s) through thread-local storage. */
+            HttpResponseCapture capture = {0};
+            tls_capture = &capture;
             md_mcp_server_handle_message(h->mcp_server, req.body, req.body_len);
+            tls_capture = NULL;
 
-            char *resp = tls_response;
-            tls_response = NULL;
+            char *resp = capture_take_body(&capture);
+            bool capture_failed = capture.failed;
+            capture_free(&capture);
 
-            if (resp) {
+            if (capture_failed) {
+                send_http_response(client_fd, 500, "Internal Server Error",
+                                   "text/plain", "Response capture failed\n", 24);
+            } else if (resp) {
                 send_http_response(client_fd, 200, "OK",
                                    "application/json", resp, strlen(resp));
                 free(resp);
@@ -451,6 +535,17 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
 
     pthread_mutex_unlock(&http->sse_mu);
     return 0;
+}
+
+static void close_sse_clients(MdMcpHttp *http)
+{
+    if (!http) return;
+
+    pthread_mutex_lock(&http->sse_mu);
+    for (int i = 0; i < http->sse_count; i++)
+        close(http->sse_clients[i]);
+    http->sse_count = 0;
+    pthread_mutex_unlock(&http->sse_mu);
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
@@ -582,7 +677,9 @@ int md_mcp_http_run(MdMcpHttp *http)
 
 void md_mcp_http_shutdown(MdMcpHttp *http)
 {
-    if (http) atomic_store(&http->shutdown, true);
+    if (!http) return;
+    atomic_store(&http->shutdown, true);
+    close_sse_clients(http);
 }
 
 MdMcpWriteFn md_mcp_http_get_write_fn(MdMcpHttp *http)
@@ -605,11 +702,7 @@ void md_mcp_http_destroy(MdMcpHttp *http)
     go_wait_group_destroy(&http->handler_wg);
 
     /* Close SSE clients */
-    pthread_mutex_lock(&http->sse_mu);
-    for (int i = 0; i < http->sse_count; i++)
-        close(http->sse_clients[i]);
-    http->sse_count = 0;
-    pthread_mutex_unlock(&http->sse_mu);
+    close_sse_clients(http);
 
     if (http->listen_fd >= 0)
         close(http->listen_fd);

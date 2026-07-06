@@ -141,12 +141,27 @@ static bool is_extended_key(WORD vk) {
 
 /* ── Vtable implementation ───────────────────────────────────── */
 
+static bool si_dimensions_are_valid(const MdInputConfig *cfg) {
+    return cfg && cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+           cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
+}
+
 static int si_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+    if (!si_dimensions_are_valid(cfg)) {
+        fprintf(stderr,
+                "input_sendinput: ERROR — screen dimensions must be configured "
+                "and >= %u (got %ux%u)\n",
+                MD_INPUT_MIN_SCREEN_DIMENSION,
+                cfg ? cfg->screen_width : 0,
+                cfg ? cfg->screen_height : 0);
+        return -1;
+    }
+
     auto *st = (SendInputState *)calloc(1, sizeof(SendInputState));
     if (!st) return -1;
 
-    st->screen_w = (cfg && cfg->screen_width  > 0) ? cfg->screen_width  : 1920;
-    st->screen_h = (cfg && cfg->screen_height > 0) ? cfg->screen_height : 1080;
+    st->screen_w = cfg->screen_width;
+    st->screen_h = cfg->screen_height;
 
     ctx->backend_data = st;
     ctx->ready = true;
@@ -155,7 +170,9 @@ static int si_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
 
 static int si_mouse_move(MdInputCtx *ctx, int x, int y) {
     auto *st = (SendInputState *)ctx->backend_data;
-    if (!st) return -1;
+    if (!st || st->screen_w < MD_INPUT_MIN_SCREEN_DIMENSION ||
+        st->screen_h < MD_INPUT_MIN_SCREEN_DIMENSION)
+        return -1;
 
     /* Convert to absolute coordinates (0–65535 range) */
     int ax = (int)(((long long)x * 65535) / (long long)(st->screen_w - 1));
