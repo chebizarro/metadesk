@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 static void test_header_round_trip(void) {
     MdPacketHeader hdr_out = {
@@ -58,6 +59,16 @@ static void test_packet_encode_decode(void) {
     printf("  PASS: packet encode/decode\n");
 }
 
+static void test_packet_encode_rejects_int_overflow(void) {
+    uint8_t buf[MD_PACKET_HEADER_SIZE];
+    int ret = md_packet_encode(MD_PKT_VIDEO_FRAME, 1, 2,
+                               NULL, (uint32_t)INT_MAX,
+                               buf, (size_t)INT_MAX + MD_PACKET_HEADER_SIZE + 1u);
+    assert(ret == -1);
+
+    printf("  PASS: packet encode int overflow rejected\n");
+}
+
 static void test_bad_version(void) {
     uint8_t buf[MD_PACKET_HEADER_SIZE] = {0};
     buf[0] = 99; /* bad version */
@@ -82,6 +93,7 @@ int main(void) {
     printf("test_packet:\n");
     test_header_round_trip();
     test_packet_encode_decode();
+    test_packet_encode_rejects_int_overflow();
     test_bad_version();
     test_buffer_too_small();
     printf("All packet tests passed.\n");

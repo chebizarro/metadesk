@@ -17,6 +17,7 @@
 #include <libavutil/pixfmt.h>
 #include <libyuv.h>
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -76,8 +77,14 @@ static int ensure_rgba_buf(MdDecoder *dec, uint32_t width, uint32_t height) {
     if (dec->rgba_width == width && dec->rgba_height == height && dec->rgba_buf)
         return 0;
 
-    uint32_t stride = width * 4;
-    size_t size = (size_t)stride * height;
+    if (width == 0 || height == 0 || width > (uint32_t)(INT_MAX / 4))
+        return -1;
+
+    size_t stride_size = (size_t)width * 4u;
+    if (stride_size > (size_t)UINT32_MAX || height > SIZE_MAX / stride_size)
+        return -1;
+
+    size_t size = stride_size * (size_t)height;
 
     uint8_t *buf = realloc(dec->rgba_buf, size);
     if (!buf)
@@ -86,7 +93,7 @@ static int ensure_rgba_buf(MdDecoder *dec, uint32_t width, uint32_t height) {
     dec->rgba_buf    = buf;
     dec->rgba_width  = width;
     dec->rgba_height = height;
-    dec->rgba_stride = stride;
+    dec->rgba_stride = (uint32_t)stride_size;
     dec->rgba_size   = size;
     return 0;
 }
@@ -102,6 +109,11 @@ static int receive_frames(MdDecoder *dec, MdDecodeCallback cb, void *userdata) {
             break;
         if (ret < 0)
             return -1;
+
+        if (dec->frame->width <= 0 || dec->frame->height <= 0) {
+            av_frame_unref(dec->frame);
+            return -1;
+        }
 
         uint32_t w = (uint32_t)dec->frame->width;
         uint32_t h = (uint32_t)dec->frame->height;
@@ -197,6 +209,9 @@ int md_decoder_submit(MdDecoder *dec, const uint8_t *data,
      * av_new_packet (which allocates + copies) to keep the caller's
      * buffer ownership clean and avoid dangling pointer issues. */
     av_packet_unref(dec->pkt);
+
+    if (size > (size_t)INT_MAX)
+        return -1;
 
     int ret = av_new_packet(dec->pkt, (int)size);
     if (ret < 0)

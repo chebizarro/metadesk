@@ -22,6 +22,8 @@
 #include <libavutil/pixfmt.h>
 #include <libyuv.h>
 
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +43,29 @@ struct MdEncoder {
     void                *cb_userdata;
 };
 
+/* ── FFmpeg option helpers ───────────────────────────────────── */
+
+static void warn_opt_failure(const char *codec_name, const char *opt_name, int ret) {
+    if (ret < 0) {
+        fprintf(stderr, "encode: warning: %s option '%s' failed: %d\n",
+                codec_name ? codec_name : "encoder", opt_name, ret);
+    }
+}
+
+static int set_opt_warn(void *obj, const char *codec_name,
+                        const char *opt_name, const char *value, int flags) {
+    int ret = av_opt_set(obj, opt_name, value, flags);
+    warn_opt_failure(codec_name, opt_name, ret);
+    return ret;
+}
+
+static int set_opt_int_warn(void *obj, const char *codec_name,
+                            const char *opt_name, int64_t value, int flags) {
+    int ret = av_opt_set_int(obj, opt_name, value, flags);
+    warn_opt_failure(codec_name, opt_name, ret);
+    return ret;
+}
+
 /* ── Colorspace conversion helpers (libyuv) ──────────────────── */
 
 /*
@@ -51,9 +76,16 @@ static int convert_to_nv12(const uint8_t *src, uint32_t stride,
                            MdPixFmt fmt, uint32_t width, uint32_t height,
                            uint8_t *dst_y, int dst_stride_y,
                            uint8_t *dst_uv, int dst_stride_uv) {
+    if (!src || !dst_y || !dst_uv || width == 0 || height == 0 ||
+        width > (uint32_t)INT_MAX || height > (uint32_t)INT_MAX ||
+        stride > (uint32_t)INT_MAX)
+        return -1;
+
     switch (fmt) {
     case MD_PIX_FMT_BGRX:
     case MD_PIX_FMT_BGRA:
+        if ((size_t)stride < (size_t)width * 4u)
+            return -1;
         /* libyuv: ARGBToNV12 expects BGRA/BGRx (it calls it "ARGB" in
          * little-endian convention: memory order B-G-R-A) */
         return ARGBToNV12(src, (int)stride,
@@ -63,6 +95,8 @@ static int convert_to_nv12(const uint8_t *src, uint32_t stride,
 
     case MD_PIX_FMT_RGBX:
     case MD_PIX_FMT_RGBA:
+        if ((size_t)stride < (size_t)width * 4u)
+            return -1;
         /* libyuv calls this "ABGR" in its naming convention */
         return ABGRToNV12(src, (int)stride,
                           dst_y, dst_stride_y,
@@ -70,12 +104,30 @@ static int convert_to_nv12(const uint8_t *src, uint32_t stride,
                           (int)width, (int)height);
 
     case MD_PIX_FMT_NV12:
-        /* Already NV12 — just copy planes */
+        /* Already NV12 — copy source planes row-by-row using the caller's
+         * stride. Do not assume the source has FFmpeg's aligned linesizes. */
+        if ((height % 2u) != 0 || stride < width ||
+            dst_stride_y < (int)width || dst_stride_uv < (int)width)
+            return -1;
+        if ((size_t)height > SIZE_MAX / (size_t)stride)
+            return -1;
         {
-            int y_size = dst_stride_y * (int)height;
-            int uv_size = dst_stride_uv * ((int)height / 2);
-            memcpy(dst_y, src, (size_t)y_size);
-            memcpy(dst_uv, src + y_size, (size_t)uv_size);
+            for (uint32_t y = 0; y < height; y++) {
+                uint8_t *dst_row = dst_y + (size_t)y * (size_t)dst_stride_y;
+                memcpy(dst_row, src + (size_t)y * (size_t)stride, (size_t)width);
+                if (dst_stride_y > (int)width) {
+                    memset(dst_row + width, 0, (size_t)dst_stride_y - (size_t)width);
+                }
+            }
+
+            const uint8_t *src_uv = src + (size_t)stride * (size_t)height;
+            for (uint32_t y = 0; y < height / 2u; y++) {
+                uint8_t *dst_row = dst_uv + (size_t)y * (size_t)dst_stride_uv;
+                memcpy(dst_row, src_uv + (size_t)y * (size_t)stride, (size_t)width);
+                if (dst_stride_uv > (int)width) {
+                    memset(dst_row + width, 128, (size_t)dst_stride_uv - (size_t)width);
+                }
+            }
         }
         return 0;
     }
@@ -140,34 +192,34 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
     /* Codec-specific options */
     if (strcmp(codec_name, "h264_nvenc") == 0) {
         /* NVENC: spec §9 parameters */
-        av_opt_set(ctx->priv_data, "preset",        "p1",  0);
-        av_opt_set(ctx->priv_data, "tune",          "ull", 0);
-        av_opt_set(ctx->priv_data, "rc",            "cbr", 0);
-        av_opt_set(ctx->priv_data, "zerolatency",   "1",   0);
-        av_opt_set(ctx->priv_data, "b_adapt",       "0",   0);
-        av_opt_set_int(ctx->priv_data, "intra-refresh", 1, 0);
+        set_opt_warn(ctx->priv_data, codec_name, "preset",        "p1",  0);
+        set_opt_warn(ctx->priv_data, codec_name, "tune",          "ull", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "rc",            "cbr", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "zerolatency",   "1",   0);
+        set_opt_warn(ctx->priv_data, codec_name, "b_adapt",       "0",   0);
+        set_opt_int_warn(ctx->priv_data, codec_name, "intra-refresh", 1, 0);
 
         /* Tell FFmpeg we're okay with delay=0 output */
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "h264_amf") == 0) {
         /* AMF: spec §9 — AMD hardware encoder */
-        av_opt_set(ctx->priv_data, "usage",       "ultralowlatency", 0);
-        av_opt_set(ctx->priv_data, "quality",     "speed", 0);
-        av_opt_set(ctx->priv_data, "rc",          "cbr",  0);
-        av_opt_set_int(ctx->priv_data, "header_spacing", -1, 0); /* SPS/PPS with every IDR */
+        set_opt_warn(ctx->priv_data, codec_name, "usage",       "ultralowlatency", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "quality",     "speed", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "rc",          "cbr",  0);
+        set_opt_int_warn(ctx->priv_data, codec_name, "header_spacing", -1, 0); /* SPS/PPS with every IDR */
 
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "h264_videotoolbox") == 0) {
         /* VideoToolbox: spec §9.2 parameters */
-        av_opt_set(ctx->priv_data, "realtime",    "true", 0);
-        av_opt_set(ctx->priv_data, "allow_sw",    "0",    0);
-        av_opt_set(ctx->priv_data, "profile",     "high", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "realtime",    "true", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "allow_sw",    "0",    0);
+        set_opt_warn(ctx->priv_data, codec_name, "profile",     "high", 0);
 
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "libx264") == 0) {
         /* x264 software fallback: ultrafast + zerolatency */
-        av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
-        av_opt_set(ctx->priv_data, "tune",   "zerolatency", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "preset", "ultrafast", 0);
+        set_opt_warn(ctx->priv_data, codec_name, "tune",   "zerolatency", 0);
 
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
@@ -193,6 +245,10 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
 
 MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
     if (!cfg || cfg->width == 0 || cfg->height == 0)
+        return NULL;
+
+    if (cfg->width > (uint32_t)INT_MAX || cfg->height > (uint32_t)INT_MAX ||
+        cfg->fps > (uint32_t)INT_MAX)
         return NULL;
 
     /* Width and height must be even for NV12 */
@@ -265,9 +321,16 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
         return NULL;
     }
 
-    av_image_fill_arrays(enc->frame->data, enc->frame->linesize,
-                         enc->nv12_buf, AV_PIX_FMT_NV12,
-                         (int)cfg->width, (int)cfg->height, 32);
+    int fill_ret = av_image_fill_arrays(enc->frame->data, enc->frame->linesize,
+                                        enc->nv12_buf, AV_PIX_FMT_NV12,
+                                        (int)cfg->width, (int)cfg->height, 32);
+    if (fill_ret < 0) {
+        av_free(enc->nv12_buf);
+        av_frame_free(&enc->frame);
+        avcodec_free_context(&enc->ctx);
+        free(enc);
+        return NULL;
+    }
 
     /* Allocate reusable output packet */
     enc->pkt = av_packet_alloc();
@@ -289,6 +352,8 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
     if (!enc || !data || !enc->ctx)
         return -1;
 
+    (void)pts;
+
     enc->cb = cb;
     enc->cb_userdata = userdata;
 
@@ -298,16 +363,22 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
                               (uint32_t)enc->ctx->height,
                               enc->frame->data[0], enc->frame->linesize[0],
                               enc->frame->data[1], enc->frame->linesize[1]);
-    if (ret < 0)
+    if (ret < 0) {
+        enc->cb = NULL;
+        enc->cb_userdata = NULL;
         return -1;
+    }
 
     /* Set PTS. FFmpeg expects PTS in the codec's time_base. */
     enc->frame->pts = enc->frame_idx++;
 
     /* Send frame to encoder */
     ret = avcodec_send_frame(enc->ctx, enc->frame);
-    if (ret < 0)
+    if (ret < 0) {
+        enc->cb = NULL;
+        enc->cb_userdata = NULL;
         return -1;
+    }
 
     /* Receive any available encoded packets */
     ret = receive_packets(enc);
@@ -330,8 +401,11 @@ int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata) {
 
     /* Send NULL frame to signal end of stream */
     int ret = avcodec_send_frame(enc->ctx, NULL);
-    if (ret < 0 && ret != AVERROR_EOF)
+    if (ret < 0 && ret != AVERROR_EOF) {
+        enc->cb = NULL;
+        enc->cb_userdata = NULL;
         return -1;
+    }
 
     /* Drain all remaining packets */
     ret = receive_packets(enc);
@@ -360,11 +434,8 @@ int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
 
     uint32_t br = clamp_bitrate(new_bitrate);
 
-    /* Update the codec context's bit_rate — this is the primary knob
-     * that all FFmpeg H.264 encoders check. */
-    enc->ctx->bit_rate = (int64_t)br;
-
-    /* Codec-specific runtime reconfiguration */
+    /* Codec-specific runtime reconfiguration. Apply private options before
+     * mutating public context/config state so failures are reported cleanly. */
     const char *name = enc->codec ? enc->codec->name : "";
 
     if (strcmp(name, "h264_nvenc") == 0) {
@@ -374,7 +445,9 @@ int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
          */
         char br_str[32];
         snprintf(br_str, sizeof(br_str), "%u", br);
-        av_opt_set(enc->ctx->priv_data, "b", br_str, 0);
+        int opt_ret = set_opt_warn(enc->ctx->priv_data, name, "b", br_str, 0);
+        if (opt_ret < 0)
+            return -1;
         /* Also update rc_max_rate for CBR consistency */
         enc->ctx->rc_max_rate = (int64_t)br;
 
@@ -391,7 +464,9 @@ int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
          */
         char br_str[32];
         snprintf(br_str, sizeof(br_str), "%u", br);
-        av_opt_set(enc->ctx->priv_data, "b", br_str, 0);
+        int opt_ret = set_opt_warn(enc->ctx->priv_data, name, "b", br_str, 0);
+        if (opt_ret < 0)
+            return -1;
         enc->ctx->rc_max_rate = (int64_t)br;
 
     } else if (strcmp(name, "libx264") == 0) {
@@ -403,6 +478,10 @@ int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
         enc->ctx->rc_max_rate = (int64_t)br;
         enc->ctx->rc_buffer_size = (int)(br * 2);  /* 2-second VBV buffer */
     }
+
+    /* Update the codec context's bit_rate — this is the primary knob
+     * that all FFmpeg H.264 encoders check. */
+    enc->ctx->bit_rate = (int64_t)br;
 
     /* Update stored config */
     enc->config.bitrate = br;

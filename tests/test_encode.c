@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 static int g_encoded_count;
 static int g_decoded_count;
@@ -91,6 +92,59 @@ static int test_encoder_create(void) {
 
     printf("OK (%s)\n", md_encoder_is_hw(enc) ? "NVENC" : "x264");
     md_encoder_destroy(enc);
+    return 0;
+}
+
+/* ── Test: reject dimensions that cannot fit FFmpeg int fields ── */
+
+static int test_encoder_create_rejects_int_overflow(void) {
+    printf("  test_encoder_create_rejects_int_overflow... ");
+
+    MdEncoderConfig cfg = {
+        .width = (uint32_t)INT_MAX + 1u,
+        .height = 2,
+        .bitrate = MD_ENCODER_DEFAULT_BITRATE,
+        .fps = 30,
+    };
+    assert(md_encoder_create(&cfg) == NULL);
+
+    cfg.width = 2;
+    cfg.height = (uint32_t)INT_MAX + 1u;
+    assert(md_encoder_create(&cfg) == NULL);
+
+    cfg.height = 2;
+    cfg.fps = (uint32_t)INT_MAX + 1u;
+    assert(md_encoder_create(&cfg) == NULL);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: encode input stride validation ────────────────────── */
+
+static int test_encoder_submit_rejects_short_stride(void) {
+    printf("  test_encoder_submit_rejects_short_stride... ");
+
+    MdEncoderConfig cfg = {
+        .width = 64,
+        .height = 64,
+        .bitrate = MD_ENCODER_DEFAULT_BITRATE,
+        .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    assert(enc != NULL);
+
+    uint8_t *buf = calloc(1, (size_t)cfg.width * cfg.height * 4u);
+    assert(buf != NULL);
+
+    assert(md_encoder_submit(enc, buf, cfg.width * 4u - 1u, MD_PIX_FMT_BGRX,
+                             0, NULL, NULL) == -1);
+    assert(md_encoder_submit(enc, buf, cfg.width - 1u, MD_PIX_FMT_NV12,
+                             0, NULL, NULL) == -1);
+
+    free(buf);
+    md_encoder_destroy(enc);
+    printf("OK\n");
     return 0;
 }
 
@@ -228,6 +282,22 @@ static int test_decoder_create(void) {
 
     printf("OK\n");
     md_decoder_destroy(dec);
+    return 0;
+}
+
+/* ── Test: oversized decoder submissions are rejected ─────────── */
+
+static int test_decoder_submit_oversized(void) {
+    printf("  test_decoder_submit_oversized... ");
+
+    MdDecoder *dec = md_decoder_create();
+    assert(dec != NULL);
+
+    uint8_t byte = 0;
+    assert(md_decoder_submit(dec, &byte, (size_t)INT_MAX + 1u, 0) == -1);
+
+    md_decoder_destroy(dec);
+    printf("OK\n");
     return 0;
 }
 
@@ -591,9 +661,12 @@ int main(void) {
 
     int failures = 0;
     failures += test_encoder_create();
+    failures += test_encoder_create_rejects_int_overflow();
+    failures += test_encoder_submit_rejects_short_stride();
     failures += test_encode_frames();
     failures += test_decoder_create();
     failures += test_roundtrip();
+    failures += test_decoder_submit_oversized();
     failures += test_decoder_destroy_null();
     failures += test_encoder_destroy_null();
     failures += test_decoder_poll_empty();

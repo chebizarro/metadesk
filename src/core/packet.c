@@ -3,6 +3,7 @@
  * Wire format encode/decode. See spec §3.1.
  */
 #include "packet.h"
+#include <limits.h>
 #include <string.h>
 
 /* Little-endian helpers */
@@ -61,9 +62,12 @@ int md_packet_header_read(MdPacketHeader *hdr, const uint8_t *buf, size_t buf_le
 int md_packet_encode(uint8_t type, uint32_t seq, uint32_t ts_ms,
                      const uint8_t *payload, uint32_t payload_len,
                      uint8_t *buf, size_t buf_len) {
-    /* Guard against integer overflow: cast to size_t before addition */
+    /* Guard against integer overflow/truncation: return type is int. */
+    if ((size_t)payload_len > SIZE_MAX - (size_t)MD_PACKET_HEADER_SIZE)
+        return -1;
+
     size_t total = (size_t)MD_PACKET_HEADER_SIZE + (size_t)payload_len;
-    if (buf_len < total)
+    if (total > (size_t)INT_MAX || buf_len < total)
         return -1;
 
     MdPacketHeader hdr = {
@@ -82,7 +86,7 @@ int md_packet_encode(uint8_t type, uint32_t seq, uint32_t ts_ms,
     if (payload && payload_len > 0)
         memcpy(buf + MD_PACKET_HEADER_SIZE, payload, payload_len);
 
-    return (int)(MD_PACKET_HEADER_SIZE + payload_len);
+    return (int)total;
 }
 
 int md_packet_decode(const uint8_t *buf, size_t buf_len,
