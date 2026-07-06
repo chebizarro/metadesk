@@ -42,11 +42,20 @@
 #include <pthread.h>
 #include <go.h>
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 
 static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+static void install_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 }
 
 /* ── State shared between capture callback and main loop ─────── */
@@ -54,6 +63,7 @@ static void signal_handler(int sig) {
 typedef struct {
     MdEncoder    *encoder;
     MdStream     *client;
+    pthread_mutex_t client_mu;  /* protects client pointer lifetime */
     MdAgent      *agent;
     MdNostr      *nostr;
     MdSession    *session;
@@ -78,14 +88,20 @@ typedef struct {
 
 static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
     HostCtx *ctx = userdata;
-    if (!ctx->client || !md_stream_is_connected(ctx->client))
-        return;
 
-    int ret = md_stream_send(ctx->client, MD_PKT_VIDEO_FRAME,
+    pthread_mutex_lock(&ctx->client_mu);
+    MdStream *client = ctx->client;
+    if (!client || !md_stream_is_connected(client)) {
+        pthread_mutex_unlock(&ctx->client_mu);
+        return;
+    }
+
+    int ret = md_stream_send(client, MD_PKT_VIDEO_FRAME,
                              ctx->pkt_seq++,
                              pkt->data, (uint32_t)pkt->size);
     if (ret == 0)
         ctx->frames_sent++;
+    pthread_mutex_unlock(&ctx->client_mu);
 }
 
 /* ── Nostr callbacks for session negotiation ──────────────── */
@@ -159,7 +175,11 @@ static void *capture_thread_func(void *arg) {
         if (md_capture_get_frame(cap, &frame) != 0)
             break;
 
-        if (!ctx->encoder || !ctx->client) {
+        pthread_mutex_lock(&ctx->client_mu);
+        bool has_client = (ctx->client != NULL);
+        pthread_mutex_unlock(&ctx->client_mu);
+
+        if (!ctx->encoder || !has_client) {
             md_capture_release_frame(cap, &frame);
             continue;
         }
@@ -313,8 +333,7 @@ static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) 
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    install_signal_handlers();
 
     /* Default options */
     uint16_t port = MD_STREAM_PORT;
@@ -469,6 +488,7 @@ int main(int argc, char **argv) {
         .session     = &session,
         .session_log = session_log,
     };
+    pthread_mutex_init(&ctx.client_mu, NULL);
     if (expected_client_pk[0])
         strncpy(ctx.expected_client_pk, expected_client_pk, sizeof(ctx.expected_client_pk) - 1);
 
@@ -846,7 +866,9 @@ int main(int argc, char **argv) {
                                  "TCP client connected");
 
         /* Reset per-connection state */
+        pthread_mutex_lock(&ctx.client_mu);
         ctx.client     = client;
+        pthread_mutex_unlock(&ctx.client_mu);
         ctx.pkt_seq    = 0;
         ctx.frames_sent = 0;
         ctx.total_encode_us = 0;
@@ -966,7 +988,9 @@ int main(int argc, char **argv) {
         md_encoder_flush(encoder, on_encoded, &ctx);
 
         /* Null out client before destroying so capture thread stops sending */
+        pthread_mutex_lock(&ctx.client_mu);
         ctx.client = NULL;
+        pthread_mutex_unlock(&ctx.client_mu);
         md_stream_destroy(client);
 
         if (!g_running) break;
@@ -1009,6 +1033,8 @@ int main(int argc, char **argv) {
         md_nostr_destroy(nostr);
     } else if (signer)
         md_signer_destroy(signer);
+
+    pthread_mutex_destroy(&ctx.client_mu);
 
     printf("host: done. served %u client(s)\n", client_num);
     return 0;

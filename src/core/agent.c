@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <pthread.h>
 
 /* Maximum delta JSON size before falling back to full tree (64 KB) */
 #define MD_AGENT_MAX_DELTA_SIZE (64 * 1024)
@@ -32,6 +33,7 @@ struct MdAgent {
     MdTreeFormat  tree_format;
     uint32_t      settle_ms;
     uint32_t      action_count;
+    pthread_mutex_t mu;
 
     /* Cached last tree for target resolution */
     MdA11yNode   *cached_tree;
@@ -117,9 +119,16 @@ MdAgent *md_agent_create(const MdAgentConfig *cfg) {
     agent->tree_format = cfg->tree_format;
     agent->settle_ms   = cfg->settle_ms > 0 ? cfg->settle_ms
                                              : MD_AGENT_DEFAULT_SETTLE_MS;
+    if (pthread_mutex_init(&agent->mu, NULL) != 0) {
+        free(agent);
+        return NULL;
+    }
 
     return agent;
 }
+
+static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
+                                     uint32_t *seq);
 
 int md_agent_handle_action(MdAgent *agent, MdStream *stream,
                            uint32_t *seq,
@@ -140,6 +149,8 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
     fprintf(stderr, "agent: action=%s target=%s\n",
             md_action_type_str(action.type),
             action.target_id[0] ? action.target_id : "(none)");
+
+    pthread_mutex_lock(&agent->mu);
 
     /* 2. Resolve target_id to screen coordinates if needed */
     if (action.target_id[0] != '\0') {
@@ -176,6 +187,7 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
         if (ret < 0) {
             fprintf(stderr, "agent: action injection failed\n");
             md_action_cleanup(&action);
+            pthread_mutex_unlock(&agent->mu);
             return -1;
         }
     }
@@ -210,8 +222,9 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
                 } else {
                     /* Delta too large — send full tree instead */
                     free(delta_json);
-                    md_agent_send_tree(agent, stream, seq);
+                    md_agent_send_tree_locked(agent, stream, seq);
                     md_a11y_delta_free(deltas, delta_count);
+                    pthread_mutex_unlock(&agent->mu);
                     return 0;
                 }
                 free(delta_json);
@@ -220,10 +233,11 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
         } else {
             /* No delta available or no changes detected.
              * Send a full tree on the first interaction. */
-            md_agent_send_tree(agent, stream, seq);
+            md_agent_send_tree_locked(agent, stream, seq);
         }
     }
 
+    pthread_mutex_unlock(&agent->mu);
     return 0;
 }
 
@@ -247,6 +261,8 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
     fprintf(stderr, "agent[mcp]: action=%s target=%s\n",
             md_action_type_str(action.type),
             action.target_id[0] ? action.target_id : "(none)");
+
+    pthread_mutex_lock(&agent->mu);
 
     /* 2. Resolve target_id to screen coordinates if needed */
     if (action.target_id[0] != '\0') {
@@ -279,6 +295,7 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
         if (ret < 0) {
             fprintf(stderr, "agent[mcp]: action injection failed\n");
             md_action_cleanup(&action);
+            pthread_mutex_unlock(&agent->mu);
             return NULL;
         }
     }
@@ -304,6 +321,7 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
             md_a11y_delta_free(deltas, delta_count);
             if (delta_json)
                 agent->action_count++;
+            pthread_mutex_unlock(&agent->mu);
             return delta_json;  /* caller frees */
         }
 
@@ -314,14 +332,17 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
             md_a11y_node_free(root);
             if (tree_json)
                 agent->action_count++;
+            pthread_mutex_unlock(&agent->mu);
             return tree_json;
         }
     }
 
+    pthread_mutex_unlock(&agent->mu);
     return NULL;
 }
 
-int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
+static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
+                                     uint32_t *seq) {
     if (!agent || !stream || !seq || !agent->a11y)
         return -1;
 
@@ -351,38 +372,63 @@ int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
     return ret;
 }
 
+int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
+    if (!agent)
+        return -1;
+
+    pthread_mutex_lock(&agent->mu);
+    int ret = md_agent_send_tree_locked(agent, stream, seq);
+    pthread_mutex_unlock(&agent->mu);
+    return ret;
+}
+
 int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq) {
     if (!agent || !stream || !seq || !agent->a11y)
         return -1;
 
+    pthread_mutex_lock(&agent->mu);
+
     int delta_count = 0;
     MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
 
-    if (!deltas || delta_count == 0)
+    if (!deltas || delta_count == 0) {
+        pthread_mutex_unlock(&agent->mu);
         return 0; /* no changes */
+    }
 
     char *json = md_a11y_delta_to_json(deltas, delta_count);
     md_a11y_delta_free(deltas, delta_count);
 
-    if (!json)
+    if (!json) {
+        pthread_mutex_unlock(&agent->mu);
         return -1;
+    }
 
     size_t len = strlen(json);
     int ret = md_stream_send(stream, MD_PKT_UI_TREE_DELTA, (*seq)++,
                              (const uint8_t *)json, (uint32_t)len);
     free(json);
+    pthread_mutex_unlock(&agent->mu);
     return ret;
 }
 
 uint32_t md_agent_get_action_count(const MdAgent *agent) {
-    return agent ? agent->action_count : 0;
+    if (!agent) return 0;
+
+    pthread_mutex_lock((pthread_mutex_t *)&agent->mu);
+    uint32_t count = agent->action_count;
+    pthread_mutex_unlock((pthread_mutex_t *)&agent->mu);
+    return count;
 }
 
 void md_agent_destroy(MdAgent *agent) {
     if (!agent) return;
 
+    pthread_mutex_lock(&agent->mu);
     if (agent->cached_tree)
         md_a11y_node_free(agent->cached_tree);
+    pthread_mutex_unlock(&agent->mu);
+    pthread_mutex_destroy(&agent->mu);
 
     free(agent);
 }

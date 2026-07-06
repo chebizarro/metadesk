@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <go.h>
+#include <stdatomic.h>
 
 #define DEFAULT_MAX_SSE_CLIENTS 4
 #define MAX_REQUEST_SIZE        (1024 * 1024)  /* 1 MB max request body */
@@ -34,7 +35,7 @@ struct MdMcpHttp {
     MdMcpServer    *mcp_server;
     int             listen_fd;
     uint16_t        port;
-    volatile bool   shutdown;
+    atomic_bool     shutdown;
 
     /* SSE client file descriptors */
     int            *sse_clients;
@@ -384,7 +385,7 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
 
     h->mcp_server = config->server;
     h->port = config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT;
-    h->shutdown = false;
+    atomic_init(&h->shutdown, false);
     h->sse_max_clients = config->max_clients > 0
         ? config->max_clients : DEFAULT_MAX_SSE_CLIENTS;
     h->sse_clients = calloc((size_t)h->sse_max_clients,
@@ -463,7 +464,7 @@ int md_mcp_http_run(MdMcpHttp *http)
 {
     if (!http) return -1;
 
-    while (!http->shutdown) {
+    while (!atomic_load(&http->shutdown)) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(http->listen_fd, &readfds);
@@ -502,7 +503,7 @@ int md_mcp_http_run(MdMcpHttp *http)
 
 void md_mcp_http_shutdown(MdMcpHttp *http)
 {
-    if (http) http->shutdown = true;
+    if (http) atomic_store(&http->shutdown, true);
 }
 
 MdMcpWriteFn md_mcp_http_get_write_fn(MdMcpHttp *http)

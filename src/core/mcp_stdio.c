@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* ── Initial line buffer size ────────────────────────────────── */
 
@@ -23,7 +24,7 @@ struct MdMcpStdio {
     MdMcpServer    *server;
     int             in_fd;
     int             out_fd;
-    volatile bool   shutdown;
+    atomic_bool     shutdown;
     pthread_mutex_t write_mu;  /* serialize writes to out_fd */
 };
 
@@ -32,7 +33,7 @@ struct MdMcpStdio {
 static int stdio_write(const char *json, size_t len, void *userdata)
 {
     MdMcpStdio *ctx = (MdMcpStdio *)userdata;
-    if (!ctx || ctx->shutdown) return -1;
+    if (!ctx || atomic_load(&ctx->shutdown)) return -1;
 
     pthread_mutex_lock(&ctx->write_mu);
 
@@ -71,7 +72,7 @@ MdMcpStdio *md_mcp_stdio_create(MdMcpServer *server, int in_fd, int out_fd)
     ctx->server = server;
     ctx->in_fd = in_fd;
     ctx->out_fd = out_fd;
-    ctx->shutdown = false;
+    atomic_init(&ctx->shutdown, false);
     pthread_mutex_init(&ctx->write_mu, NULL);
 
     return ctx;
@@ -100,7 +101,7 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
     if (!buf) return -1;
     size_t buf_len = 0;
 
-    while (!ctx->shutdown) {
+    while (!atomic_load(&ctx->shutdown)) {
         /* Read a chunk */
         if (buf_len + 1 >= buf_cap) {
             buf_cap *= 2;
@@ -149,7 +150,7 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
 
 void md_mcp_stdio_shutdown(MdMcpStdio *ctx)
 {
-    if (ctx) ctx->shutdown = true;
+    if (ctx) atomic_store(&ctx->shutdown, true);
 }
 
 void md_mcp_stdio_destroy(MdMcpStdio *ctx)

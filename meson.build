@@ -26,6 +26,7 @@ dep_avcodec   = dependency('libavcodec',      version : '>=60.0.0', required : t
 dep_avutil    = dependency('libavutil',        version : '>=58.0.0', required : true)
 dep_cjson     = dependency('libcjson',        version : '>=1.7.17')
 dep_b2        = dependency('libb2',           version : '>=0.98')
+dep_threads   = dependency('threads')
 
 # ── System library prefix detection ──────────────────────────────────────────
 # Auto-detect Homebrew prefix on macOS (Apple Silicon: /opt/homebrew, Intel: /usr/local)
@@ -244,6 +245,7 @@ core_deps = [
   dep_nostr_json,
   dep_cjson,
   dep_b2,
+  dep_threads,
 ] + platform_hal_deps
 
 # ── Signer backend deps + compile flags ─────────────────────────────────────
