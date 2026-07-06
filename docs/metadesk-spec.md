@@ -85,7 +85,7 @@ The normal runtime uses an external FIPS daemon plus metadesk host/client proces
 
 | Process | Role | Key Dependencies |
 |---|---|---|
-| `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.3.x-era runtime, run as system service or operator-managed process |
+| `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.3.x / v0.4.x runtime, run as system service or operator-managed process |
 | `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends; local FIPS control socket access |
 | `metadesk-client` | Human video client and/or agent transport endpoint | SDL2/ImGui for video; local FIPS control socket access |
 | `fips-nat` | Legacy deprecated NAT sidecar, off by default | Not in the recommended runtime path |
@@ -508,6 +508,7 @@ metadesk/
 │   │   ├── mcp_http.c/h              # MCP HTTP+SSE transport
 │   │   ├── mcp_stdio.c/h             # MCP stdio transport
 │   │   ├── fips_addr.c/h             # FIPS fd00::/8 address derivation
+│   │   ├── fips_control.c/h          # FIPS daemon control socket client
 │   │   ├── secrets.c/h               # 1Password Connect integration
 │   │   └── platform.h                # platform detection macros
 │   ├── host/                          # metadesk-host daemon
@@ -521,7 +522,7 @@ metadesk/
 │       ├── stun.c/h                  # RFC 5389 STUN binding discovery
 │       ├── punch.c/h                 # UDP hole punch coordinator
 │       ├── turn.c/h                  # RFC 5766 TURN relay client
-│       ├── publish.c/h              # Nostr NAT endpoint publication
+│       ├── publish.c/h              # NAT endpoint publication (legacy)
 │       └── fipsnat_ipc.c/h          # IPC protocol for host ↔ fips-nat
 ├── subprojects/
 │   └── imgui/                         # Dear ImGui vendored

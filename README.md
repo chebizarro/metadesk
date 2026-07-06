@@ -46,7 +46,7 @@ Both modes connect to the same host daemon and can run simultaneously.
 | `metadesk-host` | Host daemon — captures screen, walks a11y tree, handles input injection |
 | `metadesk-client` | Human video client — SDL2 display with ImGui overlay |
 | `libmetadesk` | Shared library — all core logic, no UI dependencies |
-| `fips-nat` | Legacy/deprecated NAT sidecar — not in the recommended FIPS runtime path |
+| `fips-nat` | Legacy/deprecated NAT sidecar (compile-time opt-in; off by default) |
 
 ## Building
 
@@ -54,7 +54,7 @@ Both modes connect to the same host daemon and can run simultaneously.
 
 **All platforms:** FFmpeg (≥6.0), libyuv, libsecp256k1, libwebsockets, cJSON, libb2, [nostrc](https://github.com/chebizarro/nostrc)
 
-**FIPS runtime:** A current external FIPS daemon, tested against the v0.3.x runtime surface, with TUN enabled, `.fips` DNS/address derivation available, the control socket enabled, and peer discovery/reachability owned by FIPS.
+**FIPS runtime:** A current external FIPS daemon, tested against FIPS v0.3.x and v0.4.0, with TUN enabled, `.fips` DNS/address derivation available, the control socket enabled, and peer discovery/reachability owned by FIPS.
 
 **Linux additionally:** PipeWire (≥0.3.65), AT-SPI2 (≥2.48), libudev (≥252), D-Bus  
 **macOS additionally:** ScreenCaptureKit (macOS 13+), Xcode command line tools
@@ -106,7 +106,7 @@ Readiness failures are reported before the TCP stream is opened:
 - peer not configured or not discovered by the local FIPS daemon;
 - peer present but route/session still converging before the bounded retry expires.
 
-`fips-nat` is deprecated and off by default. It remains in-tree only for legacy experiments; do not use its kind `30078` NAT endpoint publication as the recommended bootstrap path.
+`fips-nat` is deprecated and off by default. It remains in-tree as a compile-time opt-in only for legacy experiments; the FIPS daemon control socket is the supported integration path.
 
 ### Optional `fips-gateway`
 
@@ -219,24 +219,32 @@ meson test -C build
 ```
 
 ```
- 1/18 JSON-RPC 2.0 message layer     OK
- 2/18 packet round-trip               OK
- 3/18 session JSON + state machine    OK
- 4/18 FIPS address derivation         OK
- 5/18 signer abstraction              OK
- 6/18 MCP server core                 OK
- 7/18 1Password Connect secrets       OK
- 8/18 action parse/encode             OK
- 9/18 capture convenience API         OK
-10/18 MCP stdio transport             OK
-11/18 agent action handler            OK
-12/18 input injection                 OK
-13/18 encode/decode round-trip        OK
-14/18 TCP stream transport            OK
-15/18 IPC Unix domain sockets         OK
-16/18 nostr NIP-44                    OK
-17/18 MCP HTTP+SSE transport          OK
-18/18 a11y tree serialisation         OK
+ 1/26 packet round-trip               OK
+ 2/26 JSON-RPC 2.0 message layer      OK
+ 3/26 session JSON + state machine    OK
+ 4/26 FIPS control socket client seam  OK
+ 5/26 FIPS address derivation         OK
+ 6/26 signer abstraction              OK
+ 7/26 1Password Connect secrets       OK
+ 8/26 STUN binding discovery          OK
+ 9/26 UDP hole punch                  OK
+10/26 capture convenience API         OK
+11/26 action parse/encode             OK
+12/26 TURN relay client               OK
+13/26 bitrate controller AIMD         OK
+14/26 MCP stdio transport             OK
+15/26 a11y tree serialisation         OK
+16/26 TCP stream transport            OK
+17/26 agent action handler            OK
+18/26 MCP server core                 OK
+19/26 input injection                 OK
+20/26 NAT endpoint publication        OK
+21/26 fips-nat IPC protocol           OK
+22/26 signed session log              OK
+23/26 nostr NIP-44                    OK
+24/26 IPC Unix domain sockets         OK
+25/26 encode/decode round-trip        OK
+26/26 MCP HTTP+SSE transport          OK
 ```
 
 ## Project Structure
@@ -245,20 +253,26 @@ meson test -C build
 metadesk/
 ├── src/
 │   ├── core/           # libmetadesk — cross-platform core
-│   │   ├── capture.h   # screen capture HAL
 │   │   ├── a11y.h      # accessibility tree HAL
-│   │   ├── input.h     # input injection HAL
-│   │   ├── encode.c/h  # FFmpeg H.264 encode
+│   │   ├── action.c/h    # action parse/encode
+│   │   ├── bitrate_ctrl.c/h # AIMD adaptive bitrate controller
+│   │   ├── capture.h   # screen capture HAL
 │   │   ├── decode.c/h  # FFmpeg H.264 decode
+│   │   ├── encode.c/h  # FFmpeg H.264 encode
+│   │   ├── fips_addr.c/h  # FIPS address derivation and DNS
+│   │   ├── fips_control.c/h # FIPS daemon control socket client
+│   │   ├── input.h     # input injection HAL
+│   │   ├── jsonrpc.c/h   # JSON-RPC 2.0 message layer
 │   │   ├── mcp_*.c/h   # MCP server, tools, resources, transports
-│   │   ├── session.c/h # session state machine
 │   │   ├── nostr.c/h   # Nostr relay client (NIP-44/51)
+│   │   ├── session.c/h # session state machine
+│   │   ├── session_log.c/h # signed Nostr session event log
 │   │   ├── signer.c/h  # signing backend abstraction
 │   │   └── stream.c/h  # TCP framed transport
 │   ├── host/           # metadesk-host daemon
 │   ├── client/         # metadesk-client (SDL2 + ImGui)
 │   └── fips-nat/       # legacy deprecated NAT traversal daemon
-├── tests/              # 18 test suites
+├── tests/              # 26 test suites
 ├── tools/              # Diagnostic utilities
 ├── config/             # Example configuration
 └── docs/               # Specification and API docs
