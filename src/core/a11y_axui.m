@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <pthread.h>
 
 /* Maximum tree depth to prevent infinite recursion */
 #define MD_AX_MAX_DEPTH 32
@@ -34,12 +35,35 @@
 /* Maximum children per node */
 #define MD_AX_MAX_CHILDREN 256
 
+/* Older SDKs do not expose the generic AXCreated name, but AX accepts
+ * notification names as CFStrings. We still also register AXWindowCreated below
+ * because that is the public macOS window-creation notification. */
+#ifndef kAXCreatedNotification
+#define kAXCreatedNotification CFSTR("AXCreated")
+#endif
+
 /* ── Backend-private state ───────────────────────────────────── */
 
 typedef struct {
-    int          connected;
-    uint64_t     next_id;
-    MdA11yNode  *last_snapshot;
+    AXUIElementRef     app_elem;
+    AXObserverRef      observer;
+    CFRunLoopSourceRef source;
+} AXObserverRecord;
+
+typedef struct {
+    int                connected;
+    uint64_t           next_id;
+    MdA11yNode        *last_snapshot;
+    pthread_mutex_t    lock;
+    AXObserverRecord  *observers;
+    size_t             observer_count;
+    pthread_t          event_thread;
+    int                event_thread_started;
+    CFRunLoopRef       event_run_loop;
+    int                stop_requested;
+    MdA11yChangeCb     change_cb;
+    void              *change_userdata;
+    int                subscribed;
 } AXUIState;
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -363,6 +387,253 @@ static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
     return dst;
 }
 
+static int axui_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root);
+static int axui_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                                  int *out_count);
+
+/* ── Change subscriptions ────────────────────────────────────── */
+
+static const CFStringRef axui_change_notifications[] = {
+    kAXFocusedUIElementChangedNotification,
+    kAXCreatedNotification,
+    kAXWindowCreatedNotification,
+    kAXUIElementDestroyedNotification,
+    kAXValueChangedNotification,
+};
+
+static size_t axui_notification_count(void) {
+    return sizeof(axui_change_notifications) / sizeof(axui_change_notifications[0]);
+}
+
+static const char *axui_ax_error_name(AXError err) {
+    switch (err) {
+    case kAXErrorSuccess: return "success";
+    case kAXErrorFailure: return "failure";
+    case kAXErrorIllegalArgument: return "illegal argument";
+    case kAXErrorInvalidUIElement: return "invalid UI element";
+    case kAXErrorInvalidUIElementObserver: return "invalid observer";
+    case kAXErrorCannotComplete: return "cannot complete";
+    case kAXErrorAttributeUnsupported: return "attribute unsupported";
+    case kAXErrorActionUnsupported: return "action unsupported";
+    case kAXErrorNotificationUnsupported: return "notification unsupported";
+    case kAXErrorNotImplemented: return "not implemented";
+    case kAXErrorNotificationAlreadyRegistered: return "notification already registered";
+    case kAXErrorNotificationNotRegistered: return "notification not registered";
+    case kAXErrorAPIDisabled: return "api disabled";
+    case kAXErrorNoValue: return "no value";
+    case kAXErrorParameterizedAttributeUnsupported: return "parameterized attribute unsupported";
+    case kAXErrorNotEnoughPrecision: return "not enough precision";
+    default: return "unknown";
+    }
+}
+
+static void axui_release_observer_records(AXObserverRecord *records,
+                                          size_t count) {
+    if (!records) return;
+
+    for (size_t i = 0; i < count; i++) {
+        AXObserverRecord *rec = &records[i];
+        if (rec->observer && rec->app_elem) {
+            for (size_t n = 0; n < axui_notification_count(); n++)
+                AXObserverRemoveNotification(rec->observer, rec->app_elem,
+                                             axui_change_notifications[n]);
+        }
+        if (rec->observer) CFRelease(rec->observer);
+        if (rec->app_elem) CFRelease(rec->app_elem);
+    }
+
+    free(records);
+}
+
+static void axui_observer_cb(AXObserverRef observer, AXUIElementRef element,
+                             CFStringRef notification, void *refcon) {
+    (void)observer;
+    (void)element;
+    (void)notification;
+
+    @autoreleasepool {
+        MdA11yCtx *ctx = refcon;
+        if (!ctx) return;
+
+        AXUIState *st = ctx->backend_data;
+        if (!st) return;
+
+        MdA11yChangeCb cb = NULL;
+        void *cb_userdata = NULL;
+        MdA11yDelta *deltas = NULL;
+        int delta_count = 0;
+        int diff_ret = -1;
+
+        pthread_mutex_lock(&st->lock);
+        if (st->subscribed && st->change_cb) {
+            cb = st->change_cb;
+            cb_userdata = st->change_userdata;
+            diff_ret = axui_get_diff_unlocked(ctx, &deltas, &delta_count);
+        }
+        pthread_mutex_unlock(&st->lock);
+
+        if (cb && diff_ret == 0)
+            cb(deltas, delta_count, cb_userdata);
+
+        md_a11y_delta_free(deltas, delta_count);
+    }
+}
+
+static int axui_add_observer_record(AXObserverRecord **records,
+                                    size_t *count,
+                                    size_t *capacity,
+                                    AXObserverRecord rec) {
+    if (*count >= *capacity) {
+        size_t new_capacity = (*capacity == 0) ? 8 : *capacity * 2;
+        AXObserverRecord *new_records = realloc(*records,
+            new_capacity * sizeof(AXObserverRecord));
+        if (!new_records) return -1;
+        *records = new_records;
+        *capacity = new_capacity;
+    }
+
+    (*records)[(*count)++] = rec;
+    return 0;
+}
+
+static int axui_create_observers(MdA11yCtx *ctx, AXObserverRecord **out_records,
+                                 size_t *out_count) {
+    if (!ctx || !out_records || !out_count) return -1;
+
+    *out_records = NULL;
+    *out_count = 0;
+
+    AXObserverRecord *records = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    @autoreleasepool {
+        NSArray<NSRunningApplication *> *apps =
+            [[NSWorkspace sharedWorkspace] runningApplications];
+
+        for (NSRunningApplication *app in apps) {
+            if (app.activationPolicy != NSApplicationActivationPolicyRegular &&
+                app.activationPolicy != NSApplicationActivationPolicyAccessory) {
+                continue;
+            }
+
+            pid_t pid = app.processIdentifier;
+            AXUIElementRef app_elem = AXUIElementCreateApplication(pid);
+            if (!app_elem) continue;
+
+            AXObserverRef observer = NULL;
+            AXError err = AXObserverCreate(pid, axui_observer_cb, &observer);
+            if (err != kAXErrorSuccess || !observer) {
+                fprintf(stderr,
+                        "a11y_axui: failed to create AXObserver for pid %d: %s\n",
+                        (int)pid, axui_ax_error_name(err));
+                CFRelease(app_elem);
+                continue;
+            }
+
+            int registered = 0;
+            for (size_t n = 0; n < axui_notification_count(); n++) {
+                err = AXObserverAddNotification(observer, app_elem,
+                                                axui_change_notifications[n],
+                                                ctx);
+                if (err == kAXErrorSuccess ||
+                    err == kAXErrorNotificationAlreadyRegistered) {
+                    registered++;
+                    continue;
+                }
+
+                /* Notification support varies by target app and by the
+                 * notification name (notably generic AXCreated). Unsupported
+                 * notifications are non-fatal as long as at least one useful
+                 * notification registered for this app. */
+                if (err != kAXErrorNotificationUnsupported &&
+                    err != kAXErrorNotImplemented) {
+                    fprintf(stderr,
+                            "a11y_axui: failed to register AX notification for pid %d: %s\n",
+                            (int)pid, axui_ax_error_name(err));
+                }
+            }
+
+            if (registered == 0) {
+                CFRelease(observer);
+                CFRelease(app_elem);
+                continue;
+            }
+
+            AXObserverRecord rec = {
+                .app_elem = app_elem,
+                .observer = observer,
+                .source = AXObserverGetRunLoopSource(observer),
+            };
+
+            if (!rec.source || axui_add_observer_record(&records, &count,
+                                                        &capacity, rec) != 0) {
+                for (size_t n = 0; n < axui_notification_count(); n++)
+                    AXObserverRemoveNotification(observer, app_elem,
+                                                 axui_change_notifications[n]);
+                CFRelease(observer);
+                CFRelease(app_elem);
+                axui_release_observer_records(records, count);
+                return -1;
+            }
+        }
+    }
+
+    if (count == 0) {
+        free(records);
+        return -1;
+    }
+
+    *out_records = records;
+    *out_count = count;
+    return 0;
+}
+
+static void *axui_event_loop_thread(void *data) {
+    AXUIState *st = data;
+    if (!st) return NULL;
+
+    @autoreleasepool {
+        CFRunLoopRef run_loop = CFRunLoopGetCurrent();
+        CFRetain(run_loop);
+
+        pthread_mutex_lock(&st->lock);
+        st->event_run_loop = run_loop;
+        for (size_t i = 0; i < st->observer_count; i++) {
+            if (st->observers[i].source) {
+                CFRunLoopAddSource(run_loop, st->observers[i].source,
+                                   kCFRunLoopDefaultMode);
+            }
+        }
+        pthread_mutex_unlock(&st->lock);
+
+        for (;;) {
+            pthread_mutex_lock(&st->lock);
+            int stop = st->stop_requested;
+            pthread_mutex_unlock(&st->lock);
+            if (stop) break;
+
+            @autoreleasepool {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, true);
+            }
+        }
+
+        pthread_mutex_lock(&st->lock);
+        for (size_t i = 0; i < st->observer_count; i++) {
+            if (st->observers[i].source) {
+                CFRunLoopRemoveSource(run_loop, st->observers[i].source,
+                                      kCFRunLoopDefaultMode);
+            }
+        }
+        st->event_run_loop = NULL;
+        pthread_mutex_unlock(&st->lock);
+
+        CFRelease(run_loop);
+    }
+
+    return NULL;
+}
+
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int axui_init(MdA11yCtx *ctx) {
@@ -379,12 +650,13 @@ static int axui_init(MdA11yCtx *ctx) {
     AXUIState *st = calloc(1, sizeof(AXUIState));
     if (!st) return -1;
 
+    pthread_mutex_init(&st->lock, NULL);
     st->connected = 1;
     ctx->backend_data = st;
     return 0;
 }
 
-static int axui_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
+static int axui_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     AXUIState *st = ctx->backend_data;
     if (!st || !st->connected || !out_root) return -1;
 
@@ -448,8 +720,18 @@ static int axui_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return 0;
 }
 
-static int axui_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                         int *out_count) {
+static int axui_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
+    AXUIState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return -1;
+
+    pthread_mutex_lock(&st->lock);
+    int ret = axui_get_tree_unlocked(ctx, out_root);
+    pthread_mutex_unlock(&st->lock);
+    return ret;
+}
+
+static int axui_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                                  int *out_count) {
     AXUIState *st = ctx->backend_data;
     if (!st || !out_deltas || !out_count) return -1;
 
@@ -457,7 +739,7 @@ static int axui_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
     *out_count = 0;
 
     MdA11yNode *current = NULL;
-    if (axui_get_tree(ctx, &current) != 0 || !current)
+    if (axui_get_tree_unlocked(ctx, &current) != 0 || !current)
         return -1;
 
     MdA11yNode *prev = st->last_snapshot;
@@ -530,23 +812,144 @@ static int axui_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
     return 0;
 }
 
+static int axui_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                         int *out_count) {
+    AXUIState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return -1;
+
+    pthread_mutex_lock(&st->lock);
+    int ret = axui_get_diff_unlocked(ctx, out_deltas, out_count);
+    pthread_mutex_unlock(&st->lock);
+    return ret;
+}
+
 static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                   void *userdata) {
-    (void)ctx; (void)cb; (void)userdata;
-    /* Not implemented yet: this needs one AXObserver per target application
-     * PID, registrations for notifications such as
-     * kAXFocusedUIElementChangedNotification, kAXValueChangedNotification,
-     * kAXUIElementDestroyedNotification, kAXWindowCreatedNotification, and
-     * kAXMainWindowChangedNotification, plus CFRunLoop source management in
-     * AXUIState before this backend can safely emit MdA11yChangeCb deltas. */
-    return -1;
+    AXUIState *st = ctx ? ctx->backend_data : NULL;
+    if (!st || !st->connected || !cb) return -1;
+
+    pthread_mutex_lock(&st->lock);
+    if (st->subscribed) {
+        st->change_cb = cb;
+        st->change_userdata = userdata;
+        pthread_mutex_unlock(&st->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&st->lock);
+
+    if (!AXIsProcessTrusted()) {
+        fprintf(stderr,
+                "a11y_axui: accessibility permission required for AXObserver subscriptions\n");
+        return -1;
+    }
+
+    /* The AXObserver API is scoped to one target application PID. The backend
+     * snapshots the whole desktop, so subscribe by creating one observer for
+     * each GUI app currently running. Apps launched after this call are not
+     * observed until the caller recreates the subscription or an observed app
+     * emits another event that causes a full-desktop delta snapshot. */
+    AXObserverRecord *records = NULL;
+    size_t record_count = 0;
+    if (axui_create_observers(ctx, &records, &record_count) != 0) {
+        fprintf(stderr,
+                "a11y_axui: failed to create any AXObserver subscriptions\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&st->lock);
+    if (st->subscribed) {
+        st->change_cb = cb;
+        st->change_userdata = userdata;
+        pthread_mutex_unlock(&st->lock);
+        axui_release_observer_records(records, record_count);
+        return 0;
+    }
+
+    st->observers = records;
+    st->observer_count = record_count;
+    st->change_cb = cb;
+    st->change_userdata = userdata;
+    st->stop_requested = 0;
+
+    /* Seed the diff baseline so the first notification emits real deltas
+     * rather than being consumed as the initial snapshot. */
+    if (!st->last_snapshot) {
+        MdA11yNode *initial = NULL;
+        if (axui_get_tree_unlocked(ctx, &initial) == 0)
+            st->last_snapshot = initial;
+    }
+
+    st->subscribed = 1;
+    pthread_mutex_unlock(&st->lock);
+
+    int err = pthread_create(&st->event_thread, NULL,
+                             axui_event_loop_thread, st);
+    if (err != 0) {
+        pthread_mutex_lock(&st->lock);
+        st->subscribed = 0;
+        st->change_cb = NULL;
+        st->change_userdata = NULL;
+        AXObserverRecord *cleanup_records = st->observers;
+        size_t cleanup_count = st->observer_count;
+        st->observers = NULL;
+        st->observer_count = 0;
+        pthread_mutex_unlock(&st->lock);
+
+        axui_release_observer_records(cleanup_records, cleanup_count);
+        return -1;
+    }
+
+    pthread_mutex_lock(&st->lock);
+    st->event_thread_started = 1;
+    pthread_mutex_unlock(&st->lock);
+
+    return 0;
 }
 
 static void axui_destroy(MdA11yCtx *ctx) {
     AXUIState *st = ctx->backend_data;
     if (!st) return;
 
-    md_a11y_node_free(st->last_snapshot);
+    pthread_t event_thread;
+    int join_thread = 0;
+    CFRunLoopRef run_loop = NULL;
+
+    pthread_mutex_lock(&st->lock);
+    st->connected = 0;
+    st->subscribed = 0;
+    st->change_cb = NULL;
+    st->change_userdata = NULL;
+    st->stop_requested = 1;
+    if (st->event_run_loop) {
+        run_loop = st->event_run_loop;
+        CFRetain(run_loop);
+    }
+    if (st->event_thread_started) {
+        event_thread = st->event_thread;
+        join_thread = 1;
+    }
+    pthread_mutex_unlock(&st->lock);
+
+    if (run_loop) {
+        CFRunLoopStop(run_loop);
+        CFRelease(run_loop);
+    }
+
+    if (join_thread && !pthread_equal(pthread_self(), event_thread))
+        pthread_join(event_thread, NULL);
+
+    pthread_mutex_lock(&st->lock);
+    AXObserverRecord *records = st->observers;
+    size_t record_count = st->observer_count;
+    MdA11yNode *last_snapshot = st->last_snapshot;
+    st->observers = NULL;
+    st->observer_count = 0;
+    st->last_snapshot = NULL;
+    pthread_mutex_unlock(&st->lock);
+
+    axui_release_observer_records(records, record_count);
+    md_a11y_node_free(last_snapshot);
+    pthread_mutex_destroy(&st->lock);
     free(st);
     ctx->backend_data = NULL;
 }
