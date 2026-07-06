@@ -175,7 +175,8 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
         ret = md_input_execute_action(agent->input, &action);
         if (ret < 0) {
             fprintf(stderr, "agent: action injection failed\n");
-            /* Don't return error — still send delta */
+            md_action_cleanup(&action);
+            return -1;
         }
     }
 
@@ -275,12 +276,14 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
     /* 3. Inject the action */
     if (agent->input) {
         ret = md_input_execute_action(agent->input, &action);
-        if (ret < 0)
+        if (ret < 0) {
             fprintf(stderr, "agent[mcp]: action injection failed\n");
+            md_action_cleanup(&action);
+            return NULL;
+        }
     }
 
     md_action_cleanup(&action);
-    agent->action_count++;
 
     /* 4. Wait for UI to settle */
     sleep_ms(agent->settle_ms);
@@ -299,6 +302,8 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
         if (deltas && delta_count > 0) {
             char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
             md_a11y_delta_free(deltas, delta_count);
+            if (delta_json)
+                agent->action_count++;
             return delta_json;  /* caller frees */
         }
 
@@ -307,11 +312,13 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
         if (root) {
             char *tree_json = serialize_tree(root, agent->tree_format);
             md_a11y_node_free(root);
+            if (tree_json)
+                agent->action_count++;
             return tree_json;
         }
     }
 
-    return strdup("{\"status\":\"ok\"}");
+    return NULL;
 }
 
 int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {

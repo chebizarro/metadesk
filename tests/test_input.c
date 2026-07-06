@@ -15,6 +15,70 @@
 #include <assert.h>
 #include <unistd.h>
 
+/* ── Mock backend for deterministic HAL error propagation tests ─ */
+
+typedef struct {
+    int mouse_move_calls;
+    int mouse_button_calls;
+    int key_event_calls;
+
+    int mouse_move_ret;
+    int mouse_button_fail_call; /* 1-based call index, 0 = never */
+    int key_event_fail_call;    /* 1-based call index, 0 = never */
+
+    int last_x;
+    int last_y;
+    int button_pressed[4];
+    uint32_t keysyms[16];
+    int key_pressed[16];
+} MockInputData;
+
+static int mock_mouse_move(MdInputCtx *ctx, int x, int y) {
+    MockInputData *data = (MockInputData *)ctx->backend_data;
+    data->mouse_move_calls++;
+    data->last_x = x;
+    data->last_y = y;
+    return data->mouse_move_ret;
+}
+
+static int mock_mouse_button(MdInputCtx *ctx, int button, int pressed) {
+    MockInputData *data = (MockInputData *)ctx->backend_data;
+    data->mouse_button_calls++;
+    if (data->mouse_button_calls == data->mouse_button_fail_call)
+        return -1;
+    if (button >= 0 && button < 4)
+        data->button_pressed[button] = pressed;
+    return 0;
+}
+
+static int mock_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
+    MockInputData *data = (MockInputData *)ctx->backend_data;
+    int idx = data->key_event_calls++;
+    if (idx < 16) {
+        data->keysyms[idx] = keysym;
+        data->key_pressed[idx] = pressed;
+    }
+    if (data->key_event_calls == data->key_event_fail_call)
+        return -1;
+    return 0;
+}
+
+static const MdInputBackend mock_backend = {
+    .mouse_move = mock_mouse_move,
+    .mouse_button = mock_mouse_button,
+    .key_event = mock_key_event,
+};
+
+static MdInput make_mock_input(MockInputData *data,
+                               const MdInputBackend *backend) {
+    MdInput inp;
+    memset(&inp, 0, sizeof(inp));
+    inp.vtable = backend;
+    inp.backend_data = data;
+    inp.ready = true;
+    return inp;
+}
+
 /* ── Test: creation (may fail without permissions) ───────────── */
 
 static int test_create_destroy(void) {
@@ -310,6 +374,88 @@ static int test_type_key_combo_edges(void) {
     return 0;
 }
 
+/* ── Test: click propagates backend failures ─────────────────── */
+
+static int test_click_backend_failure_propagation(void) {
+    printf("  test_click_backend_failure_propagation... ");
+
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
+
+    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == 0);
+    assert(data.mouse_move_calls == 1);
+    assert(data.mouse_button_calls == 2);
+    assert(data.last_x == 10);
+    assert(data.last_y == 20);
+    assert(data.button_pressed[MD_MOUSE_LEFT] == 0);
+
+    data = (MockInputData){ .mouse_move_ret = -1 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    assert(data.mouse_move_calls == 1);
+    assert(data.mouse_button_calls == 0);
+
+    data = (MockInputData){ .mouse_button_fail_call = 1 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    assert(data.mouse_move_calls == 1);
+    assert(data.mouse_button_calls == 1);
+
+    data = (MockInputData){ .mouse_button_fail_call = 2 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    assert(data.mouse_move_calls == 1);
+    assert(data.mouse_button_calls == 2);
+
+    static const MdInputBackend missing_button_backend = {
+        .mouse_move = mock_mouse_move,
+    };
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &missing_button_backend);
+    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    assert(data.mouse_move_calls == 0);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: key_combo propagates backend failures ─────────────── */
+
+static int test_key_combo_backend_failure_propagation(void) {
+    printf("  test_key_combo_backend_failure_propagation... ");
+
+    const char *keys[] = { "ctrl", "a" };
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
+
+    assert(md_input_key_combo(&inp, keys, 2) == 0);
+    assert(data.key_event_calls == 4);
+    assert(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
+    assert(data.keysyms[1] == 0x001E && data.key_pressed[1] == 1);
+    assert(data.keysyms[2] == 0x001E && data.key_pressed[2] == 0);
+    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
+
+    data = (MockInputData){ .key_event_fail_call = 1 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_key_combo(&inp, keys, 2) == -1);
+    assert(data.key_event_calls == 1);
+
+    data = (MockInputData){ .key_event_fail_call = 2 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_key_combo(&inp, keys, 2) == -1);
+    assert(data.key_event_calls == 3); /* failed second press + ctrl cleanup */
+    assert(data.keysyms[2] == 0x001D && data.key_pressed[2] == 0);
+
+    data = (MockInputData){ .key_event_fail_call = 3 };
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_key_combo(&inp, keys, 2) == -1);
+    assert(data.key_event_calls == 4); /* release failure still releases rest */
+    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
+
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Test: is_ready and destroy NULL ─────────────────────────── */
 
 static int test_lifecycle_edges(void) {
@@ -340,6 +486,8 @@ int main(void) {
     failures += test_dbl_and_right_click();
     failures += test_mouse_scroll();
     failures += test_type_key_combo_edges();
+    failures += test_click_backend_failure_propagation();
+    failures += test_key_combo_backend_failure_propagation();
     failures += test_lifecycle_edges();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");

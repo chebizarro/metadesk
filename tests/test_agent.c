@@ -16,6 +16,33 @@
 #include <string.h>
 #include <assert.h>
 
+/* ── Mock input backend for deterministic injection failures ─── */
+
+typedef struct {
+    int type_text_calls;
+    int type_text_ret;
+} AgentMockInputData;
+
+static int agent_mock_type_text(MdInputCtx *ctx, const char *utf8) {
+    AgentMockInputData *data = (AgentMockInputData *)ctx->backend_data;
+    (void)utf8;
+    data->type_text_calls++;
+    return data->type_text_ret;
+}
+
+static const MdInputBackend agent_mock_backend = {
+    .type_text = agent_mock_type_text,
+};
+
+static MdInput make_agent_mock_input(AgentMockInputData *data) {
+    MdInput inp;
+    memset(&inp, 0, sizeof(inp));
+    inp.vtable = &agent_mock_backend;
+    inp.backend_data = data;
+    inp.ready = true;
+    return inp;
+}
+
 /* ── Test: create and destroy ────────────────────────────────── */
 
 static int test_create_destroy(void) {
@@ -218,6 +245,52 @@ static int test_handle_various_actions(void) {
     return 0;
 }
 
+/* ── Test: input injection failure propagates ────────────────── */
+
+static int test_injection_failure_propagates(void) {
+    printf("  test_injection_failure_propagates... ");
+
+    AgentMockInputData data = { .type_text_ret = -1 };
+    MdInput input = make_agent_mock_input(&data);
+    MdAgentConfig cfg = {
+        .a11y        = NULL,
+        .input       = &input,
+        .tree_format = MD_TREE_FORMAT_JSON,
+        .settle_ms   = 1,
+    };
+    MdAgent *agent = md_agent_create(&cfg);
+    assert(agent != NULL);
+
+    const char *json = "{\"v\":1,\"action\":\"type\","
+                       "\"payload\":{\"text\":\"hello\"}}";
+    uint32_t seq = 7;
+    int ret = md_agent_handle_action(agent, (MdStream *)0x1, &seq,
+                                     (const uint8_t *)json,
+                                     (uint32_t)strlen(json));
+    assert(ret == -1);
+    assert(seq == 7);
+    assert(data.type_text_calls == 1);
+    assert(md_agent_get_action_count(agent) == 0);
+    md_agent_destroy(agent);
+
+    data = (AgentMockInputData){ .type_text_ret = -1 };
+    input = make_agent_mock_input(&data);
+    cfg.input = &input;
+    agent = md_agent_create(&cfg);
+    assert(agent != NULL);
+
+    char *result = md_agent_handle_action_mcp(agent,
+                                              (const uint8_t *)json,
+                                              (uint32_t)strlen(json));
+    assert(result == NULL);
+    assert(data.type_text_calls == 1);
+    assert(md_agent_get_action_count(agent) == 0);
+
+    md_agent_destroy(agent);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Test: handle_action with invalid payload ────────────────── */
 
 static int test_handle_invalid_payload(void) {
@@ -287,14 +360,15 @@ static int test_handle_action_mcp(void) {
     MdAgent *agent = md_agent_create(&cfg);
     assert(agent != NULL);
 
-    /* With no a11y or input, MCP handler should return an error string or NULL */
+    /* With no a11y result, MCP handler should return an error (NULL),
+     * not a placeholder success response. */
     const char *json = "{\"v\":1,\"action\":\"click\",\"target_id\":\"btn1\","
                        "\"payload\":{}}";
     char *result = md_agent_handle_action_mcp(agent,
                                               (const uint8_t *)json,
                                               (uint32_t)strlen(json));
-    /* Result may be NULL or an error string — just verify no crash */
-    free(result); /* safe even if NULL */
+    assert(result == NULL);
+    assert(md_agent_get_action_count(agent) == 0);
 
     /* NULL payload */
     result = md_agent_handle_action_mcp(agent, NULL, 0);
@@ -318,6 +392,7 @@ int main(void) {
     failures += test_tree_format_config();
     failures += test_send_tree_delta_null_stream();
     failures += test_handle_various_actions();
+    failures += test_injection_failure_propagates();
     failures += test_handle_invalid_payload();
     failures += test_default_settle();
     failures += test_handle_action_mcp();

@@ -168,18 +168,23 @@ int md_input_mouse_move(MdInput *inp, int x, int y) {
 }
 
 int md_input_click(MdInput *inp, int x, int y, int button) {
-    if (!inp || !inp->vtable) return -1;
+    if (!inp || !inp->vtable || !inp->vtable->mouse_move ||
+        !inp->vtable->mouse_button)
+        return -1;
 
     /* Move to position */
-    if (inp->vtable->mouse_move)
-        inp->vtable->mouse_move(inp, x, y);
+    if (inp->vtable->mouse_move(inp, x, y) < 0)
+        return -1;
 
     /* Press + release */
-    if (inp->vtable->mouse_button) {
-        inp->vtable->mouse_button(inp, button, 1);
-        input_delay();
-        inp->vtable->mouse_button(inp, button, 0);
-    }
+    if (inp->vtable->mouse_button(inp, button, 1) < 0)
+        return -1;
+
+    input_delay();
+
+    if (inp->vtable->mouse_button(inp, button, 0) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -217,17 +222,29 @@ int md_input_key_combo(MdInput *inp, const char **keys, int key_count) {
         }
     }
 
-    /* Press keys in order */
-    for (int i = 0; i < key_count; i++)
-        inp->vtable->key_event(inp, syms[i], 1);
+    /* Press keys in order. If a press fails, release any keys that were
+     * already pressed before reporting failure. */
+    int pressed_count = 0;
+    for (int i = 0; i < key_count; i++) {
+        if (inp->vtable->key_event(inp, syms[i], 1) < 0) {
+            for (int j = pressed_count - 1; j >= 0; j--)
+                inp->vtable->key_event(inp, syms[j], 0);
+            return -1;
+        }
+        pressed_count++;
+    }
 
     input_delay();
 
-    /* Release in reverse order */
-    for (int i = key_count - 1; i >= 0; i--)
-        inp->vtable->key_event(inp, syms[i], 0);
+    /* Release in reverse order. Keep releasing remaining keys even if one
+     * release fails, then report the failure to the caller. */
+    int ret = 0;
+    for (int i = key_count - 1; i >= 0; i--) {
+        if (inp->vtable->key_event(inp, syms[i], 0) < 0)
+            ret = -1;
+    }
 
-    return 0;
+    return ret;
 }
 
 int md_input_type_text(MdInput *inp, const char *text) {
@@ -265,7 +282,8 @@ int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
     case MD_ACTION_SET_VALUE:
         if (action->text[0] != '\0') {
             const char *select_all[] = { "ctrl", "a" };
-            md_input_key_combo(inp, select_all, 2);
+            if (md_input_key_combo(inp, select_all, 2) < 0)
+                return -1;
             input_delay();
             return md_input_type_text(inp, action->text);
         }
