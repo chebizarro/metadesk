@@ -60,6 +60,17 @@ static void safe_release(IUnknown **ppunk) {
     }
 }
 
+static void release_acquired_frame(DxgiState *st) {
+    if (st->frame_acquired && st->duplication) {
+        st->duplication->ReleaseFrame();
+        st->frame_acquired = false;
+    }
+    if (st->desktop_resource) {
+        st->desktop_resource->Release();
+        st->desktop_resource = nullptr;
+    }
+}
+
 /* Create a CPU-readable staging texture matching the display size. */
 static HRESULT create_staging_texture(DxgiState *st) {
     D3D11_TEXTURE2D_DESC desc = {};
@@ -172,14 +183,7 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
     if (!st || !st->duplication) return -1;
 
     /* Release previous frame if still held */
-    if (st->frame_acquired) {
-        st->duplication->ReleaseFrame();
-        st->frame_acquired = false;
-    }
-    if (st->desktop_resource) {
-        st->desktop_resource->Release();
-        st->desktop_resource = nullptr;
-    }
+    release_acquired_frame(st);
 
     /* Acquire the next desktop frame.
      * timeout_ms=100: wait up to 100ms for a new frame.
@@ -214,7 +218,10 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
     /* Get the desktop texture */
     ID3D11Texture2D *desktopTex = nullptr;
     hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&desktopTex);
-    if (FAILED(hr)) return -1;
+    if (FAILED(hr)) {
+        release_acquired_frame(st);
+        return -1;
+    }
 
     /* Copy to staging texture for CPU access */
     st->context->CopyResource(st->staging, desktopTex);
@@ -223,7 +230,10 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
     /* Map the staging texture */
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = st->context->Map(st->staging, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return -1;
+    if (FAILED(hr)) {
+        release_acquired_frame(st);
+        return -1;
+    }
 
     /* Build MdFrame */
     out->width        = st->width;

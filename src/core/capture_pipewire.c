@@ -223,6 +223,8 @@ done:
     return result;
 }
 
+static void portal_screencast_close(PortalScreencast *portal);
+
 /*
  * portal_screencast_open:
  * Execute the full ScreenCast portal flow and return a PipeWire fd
@@ -457,8 +459,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
     return 0;
 
 fail:
-    if (portal->session_handle) { free(portal->session_handle); portal->session_handle = NULL; }
-    if (portal->bus) { dbus_connection_unref(portal->bus); portal->bus = NULL; }
+    portal_screencast_close(portal);
     return -1;
 }
 
@@ -603,8 +604,24 @@ static void on_process(void *userdata) {
         frame.data_size  = d->chunk->size;
     }
 
-    /* Hand frame to consumer via lock + cond */
+    /* Hand frame to consumer via lock + cond.
+     * If a previous frame is still pending (not yet consumed), drop it and
+     * requeue its PipeWire buffer before replacing it. If the consumer is
+     * still holding the previous frame, do not overwrite held_pw_buf: requeue
+     * this newer buffer instead so release_frame() can safely return the
+     * consumer-owned buffer later. */
     pthread_mutex_lock(&pw->frame_lock);
+    if (pw->held_pw_buf) {
+        if (pw->frame_ready) {
+            pw_stream_queue_buffer(pw->stream, pw->held_pw_buf);
+            pw->held_pw_buf = NULL;
+        } else {
+            pthread_mutex_unlock(&pw->frame_lock);
+            pw_stream_queue_buffer(pw->stream, pw_buf);
+            return;
+        }
+    }
+
     pw->pending_frame = frame;
     pw->held_pw_buf   = pw_buf;
     pw->frame_ready   = true;
@@ -667,6 +684,7 @@ static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
 
     pw->ctx = ctx;
     pw->prefer_dmabuf = false; /* SHM default; backends may expose knob later */
+    pw->portal.pw_fd = -1;
     pthread_mutex_init(&pw->frame_lock, NULL);
     pthread_cond_init(&pw->frame_cond, NULL);
 
@@ -688,6 +706,22 @@ fail:
     return -1;
 }
 
+static void pw_cleanup_start_resources(PipewireState *pw) {
+    if (pw->stream) {
+        pw_stream_disconnect(pw->stream);
+        pw_stream_destroy(pw->stream);
+        pw->stream = NULL;
+    }
+    if (pw->core) {
+        pw_core_disconnect(pw->core);
+        pw->core = NULL;
+    }
+    if (pw->portal_active || pw->portal.bus || pw->portal.session_handle || pw->portal.pw_fd >= 0) {
+        portal_screencast_close(&pw->portal);
+        pw->portal_active = false;
+    }
+}
+
 static int pw_start(MdCaptureCtx *ctx) {
     PipewireState *pw = ctx->backend_data;
     if (!pw) return -1;
@@ -700,18 +734,21 @@ static int pw_start(MdCaptureCtx *ctx) {
 
     if (portal_screencast_open(&pw->portal) == 0) {
         /* Portal succeeded — connect using the portal's PipeWire fd */
+        pw->portal_active = true;
         pw->core = pw_context_connect_fd(pw->pw_ctx,
                                          fcntl(pw->portal.pw_fd, F_DUPFD_CLOEXEC, 3),
                                          NULL, 0);
         stream_node_id = pw->portal.node_id;
-        pw->portal_active = true;
         fprintf(stderr, "capture: connected via portal (node=%u)\n", stream_node_id);
     } else {
         /* Fallback: direct connection (works on X11 / test environments) */
         fprintf(stderr, "capture: portal unavailable, falling back to direct connect\n");
         pw->core = pw_context_connect(pw->pw_ctx, NULL, 0);
     }
-    if (!pw->core) return -1;
+    if (!pw->core) {
+        pw_cleanup_start_resources(pw);
+        return -1;
+    }
 
     /* Create capture stream */
     struct pw_properties *props = pw_properties_new(
@@ -721,7 +758,10 @@ static int pw_start(MdCaptureCtx *ctx) {
         NULL);
 
     pw->stream = pw_stream_new(pw->core, "metadesk-capture", props);
-    if (!pw->stream) return -1;
+    if (!pw->stream) {
+        pw_cleanup_start_resources(pw);
+        return -1;
+    }
 
     /* Listen for stream events */
     pw_stream_add_listener(pw->stream, &pw->stream_listener,
@@ -758,11 +798,16 @@ static int pw_start(MdCaptureCtx *ctx) {
         PW_DIRECTION_INPUT, stream_node_id,
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
         params, 1);
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        pw_cleanup_start_resources(pw);
+        return -1;
+    }
 
     /* Start PipeWire loop on its own thread */
-    if (pthread_create(&pw->thread, NULL, pw_thread_func, pw) != 0)
+    if (pthread_create(&pw->thread, NULL, pw_thread_func, pw) != 0) {
+        pw_cleanup_start_resources(pw);
         return -1;
+    }
     pw->thread_started = true;
 
     return 0;
@@ -815,6 +860,11 @@ static void pw_stop(MdCaptureCtx *ctx) {
     PipewireState *pw = ctx->backend_data;
     if (!pw) return;
 
+    pthread_mutex_lock(&pw->frame_lock);
+    ctx->active = false;
+    pthread_cond_broadcast(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
+
     if (pw->loop)
         pw_main_loop_quit(pw->loop);
 
@@ -822,8 +872,6 @@ static void pw_stop(MdCaptureCtx *ctx) {
         pthread_join(pw->thread, NULL);
         pw->thread_started = false;
     }
-
-    ctx->active = false;
 }
 
 static void pw_destroy(MdCaptureCtx *ctx) {
