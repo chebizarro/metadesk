@@ -30,9 +30,16 @@
 /* ── Backend-private state ───────────────────────────────────── */
 
 typedef struct {
-    int          connected;
-    uint64_t     next_id;        /* monotonic ID counter for node IDs     */
-    MdA11yNode  *last_snapshot;  /* previous tree for delta computation   */
+    int                  connected;
+    uint64_t             next_id;        /* monotonic ID counter for node IDs     */
+    MdA11yNode          *last_snapshot;  /* previous tree for delta computation   */
+    GMutex               lock;           /* protects next_id + last_snapshot      */
+    AtspiEventListener  *listener;       /* push-change listener registered below */
+    GThread             *event_thread;   /* runs the AT-SPI/GLib event loop       */
+    MdA11yChangeCb       change_cb;
+    void                *change_userdata;
+    gboolean             subscribed;
+    gboolean             event_loop_running;
 } AtspiState;
 
 /* ── Internal: convert AtspiAccessible to MdA11yNode ─────────── */
@@ -256,6 +263,96 @@ static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
     return dst;
 }
 
+static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root);
+static int atspi_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                                   int *out_count);
+
+/* ── Change subscriptions ────────────────────────────────────── */
+
+static const char *const atspi_change_events[] = {
+    "object:state-changed",
+    "object:children-changed",
+    "window:activate",
+};
+
+static gpointer atspi_event_loop_thread(gpointer data) {
+    AtspiState *st = data;
+    g_mutex_lock(&st->lock);
+    st->event_loop_running = TRUE;
+    g_mutex_unlock(&st->lock);
+
+    atspi_event_main();
+
+    g_mutex_lock(&st->lock);
+    st->event_loop_running = FALSE;
+    g_mutex_unlock(&st->lock);
+    return NULL;
+}
+
+static void atspi_change_event_cb(AtspiEvent *event, void *user_data) {
+    MdA11yCtx *ctx = user_data;
+    if (!ctx) return;
+
+    AtspiState *st = ctx->backend_data;
+    if (!st) return;
+
+    MdA11yChangeCb cb = NULL;
+    void *cb_userdata = NULL;
+    MdA11yDelta *deltas = NULL;
+    int delta_count = 0;
+
+    g_mutex_lock(&st->lock);
+    if (st->subscribed && st->change_cb) {
+        cb = st->change_cb;
+        cb_userdata = st->change_userdata;
+        (void)atspi_get_diff_unlocked(ctx, &deltas, &delta_count);
+    }
+    g_mutex_unlock(&st->lock);
+
+    if (cb)
+        cb(deltas, delta_count, cb_userdata);
+
+    md_a11y_delta_free(deltas, delta_count);
+    if (event)
+        g_boxed_free(ATSPI_TYPE_EVENT, event);
+}
+
+static int atspi_register_change_events(AtspiState *st) {
+    for (size_t i = 0; i < sizeof(atspi_change_events) / sizeof(atspi_change_events[0]); i++) {
+        GError *error = NULL;
+        if (!atspi_event_listener_register(st->listener, atspi_change_events[i], &error)) {
+            if (error) {
+                fprintf(stderr, "a11y_atspi: failed to register %s: %s\n",
+                        atspi_change_events[i], error->message);
+                g_error_free(error);
+            } else {
+                fprintf(stderr, "a11y_atspi: failed to register %s\n",
+                        atspi_change_events[i]);
+            }
+
+            for (size_t j = 0; j < i; j++) {
+                GError *dereg_error = NULL;
+                atspi_event_listener_deregister(st->listener,
+                                                atspi_change_events[j],
+                                                &dereg_error);
+                if (dereg_error) g_error_free(dereg_error);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void atspi_deregister_change_events(AtspiState *st) {
+    if (!st || !st->listener) return;
+
+    for (size_t i = 0; i < sizeof(atspi_change_events) / sizeof(atspi_change_events[0]); i++) {
+        GError *error = NULL;
+        atspi_event_listener_deregister(st->listener, atspi_change_events[i], &error);
+        if (error) g_error_free(error);
+    }
+}
+
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int atspi_init_backend(MdA11yCtx *ctx) {
@@ -269,12 +366,13 @@ static int atspi_init_backend(MdA11yCtx *ctx) {
         return -1;
     }
 
+    g_mutex_init(&st->lock);
     st->connected = 1;
     ctx->backend_data = st;
     return 0;
 }
 
-static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
+static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     AtspiState *st = ctx->backend_data;
     if (!st || !st->connected || !out_root) return -1;
 
@@ -327,8 +425,18 @@ static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return 0;
 }
 
-static int atspi_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                          int *out_count) {
+static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
+    AtspiState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return -1;
+
+    g_mutex_lock(&st->lock);
+    int ret = atspi_get_tree_unlocked(ctx, out_root);
+    g_mutex_unlock(&st->lock);
+    return ret;
+}
+
+static int atspi_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                                   int *out_count) {
     AtspiState *st = ctx->backend_data;
     if (!st || !out_deltas || !out_count) return -1;
 
@@ -336,7 +444,7 @@ static int atspi_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
     *out_count = 0;
 
     MdA11yNode *current = NULL;
-    if (atspi_get_tree(ctx, &current) != 0 || !current)
+    if (atspi_get_tree_unlocked(ctx, &current) != 0 || !current)
         return -1;
 
     MdA11yNode *prev = st->last_snapshot;
@@ -410,21 +518,107 @@ static int atspi_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
     return 0;
 }
 
+static int atspi_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                          int *out_count) {
+    AtspiState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return -1;
+
+    g_mutex_lock(&st->lock);
+    int ret = atspi_get_diff_unlocked(ctx, out_deltas, out_count);
+    g_mutex_unlock(&st->lock);
+    return ret;
+}
+
 static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                    void *userdata) {
-    (void)ctx; (void)cb; (void)userdata;
-    /* Phase 2: register for AT-SPI2 events (state-change, children-changed).
-     * For now, return -1 to indicate polling-only mode. */
-    return -1;
+    AtspiState *st = ctx ? ctx->backend_data : NULL;
+    if (!st || !st->connected || !cb) return -1;
+
+    g_mutex_lock(&st->lock);
+    if (st->subscribed) {
+        st->change_cb = cb;
+        st->change_userdata = userdata;
+        g_mutex_unlock(&st->lock);
+        return 0;
+    }
+    g_mutex_unlock(&st->lock);
+
+    AtspiEventListener *listener = atspi_event_listener_new(
+        atspi_change_event_cb, ctx, NULL);
+    if (!listener) {
+        fprintf(stderr, "a11y_atspi: failed to create event listener\n");
+        return -1;
+    }
+
+    g_mutex_lock(&st->lock);
+    st->listener = listener;
+    st->change_cb = cb;
+    st->change_userdata = userdata;
+    g_mutex_unlock(&st->lock);
+
+    if (atspi_register_change_events(st) != 0) {
+        g_mutex_lock(&st->lock);
+        st->listener = NULL;
+        st->change_cb = NULL;
+        st->change_userdata = NULL;
+        g_mutex_unlock(&st->lock);
+        g_object_unref(listener);
+        return -1;
+    }
+
+    /* Seed the diff baseline so the first push event can emit meaningful
+     * deltas instead of being consumed as the initial snapshot. */
+    g_mutex_lock(&st->lock);
+    if (!st->last_snapshot) {
+        MdA11yNode *initial = NULL;
+        if (atspi_get_tree_unlocked(ctx, &initial) == 0)
+            st->last_snapshot = initial;
+    }
+    st->subscribed = TRUE;
+    g_mutex_unlock(&st->lock);
+
+    st->event_thread = g_thread_new("md-atspi-events",
+                                    atspi_event_loop_thread, st);
+    if (!st->event_thread) {
+        atspi_deregister_change_events(st);
+        g_mutex_lock(&st->lock);
+        st->subscribed = FALSE;
+        st->listener = NULL;
+        st->change_cb = NULL;
+        st->change_userdata = NULL;
+        g_mutex_unlock(&st->lock);
+        g_object_unref(listener);
+        return -1;
+    }
+
+    return 0;
 }
 
 static void atspi_destroy_backend(MdA11yCtx *ctx) {
     AtspiState *st = ctx->backend_data;
     if (!st) return;
 
+    atspi_deregister_change_events(st);
+
+    g_mutex_lock(&st->lock);
+    st->subscribed = FALSE;
+    st->change_cb = NULL;
+    st->change_userdata = NULL;
+    gboolean stop_loop = st->event_thread != NULL || st->event_loop_running;
+    g_mutex_unlock(&st->lock);
+
+    if (stop_loop)
+        atspi_event_quit();
+    if (st->event_thread)
+        g_thread_join(st->event_thread);
+
+    if (st->listener)
+        g_object_unref(st->listener);
+
     md_a11y_node_free(st->last_snapshot);
     atspi_exit();
 
+    g_mutex_clear(&st->lock);
     free(st);
     ctx->backend_data = NULL;
 }

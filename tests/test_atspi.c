@@ -271,6 +271,34 @@ static void test_diff(void) {
     md_a11y_destroy(ctx);
 }
 
+static void noop_change_cb(const MdA11yDelta *deltas, int count, void *userdata) {
+    (void)deltas;
+    (void)count;
+    (void)userdata;
+}
+
+static void test_subscribe_changes(void) {
+    if (!live_a11y_tests_enabled()) {
+        printf("  SKIP: subscribe live backend (set MD_A11Y_LIVE_TESTS=1)\n");
+        return;
+    }
+
+    MdA11yCtx *ctx = md_a11y_create();
+    assert(ctx != NULL);
+
+    int rc = md_a11y_subscribe_changes(ctx, noop_change_cb, NULL);
+    if (rc < 0) {
+        /* Accessibility bus may not be available in CI/headless environments. */
+        printf("  SKIP: subscribe changes (no accessibility event bus)\n");
+        md_a11y_destroy(ctx);
+        return;
+    }
+
+    assert(rc >= 0);
+    md_a11y_destroy(ctx);
+    printf("  PASS: subscribe changes\n");
+}
+
 /* ── Tree patch tests (§3.3.3 in-place delta application) ──── */
 
 static void test_tree_patch_add(void) {
@@ -464,6 +492,7 @@ int main(void) {
     test_tree_patch_update_state();
     test_walk_tree();
     test_diff();
+    test_subscribe_changes();
     printf("All a11y tests passed.\n");
     return 0;
 }

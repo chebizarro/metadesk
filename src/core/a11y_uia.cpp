@@ -445,8 +445,12 @@ static int uia_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
 static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                  void *userdata) {
     (void)ctx; (void)cb; (void)userdata;
-    /* Phase 2: IUIAutomationEventHandler for StructureChanged,
-     * PropertyChanged (UIA_NamePropertyId, UIA_BoundingRectanglePropertyId). */
+    /* Not implemented yet: this needs a COM IUIAutomationEventHandler
+     * registered via AddStructureChangedEventHandler plus
+     * AddPropertyChangedEventHandler for Name, BoundingRectangle, enabled,
+     * focus, and related state properties. The handler also needs a message
+     * pump / COM apartment lifetime tied to UIAState before this backend can
+     * safely emit MdA11yChangeCb deltas. */
     return -1;
 }
 

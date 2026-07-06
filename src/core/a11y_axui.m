@@ -533,9 +533,12 @@ static int axui_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
 static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                   void *userdata) {
     (void)ctx; (void)cb; (void)userdata;
-    /* Phase 2: register AXObserver for AXFocusedUIElementChanged,
-     * AXValueChanged, AXUIElementDestroyed, etc.
-     * For now, return -1 to indicate polling-only mode. */
+    /* Not implemented yet: this needs one AXObserver per target application
+     * PID, registrations for notifications such as
+     * kAXFocusedUIElementChangedNotification, kAXValueChangedNotification,
+     * kAXUIElementDestroyedNotification, kAXWindowCreatedNotification, and
+     * kAXMainWindowChangedNotification, plus CFRunLoop source management in
+     * AXUIState before this backend can safely emit MdA11yChangeCb deltas. */
     return -1;
 }
 

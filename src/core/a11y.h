@@ -96,7 +96,8 @@ MdA11yNode *md_a11y_walk(MdA11yCtx *ctx);
 MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count);
 
 /* Subscribe to live accessibility tree changes.
- * Returns 0 on success, -1 if not supported by the backend. */
+ * Returns a non-negative backend handle (or 0 if no fd is exposed) on success,
+ * -1 if not supported by the backend. */
 int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
 
 /* ── Serialization (spec §3.3) ───────────────────────────────── */
