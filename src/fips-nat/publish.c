@@ -2,12 +2,9 @@
  * fips-nat — publish.c
  * Legacy NAT endpoint publication to Nostr relays.
  *
- * DEPRECATED: kind:30078 NAT endpoint JSON is retained only for the
- * legacy fips-nat path. FIPS v0.3+ overlay adverts and traversal
+ * DEPRECATED: legacy fips-nat endpoint serialization is retained only for
+ * tests and old IPC payloads. FIPS v0.3+ overlay adverts and traversal
  * signaling are the recommended discovery/reachability mechanism.
- *
- * Publishes the node's STUN-discovered reflexive address as a
- * kind:30078 addressable event via the legacy transport publisher.
  *
  * The JSON content format:
  *   {
@@ -119,34 +116,15 @@ int md_publish_nat_endpoint(MdNostr *nostr, const MdNatEndpoint *ep) {
     if (!content)
         return -1;
 
-    /* Deprecated legacy publication via the core transport publisher
-     * (kind:30078, d:"fips-transport"). Do not use this as the recommended
-     * metadesk/FIPS discovery path; the FIPS daemon owns overlay adverts,
-     * STUN/TURN, and traversal signaling. */
-    int ret = md_nostr_publish_transport(nostr, content);
     free(content);
-
-    if (ret == 0) {
-        fprintf(stderr, "publish: NAT endpoint published: %s:%u\n",
-                ep->stun.ip, ep->stun.port);
-    }
-
-    return ret;
+    fprintf(stderr, "publish: legacy Nostr NAT endpoint publication is unsupported\n");
+    return -1;
 }
 
 int md_subscribe_nat_endpoint(MdNostr *nostr, const char *peer_pubkey_hex) {
     if (!nostr || !peer_pubkey_hex)
         return -1;
 
-    /* Subscribe via the existing transport subscription mechanism.
-     * The on_transport callback will fire with the JSON content.
-     * The caller parses it with md_nat_endpoint_from_json(). */
-    return md_nostr_subscribe_transport(nostr, peer_pubkey_hex);
-}
-
-/* ── Legacy API ──────────────────────────────────────────────── */
-
-int md_publish_transport(MdNostr *nostr, const char *fips_addr) {
-    if (!nostr || !fips_addr) return -1;
-    return md_nostr_publish_transport(nostr, fips_addr);
+    fprintf(stderr, "publish: legacy Nostr NAT endpoint subscription is unsupported\n");
+    return -1;
 }

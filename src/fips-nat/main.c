@@ -10,7 +10,7 @@
  *   1. Parse CLI args (signer, relays, stun server, ports)
  *   2. Initialize signer → Nostr bridge
  *   3. Run STUN discovery to find our reflexive address
- *   4. Optionally publish legacy NAT endpoint JSON to Nostr (kind:30078)
+ *   4. Keep legacy NAT endpoint JSON available over IPC
  *   5. Listen on local IPC for commands from metadesk-host
  *   6. Handle punch requests, re-discovery, status queries
  *
@@ -203,7 +203,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer       Auto-detect local signer\n");
     fprintf(stderr, "  --relay URL         Relay URL (repeatable)\n");
-    fprintf(stderr, "  --no-publish        Skip legacy kind:30078 NAT JSON publication (STUN only)\n");
+    fprintf(stderr, "  --no-publish        Skip unsupported legacy Nostr NAT publication (STUN only)\n");
     fprintf(stderr, "\nTURN relay fallback:\n");
     fprintf(stderr, "  --turn-server HOST  TURN server (e.g. turn.sharegap.net)\n");
     fprintf(stderr, "  --turn-port PORT    TURN port (default: %d)\n",

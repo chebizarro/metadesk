@@ -631,10 +631,6 @@ int main(int argc, char **argv) {
             if (session_log)
                 md_session_log_set_nostr(session_log, nostr);
 
-            /* FIPS reachability is now owned by the local FIPS daemon.
-             * Do not publish legacy kind:30078/d=fips-transport IPv6 adverts
-             * as the primary bootstrap signal. */
-
             /* Subscribe to allowlist updates */
             md_nostr_refresh_allowlist(nostr);
 

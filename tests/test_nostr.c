@@ -288,8 +288,6 @@ static void test_callback_struct_layout(void) {
     /* All callbacks should start NULL */
     assert(cbs.on_dm == NULL);
     assert(cbs.dm_userdata == NULL);
-    assert(cbs.on_transport == NULL);
-    assert(cbs.transport_userdata == NULL);
     assert(cbs.on_publish_result == NULL);
     assert(cbs.publish_result_userdata == NULL);
 

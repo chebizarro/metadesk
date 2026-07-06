@@ -282,12 +282,6 @@ static void test_subscribe_null_safety(void) {
     printf("  PASS: subscribe null safety\n");
 }
 
-static void test_legacy_publish_null_safety(void) {
-    assert(md_publish_transport(NULL, "fd00::1") == -1);
-    assert(md_publish_transport(NULL, NULL) == -1);
-
-    printf("  PASS: legacy publish null safety\n");
-}
 
 /* ── Main ─────────────────────────────────────────────────────── */
 
@@ -314,7 +308,6 @@ int main(void) {
     /* Null safety */
     test_publish_null_safety();
     test_subscribe_null_safety();
-    test_legacy_publish_null_safety();
 
     printf("test_publish: ALL %d TESTS PASSED\n", 14);
     return 0;

@@ -2,12 +2,9 @@
  * fips-nat — publish.h
  * Legacy NAT endpoint publication to Nostr relays.
  *
- * DEPRECATED: retained only for the legacy fips-nat path. Current
- * metadesk/FIPS deployments should use the FIPS daemon's discovery,
- * STUN/TURN, and traversal signaling instead of kind:30078 NAT JSON.
- *
- * Publishes the node's STUN-discovered reflexive (public) address
- * as legacy kind:30078 JSON for old UDP hole-punch peers.
+ * DEPRECATED: retained only for legacy fips-nat endpoint serialization.
+ * Current metadesk/FIPS deployments should use the FIPS daemon's discovery,
+ * STUN/TURN, and traversal signaling.
  *
  * Event content is JSON:
  *   { "v":1, "ip":"...", "port":N, "proto":"udp",
@@ -29,7 +26,6 @@ extern "C" {
 /* ── Constants ───────────────────────────────────────────────── */
 
 #define MD_PUBLISH_D_TAG         "fips-nat-endpoint"
-#define MD_PUBLISH_EVENT_KIND    30078
 #define MD_PUBLISH_VERSION       1
 
 /* ── NAT endpoint info ───────────────────────────────────────── */
@@ -58,7 +54,7 @@ int md_nat_endpoint_from_json(const char *json, MdNatEndpoint *ep);
 /* ── Publication ─────────────────────────────────────────────── */
 
 /*
- * Publish our legacy NAT endpoint JSON to Nostr relays.
+ * Legacy Nostr publication is unsupported.
  * This is not the recommended FIPS discovery/reachability path.
  *
  * nostr: active Nostr bridge (connected to relays with a signer)
@@ -69,8 +65,7 @@ int md_nat_endpoint_from_json(const char *json, MdNatEndpoint *ep);
 int md_publish_nat_endpoint(MdNostr *nostr, const MdNatEndpoint *ep);
 
 /*
- * Subscribe to a peer's legacy NAT endpoint updates.
- * Results arrive via the on_transport callback with the JSON content.
+ * Legacy Nostr subscription is unsupported.
  *
  * nostr:          active Nostr bridge
  * peer_pubkey_hex: 64-char hex pubkey of the peer
@@ -79,11 +74,6 @@ int md_publish_nat_endpoint(MdNostr *nostr, const MdNatEndpoint *ep);
  */
 int md_subscribe_nat_endpoint(MdNostr *nostr, const char *peer_pubkey_hex);
 
-/*
- * Legacy API: publish FIPS overlay address (delegates to core).
- * Kept for backward compatibility.
- */
-int md_publish_transport(MdNostr *nostr, const char *fips_addr);
 
 #ifdef __cplusplus
 }

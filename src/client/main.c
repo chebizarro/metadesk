@@ -538,8 +538,7 @@ int main(int argc, char **argv) {
         }
 
         /* Session DM callback. FIPS reachability is owned by the FIPS daemon
-         * and checked through fips_control; do not subscribe to legacy
-         * kind:30078 transport adverts here. */
+         * and checked through fips_control. */
         MdNostrCallbacks nostr_cbs = { 0 };
         nostr_cbs.on_dm = on_session_dm;
         nostr_cbs.dm_userdata = &ctx;

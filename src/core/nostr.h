@@ -76,10 +76,6 @@ typedef void (*MdNostrDmCallback)(const char *sender_pubkey_hex,
                                   const char *content,
                                   void *userdata);
 
-/* Called when a transport address event (kind:30078) is received */
-typedef void (*MdNostrTransportCallback)(const char *pubkey_hex,
-                                         const char *fips_addr,
-                                         void *userdata);
 
 /* Called when a relay responds to an event we published (OK frame).
  * `ok` is true on acceptance, false on rejection.
@@ -94,8 +90,6 @@ typedef void (*MdNostrPublishResultCallback)(const char *event_id,
 typedef struct {
     MdNostrDmCallback              on_dm;              /* incoming session DMs     */
     void                          *dm_userdata;
-    MdNostrTransportCallback       on_transport;       /* transport addr updates   */
-    void                          *transport_userdata;
     MdNostrPublishResultCallback   on_publish_result;  /* relay OK/rejection       */
     void                          *publish_result_userdata;
 } MdNostrCallbacks;
@@ -106,7 +100,6 @@ typedef struct {
  * NIP-17 gift-wraps addressed to our pubkey.
  *
  * Additional subscriptions are started on demand:
- *   - kind:30078 via md_nostr_subscribe_transport()
  *   - kind:30000 via md_nostr_refresh_allowlist()
  *
  * All subscriptions persist until md_nostr_destroy().
@@ -182,19 +175,6 @@ int md_nostr_allowlist_count(const MdNostr *n);
 int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
                                  MdAllowlistEntry *out);
 
-/* ── Transport address publication ────────────────────────────
- * The host publishes its FIPS transport address as a kind:30078
- * addressable event with d-tag "fips-transport". Clients subscribe
- * to this event to discover the host's address. Updates arrive
- * asynchronously via the on_transport callback.
- */
-
-/* Publish our FIPS transport address (kind:30078, d:"fips-transport"). */
-int md_nostr_publish_transport(MdNostr *n, const char *fips_addr);
-
-/* Subscribe to a specific host's transport address updates.
- * Results arrive asynchronously via the on_transport callback. */
-int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex);
 
 /* ── Generic event publishing ─────────────────────────────── */
 

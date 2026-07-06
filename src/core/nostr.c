@@ -463,12 +463,6 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming) {
 
         go_wait_group_add(&n->dm_wg, 1);
         go(dm_unwrap_thread, ua);
-    } else if (kind == 30078 && n->cbs.on_transport) {
-        /* Transport address event — extract content (FIPS addr) */
-        const char *pubkey = nostr_event_get_pubkey(ev);
-        const char *content = nostr_event_get_content(ev);
-        if (pubkey && content)
-            n->cbs.on_transport(pubkey, content, n->cbs.transport_userdata);
     } else if (kind == 30000) {
         /* NIP-51 categorized people list — check if it's our allowlist.
          * Parse public entries (no sk_hex for private entry decryption
@@ -1224,45 +1218,6 @@ int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
     return 0;
 }
 
-/* ── Transport address ────────────────────────────────────────
- *
- * kind:30078 is addressable, d-tag is "fips-transport".
- */
-
-int md_nostr_publish_transport(MdNostr *n, const char *fips_addr) {
-    if (!n || !n->signer || !fips_addr)
-        return -1;
-
-    NostrEvent *event = nostr_event_new();
-    if (!event) return -1;
-
-    nostr_event_set_kind(event, 30078);
-    nostr_event_set_content(event, fips_addr);
-    nostr_event_set_pubkey(event, n->pk_hex);
-    nostr_event_set_created_at(event, (int64_t)time(NULL));
-
-    /* Add d-tag ["d", "fips-transport"] — makes this an addressable event (NIP-33) */
-    NostrTag *d_tag = nostr_tag_new("d", "fips-transport", NULL);
-    if (!d_tag) { nostr_event_free(event); return -1; }
-    NostrTags *tags = nostr_tags_new(1, d_tag);
-    if (!tags) { nostr_tag_free(d_tag); nostr_event_free(event); return -1; }
-    nostr_event_set_tags(event, tags); /* takes ownership */
-
-    /* Sign via signer abstraction */
-    NostrEvent *signed_event = sign_event_via_signer(n->signer, event);
-    nostr_event_free(event);
-    if (!signed_event) return -1;
-
-    /* Publish to all connected relays */
-    int ret = publish_all(n, signed_event);
-    nostr_event_free(signed_event);
-
-    if (ret == 0) {
-        fprintf(stderr, "nostr: published transport addr %s\n", fips_addr);
-    }
-
-    return ret;
-}
 
 /* ── Generic event publishing ────────────────────────────────── */
 
@@ -1287,41 +1242,3 @@ int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json) {
     return ret;
 }
 
-int md_nostr_subscribe_transport(MdNostr *n, const char *host_pubkey_hex) {
-    if (!n || !n->pool || !host_pubkey_hex)
-        return -1;
-
-    /* Build filter: kind:30078, authors:[host_pubkey], #d:["fips-transport"].
-     * limit:1 — addressable event (NIP-33), only the latest version exists;
-     * subscription stays open for live replacements. */
-    NostrFilter *f = nostr_filter_builder_build(
-        nostr_filter_builder_limit(
-            nostr_filter_builder_tag(
-                nostr_filter_builder_authors(
-                    nostr_filter_builder_kinds(
-                        nostr_filter_builder_new(),
-                        30078, -1),
-                    host_pubkey_hex, NULL),
-                "d", "fips-transport"),
-            1));
-    if (!f) return -1;
-
-    /* Wrap in NostrFilters (by-value struct for pool_subscribe) */
-    NostrFilters *filters = nostr_filters_new();
-    if (!filters) { nostr_filter_free(f); return -1; }
-    nostr_filters_add(filters, f);
-    /* f contents moved into filters; f is zeroed but still needs freeing */
-    nostr_filter_free(f);
-
-    /* Use cached relay URLs for subscription.
-     * Incoming kind:30078 events route through
-     * md_nostr_event_handler() which calls cbs.on_transport */
-    nostr_simple_pool_subscribe(n->pool, (const char **)n->relay_urls,
-                                n->relay_count, *filters, true);
-
-    nostr_filters_free(filters);
-
-    fprintf(stderr, "nostr: subscribed to transport addr for %.8s...\n",
-            host_pubkey_hex);
-    return 0;
-}
