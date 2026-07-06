@@ -10,6 +10,9 @@
 #include "a11y.h"
 #include "input.h"
 #include "session.h"
+#include "mcp_server.h"
+#include "mcp_tools.h"
+#include <cjson/cJSON.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,9 +22,29 @@
 /* ── Mock input backend for deterministic injection failures ─── */
 
 typedef struct {
+    int mouse_move_calls;
+    int mouse_move_ret;
+    int mouse_button_calls;
+    int mouse_button_ret;
     int type_text_calls;
     int type_text_ret;
 } AgentMockInputData;
+
+static int agent_mock_mouse_move(MdInputCtx *ctx, int x, int y) {
+    AgentMockInputData *data = (AgentMockInputData *)ctx->backend_data;
+    (void)x;
+    (void)y;
+    data->mouse_move_calls++;
+    return data->mouse_move_ret;
+}
+
+static int agent_mock_mouse_button(MdInputCtx *ctx, int button, int pressed) {
+    AgentMockInputData *data = (AgentMockInputData *)ctx->backend_data;
+    (void)button;
+    (void)pressed;
+    data->mouse_button_calls++;
+    return data->mouse_button_ret;
+}
 
 static int agent_mock_type_text(MdInputCtx *ctx, const char *utf8) {
     AgentMockInputData *data = (AgentMockInputData *)ctx->backend_data;
@@ -31,6 +54,8 @@ static int agent_mock_type_text(MdInputCtx *ctx, const char *utf8) {
 }
 
 static const MdInputBackend agent_mock_backend = {
+    .mouse_move = agent_mock_mouse_move,
+    .mouse_button = agent_mock_mouse_button,
     .type_text = agent_mock_type_text,
 };
 
@@ -41,6 +66,44 @@ static MdInput make_agent_mock_input(AgentMockInputData *data) {
     inp.backend_data = data;
     inp.ready = true;
     return inp;
+}
+
+/* ── Capture transport for MCP tool-path assertions ──────────── */
+
+static char *g_agent_mcp_response = NULL;
+
+static void clear_agent_mcp_response(void) {
+    free(g_agent_mcp_response);
+    g_agent_mcp_response = NULL;
+}
+
+static int capture_agent_mcp_write(const char *json, size_t len, void *userdata) {
+    (void)userdata;
+    clear_agent_mcp_response();
+    g_agent_mcp_response = strndup(json, len);
+    return g_agent_mcp_response ? 0 : -1;
+}
+
+static MdMcpServer *make_agent_mcp_server(MdMcpToolCtx *tool_ctx) {
+    clear_agent_mcp_response();
+    MdMcpServerConfig cfg = {
+        .server_name = "agent-test",
+        .server_version = "0.0.1",
+        .write_fn = capture_agent_mcp_write,
+    };
+    MdMcpServer *server = md_mcp_server_create(&cfg);
+    assert(server != NULL);
+    assert(md_mcp_register_tools(server, tool_ctx) == 0);
+
+    const char *init = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
+                       "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
+                       "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
+    md_mcp_server_handle_message(server, init, strlen(init));
+    const char *initialized = "{\"jsonrpc\":\"2.0\","
+                              "\"method\":\"notifications/initialized\"}";
+    md_mcp_server_handle_message(server, initialized, strlen(initialized));
+    clear_agent_mcp_response();
+    return server;
 }
 
 /* ── Test: create and destroy ────────────────────────────────── */
@@ -291,6 +354,81 @@ static int test_injection_failure_propagates(void) {
     return 0;
 }
 
+/* ── Test: MCP tool failure when a11y is unavailable ─────────── */
+
+static int test_mcp_tool_requires_a11y_returns_error(void) {
+    printf("  test_mcp_tool_requires_a11y_returns_error... ");
+
+    MdAgentConfig cfg = {
+        .a11y        = NULL,
+        .input       = NULL,
+        .tree_format = MD_TREE_FORMAT_JSON,
+        .settle_ms   = 1,
+    };
+    MdAgent *agent = md_agent_create(&cfg);
+    assert(agent != NULL);
+
+    MdMcpToolCtx tool_ctx = { .agent = agent, .a11y = NULL };
+    MdMcpServer *server = make_agent_mcp_server(&tool_ctx);
+
+    const char *call = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":42,"
+                       "\"params\":{\"name\":\"metadesk_click\","
+                       "\"arguments\":{\"target_id\":\"btn_missing\"}}}";
+    md_mcp_server_handle_message(server, call, strlen(call));
+    assert(g_agent_mcp_response != NULL);
+
+    cJSON *resp = cJSON_Parse(g_agent_mcp_response);
+    assert(resp != NULL);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    assert(result != NULL);
+    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+    cJSON *content = cJSON_GetObjectItem(result, "content");
+    assert(cJSON_IsArray(content));
+    const char *text = cJSON_GetObjectItem(cJSON_GetArrayItem(content, 0),
+                                           "text")->valuestring;
+    assert(strstr(text, "action execution failed") != NULL);
+    cJSON_Delete(resp);
+
+    assert(md_agent_get_action_count(agent) == 0);
+
+    clear_agent_mcp_response();
+    md_mcp_tools_cleanup(&tool_ctx);
+    md_mcp_server_destroy(server);
+    md_agent_destroy(agent);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: no action_count increment when a11y result is missing ─ */
+
+static int test_action_count_not_incremented_when_a11y_null(void) {
+    printf("  test_action_count_not_incremented_when_a11y_null... ");
+
+    AgentMockInputData data = {0};
+    MdInput input = make_agent_mock_input(&data);
+    MdAgentConfig cfg = {
+        .a11y        = NULL,
+        .input       = &input,
+        .tree_format = MD_TREE_FORMAT_JSON,
+        .settle_ms   = 1,
+    };
+    MdAgent *agent = md_agent_create(&cfg);
+    assert(agent != NULL);
+
+    const char *json = "{\"v\":1,\"action\":\"click\","
+                       "\"target_id\":\"btn_missing\",\"payload\":{}}";
+    char *result = md_agent_handle_action_mcp(agent,
+                                              (const uint8_t *)json,
+                                              (uint32_t)strlen(json));
+    assert(result == NULL);
+    assert(md_agent_get_action_count(agent) == 0);
+
+    md_agent_destroy(agent);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Test: handle_action with invalid payload ────────────────── */
 
 static int test_handle_invalid_payload(void) {
@@ -393,10 +531,13 @@ int main(void) {
     failures += test_send_tree_delta_null_stream();
     failures += test_handle_various_actions();
     failures += test_injection_failure_propagates();
+    failures += test_mcp_tool_requires_a11y_returns_error();
+    failures += test_action_count_not_incremented_when_a11y_null();
     failures += test_handle_invalid_payload();
     failures += test_default_settle();
     failures += test_handle_action_mcp();
 
+    clear_agent_mcp_response();
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return failures;
 }

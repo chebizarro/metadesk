@@ -100,17 +100,51 @@ static const struct { const char *name; MdCapability bit; } cap_table[] = {
 };
 #define CAP_TABLE_LEN (sizeof(cap_table) / sizeof(cap_table[0]))
 
+static bool cap_string_to_bit(const char *name, MdCapability *bit_out) {
+    if (!name || !bit_out)
+        return false;
+
+    for (size_t j = 0; j < CAP_TABLE_LEN; j++) {
+        if (strcmp(name, cap_table[j].name) == 0) {
+            *bit_out = cap_table[j].bit;
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t md_caps_from_strings(const char **strs, int count) {
     uint32_t caps = 0;
     for (int i = 0; i < count; i++) {
-        for (size_t j = 0; j < CAP_TABLE_LEN; j++) {
-            if (strcmp(strs[i], cap_table[j].name) == 0) {
-                caps |= cap_table[j].bit;
-                break;
-            }
-        }
+        MdCapability bit;
+        if (cap_string_to_bit(strs[i], &bit))
+            caps |= bit;
     }
     return caps;
+}
+
+static int parse_capability_array(cJSON *caps, uint32_t *out_caps) {
+    if (!out_caps)
+        return -1;
+
+    *out_caps = 0;
+    if (!caps)
+        return 0;
+    if (!cJSON_IsArray(caps))
+        return -1;
+
+    int count = cJSON_GetArraySize(caps);
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_GetArrayItem(caps, i);
+        if (!cJSON_IsString(item))
+            return -1;
+
+        MdCapability bit;
+        if (!cap_string_to_bit(item->valuestring, &bit))
+            return -1;
+        *out_caps |= bit;
+    }
+    return 0;
 }
 
 int md_caps_to_strings(uint32_t caps, const char **out, int max_out) {
@@ -188,16 +222,9 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
 
     /* capabilities */
     cJSON *caps = cJSON_GetObjectItem(root, "capabilities");
-    if (cJSON_IsArray(caps)) {
-        int count = cJSON_GetArraySize(caps);
-        const char *strs[16];
-        int n = 0;
-        for (int i = 0; i < count && n < 16; i++) {
-            cJSON *item = cJSON_GetArrayItem(caps, i);
-            if (cJSON_IsString(item))
-                strs[n++] = item->valuestring;
-        }
-        out->capabilities = md_caps_from_strings(strs, n);
+    if (parse_capability_array(caps, &out->capabilities) < 0) {
+        cJSON_Delete(root);
+        return -1;
     }
 
     /* tree_format */
@@ -294,16 +321,9 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
 
     /* granted */
     cJSON *granted = cJSON_GetObjectItem(root, "granted");
-    if (cJSON_IsArray(granted)) {
-        int count = cJSON_GetArraySize(granted);
-        const char *strs[16];
-        int n = 0;
-        for (int i = 0; i < count && n < 16; i++) {
-            cJSON *item = cJSON_GetArrayItem(granted, i);
-            if (cJSON_IsString(item))
-                strs[n++] = item->valuestring;
-        }
-        out->granted = md_caps_from_strings(strs, n);
+    if (parse_capability_array(granted, &out->granted) < 0) {
+        cJSON_Delete(root);
+        return -1;
     }
 
     cJSON_Delete(root);

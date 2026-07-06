@@ -8,7 +8,7 @@
 #include "mcp_bridge.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
 
@@ -17,6 +17,7 @@ struct MdMcpBridge {
     MdAgent           *agent;
     MdMcpServer       *server;
     MdMcpStdio        *stdio_ctx;
+    bool               degraded;
 
     /* Contexts for tool/resource handlers (must outlive server) */
     MdMcpToolCtx       tool_ctx;
@@ -50,6 +51,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     b->a11y = config->a11y;
     b->input = config->input;
+    b->degraded = (config->a11y == NULL || config->input == NULL);
 
     /* 1. Initialize session */
     md_session_init(&b->session);
@@ -163,6 +165,11 @@ void md_mcp_bridge_shutdown(MdMcpBridge *bridge)
 MdSessionState md_mcp_bridge_get_state(const MdMcpBridge *bridge)
 {
     return bridge ? bridge->session.state : MD_SESSION_IDLE;
+}
+
+bool md_mcp_bridge_is_degraded(const MdMcpBridge *bridge)
+{
+    return bridge ? bridge->degraded : false;
 }
 
 MdMcpServer *md_mcp_bridge_get_server(const MdMcpBridge *bridge)

@@ -17,6 +17,7 @@
 #include "a11y.h"
 #include "input.h"
 #include "session.h"
+#include <stdbool.h>
 
 /* Version string — set by meson via -DMD_MCP_BRIDGE_VERSION=... */
 #ifndef MD_MCP_BRIDGE_VERSION
@@ -59,6 +60,10 @@ void md_mcp_bridge_shutdown(MdMcpBridge *bridge);
 
 /* Get the session state. */
 MdSessionState md_mcp_bridge_get_state(const MdMcpBridge *bridge);
+
+/* Return true when the bridge was created without required production
+ * dependencies and can only provide degraded/erroring tool behavior. */
+bool md_mcp_bridge_is_degraded(const MdMcpBridge *bridge);
 
 /* Get the underlying MCP server (for sending notifications). */
 MdMcpServer *md_mcp_bridge_get_server(const MdMcpBridge *bridge);

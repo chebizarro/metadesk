@@ -467,9 +467,29 @@ static void test_init_capabilities_reflect_registrations(void)
 
 /* ── Bridge lifecycle test ────────────────────────────────── */
 
-static void test_bridge_create_destroy(void)
+static void test_bridge_null_deps_fail_or_report_degraded(void)
 {
-    /* Create a bridge with pipe transport */
+    MdMcpBridgeConfig cfg = {
+        .a11y = NULL,
+        .input = NULL,
+        .tree_format = MD_TREE_FORMAT_JSON,
+        .settle_ms = 50,
+        .stdio_in_fd = -1,
+        .stdio_out_fd = -1,
+    };
+
+    MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
+    if (bridge) {
+        assert(md_mcp_bridge_is_degraded(bridge));
+        md_mcp_bridge_destroy(bridge);
+    }
+
+    PASS("bridge NULL deps fail or report degraded");
+}
+
+static void test_bridge_create_destroy_with_null_deps_graceful_degradation(void)
+{
+    /* Create a bridge with pipe transport and missing production deps. */
     int in_pipe[2], out_pipe[2];
     pipe(in_pipe);
     pipe(out_pipe);
@@ -485,8 +505,9 @@ static void test_bridge_create_destroy(void)
 
     MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
     assert(bridge != NULL);
+    assert(md_mcp_bridge_is_degraded(bridge));
 
-    /* Session should be active */
+    /* Session should be active, but explicitly degraded. */
     assert(md_mcp_bridge_get_state(bridge) == MD_SESSION_ACTIVE);
 
     /* Server should be accessible */
@@ -500,7 +521,7 @@ static void test_bridge_create_destroy(void)
     close(out_pipe[0]);
     close(out_pipe[1]);
 
-    PASS("bridge create + destroy lifecycle");
+    PASS("bridge create + destroy lifecycle with NULL deps graceful degradation");
 }
 
 /* ── Resource registration tests ─────────────────────────────── */
@@ -766,7 +787,8 @@ int main(void)
     test_tool_call_key_combo();
     test_tool_registration_failure_rolls_back();
     test_resources_with_session();
-    test_bridge_create_destroy();
+    test_bridge_null_deps_fail_or_report_degraded();
+    test_bridge_create_destroy_with_null_deps_graceful_degradation();
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();

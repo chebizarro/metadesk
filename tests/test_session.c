@@ -317,6 +317,62 @@ static void test_state_machine(void) {
     printf("  PASS: state machine\n");
 }
 
+static void test_accept_from_idle_host_side(void) {
+    MdSession s;
+    md_session_init(&s);
+
+    assert(md_session_accept(&s, "host-side-session", MD_CAP_VIDEO | MD_CAP_AGENT) == 0);
+    assert(s.state == MD_SESSION_NEGOTIATING);
+    assert(s.capabilities == (MD_CAP_VIDEO | MD_CAP_AGENT));
+    assert(strcmp(s.session_id, "host-side-session") == 0);
+
+    printf("  PASS: accept from IDLE host side\n");
+}
+
+static void test_reset_after_disconnect(void) {
+    MdSession s;
+    md_session_init(&s);
+
+    assert(md_session_request(&s, "npub1peer", MD_CAP_VIDEO,
+                              MD_TREE_FORMAT_COMPACT) == 0);
+    assert(md_session_accept(&s, "disconnect-reset-session", MD_CAP_VIDEO) == 0);
+    assert(md_session_activate(&s) == 0);
+    assert(md_session_disconnect(&s) == 0);
+    assert(s.state == MD_SESSION_DISCONNECTING);
+
+    md_session_reset(&s);
+    assert(s.state == MD_SESSION_IDLE);
+    assert(s.capabilities == 0);
+    assert(s.tree_format == MD_TREE_FORMAT_JSON);
+    assert(s.session_id[0] == '\0');
+    assert(s.peer_npub[0] == '\0');
+    assert(s.keepalive_ms == MD_SESSION_KEEPALIVE_DEFAULT_MS);
+
+    printf("  PASS: reset after disconnect\n");
+}
+
+static void test_invalid_capability_strings_rejected(void) {
+    MdSessionRequest req;
+    const char *bad_req = "{\"type\":\"session_request\",\"v\":1,"
+                          "\"capabilities\":[\"video\",\"clipboard\"],"
+                          "\"tree_format\":\"json\"}";
+    assert(md_session_request_from_json(bad_req, &req) == -1);
+
+    const char *bad_req_type = "{\"type\":\"session_request\",\"v\":1,"
+                               "\"capabilities\":[\"video\",42],"
+                               "\"tree_format\":\"json\"}";
+    assert(md_session_request_from_json(bad_req_type, &req) == -1);
+
+    MdSessionAccept acc;
+    const char *bad_acc = "{\"type\":\"session_accept\",\"v\":1,"
+                          "\"session_id\":\"sid\","
+                          "\"granted\":[\"agent\",\"clipboard\"],"
+                          "\"tree_format\":\"compact\"}";
+    assert(md_session_accept_from_json(bad_acc, &acc) == -1);
+
+    printf("  PASS: invalid capability strings rejected\n");
+}
+
 /* ── Keepalive timeout ───────────────────────────────────────── */
 
 static void test_keepalive_timeout(void) {
@@ -450,6 +506,9 @@ int main(void) {
 
     /* State machine tests */
     test_state_machine();
+    test_accept_from_idle_host_side();
+    test_reset_after_disconnect();
+    test_invalid_capability_strings_rejected();
     test_keepalive_timeout();
     test_null_session();
     test_accept_tree_format_negotiation();

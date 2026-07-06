@@ -284,10 +284,10 @@ static void test_url_parsing(void) {
     PASS();
 }
 
-/* ── Test: successful fetch, URL encoding, and truncation ────── */
+/* ── Test: successful fetch and URL encoding ────────────────── */
 
-static void test_fetch_url_encoding_and_truncation(void) {
-    TEST("fetch uses URL encoding and rejects truncation");
+static void test_fetch_url_encoding(void) {
+    TEST("fetch uses URL encoding");
 
     uint8_t buf[64];
     int failures = 0;
@@ -302,15 +302,43 @@ static void test_fetch_url_encoding_and_truncation(void) {
         FAIL("wrong secret value"); return;
     }
 
+    PASS();
+}
+
+/* ── Test: small output buffers fail instead of truncating ───── */
+
+static void test_buffer_too_small_returns_error(void) {
+    TEST("buffer too small returns error");
+
+    uint8_t buf[64];
     memset(buf, 0xA5, sizeof(buf));
-    failures = 0;
-    ret = run_mock_secret_fetch(buf, 4, &failures);
+    int failures = 0;
+    int ret = run_mock_secret_fetch(buf, 4, &failures);
     if (ret != -1) {
         FAIL("small buffer should fail instead of truncating"); return;
     }
     if (failures != 0) {
-        FAIL("server path validation failed on truncation case"); return;
+        FAIL("server path validation failed on small-buffer case"); return;
     }
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        if (buf[i] != 0xA5) {
+            FAIL("small-buffer failure modified output buffer"); return;
+        }
+    }
+
+    PASS();
+}
+
+/* ── Test: non-loopback HTTP warning path ────────────────────── */
+
+static void test_non_loopback_url_warning_path(void) {
+    TEST("non-loopback URL warning path");
+
+    MdSecrets *s = md_secrets_create("http://192.0.2.10:8080", "tok");
+    if (!s) {
+        FAIL("non-loopback HTTP URL should create after warning"); return;
+    }
+    md_secrets_destroy(s);
 
     PASS();
 }
@@ -344,7 +372,9 @@ int main(void) {
     test_get_invalid();
     test_not_connected();
     test_url_parsing();
-    test_fetch_url_encoding_and_truncation();
+    test_fetch_url_encoding();
+    test_buffer_too_small_returns_error();
+    test_non_loopback_url_warning_path();
     test_secure_destroy();
 
     printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
