@@ -66,11 +66,33 @@ struct MdSecrets {
 
 /* ── URL parsing ─────────────────────────────────────────────── */
 
+static int parse_port(const char *p, const char *end, uint16_t *port_out) {
+    if (!p || !end || !port_out || p >= end)
+        return -1;
+
+    unsigned long port = 0;
+    for (const char *q = p; q < end; q++) {
+        if (*q < '0' || *q > '9')
+            return -1;
+        port = port * 10 + (unsigned long)(*q - '0');
+        if (port > 65535)
+            return -1;
+    }
+    if (port == 0)
+        return -1;
+
+    *port_out = (uint16_t)port;
+    return 0;
+}
+
 /* Parse "http://host:port" into host and port.
  * Returns 0 on success. host_out must be freed by caller. */
 static int parse_url(const char *url, char **host_out, uint16_t *port_out) {
     if (!url || !host_out || !port_out)
         return -1;
+
+    *host_out = NULL;
+    *port_out = 8080;  /* 1Password Connect default */
 
     /* Skip "http://" — reject https:// since TLS is not implemented */
     const char *p = url;
@@ -82,24 +104,115 @@ static int parse_url(const char *url, char **host_out, uint16_t *port_out) {
     if (strncmp(p, "http://", 7) == 0)
         p += 7;
 
-    /* Find port separator or end */
-    const char *colon = strchr(p, ':');
     const char *slash = strchr(p, '/');
     const char *end = slash ? slash : p + strlen(p);
+    if (p >= end)
+        return -1;
 
-    if (colon && colon < end) {
-        /* Host:port */
-        size_t host_len = (size_t)(colon - p);
-        *host_out = strndup(p, host_len);
-        *port_out = (uint16_t)atoi(colon + 1);
+    if (*p == '[') {
+        /* Bracketed IPv6 literal, e.g. http://[::1]:8080 */
+        const char *close = memchr(p + 1, ']', (size_t)(end - p - 1));
+        if (!close)
+            return -1;
+        *host_out = strndup(p + 1, (size_t)(close - p - 1));
+        if (!*host_out)
+            return -1;
+        if (close + 1 < end) {
+            if (close[1] != ':' || parse_port(close + 2, end, port_out) < 0) {
+                free(*host_out);
+                *host_out = NULL;
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    /* Accept the common unbracketed ::1 loopback shorthand too. */
+    if ((size_t)(end - p) >= 3 && strncmp(p, "::1", 3) == 0 &&
+        (p + 3 == end || p[3] == ':')) {
+        *host_out = strdup("::1");
+        if (!*host_out)
+            return -1;
+        if (p + 3 < end && parse_port(p + 4, end, port_out) < 0) {
+            free(*host_out);
+            *host_out = NULL;
+            return -1;
+        }
+        return 0;
+    }
+
+    const char *colon = memchr(p, ':', (size_t)(end - p));
+    if (colon) {
+        *host_out = strndup(p, (size_t)(colon - p));
+        if (!*host_out)
+            return -1;
+        if (parse_port(colon + 1, end, port_out) < 0) {
+            free(*host_out);
+            *host_out = NULL;
+            return -1;
+        }
     } else {
-        /* Host only, default port */
-        size_t host_len = (size_t)(end - p);
-        *host_out = strndup(p, host_len);
-        *port_out = 8080;  /* 1Password Connect default */
+        *host_out = strndup(p, (size_t)(end - p));
     }
 
     return *host_out ? 0 : -1;
+}
+
+static int is_loopback_host(const char *host) {
+    return host &&
+           (strcmp(host, "localhost") == 0 ||
+            strcmp(host, "127.0.0.1") == 0 ||
+            strcmp(host, "::1") == 0);
+}
+
+static int is_url_unreserved(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+static char *url_percent_encode(const char *in) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    if (!in)
+        return NULL;
+
+    size_t len = strlen(in);
+    size_t out_len = 0;
+    for (size_t i = 0; i < len; i++) {
+        size_t add = is_url_unreserved((unsigned char)in[i]) ? 1 : 3;
+        if (out_len > ((size_t)-1) - add)
+            return NULL;
+        out_len += add;
+    }
+
+    char *out = malloc(out_len + 1);
+    if (!out)
+        return NULL;
+
+    char *p = out;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (is_url_unreserved(c)) {
+            *p++ = (char)c;
+        } else {
+            *p++ = '%';
+            *p++ = hex[c >> 4];
+            *p++ = hex[c & 0x0f];
+        }
+    }
+    *p = '\0';
+    return out;
+}
+
+static void secure_zero_cjson_string_values(cJSON *item) {
+    for (cJSON *cur = item; cur; cur = cur->next) {
+        if (cJSON_IsString(cur) && cur->valuestring)
+            md_secure_zero(cur->valuestring, strlen(cur->valuestring));
+        if (cur->child)
+            secure_zero_cjson_string_values(cur->child);
+    }
 }
 
 /* ── op:// reference parsing ─────────────────────────────────── */
@@ -305,11 +418,22 @@ static char *find_vault_id(MdSecrets *s, const char *vault_name) {
 /* Find item ID by title within a vault. Returns malloced string or NULL. */
 static char *find_item_id(MdSecrets *s, const char *vault_id,
                           const char *item_name) {
-    /* URL-encode the filter query */
+    char *enc_vault_id = url_percent_encode(vault_id);
+    char *enc_item_name = url_percent_encode(item_name);
+    if (!enc_vault_id || !enc_item_name) {
+        free(enc_vault_id);
+        free(enc_item_name);
+        return NULL;
+    }
+
     char path[512];
-    snprintf(path, sizeof(path),
-             "/v1/vaults/%s/items?filter=title%%20eq%%20\"%s\"",
-             vault_id, item_name);
+    int path_len = snprintf(path, sizeof(path),
+             "/v1/vaults/%s/items?filter=title%%20eq%%20%%22%s%%22",
+             enc_vault_id, enc_item_name);
+    free(enc_vault_id);
+    free(enc_item_name);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+        return NULL;
 
     size_t body_len;
     char *body = http_get(s, path, &body_len);
@@ -334,9 +458,21 @@ static char *find_item_id(MdSecrets *s, const char *vault_id,
 /* Get a field value from a full item. Returns malloced string or NULL. */
 static char *get_field_value(MdSecrets *s, const char *vault_id,
                              const char *item_id, const char *field_name) {
+    char *enc_vault_id = url_percent_encode(vault_id);
+    char *enc_item_id = url_percent_encode(item_id);
+    if (!enc_vault_id || !enc_item_id) {
+        free(enc_vault_id);
+        free(enc_item_id);
+        return NULL;
+    }
+
     char path[512];
-    snprintf(path, sizeof(path),
-             "/v1/vaults/%s/items/%s", vault_id, item_id);
+    int path_len = snprintf(path, sizeof(path),
+             "/v1/vaults/%s/items/%s", enc_vault_id, enc_item_id);
+    free(enc_vault_id);
+    free(enc_item_id);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+        return NULL;
 
     size_t body_len;
     char *body = http_get(s, path, &body_len);
@@ -344,7 +480,7 @@ static char *get_field_value(MdSecrets *s, const char *vault_id,
 
     cJSON *root = cJSON_Parse(body);
 
-    /* Securely zero the body — it contained the secret field values */
+    /* Securely zero the raw response — it contained secret field values. */
     md_secure_zero(body, body_len);
     free(body);
 
@@ -393,6 +529,7 @@ static char *get_field_value(MdSecrets *s, const char *vault_id,
         }
     }
 
+    secure_zero_cjson_string_values(root);
     cJSON_Delete(root);
     return value;
 }
@@ -423,13 +560,25 @@ MdSecrets *md_secrets_create(const char *connect_url, const char *token) {
         return NULL;
     }
 
+    if (!is_loopback_host(s->host)) {
+        fprintf(stderr,
+                "secrets: WARNING — 1Password Connect URL '%s' is non-loopback HTTP; "
+                "bearer token and secrets may traverse the network in plaintext\n",
+                connect_url);
+    }
+
     /* Copy token into mlock'd region */
     memcpy(s->token, token, token_len);
     s->token_len = token_len;
 
-    /* Lock the token in memory to prevent swapping (best-effort) */
+    /* Lock the token in memory to prevent swapping. */
     if (md_mem_lock(s->token, sizeof(s->token)) < 0) {
-        fprintf(stderr, "secrets: WARNING — memory lock failed (secrets may swap)\n");
+        fprintf(stderr, "secrets: memory lock failed: %s\n", strerror(errno));
+        md_secure_zero(s->token, sizeof(s->token));
+        free(s->host);
+        free(s->connect_url);
+        free(s);
+        return NULL;
     }
 
     return s;
@@ -474,12 +623,12 @@ int md_secrets_get(MdSecrets *s, const char *item_ref,
         goto cleanup;
     }
 
-    /* Copy value to caller's buffer */
+    /* Copy value to caller's buffer. Refuse silent truncation. */
     size_t value_len = strlen(value);
     if (value_len > buf_len) {
-        /* Truncate — caller's buffer is too small */
-        memcpy(buf, value, buf_len);
-        result = (int)buf_len;
+        fprintf(stderr, "secrets: output buffer too small for field '%s'\n",
+                field_name);
+        result = -1;
     } else {
         memcpy(buf, value, value_len);
         if (value_len < buf_len)

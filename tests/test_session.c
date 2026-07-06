@@ -267,9 +267,15 @@ static void test_state_machine(void) {
     assert(s.state == MD_SESSION_IDLE);
     assert(s.keepalive_ms == MD_SESSION_KEEPALIVE_DEFAULT_MS);
 
-    /* Can't accept from IDLE */
-    assert(md_session_accept(&s, "id", MD_CAP_VIDEO) == -1);
+    /* Host side can accept an incoming session from IDLE */
+    assert(md_session_accept(&s, "host-side-id", MD_CAP_VIDEO) == 0);
+    assert(s.state == MD_SESSION_NEGOTIATING);
+    assert(strcmp(s.session_id, "host-side-id") == 0);
+
+    /* Reset returns DISCONNECTING/NEGOTIATING sessions to IDLE */
+    md_session_reset(&s);
     assert(s.state == MD_SESSION_IDLE);
+    assert(s.keepalive_ms == MD_SESSION_KEEPALIVE_DEFAULT_MS);
 
     /* Can't activate from IDLE */
     assert(md_session_activate(&s) == -1);
@@ -299,6 +305,11 @@ static void test_state_machine(void) {
     assert(md_session_disconnect(&s) == 0);
     assert(s.state == MD_SESSION_DISCONNECTING);
 
+    /* Reset is the path from DISCONNECTING back to IDLE */
+    md_session_reset(&s);
+    assert(s.state == MD_SESSION_IDLE);
+    assert(s.session_id[0] == '\0');
+
     /* Can't disconnect from IDLE */
     md_session_init(&s);
     assert(md_session_disconnect(&s) == -1);
@@ -325,6 +336,9 @@ static void test_keepalive_timeout(void) {
     /* Not timed out shortly after pong */
     assert(!md_session_is_timed_out(&s, 1000 + s.keepalive_ms));
 
+    /* Clock rollback must not underflow into a false timeout */
+    assert(!md_session_is_timed_out(&s, 999));
+
     /* Timed out after keepalive * timeout_mult */
     uint64_t timeout = (uint64_t)s.keepalive_ms * MD_SESSION_KEEPALIVE_TIMEOUT_MULT;
     assert(!md_session_is_timed_out(&s, 1000 + timeout));
@@ -345,6 +359,7 @@ static void test_null_session(void) {
     assert(md_session_accept(NULL, "id", 0) == -1);
     assert(md_session_activate(NULL) == -1);
     assert(md_session_disconnect(NULL) == -1);
+    md_session_reset(NULL);
     assert(md_session_on_ping(NULL, 0) == false);
     md_session_on_pong(NULL, 0);
     assert(md_session_is_timed_out(NULL, 0) == false);

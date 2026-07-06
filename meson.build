@@ -462,7 +462,7 @@ test('FIPS control socket client seam', test_fips_control, timeout : 10)
 
 test_secrets = executable('test_secrets',
   files('tests/test_secrets.c'),
-  dependencies : [dep_metadesk],
+  dependencies : [dep_metadesk, dep_threads],
 )
 test('1Password Connect secrets', test_secrets)
 

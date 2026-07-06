@@ -70,6 +70,21 @@ static int http_write_fn(const char *json, size_t len, void *userdata)
 
 /* ── HTTP response helpers ───────────────────────────────────── */
 
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 static void send_http_response(int fd, int status, const char *status_text,
                                const char *content_type,
                                const char *body, size_t body_len)
@@ -83,9 +98,10 @@ static void send_http_response(int fd, int status, const char *status_text,
         "\r\n",
         status, status_text, content_type, body_len);
 
-    write(fd, header, (size_t)hlen);
+    if (hlen > 0)
+        write_all(fd, header, (size_t)hlen);
     if (body && body_len > 0)
-        write(fd, body, body_len);
+        write_all(fd, body, body_len);
 }
 
 static void send_sse_headers(int fd)
@@ -96,7 +112,7 @@ static void send_sse_headers(int fd)
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
-    write(fd, headers, strlen(headers));
+    write_all(fd, headers, strlen(headers));
 }
 
 /* ── Parse minimal HTTP request ──────────────────────────────── */
@@ -131,6 +147,37 @@ static bool is_json_content_type(const char *content_type)
     return *content_type == '\0' || *content_type == ';';
 }
 
+static int parse_content_length(const char *header_start, const char *headers_end,
+                                size_t *content_length)
+{
+    *content_length = 0;
+
+    const char *cl = strcasestr(header_start, "Content-Length:");
+    if (!cl || cl >= headers_end)
+        return 0;
+
+    cl += 15;
+    while (cl < headers_end && (*cl == ' ' || *cl == '\t'))
+        cl++;
+    if (cl >= headers_end || *cl < '0' || *cl > '9')
+        return -1;
+
+    errno = 0;
+    char *endptr = NULL;
+    long val = strtol(cl, &endptr, 10);
+    if (errno == ERANGE || val < 0 || !endptr)
+        return -1;
+
+    const char *p = endptr;
+    while (p < headers_end && (*p == ' ' || *p == '\t'))
+        p++;
+    if (p < headers_end && *p != '\r' && *p != '\n')
+        return -1;
+
+    *content_length = (size_t)val;
+    return 0;
+}
+
 static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 {
     memset(req, 0, sizeof(*req));
@@ -149,12 +196,9 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
     const char *body_start = headers_end + 4;
 
     /* Find Content-Length */
-    const char *cl = strcasestr(header_start, "Content-Length:");
-    if (cl && cl < headers_end) {
-        cl += 15;
-        while (*cl == ' ' || *cl == '\t') cl++;
-        req->content_length = (size_t)atol(cl);
-    }
+    if (parse_content_length(header_start, headers_end,
+                             &req->content_length) < 0)
+        return -1;
 
     /* Find Content-Type */
     const char *ct = strcasestr(header_start, "Content-Type:");
@@ -219,9 +263,15 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         char *body_start = strstr(buf, "\r\n\r\n");
         if (body_start) {
             /* Check Content-Length and enforce limit */
-            const char *cl = strcasestr(buf, "Content-Length:");
             size_t content_len = 0;
-            if (cl) content_len = (size_t)atol(cl + 15);
+            if (parse_content_length(buf, body_start, &content_len) < 0) {
+                send_http_response(client_fd, 400, "Bad Request",
+                                   "text/plain",
+                                   "Invalid Content-Length\n", 23);
+                free(buf);
+                close(client_fd);
+                return;
+            }
 
             /* Reject oversized requests */
             if (content_len > MAX_REQUEST_SIZE) {
@@ -339,6 +389,32 @@ static void *handle_client_thread(void *arg) {
 
 /* ── SSE send ────────────────────────────────────────────────── */
 
+static int write_sse_data_lines(int fd, const char *data, size_t data_len)
+{
+    if (data_len == 0)
+        return write_all(fd, "data: \n", 7);
+
+    size_t pos = 0;
+    while (pos < data_len) {
+        const char *line = data + pos;
+        const char *nl = memchr(line, '\n', data_len - pos);
+        size_t line_len = nl ? (size_t)(nl - line) : data_len - pos;
+        if (line_len > 0 && line[line_len - 1] == '\r')
+            line_len--;
+
+        if (write_all(fd, "data: ", 6) < 0 ||
+            (line_len > 0 && write_all(fd, line, line_len) < 0) ||
+            write_all(fd, "\n", 1) < 0)
+            return -1;
+
+        if (!nl)
+            break;
+        pos = (size_t)(nl - data) + 1;
+    }
+
+    return 0;
+}
+
 int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
                          const char *data, size_t data_len)
 {
@@ -347,20 +423,23 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
     pthread_mutex_lock(&http->sse_mu);
 
     for (int i = 0; i < http->sse_count; ) {
-        /* Format: "event: <event>\ndata: <json>\n\n" */
-        char header_buf[128];
-        int hlen = 0;
-        if (event)
-            hlen = snprintf(header_buf, sizeof(header_buf),
-                           "event: %s\ndata: ", event);
-        else
-            hlen = snprintf(header_buf, sizeof(header_buf), "data: ");
+        int ok = 0;
 
-        ssize_t w1 = write(http->sse_clients[i], header_buf, (size_t)hlen);
-        ssize_t w2 = write(http->sse_clients[i], data, data_len);
-        ssize_t w3 = write(http->sse_clients[i], "\n\n", 2);
+        if (event) {
+            char event_buf[128];
+            int hlen = snprintf(event_buf, sizeof(event_buf),
+                                "event: %s\n", event);
+            if (hlen <= 0 || (size_t)hlen >= sizeof(event_buf) ||
+                write_all(http->sse_clients[i], event_buf, (size_t)hlen) < 0)
+                ok = -1;
+        }
 
-        if (w1 <= 0 || w2 <= 0 || w3 <= 0) {
+        if (ok == 0 &&
+            (write_sse_data_lines(http->sse_clients[i], data, data_len) < 0 ||
+             write_all(http->sse_clients[i], "\n", 1) < 0))
+            ok = -1;
+
+        if (ok < 0) {
             /* Client disconnected — remove from list */
             close(http->sse_clients[i]);
             http->sse_clients[i] = http->sse_clients[http->sse_count - 1];

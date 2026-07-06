@@ -69,6 +69,9 @@ int md_session_activate(MdSession *s);
 /* Initiate graceful disconnect */
 int md_session_disconnect(MdSession *s);
 
+/* Reset/reinitialize a session back to IDLE after disconnect or failure. */
+void md_session_reset(MdSession *s);
+
 /* Process a keepalive ping; returns true if pong should be sent */
 bool md_session_on_ping(MdSession *s, uint32_t timestamp_ms);
 

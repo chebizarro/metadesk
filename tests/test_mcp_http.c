@@ -253,6 +253,56 @@ static void test_post_initialize(void)
     PASS("POST /mcp HTTP routing");
 }
 
+static void test_invalid_content_length_rejected(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .port   = port,
+    };
+
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    assert(http != NULL);
+
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    usleep(100000);
+
+    const char *request =
+        "POST /mcp HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: abc\r\n"
+        "\r\n{}";
+
+    char response[2048];
+    int n = http_request(port, request, response, sizeof(response));
+    assert(n > 0);
+    assert(strstr(response, "400") != NULL);
+
+    request =
+        "POST /mcp HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: -1\r\n"
+        "\r\n{}";
+    n = http_request(port, request, response, sizeof(response));
+    assert(n > 0);
+    assert(strstr(response, "400") != NULL);
+
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+
+    PASS("invalid Content-Length rejected");
+}
+
 static void test_post_requires_json_content_type(void)
 {
     MdMcpServer *mcp = make_mcp_server();
@@ -342,6 +392,58 @@ static void test_get_404(void)
     md_mcp_server_destroy(mcp);
 
     PASS("GET unknown path → 404");
+}
+
+static void test_sse_multiline_data(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .port   = port,
+    };
+
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    assert(http != NULL);
+
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    usleep(100000);
+
+    char headers[1024];
+    int fd = sse_connect(port, headers, sizeof(headers));
+    assert(fd >= 0);
+    assert(strstr(headers, "text/event-stream") != NULL);
+
+    assert(md_mcp_http_send_sse(http, "multi", "line1\nline2", 11) == 0);
+
+    char event[1024];
+    ssize_t n = read(fd, event, sizeof(event) - 1);
+    assert(n > 0);
+    size_t total = (size_t)n;
+    event[total] = '\0';
+    for (int i = 0; i < 3 && strstr(event, "data: line2\n") == NULL; i++) {
+        n = read(fd, event + total, sizeof(event) - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        event[total] = '\0';
+    }
+    assert(strstr(event, "event: multi\n") != NULL);
+    assert(strstr(event, "data: line1\n") != NULL);
+    assert(strstr(event, "data: line2\n") != NULL);
+    assert(strstr(event, "data: line1\nline2") == NULL);
+
+    close(fd);
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+
+    PASS("SSE multiline data formatting");
 }
 
 static void test_sse_max_clients_config(void)
@@ -494,8 +596,10 @@ int main(void)
     test_run_null();
     test_sse_no_clients();
     test_post_initialize();
+    test_invalid_content_length_rejected();
     test_post_requires_json_content_type();
     test_get_404();
+    test_sse_multiline_data();
     test_sse_max_clients_config();
     test_shutdown();
 

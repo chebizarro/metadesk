@@ -12,6 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -22,6 +27,128 @@ static int tests_failed = 0;
     do { printf("PASS\n"); tests_passed++; } while (0)
 #define FAIL(msg) \
     do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
+
+typedef struct {
+    int listen_fd;
+    int failures;
+    int requests;
+} MockSecretsServer;
+
+static void mock_write_response(int fd, const char *body) {
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        strlen(body));
+    write(fd, header, (size_t)hlen);
+    write(fd, body, strlen(body));
+}
+
+static void *mock_secrets_server_thread(void *arg) {
+    MockSecretsServer *srv = (MockSecretsServer *)arg;
+    const char *expected_paths[] = {
+        "/v1/vaults",
+        "/v1/vaults/vault%20id/items?filter=title%20eq%20%22my%20item%22",
+        "/v1/vaults/vault%20id/items/item%20id%231",
+    };
+    const char *bodies[] = {
+        "[{\"name\":\"Vault\",\"id\":\"vault id\"}]",
+        "[{\"id\":\"item id#1\"}]",
+        "{\"fields\":[{\"label\":\"password\",\"value\":\"secret-value\"}]}",
+    };
+
+    for (int i = 0; i < 3; i++) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(srv->listen_fd, &readfds);
+        struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+        if (select(srv->listen_fd + 1, &readfds, NULL, NULL, &tv) <= 0) {
+            srv->failures++;
+            break;
+        }
+
+        int fd = accept(srv->listen_fd, NULL, NULL);
+        if (fd < 0) {
+            srv->failures++;
+            break;
+        }
+
+        char req[2048];
+        ssize_t n = read(fd, req, sizeof(req) - 1);
+        if (n <= 0) {
+            srv->failures++;
+            close(fd);
+            continue;
+        }
+        req[n] = '\0';
+
+        char path[512] = {0};
+        if (sscanf(req, "GET %511s HTTP/1.", path) != 1 ||
+            strcmp(path, expected_paths[i]) != 0) {
+            srv->failures++;
+        }
+        srv->requests++;
+        mock_write_response(fd, bodies[i]);
+        close(fd);
+    }
+
+    close(srv->listen_fd);
+    return NULL;
+}
+
+static int run_mock_secret_fetch(uint8_t *buf, size_t buf_len,
+                                 int *server_failures) {
+    MockSecretsServer srv = { .listen_fd = -1, .failures = 0, .requests = 0 };
+    srv.listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (srv.listen_fd < 0)
+        return -999;
+
+    int opt = 1;
+    setsockopt(srv.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    int off = 0;
+    setsockopt(srv.listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+
+    struct sockaddr_in6 addr = {0};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = 0;
+    addr.sin6_addr = in6addr_loopback;
+    if (bind(srv.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(srv.listen_fd, 4) < 0) {
+        close(srv.listen_fd);
+        return -999;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(srv.listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) {
+        close(srv.listen_fd);
+        return -999;
+    }
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, mock_secrets_server_thread, &srv) != 0) {
+        close(srv.listen_fd);
+        return -999;
+    }
+
+    char url[128];
+    snprintf(url, sizeof(url), "http://localhost:%u", ntohs(addr.sin6_port));
+    MdSecrets *s = md_secrets_create(url, "test-token");
+    int ret = -1;
+    if (s) {
+        ret = md_secrets_get(s, "op://Vault/my item/password", buf, buf_len);
+        md_secrets_destroy(s);
+    } else {
+        close(srv.listen_fd);
+    }
+
+    pthread_join(tid, NULL);
+    if (server_failures)
+        *server_failures = srv.failures + (srv.requests != 3);
+    return ret;
+}
 
 /* ── Test: create/destroy lifecycle ──────────────────────────── */
 
@@ -157,6 +284,37 @@ static void test_url_parsing(void) {
     PASS();
 }
 
+/* ── Test: successful fetch, URL encoding, and truncation ────── */
+
+static void test_fetch_url_encoding_and_truncation(void) {
+    TEST("fetch uses URL encoding and rejects truncation");
+
+    uint8_t buf[64];
+    int failures = 0;
+    int ret = run_mock_secret_fetch(buf, sizeof(buf), &failures);
+    if (ret != (int)strlen("secret-value")) {
+        FAIL("mock fetch failed"); return;
+    }
+    if (failures != 0) {
+        FAIL("server saw unencoded or missing request path"); return;
+    }
+    if (strcmp((char *)buf, "secret-value") != 0) {
+        FAIL("wrong secret value"); return;
+    }
+
+    memset(buf, 0xA5, sizeof(buf));
+    failures = 0;
+    ret = run_mock_secret_fetch(buf, 4, &failures);
+    if (ret != -1) {
+        FAIL("small buffer should fail instead of truncating"); return;
+    }
+    if (failures != 0) {
+        FAIL("server path validation failed on truncation case"); return;
+    }
+
+    PASS();
+}
+
 /* ── Test: secret zeroing on destroy ─────────────────────────── */
 
 static void test_secure_destroy(void) {
@@ -186,6 +344,7 @@ int main(void) {
     test_get_invalid();
     test_not_connected();
     test_url_parsing();
+    test_fetch_url_encoding_and_truncation();
     test_secure_destroy();
 
     printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
