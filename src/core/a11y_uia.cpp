@@ -24,6 +24,11 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <new>
+
+#ifndef SAFE_RELEASE
+#define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
+#endif
 
 /* Maximum tree depth */
 #define MD_UIA_MAX_DEPTH     32
@@ -35,8 +40,19 @@ struct UIAState {
     IUIAutomation      *automation;
     IUIAutomationTreeWalker *walker;
     int                 connected;
+    int                 com_initialized;
     uint64_t            next_id;
     MdA11yNode         *last_snapshot;
+    CRITICAL_SECTION    lock;
+    int                 lock_initialized;
+
+    HANDLE              event_thread;
+    HANDLE              stop_event;
+    HANDLE              ready_event;
+    HRESULT             subscribe_hr;
+    int                 subscribed;
+    MdA11yChangeCb      change_cb;
+    void               *change_userdata;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -132,8 +148,9 @@ static void extract_states(IUIAutomationElement *elem, MdA11yNode *node) {
 
 /* ── Tree walking ────────────────────────────────────────────── */
 
-static MdA11yNode *walk_element(UIAState *st, IUIAutomationElement *elem, int depth) {
-    if (!elem || depth > MD_UIA_MAX_DEPTH)
+static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
+                                 IUIAutomationElement *elem, int depth) {
+    if (!st || !walker || !elem || depth > MD_UIA_MAX_DEPTH)
         return nullptr;
 
     MdA11yNode *node = (MdA11yNode *)calloc(1, sizeof(MdA11yNode));
@@ -167,19 +184,19 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationElement *elem, int de
 
     /* Walk children via TreeWalker */
     IUIAutomationElement *child = nullptr;
-    HRESULT hr = st->walker->GetFirstChildElement(elem, &child);
+    HRESULT hr = walker->GetFirstChildElement(elem, &child);
     if (SUCCEEDED(hr) && child) {
         /* Count and collect children */
         MdA11yNode *children[MD_UIA_MAX_CHILDREN];
         int childCount = 0;
 
         while (child && childCount < MD_UIA_MAX_CHILDREN) {
-            MdA11yNode *childNode = walk_element(st, child, depth + 1);
+            MdA11yNode *childNode = walk_element(st, walker, child, depth + 1);
             if (childNode)
                 children[childCount++] = childNode;
 
             IUIAutomationElement *next = nullptr;
-            hr = st->walker->GetNextSiblingElement(child, &next);
+            hr = walker->GetNextSiblingElement(child, &next);
             child->Release();
             child = (SUCCEEDED(hr)) ? next : nullptr;
         }
@@ -278,13 +295,22 @@ static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
 
 static int uia_init(MdA11yCtx *ctx) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+    int com_initialized = 0;
+    if (SUCCEEDED(hr)) {
+        com_initialized = 1;
+    } else if (hr != RPC_E_CHANGED_MODE) {
         fprintf(stderr, "a11y_uia: CoInitializeEx failed: 0x%08lx\n", hr);
         return -1;
     }
 
     auto *st = (UIAState *)calloc(1, sizeof(UIAState));
-    if (!st) return -1;
+    if (!st) {
+        if (com_initialized) CoUninitialize();
+        return -1;
+    }
+    st->com_initialized = com_initialized;
+    InitializeCriticalSection(&st->lock);
+    st->lock_initialized = 1;
 
     hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr,
                           CLSCTX_INPROC_SERVER,
@@ -292,6 +318,8 @@ static int uia_init(MdA11yCtx *ctx) {
                           (void **)&st->automation);
     if (FAILED(hr) || !st->automation) {
         fprintf(stderr, "a11y_uia: failed to create IUIAutomation: 0x%08lx\n", hr);
+        if (st->lock_initialized) DeleteCriticalSection(&st->lock);
+        if (st->com_initialized) CoUninitialize();
         free(st);
         return -1;
     }
@@ -300,7 +328,9 @@ static int uia_init(MdA11yCtx *ctx) {
     hr = st->automation->get_ContentViewWalker(&st->walker);
     if (FAILED(hr) || !st->walker) {
         fprintf(stderr, "a11y_uia: failed to get ContentViewWalker\n");
-        st->automation->Release();
+        SAFE_RELEASE(st->automation);
+        if (st->lock_initialized) DeleteCriticalSection(&st->lock);
+        if (st->com_initialized) CoUninitialize();
         free(st);
         return -1;
     }
@@ -310,15 +340,18 @@ static int uia_init(MdA11yCtx *ctx) {
     return 0;
 }
 
-static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
-    auto *st = (UIAState *)ctx->backend_data;
-    if (!st || !st->connected || !out_root) return -1;
+static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
+                                      IUIAutomationTreeWalker *walker,
+                                      MdA11yNode **out_root) {
+    if (!st || !automation || !walker || !st->connected || !out_root)
+        return -1;
 
+    *out_root = nullptr;
     st->next_id = 0;
 
     /* Get the root element (desktop) */
     IUIAutomationElement *rootElem = nullptr;
-    HRESULT hr = st->automation->GetRootElement(&rootElem);
+    HRESULT hr = automation->GetRootElement(&rootElem);
     if (FAILED(hr) || !rootElem) return -1;
 
     /* Create root node */
@@ -334,7 +367,7 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
 
     /* Walk top-level children (application windows) */
     IUIAutomationElement *child = nullptr;
-    hr = st->walker->GetFirstChildElement(rootElem, &child);
+    hr = walker->GetFirstChildElement(rootElem, &child);
     rootElem->Release();
 
     if (SUCCEEDED(hr) && child) {
@@ -342,12 +375,12 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
         int childCount = 0;
 
         while (child && childCount < MD_UIA_MAX_CHILDREN) {
-            MdA11yNode *childNode = walk_element(st, child, 1);
+            MdA11yNode *childNode = walk_element(st, walker, child, 1);
             if (childNode)
                 children[childCount++] = childNode;
 
             IUIAutomationElement *next = nullptr;
-            hr = st->walker->GetNextSiblingElement(child, &next);
+            hr = walker->GetNextSiblingElement(child, &next);
             child->Release();
             child = (SUCCEEDED(hr)) ? next : nullptr;
         }
@@ -357,6 +390,9 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
             if (root->children) {
                 memcpy(root->children, children, (size_t)childCount * sizeof(MdA11yNode *));
                 root->child_count = childCount;
+            } else {
+                for (int i = 0; i < childCount; i++)
+                    md_a11y_node_free(children[i]);
             }
         }
     }
@@ -365,16 +401,28 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return 0;
 }
 
-static int uia_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                        int *out_count) {
-    auto *st = (UIAState *)ctx->backend_data;
-    if (!st || !out_deltas || !out_count) return -1;
+static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+    if (!st || !st->lock_initialized) return -1;
+
+    EnterCriticalSection(&st->lock);
+    int ret = uia_get_tree_with_unlocked(st, st->automation, st->walker, out_root);
+    LeaveCriticalSection(&st->lock);
+    return ret;
+}
+
+static int uia_get_diff_with_unlocked(UIAState *st, IUIAutomation *automation,
+                                      IUIAutomationTreeWalker *walker,
+                                      MdA11yDelta **out_deltas,
+                                      int *out_count) {
+    if (!st || !automation || !walker || !out_deltas || !out_count)
+        return -1;
 
     *out_deltas = nullptr;
     *out_count = 0;
 
     MdA11yNode *current = nullptr;
-    if (uia_get_tree(ctx, &current) != 0 || !current)
+    if (uia_get_tree_with_unlocked(st, automation, walker, &current) != 0 || !current)
         return -1;
 
     MdA11yNode *prev = st->last_snapshot;
@@ -442,31 +490,343 @@ static int uia_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
     return 0;
 }
 
+static int uia_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
+                        int *out_count) {
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+    if (!st || !st->lock_initialized) return -1;
+
+    EnterCriticalSection(&st->lock);
+    int ret = uia_get_diff_with_unlocked(st, st->automation, st->walker,
+                                         out_deltas, out_count);
+    LeaveCriticalSection(&st->lock);
+    return ret;
+}
+
+class UIAChangeHandler final : public IUIAutomationFocusChangedEventHandler,
+                               public IUIAutomationStructureChangedEventHandler,
+                               public IUIAutomationEventHandler {
+public:
+    UIAChangeHandler(UIAState *st, IUIAutomation *automation,
+                     IUIAutomationTreeWalker *walker)
+        : refs_(1), st_(st), automation_(automation), walker_(walker) {
+        if (automation_) automation_->AddRef();
+        if (walker_) walker_->AddRef();
+    }
+
+    virtual ~UIAChangeHandler() {
+        SAFE_RELEASE(walker_);
+        SAFE_RELEASE(automation_);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+
+        if (riid == IID_IUnknown ||
+            riid == __uuidof(IUIAutomationFocusChangedEventHandler)) {
+            *ppvObject = static_cast<IUIAutomationFocusChangedEventHandler *>(this);
+        } else if (riid == __uuidof(IUIAutomationStructureChangedEventHandler)) {
+            *ppvObject = static_cast<IUIAutomationStructureChangedEventHandler *>(this);
+        } else if (riid == __uuidof(IUIAutomationEventHandler)) {
+            *ppvObject = static_cast<IUIAutomationEventHandler *>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return (ULONG)InterlockedIncrement(&refs_);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG refs = InterlockedDecrement(&refs_);
+        if (refs == 0) delete this;
+        return (ULONG)refs;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement *sender) override {
+        (void)sender;
+        emit_change();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleStructureChangedEvent(
+        IUIAutomationElement *sender, StructureChangeType changeType,
+        SAFEARRAY *runtimeId) override {
+        (void)sender;
+        (void)changeType;
+        (void)runtimeId;
+        emit_change();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement *sender,
+                                                    EVENTID eventId) override {
+        (void)sender;
+        (void)eventId;
+        emit_change();
+        return S_OK;
+    }
+
+private:
+    void emit_change() {
+        if (!st_ || !automation_ || !walker_ || !st_->lock_initialized)
+            return;
+
+        MdA11yChangeCb cb = nullptr;
+        void *userdata = nullptr;
+        MdA11yDelta *deltas = nullptr;
+        int delta_count = 0;
+
+        EnterCriticalSection(&st_->lock);
+        if (st_->subscribed && st_->change_cb) {
+            cb = st_->change_cb;
+            userdata = st_->change_userdata;
+            (void)uia_get_diff_with_unlocked(st_, automation_, walker_,
+                                             &deltas, &delta_count);
+        }
+        LeaveCriticalSection(&st_->lock);
+
+        if (cb)
+            cb(deltas, delta_count, userdata);
+        md_a11y_delta_free(deltas, delta_count);
+    }
+
+    volatile LONG refs_;
+    UIAState *st_;
+    IUIAutomation *automation_;
+    IUIAutomationTreeWalker *walker_;
+};
+
+static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
+    UIAState *st = (UIAState *)data;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int com_initialized = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        EnterCriticalSection(&st->lock);
+        st->subscribe_hr = hr;
+        LeaveCriticalSection(&st->lock);
+        SetEvent(st->ready_event);
+        return 1;
+    }
+
+    IUIAutomation *automation = nullptr;
+    IUIAutomationTreeWalker *walker = nullptr;
+    IUIAutomationElement *root = nullptr;
+    UIAChangeHandler *handler = nullptr;
+    bool focus_registered = false;
+    bool structure_registered = false;
+
+    hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr,
+                          CLSCTX_INPROC_SERVER,
+                          __uuidof(IUIAutomation),
+                          (void **)&automation);
+    if (SUCCEEDED(hr) && automation)
+        hr = automation->get_ContentViewWalker(&walker);
+    if (SUCCEEDED(hr) && automation)
+        hr = automation->GetRootElement(&root);
+    if (SUCCEEDED(hr) && !root)
+        hr = E_FAIL;
+    if (SUCCEEDED(hr) && automation && walker)
+        handler = new (std::nothrow) UIAChangeHandler(st, automation, walker);
+    if (SUCCEEDED(hr) && !handler)
+        hr = E_OUTOFMEMORY;
+
+    if (SUCCEEDED(hr)) {
+        /* Seed the baseline before the first pushed event so callbacks emit
+         * computed deltas instead of consuming the initial snapshot. */
+        EnterCriticalSection(&st->lock);
+        if (!st->last_snapshot) {
+            MdA11yNode *initial = nullptr;
+            if (uia_get_tree_with_unlocked(st, automation, walker, &initial) == 0)
+                st->last_snapshot = initial;
+        }
+        LeaveCriticalSection(&st->lock);
+
+        auto *focus_handler =
+            static_cast<IUIAutomationFocusChangedEventHandler *>(handler);
+        auto *structure_handler =
+            static_cast<IUIAutomationStructureChangedEventHandler *>(handler);
+
+        hr = automation->AddFocusChangedEventHandler(nullptr, focus_handler);
+        if (SUCCEEDED(hr)) {
+            focus_registered = true;
+            hr = automation->AddStructureChangedEventHandler(
+                root, TreeScope_Subtree, nullptr, structure_handler);
+            if (SUCCEEDED(hr))
+                structure_registered = true;
+        }
+    }
+
+    EnterCriticalSection(&st->lock);
+    st->subscribe_hr = hr;
+    if (SUCCEEDED(hr))
+        st->subscribed = 1;
+    LeaveCriticalSection(&st->lock);
+    SetEvent(st->ready_event);
+
+    if (SUCCEEDED(hr)) {
+        HANDLE stop_event = st->stop_event;
+        for (;;) {
+            DWORD wait = MsgWaitForMultipleObjects(1, &stop_event, FALSE,
+                                                   INFINITE, QS_ALLINPUT);
+            if (wait == WAIT_OBJECT_0)
+                break;
+            if (wait == WAIT_OBJECT_0 + 1) {
+                MSG msg;
+                while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+        }
+    }
+
+    EnterCriticalSection(&st->lock);
+    st->subscribed = 0;
+    LeaveCriticalSection(&st->lock);
+
+    if (structure_registered) {
+        auto *structure_handler =
+            static_cast<IUIAutomationStructureChangedEventHandler *>(handler);
+        automation->RemoveStructureChangedEventHandler(root, structure_handler);
+    }
+    if (focus_registered) {
+        auto *focus_handler =
+            static_cast<IUIAutomationFocusChangedEventHandler *>(handler);
+        automation->RemoveFocusChangedEventHandler(focus_handler);
+    }
+
+    if (handler) handler->Release();
+    SAFE_RELEASE(root);
+    SAFE_RELEASE(walker);
+    SAFE_RELEASE(automation);
+    if (com_initialized)
+        CoUninitialize();
+    return SUCCEEDED(hr) ? 0 : 1;
+}
+
 static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                  void *userdata) {
-    (void)ctx; (void)cb; (void)userdata;
-    /* Not implemented yet: this needs a COM IUIAutomationEventHandler
-     * registered via AddStructureChangedEventHandler plus
-     * AddPropertyChangedEventHandler for Name, BoundingRectangle, enabled,
-     * focus, and related state properties. The handler also needs a message
-     * pump / COM apartment lifetime tied to UIAState before this backend can
-     * safely emit MdA11yChangeCb deltas. */
-    return -1;
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+    if (!st || !st->connected || !st->lock_initialized || !cb)
+        return -1;
+
+    EnterCriticalSection(&st->lock);
+    if (st->subscribed) {
+        st->change_cb = cb;
+        st->change_userdata = userdata;
+        LeaveCriticalSection(&st->lock);
+        return 0;
+    }
+    if (st->event_thread) {
+        LeaveCriticalSection(&st->lock);
+        return -1;
+    }
+    st->change_cb = cb;
+    st->change_userdata = userdata;
+    st->subscribe_hr = E_PENDING;
+    LeaveCriticalSection(&st->lock);
+
+    st->stop_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    st->ready_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!st->stop_event || !st->ready_event) {
+        if (st->stop_event) CloseHandle(st->stop_event);
+        if (st->ready_event) CloseHandle(st->ready_event);
+        st->stop_event = nullptr;
+        st->ready_event = nullptr;
+        EnterCriticalSection(&st->lock);
+        st->change_cb = nullptr;
+        st->change_userdata = nullptr;
+        LeaveCriticalSection(&st->lock);
+        return -1;
+    }
+
+    st->event_thread = CreateThread(nullptr, 0, uia_event_thread_proc,
+                                    st, 0, nullptr);
+    if (!st->event_thread) {
+        CloseHandle(st->stop_event);
+        CloseHandle(st->ready_event);
+        st->stop_event = nullptr;
+        st->ready_event = nullptr;
+        EnterCriticalSection(&st->lock);
+        st->change_cb = nullptr;
+        st->change_userdata = nullptr;
+        LeaveCriticalSection(&st->lock);
+        return -1;
+    }
+
+    WaitForSingleObject(st->ready_event, INFINITE);
+
+    HRESULT hr;
+    EnterCriticalSection(&st->lock);
+    hr = st->subscribe_hr;
+    LeaveCriticalSection(&st->lock);
+
+    if (FAILED(hr)) {
+        WaitForSingleObject(st->event_thread, INFINITE);
+        CloseHandle(st->event_thread);
+        CloseHandle(st->stop_event);
+        CloseHandle(st->ready_event);
+        st->event_thread = nullptr;
+        st->stop_event = nullptr;
+        st->ready_event = nullptr;
+        EnterCriticalSection(&st->lock);
+        st->change_cb = nullptr;
+        st->change_userdata = nullptr;
+        LeaveCriticalSection(&st->lock);
+        fprintf(stderr, "a11y_uia: failed to subscribe UIA events: 0x%08lx\n", hr);
+        return -1;
+    }
+
+    return 0;
 }
 
 static void uia_destroy(MdA11yCtx *ctx) {
-    auto *st = (UIAState *)ctx->backend_data;
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
     if (!st) return;
+
+    if (st->lock_initialized) {
+        EnterCriticalSection(&st->lock);
+        st->connected = 0;
+        st->subscribed = 0;
+        st->change_cb = nullptr;
+        st->change_userdata = nullptr;
+        LeaveCriticalSection(&st->lock);
+    }
+
+    if (st->event_thread) {
+        if (st->stop_event)
+            SetEvent(st->stop_event);
+        WaitForSingleObject(st->event_thread, INFINITE);
+        CloseHandle(st->event_thread);
+        st->event_thread = nullptr;
+    }
+    if (st->stop_event) {
+        CloseHandle(st->stop_event);
+        st->stop_event = nullptr;
+    }
+    if (st->ready_event) {
+        CloseHandle(st->ready_event);
+        st->ready_event = nullptr;
+    }
 
     md_a11y_node_free(st->last_snapshot);
 
-    if (st->walker)     st->walker->Release();
-    if (st->automation) st->automation->Release();
+    SAFE_RELEASE(st->walker);
+    SAFE_RELEASE(st->automation);
+
+    if (st->lock_initialized)
+        DeleteCriticalSection(&st->lock);
+
+    if (st->com_initialized)
+        CoUninitialize();
 
     free(st);
     ctx->backend_data = nullptr;
-
-    CoUninitialize();
 }
 
 /* ── Singleton vtable ────────────────────────────────────────── */

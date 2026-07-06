@@ -288,7 +288,8 @@ static void test_subscribe_changes(void) {
 
     int rc = md_a11y_subscribe_changes(ctx, noop_change_cb, NULL);
     if (rc < 0) {
-        /* Accessibility bus may not be available in CI/headless environments. */
+        /* Accessibility bus may not be available in CI/headless environments.
+         * Windows UIA subscriptions also require an interactive desktop. */
         printf("  SKIP: subscribe changes (no accessibility event bus)\n");
         md_a11y_destroy(ctx);
         return;

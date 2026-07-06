@@ -203,6 +203,7 @@ elif host_os == 'windows'
     cc.find_library('advapi32', required : true),
     cc.find_library('ole32', required : true),
     cc.find_library('oleaut32', required : true),
+    cc.find_library('uiautomationcore', required : true),
   ]
 
 else
