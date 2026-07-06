@@ -30,6 +30,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <go.h>
@@ -62,6 +63,11 @@ typedef struct {
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* set by on_dm callback           */
     GoChannel      *session_ch;       /* signaled on session accepted    */
+
+    /* Connection recovery UI state */
+    int            reconnecting;      /* unexpected disconnect recovery  */
+    uint32_t       reconnect_delay_ms; /* next retry delay for overlay     */
+    const char    *connection_status; /* transient user-facing detail     */
 } ClientCtx;
 
 /* ── Decode callback: display frame ──────────────────────────── */
@@ -77,11 +83,7 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
             ctx->frames_displayed++;
     }
 
-    /* Render overlay on top of the video frame */
-    if (ctx->overlay) {
-        md_overlay_new_frame(ctx->overlay);
-        /* Stats are updated from the main loop, overlay_render called there */
-    }
+    /* Overlay stats/rendering are driven from the main loop. */
 }
 
 /* ── Nostr callbacks for --npub session negotiation ──────────── */
@@ -107,7 +109,8 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         ctx->granted_caps = acc.granted;
         ctx->accepted_tree_format = acc.tree_format;
         ctx->session_accepted = 1;
-        go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
+        if (ctx->session_ch)
+            go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
     }
 }
 
@@ -193,6 +196,209 @@ static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
         md_nostr_destroy(*nostr);
         *nostr = NULL;
     }
+}
+
+static void reset_session_accept_state(ClientCtx *ctx) {
+    if (!ctx) return;
+    ctx->accepted_session_id[0] = '\0';
+    ctx->granted_caps = 0;
+    ctx->accepted_tree_format = MD_TREE_FORMAT_COMPACT;
+    ctx->session_accepted = 0;
+}
+
+static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
+                                  const char *host_pubkey_hex,
+                                  uint32_t timeout_ms,
+                                  MdSessionRequest *out_req) {
+    if (!nostr || !ctx || !host_pubkey_hex || !out_req)
+        return -1;
+
+    reset_session_accept_state(ctx);
+
+    MdSessionRequest req = {
+        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
+        .tree_format = MD_TREE_FORMAT_COMPACT,
+    };
+    const char *our_pk = md_nostr_get_npub(nostr);
+    if (our_pk)
+        strncpy(req.fips_addr, our_pk, sizeof(req.fips_addr) - 1);
+
+    char *req_json = md_session_request_to_json(&req);
+    if (!req_json) {
+        fprintf(stderr, "ERROR: failed to serialize session request\n");
+        return -1;
+    }
+
+    printf("client: sending session request DM...\n");
+    if (md_nostr_send_session_request(nostr, host_pubkey_hex, req_json) != 0) {
+        fprintf(stderr, "ERROR: failed to send session request\n");
+        free(req_json);
+        return -1;
+    }
+    free(req_json);
+
+    void *dummy = NULL;
+    GoSelectCase cases[] = {
+        { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &dummy },
+    };
+    go_select_timeout(cases, 1, (uint64_t)timeout_ms * 2);
+
+    if (!ctx->session_accepted) {
+        fprintf(stderr, "ERROR: timed out waiting for session accept\n");
+        return -1;
+    }
+
+    printf("client: session accepted (id=%s)\n", ctx->accepted_session_id);
+    *out_req = req;
+    return 0;
+}
+
+static int send_session_info(MdStream *stream, const ClientCtx *ctx) {
+    if (!stream || !ctx)
+        return -1;
+
+    MdSessionAccept acc = { .tree_format = ctx->accepted_tree_format };
+    strncpy(acc.session_id, ctx->accepted_session_id, sizeof(acc.session_id) - 1);
+    acc.granted = ctx->granted_caps;
+
+    char *info_json = md_session_accept_to_json(&acc);
+    if (!info_json)
+        return -1;
+
+    int ret = md_stream_send(stream, MD_PKT_SESSION_INFO, 0,
+                             (const uint8_t *)info_json,
+                             (uint32_t)strlen(info_json));
+    free(info_json);
+    return ret;
+}
+
+static MdStream *connect_client_stream(const char *host, const char *npub,
+                                       const char *fips_control_socket,
+                                       uint16_t port, uint32_t timeout_ms,
+                                       MdNostr *nostr,
+                                       const char *host_pubkey_hex,
+                                       ClientCtx *ctx,
+                                       MdSession *session) {
+    MdStream *stream = NULL;
+
+    if (npub) {
+        printf("client: checking FIPS daemon health...\n");
+        if (check_fips_daemon(fips_control_socket, timeout_ms) != 0)
+            return NULL;
+
+        printf("client: waiting for FIPS peer readiness for %.*s...\n", 12, npub);
+        MdFipsPeerReadiness ready;
+        MdFipsPeerReadinessState rstate = md_fips_control_wait_peer_ready(
+            fips_control_socket, npub, timeout_ms,
+            MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS, &ready);
+        if (rstate != MD_FIPS_PEER_READY) {
+            if (rstate == MD_FIPS_PEER_NOT_FOUND)
+                print_fips_setup_guidance("client", npub, &ready);
+            else
+                fprintf(stderr, "ERROR: FIPS route not ready (%s): %s\n",
+                        md_fips_peer_readiness_string(rstate), ready.detail);
+            return NULL;
+        }
+        printf("client: FIPS peer ready: %s\n", ready.detail);
+
+        MdSessionRequest req;
+        if (negotiate_npub_session(nostr, ctx, host_pubkey_hex,
+                                   timeout_ms, &req) != 0)
+            return NULL;
+
+        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
+        stream = md_stream_connect_fips(npub, port, timeout_ms);
+        if (!stream) {
+            fprintf(stderr, "ERROR: FIPS connect failed\n");
+            return NULL;
+        }
+
+        if (send_session_info(stream, ctx) != 0) {
+            fprintf(stderr, "ERROR: failed to send session info\n");
+            md_stream_destroy(stream);
+            return NULL;
+        }
+
+        md_session_reset(session);
+        md_session_request(session, npub, req.capabilities,
+                           ctx->accepted_tree_format);
+        md_session_accept(session, ctx->accepted_session_id,
+                          ctx->granted_caps);
+        md_session_activate(session);
+    } else {
+        printf("client: connecting to %s:%u...\n", host, port);
+        stream = md_stream_connect(host, port, timeout_ms);
+        if (!stream)
+            fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
+    }
+
+    return stream;
+}
+
+static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
+                                  uint32_t stats_start_ms) {
+    if (!ctx || !ctx->overlay)
+        return;
+
+    MdStreamStats stream_stats = { 0 };
+    if (stream)
+        md_stream_get_stats(stream, &stream_stats);
+
+    uint32_t now = md_stream_now_ms();
+    double avg_decode_ms = ctx->frames_decoded > 0
+        ? (double)ctx->total_decode_us / ctx->frames_decoded / 1000.0
+        : 0.0;
+
+    MdOverlayStats overlay_stats = {
+        .latency_ms   = (float)(avg_decode_ms + stream_stats.avg_rtt_ms),
+        .encode_ms    = 0.0f,
+        .decode_ms    = (float)avg_decode_ms,
+        .rtt_ms       = (float)stream_stats.avg_rtt_ms,
+        .connected    = stream && md_stream_is_connected(stream),
+        .reconnecting = ctx->reconnecting != 0,
+        .reconnect_delay_ms = ctx->reconnect_delay_ms,
+        .status_message = ctx->connection_status,
+        .fps          = ctx->frames_decoded > 0
+            ? (int)(ctx->frames_decoded * 1000.0 /
+                    (now - stats_start_ms + 1)) : 0,
+        .bitrate_mbps = stream_stats.bytes_recv > 0
+            ? (float)(stream_stats.bytes_recv * 8.0 / 1000000.0) : 0.0f,
+        .encoder_name = NULL,
+    };
+
+    md_overlay_new_frame(ctx->overlay);
+    md_overlay_render(ctx->overlay, &overlay_stats);
+}
+
+static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
+                                   bool *deliberate_exit) {
+    uint32_t start = md_stream_now_ms();
+
+    while (g_running) {
+        uint32_t now = md_stream_now_ms();
+        uint32_t elapsed = now - start;
+        if (elapsed >= delay_ms)
+            return 0;
+
+        if (ctx) {
+            ctx->reconnect_delay_ms = delay_ms - elapsed;
+            if (ctx->renderer && md_renderer_poll_events(ctx->renderer) < 0) {
+                if (deliberate_exit)
+                    *deliberate_exit = true;
+                g_running = 0;
+                return -1;
+            }
+            render_client_overlay(ctx, NULL, start);
+        }
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
+            if (!g_running)
+                return -1;
+        }
+    }
+
+    return -1;
 }
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -301,6 +507,7 @@ int main(int argc, char **argv) {
     /* Connect to host */
     MdStream *stream = NULL;
     MdNostr *nostr = NULL;
+    char host_pubkey_hex[65] = { 0 };
 
     if (npub) {
         /* ── Nostr-signaled FIPS connect (Phase 2.1) ──────────── */
@@ -334,7 +541,6 @@ int main(int argc, char **argv) {
          * and checked through fips_control; do not subscribe to legacy
          * kind:30078 transport adverts here. */
         MdNostrCallbacks nostr_cbs = { 0 };
-
         nostr_cbs.on_dm = on_session_dm;
         nostr_cbs.dm_userdata = &ctx;
 
@@ -352,11 +558,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
             go_channel_close(ctx.session_ch);
             go_channel_unref(ctx.session_ch);
+            ctx.session_ch = NULL;
             if (signer) md_signer_destroy(signer);
             return 1;
         }
 
-        char host_pubkey_hex[65];
         if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
             fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
             cleanup_npub_nostr(&nostr, &ctx);
@@ -366,103 +572,15 @@ int main(int argc, char **argv) {
         /* Store expected host pubkey hex for callback verification */
         strncpy(ctx.expected_host_pk, host_pubkey_hex, sizeof(ctx.expected_host_pk) - 1);
         ctx.expected_host_pk[sizeof(ctx.expected_host_pk) - 1] = '\0';
+    }
 
-        printf("client: checking FIPS daemon health...\n");
-        if (check_fips_daemon(fips_control_socket, timeout_ms) != 0) {
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-
-        printf("client: waiting for FIPS peer readiness for %.*s...\n", 12, npub);
-        MdFipsPeerReadiness ready;
-        MdFipsPeerReadinessState rstate = md_fips_control_wait_peer_ready(
-            fips_control_socket, npub, timeout_ms,
-            MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS, &ready);
-        if (rstate != MD_FIPS_PEER_READY) {
-            if (rstate == MD_FIPS_PEER_NOT_FOUND)
-                print_fips_setup_guidance("client", npub, &ready);
-            else
-                fprintf(stderr, "ERROR: FIPS route not ready (%s): %s\n",
-                        md_fips_peer_readiness_string(rstate), ready.detail);
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-        printf("client: FIPS peer ready: %s\n", ready.detail);
-
-        /* Step 1: Send session request DM */
-        MdSessionRequest req = {
-            .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
-            .tree_format = MD_TREE_FORMAT_COMPACT,
-        };
-        const char *our_pk = md_nostr_get_npub(nostr);
-        if (our_pk)
-            strncpy(req.fips_addr, our_pk, sizeof(req.fips_addr) - 1);
-
-        char *req_json = md_session_request_to_json(&req);
-        if (!req_json) {
-            fprintf(stderr, "ERROR: failed to serialize session request\n");
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-
-        printf("client: sending session request DM...\n");
-        if (md_nostr_send_session_request(nostr, host_pubkey_hex, req_json) != 0) {
-            fprintf(stderr, "ERROR: failed to send session request\n");
-            free(req_json);
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-        free(req_json);
-
-        /* Step 2: Wait for session accept DM (channel-based with timeout) */
-        {
-            void *dummy = NULL;
-            GoSelectCase cases[] = {
-                { .op = GO_SELECT_RECEIVE, .chan = ctx.session_ch, .recv_buf = &dummy },
-            };
-            go_select_timeout(cases, 1, (uint64_t)timeout_ms * 2);
-        }
-        if (!ctx.session_accepted) {
-            fprintf(stderr, "ERROR: timed out waiting for session accept\n");
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-        printf("client: session accepted (id=%s)\n", ctx.accepted_session_id);
-
-        /* Step 3: Connect via FIPS over the daemon-managed route */
-        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
-        stream = md_stream_connect_fips(npub, port, timeout_ms);
-        if (!stream) {
-            fprintf(stderr, "ERROR: FIPS connect failed\n");
-            cleanup_npub_nostr(&nostr, &ctx);
-            return 1;
-        }
-
-        /* Step 4: Send MD_PKT_SESSION_INFO with session_id + capabilities */
-        MdSessionAccept acc = { .tree_format = ctx.accepted_tree_format };
-        strncpy(acc.session_id, ctx.accepted_session_id, sizeof(acc.session_id) - 1);
-        acc.granted = ctx.granted_caps;
-        char *info_json = md_session_accept_to_json(&acc);
-        if (info_json) {
-            md_stream_send(stream, MD_PKT_SESSION_INFO, 0,
-                           (const uint8_t *)info_json, (uint32_t)strlen(info_json));
-            free(info_json);
-        }
-
-        /* Update session state — use confirmed tree format from host */
-        md_session_request(&session, npub, req.capabilities,
-                           ctx.accepted_tree_format);
-        md_session_accept(&session, ctx.accepted_session_id, ctx.granted_caps);
-        md_session_activate(&session);
-
-    } else {
-        /* ── Direct IP/hostname connect (existing path) ───────── */
-        printf("client: connecting to %s:%u...\n", host, port);
-        stream = md_stream_connect(host, port, timeout_ms);
-        if (!stream) {
-            fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
-            return 1;
-        }
+    stream = connect_client_stream(host, npub, fips_control_socket,
+                                   port, timeout_ms, nostr,
+                                   host_pubkey_hex, &ctx, &session);
+    if (!stream) {
+        cleanup_npub_nostr(&nostr, &ctx);
+        if (signer) md_signer_destroy(signer);
+        return 1;
     }
     printf("client: connected\n");
 
@@ -471,6 +589,8 @@ int main(int argc, char **argv) {
     if (!decoder) {
         fprintf(stderr, "ERROR: failed to create H.264 decoder\n");
         md_stream_destroy(stream);
+        cleanup_npub_nostr(&nostr, &ctx);
+        if (signer) md_signer_destroy(signer);
         return 1;
     }
 
@@ -496,12 +616,58 @@ int main(int argc, char **argv) {
     uint32_t pkt_seq = 0;
     uint32_t last_stats_ms = md_stream_now_ms();
     uint32_t video_packets = 0;
+    uint32_t reconnect_delay_ms = 1000;
+    const uint32_t reconnect_delay_max_ms = 30000;
+    bool deliberate_exit = false;
 
-    while (g_running && md_stream_is_connected(stream)) {
-        /* Check SDL events (window close, etc.) */
+    while (g_running) {
+        if (!stream || !md_stream_is_connected(stream)) {
+            if (stream) {
+                md_stream_destroy(stream);
+                stream = NULL;
+            }
+            md_session_reset(&session);
+
+            ctx.reconnecting = 1;
+            ctx.connection_status = "Disconnected — reconnecting...";
+            ctx.reconnect_delay_ms = reconnect_delay_ms;
+            render_client_overlay(&ctx, NULL, last_stats_ms);
+
+            fprintf(stderr, "client: reconnecting in %.1fs\n",
+                    (double)reconnect_delay_ms / 1000.0);
+            if (sleep_with_reconnect_ui(&ctx, reconnect_delay_ms,
+                                        &deliberate_exit) != 0 ||
+                deliberate_exit || !g_running) {
+                break;
+            }
+
+            stream = connect_client_stream(host, npub, fips_control_socket,
+                                           port, timeout_ms, nostr,
+                                           host_pubkey_hex, &ctx, &session);
+            if (stream) {
+                ctx.reconnecting = 0;
+                ctx.reconnect_delay_ms = 0;
+                ctx.connection_status = NULL;
+                reconnect_delay_ms = 1000;
+                last_stats_ms = md_stream_now_ms();
+                printf("client: reconnected\n");
+                continue;
+            }
+
+            if (reconnect_delay_ms < reconnect_delay_max_ms) {
+                reconnect_delay_ms *= 2;
+                if (reconnect_delay_ms > reconnect_delay_max_ms)
+                    reconnect_delay_ms = reconnect_delay_max_ms;
+            }
+            continue;
+        }
+
+        /* Check SDL events (window close, Escape, etc.) */
         if (ctx.renderer) {
             if (md_renderer_poll_events(ctx.renderer) < 0) {
                 printf("client: window closed\n");
+                deliberate_exit = true;
+                g_running = 0;
                 break;
             }
         }
@@ -512,13 +678,20 @@ int main(int argc, char **argv) {
         int ret = md_stream_recv(stream, &hdr, &payload, 16 /* ~1 frame at 60fps */);
 
         if (ret == 1) {
-            /* Timeout — no data yet, loop back */
+            /* Timeout — no data yet, keep UI responsive and loop back. */
+            render_client_overlay(&ctx, stream, last_stats_ms);
             continue;
         }
         if (ret < 0) {
-            /* Connection lost */
+            /* Unexpected connection loss — enter reconnect loop. */
             fprintf(stderr, "client: connection lost\n");
-            break;
+            md_stream_destroy(stream);
+            stream = NULL;
+            md_session_reset(&session);
+            ctx.reconnecting = 1;
+            ctx.connection_status = "Disconnected — reconnecting...";
+            ctx.reconnect_delay_ms = reconnect_delay_ms;
+            continue;
         }
 
         /* Handle packet by type */
@@ -604,31 +777,7 @@ int main(int argc, char **argv) {
         free(payload);
 
         /* Update and render overlay */
-        if (ctx.overlay) {
-            MdStreamStats stream_stats;
-            md_stream_get_stats(stream, &stream_stats);
-
-            double avg_decode_ms = ctx.frames_decoded > 0
-                ? (double)ctx.total_decode_us / ctx.frames_decoded / 1000.0
-                : 0.0;
-
-            MdOverlayStats overlay_stats = {
-                .latency_ms   = (float)(avg_decode_ms + stream_stats.avg_rtt_ms),
-                .encode_ms    = 0.0f,  /* TODO: receive from host stats */
-                .decode_ms    = (float)avg_decode_ms,
-                .rtt_ms       = (float)stream_stats.avg_rtt_ms,
-                .connected    = md_stream_is_connected(stream),
-                .fps          = ctx.frames_decoded > 0
-                    ? (int)(ctx.frames_decoded * 1000.0 /
-                            (md_stream_now_ms() - last_stats_ms + 1)) : 0,
-                .bitrate_mbps = stream_stats.bytes_recv > 0
-                    ? (float)(stream_stats.bytes_recv * 8.0 / 1000000.0) : 0.0f,
-                .encoder_name = NULL,
-            };
-
-            md_overlay_new_frame(ctx.overlay);
-            md_overlay_render(ctx.overlay, &overlay_stats);
-        }
+        render_client_overlay(&ctx, stream, last_stats_ms);
 
         /* Print stats every 5 seconds */
         uint32_t now = md_stream_now_ms();
@@ -658,12 +807,9 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
-    if (nostr) {
-        go_channel_close(ctx.session_ch);
-        go_channel_unref(ctx.session_ch);
-        md_nostr_destroy(nostr);
-    } else if (signer)
-        md_signer_destroy(signer); /* only if nostr didn't borrow it */
+    cleanup_npub_nostr(&nostr, &ctx);
+    if (signer)
+        md_signer_destroy(signer);
     free(ctx.ui_tree_json);
     if (ctx.overlay)
         md_overlay_destroy(ctx.overlay);

@@ -71,6 +71,9 @@ typedef struct {
     float  decode_ms;        /* average decode time                */
     float  rtt_ms;           /* network round-trip time            */
     bool   connected;        /* true if stream is active           */
+    bool   reconnecting;     /* true while client is retrying      */
+    uint32_t reconnect_delay_ms; /* next retry delay, if reconnecting */
+    const char *status_message;  /* optional connection detail        */
     int    fps;              /* current display FPS                */
     float  bitrate_mbps;     /* current bitrate in Mbps            */
     const char *encoder_name; /* "NVENC" or "x264"                */
