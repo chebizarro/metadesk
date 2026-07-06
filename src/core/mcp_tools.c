@@ -355,7 +355,11 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
             .userdata = &hctxs[i],
         };
 
-        if (md_mcp_server_register_tool(server, &tool) != 0) {
+        if (!tool.input_schema || md_mcp_server_register_tool(server, &tool) != 0) {
+            if (tool.input_schema)
+                cJSON_Delete(tool.input_schema);
+            for (size_t j = 0; j < i; j++)
+                md_mcp_server_unregister_tool(server, tool_defs[j].name);
             free(hctxs);
             tool_ctx->_handler_ctxs = NULL;
             return -1;

@@ -467,6 +467,29 @@ int md_mcp_server_register_tool(MdMcpServer *server, const MdMcpTool *tool)
     return 0;
 }
 
+int md_mcp_server_unregister_tool(MdMcpServer *server, const char *name)
+{
+    if (!server || !name)
+        return -1;
+
+    for (int i = 0; i < server->tool_count; i++) {
+        if (strcmp(server->tools[i].name, name) == 0) {
+            if (server->tools[i].input_schema)
+                cJSON_Delete(server->tools[i].input_schema);
+
+            for (int j = i; j < server->tool_count - 1; j++)
+                server->tools[j] = server->tools[j + 1];
+
+            server->tool_count--;
+            memset(&server->tools[server->tool_count], 0,
+                   sizeof(server->tools[server->tool_count]));
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 int md_mcp_server_register_resource(MdMcpServer *server,
                                     const MdMcpResource *res)
 {

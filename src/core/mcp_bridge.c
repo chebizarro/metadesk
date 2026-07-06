@@ -93,14 +93,26 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     /* 4. Register tools */
     b->tool_ctx.agent = b->agent;
     b->tool_ctx.a11y = config->a11y;
-    md_mcp_register_tools(b->server, &b->tool_ctx);
+    if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0) {
+        md_mcp_tools_cleanup(&b->tool_ctx);
+        md_mcp_server_destroy(b->server);
+        md_agent_destroy(b->agent);
+        free(b);
+        return NULL;
+    }
 
     /* 5. Register resources */
     b->resource_ctx.a11y = config->a11y;
     b->resource_ctx.session = &b->session;
     b->resource_ctx.agent = b->agent;
     b->resource_ctx.tree_format = config->tree_format;
-    md_mcp_register_resources(b->server, &b->resource_ctx);
+    if (md_mcp_register_resources(b->server, &b->resource_ctx) != 0) {
+        md_mcp_tools_cleanup(&b->tool_ctx);
+        md_mcp_server_destroy(b->server);
+        md_agent_destroy(b->agent);
+        free(b);
+        return NULL;
+    }
 
     /* 6. Subscribe to a11y changes for notifications */
     if (config->a11y) {
@@ -115,6 +127,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
                                             config->stdio_in_fd,
                                             config->stdio_out_fd);
         if (!b->stdio_ctx) {
+            md_mcp_tools_cleanup(&b->tool_ctx);
             md_mcp_server_destroy(b->server);
             md_agent_destroy(b->agent);
             free(b);

@@ -91,6 +91,10 @@ void         md_mcp_server_destroy(MdMcpServer *server);
  * ownership of input_schema. Returns 0 on success. */
 int md_mcp_server_register_tool(MdMcpServer *server, const MdMcpTool *tool);
 
+/* Unregister a tool by name. Deletes the owned input_schema for that tool.
+ * Returns 0 if removed, -1 if not found or invalid. */
+int md_mcp_server_unregister_tool(MdMcpServer *server, const char *name);
+
 /* Register a resource. Returns 0 on success. */
 int md_mcp_server_register_resource(MdMcpServer *server, const MdMcpResource *res);
 

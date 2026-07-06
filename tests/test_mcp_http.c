@@ -85,6 +85,25 @@ static int http_request(uint16_t port, const char *request,
     return (int)n;
 }
 
+static int sse_connect(uint16_t port, char *headers_buf,
+                       size_t headers_buf_len)
+{
+    int fd = tcp_connect(port);
+    if (fd < 0) return -1;
+
+    const char *request = "GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ssize_t w = write(fd, request, strlen(request));
+    if (w <= 0) { close(fd); return -1; }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    ssize_t n = read(fd, headers_buf, headers_buf_len - 1);
+    if (n <= 0) { close(fd); return -1; }
+    headers_buf[n] = '\0';
+    return fd;
+}
+
 /* ── Test: NULL config ───────────────────────────────────────── */
 
 static void test_create_null(void)
@@ -95,6 +114,22 @@ static void test_create_null(void)
     assert(md_mcp_http_create(&cfg) == NULL);
 
     PASS("create null config");
+}
+
+static void test_create_invalid_bind_addr(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .bind_addr = "not-an-ip-address",
+        .port = g_test_port++,
+    };
+    assert(md_mcp_http_create(&cfg) == NULL);
+
+    md_mcp_server_destroy(mcp);
+    PASS("invalid bind address fails");
 }
 
 /* ── Test: create and destroy ────────────────────────────────── */
@@ -200,6 +235,7 @@ static void test_post_initialize(void)
     char response[4096];
     int n = http_request(port, request, response, sizeof(response));
     assert(n > 0);
+    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
 
     /* The HTTP layer should return a valid HTTP response.
      * With correct wiring we'd get 200 + JSON-RPC; with dummy write
@@ -215,6 +251,60 @@ static void test_post_initialize(void)
     md_mcp_server_destroy(temp_mcp);
 
     PASS("POST /mcp HTTP routing");
+}
+
+static void test_post_requires_json_content_type(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .port   = port,
+    };
+
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    assert(http != NULL);
+
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    usleep(100000);
+
+    const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1}";
+    char request[1024];
+    snprintf(request, sizeof(request),
+             "POST /mcp HTTP/1.1\r\n"
+             "Host: localhost:%d\r\n"
+             "Content-Length: %zu\r\n"
+             "\r\n%s",
+             port, strlen(body), body);
+
+    char response[2048];
+    int n = http_request(port, request, response, sizeof(response));
+    assert(n > 0);
+    assert(strstr(response, "415") != NULL);
+    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
+
+    snprintf(request, sizeof(request),
+             "POST /mcp HTTP/1.1\r\n"
+             "Host: localhost:%d\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %zu\r\n"
+             "\r\n%s",
+             port, strlen(body), body);
+    n = http_request(port, request, response, sizeof(response));
+    assert(n > 0);
+    assert(strstr(response, "415") != NULL);
+
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+
+    PASS("POST /mcp requires application/json Content-Type");
 }
 
 /* ── Test: GET unknown path → 404 ────────────────────────────── */
@@ -243,6 +333,7 @@ static void test_get_404(void)
     int n = http_request(port, request, response, sizeof(response));
     assert(n > 0);
     assert(strstr(response, "404") != NULL);
+    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
 
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
@@ -251,6 +342,73 @@ static void test_get_404(void)
     md_mcp_server_destroy(mcp);
 
     PASS("GET unknown path → 404");
+}
+
+static void test_sse_max_clients_config(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    assert(mcp != NULL);
+
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp,
+        .port   = port,
+        .max_clients = 1,
+    };
+
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    assert(http != NULL);
+
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    usleep(100000);
+
+    char headers1[1024];
+    int fd1 = sse_connect(port, headers1, sizeof(headers1));
+    assert(fd1 >= 0);
+    assert(strstr(headers1, "text/event-stream") != NULL);
+    assert(strstr(headers1, "Access-Control-Allow-Origin") == NULL);
+
+    char headers2[1024];
+    int fd2 = sse_connect(port, headers2, sizeof(headers2));
+    assert(fd2 >= 0);
+    assert(strstr(headers2, "text/event-stream") != NULL);
+
+    usleep(100000);
+    assert(md_mcp_http_send_sse(http, "test", "data", 4) == 0);
+
+    char event[1024];
+    ssize_t n = read(fd1, event, sizeof(event) - 1);
+    assert(n > 0);
+    size_t total = (size_t)n;
+    event[total] = '\0';
+    for (int i = 0; i < 3 && strstr(event, "data: data") == NULL; i++) {
+        n = read(fd1, event + total, sizeof(event) - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        event[total] = '\0';
+    }
+    assert(strstr(event, "event: test") != NULL);
+    assert(strstr(event, "data: data") != NULL);
+
+    n = read(fd2, event, sizeof(event) - 1);
+    if (n > 0) {
+        event[n] = '\0';
+        assert(strstr(event, "event: test") == NULL);
+    } else {
+        assert(n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+
+    close(fd1);
+    close(fd2);
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+
+    PASS("SSE max_clients config");
 }
 
 /* ── Test: shutdown flag stops run loop ──────────────────────── */
@@ -330,12 +488,15 @@ int main(void)
     printf("test_mcp_http: HTTP+SSE transport tests\n");
 
     test_create_null();
+    test_create_invalid_bind_addr();
     test_create_destroy();
     test_destroy_null();
     test_run_null();
     test_sse_no_clients();
     test_post_initialize();
+    test_post_requires_json_content_type();
     test_get_404();
+    test_sse_max_clients_config();
     test_shutdown();
 
     printf("\nAll HTTP transport tests passed.\n");

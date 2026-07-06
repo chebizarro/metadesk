@@ -678,6 +678,48 @@ static void test_tool_call_key_combo(void)
     PASS("tool call key_combo (no agent) returns isError");
 }
 
+static void test_tool_registration_failure_rolls_back(void)
+{
+    MdMcpServer *s = make_server();
+    char names[24][32];
+
+    /* Leave only 8 slots free so registering the 9 built-in tools fails
+     * after several have already been accepted by the server. */
+    for (int i = 0; i < 24; i++) {
+        snprintf(names[i], sizeof(names[i]), "prefill_tool_%02d", i);
+        cJSON *schema = cJSON_CreateObject();
+        MdMcpTool tool = {
+            .name = names[i],
+            .input_schema = schema,
+            .handler = stub_tool_handler,
+        };
+        assert(md_mcp_server_register_tool(s, &tool) == 0);
+    }
+
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    assert(md_mcp_register_tools(s, &tool_ctx) == -1);
+    assert(tool_ctx._handler_ctxs == NULL);
+
+    do_init(s);
+    clear_responses();
+    const char *list = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":9}";
+    md_mcp_server_handle_message(s, list, strlen(list));
+
+    cJSON *resp = last_response();
+    cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
+    assert(cJSON_GetArraySize(tools) == 24);
+    for (int i = 0; i < cJSON_GetArraySize(tools); i++) {
+        cJSON *t = cJSON_GetArrayItem(tools, i);
+        assert(strncmp(cJSON_GetObjectItem(t, "name")->valuestring,
+                       "prefill_tool_", 13) == 0);
+    }
+    cJSON_Delete(resp);
+
+    md_mcp_tools_cleanup(&tool_ctx);
+    md_mcp_server_destroy(s);
+    PASS("tool registration failure rolls back partial tools");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
@@ -700,6 +742,7 @@ int main(void)
     test_tool_call_click_no_agent();
     test_tool_call_missing_target();
     test_tool_call_key_combo();
+    test_tool_registration_failure_rolls_back();
     test_resources_with_session();
     test_bridge_create_destroy();
 

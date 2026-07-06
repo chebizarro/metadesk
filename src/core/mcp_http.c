@@ -9,11 +9,12 @@
  * Concurrent: each accepted connection is handled by a go()
  * goroutine so POST processing doesn't block the accept loop.
  * Thread-local storage routes responses to the correct request.
- * Max 4 concurrent SSE clients.
+ * SSE client capacity is configurable.
  */
 #include "mcp_http.h"
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -23,8 +24,8 @@
 #include <arpa/inet.h>
 #include <go.h>
 
-#define MAX_SSE_CLIENTS   4
-#define MAX_REQUEST_SIZE  (1024 * 1024)  /* 1 MB max request body */
+#define DEFAULT_MAX_SSE_CLIENTS 4
+#define MAX_REQUEST_SIZE        (1024 * 1024)  /* 1 MB max request body */
 #define READ_BUF_SIZE     4096
 
 /* ── Server struct ───────────────────────────────────────────── */
@@ -36,8 +37,9 @@ struct MdMcpHttp {
     volatile bool   shutdown;
 
     /* SSE client file descriptors */
-    int             sse_clients[MAX_SSE_CLIENTS];
+    int            *sse_clients;
     int             sse_count;
+    int             sse_max_clients;
     pthread_mutex_t sse_mu;
 
     /* Tracks in-flight handler goroutines for graceful shutdown */
@@ -76,7 +78,6 @@ static void send_http_response(int fd, int status, const char *status_text,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
         "\r\n",
         status, status_text, content_type, body_len);
@@ -92,7 +93,6 @@ static void send_sse_headers(int fd)
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
     write(fd, headers, strlen(headers));
@@ -106,8 +106,29 @@ typedef struct {
     char *body;              /* heap-allocated body for POST */
     size_t body_len;
     size_t content_length;
+    char content_type[128];  /* Content-Type header */
     char session_id[128];    /* Mcp-Session-Id header */
 } HttpRequest;
+
+static bool is_json_content_type(const char *content_type)
+{
+    if (!content_type || !*content_type)
+        return false;
+
+    while (*content_type == ' ' || *content_type == '\t')
+        content_type++;
+
+    const char *json_type = "application/json";
+    size_t json_type_len = strlen(json_type);
+    if (strncasecmp(content_type, json_type, json_type_len) != 0)
+        return false;
+
+    content_type += json_type_len;
+    while (*content_type == ' ' || *content_type == '\t')
+        content_type++;
+
+    return *content_type == '\0' || *content_type == ';';
+}
 
 static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 {
@@ -122,25 +143,41 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 
     /* Parse headers */
     const char *header_start = end + 2;
-    const char *body_start = strstr(buf, "\r\n\r\n");
-    if (!body_start) return -1;
-    body_start += 4;
+    const char *headers_end = strstr(buf, "\r\n\r\n");
+    if (!headers_end) return -1;
+    const char *body_start = headers_end + 4;
 
     /* Find Content-Length */
     const char *cl = strcasestr(header_start, "Content-Length:");
-    if (cl) {
+    if (cl && cl < headers_end) {
         cl += 15;
-        while (*cl == ' ') cl++;
+        while (*cl == ' ' || *cl == '\t') cl++;
         req->content_length = (size_t)atol(cl);
+    }
+
+    /* Find Content-Type */
+    const char *ct = strcasestr(header_start, "Content-Type:");
+    if (ct && ct < headers_end) {
+        ct += 13;
+        while (*ct == ' ' || *ct == '\t') ct++;
+        const char *ct_end = strstr(ct, "\r\n");
+        if (ct_end && ct_end <= headers_end) {
+            while (ct_end > ct && (ct_end[-1] == ' ' || ct_end[-1] == '\t'))
+                ct_end--;
+            size_t ct_len = (size_t)(ct_end - ct);
+            if (ct_len >= sizeof(req->content_type))
+                ct_len = sizeof(req->content_type) - 1;
+            memcpy(req->content_type, ct, ct_len);
+        }
     }
 
     /* Find Mcp-Session-Id */
     const char *sid = strcasestr(header_start, "Mcp-Session-Id:");
-    if (sid) {
+    if (sid && sid < headers_end) {
         sid += 15;
-        while (*sid == ' ') sid++;
+        while (*sid == ' ' || *sid == '\t') sid++;
         const char *sid_end = strstr(sid, "\r\n");
-        if (sid_end) {
+        if (sid_end && sid_end <= headers_end) {
             size_t slen = (size_t)(sid_end - sid);
             if (slen >= sizeof(req->session_id)) slen = sizeof(req->session_id) - 1;
             memcpy(req->session_id, sid, slen);
@@ -225,6 +262,16 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     }
     free(buf);
 
+    /* All POSTs must carry JSON-RPC as application/json. */
+    if (strcmp(req.method, "POST") == 0 &&
+        !is_json_content_type(req.content_type)) {
+        send_http_response(client_fd, 415, "Unsupported Media Type",
+                           "text/plain", "Unsupported media type\n", 23);
+        free(req.body);
+        close(client_fd);
+        return;
+    }
+
     /* Route by method + path */
     if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "POST") == 0) {
         /* JSON-RPC request */
@@ -256,7 +303,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         send_sse_headers(client_fd);
 
         pthread_mutex_lock(&h->sse_mu);
-        if (h->sse_count < MAX_SSE_CLIENTS) {
+        if (h->sse_count < h->sse_max_clients) {
             h->sse_clients[h->sse_count++] = client_fd;
         } else {
             close(client_fd);
@@ -338,6 +385,14 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     h->mcp_server = config->server;
     h->port = config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT;
     h->shutdown = false;
+    h->sse_max_clients = config->max_clients > 0
+        ? config->max_clients : DEFAULT_MAX_SSE_CLIENTS;
+    h->sse_clients = calloc((size_t)h->sse_max_clients,
+                            sizeof(*h->sse_clients));
+    if (!h->sse_clients) {
+        free(h);
+        return NULL;
+    }
     pthread_mutex_init(&h->sse_mu, NULL);
     go_wait_group_init(&h->handler_wg);
 
@@ -345,6 +400,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     h->listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (h->listen_fd < 0) {
         go_wait_group_destroy(&h->handler_wg);
+        pthread_mutex_destroy(&h->sse_mu);
+        free(h->sse_clients);
         free(h);
         return NULL;
     }
@@ -361,7 +418,22 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     addr.sin6_port = htons(h->port);
 
     if (config->bind_addr) {
-        inet_pton(AF_INET6, config->bind_addr, &addr.sin6_addr);
+        if (inet_pton(AF_INET6, config->bind_addr, &addr.sin6_addr) != 1) {
+            struct in_addr v4_addr;
+            if (inet_pton(AF_INET, config->bind_addr, &v4_addr) == 1) {
+                memset(&addr.sin6_addr, 0, sizeof(addr.sin6_addr));
+                addr.sin6_addr.s6_addr[10] = 0xff;
+                addr.sin6_addr.s6_addr[11] = 0xff;
+                memcpy(&addr.sin6_addr.s6_addr[12], &v4_addr, sizeof(v4_addr));
+            } else {
+                close(h->listen_fd);
+                go_wait_group_destroy(&h->handler_wg);
+                pthread_mutex_destroy(&h->sse_mu);
+                free(h->sse_clients);
+                free(h);
+                return NULL;
+            }
+        }
     } else {
         addr.sin6_addr = in6addr_loopback;  /* localhost only by default */
     }
@@ -369,6 +441,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     if (bind(h->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(h->listen_fd);
         go_wait_group_destroy(&h->handler_wg);
+        pthread_mutex_destroy(&h->sse_mu);
+        free(h->sse_clients);
         free(h);
         return NULL;
     }
@@ -376,6 +450,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     if (listen(h->listen_fd, 8) < 0) {
         close(h->listen_fd);
         go_wait_group_destroy(&h->handler_wg);
+        pthread_mutex_destroy(&h->sse_mu);
+        free(h->sse_clients);
         free(h);
         return NULL;
     }
@@ -459,5 +535,6 @@ void md_mcp_http_destroy(MdMcpHttp *http)
         close(http->listen_fd);
 
     pthread_mutex_destroy(&http->sse_mu);
+    free(http->sse_clients);
     free(http);
 }
