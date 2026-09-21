@@ -12,6 +12,11 @@ project('metadesk', ['c', 'cpp'],
 # ── Platform detection ───────────────────────────────────────────────────────
 host_os = host_machine.system()  # 'linux', 'darwin', 'windows'
 
+# Tests assert through bare assert(); never let NDEBUG compile them out,
+# or -Db_ndebug=true turns the suite into silent no-ops. No src/ file
+# uses assert, so this only affects tests.
+add_project_arguments('-UNDEBUG', language : 'c')
+
 # ── Options ──────────────────────────────────────────────────────────────────
 enable_client  = get_option('client')
 enable_fipsnat = get_option('fips_nat')
@@ -61,7 +66,6 @@ endif
 # nostrc components:
 #   Installed (pkg-config/find_library): libnostr, nip44, secp256k1, etc.
 #   Not yet installed (build-tree only): libgo runtime, nip51
-#
 # Use -Dnostrc_root=<path> to specify the nostrc project root for uninstalled
 # components. Use -Dnostrc_build_dir=<path> to override the build directory.
 _nostrc_root = get_option('nostrc_root')
@@ -428,6 +432,17 @@ test_atspi = executable('test_atspi',
   dependencies : [dep_metadesk],
 )
 test('a11y tree serialisation', test_atspi)
+
+# Live-backend checks hang/fail without an a11y bus or AX permission, so
+# they are opt-in: configure with -Dlive_tests=true, run via
+# `meson test --suite live`.
+if get_option('live_tests')
+  test('a11y live backend', test_atspi,
+    env : {'MD_A11Y_LIVE_TESTS' : '1'},
+    suite : 'live',
+    timeout : 30,
+  )
+endif
 
 test_nostr = executable('test_nostr',
   files('tests/test_nostr.c'),
