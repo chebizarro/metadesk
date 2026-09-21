@@ -284,6 +284,7 @@ MdIpcConn *md_ipc_connect(const char *name, uint32_t timeout_ms) {
 
 int md_ipc_send(MdIpcConn *conn, const void *data, size_t len) {
     if (!conn || !conn->connected || !data) return -1;
+    if (len > MD_IPC_MAX_MSG) return -1; /* protocol limit */
 
     const uint8_t *p = (const uint8_t *)data;
     size_t remaining = len;
@@ -326,7 +327,12 @@ int md_ipc_recv(MdIpcConn *conn, void *buf, size_t buf_len,
                     CloseHandle(ov.hEvent);
                     return -1; /* timeout */
                 }
-                GetOverlappedResult(conn->pipe, &ov, &bytesRead, FALSE);
+                if (!GetOverlappedResult(conn->pipe, &ov, &bytesRead, FALSE)) {
+                    CancelIo(conn->pipe);
+                    CloseHandle(ov.hEvent);
+                    conn->connected = false;
+                    return -1;
+                }
             } else if (err == ERROR_BROKEN_PIPE) {
                 CloseHandle(ov.hEvent);
                 conn->connected = false;

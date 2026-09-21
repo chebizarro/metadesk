@@ -54,7 +54,8 @@ static inline bool md_ipc_name_is_valid(const char *name)
     return true;
 }
 
-/* Maximum data per single send/recv */
+/* Maximum data per single send/recv — enforced by md_ipc_send (larger
+ * sends fail) and md_ipc_recv (reads are clamped). */
 #define MD_IPC_MAX_MSG  (64 * 1024)
 
 /* Opaque types */

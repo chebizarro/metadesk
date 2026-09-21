@@ -281,6 +281,7 @@ MdIpcConn *md_ipc_connect(const char *name, uint32_t timeout_ms) {
 
 int md_ipc_send(MdIpcConn *conn, const void *data, size_t len) {
     if (!conn || !conn->connected || !data) return -1;
+    if (len > MD_IPC_MAX_MSG) return -1; /* protocol limit */
     int ret = write_all(conn->fd, data, len);
     if (ret < 0) conn->connected = false;
     return ret;
@@ -289,6 +290,10 @@ int md_ipc_send(MdIpcConn *conn, const void *data, size_t len) {
 int md_ipc_recv(MdIpcConn *conn, void *buf, size_t buf_len,
                 uint32_t timeout_ms) {
     if (!conn || !conn->connected || !buf || buf_len == 0) return -1;
+
+    /* Never read beyond the protocol message limit */
+    if (buf_len > MD_IPC_MAX_MSG)
+        buf_len = MD_IPC_MAX_MSG;
 
     if (timeout_ms > 0) {
         struct pollfd pfd = { .fd = conn->fd, .events = POLLIN };

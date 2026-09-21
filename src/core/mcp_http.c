@@ -187,6 +187,14 @@ static void send_http_response(int fd, int status, const char *status_text,
         write_all(fd, body, body_len);
 }
 
+/* Plain-text error/short response — length computed, never hand-counted. */
+static void send_http_text(int fd, int status, const char *status_text,
+                           const char *msg)
+{
+    send_http_response(fd, status, status_text, "text/plain",
+                       msg, strlen(msg));
+}
+
 static void send_sse_headers(int fd)
 {
     const char *headers =
@@ -354,9 +362,8 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             /* Check Content-Length and enforce limit */
             size_t content_len = 0;
             if (parse_content_length(buf, body_start, &content_len) < 0) {
-                send_http_response(client_fd, 400, "Bad Request",
-                                   "text/plain",
-                                   "Invalid Content-Length\n", 23);
+                send_http_text(client_fd, 400, "Bad Request",
+                               "Invalid Content-Length\n");
                 free(buf);
                 close(client_fd);
                 return;
@@ -364,10 +371,8 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
             /* Reject oversized requests */
             if (content_len > MAX_REQUEST_SIZE) {
-                send_http_response(client_fd, 413,
-                                   "Content Too Large",
-                                   "text/plain",
-                                   "Request body too large\n", 23);
+                send_http_text(client_fd, 413, "Content Too Large",
+                               "Request body too large\n");
                 free(buf);
                 close(client_fd);
                 return;
@@ -394,8 +399,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
     HttpRequest req;
     if (parse_http_request(buf, total, &req) != 0) {
-        send_http_response(client_fd, 400, "Bad Request",
-                           "text/plain", "Bad request\n", 12);
+        send_http_text(client_fd, 400, "Bad Request", "Bad request\n");
         free(buf);
         close(client_fd);
         return;
@@ -405,8 +409,8 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     /* All POSTs must carry JSON-RPC as application/json. */
     if (strcmp(req.method, "POST") == 0 &&
         !is_json_content_type(req.content_type)) {
-        send_http_response(client_fd, 415, "Unsupported Media Type",
-                           "text/plain", "Unsupported media type\n", 23);
+        send_http_text(client_fd, 415, "Unsupported Media Type",
+                       "Unsupported media type\n");
         free(req.body);
         close(client_fd);
         return;
@@ -416,8 +420,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "POST") == 0) {
         /* JSON-RPC request */
         if (!req.body || req.body_len == 0) {
-            send_http_response(client_fd, 400, "Bad Request",
-                               "text/plain", "Empty body\n", 11);
+            send_http_text(client_fd, 400, "Bad Request", "Empty body\n");
         } else {
             /* Dispatch to MCP server with a per-request capture sink —
              * this request's response(s) come back through it. */
@@ -431,15 +434,14 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             capture_free(&capture);
 
             if (capture_failed) {
-                send_http_response(client_fd, 500, "Internal Server Error",
-                                   "text/plain", "Response capture failed\n", 24);
+                send_http_text(client_fd, 500, "Internal Server Error",
+                               "Response capture failed\n");
             } else if (resp) {
                 send_http_response(client_fd, 200, "OK",
                                    "application/json", resp, strlen(resp));
                 free(resp);
             } else {
-                send_http_response(client_fd, 202, "Accepted",
-                                   "text/plain", "", 0);
+                send_http_text(client_fd, 202, "Accepted", "");
             }
         }
         free(req.body);
@@ -460,8 +462,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         free(req.body);
 
     } else {
-        send_http_response(client_fd, 404, "Not Found",
-                           "text/plain", "Not found\n", 10);
+        send_http_text(client_fd, 404, "Not Found", "Not found\n");
         free(req.body);
         close(client_fd);
     }
