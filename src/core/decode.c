@@ -39,6 +39,8 @@ struct MdDecoder {
 
 /*
  * Convert a decoded AVFrame (NV12 or I420) to RGBA via libyuv.
+ * libyuv "ARGB" is BGRA in memory; "ABGR" is R,G,B,A — the byte order
+ * the client's SDL texture (SDL_PIXELFORMAT_ABGR8888) expects.
  * Returns 0 on success.
  */
 static int frame_to_rgba(const AVFrame *frame, uint8_t *dst, uint32_t dst_stride) {
@@ -47,20 +49,20 @@ static int frame_to_rgba(const AVFrame *frame, uint8_t *dst, uint32_t dst_stride
 
     switch (frame->format) {
     case AV_PIX_FMT_NV12:
-        return NV12ToARGB(frame->data[0], frame->linesize[0],   /* Y  */
+        return NV12ToABGR(frame->data[0], frame->linesize[0],   /* Y  */
                           frame->data[1], frame->linesize[1],   /* UV */
                           dst, (int)dst_stride,
                           w, h);
 
     case AV_PIX_FMT_YUV420P:
-        return I420ToARGB(frame->data[0], frame->linesize[0],   /* Y  */
+        return I420ToABGR(frame->data[0], frame->linesize[0],   /* Y  */
                           frame->data[1], frame->linesize[1],   /* U  */
                           frame->data[2], frame->linesize[2],   /* V  */
                           dst, (int)dst_stride,
                           w, h);
 
     case AV_PIX_FMT_NV21:
-        return NV21ToARGB(frame->data[0], frame->linesize[0],
+        return NV21ToABGR(frame->data[0], frame->linesize[0],
                           frame->data[1], frame->linesize[1],
                           dst, (int)dst_stride,
                           w, h);

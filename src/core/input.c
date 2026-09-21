@@ -299,7 +299,13 @@ int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
 
     case MD_ACTION_SET_VALUE:
         if (action->text[0] != '\0') {
+            /* Select-all shortcut is platform-specific: Cmd on macOS,
+             * Ctrl elsewhere. This runs on the host, so pick by build OS. */
+#ifdef __APPLE__
+            const char *select_all[] = { "meta", "a" };
+#else
             const char *select_all[] = { "ctrl", "a" };
+#endif
             if (md_input_key_combo(inp, select_all, 2) < 0)
                 return -1;
             input_delay();

@@ -296,9 +296,11 @@ int md_ipc_recv(MdIpcConn *conn, void *buf, size_t buf_len,
         if (ret == 0) return -1; /* timeout */
     }
 
-    ssize_t n = read(conn->fd, buf, buf_len);
+    ssize_t n;
+    do {
+        n = read(conn->fd, buf, buf_len);
+    } while (n < 0 && errno == EINTR);
     if (n < 0) {
-        if (errno == EINTR) return 0;
         conn->connected = false;
         return -1;
     }

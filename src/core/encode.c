@@ -352,8 +352,6 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
     if (!enc || !data || !enc->ctx)
         return -1;
 
-    (void)pts;
-
     enc->cb = cb;
     enc->cb_userdata = userdata;
 
@@ -369,8 +367,11 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
         return -1;
     }
 
-    /* Set PTS. FFmpeg expects PTS in the codec's time_base. */
-    enc->frame->pts = enc->frame_idx++;
+    /* Set PTS. FFmpeg expects PTS in the codec's time_base; use the
+     * caller's timestamp when provided, else fall back to frame count. */
+    enc->frame->pts = (pts >= 0) ? pts : (int64_t)enc->frame_idx++;
+    if (pts >= 0)
+        enc->frame_idx = pts + 1;
 
     /* Send frame to encoder */
     ret = avcodec_send_frame(enc->ctx, enc->frame);

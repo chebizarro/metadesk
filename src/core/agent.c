@@ -175,9 +175,22 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
                 break;
             }
         } else {
-            fprintf(stderr, "agent: could not resolve target '%s'\n",
-                    action.target_id);
-            /* Continue anyway — some actions (key_combo, type) don't need coords */
+            /* Coordinate actions with an unresolvable target must not fall
+             * through to a click at stale or (0,0) coordinates. */
+            switch (action.type) {
+            case MD_ACTION_CLICK:
+            case MD_ACTION_DBL_CLICK:
+            case MD_ACTION_RIGHT_CLICK:
+            case MD_ACTION_FOCUS:
+                fprintf(stderr, "agent: could not resolve target '%s'\n",
+                        action.target_id);
+                md_action_cleanup(&action);
+                pthread_mutex_unlock(&agent->mu);
+                return -1;
+            default:
+                /* key_combo, type, etc. don't need coordinates */
+                break;
+            }
         }
     }
 
@@ -284,8 +297,22 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
                 break;
             }
         } else {
-            fprintf(stderr, "agent[mcp]: could not resolve target '%s'\n",
-                    action.target_id);
+            /* Coordinate actions with an unresolvable target must not fall
+             * through to a click at stale or (0,0) coordinates. */
+            switch (action.type) {
+            case MD_ACTION_CLICK:
+            case MD_ACTION_DBL_CLICK:
+            case MD_ACTION_RIGHT_CLICK:
+            case MD_ACTION_FOCUS:
+                fprintf(stderr, "agent[mcp]: could not resolve target '%s'\n",
+                        action.target_id);
+                md_action_cleanup(&action);
+                pthread_mutex_unlock(&agent->mu);
+                return NULL;
+            default:
+                /* key_combo, type, etc. don't need coordinates */
+                break;
+            }
         }
     }
 
