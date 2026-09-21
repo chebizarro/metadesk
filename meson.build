@@ -444,6 +444,9 @@ test_agent = executable('test_agent',
 test('agent action handler', test_agent)
 
 # ── Tools ────────────────────────────────────────────────────────────────────
+# Diagnostic utilities (capture_frame, atspi_dump are useful for manual backend
+# triage; encode_roundtrip overlaps tests/test_encode.c) — opt-in.
+if get_option('tools')
 capture_frame = executable('capture_frame',
   files('tools/capture_frame.c'),
   dependencies : [dep_metadesk],
@@ -461,6 +464,7 @@ atspi_dump = executable('atspi_dump',
   dependencies : [dep_metadesk],
   install : false,
 )
+endif
 
 test_fips_addr = executable('test_fips_addr',
   files('tests/test_fips_addr.c'),

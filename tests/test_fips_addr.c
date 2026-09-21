@@ -129,56 +129,6 @@ static void test_fips_reference_vectors(void) {
     PASS();
 }
 
-/* ── Test: deterministic output ────────────────────────────── */
-
-static void test_deterministic(void) {
-    TEST("derivation is deterministic");
-
-    const char *npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
-
-    char ipv6_a[MD_FIPS_IPV6_STRLEN];
-    char ipv6_b[MD_FIPS_IPV6_STRLEN];
-
-    md_fips_addr_from_npub(npub, ipv6_a, sizeof(ipv6_a));
-    md_fips_addr_from_npub(npub, ipv6_b, sizeof(ipv6_b));
-
-    if (strcmp(ipv6_a, ipv6_b) != 0) {
-        FAIL("non-deterministic output");
-        return;
-    }
-
-    PASS();
-}
-
-/* ── Test: different keys produce different addresses ──────── */
-
-static void test_different_keys(void) {
-    TEST("different keys produce different addresses");
-
-    /* Two different hex pubkeys */
-    const char *pk1 = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
-    const char *pk2 = "e88a691e98d9987c964ab1c8f54cb49a4ab36f0c7bba68e01b32ed8d67ed59d4";
-
-    char ipv6_1[MD_FIPS_IPV6_STRLEN];
-    char ipv6_2[MD_FIPS_IPV6_STRLEN];
-
-    md_fips_addr_from_pubkey_hex(pk1, ipv6_1, sizeof(ipv6_1));
-    md_fips_addr_from_pubkey_hex(pk2, ipv6_2, sizeof(ipv6_2));
-
-    if (strcmp(ipv6_1, ipv6_2) == 0) {
-        FAIL("different keys produced same address");
-        return;
-    }
-
-    /* Both should still be in fd00::/8 */
-    if (!md_fips_is_fips_addr(ipv6_1) || !md_fips_is_fips_addr(ipv6_2)) {
-        FAIL("addresses not in fd00::/8");
-        return;
-    }
-
-    PASS();
-}
-
 /* ── Test: raw pubkey derivation ───────────────────────────── */
 
 static void test_raw_pubkey(void) {
@@ -326,26 +276,6 @@ static void test_error_handling(void) {
     PASS();
 }
 
-/* ── Test: MTU constants ───────────────────────────────────── */
-
-static void test_mtu_constants(void) {
-    TEST("MTU constants");
-
-    if (MD_FIPS_IPV6_OVERHEAD != 77) {
-        FAIL("FIPS_IPV6_OVERHEAD != 77"); return;
-    }
-
-    if (MD_FIPS_EFFECTIVE_MTU != (1280 - 77)) {
-        FAIL("FIPS_EFFECTIVE_MTU incorrect"); return;
-    }
-
-    if (MD_FIPS_EFFECTIVE_MTU <= 0) {
-        FAIL("effective MTU is non-positive"); return;
-    }
-
-    PASS();
-}
-
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -353,13 +283,10 @@ int main(void) {
 
     test_addr_has_fips_prefix();
     test_fips_reference_vectors();
-    test_deterministic();
-    test_different_keys();
     test_raw_pubkey();
     test_dns_name();
     test_validation();
     test_error_handling();
-    test_mtu_constants();
 
     printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

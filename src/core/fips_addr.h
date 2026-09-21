@@ -44,6 +44,9 @@ extern "C" {
 
 /* Default FIPS transport MTU (typical UDP = 1280, minus overhead) */
 #define MD_FIPS_EFFECTIVE_MTU (1280 - MD_FIPS_IPV6_OVERHEAD)
+/* Guarded at the definition site: a change here is a protocol change. */
+_Static_assert(MD_FIPS_EFFECTIVE_MTU == 1203,
+               "FIPS effective MTU changed — check fips-ipv6-adapter.md");
 
 /* Maximum IPv6 address string length (including null terminator) */
 #define MD_FIPS_IPV6_STRLEN   46

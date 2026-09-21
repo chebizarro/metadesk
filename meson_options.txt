@@ -1,5 +1,7 @@
 option('live_tests', type : 'boolean', value : false,
        description : 'Add live a11y-backend tests (need an a11y bus / AX permission; run via meson test --suite live)')
+option('tools', type : 'boolean', value : false,
+       description : 'Build diagnostic utilities (capture_frame, encode_roundtrip, atspi_dump)')
 option('client',   type : 'boolean', value : true,
        description : 'Build the human video client (requires SDL2 + Dear ImGui)')
 option('signer_nip46', type : 'boolean', value : false,
