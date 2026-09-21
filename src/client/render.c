@@ -30,15 +30,10 @@ struct MdRenderer {
     uint32_t      win_height;
     uint32_t      out_width;     /* renderer output size (pixels)      */
     uint32_t      out_height;
-    uint32_t      host_width;    /* host screen dimensions for scaling */
-    uint32_t      host_height;
     float         hidpi_scale_x; /* pixels / points (1.0 on non-HiDPI) */
     float         hidpi_scale_y;
     bool          open;          /* false after window close event  */
     bool          sdl_inited;    /* true if we called SDL_Init      */
-
-    MdInputCallback input_cb;    /* keyboard/mouse event callback   */
-    void           *input_userdata;
 };
 
 /* ── Internal helpers ────────────────────────────────────────── */
@@ -179,12 +174,6 @@ int md_renderer_poll_events(MdRenderer *r) {
                 r->open = false;
                 return -1;
             }
-            if (r->input_cb) {
-                r->input_cb(MD_INPUT_KEY,
-                            event.key.keysym.scancode,
-                            event.type == SDL_KEYDOWN ? 1 : 0,
-                            r->input_userdata);
-            }
             break;
 
         case SDL_WINDOWEVENT:
@@ -200,44 +189,6 @@ int md_renderer_poll_events(MdRenderer *r) {
             }
             break;
 
-        case SDL_MOUSEMOTION:
-            if (r->input_cb) {
-                int mx = event.motion.x;
-                int my = event.motion.y;
-                /* Scale from client window points to host screen coordinates.
-                 * SDL mouse events are in window-coordinate points.
-                 * On HiDPI/Retina displays, we first convert points to pixels
-                 * (via hidpi_scale), then scale to host coordinates using the
-                 * renderer output size (pixels) to ensure correct mapping
-                 * regardless of display scaling. (OQ-10 fix) */
-                if (r->host_width && r->host_height &&
-                    r->out_width && r->out_height) {
-                    /* Convert points → pixels, then scale to host */
-                    float px = (float)mx * r->hidpi_scale_x;
-                    float py = (float)my * r->hidpi_scale_y;
-                    mx = (int)(px * (float)r->host_width  / (float)r->out_width);
-                    my = (int)(py * (float)r->host_height / (float)r->out_height);
-                }
-                r->input_cb(MD_INPUT_MOUSE_MOVE, mx, my,
-                            r->input_userdata);
-            }
-            break;
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP:
-            if (r->input_cb) {
-                r->input_cb(MD_INPUT_MOUSE_BUTTON,
-                            event.button.button,
-                            event.type == SDL_MOUSEBUTTONDOWN ? 1 : 0,
-                            r->input_userdata);
-            }
-            break;
-        case SDL_MOUSEWHEEL:
-            if (r->input_cb) {
-                r->input_cb(MD_INPUT_SCROLL,
-                            event.wheel.x, event.wheel.y,
-                            r->input_userdata);
-            }
-            break;
 
         default:
             break;
@@ -285,18 +236,6 @@ void *md_renderer_get_sdl_renderer(MdRenderer *r) {
 
 bool md_renderer_is_open(const MdRenderer *r) {
     return r ? r->open : false;
-}
-
-void md_renderer_set_input_callback(MdRenderer *r, MdInputCallback cb, void *userdata) {
-    if (!r) return;
-    r->input_cb = cb;
-    r->input_userdata = userdata;
-}
-
-void md_renderer_set_host_size(MdRenderer *r, uint32_t host_w, uint32_t host_h) {
-    if (!r) return;
-    r->host_width = host_w;
-    r->host_height = host_h;
 }
 
 void md_renderer_destroy(MdRenderer *r) {

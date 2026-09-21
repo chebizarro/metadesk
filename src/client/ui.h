@@ -25,45 +25,6 @@ extern "C" {
 /* Opaque overlay context */
 typedef struct MdOverlay MdOverlay;
 
-/* Read-only view of an allowlist entry for the UI */
-typedef struct {
-    const char *pubkey_hex;  /* 64-char hex npub                   */
-    const char *caps;        /* capability string (may be NULL)    */
-} MdOverlayAllowlistEntry;
-
-/* Callback signatures for allowlist mutation from UI actions.
- * The overlay itself doesn't touch Nostr — it invokes these
- * callbacks which the host wires to md_nostr_allowlist_add/remove. */
-typedef void (*MdOverlayAllowlistAddFn)(const char *pubkey_hex,
-                                        const char *caps,
-                                        void *userdata);
-typedef void (*MdOverlayAllowlistRemoveFn)(const char *pubkey_hex,
-                                           void *userdata);
-
-/* Callback for session approval decision (true = allow, false = deny).
- * add_to_allowlist: if true, also add the npub to the persistent allowlist. */
-typedef void (*MdOverlayApprovalFn)(const char *pubkey_hex,
-                                    bool approved,
-                                    bool add_to_allowlist,
-                                    void *userdata);
-
-/* Pending approval request shown in the popup */
-typedef struct {
-    const char *pubkey_hex;      /* requesting peer's npub          */
-    uint32_t    requested_caps;  /* capability bits they want       */
-    const char *fips_addr;       /* requester's FIPS address        */
-} MdOverlayApprovalRequest;
-
-/* Peer connection info for peer list panel */
-typedef struct {
-    const char *pubkey_hex;  /* 64-char hex npub of the peer       */
-    const char *session_id;  /* session UUID (may be NULL)         */
-    const char *status;      /* "active", "negotiating", etc.      */
-    float       rtt_ms;      /* round-trip time to this peer       */
-    uint32_t    capabilities; /* granted capability bits            */
-    uint64_t    connected_since_ms; /* timestamp (0 = not connected) */
-} MdOverlayPeerInfo;
-
 /* Overlay stats shown to user */
 typedef struct {
     float  latency_ms;       /* total pipeline latency             */
@@ -77,22 +38,6 @@ typedef struct {
     int    fps;              /* current display FPS                */
     float  bitrate_mbps;     /* current bitrate in Mbps            */
     const char *encoder_name; /* "NVENC" or "x264"                */
-
-    /* Peer list panel data (NULL/0 hides panel) */
-    const MdOverlayPeerInfo *peers;
-    int    peer_count;
-
-    /* Allowlist panel data (host mode only — NULL for client) */
-    const MdOverlayAllowlistEntry *allowlist_entries;
-    int    allowlist_count;  /* number of entries (0 hides panel)  */
-    MdOverlayAllowlistAddFn    on_allowlist_add;
-    MdOverlayAllowlistRemoveFn on_allowlist_remove;
-    void  *allowlist_userdata;
-
-    /* Approval popup data (NULL hides popup) */
-    const MdOverlayApprovalRequest *pending_approval;
-    MdOverlayApprovalFn on_approval;
-    void  *approval_userdata;
 } MdOverlayStats;
 
 /* Create ImGui overlay attached to an SDL window/renderer.
@@ -108,12 +53,6 @@ void md_overlay_new_frame(MdOverlay *o);
 /* Render the overlay with current stats.
  * Call between md_overlay_new_frame() and the SDL_RenderPresent(). */
 void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats);
-
-/* Check if the overlay wants to capture mouse/keyboard (ImGui focus). */
-bool md_overlay_wants_input(const MdOverlay *o);
-
-/* Toggle overlay visibility. */
-void md_overlay_toggle(MdOverlay *o);
 
 /* Destroy overlay and ImGui context. */
 void md_overlay_destroy(MdOverlay *o);

@@ -78,7 +78,6 @@ meson test -C build
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `nvenc` | `true` | NVENC hardware encoding (requires NVIDIA GPU) |
 | `client` | `true` | Build the human video client (requires SDL2) |
 | `fips_nat` | `false` | Build legacy fips-nat daemon (deprecated; requires libnice) |
 | `signer_nip46` | `false` | NIP-46 Nostr Connect remote signer |
@@ -200,15 +199,7 @@ Access control is managed entirely through Nostr identity — no accounts, no pa
 
 ## Secret Storage
 
-All cryptographic material is retrieved at startup from [1Password Connect](https://developer.1password.com/docs/connect/) and held in locked memory. No secrets are stored in config files or environment variables.
-
-```toml
-# config/metadesk.toml — only references, never secrets
-[secrets]
-connect_url = "http://localhost:8080"
-nsec_ref = "op://metadesk/fips-node/nsec"
-token_ref = "op://metadesk/1pc/token"
-```
+All cryptographic material is retrieved at startup from [1Password Connect](https://developer.1password.com/docs/connect/) and held in locked memory. No secrets are stored in config files or environment variables; configuration holds `op://` references only, never secrets.
 
 ## Testing
 
@@ -282,7 +273,6 @@ metadesk/
 
 - [Full Specification](docs/metadesk-spec.md) — architecture, wire formats, session negotiation, roadmap
 - [Agent API Guide](docs/AGENT_API.md) — MCP integration with examples
-- [Example Config](config/metadesk.toml.example) — annotated configuration template
 
 ## Status
 

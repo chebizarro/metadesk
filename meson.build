@@ -13,8 +13,6 @@ project('metadesk', ['c', 'cpp'],
 host_os = host_machine.system()  # 'linux', 'darwin', 'windows'
 
 # ── Options ──────────────────────────────────────────────────────────────────
-cmake = import('cmake')
-enable_nvenc   = get_option('nvenc')
 enable_client  = get_option('client')
 enable_fipsnat = get_option('fips_nat')
 enable_nip46   = get_option('signer_nip46')
@@ -102,8 +100,6 @@ else
   error('nostr_nip51_core not found. Install nostrc or set -Dnostrc_root=<path>')
 endif
 
-dep_nip17 = cc.find_library('nostr', required : false, dirs : _sys_lib_dirs)
-
 # nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
 # libgo — try installed library first, fallback to build-tree static libs
 _libgo_lib = cc.find_library('libgo', required : false, dirs : _sys_lib_dirs)
@@ -169,7 +165,6 @@ elif host_os == 'darwin'
     'src/core/capture_screencapturekit.m',
     'src/core/a11y_axui.m',
     'src/core/input_cgevent.m',
-    'src/core/encode_videotoolbox.m',
     'src/core/ipc_unix.c',
   )
   # macOS uses system frameworks — link via add_project_link_arguments
@@ -183,7 +178,6 @@ elif host_os == 'darwin'
     '-framework', 'CoreMedia',
     '-framework', 'CoreVideo',
     '-framework', 'ApplicationServices',
-    '-framework', 'VideoToolbox',
     language : ['c', 'cpp', 'objc'],
   )
 
@@ -234,7 +228,6 @@ core_deps = [
   dep_nostr,
   dep_nip44,
   dep_nip51,
-  dep_nip17,
   dep_nip11,
   dep_curl,
   dep_libgo,
