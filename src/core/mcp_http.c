@@ -28,6 +28,9 @@
 #define DEFAULT_MAX_SSE_CLIENTS 4
 #define MAX_REQUEST_SIZE        (1024 * 1024)  /* 1 MB max request body */
 #define READ_BUF_SIZE     4096
+/* Bound how long a connection handler can block on reads — without it
+ * an idle client parks a handler goroutine forever and wedges destroy. */
+#define CLIENT_READ_TIMEOUT_SEC 30
 
 /* ── Server struct ───────────────────────────────────────────── */
 
@@ -136,13 +139,16 @@ static int http_write_fn(const char *json, size_t len, void *userdata)
     MdMcpHttp *h = (MdMcpHttp *)userdata;
     if (!h || !json) return -1;
 
-    int rc = capture_append(tls_capture, json, len);
+    /* Inside a POST dispatch the write is that request's response —
+     * capturing it for the HTTP reply, NOT broadcasting it to every
+     * SSE client. Only server-initiated notifications (outside any
+     * dispatch) go to SSE subscribers. */
+    if (tls_capture)
+        return capture_append(tls_capture, json, len);
 
-    /* Also broadcast as SSE to all subscribed clients */
     if (md_mcp_http_send_sse(h, "message", json, len) < 0)
-        rc = -1;
-
-    return rc;
+        return -1;
+    return 0;
 }
 
 /* ── HTTP response helpers ───────────────────────────────────── */
@@ -320,6 +326,12 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 
 static void handle_client(MdMcpHttp *h, int client_fd)
 {
+    /* Bound read waits so idle connections cannot park a handler */
+    struct timeval rcv_timeout = { .tv_sec = CLIENT_READ_TIMEOUT_SEC,
+                                   .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+               &rcv_timeout, sizeof(rcv_timeout));
+
     /* Heap-allocate the request buffer to handle larger payloads */
     size_t buf_cap = READ_BUF_SIZE * 4;
     char *buf = malloc(buf_cap);
