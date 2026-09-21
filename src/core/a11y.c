@@ -91,6 +91,16 @@ static bool nodes_differ(const MdA11yNode *a, const MdA11yNode *b) {
     if (a->x != b->x || a->y != b->y || a->w != b->w || a->h != b->h)
         return true;
     if (a->state_count != b->state_count) return true;
+    /* Compare state *contents*, not just the count: a toggle from
+     * ["focused"] to ["selected"] keeps the same count but is a real change.
+     * Backends emit states in a stable order, so an element-wise compare is
+     * sufficient (and mirrors the role/label comparisons above). */
+    for (int i = 0; i < a->state_count; i++) {
+        const char *sa = a->states ? a->states[i] : NULL;
+        const char *sb = b->states ? b->states[i] : NULL;
+        if ((sa == NULL) != (sb == NULL)) return true;
+        if (sa && sb && strcmp(sa, sb) != 0) return true;
+    }
     return false;
 }
 

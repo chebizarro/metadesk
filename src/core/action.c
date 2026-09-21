@@ -65,6 +65,12 @@ int md_action_parse(MdAction *action, const char *json, size_t json_len) {
         return -1;
     }
     action->type = md_action_type_from_str(act->valuestring);
+    if (action->type == MD_ACTION_UNKNOWN) {
+        /* Reject at the parse boundary rather than letting an unknown verb
+         * travel as a valid-looking MD_ACTION_UNKNOWN and fail deeper in. */
+        cJSON_Delete(root);
+        return -1;
+    }
 
     /* target_id (optional for key_combo) */
     cJSON *tid = cJSON_GetObjectItemCaseSensitive(root, "target_id");
@@ -161,7 +167,11 @@ char *md_action_encode(const MdAction *action) {
         has_payload = 1;
     }
 
-    if (action->type == MD_ACTION_SCREENSHOT) {
+    /* Emit region whenever it carries data, symmetric with the parser (which
+     * reads it for any action). Previously only screenshots encoded it, so a
+     * region set on any other action was silently dropped on round-trip. */
+    if (action->region[0] || action->region[1] ||
+        action->region[2] || action->region[3]) {
         cJSON *region = cJSON_CreateIntArray(action->region, 4);
         cJSON_AddItemToObject(payload, "region", region);
         has_payload = 1;

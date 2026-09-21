@@ -192,19 +192,18 @@ static void test_parse_errors(void)
     PASS("parse errors");
 }
 
-/* ── Parse: unknown action type still parses ─────────────────── */
+/* ── Parse: unknown action type is rejected ───────────── */
 
 static void test_parse_unknown_type(void)
 {
     const char *json = "{\"v\":1,\"action\":\"weird_new_action\","
                        "\"target_id\":\"x\",\"payload\":{}}";
     MdAction action;
-    MD_CHECK(md_action_parse(&action, json, strlen(json)) == 0);
-    MD_CHECK(action.type == MD_ACTION_UNKNOWN);
-    MD_CHECK(strcmp(action.target_id, "x") == 0);
-    md_action_cleanup(&action);
+    /* An unknown verb must be rejected at the parse boundary, not accepted
+     * as a valid-looking MD_ACTION_UNKNOWN. */
+    MD_CHECK(md_action_parse(&action, json, strlen(json)) == -1);
 
-    PASS("parse unknown type");
+    PASS("parse unknown type rejected");
 }
 
 /* ── Parse: max keys clamped ─────────────────────────────────── */
