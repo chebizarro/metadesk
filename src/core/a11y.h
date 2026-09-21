@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,7 +62,6 @@ typedef void (*MdA11yChangeCb)(const MdA11yDelta *deltas, int count,
 typedef struct MdA11yBackend {
     int   (*init)(MdA11yCtx *ctx);
     int   (*get_tree)(MdA11yCtx *ctx, MdA11yNode **out_root);
-    int   (*get_diff)(MdA11yCtx *ctx, MdA11yDelta **out_deltas, int *out_count);
     int   (*subscribe_changes)(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
     void  (*destroy)(MdA11yCtx *ctx);
 } MdA11yBackend;
@@ -71,6 +71,13 @@ typedef struct MdA11yBackend {
 struct MdA11yCtx {
     const MdA11yBackend *vtable;
     void                *backend_data;  /* backend-private state */
+
+    /* Previous tree snapshot for delta computation. The diff engine is
+     * implemented once in a11y.c on top of get_tree — it operates only
+     * on the platform-neutral MdA11yNode, so it does not belong in the
+     * three backends. */
+    MdA11yNode          *last_snapshot;
+    pthread_mutex_t      snapshot_mu;
 };
 
 /* ── Factory ─────────────────────────────────────────────────── */

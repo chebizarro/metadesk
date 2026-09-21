@@ -32,8 +32,7 @@
 typedef struct {
     int                  connected;
     uint64_t             next_id;        /* monotonic ID counter for node IDs     */
-    MdA11yNode          *last_snapshot;  /* previous tree for delta computation   */
-    GMutex               lock;           /* protects next_id + last_snapshot      */
+    GMutex               lock;           /* protects next_id + backend state      */
     AtspiEventListener  *listener;       /* push-change listener registered below */
     GThread             *event_thread;   /* runs the AT-SPI/GLib event loop       */
     MdA11yChangeCb       change_cb;
@@ -188,85 +187,6 @@ static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,
     return node;
 }
 
-/* ── Delta computation ───────────────────────────────────────── */
-
-typedef struct {
-    const char        *id;
-    const MdA11yNode  *node;
-} FlatEntry;
-
-static void flatten_tree(const MdA11yNode *node, FlatEntry **entries,
-                         int *count, int *capacity) {
-    if (!node) return;
-
-    if (*count >= *capacity) {
-        *capacity = (*capacity == 0) ? 64 : *capacity * 2;
-        *entries = realloc(*entries, (size_t)*capacity * sizeof(FlatEntry));
-        if (!*entries) { *count = 0; return; }
-    }
-
-    (*entries)[*count].id = node->id;
-    (*entries)[*count].node = node;
-    (*count)++;
-
-    for (int i = 0; i < node->child_count && node->children; i++)
-        flatten_tree(node->children[i], entries, count, capacity);
-}
-
-static const FlatEntry *find_by_id(const FlatEntry *entries, int count,
-                                   const char *id) {
-    if (!id) return NULL;
-    for (int i = 0; i < count; i++) {
-        if (entries[i].id && strcmp(entries[i].id, id) == 0)
-            return &entries[i];
-    }
-    return NULL;
-}
-
-static bool nodes_differ(const MdA11yNode *a, const MdA11yNode *b) {
-    if (!a || !b) return true;
-    if ((a->role == NULL) != (b->role == NULL)) return true;
-    if (a->role && b->role && strcmp(a->role, b->role) != 0) return true;
-    if ((a->label == NULL) != (b->label == NULL)) return true;
-    if (a->label && b->label && strcmp(a->label, b->label) != 0) return true;
-    if (a->x != b->x || a->y != b->y || a->w != b->w || a->h != b->h)
-        return true;
-    if (a->state_count != b->state_count) return true;
-    return false;
-}
-
-static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
-    if (!src) return NULL;
-
-    MdA11yNode *dst = calloc(1, sizeof(MdA11yNode));
-    if (!dst) return NULL;
-
-    if (src->id)    dst->id    = strdup(src->id);
-    if (src->role)  dst->role  = strdup(src->role);
-    if (src->label) dst->label = strdup(src->label);
-    dst->x = src->x;
-    dst->y = src->y;
-    dst->w = src->w;
-    dst->h = src->h;
-
-    if (src->state_count > 0 && src->states) {
-        dst->states = calloc((size_t)src->state_count, sizeof(char *));
-        if (dst->states) {
-            dst->state_count = src->state_count;
-            for (int i = 0; i < src->state_count; i++) {
-                if (src->states[i])
-                    dst->states[i] = strdup(src->states[i]);
-            }
-        }
-    }
-
-    return dst;
-}
-
-static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root);
-static int atspi_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                                   int *out_count);
-
 /* ── Change subscriptions ────────────────────────────────────── */
 
 static const char *const atspi_change_events[] = {
@@ -298,16 +218,20 @@ static void atspi_change_event_cb(AtspiEvent *event, void *user_data) {
 
     MdA11yChangeCb cb = NULL;
     void *cb_userdata = NULL;
-    MdA11yDelta *deltas = NULL;
-    int delta_count = 0;
 
     g_mutex_lock(&st->lock);
     if (st->subscribed && st->change_cb) {
         cb = st->change_cb;
         cb_userdata = st->change_userdata;
-        (void)atspi_get_diff_unlocked(ctx, &deltas, &delta_count);
     }
     g_mutex_unlock(&st->lock);
+
+    /* Diff outside the backend lock: md_a11y_diff re-enters get_tree,
+     * which takes the same lock. */
+    MdA11yDelta *deltas = NULL;
+    int delta_count = 0;
+    if (cb)
+        deltas = md_a11y_diff(ctx, &delta_count);
 
     if (cb)
         cb(deltas, delta_count, cb_userdata);
@@ -435,100 +359,6 @@ static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return ret;
 }
 
-static int atspi_get_diff_unlocked(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                                   int *out_count) {
-    AtspiState *st = ctx->backend_data;
-    if (!st || !out_deltas || !out_count) return -1;
-
-    *out_deltas = NULL;
-    *out_count = 0;
-
-    MdA11yNode *current = NULL;
-    if (atspi_get_tree_unlocked(ctx, &current) != 0 || !current)
-        return -1;
-
-    MdA11yNode *prev = st->last_snapshot;
-
-    /* No previous snapshot — everything is new. Return empty delta;
-     * caller should send a full tree instead. */
-    if (!prev) {
-        st->last_snapshot = current;
-        return 0;
-    }
-
-    /* Flatten both trees */
-    FlatEntry *prev_flat = NULL, *curr_flat = NULL;
-    int prev_count = 0, curr_count = 0;
-    int prev_cap = 0, curr_cap = 0;
-
-    flatten_tree(prev, &prev_flat, &prev_count, &prev_cap);
-    flatten_tree(current, &curr_flat, &curr_count, &curr_cap);
-
-    int max_deltas = prev_count + curr_count;
-    MdA11yDelta *deltas = calloc((size_t)max_deltas, sizeof(MdA11yDelta));
-    if (!deltas) {
-        free(prev_flat);
-        free(curr_flat);
-        md_a11y_node_free(current);
-        return -1;
-    }
-
-    int dc = 0;
-
-    /* Removed nodes */
-    for (int i = 0; i < prev_count; i++) {
-        if (!find_by_id(curr_flat, curr_count, prev_flat[i].id)) {
-            deltas[dc].op = MD_A11Y_OP_REMOVE;
-            deltas[dc].node = clone_node_shallow(prev_flat[i].node);
-            dc++;
-        }
-    }
-
-    /* Added and updated nodes */
-    for (int i = 0; i < curr_count; i++) {
-        const FlatEntry *prev_entry = find_by_id(prev_flat, prev_count,
-                                                  curr_flat[i].id);
-        if (!prev_entry) {
-            deltas[dc].op = MD_A11Y_OP_ADD;
-            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
-            dc++;
-        } else if (nodes_differ(prev_entry->node, curr_flat[i].node)) {
-            deltas[dc].op = MD_A11Y_OP_UPDATE;
-            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
-            dc++;
-        }
-    }
-
-    free(prev_flat);
-    free(curr_flat);
-
-    /* Replace snapshot */
-    md_a11y_node_free(st->last_snapshot);
-    st->last_snapshot = current;
-
-    if (dc == 0) {
-        free(deltas);
-        *out_deltas = NULL;
-        *out_count = 0;
-        return 0;
-    }
-
-    *out_deltas = deltas;
-    *out_count = dc;
-    return 0;
-}
-
-static int atspi_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                          int *out_count) {
-    AtspiState *st = ctx ? ctx->backend_data : NULL;
-    if (!st) return -1;
-
-    g_mutex_lock(&st->lock);
-    int ret = atspi_get_diff_unlocked(ctx, out_deltas, out_count);
-    g_mutex_unlock(&st->lock);
-    return ret;
-}
-
 static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                    void *userdata) {
     AtspiState *st = ctx ? ctx->backend_data : NULL;
@@ -569,13 +399,13 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     /* Seed the diff baseline so the first push event can emit meaningful
      * deltas instead of being consumed as the initial snapshot. */
     g_mutex_lock(&st->lock);
-    if (!st->last_snapshot) {
-        MdA11yNode *initial = NULL;
-        if (atspi_get_tree_unlocked(ctx, &initial) == 0)
-            st->last_snapshot = initial;
-    }
     st->subscribed = TRUE;
     g_mutex_unlock(&st->lock);
+    {
+        int seeded = 0;
+        MdA11yDelta *seed = md_a11y_diff(ctx, &seeded);
+        md_a11y_delta_free(seed, seeded);
+    }
 
     st->event_thread = g_thread_new("md-atspi-events",
                                     atspi_event_loop_thread, st);
@@ -615,7 +445,6 @@ static void atspi_destroy_backend(MdA11yCtx *ctx) {
     if (st->listener)
         g_object_unref(st->listener);
 
-    md_a11y_node_free(st->last_snapshot);
     atspi_exit();
 
     g_mutex_clear(&st->lock);
@@ -628,7 +457,6 @@ static void atspi_destroy_backend(MdA11yCtx *ctx) {
 static const MdA11yBackend atspi_backend = {
     .init              = atspi_init_backend,
     .get_tree          = atspi_get_tree,
-    .get_diff          = atspi_get_diff,
     .subscribe_changes = atspi_subscribe_changes,
     .destroy           = atspi_destroy_backend,
 };

@@ -39,10 +39,10 @@ extern "C" {
 struct UIAState {
     IUIAutomation      *automation;
     IUIAutomationTreeWalker *walker;
+    MdA11yCtx          *ctx;         /* back-pointer for md_a11y_diff */
     int                 connected;
     int                 com_initialized;
     uint64_t            next_id;
-    MdA11yNode         *last_snapshot;
     CRITICAL_SECTION    lock;
     int                 lock_initialized;
 
@@ -216,81 +216,6 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
     return node;
 }
 
-/* ── Delta computation (same algorithm as other backends) ────── */
-
-struct FlatEntry {
-    const char        *id;
-    const MdA11yNode  *node;
-};
-
-static void flatten_tree(const MdA11yNode *node, FlatEntry **entries,
-                         int *count, int *capacity) {
-    if (!node) return;
-
-    if (*count >= *capacity) {
-        *capacity = (*capacity == 0) ? 64 : *capacity * 2;
-        *entries = (FlatEntry *)realloc(*entries, (size_t)*capacity * sizeof(FlatEntry));
-        if (!*entries) { *count = 0; return; }
-    }
-
-    (*entries)[*count].id = node->id;
-    (*entries)[*count].node = node;
-    (*count)++;
-
-    for (int i = 0; i < node->child_count && node->children; i++)
-        flatten_tree(node->children[i], entries, count, capacity);
-}
-
-static const FlatEntry *find_by_id(const FlatEntry *entries, int count,
-                                   const char *id) {
-    if (!id) return nullptr;
-    for (int i = 0; i < count; i++) {
-        if (entries[i].id && strcmp(entries[i].id, id) == 0)
-            return &entries[i];
-    }
-    return nullptr;
-}
-
-static bool nodes_differ(const MdA11yNode *a, const MdA11yNode *b) {
-    if (!a || !b) return true;
-    if ((a->role == nullptr) != (b->role == nullptr)) return true;
-    if (a->role && b->role && strcmp(a->role, b->role) != 0) return true;
-    if ((a->label == nullptr) != (b->label == nullptr)) return true;
-    if (a->label && b->label && strcmp(a->label, b->label) != 0) return true;
-    if (a->x != b->x || a->y != b->y || a->w != b->w || a->h != b->h)
-        return true;
-    if (a->state_count != b->state_count) return true;
-    return false;
-}
-
-static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
-    if (!src) return nullptr;
-
-    MdA11yNode *dst = (MdA11yNode *)calloc(1, sizeof(MdA11yNode));
-    if (!dst) return nullptr;
-
-    if (src->id)    dst->id    = _strdup(src->id);
-    if (src->role)  dst->role  = _strdup(src->role);
-    if (src->label) dst->label = _strdup(src->label);
-    dst->x = src->x;
-    dst->y = src->y;
-    dst->w = src->w;
-    dst->h = src->h;
-
-    if (src->state_count > 0 && src->states) {
-        dst->states = (char **)calloc((size_t)src->state_count, sizeof(char *));
-        if (dst->states) {
-            dst->state_count = src->state_count;
-            for (int i = 0; i < src->state_count; i++) {
-                if (src->states[i])
-                    dst->states[i] = _strdup(src->states[i]);
-            }
-        }
-    }
-
-    return dst;
-}
-
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int uia_init(MdA11yCtx *ctx) {
@@ -309,6 +234,7 @@ static int uia_init(MdA11yCtx *ctx) {
         return -1;
     }
     st->com_initialized = com_initialized;
+    st->ctx = ctx;
     InitializeCriticalSection(&st->lock);
     st->lock_initialized = 1;
 
@@ -411,97 +337,6 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return ret;
 }
 
-static int uia_get_diff_with_unlocked(UIAState *st, IUIAutomation *automation,
-                                      IUIAutomationTreeWalker *walker,
-                                      MdA11yDelta **out_deltas,
-                                      int *out_count) {
-    if (!st || !automation || !walker || !out_deltas || !out_count)
-        return -1;
-
-    *out_deltas = nullptr;
-    *out_count = 0;
-
-    MdA11yNode *current = nullptr;
-    if (uia_get_tree_with_unlocked(st, automation, walker, &current) != 0 || !current)
-        return -1;
-
-    MdA11yNode *prev = st->last_snapshot;
-
-    if (!prev) {
-        st->last_snapshot = current;
-        return 0;
-    }
-
-    FlatEntry *prev_flat = nullptr, *curr_flat = nullptr;
-    int prev_count = 0, curr_count = 0;
-    int prev_cap = 0, curr_cap = 0;
-
-    flatten_tree(prev, &prev_flat, &prev_count, &prev_cap);
-    flatten_tree(current, &curr_flat, &curr_count, &curr_cap);
-
-    int max_deltas = prev_count + curr_count;
-    MdA11yDelta *deltas = (MdA11yDelta *)calloc((size_t)max_deltas, sizeof(MdA11yDelta));
-    if (!deltas) {
-        free(prev_flat);
-        free(curr_flat);
-        md_a11y_node_free(current);
-        return -1;
-    }
-
-    int dc = 0;
-
-    for (int i = 0; i < prev_count; i++) {
-        if (!find_by_id(curr_flat, curr_count, prev_flat[i].id)) {
-            deltas[dc].op = MD_A11Y_OP_REMOVE;
-            deltas[dc].node = clone_node_shallow(prev_flat[i].node);
-            dc++;
-        }
-    }
-
-    for (int i = 0; i < curr_count; i++) {
-        const FlatEntry *prev_entry = find_by_id(prev_flat, prev_count,
-                                                  curr_flat[i].id);
-        if (!prev_entry) {
-            deltas[dc].op = MD_A11Y_OP_ADD;
-            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
-            dc++;
-        } else if (nodes_differ(prev_entry->node, curr_flat[i].node)) {
-            deltas[dc].op = MD_A11Y_OP_UPDATE;
-            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
-            dc++;
-        }
-    }
-
-    free(prev_flat);
-    free(curr_flat);
-
-    md_a11y_node_free(st->last_snapshot);
-    st->last_snapshot = current;
-
-    if (dc == 0) {
-        free(deltas);
-        *out_deltas = nullptr;
-        *out_count = 0;
-        return 0;
-    }
-
-    *out_deltas = deltas;
-    *out_count = dc;
-    return 0;
-}
-
-static int uia_get_diff(MdA11yCtx *ctx, MdA11yDelta **out_deltas,
-                        int *out_count) {
-    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
-    if (!st || !st->lock_initialized) return -1;
-
-    EnterCriticalSection(&st->lock);
-    int ret = uia_get_diff_with_unlocked(st, st->automation, st->walker,
-                                         out_deltas, out_count);
-    LeaveCriticalSection(&st->lock);
-    return ret;
-}
-
 class UIAChangeHandler final : public IUIAutomationFocusChangedEventHandler,
                                public IUIAutomationStructureChangedEventHandler,
                                public IUIAutomationEventHandler {
@@ -573,22 +408,24 @@ public:
 
 private:
     void emit_change() {
-        if (!st_ || !automation_ || !walker_ || !st_->lock_initialized)
+        if (!st_ || !st_->ctx || !st_->lock_initialized)
             return;
 
         MdA11yChangeCb cb = nullptr;
         void *userdata = nullptr;
-        MdA11yDelta *deltas = nullptr;
-        int delta_count = 0;
 
         EnterCriticalSection(&st_->lock);
         if (st_->subscribed && st_->change_cb) {
             cb = st_->change_cb;
             userdata = st_->change_userdata;
-            (void)uia_get_diff_with_unlocked(st_, automation_, walker_,
-                                             &deltas, &delta_count);
         }
         LeaveCriticalSection(&st_->lock);
+
+        /* Diff via the shared engine in a11y.c (snapshot lives on the ctx) */
+        MdA11yDelta *deltas = nullptr;
+        int delta_count = 0;
+        if (cb)
+            deltas = md_a11y_diff(st_->ctx, &delta_count);
 
         if (cb)
             cb(deltas, delta_count, userdata);
@@ -638,13 +475,9 @@ static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
     if (SUCCEEDED(hr)) {
         /* Seed the baseline before the first pushed event so callbacks emit
          * computed deltas instead of consuming the initial snapshot. */
-        EnterCriticalSection(&st->lock);
-        if (!st->last_snapshot) {
-            MdA11yNode *initial = nullptr;
-            if (uia_get_tree_with_unlocked(st, automation, walker, &initial) == 0)
-                st->last_snapshot = initial;
-        }
-        LeaveCriticalSection(&st->lock);
+        int seeded = 0;
+        MdA11yDelta *seed = md_a11y_diff(st->ctx, &seeded);
+        md_a11y_delta_free(seed, seeded);
 
         auto *focus_handler =
             static_cast<IUIAutomationFocusChangedEventHandler *>(handler);
@@ -814,8 +647,6 @@ static void uia_destroy(MdA11yCtx *ctx) {
         st->ready_event = nullptr;
     }
 
-    md_a11y_node_free(st->last_snapshot);
-
     SAFE_RELEASE(st->walker);
     SAFE_RELEASE(st->automation);
 
@@ -834,7 +665,6 @@ static void uia_destroy(MdA11yCtx *ctx) {
 static const MdA11yBackend uia_backend = {
     uia_init,
     uia_get_tree,
-    uia_get_diff,
     uia_subscribe_changes,
     uia_destroy,
 };

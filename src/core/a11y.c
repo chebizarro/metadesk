@@ -24,8 +24,10 @@ MdA11yCtx *md_a11y_create(void) {
     if (!ctx) return NULL;
 
     ctx->vtable = vtable;
+    pthread_mutex_init(&ctx->snapshot_mu, NULL);
 
     if (ctx->vtable->init(ctx) != 0) {
+        pthread_mutex_destroy(&ctx->snapshot_mu);
         free(ctx);
         return NULL;
     }
@@ -42,14 +44,167 @@ MdA11yNode *md_a11y_walk(MdA11yCtx *ctx) {
     return root;
 }
 
+/* ── Shared diff engine ──────────────────────────────────────
+ * Computes deltas between the previous snapshot and a fresh tree from
+ * vtable->get_tree. Operates only on platform-neutral MdA11yNode, so
+ * it lives here, not in the backends. */
+
+typedef struct {
+    const char        *id;
+    const MdA11yNode  *node;
+} FlatEntry;
+
+static void flatten_tree(const MdA11yNode *node, FlatEntry **entries,
+                         int *count, int *capacity) {
+    if (!node) return;
+
+    if (*count >= *capacity) {
+        *capacity = (*capacity == 0) ? 64 : *capacity * 2;
+        *entries = realloc(*entries, (size_t)*capacity * sizeof(FlatEntry));
+        if (!*entries) { *count = 0; return; }
+    }
+
+    (*entries)[*count].id = node->id;
+    (*entries)[*count].node = node;
+    (*count)++;
+
+    for (int i = 0; i < node->child_count && node->children; i++)
+        flatten_tree(node->children[i], entries, count, capacity);
+}
+
+static const FlatEntry *find_by_id(const FlatEntry *entries, int count,
+                                   const char *id) {
+    if (!id) return NULL;
+    for (int i = 0; i < count; i++) {
+        if (entries[i].id && strcmp(entries[i].id, id) == 0)
+            return &entries[i];
+    }
+    return NULL;
+}
+
+static bool nodes_differ(const MdA11yNode *a, const MdA11yNode *b) {
+    if (!a || !b) return true;
+    if ((a->role == NULL) != (b->role == NULL)) return true;
+    if (a->role && b->role && strcmp(a->role, b->role) != 0) return true;
+    if ((a->label == NULL) != (b->label == NULL)) return true;
+    if (a->label && b->label && strcmp(a->label, b->label) != 0) return true;
+    if (a->x != b->x || a->y != b->y || a->w != b->w || a->h != b->h)
+        return true;
+    if (a->state_count != b->state_count) return true;
+    return false;
+}
+
+static MdA11yNode *clone_node_shallow(const MdA11yNode *src) {
+    if (!src) return NULL;
+
+    MdA11yNode *dst = calloc(1, sizeof(MdA11yNode));
+    if (!dst) return NULL;
+
+    if (src->id)    dst->id    = strdup(src->id);
+    if (src->role)  dst->role  = strdup(src->role);
+    if (src->label) dst->label = strdup(src->label);
+    dst->x = src->x;
+    dst->y = src->y;
+    dst->w = src->w;
+    dst->h = src->h;
+
+    if (src->state_count > 0 && src->states) {
+        dst->states = calloc((size_t)src->state_count, sizeof(char *));
+        if (dst->states) {
+            dst->state_count = src->state_count;
+            for (int i = 0; i < src->state_count; i++) {
+                if (src->states[i])
+                    dst->states[i] = strdup(src->states[i]);
+            }
+        }
+    }
+
+    return dst;
+}
+
 MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
-    if (!ctx || !ctx->vtable || !ctx->vtable->get_diff || !delta_count)
+    if (!ctx || !ctx->vtable || !ctx->vtable->get_tree || !delta_count)
         return NULL;
 
     *delta_count = 0;
-    MdA11yDelta *deltas = NULL;
-    if (ctx->vtable->get_diff(ctx, &deltas, delta_count) != 0)
+
+    pthread_mutex_lock(&ctx->snapshot_mu);
+
+    MdA11yNode *current = NULL;
+    if (ctx->vtable->get_tree(ctx, &current) != 0 || !current) {
+        pthread_mutex_unlock(&ctx->snapshot_mu);
         return NULL;
+    }
+
+    MdA11yNode *prev = ctx->last_snapshot;
+
+    /* No previous snapshot — caller should send a full tree instead. */
+    if (!prev) {
+        ctx->last_snapshot = current;
+        pthread_mutex_unlock(&ctx->snapshot_mu);
+        return NULL;
+    }
+
+    /* Flatten both trees */
+    FlatEntry *prev_flat = NULL, *curr_flat = NULL;
+    int prev_count = 0, curr_count = 0;
+    int prev_cap = 0, curr_cap = 0;
+
+    flatten_tree(prev, &prev_flat, &prev_count, &prev_cap);
+    flatten_tree(current, &curr_flat, &curr_count, &curr_cap);
+
+    int max_deltas = prev_count + curr_count;
+    MdA11yDelta *deltas = calloc((size_t)(max_deltas > 0 ? max_deltas : 1),
+                                 sizeof(MdA11yDelta));
+    if (!deltas) {
+        free(prev_flat);
+        free(curr_flat);
+        md_a11y_node_free(current);
+        pthread_mutex_unlock(&ctx->snapshot_mu);
+        return NULL;
+    }
+
+    int dc = 0;
+
+    /* Removed nodes */
+    for (int i = 0; i < prev_count; i++) {
+        if (!find_by_id(curr_flat, curr_count, prev_flat[i].id)) {
+            deltas[dc].op = MD_A11Y_OP_REMOVE;
+            deltas[dc].node = clone_node_shallow(prev_flat[i].node);
+            dc++;
+        }
+    }
+
+    /* Added and updated nodes */
+    for (int i = 0; i < curr_count; i++) {
+        const FlatEntry *prev_entry = find_by_id(prev_flat, prev_count,
+                                                  curr_flat[i].id);
+        if (!prev_entry) {
+            deltas[dc].op = MD_A11Y_OP_ADD;
+            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
+            dc++;
+        } else if (nodes_differ(prev_entry->node, curr_flat[i].node)) {
+            deltas[dc].op = MD_A11Y_OP_UPDATE;
+            deltas[dc].node = clone_node_shallow(curr_flat[i].node);
+            dc++;
+        }
+    }
+
+    free(prev_flat);
+    free(curr_flat);
+
+    /* Replace snapshot */
+    md_a11y_node_free(ctx->last_snapshot);
+    ctx->last_snapshot = current;
+
+    pthread_mutex_unlock(&ctx->snapshot_mu);
+
+    if (dc == 0) {
+        free(deltas);
+        return NULL;
+    }
+
+    *delta_count = dc;
     return deltas;
 }
 
@@ -67,6 +222,8 @@ void md_a11y_destroy(MdA11yCtx *ctx) {
     if (!ctx) return;
     if (ctx->vtable && ctx->vtable->destroy)
         ctx->vtable->destroy(ctx);
+    md_a11y_node_free(ctx->last_snapshot);
+    pthread_mutex_destroy(&ctx->snapshot_mu);
     free(ctx);
 }
 
