@@ -23,6 +23,8 @@
  * followed by slow recovery, which is well-understood and robust.
  */
 #include "bitrate_ctrl.h"
+#include "log.h"
+#define MD_LOG_TAG "bitrate"
 
 #include <stdlib.h>
 #include <string.h>
@@ -51,13 +53,20 @@ static void apply_defaults(MdBitrateCtrlConfig *cfg) {
     if (cfg->increase_threshold == 0)
         cfg->increase_threshold = MD_BITRATE_CTRL_DEFAULT_INCREASE_THRESH;
 
-    /* Ensure sane thresholds */
-    if (cfg->rtt_low_ms >= cfg->rtt_high_ms)
+    /* Ensure sane thresholds. These correct *contradictory* caller-supplied
+     * values (not the 0=unset defaults above), so warn rather than silently
+     * rewriting them out from under the caller. */
+    if (cfg->rtt_low_ms >= cfg->rtt_high_ms) {
+        MD_LOG_W("rtt_low_ms (%u) >= rtt_high_ms (%u); clamping low to %u",
+                 cfg->rtt_low_ms, cfg->rtt_high_ms, cfg->rtt_high_ms / 2);
         cfg->rtt_low_ms = cfg->rtt_high_ms / 2;
+    }
 
-    /* Ensure decrease_pct is < 100 (otherwise it's not a decrease) */
-    if (cfg->decrease_pct >= 100)
+    /* decrease_pct must be < 100 or it is not a decrease. */
+    if (cfg->decrease_pct >= 100) {
+        MD_LOG_W("decrease_pct (%u) >= 100; clamping to 70", cfg->decrease_pct);
         cfg->decrease_pct = 70;
+    }
 }
 
 static uint32_t clamp(uint32_t val, uint32_t lo, uint32_t hi) {
@@ -82,8 +91,12 @@ MdBitrateCtrl *md_bitrate_ctrl_create(const MdBitrateCtrlConfig *cfg) {
         ctrl->cfg.min_bitrate = MD_BITRATE_CTRL_DEFAULT_MIN_BITRATE;
     if (ctrl->cfg.max_bitrate == 0)
         ctrl->cfg.max_bitrate = MD_BITRATE_CTRL_DEFAULT_MAX_BITRATE;
-    if (ctrl->cfg.min_bitrate >= ctrl->cfg.max_bitrate)
+    if (ctrl->cfg.min_bitrate >= ctrl->cfg.max_bitrate) {
+        MD_LOG_W("min_bitrate (%u) >= max_bitrate (%u); clamping min to %u",
+                 ctrl->cfg.min_bitrate, ctrl->cfg.max_bitrate,
+                 ctrl->cfg.max_bitrate / 2);
         ctrl->cfg.min_bitrate = ctrl->cfg.max_bitrate / 2;
+    }
 
     /* Initial bitrate */
     ctrl->current_bitrate = ctrl->cfg.initial_bitrate

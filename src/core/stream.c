@@ -8,9 +8,10 @@
  * Receive reads the header first, validates it, then reads the
  * payload in a loop until all bytes arrive (handles partial reads).
  *
- * Latency measurement: ping packets carry the send timestamp in
- * the header's timestamp_ms field. Pong echoes it back. RTT is
- * computed on pong receipt.
+ * Latency measurement: md_stream_send_ping() records its send time
+ * locally (ping_send_ms) and only one ping is tracked in flight; on
+ * pong receipt RTT = now - ping_send_ms, fed into an EMA. The pong's
+ * own header timestamp is not used (no cross-peer echo protocol).
  */
 #include "stream.h"
 
@@ -250,19 +251,26 @@ static SSL_CTX *tls_server_ctx_self_signed(void) {
         return NULL;
     }
 
-    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-    X509_gmtime_adj(X509_get_notBefore(cert), 0);
-    X509_gmtime_adj(X509_get_notAfter(cert), 86400L);
-    X509_set_pubkey(cert, pkey);
-
     X509_NAME *name = X509_get_subject_name(cert);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               (unsigned char *)"metadesk", -1, -1, 0);
-    X509_set_issuer_name(cert, name);
-    X509_sign(cert, pkey, EVP_sha256());
 
-    SSL_CTX_use_certificate(ctx, cert);
-    SSL_CTX_use_PrivateKey(ctx, pkey);
+    /* A failure anywhere here yields an unsigned or keyless cert that would
+     * make every TLS handshake fail with an opaque error; bail loudly. */
+    if (!ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) ||
+        !X509_gmtime_adj(X509_get_notBefore(cert), 0) ||
+        !X509_gmtime_adj(X509_get_notAfter(cert), 86400L) ||
+        !X509_set_pubkey(cert, pkey) ||
+        !X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                    (unsigned char *)"metadesk", -1, -1, 0) ||
+        !X509_set_issuer_name(cert, name) ||
+        !X509_sign(cert, pkey, EVP_sha256()) ||
+        SSL_CTX_use_certificate(ctx, cert) != 1 ||
+        SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+        MD_LOG_E("failed to build self-signed TLS certificate");
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
 
     X509_free(cert);
     EVP_PKEY_free(pkey);
@@ -631,8 +639,13 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
     uint8_t *payload = NULL;
     if (hdr->payload_len > 0) {
         payload = malloc(hdr->payload_len);
-        if (!payload)
+        if (!payload) {
+            /* The header is already consumed but payload_len bytes remain
+             * unread; we cannot resync, so tear the connection down rather
+             * than let the next recv read payload as a header. */
+            s->connected = false;
             return -1;
+        }
 
         ret = read_exact(s, payload, hdr->payload_len, timeout_ms);
         if (ret != 0) {

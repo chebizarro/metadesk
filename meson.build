@@ -577,7 +577,8 @@ if enable_nip46
 endif
 
 test_bitrate_ctrl = executable('test_bitrate_ctrl',
-  files('tests/test_bitrate_ctrl.c', 'src/core/bitrate_ctrl.c'),
+  files('tests/test_bitrate_ctrl.c', 'src/core/bitrate_ctrl.c',
+        'src/core/log.c'),
   include_directories : [core_inc],
 )
 test('bitrate controller AIMD', test_bitrate_ctrl)
