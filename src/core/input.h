@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "action.h"   /* MD_MAX_KEYS: a key combo is a list of action keys */
 
 /* Documented fallback used only when callers cannot provide/display-detect
  * dimensions. Callers should pass the capture/display size whenever possible. */
@@ -98,8 +99,9 @@ int md_input_scroll(MdInput *inp, int dx, int dy);
 
 /* ── Keyboard injection ──────────────────────────────────────── */
 
-/* Maximum keys in a combo (same constant as MdAction's MD_MAX_KEYS) */
-#define MD_INPUT_MAX_COMBO_KEYS 8
+/* A key combo is exactly a list of action keys — one constant, defined by
+ * MdAction, reused here rather than re-declared. */
+#define MD_INPUT_MAX_COMBO_KEYS MD_MAX_KEYS
 
 /* Inject a key combo, e.g. ["ctrl", "s"].
  * Keys are pressed in order, then released in reverse. */

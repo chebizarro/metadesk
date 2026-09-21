@@ -73,27 +73,25 @@ static inline int md_mem_unlock(void *ptr, size_t size) {
  *
  * Platform implementations:
  *   Windows:      SecureZeroMemory (compiler intrinsic)
- *   macOS:        memset_s (C11 Annex K, always available on Apple)
  *   glibc ≥2.25: explicit_bzero
- *   Fallback:     volatile function pointer trick
+ *   Everything else (incl. macOS): volatile function pointer trick
+ *
+ * The C11 Annex K memset_s branch was removed: it required
+ * __STDC_WANT_LIB_EXT1__ to have been defined before <string.h> was first
+ * included anywhere in the TU, which this header cannot guarantee, so it was
+ * dead in practice and fell through to the portable path below anyway.
  */
 static inline void md_secure_zero(void *ptr, size_t size) {
     if (!ptr || size == 0) return;
 
 #if defined(_WIN32)
     SecureZeroMemory(ptr, size);
-#elif defined(__APPLE__) && defined(__STDC_LIB_EXT1__)
-    /* memset_s available when __STDC_WANT_LIB_EXT1__ was set before
-     * <string.h> was first included.  Fragile in practice — fall through
-     * to the portable fallback when the macro wasn't early enough. */
-    memset_s(ptr, size, 0, size);
 #elif defined(__GLIBC__) && defined(__GLIBC_MINOR__) && \
       (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
     explicit_bzero(ptr, size);
 #else
-    /* Portable fallback: volatile function pointer prevents
-     * dead-store elimination by the compiler.  Works on all
-     * platforms including macOS when memset_s isn't declared. */
+    /* Portable fallback: a volatile function pointer prevents the compiler
+     * from eliminating the zeroing store. Works everywhere, macOS included. */
     static void *(*const volatile memset_func)(void *, int, size_t) = memset;
     memset_func(ptr, 0, size);
 #endif

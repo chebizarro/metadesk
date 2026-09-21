@@ -297,9 +297,13 @@ static cJSON *node_to_json(const MdA11yNode *node) {
     return obj;
 }
 
-static uint64_t now_ms(void) {
+/* Wall-clock milliseconds. This value is only ever serialized into the tree
+ * document's "ts" field, which is meant to be a real timestamp a consumer can
+ * interpret across processes and restarts — so it uses CLOCK_REALTIME, not the
+ * monotonic clock (whose epoch is arbitrary and would make "ts" meaningless). */
+static uint64_t now_wall_ms(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
@@ -310,7 +314,7 @@ char *md_a11y_to_json(const MdA11yNode *root) {
     if (!doc) return NULL;
 
     cJSON_AddNumberToObject(doc, "v", 1);
-    cJSON_AddNumberToObject(doc, "ts", (double)now_ms());
+    cJSON_AddNumberToObject(doc, "ts", (double)now_wall_ms());
     cJSON_AddItemToObject(doc, "root", node_to_json(root));
 
     char *str = cJSON_PrintUnformatted(doc);
@@ -532,7 +536,7 @@ char *md_a11y_to_compact(const MdA11yNode *root) {
     char *buf = malloc(buf_size);
     if (!buf) return NULL;
 
-    int written = snprintf(buf, buf_size, "v1 ts:%lu\n", (unsigned long)now_ms());
+    int written = snprintf(buf, buf_size, "v1 ts:%lu\n", (unsigned long)now_wall_ms());
     if (written < 0) { free(buf); return NULL; }
     written += compact_node(root, 0, buf + written, buf_size - (size_t)written);
 
@@ -743,7 +747,7 @@ char *md_a11y_tree_patch(const char *tree_json, const char *delta_json) {
 
     /* Update timestamp */
     cJSON_DeleteItemFromObject(doc, "ts");
-    cJSON_AddNumberToObject(doc, "ts", (double)now_ms());
+    cJSON_AddNumberToObject(doc, "ts", (double)now_wall_ms());
 
     char *result = cJSON_PrintUnformatted(doc);
     cJSON_Delete(deltas);

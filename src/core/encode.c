@@ -179,7 +179,7 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
     uint32_t w = enc->config.width;
     uint32_t h = enc->config.height;
     uint32_t fps = enc->config.fps ? enc->config.fps : MD_ENCODER_DEFAULT_FPS;
-    uint32_t br = enc->config.bitrate ? enc->config.bitrate : MD_ENCODER_DEFAULT_BITRATE;
+    uint32_t br = md_encoder_get_bitrate(enc);
 
     ctx->width     = (int)w;
     ctx->height    = (int)h;
