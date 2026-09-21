@@ -42,7 +42,7 @@ typedef struct {
     uint32_t height;
     uint32_t bitrate;       /* bits/sec, default 8_000_000 (8 Mbps)   */
     uint32_t fps;           /* frames/sec, default 60                  */
-    bool     prefer_nvenc;  /* true = try NVENC first, false = x264   */
+    bool     prefer_nvenc;  /* try NVENC first (see md_encoder_create)  */
 } MdEncoderConfig;
 
 /* Default encoder settings */
@@ -62,7 +62,12 @@ typedef struct {
 typedef void (*MdEncodeCallback)(const MdEncodedPacket *pkt, void *userdata);
 
 /* Create encoder with given config. Returns NULL on failure.
- * Tries NVENC if prefer_nvenc is set, falls back to libx264. */
+ *
+ * Codec selection cascades through the first that opens AND accepts the spec
+ * §9 low-latency options: [NVENC if prefer_nvenc] -> VideoToolbox -> AMF ->
+ * libx264. prefer_nvenc only controls whether NVENC is attempted first; the
+ * hardware backends for the current platform are always tried before the
+ * libx264 software fallback. md_encoder_is_hw() reports which kind was chosen. */
 MdEncoder *md_encoder_create(const MdEncoderConfig *cfg);
 
 /* Submit a raw frame for encoding.

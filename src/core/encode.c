@@ -18,6 +18,7 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include <libavutil/dict.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixfmt.h>
 #include <libyuv.h>
@@ -44,28 +45,6 @@ struct MdEncoder {
     MdEncodeCallback     cb;
     void                *cb_userdata;
 };
-
-/* ── FFmpeg option helpers ───────────────────────────────────── */
-
-static void warn_opt_failure(const char *codec_name, const char *opt_name, int ret) {
-    if (ret < 0) {
-        MD_LOG_W("warning: %s option '%s' failed: %d", codec_name ? codec_name : "encoder", opt_name, ret);
-    }
-}
-
-static int set_opt_warn(void *obj, const char *codec_name,
-                        const char *opt_name, const char *value, int flags) {
-    int ret = av_opt_set(obj, opt_name, value, flags);
-    warn_opt_failure(codec_name, opt_name, ret);
-    return ret;
-}
-
-static int set_opt_int_warn(void *obj, const char *codec_name,
-                            const char *opt_name, int64_t value, int flags) {
-    int ret = av_opt_set_int(obj, opt_name, value, flags);
-    warn_opt_failure(codec_name, opt_name, ret);
-    return ret;
-}
 
 /* ── Colorspace conversion helpers (libyuv) ──────────────────── */
 
@@ -190,52 +169,58 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
     ctx->gop_size  = 0;           /* intra-refresh instead of keyframes */
     ctx->max_b_frames = 0;        /* no B-frames for low latency        */
 
-    /* Codec-specific options */
+    /* Codec-specific low-latency options (spec §9). Collected into a dict and
+     * handed to avcodec_open2, which consumes the options it accepts. Anything
+     * still in the dict afterwards was REJECTED by this FFmpeg build's codec
+     * — which means the low-latency contract can't be honoured (e.g. NVENC
+     * would fall back to B-frames + lookahead). Rather than silently open a
+     * degraded encoder, we fail so the caller's cascade tries the next one. */
+    AVDictionary *opts = NULL;
     if (strcmp(codec_name, "h264_nvenc") == 0) {
-        /* NVENC: spec §9 parameters */
-        set_opt_warn(ctx->priv_data, codec_name, "preset",        "p1",  0);
-        set_opt_warn(ctx->priv_data, codec_name, "tune",          "ull", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "rc",            "cbr", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "zerolatency",   "1",   0);
-        set_opt_warn(ctx->priv_data, codec_name, "b_adapt",       "0",   0);
-        set_opt_int_warn(ctx->priv_data, codec_name, "intra-refresh", 1, 0);
-
-        /* Tell FFmpeg we're okay with delay=0 output */
+        av_dict_set(&opts, "preset",      "p1",  0);
+        av_dict_set(&opts, "tune",        "ull", 0);
+        av_dict_set(&opts, "rc",          "cbr", 0);
+        av_dict_set(&opts, "zerolatency", "1",   0);
+        av_dict_set(&opts, "b_adapt",     "0",   0);
+        av_dict_set_int(&opts, "intra-refresh", 1, 0);
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "h264_amf") == 0) {
-        /* AMF: spec §9 — AMD hardware encoder */
-        set_opt_warn(ctx->priv_data, codec_name, "usage",       "ultralowlatency", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "quality",     "speed", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "rc",          "cbr",  0);
-        set_opt_int_warn(ctx->priv_data, codec_name, "header_spacing", -1, 0); /* SPS/PPS with every IDR */
-
+        av_dict_set(&opts, "usage",   "ultralowlatency", 0);
+        av_dict_set(&opts, "quality", "speed",           0);
+        av_dict_set(&opts, "rc",      "cbr",             0);
+        av_dict_set_int(&opts, "header_spacing", -1, 0); /* SPS/PPS per IDR */
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "h264_videotoolbox") == 0) {
-        /* VideoToolbox: spec §9.2 parameters */
-        set_opt_warn(ctx->priv_data, codec_name, "realtime",    "true", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "allow_sw",    "0",    0);
-        set_opt_warn(ctx->priv_data, codec_name, "profile",     "high", 0);
-
+        av_dict_set(&opts, "realtime", "true", 0);
+        av_dict_set(&opts, "allow_sw", "0",    0);
+        av_dict_set(&opts, "profile",  "high", 0);
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "libx264") == 0) {
-        /* x264 software fallback: ultrafast + zerolatency */
-        set_opt_warn(ctx->priv_data, codec_name, "preset", "ultrafast", 0);
-        set_opt_warn(ctx->priv_data, codec_name, "tune",   "zerolatency", 0);
-
+        av_dict_set(&opts, "preset", "ultrafast",   0);
+        av_dict_set(&opts, "tune",   "zerolatency", 0);
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-        /* x264 needs gop_size > 0; use a large value with intra-refresh */
         ctx->gop_size = (int)fps * 2; /* keyframe every 2 seconds */
     }
 
     /* Threading: single-threaded for lowest latency */
     ctx->thread_count = 1;
 
-    int ret = avcodec_open2(ctx, codec, NULL);
+    int ret = avcodec_open2(ctx, codec, &opts);
     if (ret < 0) {
+        av_dict_free(&opts);
         avcodec_free_context(&ctx);
         return -1;
     }
+
+    if (av_dict_count(opts) > 0) {
+        const AVDictionaryEntry *e = NULL;
+        while ((e = av_dict_get(opts, "", e, AV_DICT_IGNORE_SUFFIX)))
+            MD_LOG_W("%s rejected low-latency option '%s'", codec_name, e->key);
+        av_dict_free(&opts);
+        avcodec_free_context(&ctx);
+        return -1;
+    }
+    av_dict_free(&opts);
 
     enc->codec = codec;
     enc->ctx   = ctx;
@@ -436,56 +421,26 @@ int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
 
     uint32_t br = clamp_bitrate(new_bitrate);
 
-    /* Codec-specific runtime reconfiguration. Apply private options before
-     * mutating public context/config state so failures are reported cleanly. */
-    const char *name = enc->codec ? enc->codec->name : "";
+    /* Runtime reconfiguration, codec-independent. bit_rate is the primary knob
+     * every FFmpeg H.264 encoder reads; rc_max_rate + rc_buffer_size pin the
+     * CBR envelope. The private "b" option is what NVENC/AMF re-read per frame;
+     * encoders that don't expose it return AVERROR_OPTION_NOT_FOUND, which is
+     * benign. Any other av_opt_set error means the change did NOT take effect,
+     * so report it (bitrate_ctrl's AIMD loop assumes its output is applied). */
+    enc->ctx->bit_rate       = (int64_t)br;
+    enc->ctx->rc_max_rate    = (int64_t)br;
+    enc->ctx->rc_buffer_size = (int)(br * 2);  /* ~2-second VBV buffer */
 
-    if (strcmp(name, "h264_nvenc") == 0) {
-        /*
-         * NVENC CBR: update the bitrate via av_opt_set on private data.
-         * The NVENC wrapper picks up the new rate on the next frame.
-         */
+    if (enc->ctx->priv_data) {
         char br_str[32];
         snprintf(br_str, sizeof(br_str), "%u", br);
-        int opt_ret = set_opt_warn(enc->ctx->priv_data, name, "b", br_str, 0);
-        if (opt_ret < 0)
+        int ret = av_opt_set(enc->ctx->priv_data, "b", br_str, 0);
+        if (ret < 0 && ret != AVERROR_OPTION_NOT_FOUND) {
+            MD_LOG_W("set_bitrate: av_opt_set(b=%s) failed: %d", br_str, ret);
             return -1;
-        /* Also update rc_max_rate for CBR consistency */
-        enc->ctx->rc_max_rate = (int64_t)br;
-
-    } else if (strcmp(name, "h264_videotoolbox") == 0) {
-        /*
-         * VideoToolbox: setting bit_rate on the context is sufficient;
-         * VT reads it before each frame encode.
-         */
-        enc->ctx->rc_max_rate = (int64_t)br;
-
-    } else if (strcmp(name, "h264_amf") == 0) {
-        /*
-         * AMF: update bitrate via av_opt_set on private data.
-         */
-        char br_str[32];
-        snprintf(br_str, sizeof(br_str), "%u", br);
-        int opt_ret = set_opt_warn(enc->ctx->priv_data, name, "b", br_str, 0);
-        if (opt_ret < 0)
-            return -1;
-        enc->ctx->rc_max_rate = (int64_t)br;
-
-    } else if (strcmp(name, "libx264") == 0) {
-        /*
-         * x264: the FFmpeg wrapper reads ctx->bit_rate before each
-         * avcodec_send_frame call when the internal reconfig flag is
-         * set. Setting bit_rate + rc_max_rate triggers x264_encoder_reconfig.
-         */
-        enc->ctx->rc_max_rate = (int64_t)br;
-        enc->ctx->rc_buffer_size = (int)(br * 2);  /* 2-second VBV buffer */
+        }
     }
 
-    /* Update the codec context's bit_rate — this is the primary knob
-     * that all FFmpeg H.264 encoders check. */
-    enc->ctx->bit_rate = (int64_t)br;
-
-    /* Update stored config */
     enc->config.bitrate = br;
     return 0;
 }
