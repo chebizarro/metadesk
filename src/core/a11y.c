@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <time.h>
 
 /* ── Public convenience API ──────────────────────────────────── */
@@ -72,14 +73,22 @@ static void flatten_tree(const MdA11yNode *node, FlatEntry **entries,
         flatten_tree(node->children[i], entries, count, capacity);
 }
 
+/* Order FlatEntry by id (NULLs first) so the diff can bsearch instead of
+ * linear-scanning — the two lookup loops below were O(n²) per change event on
+ * a whole-desktop tree. */
+static int flat_cmp(const void *a, const void *b) {
+    const FlatEntry *ea = a, *eb = b;
+    if (!ea->id) return eb->id ? -1 : 0;
+    if (!eb->id) return 1;
+    return strcmp(ea->id, eb->id);
+}
+
+/* Look up an id in a FlatEntry array that has been sorted with flat_cmp. */
 static const FlatEntry *find_by_id(const FlatEntry *entries, int count,
                                    const char *id) {
     if (!id) return NULL;
-    for (int i = 0; i < count; i++) {
-        if (entries[i].id && strcmp(entries[i].id, id) == 0)
-            return &entries[i];
-    }
-    return NULL;
+    FlatEntry key = { .id = id, .node = NULL };
+    return bsearch(&key, entries, (size_t)count, sizeof(FlatEntry), flat_cmp);
 }
 
 static bool nodes_differ(const MdA11yNode *a, const MdA11yNode *b) {
@@ -162,6 +171,10 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
 
     flatten_tree(prev, &prev_flat, &prev_count, &prev_cap);
     flatten_tree(current, &curr_flat, &curr_count, &curr_cap);
+
+    /* Sort both so find_by_id() can bsearch (O(n log n) total, not O(n²)). */
+    if (prev_flat) qsort(prev_flat, (size_t)prev_count, sizeof(FlatEntry), flat_cmp);
+    if (curr_flat) qsort(curr_flat, (size_t)curr_count, sizeof(FlatEntry), flat_cmp);
 
     int max_deltas = prev_count + curr_count;
     MdA11yDelta *deltas = calloc((size_t)(max_deltas > 0 ? max_deltas : 1),
@@ -443,12 +456,51 @@ static int has_state(const MdA11yNode *node, const char *state) {
     return 0;
 }
 
-/* Append state annotations. Returns chars written. */
-static int compact_states(const MdA11yNode *node, char *buf, size_t buf_len) {
-    size_t written = 0;
-    int n;
+/* ── Growable string builder ──────────────────────────────────
+ * The compact serializer used to write into a fixed 256 KB buffer and
+ * silently truncate anything larger (a self-labelled placeholder). It now
+ * appends into this buffer, which grows as needed. */
+typedef struct { char *buf; size_t len; size_t cap; bool oom; } StrBuf;
 
-    /* State annotations in priority order */
+static void sb_reserve(StrBuf *sb, size_t extra) {
+    if (sb->oom) return;
+    if (sb->buf && sb->len + extra + 1 <= sb->cap) return;
+    size_t newcap = sb->cap ? sb->cap : 4096;
+    while (newcap < sb->len + extra + 1) newcap *= 2;
+    char *nb = realloc(sb->buf, newcap);
+    if (!nb) { sb->oom = true; return; }
+    sb->buf = nb;
+    sb->cap = newcap;
+}
+
+/* Append a literal string (never treated as a format — labels may contain %). */
+static void sb_append(StrBuf *sb, const char *s) {
+    if (sb->oom || !s) return;
+    size_t n = strlen(s);
+    sb_reserve(sb, n);
+    if (sb->oom) return;
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = '\0';
+}
+
+static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    if (sb->oom) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) { sb->oom = true; return; }
+    sb_reserve(sb, (size_t)need);
+    if (sb->oom) return;
+    va_start(ap, fmt);
+    vsnprintf(sb->buf + sb->len, sb->cap - sb->len, fmt, ap);
+    va_end(ap);
+    sb->len += (size_t)need;
+}
+
+/* Append state annotations in priority order. */
+static void compact_states(const MdA11yNode *node, StrBuf *sb) {
     static const struct { const char *state; const char *fmt; } state_map[] = {
         { "focused",  " <focused>" },
         { "enabled",  " *enabled*" },
@@ -458,105 +510,56 @@ static int compact_states(const MdA11yNode *node, char *buf, size_t buf_len) {
         { "pressed",  " *pressed*" },
         { "expanded", " *expanded*" },
     };
-
-    for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++) {
-        if (has_state(node, state_map[i].state)) {
-            n = snprintf(buf + written, buf_len - written, "%s", state_map[i].fmt);
-            if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-        }
-    }
-    return (int)written;
+    for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++)
+        if (has_state(node, state_map[i].state))
+            sb_append(sb, state_map[i].fmt);
 }
 
 /*
  * Append a node in compact format. Applies interactable filtering:
- * non-interactable nodes are skipped but their children are still
- * walked (so interactive elements nested under panels still appear).
- *
- * Returns chars written.
+ * non-interactable nodes are skipped but their children are still walked
+ * (so interactive elements nested under panels still appear).
  */
-static int compact_node(const MdA11yNode *node, int depth, char *buf, size_t buf_len) {
-    if (!node || buf_len == 0) return 0;
-
-    size_t written = 0;
-    int n;
+static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb) {
+    if (!node) return;
     bool emit = is_interactable(node->role);
 
     if (emit) {
-        /* Indentation */
-        for (int i = 0; i < depth; i++) {
-            n = snprintf(buf + written, buf_len - written, "  ");
-            if (n < 0 || (size_t)n >= buf_len - written) return (int)written;
-            written += (size_t)n;
-        }
+        for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        const char *abbr = role_abbrev(node->role);
-        const char *id = node->id ? node->id : "?";
-        n = snprintf(buf + written, buf_len - written, "%s[%s]", abbr, id);
-        if (n < 0 || (size_t)n >= buf_len - written) return (int)written;
-        written += (size_t)n;
+        sb_appendf(sb, "%s[%s]", role_abbrev(node->role),
+                   node->id ? node->id : "?");
 
-        /* For text entries: <focused> before quoted content (spec §3.3.2) */
         if (is_text_role(node->role)) {
-            if (has_state(node, "focused")) {
-                n = snprintf(buf + written, buf_len - written, " <focused>");
-                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-            }
-            /* Quote text content with single quotes */
-            const char *label = node->label ? node->label : "";
-            n = snprintf(buf + written, buf_len - written, " '%s'", label);
-            if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-            /* Remaining states (exclude focused — already emitted) */
-            if (has_state(node, "enabled")) {
-                n = snprintf(buf + written, buf_len - written, " *enabled*");
-                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-            }
-            if (has_state(node, "disabled")) {
-                n = snprintf(buf + written, buf_len - written, " *disabled*");
-                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-            }
+            /* text entry: <focused> before quoted content (spec §3.3.2) */
+            if (has_state(node, "focused")) sb_append(sb, " <focused>");
+            sb_appendf(sb, " '%s'", node->label ? node->label : "");
+            if (has_state(node, "enabled"))  sb_append(sb, " *enabled*");
+            if (has_state(node, "disabled")) sb_append(sb, " *disabled*");
         } else {
-            /* Non-text: label then states */
             const char *label = node->label ? node->label : "";
-            if (label[0]) {
-                n = snprintf(buf + written, buf_len - written, " %s", label);
-                if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
-            }
-            written += (size_t)compact_states(node, buf + written, buf_len - written);
+            if (label[0]) sb_appendf(sb, " %s", label);
+            compact_states(node, sb);
         }
 
-        n = snprintf(buf + written, buf_len - written, "\n");
-        if (n > 0 && (size_t)n < buf_len - written) written += (size_t)n;
+        sb_append(sb, "\n");
     }
 
-    /* Always recurse children — interactables under skipped nodes still show.
-     * When a node is skipped, children inherit the parent's depth. */
     int child_depth = emit ? depth + 1 : depth;
-    for (int i = 0; i < node->child_count && node->children; i++) {
-        int child_written = compact_node(node->children[i], child_depth,
-                                         buf + written, buf_len - written);
-        written += (size_t)child_written;
-    }
-
-    return (int)written;
+    for (int i = 0; i < node->child_count && node->children; i++)
+        compact_node(node->children[i], child_depth, sb);
 }
 
 char *md_a11y_to_compact(const MdA11yNode *root) {
     if (!root) return NULL;
 
-    /* Allocate a generous buffer; real implementation would use dynamic sizing */
-    size_t buf_size = 256 * 1024;  /* 256 KB — enough for deep trees */
-    char *buf = malloc(buf_size);
-    if (!buf) return NULL;
+    StrBuf sb = { 0 };
+    sb_appendf(&sb, "v1 ts:%lu\n", (unsigned long)now_wall_ms());
+    compact_node(root, 0, &sb);
 
-    int written = snprintf(buf, buf_size, "v1 ts:%lu\n", (unsigned long)now_wall_ms());
-    if (written < 0) { free(buf); return NULL; }
-    written += compact_node(root, 0, buf + written, buf_size - (size_t)written);
-
-    /* Trim to actual size */
-    char *result = realloc(buf, (size_t)written + 1);
-    return result ? result : buf;
+    if (sb.oom) { free(sb.buf); return NULL; }
+    return sb.buf;  /* NUL-terminated; caller frees */
 }
 
 /* ── Delta serialization (spec §3.3.3) ─────────────────────── */
