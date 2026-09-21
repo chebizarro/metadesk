@@ -36,7 +36,8 @@ typedef struct MdSecrets MdSecrets;
  * connect_url: 1Password Connect server URL (e.g. "http://localhost:8080")
  * token: 1Password Connect bearer token (bootstrap secret)
  *
- * The token is copied into mlock'd memory and the original is zeroed.
+ * The token is copied into mlock'd memory. The caller's copy is NOT
+ * zeroed — the caller remains responsible for zeroing it.
  * Returns NULL on failure (invalid args, mlock failure).
  */
 MdSecrets *md_secrets_create(const char *connect_url, const char *token);

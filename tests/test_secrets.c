@@ -274,12 +274,12 @@ static void test_url_parsing(void) {
     if (!s3) { FAIL("IP address URL failed"); return; }
     md_secrets_destroy(s3);
 
-    /* HTTPS prefix is now rejected (TLS not implemented) */
+    /* HTTPS prefix is accepted (libcurl provides TLS) */
     MdSecrets *s4 = md_secrets_create("https://secrets.local:443", "tok");
-    if (s4) {
-        md_secrets_destroy(s4);
-        FAIL("https URL should have been rejected"); return;
+    if (!s4) {
+        FAIL("https URL should have been accepted"); return;
     }
+    md_secrets_destroy(s4);
 
     PASS();
 }

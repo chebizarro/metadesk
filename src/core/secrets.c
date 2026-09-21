@@ -2,15 +2,15 @@
  * metadesk — secrets.c
  * 1Password Connect REST API integration.
  *
- * Uses POSIX sockets for HTTP requests to the local 1Password Connect
- * server. No external HTTP library dependency — the Connect server is
- * always on localhost or LAN, so a simple HTTP/1.1 client suffices.
+ * HTTP is handled by libcurl (already a required dependency of the
+ * core library), which gives us TLS, chunked transfer encoding, and
+ * real status codes.
  *
  * Security measures:
  *   - Token stored in mlock'd memory (no swap)
  *   - All secret buffers zeroed on free
  *   - No secrets written to disk, logs, or env vars
- *   - Connection over localhost (no TLS needed for Phase 1)
+ *   - Plaintext HTTP is warned about outside loopback
  *
  * The op:// reference format is parsed as: op://vault/item/field
  * Vault lookup: GET /v1/vaults → find vault by name → get vault ID
@@ -21,27 +21,7 @@
 #include "platform.h"
 
 #include <cjson/cJSON.h>
-
-#ifdef _WIN32
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-#  pragma comment(lib, "ws2_32.lib")
-   typedef SOCKET sock_t;
-#  define SOCK_INVALID INVALID_SOCKET
-#  define sock_close(s) closesocket(s)
-#  define sock_read(s,b,n) recv((s),(b),(int)(n),0)
-#  define sock_write(s,b,n) send((s),(b),(int)(n),0)
-#else
-#  include <sys/socket.h>
-#  include <netinet/in.h>
-#  include <netdb.h>
-#  include <unistd.h>
-   typedef int sock_t;
-#  define SOCK_INVALID (-1)
-#  define sock_close(s) close(s)
-#  define sock_read(s,b,n) read((s),(b),(n))
-#  define sock_write(s,b,n) write((s),(b),(n))
-#endif
+#include <curl/curl.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +65,7 @@ static int parse_port(const char *p, const char *end, uint16_t *port_out) {
     return 0;
 }
 
-/* Parse "http://host:port" into host and port.
+/* Parse "http(s)://host:port" into host and port.
  * Returns 0 on success. host_out must be freed by caller. */
 static int parse_url(const char *url, char **host_out, uint16_t *port_out) {
     if (!url || !host_out || !port_out)
@@ -94,14 +74,10 @@ static int parse_url(const char *url, char **host_out, uint16_t *port_out) {
     *host_out = NULL;
     *port_out = 8080;  /* 1Password Connect default */
 
-    /* Skip "http://" — reject https:// since TLS is not implemented */
     const char *p = url;
-    if (strncmp(p, "https://", 8) == 0) {
-        fprintf(stderr, "secrets: TLS not implemented — use http:// "
-                "(1Password Connect should be on localhost)\n");
-        return -1;
-    }
-    if (strncmp(p, "http://", 7) == 0)
+    if (strncmp(p, "https://", 8) == 0)
+        p += 8;
+    else if (strncmp(p, "http://", 7) == 0)
         p += 7;
 
     const char *slash = strchr(p, '/');
@@ -253,135 +229,108 @@ static int parse_op_ref(const char *ref,
     return 0;
 }
 
-/* ── HTTP client ─────────────────────────────────────────────── */
+/* ── HTTP client (libcurl) ───────────────────────────────── */
+
+typedef struct {
+    char  *data;
+    size_t len;
+    size_t cap;
+} CurlBuf;
+
+static size_t curl_write_cb(char *ptr, size_t size, size_t nmemb,
+                            void *userdata) {
+    CurlBuf *buf = userdata;
+    size_t n = size * nmemb;
+
+    if (buf->len + n + 1 > MD_SECRETS_MAX_RESPONSE)
+        return 0;  /* overflow — aborts the transfer */
+    if (buf->len + n + 1 > buf->cap) {
+        size_t new_cap = buf->cap ? buf->cap : 16384;
+        while (new_cap < buf->len + n + 1)
+            new_cap *= 2;
+        char *nb = realloc(buf->data, new_cap);
+        if (!nb) return 0;
+        buf->data = nb;
+        buf->cap = new_cap;
+    }
+    memcpy(buf->data + buf->len, ptr, n);
+    buf->len += n;
+    buf->data[buf->len] = '\0';
+    return n;
+}
 
 /*
  * Perform an HTTP GET request and return the response body.
- * Caller must free the returned buffer.
- * Returns NULL on error. body_len is set to the response length.
+ * Caller must free the returned buffer. Returns NULL on error.
+ * body_len is set to the response length on success.
+ * status_out (optional) receives the HTTP status code, or 0 for a
+ * transport-level failure (DNS/connect/TLS), so callers can
+ * distinguish auth failures (401/403) from missing items (404).
  */
-static char *http_get(MdSecrets *s, const char *path, size_t *body_len) {
+static char *http_get(MdSecrets *s, const char *path, size_t *body_len,
+                      long *status_out) {
     if (!s || !path || !body_len)
         return NULL;
 
     *body_len = 0;
+    if (status_out) *status_out = 0;
 
-    /* Resolve host */
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", s->port);
-
-    if (getaddrinfo(s->host, port_str, &hints, &res) != 0)
+    char url[1024];
+    int url_len = snprintf(url, sizeof(url), "%s%s", s->connect_url, path);
+    if (url_len <= 0 || (size_t)url_len >= sizeof(url))
         return NULL;
 
-    sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd == SOCK_INVALID) {
-        freeaddrinfo(res);
+    char auth[MD_SECRETS_TOKEN_MAX + 32];
+    int auth_len = snprintf(auth, sizeof(auth), "Authorization: Bearer %.*s",
+                            (int)s->token_len, s->token);
+    if (auth_len <= 0 || (size_t)auth_len >= sizeof(auth))
         return NULL;
-    }
 
-    /* Set socket timeout */
-#ifdef _WIN32
-    DWORD timeout_ms = MD_SECRETS_TIMEOUT_MS;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-#else
-    struct timeval tv;
-    tv.tv_sec = MD_SECRETS_TIMEOUT_MS / 1000;
-    tv.tv_usec = (MD_SECRETS_TIMEOUT_MS % 1000) * 1000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
-
-    if (connect(fd, res->ai_addr, (int)res->ai_addrlen) < 0) {
-        sock_close(fd);
-        freeaddrinfo(res);
-        return NULL;
-    }
-    freeaddrinfo(res);
-
-    /* Build HTTP request */
-    char request[2048];
-    int req_len = snprintf(request, sizeof(request),
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s:%u\r\n"
-        "Authorization: Bearer %.*s\r\n"
-        "Accept: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path, s->host, s->port,
-        (int)s->token_len, s->token);
-
-    if (req_len <= 0 || (size_t)req_len >= sizeof(request)) {
-        close(fd);
+    CURL *c = curl_easy_init();
+    if (!c) {
+        md_secure_zero(auth, sizeof(auth));
         return NULL;
     }
 
-    /* Send request */
-    if (sock_write(fd, request, (size_t)req_len) != req_len) {
-        sock_close(fd);
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, auth);
+    hdrs = curl_slist_append(hdrs, "Accept: application/json");
+    md_secure_zero(auth, sizeof(auth));
+    if (!hdrs) {
+        curl_easy_cleanup(c);
         return NULL;
     }
 
-    /* Zero the request buffer (contained the token) */
-    md_secure_zero(request, sizeof(request));
+    CurlBuf buf = {0};
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)MD_SECRETS_TIMEOUT_MS);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
 
-    /* Read response */
-    char *response = calloc(1, MD_SECRETS_MAX_RESPONSE + 1);
-    if (!response) {
-        close(fd);
+    CURLcode rc = curl_easy_perform(c);
+
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    if (status_out) *status_out = status;
+
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK || status < 200 || status >= 300) {
+        if (buf.data) {
+            md_secure_zero(buf.data, buf.len);
+            free(buf.data);
+        }
         return NULL;
     }
 
-    size_t total = 0;
-    while (total < MD_SECRETS_MAX_RESPONSE) {
-        int n = (int)sock_read(fd, response + total,
-                               MD_SECRETS_MAX_RESPONSE - total);
-        if (n <= 0) break;
-        total += (size_t)n;
-    }
-    sock_close(fd);
-
-    if (total == 0) {
-        free(response);
+    if (!buf.data)
         return NULL;
-    }
 
-    /* Parse HTTP response — find body after \r\n\r\n */
-    char *body = strstr(response, "\r\n\r\n");
-    if (!body) {
-        free(response);
-        return NULL;
-    }
-    body += 4;
-
-    /* Check status code (first line: "HTTP/1.1 200 OK\r\n") */
-    if (strncmp(response, "HTTP/1.", 7) != 0) {
-        free(response);
-        return NULL;
-    }
-    int status = atoi(response + 9);  /* skip "HTTP/1.x " */
-    if (status < 200 || status >= 300) {
-        free(response);
-        return NULL;
-    }
-
-    /* Copy body to new buffer */
-    size_t body_size = total - (size_t)(body - response);
-    char *result = calloc(1, body_size + 1);
-    if (!result) {
-        free(response);
-        return NULL;
-    }
-    memcpy(result, body, body_size);
-    *body_len = body_size;
-
-    free(response);
-    return result;
+    *body_len = buf.len;
+    return buf.data;
 }
 
 /* ── Vault and item resolution ───────────────────────────────── */
@@ -389,8 +338,17 @@ static char *http_get(MdSecrets *s, const char *path, size_t *body_len) {
 /* Find vault ID by name. Returns malloced string or NULL. */
 static char *find_vault_id(MdSecrets *s, const char *vault_name) {
     size_t body_len;
-    char *body = http_get(s, "/v1/vaults", &body_len);
-    if (!body) return NULL;
+    long status;
+    char *body = http_get(s, "/v1/vaults", &body_len, &status);
+    if (!body) {
+        if (status == 401 || status == 403)
+            fprintf(stderr, "secrets: Connect auth failed (HTTP %ld) — check token\n",
+                    status);
+        else if (status == 0)
+            fprintf(stderr, "secrets: Connect server unreachable at %s\n",
+                    s->connect_url);
+        return NULL;
+    }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -436,7 +394,8 @@ static char *find_item_id(MdSecrets *s, const char *vault_id,
         return NULL;
 
     size_t body_len;
-    char *body = http_get(s, path, &body_len);
+    long status;
+    char *body = http_get(s, path, &body_len, &status);
     if (!body) return NULL;
 
     cJSON *root = cJSON_Parse(body);
@@ -475,7 +434,8 @@ static char *get_field_value(MdSecrets *s, const char *vault_id,
         return NULL;
 
     size_t body_len;
-    char *body = http_get(s, path, &body_len);
+    long status;
+    char *body = http_get(s, path, &body_len, &status);
     if (!body) return NULL;
 
     cJSON *root = cJSON_Parse(body);
@@ -560,7 +520,8 @@ MdSecrets *md_secrets_create(const char *connect_url, const char *token) {
         return NULL;
     }
 
-    if (!is_loopback_host(s->host)) {
+    if (!is_loopback_host(s->host) &&
+        strncmp(connect_url, "http://", 7) == 0) {
         fprintf(stderr,
                 "secrets: WARNING — 1Password Connect URL '%s' is non-loopback HTTP; "
                 "bearer token and secrets may traverse the network in plaintext\n",
@@ -652,7 +613,8 @@ bool md_secrets_is_connected(MdSecrets *s) {
 
     /* GET /v1/activity — lightweight health check */
     size_t body_len;
-    char *body = http_get(s, "/v1/activity", &body_len);
+    long status;
+    char *body = http_get(s, "/v1/activity", &body_len, &status);
     if (!body) return false;
     free(body);
     return true;
