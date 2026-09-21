@@ -34,6 +34,9 @@ struct MdRenderer {
     float         hidpi_scale_y;
     bool          open;          /* false after window close event  */
     bool          sdl_inited;    /* true if we called SDL_Init      */
+
+    MdSdlEventCallback event_cb; /* receives every SDL event first    */
+    void              *event_userdata;
 };
 
 /* ── Internal helpers ────────────────────────────────────────── */
@@ -163,6 +166,10 @@ int md_renderer_poll_events(MdRenderer *r) {
 
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        /* Give the overlay first sight of every event (single pump) */
+        if (r->event_cb)
+            r->event_cb(&event, r->event_userdata);
+
         switch (event.type) {
         case SDL_QUIT:
             r->open = false;
@@ -203,6 +210,13 @@ int md_renderer_get_window_size(const MdRenderer *r, uint32_t *w, uint32_t *h) {
     *w = r->win_width;
     *h = r->win_height;
     return 0;
+}
+
+void md_renderer_set_event_callback(MdRenderer *r, MdSdlEventCallback cb,
+                                        void *userdata) {
+    if (!r) return;
+    r->event_cb = cb;
+    r->event_userdata = userdata;
 }
 
 void md_renderer_update_hidpi_scale(MdRenderer *r) {

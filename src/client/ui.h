@@ -47,8 +47,13 @@ typedef struct {
 MdOverlay *md_overlay_create(void *sdl_window, void *sdl_renderer);
 
 /* Begin a new overlay frame. Call before md_overlay_render().
- * Processes ImGui's share of SDL events internally. */
+ * SDL events arrive via md_overlay_handle_sdl_event() from the
+ * renderer's single event pump. */
 void md_overlay_new_frame(MdOverlay *o);
+
+/* Handle one SDL event (fed by the renderer's event pump).
+ * `event` is an SDL_Event*. Handles ImGui input + the F1 toggle. */
+void md_overlay_handle_sdl_event(MdOverlay *o, void *event);
 
 /* Render the overlay with current stats.
  * Call between md_overlay_new_frame() and the SDL_RenderPresent(). */

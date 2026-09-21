@@ -50,6 +50,14 @@ void *md_renderer_get_sdl_renderer(MdRenderer *r);
 /* Check if window is still open. */
 bool md_renderer_is_open(const MdRenderer *r);
 
+/* Register a callback invoked for every SDL event during
+ * md_renderer_poll_events(), before the renderer's own handling.
+ * `event` is an SDL_Event* (opaque here to keep SDL out of the header).
+ * Used by the ImGui overlay so a single event pump serves both. */
+typedef void (*MdSdlEventCallback)(void *event, void *userdata);
+void md_renderer_set_event_callback(MdRenderer *r, MdSdlEventCallback cb,
+                                    void *userdata);
+
 /* Recompute HiDPI scale factors (output pixels vs window points).
  * Called automatically on create and window resize; may also be called
  * manually after display changes. */

@@ -96,24 +96,25 @@ MdOverlay *md_overlay_create(void *sdl_window, void *sdl_renderer) {
 void md_overlay_new_frame(MdOverlay *o) {
     if (!o) return;
 
-    /* Process SDL events for ImGui */
-    SDL_Event event;
-    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT,
-                          SDL_FIRSTEVENT, SDL_LASTEVENT) > 0) {
-        ImGui_ImplSDL2_ProcessEvent(&event);
-
-        /* Check for F1 toggle */
-        if (event.type == SDL_KEYDOWN &&
-            event.key.keysym.sym == SDLK_F1 &&
-            !event.key.repeat) {
-            o->visible = !o->visible;
-        }
-    }
-
-    /* Start new ImGui frame */
+    /* Events arrive via md_overlay_handle_sdl_event() from the
+     * renderer's single pump — no second consumer of the SDL queue. */
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
+}
+
+void md_overlay_handle_sdl_event(MdOverlay *o, void *event) {
+    if (!o || !event) return;
+
+    SDL_Event *ev = static_cast<SDL_Event *>(event);
+    ImGui_ImplSDL2_ProcessEvent(ev);
+
+    /* F1 toggles overlay visibility */
+    if (ev->type == SDL_KEYDOWN &&
+        ev->key.keysym.sym == SDLK_F1 &&
+        !ev->key.repeat) {
+        o->visible = !o->visible;
+    }
 }
 
 void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {

@@ -335,6 +335,11 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     return stream;
 }
 
+/* Forward SDL events from the renderer's pump to the ImGui overlay. */
+static void overlay_event_forward(void *event, void *userdata) {
+    md_overlay_handle_sdl_event((MdOverlay *)userdata, event);
+}
+
 static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
                                   uint32_t stats_start_ms) {
     if (!ctx || !ctx->overlay)
@@ -605,6 +610,11 @@ int main(int argc, char **argv) {
                 md_renderer_get_sdl_renderer(ctx.renderer));
             if (!ctx.overlay) {
                 fprintf(stderr, "WARNING: ImGui overlay unavailable\n");
+            } else {
+                /* Single event pump: renderer forwards every event here */
+                md_renderer_set_event_callback(ctx.renderer,
+                                               overlay_event_forward,
+                                               ctx.overlay);
             }
         }
     }
