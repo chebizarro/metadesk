@@ -111,61 +111,6 @@ char *md_session_log_build_content(MdSessionLogEventType type,
     return json;
 }
 
-/* ── Build unsigned Nostr event JSON for signing ─────────────── */
-
-static char *build_unsigned_event_json(const char *pubkey_hex,
-                                       const char *content,
-                                       const char *session_id,
-                                       const char *peer_pubkey,
-                                       int64_t timestamp) {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return NULL;
-
-    cJSON_AddNumberToObject(root, "kind", MD_SESSION_LOG_KIND);
-    cJSON_AddStringToObject(root, "content", content ? content : "");
-    cJSON_AddStringToObject(root, "pubkey", pubkey_hex ? pubkey_hex : "");
-    cJSON_AddNumberToObject(root, "created_at", (double)timestamp);
-
-    /* Build tags array */
-    cJSON *tags = cJSON_CreateArray();
-    if (tags) {
-        /* ["d", "metadesk-session-log"] — not an addressable event but
-         * useful for filtering */
-        cJSON *d_tag = cJSON_CreateArray();
-        if (d_tag) {
-            cJSON_AddItemToArray(d_tag, cJSON_CreateString("d"));
-            cJSON_AddItemToArray(d_tag, cJSON_CreateString("metadesk-session-log"));
-            cJSON_AddItemToArray(tags, d_tag);
-        }
-
-        /* ["p", peer_pubkey] if available */
-        if (peer_pubkey && peer_pubkey[0]) {
-            cJSON *p_tag = cJSON_CreateArray();
-            if (p_tag) {
-                cJSON_AddItemToArray(p_tag, cJSON_CreateString("p"));
-                cJSON_AddItemToArray(p_tag, cJSON_CreateString(peer_pubkey));
-                cJSON_AddItemToArray(tags, p_tag);
-            }
-        }
-
-        /* ["session", session_id] if available */
-        if (session_id && session_id[0]) {
-            cJSON *s_tag = cJSON_CreateArray();
-            if (s_tag) {
-                cJSON_AddItemToArray(s_tag, cJSON_CreateString("session"));
-                cJSON_AddItemToArray(s_tag, cJSON_CreateString(session_id));
-                cJSON_AddItemToArray(tags, s_tag);
-            }
-        }
-
-        cJSON_AddItemToObject(root, "tags", tags);
-    }
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return json;
-}
-
 /* ── Logging ─────────────────────────────────────────────────── */
 
 int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
@@ -205,14 +150,34 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
         sign_status = -1;
         char *pk_hex = NULL;
         if (md_signer_get_pubkey(log->signer, &pk_hex) == MD_SIGNER_OK && pk_hex) {
-            char *unsigned_json = build_unsigned_event_json(
-                pk_hex, content, session_id, peer_pubkey, ts);
-            if (unsigned_json) {
-                int sret = md_signer_sign_event(log->signer, unsigned_json, &signed_json);
-                if (sret == MD_SIGNER_OK && signed_json)
+            /* Build the event with the shared Nostr builders; the
+             * ["t", topic] tag is the standard filterable topic marker
+             * (a "d" tag only has meaning on addressable kinds). */
+            NostrEvent *ev = nostr_event_new();
+            NostrTags *tags = ev ? nostr_tags_new(0) : NULL;
+            if (ev && tags) {
+                nostr_event_set_kind(ev, MD_SESSION_LOG_KIND);
+                nostr_event_set_content(ev, content);
+                nostr_event_set_pubkey(ev, pk_hex);
+                nostr_event_set_created_at(ev, ts);
+                nostr_tags_append(tags,
+                    nostr_tag_new("t", "metadesk-session-log", NULL));
+                if (peer_pubkey && peer_pubkey[0])
+                    nostr_tags_append(tags,
+                        nostr_tag_new("p", peer_pubkey, NULL));
+                if (session_id && session_id[0])
+                    nostr_tags_append(tags,
+                        nostr_tag_new("session", session_id, NULL));
+                nostr_event_set_tags(ev, tags); /* takes ownership */
+
+                if (md_nostr_sign_event_json(log->signer, ev,
+                                             &signed_json) == 0 &&
+                    signed_json)
                     sign_status = 0;
-                free(unsigned_json);
+            } else {
+                if (tags) nostr_tags_free(tags);
             }
+            if (ev) nostr_event_free(ev);
             free(pk_hex);
         }
         if (sign_status != 0) {

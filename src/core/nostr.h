@@ -184,6 +184,15 @@ int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
 /* ── Generic event publishing ─────────────────────────────── */
 
 /*
+ * Sign an event through the signer abstraction and return the signed
+ * event JSON. Universal signing path shared by all event builders
+ * (DM seals, allowlists, session log entries).
+ * Returns 0 on success (caller frees *out_json), -1 on error.
+ */
+int md_nostr_sign_event_json(MdSigner *signer, NostrEvent *ev,
+                             char **out_json);
+
+/*
  * Publish an already-signed event (JSON string) to all connected relays.
  * The JSON must contain a valid signed Nostr event with id, pubkey, sig.
  * Returns 0 on success, -1 on error.

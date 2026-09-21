@@ -656,8 +656,23 @@ static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev) {
     return signed_ev;
 }
 
-/* ── Session signaling (NIP-17 gift-wrapped DMs) ──────────────
- *
+/* ── Session signaling (NIP-17 gift-wrapped DMs) ────────────── */
+
+int md_nostr_sign_event_json(MdSigner *signer, NostrEvent *ev,
+                             char **out_json) {
+    if (!signer || !ev || !out_json)
+        return -1;
+
+    NostrEvent *signed_ev = sign_event_via_signer(signer, ev);
+    if (!signed_ev)
+        return -1;
+
+    *out_json = nostr_event_serialize(signed_ev);
+    nostr_event_free(signed_ev);
+    return *out_json ? 0 : -1;
+}
+
+/*
  * NIP-17 three-layer encryption:
  *   1. Rumor (kind:14) — unsigned message with session JSON
  *   2. Seal (kind:13) — NIP-44 encrypted rumor, signed by sender
