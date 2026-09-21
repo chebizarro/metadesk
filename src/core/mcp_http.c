@@ -50,20 +50,17 @@ struct MdMcpHttp {
     GoWaitGroup     handler_wg;
 };
 
-/* ── Thread-local response capture ───────────────────────────
- * handle_message() calls write_fn synchronously on the calling
- * thread, so TLS gives us per-request response isolation without
- * shared mutable state. A request may write more than once (for
- * example a response plus an immediate notification), so capture all
- * writes and return a JSON array when multiple messages are emitted. */
+/* ── Per-request response capture ─────────────────────────────
+ * A POST's response is captured through a per-request sink passed to
+ * md_mcp_server_handle_message_with_sink(). A request may write more
+ * than once (a response plus an immediate notification), so capture
+ * all writes and return a JSON array when multiple are emitted. */
 typedef struct {
     char  **items;
     size_t  count;
     size_t  cap;
     bool    failed;
 } HttpResponseCapture;
-
-static _Thread_local HttpResponseCapture *tls_capture = NULL;
 
 static int capture_append(HttpResponseCapture *cap, const char *json, size_t len)
 {
@@ -134,17 +131,20 @@ static void capture_free(HttpResponseCapture *cap)
     memset(cap, 0, sizeof(*cap));
 }
 
+/* Per-request response sink used by the POST handler. */
+static int http_capture_write(const char *json, size_t len, void *userdata)
+{
+    return capture_append((HttpResponseCapture *)userdata, json, len);
+}
+
+/* Server write_fn — the out-of-band notification channel only.
+ * Request responses never pass through here (they use the per-request
+ * capture sink), so everything on this channel is a server-initiated
+ * notification for SSE subscribers. */
 static int http_write_fn(const char *json, size_t len, void *userdata)
 {
     MdMcpHttp *h = (MdMcpHttp *)userdata;
     if (!h || !json) return -1;
-
-    /* Inside a POST dispatch the write is that request's response —
-     * capturing it for the HTTP reply, NOT broadcasting it to every
-     * SSE client. Only server-initiated notifications (outside any
-     * dispatch) go to SSE subscribers. */
-    if (tls_capture)
-        return capture_append(tls_capture, json, len);
 
     if (md_mcp_http_send_sse(h, "message", json, len) < 0)
         return -1;
@@ -419,12 +419,12 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             send_http_response(client_fd, 400, "Bad Request",
                                "text/plain", "Empty body\n", 11);
         } else {
-            /* Dispatch to MCP server — write_fn captures this request's
-             * synchronous response(s) through thread-local storage. */
+            /* Dispatch to MCP server with a per-request capture sink —
+             * this request's response(s) come back through it. */
             HttpResponseCapture capture = {0};
-            tls_capture = &capture;
-            md_mcp_server_handle_message(h->mcp_server, req.body, req.body_len);
-            tls_capture = NULL;
+            md_mcp_server_handle_message_with_sink(h->mcp_server,
+                                                   req.body, req.body_len,
+                                                   http_capture_write, &capture);
 
             char *resp = capture_take_body(&capture);
             bool capture_failed = capture.failed;

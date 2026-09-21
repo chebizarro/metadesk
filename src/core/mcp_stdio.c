@@ -130,7 +130,9 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
 
             /* Skip empty lines */
             if (line_len > 0) {
-                md_mcp_server_handle_message(ctx->server, start, line_len);
+                md_mcp_server_handle_message_with_sink(ctx->server,
+                                                       start, line_len,
+                                                       stdio_write, ctx);
             }
 
             start = newline + 1;

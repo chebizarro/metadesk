@@ -31,6 +31,12 @@ struct MdMcpServer {
     _Atomic int      init_state;
     pthread_mutex_t  sub_mu;   /* protects subscriptions only */
     pthread_mutex_t  tool_mu;  /* serializes tool handlers with shared state */
+    pthread_mutex_t  dispatch_mu; /* serializes request dispatch */
+
+    /* Per-request response sink (set only while dispatching under
+     * dispatch_mu). When active, responses go here instead of write_fn. */
+    MdMcpWriteFn     active_sink;
+    void            *active_sink_ud;
 
     /* Registered tools */
     MdMcpTool        tools[MD_MCP_MAX_TOOLS];
@@ -50,7 +56,9 @@ struct MdMcpServer {
 static int send_json(MdMcpServer *s, char *json)
 {
     if (!json) return -1;
-    int rc = s->write_fn(json, strlen(json), s->write_userdata);
+    MdMcpWriteFn fn = s->active_sink ? s->active_sink : s->write_fn;
+    void *ud = s->active_sink ? s->active_sink_ud : s->write_userdata;
+    int rc = fn(json, strlen(json), ud);
     free(json);
     return rc;
 }
@@ -341,12 +349,40 @@ static int handle_resources_unsubscribe(MdMcpServer *s, const MdJsonRpcId *id,
 
 /* ── Main dispatch ───────────────────────────────────────────── */
 
-int md_mcp_server_handle_message(MdMcpServer *server,
-                                 const char *json, size_t len)
+static int dispatch_message(MdMcpServer *server,
+                            const char *json, size_t len);
+
+int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
+                                           const char *json, size_t len,
+                                           MdMcpWriteFn sink, void *sink_ud)
 {
     if (!server || !json || len == 0)
         return -1;
 
+    pthread_mutex_lock(&server->dispatch_mu);
+    server->active_sink = sink;
+    server->active_sink_ud = sink_ud;
+
+    int rc = dispatch_message(server, json, len);
+
+    server->active_sink = NULL;
+    server->active_sink_ud = NULL;
+    pthread_mutex_unlock(&server->dispatch_mu);
+    return rc;
+}
+
+int md_mcp_server_handle_message(MdMcpServer *server,
+                                 const char *json, size_t len)
+{
+    return md_mcp_server_handle_message_with_sink(server, json, len,
+                                                  NULL, NULL);
+}
+
+/* Shared dispatch body — caller holds dispatch_mu and has set any
+ * per-request sink. */
+static int dispatch_message(MdMcpServer *server,
+                            const char *json, size_t len)
+{
     MdJsonRpcRequest req;
     if (md_jsonrpc_parse_request(&req, json, len) != 0) {
         /* Can't parse — send parse error with null id */
@@ -461,6 +497,7 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
     pthread_mutex_init(&s->sub_mu, NULL);
     pthread_mutex_init(&s->tool_mu, NULL);
+    pthread_mutex_init(&s->dispatch_mu, NULL);
 
     return s;
 }
@@ -481,6 +518,7 @@ void md_mcp_server_destroy(MdMcpServer *server)
 
     pthread_mutex_destroy(&server->tool_mu);
     pthread_mutex_destroy(&server->sub_mu);
+    pthread_mutex_destroy(&server->dispatch_mu);
     free(server->server_name);
     free(server->server_version);
     free(server);

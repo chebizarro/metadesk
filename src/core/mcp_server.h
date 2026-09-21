@@ -101,10 +101,22 @@ int md_mcp_server_register_resource(MdMcpServer *server, const MdMcpResource *re
 /* ── Message handling ────────────────────────────────────────── */
 
 /* Handle an incoming JSON message from the transport.
- * Parses, dispatches, and sends the response via write_fn.
+ * Parses, dispatches, and sends the response via the server's write_fn
+ * (the out-of-band notification channel).
  * Returns 0 on success, -1 on error. */
 int md_mcp_server_handle_message(MdMcpServer *server,
                                  const char *json, size_t len);
+
+/* Handle an incoming JSON message with a per-request response sink.
+ * Responses produced by this dispatch go to `sink` instead of the
+ * server's write_fn; server-initiated notifications continue to use
+ * write_fn. This is the correct channel for request/response transports
+ * (HTTP) — no thread-local routing, no mutable global.
+ * Dispatch is serialized across concurrent callers.
+ * Returns 0 on success, -1 on error. */
+int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
+                                           const char *json, size_t len,
+                                           MdMcpWriteFn sink, void *sink_ud);
 
 /* ── Notifications ───────────────────────────────────────────── */
 
