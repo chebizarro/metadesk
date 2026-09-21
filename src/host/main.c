@@ -825,6 +825,10 @@ int main(int argc, char **argv) {
             .settle_ms = 100,
             .stdio_in_fd = mcp_stdio ? STDIN_FILENO : -1,
             .stdio_out_fd = mcp_stdio ? STDOUT_FILENO : -1,
+            .http_port = mcp_http
+                ? (mcp_http_port > 0 ? (uint16_t)mcp_http_port
+                                     : (uint16_t)MD_MCP_HTTP_DEFAULT_PORT)
+                : 0,
         };
 
         MdMcpBridge *mcp_bridge = md_mcp_bridge_create(&mcp_cfg);
@@ -833,38 +837,14 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        int mcp_rc = 0;
-
         if (mcp_http) {
-            /* HTTP+SSE transport */
-            MdMcpHttpConfig http_cfg = {
-                .server = md_mcp_bridge_get_server(mcp_bridge),
-                .port = mcp_http_port,
-            };
-            MdMcpHttp *http = md_mcp_http_create(&http_cfg);
-            if (!http) {
-                fprintf(stderr, "ERROR: failed to create MCP HTTP server\n");
-                md_mcp_bridge_destroy(mcp_bridge);
-                return 1;
-            }
-            if (md_mcp_server_set_write_fn(md_mcp_bridge_get_server(mcp_bridge),
-                                           md_mcp_http_get_write_fn(http),
-                                           md_mcp_http_get_write_userdata(http)) != 0) {
-                fprintf(stderr, "ERROR: failed to bind MCP HTTP transport\n");
-                md_mcp_http_destroy(http);
-                md_mcp_bridge_destroy(mcp_bridge);
-                return 1;
-            }
             uint16_t actual_port = mcp_http_port > 0
                                    ? mcp_http_port
                                    : MD_MCP_HTTP_DEFAULT_PORT;
             printf("host[mcp]: HTTP+SSE listening on port %u\n", actual_port);
-            mcp_rc = md_mcp_http_run(http);
-            md_mcp_http_destroy(http);
-        } else {
-            /* stdio transport (blocking — exits on EOF or shutdown) */
-            mcp_rc = md_mcp_bridge_run(mcp_bridge);
         }
+
+        int mcp_rc = md_mcp_bridge_run(mcp_bridge);
 
         md_mcp_bridge_destroy(mcp_bridge);
 

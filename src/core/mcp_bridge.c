@@ -17,6 +17,7 @@ struct MdMcpBridge {
     MdAgent           *agent;
     MdMcpServer       *server;
     MdMcpStdio        *stdio_ctx;
+    MdMcpHttp         *http_ctx;
 
     /* Contexts for tool/resource handlers (must outlive server) */
     MdMcpToolCtx       tool_ctx;
@@ -115,7 +116,24 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
             goto fail;
     }
 
-    /* 8. Activate session */
+    /* 8. Create HTTP+SSE transport if requested */
+    if (config->http_port > 0) {
+        MdMcpHttpConfig http_cfg = {
+            .server = b->server,
+            .bind_addr = config->http_bind_addr,
+            .port = config->http_port,
+        };
+        b->http_ctx = md_mcp_http_create(&http_cfg);
+        if (!b->http_ctx)
+            goto fail;
+        /* HTTP responses use per-request sinks; the server write_fn is
+         * the notification (SSE) channel. */
+        md_mcp_server_set_write_fn(b->server,
+                                   md_mcp_http_get_write_fn(b->http_ctx),
+                                   md_mcp_http_get_write_userdata(b->http_ctx));
+    }
+
+    /* 9. Activate session */
     md_session_activate(&b->session);
 
     return b;
@@ -130,9 +148,10 @@ int md_mcp_bridge_run(MdMcpBridge *bridge)
 {
     if (!bridge) return -1;
 
-    if (bridge->stdio_ctx) {
+    if (bridge->stdio_ctx)
         return md_mcp_stdio_run(bridge->stdio_ctx);
-    }
+    if (bridge->http_ctx)
+        return md_mcp_http_run(bridge->http_ctx);
 
     /* No transport configured */
     return -1;
@@ -143,6 +162,8 @@ void md_mcp_bridge_shutdown(MdMcpBridge *bridge)
     if (!bridge) return;
     if (bridge->stdio_ctx)
         md_mcp_stdio_shutdown(bridge->stdio_ctx);
+    if (bridge->http_ctx)
+        md_mcp_http_shutdown(bridge->http_ctx);
 }
 
 MdSessionState md_mcp_bridge_get_state(const MdMcpBridge *bridge)
@@ -163,6 +184,8 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
 
     if (bridge->stdio_ctx)
         md_mcp_stdio_destroy(bridge->stdio_ctx);
+    if (bridge->http_ctx)
+        md_mcp_http_destroy(bridge->http_ctx);
 
     /* Free heap-allocated per-tool handler contexts before destroying server */
     md_mcp_tools_cleanup(&bridge->tool_ctx);

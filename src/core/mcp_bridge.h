@@ -13,6 +13,7 @@
 #include "mcp_tools.h"
 #include "mcp_resources.h"
 #include "mcp_stdio.h"
+#include "mcp_http.h"
 #include "agent.h"
 #include "a11y.h"
 #include "input.h"
@@ -41,6 +42,8 @@ typedef struct {
     /* Transport: use one of these */
     int           stdio_in_fd;    /* stdio transport: read fd (-1 to skip) */
     int           stdio_out_fd;   /* stdio transport: write fd             */
+    uint16_t      http_port;      /* HTTP+SSE transport (0 to skip)        */
+    const char   *http_bind_addr; /* NULL for localhost only               */
 } MdMcpBridgeConfig;
 
 /* Create the full MCP bridge: MdSession + MdAgent + MdMcpServer +
