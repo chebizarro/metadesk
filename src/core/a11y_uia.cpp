@@ -158,6 +158,31 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
 
     node->id = make_node_id(st);
 
+    /* Prefer the platform's stable element identity over DFS position.
+     * UIA RuntimeId survives across walks; the DFS counter does not. */
+    {
+        SAFEARRAY *rid = nullptr;
+        if (SUCCEEDED(elem->GetRuntimeId(&rid)) && rid) {
+            LONG lb = 0, ub = -1;
+            SafeArrayGetLBound(rid, 1, &lb);
+            SafeArrayGetUBound(rid, 1, &ub);
+            char buf[256];
+            size_t off = 0;
+            for (LONG i = lb; i <= ub && off < sizeof(buf) - 12; i++) {
+                int v = 0;
+                if (SUCCEEDED(SafeArrayGetElement(rid, &i, &v)))
+                    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                            "%s%x", i == lb ? "u:" : ".",
+                                            (unsigned)v);
+            }
+            SafeArrayDestroy(rid);
+            if (off > 2) {
+                free(node->id);
+                node->id = _strdup(buf);
+            }
+        }
+    }
+
     /* Role (ControlType) */
     CONTROLTYPEID ctid = 0;
     elem->get_CurrentControlType(&ctid);
@@ -287,7 +312,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
         return -1;
     }
 
-    root->id = make_node_id(st);
+    root->id = _strdup("desktop");
     root->role = _strdup("desktop");
     root->label = _strdup("Desktop");
 

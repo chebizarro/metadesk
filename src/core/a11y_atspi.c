@@ -110,6 +110,20 @@ static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,
 
     node->id = make_node_id(st);
 
+    /* Prefer the toolkit-provided accessible id over DFS position —
+     * it survives across walks where the DFS counter does not. */
+    {
+        gchar *acc_id = atspi_accessible_get_accessible_id(acc, &error);
+        if (error) { g_error_free(error); error = NULL; }
+        if (acc_id) {
+            if (*acc_id) {
+                free(node->id);
+                node->id = g_strdup_printf("a:%s", acc_id);
+            }
+            g_free(acc_id);
+        }
+    }
+
     /* Role */
     gchar *role_name = atspi_accessible_get_role_name(acc, &error);
     if (role_name) {
@@ -318,7 +332,7 @@ static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
 
     st->next_id = 0;
 
-    root->id = make_node_id(st);
+    root->id = strdup("desktop");
     root->role = strdup("desktop");
     root->label = strdup("Desktop");
 

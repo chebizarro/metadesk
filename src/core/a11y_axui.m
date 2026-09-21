@@ -176,6 +176,20 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
 
     node->id = make_node_id(st);
 
+    /* Prefer a stable element identity over DFS position. AXUIElement
+     * has no public stable id; CFHash combined with the owning pid is
+     * the closest available and survives across walks for live elements. */
+    {
+        pid_t pid = 0;
+        if (AXUIElementGetPid(elem, &pid) == kAXErrorSuccess) {
+            char idbuf[64];
+            snprintf(idbuf, sizeof(idbuf), "ax%ld:%lx",
+                     (long)pid, (unsigned long)CFHash(elem));
+            free(node->id);
+            node->id = strdup(idbuf);
+        }
+    }
+
     /* Batch-request all scalar attributes in one IPC call.
      * Indices: 0=Role, 1=Title, 2=Description, 3=Value,
      *          4=Enabled, 5=Focused, 6=Selected, 7=Position, 8=Size */
@@ -589,7 +603,7 @@ static int axui_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     MdA11yNode *root = calloc(1, sizeof(MdA11yNode));
     if (!root) return -1;
 
-    root->id = make_node_id(st);
+    root->id = strdup("desktop");
     root->role = strdup("desktop");
     root->label = strdup("Desktop");
 
