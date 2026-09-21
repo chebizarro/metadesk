@@ -214,7 +214,15 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
     HRESULT hr = walker->GetFirstChildElement(elem, &child);
     if (SUCCEEDED(hr) && child) {
         /* Count and collect children */
-        MdA11yNode *children[MD_UIA_MAX_CHILDREN];
+        /* Heap-allocated: with recursion depth MD_UIA_MAX_DEPTH the
+         * stack copies would total ~64 KB. */
+        MdA11yNode **children =
+            (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
+        if (!children) {
+            SAFE_RELEASE(child);
+            md_a11y_node_free(node);
+            return nullptr;
+        }
         int childCount = 0;
 
         while (child && childCount < MD_UIA_MAX_CHILDREN) {
@@ -227,6 +235,8 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
             child->Release();
             child = (SUCCEEDED(hr)) ? next : nullptr;
         }
+        /* Exiting on the child cap leaves `child` held */
+        SAFE_RELEASE(child);
 
         if (childCount > 0) {
             node->children = (MdA11yNode **)calloc((size_t)childCount, sizeof(MdA11yNode *));
@@ -238,6 +248,7 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
                     md_a11y_node_free(children[i]);
             }
         }
+        free(children);
     }
 
     return node;
@@ -324,7 +335,14 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     rootElem->Release();
 
     if (SUCCEEDED(hr) && child) {
-        MdA11yNode *children[MD_UIA_MAX_CHILDREN];
+        MdA11yNode **children =
+            (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
+        if (!children) {
+            SAFE_RELEASE(child);
+            md_a11y_node_free(root);
+            *out_root = nullptr;
+            return -1;
+        }
         int childCount = 0;
 
         while (child && childCount < MD_UIA_MAX_CHILDREN) {
@@ -337,6 +355,8 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
             child->Release();
             child = (SUCCEEDED(hr)) ? next : nullptr;
         }
+        /* Exiting on the child cap leaves `child` held */
+        SAFE_RELEASE(child);
 
         if (childCount > 0) {
             root->children = (MdA11yNode **)calloc((size_t)childCount, sizeof(MdA11yNode *));
@@ -348,6 +368,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
                     md_a11y_node_free(children[i]);
             }
         }
+        free(children);
     }
 
     *out_root = root;

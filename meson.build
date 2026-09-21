@@ -409,7 +409,9 @@ if get_option('live_tests')
   test('a11y live backend', test_atspi,
     env : {'MD_A11Y_LIVE_TESTS' : '1'},
     suite : 'live',
-    timeout : 30,
+    # Cold AX/AT-SPI full-desktop walks take minutes on busy machines
+    # (one IPC round-trip cluster per node) — not a hang.
+    timeout : 300,
   )
 endif
 

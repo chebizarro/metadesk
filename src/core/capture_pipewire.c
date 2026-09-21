@@ -87,39 +87,32 @@ static void munge_sender(const char *name, char *out, size_t out_sz) {
     out[j] = '\0';
 }
 
-/* ── D-Bus a{sv} dict helpers ────────────────────────────────── */
+/* ── D-Bus a{sv} dict helpers ───────────────────────────────── */
 
-static void dict_append_sv_string(DBusMessageIter *dict,
-                                  const char *key, const char *val) {
+static void dict_append_sv(DBusMessageIter *dict, const char *key,
+                           int type, const char *sig, const void *val) {
     DBusMessageIter entry, variant;
     dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
     dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
-    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, sig, &variant);
+    dbus_message_iter_append_basic(&variant, type, val);
     dbus_message_iter_close_container(&entry, &variant);
     dbus_message_iter_close_container(dict, &entry);
+}
+
+static void dict_append_sv_string(DBusMessageIter *dict,
+                                  const char *key, const char *val) {
+    dict_append_sv(dict, key, DBUS_TYPE_STRING, "s", &val);
 }
 
 static void dict_append_sv_uint32(DBusMessageIter *dict,
                                   const char *key, uint32_t val) {
-    DBusMessageIter entry, variant;
-    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "u", &variant);
-    dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &val);
-    dbus_message_iter_close_container(&entry, &variant);
-    dbus_message_iter_close_container(dict, &entry);
+    dict_append_sv(dict, key, DBUS_TYPE_UINT32, "u", &val);
 }
 
 static void dict_append_sv_bool(DBusMessageIter *dict,
-                                const char *key, dbus_bool_t val) {
-    DBusMessageIter entry, variant;
-    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
-    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &val);
-    dbus_message_iter_close_container(&entry, &variant);
-    dbus_message_iter_close_container(dict, &entry);
+                                 const char *key, dbus_bool_t val) {
+    dict_append_sv(dict, key, DBUS_TYPE_BOOLEAN, "b", &val);
 }
 
 /* Look up a string value in an a{sv} dict iter positioned at the array */

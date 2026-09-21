@@ -61,7 +61,7 @@ typedef struct {
     pthread_t          event_thread;
     int                event_thread_started;
     CFRunLoopRef       event_run_loop;
-    int                stop_requested;
+    int                stop_requested;   /* set before CFRunLoopRun races */
     MdA11yChangeCb     change_cb;
     void              *change_userdata;
     int                subscribed;
@@ -533,6 +533,12 @@ static void *axui_event_loop_thread(void *data) {
         CFRetain(run_loop);
 
         pthread_mutex_lock(&st->lock);
+        if (st->stop_requested) {
+            /* destroy() won the race — it never saw our run loop */
+            pthread_mutex_unlock(&st->lock);
+            CFRelease(run_loop);
+            return NULL;
+        }
         st->event_run_loop = run_loop;
         for (size_t i = 0; i < st->observer_count; i++) {
             if (st->observers[i].source) {
@@ -542,16 +548,9 @@ static void *axui_event_loop_thread(void *data) {
         }
         pthread_mutex_unlock(&st->lock);
 
-        for (;;) {
-            pthread_mutex_lock(&st->lock);
-            int stop = st->stop_requested;
-            pthread_mutex_unlock(&st->lock);
-            if (stop) break;
-
-            @autoreleasepool {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, true);
-            }
-        }
+        /* Event-driven: axui_destroy stops this via CFRunLoopStop —
+         * no polling wake-up needed. */
+        CFRunLoopRun();
 
         pthread_mutex_lock(&st->lock);
         for (size_t i = 0; i < st->observer_count; i++) {
@@ -572,13 +571,12 @@ static void *axui_event_loop_thread(void *data) {
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int axui_init(MdA11yCtx *ctx) {
-    /* Check accessibility permission */
-    NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
-    Boolean trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-    if (!trusted) {
-        MD_LOG_I("accessibility permission not granted.\nPlease enable in System Settings > Privacy & Security > Accessibility.");
-        /* Don't fail — permission may be granted while we're running.
-         * get_tree will return empty results until granted. */
+    /* Fail fast when accessibility permission is missing: without trust,
+     * every AX IPC call blocks for its ~6 s timeout, so a walk of the
+     * desktop would grind for minutes instead of failing. */
+    if (!AXIsProcessTrusted()) {
+        MD_LOG_E("accessibility permission not granted — enable this app in System Settings > Privacy & Security > Accessibility");
+        return -1;
     }
 
     AXUIState *st = calloc(1, sizeof(AXUIState));
@@ -708,13 +706,13 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     st->observer_count = record_count;
     st->change_cb = cb;
     st->change_userdata = userdata;
-    st->stop_requested = 0;
 
     /* Seed the diff baseline so the first notification emits real deltas
      * rather than being consumed as the initial snapshot. The diff engine
      * lives in a11y.c and takes the snapshot mutex, so seed after
      * releasing the backend lock. */
     st->subscribed = 1;
+    st->stop_requested = 0;  /* thread handshake starts clear */
     pthread_mutex_unlock(&st->lock);
     {
         int seeded = 0;
@@ -759,6 +757,9 @@ static void axui_destroy(MdA11yCtx *ctx) {
     st->subscribed = 0;
     st->change_cb = NULL;
     st->change_userdata = NULL;
+    /* Order matters: stop_requested is set under the same lock the
+     * thread uses to publish its run loop, so the stop can never be
+     * lost to a thread that has not started running yet. */
     st->stop_requested = 1;
     if (st->event_run_loop) {
         run_loop = st->event_run_loop;

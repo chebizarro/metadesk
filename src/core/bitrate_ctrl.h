@@ -66,6 +66,11 @@ typedef struct {
 #define MD_BITRATE_CTRL_DEFAULT_DECREASE_PCT  70
 #define MD_BITRATE_CTRL_DEFAULT_INCREASE_PCT  10
 #define MD_BITRATE_CTRL_DEFAULT_COOLDOWN_MS  1000
+/* Bitrate bounds mirror the encoder's, so the controller's clamp and
+ * the encoder's clamp provably agree. */
+#include "encode.h"
+#define MD_BITRATE_CTRL_DEFAULT_MIN_BITRATE  MD_ENCODER_MIN_BITRATE
+#define MD_BITRATE_CTRL_DEFAULT_MAX_BITRATE  MD_ENCODER_DEFAULT_BITRATE
 #define MD_BITRATE_CTRL_DEFAULT_INCREASE_THRESH 3
 
 /* ── Controller state ────────────────────────────────────────── */

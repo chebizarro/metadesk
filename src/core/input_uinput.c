@@ -34,17 +34,19 @@ typedef struct {
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
-static void emit(int fd, uint16_t type, uint16_t code, int32_t value) {
+static int emit(int fd, uint16_t type, uint16_t code, int32_t value) {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.type  = type;
     ev.code  = code;
     ev.value = value;
-    if (write(fd, &ev, sizeof(ev)) < 0) { /* ignore */ }
+    if (write(fd, &ev, sizeof(ev)) != sizeof(ev))
+        return -1;
+    return 0;
 }
 
-static void syn(int fd) {
-    emit(fd, EV_SYN, SYN_REPORT, 0);
+static int syn(int fd) {
+    return emit(fd, EV_SYN, SYN_REPORT, 0);
 }
 
 static void uinput_delay(void) {
@@ -57,7 +59,7 @@ static void uinput_delay(void) {
 static int create_keyboard(void) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
-        MD_LOG_I("cannot open /dev/uinput: %s", strerror(errno));
+        MD_LOG_E("cannot open /dev/uinput: %s", strerror(errno));
         return -1;
     }
 
@@ -176,19 +178,23 @@ static int uinput_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
     ctx->backend_data = st;
     ctx->ready = (st->kbd_fd >= 0 || st->mouse_fd >= 0);
 
-    if (!ctx->ready)
-        MD_LOG_E("ERROR — no virtual devices created. Check /dev/uinput permissions.");
+    if (!ctx->ready) {
+        MD_LOG_E("no virtual devices created — check /dev/uinput permissions");
+        uinput_destroy(ctx);
+        return -1;
+    }
 
-    return 0; /* return success even if not ready — caller checks is_ready */
+    return 0;
 }
 
 static int uinput_mouse_move(MdInputCtx *ctx, int x, int y) {
     UinputState *st = ctx->backend_data;
     if (!st || st->mouse_fd < 0) return -1;
 
-    emit(st->mouse_fd, EV_ABS, ABS_X, x);
-    emit(st->mouse_fd, EV_ABS, ABS_Y, y);
-    syn(st->mouse_fd);
+    if (emit(st->mouse_fd, EV_ABS, ABS_X, x) < 0 ||
+        emit(st->mouse_fd, EV_ABS, ABS_Y, y) < 0 ||
+        syn(st->mouse_fd) < 0)
+        return -1;
     return 0;
 }
 
@@ -204,8 +210,9 @@ static int uinput_mouse_button(MdInputCtx *ctx, int button, int pressed) {
     default: return -1;
     }
 
-    emit(st->mouse_fd, EV_KEY, btn, pressed ? 1 : 0);
-    syn(st->mouse_fd);
+    if (emit(st->mouse_fd, EV_KEY, btn, pressed ? 1 : 0) < 0 ||
+        syn(st->mouse_fd) < 0)
+        return -1;
     return 0;
 }
 
@@ -213,9 +220,12 @@ static int uinput_mouse_scroll(MdInputCtx *ctx, int dx, int dy) {
     UinputState *st = ctx->backend_data;
     if (!st || st->mouse_fd < 0) return -1;
 
-    if (dy != 0) emit(st->mouse_fd, EV_REL, REL_WHEEL, dy);
-    if (dx != 0) emit(st->mouse_fd, EV_REL, REL_HWHEEL, dx);
-    syn(st->mouse_fd);
+    if (dy != 0 && emit(st->mouse_fd, EV_REL, REL_WHEEL, dy) < 0)
+        return -1;
+    if (dx != 0 && emit(st->mouse_fd, EV_REL, REL_HWHEEL, dx) < 0)
+        return -1;
+    if (syn(st->mouse_fd) < 0)
+        return -1;
     return 0;
 }
 
@@ -224,8 +234,9 @@ static int uinput_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
     if (!st || st->kbd_fd < 0) return -1;
 
     /* keysym values in our system are Linux KEY_* codes directly */
-    emit(st->kbd_fd, EV_KEY, (uint16_t)keysym, pressed ? 1 : 0);
-    syn(st->kbd_fd);
+    if (emit(st->kbd_fd, EV_KEY, (uint16_t)keysym, pressed ? 1 : 0) < 0 ||
+        syn(st->kbd_fd) < 0)
+        return -1;
     return 0;
 }
 
@@ -299,19 +310,23 @@ static int uinput_type_text(MdInputCtx *ctx, const char *utf8) {
         if (sym == 0) continue;
 
         if (need_shift) {
-            emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 1);
-            syn(st->kbd_fd);
+            if (emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 1) < 0 ||
+                syn(st->kbd_fd) < 0)
+                return -1;
         }
 
-        emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 1);
-        syn(st->kbd_fd);
+        if (emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 1) < 0 ||
+            syn(st->kbd_fd) < 0)
+            return -1;
         uinput_delay();
-        emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 0);
-        syn(st->kbd_fd);
+        if (emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 0) < 0 ||
+            syn(st->kbd_fd) < 0)
+            return -1;
 
         if (need_shift) {
-            emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 0);
-            syn(st->kbd_fd);
+            if (emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 0) < 0 ||
+                syn(st->kbd_fd) < 0)
+                return -1;
         }
     }
 

@@ -79,9 +79,9 @@ MdBitrateCtrl *md_bitrate_ctrl_create(const MdBitrateCtrlConfig *cfg) {
 
     /* Ensure min < max */
     if (ctrl->cfg.min_bitrate == 0)
-        ctrl->cfg.min_bitrate = 100000;  /* 100 Kbps */
+        ctrl->cfg.min_bitrate = MD_BITRATE_CTRL_DEFAULT_MIN_BITRATE;
     if (ctrl->cfg.max_bitrate == 0)
-        ctrl->cfg.max_bitrate = 8000000; /* 8 Mbps */
+        ctrl->cfg.max_bitrate = MD_BITRATE_CTRL_DEFAULT_MAX_BITRATE;
     if (ctrl->cfg.min_bitrate >= ctrl->cfg.max_bitrate)
         ctrl->cfg.min_bitrate = ctrl->cfg.max_bitrate / 2;
 

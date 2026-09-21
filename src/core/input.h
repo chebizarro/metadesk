@@ -98,7 +98,7 @@ int md_input_scroll(MdInput *inp, int dx, int dy);
 
 /* ── Keyboard injection ──────────────────────────────────────── */
 
-/* Maximum keys in a combo */
+/* Maximum keys in a combo (same constant as MdAction's MD_MAX_KEYS) */
 #define MD_INPUT_MAX_COMBO_KEYS 8
 
 /* Inject a key combo, e.g. ["ctrl", "s"].
