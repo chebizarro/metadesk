@@ -6,6 +6,7 @@
  * verifies responses come back correctly over the pipe.
  */
 #include "mcp_server.h"
+#include "md_mcp_fixture.h"
 #include "mcp_tools.h"
 #include "mcp_stdio.h"
 #include "jsonrpc.h"
@@ -131,7 +132,7 @@ static void test_stdio_init_and_ping(void)
 
     /* Send initialize */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
-                     "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
+                     "\"id\":1,\"params\":{\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\","
                      "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}");
 
     char *resp = harness_recv(h);

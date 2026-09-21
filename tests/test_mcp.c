@@ -3,6 +3,7 @@
  * Unit tests for MCP server core.
  */
 #include "mcp_server.h"
+#include "md_mcp_fixture.h"
 #include "mcp_tools.h"
 #include "mcp_resources.h"
 #include "mcp_bridge.h"
@@ -99,16 +100,11 @@ static MdMcpServer *make_server(void)
     return md_mcp_server_create(&cfg);
 }
 
+#define MD_TEST_MCP_PROTOCOL "2025-03-26"
+
 static void do_init(MdMcpServer *s)
 {
-    const char *init = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
-                       "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
-                       "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
-    md_mcp_server_handle_message(s, init, strlen(init));
-
-    const char *initialized = "{\"jsonrpc\":\"2.0\","
-                              "\"method\":\"notifications/initialized\"}";
-    md_mcp_server_handle_message(s, initialized, strlen(initialized));
+    md_test_mcp_handshake(s);
 }
 
 /* ── Tests ───────────────────────────────────────────────────── */
@@ -130,7 +126,7 @@ static void test_initialize(void)
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     assert(result != NULL);
     assert(strcmp(cJSON_GetObjectItem(result, "protocolVersion")->valuestring,
-                 "2025-03-26") == 0);
+                 MD_TEST_MCP_PROTOCOL) == 0);
 
     cJSON *info = cJSON_GetObjectItem(result, "serverInfo");
     assert(strcmp(cJSON_GetObjectItem(info, "name")->valuestring,

@@ -11,6 +11,7 @@
 #include "input.h"
 #include "session.h"
 #include "mcp_server.h"
+#include "md_mcp_fixture.h"
 #include "mcp_tools.h"
 #include <cjson/cJSON.h>
 
@@ -95,13 +96,7 @@ static MdMcpServer *make_agent_mcp_server(MdMcpToolCtx *tool_ctx) {
     assert(server != NULL);
     assert(md_mcp_register_tools(server, tool_ctx) == 0);
 
-    const char *init = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
-                       "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
-                       "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
-    md_mcp_server_handle_message(server, init, strlen(init));
-    const char *initialized = "{\"jsonrpc\":\"2.0\","
-                              "\"method\":\"notifications/initialized\"}";
-    md_mcp_server_handle_message(server, initialized, strlen(initialized));
+    md_test_mcp_handshake(server);
     clear_agent_mcp_response();
     return server;
 }

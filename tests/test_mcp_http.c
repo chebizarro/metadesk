@@ -6,6 +6,7 @@
  * TCP client, and shutdown behavior.
  */
 #include "mcp_server.h"
+#include "md_mcp_fixture.h"
 #include "mcp_http.h"
 #include "jsonrpc.h"
 
@@ -214,7 +215,7 @@ static void test_post_initialize(void)
     pthread_create(&tid, NULL, server_thread, &sa);
 
     const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
-                       "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
+                       "\"id\":1,\"params\":{\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\","
                        "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
 
     char request[2048];
@@ -232,7 +233,7 @@ static void test_post_initialize(void)
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
     assert(strstr(response, "\"result\"") != NULL);
-    assert(strstr(response, "\"protocolVersion\":\"2025-03-26\"") != NULL);
+    assert(strstr(response, "\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\"") != NULL);
 
     /* Shutdown */
     md_mcp_http_shutdown(http);
