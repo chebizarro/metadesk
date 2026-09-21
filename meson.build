@@ -600,39 +600,41 @@ if enable_nip46
   test('NIP-46 signer integration', test_signer_nip46)
 endif
 
-# ── STUN tests (no libnice needed — raw RFC 5389) ────────────────────────────
-test_stun = executable('test_stun',
-  files('tests/test_stun.c', 'src/fips-nat/stun.c'),
-  include_directories : [include_directories('src/fips-nat')],
-)
-test('STUN binding discovery', test_stun)
+# ── fips-nat tests (deprecated daemon — only when -Dfips_nat=true) ────────────
+if enable_fipsnat
+  test_stun = executable('test_stun',
+    files('tests/test_stun.c', 'src/fips-nat/stun.c'),
+    include_directories : [include_directories('src/fips-nat')],
+  )
+  test('STUN binding discovery', test_stun)
 
-test_punch = executable('test_punch',
-  files('tests/test_punch.c', 'src/fips-nat/punch.c', 'src/fips-nat/stun.c'),
-  include_directories : [include_directories('src/fips-nat')],
-)
-test('UDP hole punch', test_punch, timeout : 10)
+  test_punch = executable('test_punch',
+    files('tests/test_punch.c', 'src/fips-nat/punch.c', 'src/fips-nat/stun.c'),
+    include_directories : [include_directories('src/fips-nat')],
+  )
+  test('UDP hole punch', test_punch, timeout : 10)
 
-test_publish = executable('test_publish',
-  files('tests/test_publish.c', 'src/fips-nat/publish.c', 'src/fips-nat/stun.c'),
-  include_directories : [core_inc, include_directories('src/fips-nat')],
-  dependencies : [dep_metadesk],
-)
-test('NAT endpoint publication', test_publish)
+  test_publish = executable('test_publish',
+    files('tests/test_publish.c', 'src/fips-nat/publish.c', 'src/fips-nat/stun.c'),
+    include_directories : [core_inc, include_directories('src/fips-nat')],
+    dependencies : [dep_metadesk],
+  )
+  test('NAT endpoint publication', test_publish)
 
-test_fipsnat_ipc = executable('test_fipsnat_ipc',
-  files('tests/test_fipsnat_ipc.c', 'src/fips-nat/fipsnat_ipc.c',
-        'src/fips-nat/stun.c'),
-  include_directories : [core_inc, include_directories('src/fips-nat')],
-  dependencies : [dep_metadesk],
-)
-test('fips-nat IPC protocol', test_fipsnat_ipc)
+  test_fipsnat_ipc = executable('test_fipsnat_ipc',
+    files('tests/test_fipsnat_ipc.c', 'src/fips-nat/fipsnat_ipc.c',
+          'src/fips-nat/stun.c'),
+    include_directories : [core_inc, include_directories('src/fips-nat')],
+    dependencies : [dep_metadesk],
+  )
+  test('fips-nat IPC protocol', test_fipsnat_ipc)
 
-test_turn = executable('test_turn',
-  files('tests/test_turn.c', 'src/fips-nat/turn.c', 'src/fips-nat/stun.c'),
-  include_directories : [include_directories('src/fips-nat')],
-)
-test('TURN relay client', test_turn)
+  test_turn = executable('test_turn',
+    files('tests/test_turn.c', 'src/fips-nat/turn.c', 'src/fips-nat/stun.c'),
+    include_directories : [include_directories('src/fips-nat')],
+  )
+  test('TURN relay client', test_turn)
+endif
 
 test_bitrate_ctrl = executable('test_bitrate_ctrl',
   files('tests/test_bitrate_ctrl.c', 'src/core/bitrate_ctrl.c'),

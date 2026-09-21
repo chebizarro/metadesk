@@ -346,7 +346,7 @@ int main(int argc, char **argv) {
     MdNostr *nostr = NULL;
     if (signer && !no_publish) {
         if (relay_count == 0) {
-            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_urls[0] = MD_DEFAULT_RELAY;
             relay_count = 1;
         }
 

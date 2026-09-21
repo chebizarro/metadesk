@@ -132,7 +132,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
-    fprintf(stderr, "  --relay URL        Relay URL (default: wss://relay.sharegap.net)\n");
+    fprintf(stderr, "  --relay URL        Relay URL (default: " MD_DEFAULT_RELAY ")\n");
     fprintf(stderr, "  -h, --help         Show this help\n");
 }
 
@@ -538,7 +538,7 @@ int main(int argc, char **argv) {
 
         /* Default relay if none specified */
         if (relay_count == 0) {
-            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_urls[0] = MD_DEFAULT_RELAY;
             relay_count = 1;
         }
 

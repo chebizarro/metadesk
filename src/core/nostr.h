@@ -39,6 +39,11 @@
 extern "C" {
 #endif
 
+/* Default signaling relay used by host/client/fips-nat when no
+ * --relay option is given. Single definition to keep the three
+ * binaries in step. */
+#define MD_DEFAULT_RELAY "wss://relay.sharegap.net"
+
 /* ── Metadesk Nostr context ──────────────────────────────────
  * Wraps a nostrc relay pool + keypair + live subscriptions
  * for metadesk session operations.

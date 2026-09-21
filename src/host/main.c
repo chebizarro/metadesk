@@ -341,7 +341,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer    Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer    Auto-detect local signer (NIP-5F, NIP-55L)\n");
-    fprintf(stderr, "  --relay URL      Relay URL (default: wss://relay.sharegap.net)\n");
+    fprintf(stderr, "  --relay URL      Relay URL (default: " MD_DEFAULT_RELAY ")\n");
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
@@ -609,7 +609,7 @@ int main(int argc, char **argv) {
     MdNostr *nostr = NULL;
     if (signer) {
         if (relay_count == 0) {
-            relay_urls[0] = "wss://relay.sharegap.net";
+            relay_urls[0] = MD_DEFAULT_RELAY;
             relay_count = 1;
         }
 
