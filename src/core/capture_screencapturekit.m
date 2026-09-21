@@ -47,6 +47,12 @@ typedef struct {
     void                   *held_sample_buf;   /* CMSampleBufferRef */
     void                   *held_pixel_buf;    /* CVPixelBufferRef (locked) */
 
+    /* True while the consumer holds a frame handed out by get_frame.
+     * The producer must not overwrite held_* in that state — the old
+     * buffer would leak and the consumer's release_frame would release
+     * the new one (the PipeWire backend already guards this). */
+    bool                    frame_checked_out;
+
     /* Sequence counter */
     atomic_uint_least32_t   seq;
 
@@ -135,6 +141,14 @@ API_AVAILABLE(macos(12.3))
     ctx->height = h;
 
     pthread_mutex_lock(&sck->frame_lock);
+
+    if (sck->frame_checked_out) {
+        /* Consumer still holds the previous frame — drop this one
+         * instead of corrupting the buffer it is reading. */
+        pthread_mutex_unlock(&sck->frame_lock);
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return;
+    }
 
     /* If a previous frame is pending (consumer too slow), release it */
     if (sck->frame_ready && sck->held_pixel_buf) {
@@ -307,6 +321,7 @@ static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
 
     *out = sck->pending_frame;
     sck->frame_ready = false;
+    sck->frame_checked_out = true;
     pthread_mutex_unlock(&sck->frame_lock);
     return 0;
 }
@@ -326,6 +341,7 @@ static void sck_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {
         CFRelease(sck->held_sample_buf);
         sck->held_sample_buf = NULL;
     }
+    sck->frame_checked_out = false;
     pthread_mutex_unlock(&sck->frame_lock);
 }
 

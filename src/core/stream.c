@@ -102,12 +102,24 @@ static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
 
 /* Read exactly n bytes, handling partial reads.
  * Uses SSL_read when TLS is active, raw read() otherwise.
+ * timeout_ms is a deadline for the whole read, not a per-syscall
+ * budget — a peer dribbling bytes cannot extend it.
  * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
 static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) {
     size_t total = 0;
     int fd = s->fd;
+    const uint32_t deadline = timeout_ms > 0
+        ? md_stream_now_ms() + timeout_ms : 0;
 
     while (total < n) {
+        int wait_ms = -1;
+        if (deadline) {
+            uint32_t now = md_stream_now_ms();
+            if (now >= deadline)
+                return 1;   /* timeout */
+            wait_ms = (int)(deadline - now);
+        }
+
         /* For TLS streams, check SSL_pending before polling.
          * OpenSSL may have buffered data internally. */
         if (s->ssl && SSL_pending(s->ssl) > 0) {
@@ -116,7 +128,7 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
                 int err = SSL_get_error(s->ssl, r);
                 if (err == SSL_ERROR_ZERO_RETURN)
                     return -1;  /* clean TLS close */
-                int wr = ssl_retry_wait(fd, err, timeout_ms > 0 ? (int)timeout_ms : -1);
+                int wr = ssl_retry_wait(fd, err, wait_ms);
                 if (wr != 0) return wr;
                 continue;
             }
@@ -124,9 +136,9 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
             continue;
         }
 
-        if (timeout_ms > 0) {
+        if (wait_ms >= 0) {
             struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            int pr = poll(&pfd, 1, (int)timeout_ms);
+            int pr = poll(&pfd, 1, wait_ms);
             if (pr == 0) return 1;   /* timeout */
             if (pr < 0) {
                 if (errno == EINTR) continue;
@@ -142,7 +154,7 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
                 int err = SSL_get_error(s->ssl, r);
                 if (err == SSL_ERROR_ZERO_RETURN)
                     return -1;  /* clean TLS close */
-                int wr = ssl_retry_wait(fd, err, timeout_ms > 0 ? (int)timeout_ms : -1);
+                int wr = ssl_retry_wait(fd, err, wait_ms);
                 if (wr != 0) return wr;
                 continue;
             }
@@ -511,8 +523,12 @@ MdStream *md_stream_connect_tls(const char *host, uint16_t port,
     }
 
     SSL_set_fd(ssl, s->fd);
-    /* Set SNI for certificate verification */
+    /* SNI for name-based virtual hosting */
     SSL_set_tlsext_host_name(ssl, host);
+    /* Verify the certificate matches the host we dialed (SNI alone
+     * does no verification) */
+    if (tls->verify_peer)
+        SSL_set1_host(ssl, host);
 
     if (SSL_connect(ssl) != 1) {
         fprintf(stderr, "stream: TLS handshake failed connecting to %s:%u\n",
