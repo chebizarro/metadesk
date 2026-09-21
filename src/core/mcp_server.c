@@ -197,10 +197,22 @@ static int handle_tools_call(MdMcpServer *s, const MdJsonRpcId *id,
 
     /* Build result */
     cJSON *result = cJSON_CreateObject();
-    if (content)
+    if (is_error && error_msg) {
+        /* Surface the handler's error text — per MCP, tool errors are
+         * reported as isError plus a text content item. */
+        cJSON *err_arr = cJSON_CreateArray();
+        cJSON *text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+        cJSON_AddStringToObject(text, "text", error_msg);
+        cJSON_AddItemToArray(err_arr, text);
+        if (content)
+            cJSON_AddItemToArray(err_arr, content);
+        cJSON_AddItemToObject(result, "content", err_arr);
+    } else if (content) {
         cJSON_AddItemToObject(result, "content", content);
-    else
+    } else {
         cJSON_AddItemToObject(result, "content", cJSON_CreateArray());
+    }
 
     if (is_error)
         cJSON_AddBoolToObject(result, "isError", true);

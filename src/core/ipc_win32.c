@@ -158,7 +158,8 @@ MdIpcServer *md_ipc_listen(const char *name) {
      * PIPE_TYPE_BYTE | PIPE_READMODE_BYTE: byte-stream mode
      * PIPE_WAIT: blocking operations
      * Buffer sizes: 64 KB each direction */
-    srv->pipe = ipc_create_named_pipe(srv->path, PIPE_ACCESS_DUPLEX);
+      srv->pipe = ipc_create_named_pipe(srv->path,
+                                        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED);
 
     if (srv->pipe == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "ipc: CreateNamedPipe failed for '%s': %lu\n",
