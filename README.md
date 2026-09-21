@@ -46,7 +46,6 @@ Both modes connect to the same host daemon and can run simultaneously.
 | `metadesk-host` | Host daemon — captures screen, walks a11y tree, handles input injection |
 | `metadesk-client` | Human video client — SDL2 display with ImGui overlay |
 | `libmetadesk` | Shared library — all core logic, no UI dependencies |
-| `fips-nat` | Legacy/deprecated NAT sidecar (compile-time opt-in; off by default) |
 
 ## Building
 
@@ -79,7 +78,6 @@ meson test -C build
 | Option | Default | Description |
 |--------|---------|-------------|
 | `client` | `true` | Build the human video client (requires SDL2) |
-| `fips_nat` | `false` | Build legacy fips-nat daemon (deprecated; requires libnice) |
 | `signer_nip46` | `false` | NIP-46 Nostr Connect remote signer |
 | `signer_nip55l` | `false` | NIP-55L D-Bus local signer |
 | `signer_nip5f` | `false` | NIP-5F Unix socket signer |
@@ -105,7 +103,7 @@ Readiness failures are reported before the TCP stream is opened:
 - peer not configured or not discovered by the local FIPS daemon;
 - peer present but route/session still converging before the bounded retry expires.
 
-`fips-nat` is deprecated and off by default. It remains in-tree as a compile-time opt-in only for legacy experiments; the FIPS daemon control socket is the supported integration path.
+The FIPS daemon control socket is the supported integration path for NAT traversal and discovery.
 
 ### Optional `fips-gateway`
 
@@ -210,32 +208,27 @@ meson test -C build
 ```
 
 ```
- 1/26 packet round-trip               OK
- 2/26 JSON-RPC 2.0 message layer      OK
- 3/26 session JSON + state machine    OK
- 4/26 FIPS control socket client seam  OK
- 5/26 FIPS address derivation         OK
- 6/26 signer abstraction              OK
- 7/26 1Password Connect secrets       OK
- 8/26 STUN binding discovery          OK
- 9/26 UDP hole punch                  OK
-10/26 capture convenience API         OK
-11/26 action parse/encode             OK
-12/26 TURN relay client               OK
-13/26 bitrate controller AIMD         OK
-14/26 MCP stdio transport             OK
-15/26 a11y tree serialisation         OK
-16/26 TCP stream transport            OK
-17/26 agent action handler            OK
-18/26 MCP server core                 OK
-19/26 input injection                 OK
-20/26 NAT endpoint publication        OK
-21/26 fips-nat IPC protocol           OK
-22/26 signed session log              OK
-23/26 nostr NIP-44                    OK
-24/26 IPC Unix domain sockets         OK
-25/26 encode/decode round-trip        OK
-26/26 MCP HTTP+SSE transport          OK
+ 1/21 packet round-trip               OK
+ 2/21 JSON-RPC 2.0 message layer      OK
+ 3/21 session JSON + state machine    OK
+ 4/21 FIPS control socket client seam OK
+ 5/21 FIPS address derivation         OK
+ 6/21 signer abstraction              OK
+ 7/21 1Password Connect secrets       OK
+ 8/21 capture convenience API         OK
+ 9/21 action parse/encode             OK
+10/21 bitrate controller AIMD         OK
+11/21 MCP stdio transport             OK
+12/21 a11y tree serialisation         OK
+13/21 TCP stream transport            OK
+14/21 agent action handler            OK
+15/21 MCP server core                 OK
+16/21 input injection                 OK
+17/21 signed session log              OK
+18/21 nostr NIP-44                    OK
+19/21 IPC Unix domain sockets         OK
+20/21 encode/decode round-trip        OK
+21/21 MCP HTTP+SSE transport          OK
 ```
 
 ## Project Structure
@@ -261,11 +254,10 @@ metadesk/
 │   │   ├── signer.c/h  # signing backend abstraction
 │   │   └── stream.c/h  # TCP framed transport
 │   ├── host/           # metadesk-host daemon
-│   ├── client/         # metadesk-client (SDL2 + ImGui)
-│   └── fips-nat/       # legacy deprecated NAT traversal daemon
-├── tests/              # 26 test suites
+│   └── client/         # metadesk-client (SDL2 + ImGui)
+├── tests/              # 21 test suites
 ├── tools/              # Diagnostic utilities
-├── config/             # Example configuration
+├── imgui_vendor/       # Vendored Dear ImGui sources (client)
 └── docs/               # Specification and API docs
 ```
 

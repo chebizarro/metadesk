@@ -39,9 +39,9 @@
 extern "C" {
 #endif
 
-/* Default signaling relay used by host/client/fips-nat when no
- * --relay option is given. Single definition to keep the three
- * binaries in step. */
+/* Default signaling relay used by host/client when no
+ * --relay option is given. Single definition to keep the binaries
+ * in step. */
 #define MD_DEFAULT_RELAY "wss://relay.sharegap.net"
 
 /* ── Metadesk Nostr context ──────────────────────────────────

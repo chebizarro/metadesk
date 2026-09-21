@@ -88,7 +88,6 @@ The normal runtime uses an external FIPS daemon plus metadesk host/client proces
 | `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.3.x / v0.4.x runtime, run as system service or operator-managed process |
 | `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends; local FIPS control socket access |
 | `metadesk-client` | Human video client and/or agent transport endpoint | SDL2/ImGui for video; local FIPS control socket access |
-| `fips-nat` | Legacy deprecated NAT sidecar, off by default | Not in the recommended runtime path |
 
 ### 2.2.1 External FIPS Runtime Contract
 
@@ -373,7 +372,6 @@ Required on Linux, macOS, and Windows.
 | `nostrc` | — | Nostr C library: events, keys, relay pool, NIP-44/17/51 | github.com/chebizarro/nostrc |
 | `libgo` | — | Go-style concurrency runtime (channels, goroutines, waitgroups) | bundled with nostrc |
 | `libsecp256k1` | ≥ 0.3.2 | Nostr keypair ops, NIP-44 ECDH | Transitive via nostrc |
-| `libnice` | ≥ 0.1.21 | Legacy `fips-nat` only | Optional; only needed with `-Dfips_nat=true` |
 | `SDL2` | ≥ 2.28 | Human client frame display | Homebrew: `sdl2` |
 | Dear ImGui | ≥ 1.90 | Human client overlay UI | vendor as submodule |
 | `cJSON` | ≥ 1.7.17 | JSON encode/decode for wire formats | Homebrew: `cjson` |
@@ -462,8 +460,6 @@ ninja -C build
 #   build/metadesk-host    — host daemon
 #   build/metadesk-client  — human video client
 #   build/libmetadesk.so   — shared core (.dylib on macOS, .dll on Windows)
-# Optional legacy output with -Dfips_nat=true:
-#   build/fips-nat         — deprecated NAT traversal sidecar
 ```
 
 ---
@@ -516,14 +512,7 @@ metadesk/
 │   ├── client/                        # metadesk-client (human video client)
 │   │   ├── main.c
 │   │   ├── render.c/h                # SDL2 frame display + HiDPI scaling
-│   │   └── ui.cpp/h                  # Dear ImGui overlay (peer list, allowlist, approval)
-│   └── fips-nat/                      # legacy deprecated NAT traversal sidecar
-│       ├── main.c
-│       ├── stun.c/h                  # RFC 5389 STUN binding discovery
-│       ├── punch.c/h                 # UDP hole punch coordinator
-│       ├── turn.c/h                  # RFC 5766 TURN relay client
-│       ├── publish.c/h              # NAT endpoint publication (legacy)
-│       └── fipsnat_ipc.c/h          # IPC protocol for host ↔ fips-nat
+│   │   └── ui.cpp/h                  # Dear ImGui stats overlay
 ├── subprojects/
 │   └── imgui/                         # Dear ImGui vendored
 ├── tests/                             # 25+ unit test executables
@@ -619,7 +608,7 @@ All Phase 1 milestones are complete.
 ### 8.3 Phase 2 Milestones
 
 - ✅ **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool. Pluggable signer abstraction with NIP-46, NIP-55L, and NIP-5F backends.
-- ✅ **2.2** legacy fips-nat daemon — STUN address discovery, Nostr transport publication, UDP hole punch, TURN fallback via sharegap.net relay node; superseded for the recommended path by FIPS-owned discovery/traversal
+- ✅ **2.2** ~~legacy fips-nat daemon~~ — superseded by FIPS-owned discovery/traversal; removed from the tree (2026-09)
 - ✅ **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
 - ✅ **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log (kind:1078)
 - ✅ **2.5** Adaptive bitrate — AIMD RTT feedback loop to encoder bitrate target

@@ -19,7 +19,6 @@ add_project_arguments('-UNDEBUG', language : 'c')
 
 # ── Options ──────────────────────────────────────────────────────────────────
 enable_client  = get_option('client')
-enable_fipsnat = get_option('fips_nat')
 enable_nip46   = get_option('signer_nip46')
 enable_nip55l  = get_option('signer_nip55l')
 enable_nip5f   = get_option('signer_nip5f')
@@ -238,14 +237,6 @@ if enable_client
   dep_sdl2 = dependency('sdl2', version : '>=2.28')
 endif
 
-# ── legacy fips-nat deps ────────────────────────────────────────────────────
-# fips-nat is deprecated; FIPS daemon discovery/traversal is the supported path.
-# Keep this opt-in build target until the replacement path is verified in-tree.
-if enable_fipsnat
-  message('Building deprecated legacy fips-nat target; prefer the FIPS daemon control path')
-  dep_nice = dependency('nice', version : '>=0.1.21')
-endif
-
 # ── Core include path ───────────────────────────────────────────────────────
 core_inc = include_directories('src/core')
 
@@ -376,12 +367,6 @@ host_sources = files('src/host/main.c')
 host_includes = [core_inc]
 host_c_args = []
 
-if enable_fipsnat
-  host_sources += files('src/fips-nat/fipsnat_ipc.c', 'src/fips-nat/stun.c')
-  host_includes += include_directories('src/fips-nat')
-  host_c_args += ['-DMD_ENABLE_FIPSNAT']
-endif
-
 executable('metadesk-host', host_sources,
   include_directories : host_includes,
   dependencies : [dep_metadesk],
@@ -399,23 +384,6 @@ if enable_client
   executable('metadesk-client', client_sources,
     include_directories : [core_inc],
     dependencies : [dep_metadesk, dep_sdl2, dep_imgui],
-    install : true,
-  )
-endif
-
-# ── legacy fips-nat (deprecated, opt-in) ─────────────────────────────────────
-if enable_fipsnat
-  fipsnat_sources = files(
-    'src/fips-nat/main.c',
-    'src/fips-nat/stun.c',
-    'src/fips-nat/publish.c',
-    'src/fips-nat/punch.c',
-    'src/fips-nat/turn.c',
-    'src/fips-nat/fipsnat_ipc.c',
-  )
-  executable('fips-nat', fipsnat_sources,
-    include_directories : [core_inc],
-    dependencies : [dep_metadesk, dep_nice],
     install : true,
   )
 endif
@@ -598,42 +566,6 @@ if enable_nip46
     c_args : ['-DMD_SIGNER_ENABLE_NIP46'],
   )
   test('NIP-46 signer integration', test_signer_nip46)
-endif
-
-# ── fips-nat tests (deprecated daemon — only when -Dfips_nat=true) ────────────
-if enable_fipsnat
-  test_stun = executable('test_stun',
-    files('tests/test_stun.c', 'src/fips-nat/stun.c'),
-    include_directories : [include_directories('src/fips-nat')],
-  )
-  test('STUN binding discovery', test_stun)
-
-  test_punch = executable('test_punch',
-    files('tests/test_punch.c', 'src/fips-nat/punch.c', 'src/fips-nat/stun.c'),
-    include_directories : [include_directories('src/fips-nat')],
-  )
-  test('UDP hole punch', test_punch, timeout : 10)
-
-  test_publish = executable('test_publish',
-    files('tests/test_publish.c', 'src/fips-nat/publish.c', 'src/fips-nat/stun.c'),
-    include_directories : [core_inc, include_directories('src/fips-nat')],
-    dependencies : [dep_metadesk],
-  )
-  test('NAT endpoint publication', test_publish)
-
-  test_fipsnat_ipc = executable('test_fipsnat_ipc',
-    files('tests/test_fipsnat_ipc.c', 'src/fips-nat/fipsnat_ipc.c',
-          'src/fips-nat/stun.c'),
-    include_directories : [core_inc, include_directories('src/fips-nat')],
-    dependencies : [dep_metadesk],
-  )
-  test('fips-nat IPC protocol', test_fipsnat_ipc)
-
-  test_turn = executable('test_turn',
-    files('tests/test_turn.c', 'src/fips-nat/turn.c', 'src/fips-nat/stun.c'),
-    include_directories : [include_directories('src/fips-nat')],
-  )
-  test('TURN relay client', test_turn)
 endif
 
 test_bitrate_ctrl = executable('test_bitrate_ctrl',
