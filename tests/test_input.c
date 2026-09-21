@@ -21,6 +21,8 @@ typedef struct {
     int mouse_move_calls;
     int mouse_button_calls;
     int key_event_calls;
+    int mouse_scroll_calls;
+    int type_text_calls;
 
     int mouse_move_ret;
     int mouse_button_fail_call; /* 1-based call index, 0 = never */
@@ -28,6 +30,9 @@ typedef struct {
 
     int last_x;
     int last_y;
+    int last_dx;
+    int last_dy;
+    char last_text[128];
     int button_pressed[4];
     uint32_t keysyms[16];
     int key_pressed[16];
@@ -63,10 +68,28 @@ static int mock_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
     return 0;
 }
 
+static int mock_mouse_scroll(MdInputCtx *ctx, int dx, int dy) {
+    MockInputData *data = (MockInputData *)ctx->backend_data;
+    data->mouse_scroll_calls++;
+    data->last_dx = dx;
+    data->last_dy = dy;
+    return 0;
+}
+
+static int mock_type_text(MdInputCtx *ctx, const char *utf8) {
+    MockInputData *data = (MockInputData *)ctx->backend_data;
+    data->type_text_calls++;
+    snprintf(data->last_text, sizeof(data->last_text), "%s",
+             utf8 ? utf8 : "");
+    return 0;
+}
+
 static const MdInputBackend mock_backend = {
     .mouse_move = mock_mouse_move,
     .mouse_button = mock_mouse_button,
+    .mouse_scroll = mock_mouse_scroll,
     .key_event = mock_key_event,
+    .type_text = mock_type_text,
 };
 
 static MdInput make_mock_input(MockInputData *data,
@@ -114,71 +137,92 @@ static int test_create_defaults(void) {
     return 0;
 }
 
-/* ── Test: action dispatch with no devices ───────────────────── */
+/* ── Test: action dispatch against the mock backend ────────────
+ * Deterministic: asserts the exact injected event sequence for every
+ * action class, independent of device availability. */
 
 static int test_action_dispatch(void) {
     printf("  test_action_dispatch... ");
 
-    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
-    MdInput *inp = md_input_create(&cfg);
-    assert(inp != NULL);
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
 
-    /* Build a click action */
+    /* Click: move to (100,200), press, release */
     MdAction action;
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_CLICK;
     action.region[0] = 100;
     action.region[1] = 200;
+    assert(md_input_execute_action(&inp, &action) == 0);
+    assert(data.mouse_move_calls == 1);
+    assert(data.last_x == 100 && data.last_y == 200);
+    assert(data.mouse_button_calls == 2);
+    assert(data.button_pressed[MD_MOUSE_LEFT] == 0);
 
-    /* Execute — returns 0 if devices are ready, -1 otherwise */
-    int ret = md_input_execute_action(inp, &action);
-    if (md_input_is_ready(inp))
-        assert(ret == 0);
-    /* If not ready, -1 is expected */
-
-    /* Key combo action */
+    /* Key combo: press ctrl, press s, release s, release ctrl */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_KEY_COMBO;
     action.keys[0] = strdup("ctrl");
     action.keys[1] = strdup("s");
     action.key_count = 2;
-
-    ret = md_input_execute_action(inp, &action);
-    if (md_input_is_ready(inp))
-        assert(ret == 0);
-
+    assert(md_input_execute_action(&inp, &action) == 0);
+    assert(data.key_event_calls == 4);
+    assert(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
+    assert(data.keysyms[1] == 0x001F && data.key_pressed[1] == 1);
+    assert(data.keysyms[2] == 0x001F && data.key_pressed[2] == 0);
+    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
     md_action_cleanup(&action);
 
-    /* Type text action */
+    /* Type text */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_TYPE;
     strncpy(action.text, "Hello, world!", sizeof(action.text) - 1);
+    assert(md_input_execute_action(&inp, &action) == 0);
+    assert(data.type_text_calls == 1);
+    assert(strcmp(data.last_text, "Hello, world!") == 0);
 
-    ret = md_input_execute_action(inp, &action);
-    if (md_input_is_ready(inp))
-        assert(ret == 0);
-
-    /* Scroll action */
+    /* Scroll */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_SCROLL;
     action.dx = 0;
     action.dy = 3;
+    assert(md_input_execute_action(&inp, &action) == 0);
+    assert(data.mouse_scroll_calls == 1);
+    assert(data.last_dx == 0 && data.last_dy == 3);
 
-    ret = md_input_execute_action(inp, &action);
-    if (md_input_is_ready(inp))
-        assert(ret == 0);
+    /* set_value: select-all (platform accel key) then type */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
+    memset(&action, 0, sizeof(action));
+    action.type = MD_ACTION_SET_VALUE;
+    strncpy(action.text, "replacement", sizeof(action.text) - 1);
+    assert(md_input_execute_action(&inp, &action) == 0);
+    assert(data.key_event_calls == 4);
+#ifdef __APPLE__
+    assert(data.keysyms[0] == 0x007D); /* meta/Cmd on macOS */
+#else
+    assert(data.keysyms[0] == 0x001D); /* ctrl elsewhere */
+#endif
+    assert(data.keysyms[1] == 0x001E); /* a */
+    assert(data.type_text_calls == 1);
+    assert(strcmp(data.last_text, "replacement") == 0);
 
-    /* Unknown action */
+    /* Unknown action always fails */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_UNKNOWN;
-    ret = md_input_execute_action(inp, &action);
-    assert(ret == -1); /* should always fail */
+    assert(md_input_execute_action(&inp, &action) == -1);
 
     /* NULL action */
-    ret = md_input_execute_action(inp, NULL);
-    assert(ret == -1);
+    assert(md_input_execute_action(&inp, NULL) == -1);
 
-    md_input_destroy(inp);
     printf("OK\n");
     return 0;
 }
@@ -201,18 +245,18 @@ static int test_action_from_json(void) {
     assert(strcmp(action.keys[1], "shift") == 0);
     assert(strcmp(action.keys[2], "t") == 0);
 
-    /* Dispatch */
-    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
-    MdInput *inp = md_input_create(&cfg);
-    assert(inp != NULL);
+    /* Dispatch through the mock backend — deterministic */
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
 
-    ret = md_input_execute_action(inp, &action);
-    /* Only check success if devices are available */
-    if (md_input_is_ready(inp))
-        assert(ret == 0);
+    ret = md_input_execute_action(&inp, &action);
+    assert(ret == 0);
+    assert(data.key_event_calls == 6); /* 3 presses + 3 releases */
+    assert(data.keysyms[0] == 0x001D); /* ctrl */
+    assert(data.keysyms[1] == 0x002A); /* shift */
+    assert(data.keysyms[2] == 0x0014); /* t */
 
     md_action_cleanup(&action);
-    md_input_destroy(inp);
 
     printf("OK\n");
     return 0;
@@ -292,25 +336,27 @@ static int test_keysym_lookup(void) {
 static int test_dbl_and_right_click(void) {
     printf("  test_dbl_and_right_click... ");
 
-    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
-    MdInput *inp = md_input_create(&cfg);
-    assert(inp != NULL);
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
 
-    /* These call through the backend — verify they don't crash
-     * regardless of device availability */
-    int ret;
+    /* Double click: two move+press+release cycles at (500,300) */
+    assert(md_input_dbl_click(&inp, 500, 300) == 0);
+    assert(data.mouse_move_calls == 2);
+    assert(data.mouse_button_calls == 4);
+    assert(data.last_x == 500 && data.last_y == 300);
 
-    ret = md_input_dbl_click(inp, 500, 300);
-    if (md_input_is_ready(inp)) assert(ret == 0);
-
-    ret = md_input_right_click(inp, 500, 300);
-    if (md_input_is_ready(inp)) assert(ret == 0);
+    /* Right click: one cycle on the right button */
+    data = (MockInputData){0};
+    inp = make_mock_input(&data, &mock_backend);
+    assert(md_input_right_click(&inp, 500, 300) == 0);
+    assert(data.mouse_move_calls == 1);
+    assert(data.mouse_button_calls == 2);
+    assert(data.button_pressed[MD_MOUSE_RIGHT] == 0);
 
     /* NULL input */
     assert(md_input_dbl_click(NULL, 0, 0) == -1);
     assert(md_input_right_click(NULL, 0, 0) == -1);
 
-    md_input_destroy(inp);
     printf("OK\n");
     return 0;
 }
@@ -320,24 +366,24 @@ static int test_dbl_and_right_click(void) {
 static int test_mouse_scroll(void) {
     printf("  test_mouse_scroll... ");
 
-    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
-    MdInput *inp = md_input_create(&cfg);
-    assert(inp != NULL);
-
     /* scroll with NULL */
     assert(md_input_scroll(NULL, 0, 3) == -1);
 
     /* mouse_move with NULL */
     assert(md_input_mouse_move(NULL, 100, 100) == -1);
 
-    /* Normal calls (may or may not succeed depending on device) */
-    int ret = md_input_scroll(inp, 0, 3);
-    if (md_input_is_ready(inp)) assert(ret == 0);
+    /* Deterministic mock assertions */
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
 
-    ret = md_input_mouse_move(inp, 100, 200);
-    if (md_input_is_ready(inp)) assert(ret == 0);
+    assert(md_input_scroll(&inp, 0, 3) == 0);
+    assert(data.mouse_scroll_calls == 1);
+    assert(data.last_dy == 3);
 
-    md_input_destroy(inp);
+    assert(md_input_mouse_move(&inp, 100, 200) == 0);
+    assert(data.mouse_move_calls == 1);
+    assert(data.last_x == 100 && data.last_y == 200);
+
     printf("OK\n");
     return 0;
 }
