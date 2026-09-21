@@ -351,77 +351,81 @@ char *md_a11y_to_json(const MdA11yNode *root) {
  */
 
 /* Role abbreviation map */
+/*
+ * One role vocabulary, one table. role_abbrev() and is_interactable() were
+ * two parallel strcmp cascades over the same set of roles that had to be kept
+ * in sync by hand; they now read a single source of truth. `alt` is an
+ * accepted synonym for the same role (or NULL).
+ */
+typedef struct {
+    const char *role;
+    const char *alt;
+    const char *abbrev;
+    bool        interactable;
+} RoleInfo;
+
+static const RoleInfo role_table[] = {
+    /* Containers — always shown for structural context */
+    { "frame",         "window",  "WIN", true  },
+    { "application",   NULL,      "APP", true  },
+    { "desktop frame", "desktop", "DSK", true  },
+    { "dialog",        NULL,      "DLG", true  },
+    /* Interactive controls — the primary targets */
+    { "push button",   "button",  "BTN", true  },
+    { "toggle button", NULL,      "TGL", true  },
+    { "text",          "entry",   "TXT", true  },
+    { "menu",          "menu bar","MNU", true  },
+    { "menu item",     NULL,      "MNI", true  },
+    { "check box",     NULL,      "CHK", true  },
+    { "radio button",  NULL,      "RAD", true  },
+    { "combo box",     NULL,      "CMB", true  },
+    { "list",          NULL,      "LST", true  },
+    { "list item",     NULL,      "LI",  true  },
+    { "tab",           NULL,      "TAB", true  },
+    { "page tab",      NULL,      "PTB", true  },
+    { "link",          NULL,      "LNK", true  },
+    { "slider",        NULL,      "SLD", true  },
+    { "spin button",   NULL,      "SPN", true  },
+    { "tree",          NULL,      "TRE", true  },
+    { "table",         NULL,      "TBL", true  },
+    /* Decorative / structural — skipped in compact output (children walked) */
+    { "panel",         "filler",  "PNL", false },
+    { "label",         NULL,      "LBL", false },
+    { "scroll bar",    NULL,      "SCR", false },
+    { "separator",     NULL,      "SEP", false },
+    { "tool bar",      NULL,      "TBR", false },
+    { "image",         NULL,      "IMG", false },
+    { "status bar",    NULL,      "STS", false },
+    { "page tab list", NULL,      "PTL", false },
+    { "split pane",    NULL,      "SPL", false },
+    { "progress bar",  NULL,      "PRG", false },
+};
+
+static const RoleInfo *role_lookup(const char *role) {
+    if (!role) return NULL;
+    for (size_t i = 0; i < sizeof(role_table) / sizeof(role_table[0]); i++) {
+        if (strcmp(role, role_table[i].role) == 0 ||
+            (role_table[i].alt && strcmp(role, role_table[i].alt) == 0))
+            return &role_table[i];
+    }
+    return NULL;
+}
+
 static const char *role_abbrev(const char *role) {
     if (!role) return "???";
-    if (strcmp(role, "frame") == 0 || strcmp(role, "window") == 0) return "WIN";
-    if (strcmp(role, "application") == 0) return "APP";
-    if (strcmp(role, "desktop frame") == 0 || strcmp(role, "desktop") == 0) return "DSK";
-    if (strcmp(role, "push button") == 0 || strcmp(role, "button") == 0) return "BTN";
-    if (strcmp(role, "text") == 0 || strcmp(role, "entry") == 0) return "TXT";
-    if (strcmp(role, "menu") == 0 || strcmp(role, "menu bar") == 0) return "MNU";
-    if (strcmp(role, "menu item") == 0) return "MNI";
-    if (strcmp(role, "check box") == 0) return "CHK";
-    if (strcmp(role, "radio button") == 0) return "RAD";
-    if (strcmp(role, "combo box") == 0) return "CMB";
-    if (strcmp(role, "list") == 0) return "LST";
-    if (strcmp(role, "list item") == 0) return "LI";
-    if (strcmp(role, "tab") == 0) return "TAB";
-    if (strcmp(role, "panel") == 0 || strcmp(role, "filler") == 0) return "PNL";
-    if (strcmp(role, "label") == 0) return "LBL";
-    if (strcmp(role, "scroll bar") == 0) return "SCR";
-    if (strcmp(role, "separator") == 0) return "SEP";
-    if (strcmp(role, "tool bar") == 0) return "TBR";
-    if (strcmp(role, "tree") == 0) return "TRE";
-    if (strcmp(role, "table") == 0) return "TBL";
-    if (strcmp(role, "image") == 0) return "IMG";
-    if (strcmp(role, "link") == 0) return "LNK";
-    if (strcmp(role, "status bar") == 0) return "STS";
-    if (strcmp(role, "dialog") == 0) return "DLG";
-    if (strcmp(role, "page tab") == 0) return "PTB";
-    if (strcmp(role, "page tab list") == 0) return "PTL";
-    if (strcmp(role, "split pane") == 0) return "SPL";
-    if (strcmp(role, "toggle button") == 0) return "TGL";
-    if (strcmp(role, "slider") == 0) return "SLD";
-    if (strcmp(role, "progress bar") == 0) return "PRG";
-    if (strcmp(role, "spin button") == 0) return "SPN";
-    return "UNK";
+    const RoleInfo *ri = role_lookup(role);
+    return ri ? ri->abbrev : "UNK";
 }
 
 /*
- * Interactable classification. Returns true if the node should be
- * emitted in compact output. Container roles (WIN, APP, DSK, DLG)
- * are always emitted for structural context. Leaf interactable roles
- * (BTN, TXT, MNU, CHK, etc.) are the primary targets. Decorative
- * roles (PNL, SCR, SEP, IMG, LBL, STS) are skipped — but their
- * children are still walked.
+ * Interactable classification: true if the node should be emitted in compact
+ * output. Containers (WIN/APP/DSK/DLG) show for structure; leaf controls
+ * (BTN/TXT/MNU/CHK/...) are the targets; decorative roles are skipped (their
+ * children are still walked).
  */
 static bool is_interactable(const char *role) {
-    if (!role) return false;
-    /* Containers — always show for context */
-    if (strcmp(role, "frame") == 0 || strcmp(role, "window") == 0) return true;
-    if (strcmp(role, "application") == 0) return true;
-    if (strcmp(role, "desktop frame") == 0 || strcmp(role, "desktop") == 0) return true;
-    if (strcmp(role, "dialog") == 0) return true;
-    /* Interactive controls — the primary targets */
-    if (strcmp(role, "push button") == 0 || strcmp(role, "button") == 0) return true;
-    if (strcmp(role, "toggle button") == 0) return true;
-    if (strcmp(role, "text") == 0 || strcmp(role, "entry") == 0) return true;
-    if (strcmp(role, "menu") == 0 || strcmp(role, "menu bar") == 0) return true;
-    if (strcmp(role, "menu item") == 0) return true;
-    if (strcmp(role, "check box") == 0) return true;
-    if (strcmp(role, "radio button") == 0) return true;
-    if (strcmp(role, "combo box") == 0) return true;
-    if (strcmp(role, "list item") == 0) return true;
-    if (strcmp(role, "tab") == 0) return true;
-    if (strcmp(role, "page tab") == 0) return true;
-    if (strcmp(role, "link") == 0) return true;
-    if (strcmp(role, "slider") == 0) return true;
-    if (strcmp(role, "spin button") == 0) return true;
-    if (strcmp(role, "tree") == 0) return true;
-    if (strcmp(role, "table") == 0) return true;
-    if (strcmp(role, "list") == 0) return true;
-    /* Everything else is decorative / structural — skip it */
-    return false;
+    const RoleInfo *ri = role_lookup(role);
+    return ri && ri->interactable;
 }
 
 /* Returns true if the role is a text input (content should be quoted) */
