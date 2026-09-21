@@ -214,8 +214,18 @@ MdSignerType md_signer_get_type(const MdSigner *s);
 /* Get a human-readable name for the signer backend. */
 const char *md_signer_type_name(MdSignerType type);
 
-/* Check if the signer is ready (connected, key available). */
+/* Cheap, side-effect-free predicate: true iff the signer's pubkey is
+ * already cached. For remote signers (NIP-46/55L/5F) this is false until
+ * a successful md_signer_probe() (or any get_pubkey) has populated it.
+ * Never performs I/O. */
 bool md_signer_is_ready(const MdSigner *s);
+
+/* Actively probe the signer: fetch the pubkey, blocking on a remote
+ * round-trip for NIP-46/55L/5F backends. On success the pubkey is cached
+ * and md_signer_is_ready() then returns true. Returns MD_SIGNER_OK or a
+ * negative MD_SIGNER_* error. Use this (not is_ready) to test whether a
+ * remote signer service is actually reachable. */
+int md_signer_probe(MdSigner *s);
 
 /* Destroy signer, zeroing any key material. */
 void md_signer_destroy(MdSigner *s);

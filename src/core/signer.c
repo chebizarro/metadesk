@@ -826,18 +826,25 @@ const char *md_signer_type_name(MdSignerType type) {
 }
 
 bool md_signer_is_ready(const MdSigner *s) {
-    if (!s || !s->ops)
-        return false;
+    /* Cheap predicate: only reports whether the pubkey is already cached.
+     * No I/O — remote signers must be probed with md_signer_probe(). */
+    return s && s->pubkey_hex != NULL;
+}
 
-    /* A signer is ready if we can get a pubkey */
+int md_signer_probe(MdSigner *s) {
+    if (!s || !s->ops || !s->ops->get_pubkey)
+        return MD_SIGNER_ERR_INVALID;
+
     if (s->pubkey_hex)
-        return true;
+        return MD_SIGNER_OK;
 
-    /* Try fetching (non-const cast for lazy init) */
+    /* Route through md_signer_get_pubkey so a successful round-trip caches
+     * s->pubkey_hex (making md_signer_is_ready() true afterwards). Blocking
+     * for remote NIP-46/55L/5F backends. */
     char *pk = NULL;
-    int ret = s->ops->get_pubkey((MdSigner *)s, &pk);
+    int ret = md_signer_get_pubkey(s, &pk);
     free(pk);
-    return ret == MD_SIGNER_OK;
+    return ret;
 }
 
 void md_signer_destroy(MdSigner *s) {

@@ -124,11 +124,12 @@ static void test_lifecycle(void) {
         return;
     }
 
-    if (!md_signer_is_ready(s)) {
+    if (md_signer_probe(s) != MD_SIGNER_OK) {
         md_signer_destroy(s);
         FAIL("not ready");
         return;
     }
+    MD_CHECK(md_signer_is_ready(s));  /* probe must have cached the pubkey */
 
     md_signer_destroy(s);
     PASS();
