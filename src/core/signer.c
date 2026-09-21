@@ -21,6 +21,7 @@
 
 #include <nostr-event.h>
 #include <nostr-keys.h>
+#include <nostr-utils.h>
 #include <nostr/nip44/nip44.h>
 #include <json.h>
 
@@ -34,12 +35,7 @@
 
 static int hex_to_bin(const char *hex, uint8_t *out, size_t out_len) {
     if (!hex || strlen(hex) != out_len * 2) return -1;
-    for (size_t i = 0; i < out_len; i++) {
-        unsigned int byte;
-        if (sscanf(hex + 2*i, "%2x", &byte) != 1) return -1;
-        out[i] = (uint8_t)byte;
-    }
-    return 0;
+    return nostr_hex2bin(out, hex, out_len) ? 0 : -1;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -83,10 +79,8 @@ static int direct_sign_event(MdSigner *s, const char *event_json,
     }
 
     /* Ensure pubkey is set */
-    if (!ev->pubkey || strlen(ev->pubkey) == 0) {
-        free(ev->pubkey);
-        ev->pubkey = strdup(dk->pk_hex);
-    }
+    if (!ev->pubkey || strlen(ev->pubkey) == 0)
+        nostr_event_set_pubkey(ev, dk->pk_hex);
 
     /* Sign the event (computes id and sig) */
     int ret = nostr_event_sign(ev, dk->sk_hex);
@@ -471,15 +465,7 @@ static char *npub_to_hex(const char *npub) {
     uint8_t pk[32];
     if (nostr_nip19_decode_npub(npub, pk) != 0)
         return NULL;
-    static const char hexd[] = "0123456789abcdef";
-    char *hex = malloc(65);
-    if (!hex) return NULL;
-    for (int i = 0; i < 32; i++) {
-        hex[2*i]     = hexd[(pk[i] >> 4) & 0xF];
-        hex[2*i + 1] = hexd[pk[i] & 0xF];
-    }
-    hex[64] = '\0';
-    return hex;
+    return nostr_bin2hex(pk, sizeof(pk));
 }
 
 static int nip55l_get_pubkey(MdSigner *s, char **out) {
@@ -506,33 +492,15 @@ static int nip55l_sign_event(MdSigner *s, const char *event_json,
     if (!event_json || !out_signed_json)
         return MD_SIGNER_ERR_INVALID;
 
-    /* nostr_nip55l_sign_event returns only the signature string,
-     * not the full signed event JSON. Reconstruct the full event:
-     * deserialize → set sig from NIP-55L → re-serialize. */
-    char *sig = NULL;
-    int ret = nostr_nip55l_sign_event(event_json, "", "", &sig);
-    if (ret != 0 || !sig)
+    /* nostr_nip55l_sign_event_json returns the complete signed event
+     * (id, pubkey, created_at, kind, tags, content, sig) — the signature
+     * alone would leave the event without an id, which relays reject. */
+    char *signed_json = NULL;
+    int ret = nostr_nip55l_sign_event_json(event_json, "", "", &signed_json);
+    if (ret != 0 || !signed_json)
         return MD_SIGNER_ERR_CONNECT;
 
-    /* Deserialize the original event, stamp the signature, re-serialize */
-    NostrEvent *ev = nostr_event_new();
-    if (!ev) { free(sig); return MD_SIGNER_ERR_INTERNAL; }
-
-    if (nostr_event_deserialize(ev, event_json) != 0) {
-        nostr_event_free(ev);
-        free(sig);
-        return MD_SIGNER_ERR_INVALID;
-    }
-
-    /* Replace sig field */
-    free(ev->sig);
-    ev->sig = sig;  /* ownership transferred */
-
-    char *result = nostr_event_serialize(ev);
-    nostr_event_free(ev);
-    if (!result) return MD_SIGNER_ERR_INTERNAL;
-
-    *out_signed_json = result;
+    *out_signed_json = signed_json;
     return MD_SIGNER_OK;
 }
 

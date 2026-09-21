@@ -70,18 +70,31 @@ if _nostrc_build == '' and _nostrc_root != ''
   _nostrc_build = _nostrc_root / 'build'
 endif
 
-# nostrc installed headers + libgo headers (if from source tree)
+# nostrc headers: prefer the source tree (it is ahead of the installed
+# libnostr: publish_and_wait, event_middleware_ex, nostr_event_validate),
+# fall back to the installed headers.
 _nostrc_inc_paths = []
+if _nostrc_root != ''
+  _nostrc_inc_paths += _nostrc_root / 'libnostr' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip17' / 'include'
+endif
 foreach d : _sys_inc_dirs
   _nostrc_inc_paths += d / 'nostr'
 endforeach
-if _nostrc_root != ''
-  _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
-endif
 nostrc_inc = include_directories(_nostrc_inc_paths)
 
-dep_nostr_lib = cc.find_library('nostr', required : true, dirs : _sys_lib_dirs)
+fs = import('fs')
+
+# libnostr: prefer the build-tree static lib (matches the headers above)
+_nostrc_core = _nostrc_build / 'libnostr' / 'libnostr.a'
+if _nostrc_build != '' and fs.exists(_nostrc_core)
+  dep_nostr_lib = declare_dependency(link_args : [_nostrc_core])
+  message('nostr: using build-tree libnostr: ' + _nostrc_core)
+else
+  dep_nostr_lib = cc.find_library('nostr', required : true, dirs : _sys_lib_dirs)
+endif
 dep_nostr = declare_dependency(
   dependencies : dep_nostr_lib,
   include_directories : nostrc_inc,
@@ -127,6 +140,18 @@ dep_nostr_json = cc.find_library('nostr_json', required : true, dirs : _sys_lib_
 
 # NIP-11 relay information document (requires libcurl for HTTP fetch)
 dep_curl = dependency('libcurl', version : '>=7.80', required : true)
+# nip17 — try installed library first, fallback to build-tree object
+dep_nip17_lib = cc.find_library('nostr_nip17_core', required : false, dirs : _sys_lib_dirs)
+if dep_nip17_lib.found()
+  dep_nip17 = dep_nip17_lib
+elif _nostrc_build != ''
+  _nip17_obj = _nostrc_build / 'nips' / 'nip17' / 'CMakeFiles' / 'nostr_nip17_core.dir' / 'src' / 'nip17.c.o'
+  dep_nip17 = declare_dependency(link_args : [_nip17_obj])
+  message('nip17: using build-tree object: ' + _nip17_obj)
+else
+  error('nostr_nip17_core not found. Install nostrc or set -Dnostrc_root=<path>')
+endif
+
 dep_nip11_lib = cc.find_library('nip11', required : false, dirs : _sys_lib_dirs)
 if dep_nip11_lib.found()
   dep_nip11 = dep_nip11_lib
@@ -228,6 +253,7 @@ core_deps = [
   dep_nostr,
   dep_nip44,
   dep_nip51,
+  dep_nip17,
   dep_nip11,
   dep_curl,
   dep_libgo,
