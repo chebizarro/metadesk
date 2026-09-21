@@ -59,7 +59,6 @@ static int test_connect_and_send(void) {
     pthread_create(&tid, NULL, server_thread, &st);
 
     /* Give server a moment to start accepting */
-    usleep(50000);
 
     /* Connect client */
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 1, 3000);
@@ -128,7 +127,6 @@ static int test_ping_pong(void) {
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
-    usleep(50000);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 2, 3000);
     assert(client != NULL);
@@ -185,7 +183,6 @@ static int test_empty_payload(void) {
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
-    usleep(50000);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 3, 3000);
     assert(client != NULL);
@@ -223,7 +220,6 @@ static int test_recv_timeout(void) {
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
-    usleep(50000);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 4, 3000);
     assert(client != NULL);
@@ -256,8 +252,6 @@ static int test_tls_roundtrip(void) {
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
-
-    usleep(50000);
 
     /* TLS client (no peer verification for self-signed) */
     MdStreamTlsConfig client_tls = { .enabled = true, .verify_peer = false };
@@ -305,7 +299,6 @@ static int test_plaintext_no_tls(void) {
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
-    usleep(50000);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 11, 5000);
     assert(client != NULL);

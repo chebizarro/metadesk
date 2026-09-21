@@ -175,9 +175,6 @@ static void test_connect_accept(void)
     pthread_t tid;
     pthread_create(&tid, NULL, accept_thread, &args);
 
-    /* Small delay so accept is waiting before we connect */
-    usleep(50000);
-
     MdIpcConn *client = md_ipc_connect(name, 2000);
     assert(client != NULL);
 
@@ -208,7 +205,6 @@ static void test_send_recv(void)
     AcceptArgs args = { .srv = srv, .accepted = NULL };
     pthread_t tid;
     pthread_create(&tid, NULL, accept_thread, &args);
-    usleep(50000);
 
     MdIpcConn *client = md_ipc_connect(name, 2000);
     assert(client != NULL);
@@ -253,7 +249,6 @@ static void test_send_large(void)
     AcceptArgs args = { .srv = srv, .accepted = NULL };
     pthread_t tid;
     pthread_create(&tid, NULL, accept_thread, &args);
-    usleep(50000);
 
     MdIpcConn *client = md_ipc_connect(name, 2000);
     assert(client != NULL);
@@ -298,7 +293,6 @@ static void test_recv_timeout(void)
     AcceptArgs args = { .srv = srv, .accepted = NULL };
     pthread_t tid;
     pthread_create(&tid, NULL, accept_thread, &args);
-    usleep(50000);
 
     MdIpcConn *client = md_ipc_connect(name, 2000);
     assert(client != NULL);
@@ -332,7 +326,6 @@ static void test_close_detection(void)
     AcceptArgs args = { .srv = srv, .accepted = NULL };
     pthread_t tid;
     pthread_create(&tid, NULL, accept_thread, &args);
-    usleep(50000);
 
     MdIpcConn *client = md_ipc_connect(name, 2000);
     assert(client != NULL);

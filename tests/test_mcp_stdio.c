@@ -144,9 +144,6 @@ static void test_stdio_init_and_ping(void)
     /* Send initialized notification */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 
-    /* Small delay for notification processing */
-    usleep(10000);
-
     /* Send ping */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":2}");
     resp = harness_recv(h);
@@ -172,7 +169,6 @@ static void test_stdio_tools_list(void)
     free(harness_recv(h));  /* consume init response */
 
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
-    usleep(10000);
 
     /* List tools */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}");
@@ -199,7 +195,6 @@ static void test_stdio_tool_call(void)
                      "\"id\":1,\"params\":{}}");
     free(harness_recv(h));
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
-    usleep(10000);
 
     /* Call click tool */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":3,"

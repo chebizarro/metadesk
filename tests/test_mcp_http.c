@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include "md_test_net.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -211,7 +212,6 @@ static void test_post_initialize(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000); /* wait for server to start */
 
     const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\","
                        "\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\","
@@ -261,7 +261,6 @@ static void test_invalid_content_length_rejected(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     const char *request =
         "POST /mcp HTTP/1.1\r\n"
@@ -311,7 +310,6 @@ static void test_post_requires_json_content_type(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1}";
     char request[1024];
@@ -367,7 +365,6 @@ static void test_get_404(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     const char *request = "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n";
     char response[2048];
@@ -402,7 +399,6 @@ static void test_sse_multiline_data(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     char headers[1024];
     int fd = sse_connect(port, headers, sizeof(headers));
@@ -455,7 +451,6 @@ static void test_sse_max_clients_config(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     char headers1[1024];
     int fd1 = sse_connect(port, headers1, sizeof(headers1));
@@ -468,16 +463,16 @@ static void test_sse_max_clients_config(void)
     assert(fd2 >= 0);
     assert(strstr(headers2, "text/event-stream") != NULL);
 
-    usleep(100000);
-    assert(md_mcp_http_send_sse(http, "test", "data", 4) == 0);
-
+    /* fd1's registration races with send_sse (headers are sent before
+     * the client is added to the SSE list) — retry until it arrives. */
     char event[1024];
-    ssize_t n = read(fd1, event, sizeof(event) - 1);
-    assert(n > 0);
-    size_t total = (size_t)n;
-    event[total] = '\0';
-    for (int i = 0; i < 3 && strstr(event, "data: data") == NULL; i++) {
-        n = read(fd1, event + total, sizeof(event) - 1 - total);
+    size_t total = 0;
+    event[0] = '\0';
+    for (int i = 0; i < 40 && strstr(event, "data: data") == NULL; i++) {
+        assert(md_mcp_http_send_sse(http, "test", "data", 4) == 0);
+        if (md_test_wait_readable(fd1, 100) != 1)
+            continue;
+        ssize_t n = read(fd1, event + total, sizeof(event) - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         event[total] = '\0';
@@ -485,7 +480,7 @@ static void test_sse_max_clients_config(void)
     assert(strstr(event, "event: test") != NULL);
     assert(strstr(event, "data: data") != NULL);
 
-    n = read(fd2, event, sizeof(event) - 1);
+    ssize_t n = read(fd2, event, sizeof(event) - 1);
     if (n > 0) {
         event[n] = '\0';
         assert(strstr(event, "event: test") == NULL);
@@ -523,7 +518,6 @@ static void test_shutdown(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     /* Shutdown should cause run to return */
     md_mcp_http_shutdown(http);
@@ -553,7 +547,6 @@ static void test_shutdown_closes_sse_clients(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
-    usleep(100000);
 
     char headers[1024];
     int fd = sse_connect(port, headers, sizeof(headers));
