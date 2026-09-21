@@ -31,6 +31,8 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include "log.h"
+#define MD_LOG_TAG "capture_dxgi"
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -108,7 +110,7 @@ static int dxgi_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
         &st->context);
 
     if (FAILED(hr)) {
-        fprintf(stderr, "capture_dxgi: D3D11CreateDevice failed: 0x%08lx\n", hr);
+        MD_LOG_I("D3D11CreateDevice failed: 0x%08lx", hr);
         free(st);
         return -1;
     }
@@ -139,9 +141,7 @@ static int dxgi_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     hr = output1->DuplicateOutput(st->device, &st->duplication);
     output1->Release();
     if (FAILED(hr)) {
-        fprintf(stderr, "capture_dxgi: DuplicateOutput failed: 0x%08lx\n"
-                "  Ensure the process has desktop access and is not running "
-                "in a different session.\n", hr);
+        MD_LOG_I("DuplicateOutput failed: 0x%08lx\n  Ensure the process has desktop access and is not running in a different session.", hr);
         goto fail;
     }
 
@@ -155,7 +155,7 @@ static int dxgi_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     /* Create staging texture for CPU reads */
     hr = create_staging_texture(st);
     if (FAILED(hr)) {
-        fprintf(stderr, "capture_dxgi: failed to create staging texture: 0x%08lx\n", hr);
+        MD_LOG_E("failed to create staging texture: 0x%08lx", hr);
         goto fail;
     }
 
@@ -202,7 +202,7 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
         if (FAILED(hr)) {
             if (hr == DXGI_ERROR_ACCESS_LOST) {
                 /* Desktop switch or mode change — need to reinitialize */
-                fprintf(stderr, "capture_dxgi: access lost, need reinit\n");
+                MD_LOG_I("access lost, need reinit");
                 ctx->active = false;
             }
             return -1;
@@ -316,7 +316,7 @@ const MdCaptureBackend *md_capture_backend_create(void) {
 
 extern "C"
 const MdCaptureBackend *md_capture_backend_create(void) {
-    fprintf(stderr, "capture: DXGI backend not available on this platform\n");
+    MD_LOG_I("DXGI backend not available on this platform");
     return nullptr;
 }
 

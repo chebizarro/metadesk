@@ -25,6 +25,8 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <new>
+#include "log.h"
+#define MD_LOG_TAG "a11y_uia"
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
@@ -249,7 +251,7 @@ static int uia_init(MdA11yCtx *ctx) {
     if (SUCCEEDED(hr)) {
         com_initialized = 1;
     } else if (hr != RPC_E_CHANGED_MODE) {
-        fprintf(stderr, "a11y_uia: CoInitializeEx failed: 0x%08lx\n", hr);
+        MD_LOG_I("CoInitializeEx failed: 0x%08lx", hr);
         return -1;
     }
 
@@ -268,7 +270,7 @@ static int uia_init(MdA11yCtx *ctx) {
                           __uuidof(IUIAutomation),
                           (void **)&st->automation);
     if (FAILED(hr) || !st->automation) {
-        fprintf(stderr, "a11y_uia: failed to create IUIAutomation: 0x%08lx\n", hr);
+        MD_LOG_E("failed to create IUIAutomation: 0x%08lx", hr);
         if (st->lock_initialized) DeleteCriticalSection(&st->lock);
         if (st->com_initialized) CoUninitialize();
         free(st);
@@ -278,7 +280,7 @@ static int uia_init(MdA11yCtx *ctx) {
     /* Create a content tree walker (skips raw/control elements) */
     hr = st->automation->get_ContentViewWalker(&st->walker);
     if (FAILED(hr) || !st->walker) {
-        fprintf(stderr, "a11y_uia: failed to get ContentViewWalker\n");
+        MD_LOG_E("failed to get ContentViewWalker");
         SAFE_RELEASE(st->automation);
         if (st->lock_initialized) DeleteCriticalSection(&st->lock);
         if (st->com_initialized) CoUninitialize();
@@ -636,7 +638,7 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         st->change_cb = nullptr;
         st->change_userdata = nullptr;
         LeaveCriticalSection(&st->lock);
-        fprintf(stderr, "a11y_uia: failed to subscribe UIA events: 0x%08lx\n", hr);
+        MD_LOG_E("failed to subscribe UIA events: 0x%08lx", hr);
         return -1;
     }
 
@@ -703,7 +705,7 @@ const MdA11yBackend *md_a11y_backend_create(void) {
 
 extern "C"
 const MdA11yBackend *md_a11y_backend_create(void) {
-    fprintf(stderr, "a11y: UI Automation backend not available on this platform\n");
+    MD_LOG_I("UI Automation backend not available on this platform");
     return nullptr;
 }
 

@@ -31,6 +31,8 @@
 #include <json.h>
 #include <go.h>
 #include <nostr-kinds.h>
+#include "log.h"
+#define MD_LOG_TAG "nostr"
 
 /* Forward declaration — defined after DM helpers, used by auth handler */
 static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev);
@@ -127,8 +129,7 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
     free(accepted);
 
     if (ok_count == 0) {
-        fprintf(stderr, "nostr: publish rejected (or unacknowledged) by all %zu relays\n",
-                n->relay_count);
+        MD_LOG_W("publish rejected (or unacknowledged) by all %zu relays", n->relay_count);
         return -1;
     }
     return 0;
@@ -150,8 +151,7 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
         return;
 
     const char *relay_url = nostr_relay_get_url_const(relay);
-    fprintf(stderr, "nostr: NIP-42 AUTH challenge from %s\n",
-            relay_url ? relay_url : "(unknown)");
+    MD_LOG_I("NIP-42 AUTH challenge from %s", relay_url ? relay_url : "(unknown)");
 
     /* Build kind:22242 auth event with relay + challenge tags */
     NostrEvent *ev = nostr_event_new();
@@ -183,16 +183,14 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
     NostrEvent *signed_ev = sign_event_via_signer(n->signer, ev);
     nostr_event_free(ev);
     if (!signed_ev) {
-        fprintf(stderr, "nostr: AUTH sign failed for %s\n",
-                relay_url ? relay_url : "(unknown)");
+        MD_LOG_E("AUTH sign failed for %s", relay_url ? relay_url : "(unknown)");
         return;
     }
 
     /* Send the signed auth event back to the relay */
     nostr_relay_publish(relay, signed_ev);
     nostr_event_free(signed_ev);
-    fprintf(stderr, "nostr: AUTH response sent to %s\n",
-            relay_url ? relay_url : "(unknown)");
+    MD_LOG_I("AUTH response sent to %s", relay_url ? relay_url : "(unknown)");
 }
 
 /* ── Relay OK callback ─────────────────────────────────────────
@@ -207,10 +205,7 @@ static void md_nostr_ok_handler(const char *event_id, bool ok,
     if (!n) return;
 
     if (!ok) {
-        fprintf(stderr, "nostr: relay REJECTED event %.16s%s — %s\n",
-                event_id ? event_id : "(null)",
-                event_id && strlen(event_id) > 16 ? "..." : "",
-                reason ? reason : "(no reason)");
+        MD_LOG_W("relay REJECTED event %.16s%s — %s", event_id ? event_id : "(null)", event_id && strlen(event_id) > 16 ? "..." : "", reason ? reason : "(no reason)");
     }
 
     if (n->cbs.on_publish_result) {
@@ -361,7 +356,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming,
             return;
         char canon[65];
         if (nostr_event_validate(ev, canon) != NOSTR_EVENT_VALIDATION_OK) {
-            fprintf(stderr, "nostr: rejected allowlist event with invalid id/sig\n");
+            MD_LOG_W("rejected allowlist event with invalid id/sig");
             return;
         }
 
@@ -376,8 +371,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming,
             n->allowlist_refresh_loaded = true;
             size_t count = list->count;
             pthread_mutex_unlock(&n->allowlist_mu);
-            fprintf(stderr, "nostr: refreshed allowlist (%zu entries)\n",
-                    count);
+            MD_LOG_I("refreshed allowlist (%zu entries)", count);
         } else {
             nostr_nip51_list_free(list);
         }
@@ -465,7 +459,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     } else {
         n->signer = md_signer_create_direct(cfg->sk_hex);
         if (!n->signer) {
-            fprintf(stderr, "nostr: failed to create signer from sk_hex\n");
+            MD_LOG_E("failed to create signer from sk_hex");
             free(n);
             return NULL;
         }
@@ -475,7 +469,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     /* Get pubkey from signer */
     char *pk = NULL;
     if (md_signer_get_pubkey(n->signer, &pk) != MD_SIGNER_OK || !pk) {
-        fprintf(stderr, "nostr: failed to get pubkey from signer\n");
+        MD_LOG_E("failed to get pubkey from signer");
         if (n->owns_signer) md_signer_destroy(n->signer);
         free(n);
         return NULL;
@@ -537,7 +531,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
 
     if (n->relay_count == 0) {
         /* A bridge with no usable relays cannot perform any operation */
-        fprintf(stderr, "nostr: no usable relays — bridge creation failed\n");
+        MD_LOG_E("no usable relays — bridge creation failed");
         md_nostr_destroy(n);
         return NULL;
     }
@@ -551,9 +545,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
      * leave the first subscription matching against freed memory. */
     md_nostr_subscribe(n);
 
-    fprintf(stderr, "nostr: bridge ready (signer=%s, pk=%.*s..., relays=%zu)\n",
-            md_signer_type_name(md_signer_get_type(n->signer)),
-            8, n->pk_hex, n->relay_count);
+    MD_LOG_I("bridge ready (signer=%s, pk=%.*s..., relays=%zu)", md_signer_type_name(md_signer_get_type(n->signer)), 8, n->pk_hex, n->relay_count);
 
     return n;
 }
@@ -759,10 +751,7 @@ static void warn_allowlist_startup_window(const MdNostr *n) {
     if (!n || n->allowlist_refresh_loaded || n->allowlist)
         return;
 
-    fprintf(stderr,
-            "nostr: WARNING: allowlist checked before first NIP-51 refresh (%s); "
-            "startup window remains open until relay data arrives\n",
-            n->allowlist_refresh_requested ? "waiting for relay data" : "refresh not requested");
+    MD_LOG_W("WARNING: allowlist checked before first NIP-51 refresh (%s); startup window remains open until relay data arrives", n->allowlist_refresh_requested ? "waiting for relay data" : "refresh not requested");
 }
 
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
@@ -878,7 +867,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
     nostr_event_free(signed_event);
 
     if (ret == 0)
-        fprintf(stderr, "nostr: published allowlist (%zu entries)\n", count);
+        MD_LOG_I("published allowlist (%zu entries)", count);
 
     return ret;
 }
@@ -933,8 +922,7 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     nostr_event_free(signed_event);
 
     if (ret == 0)
-        fprintf(stderr, "nostr: published updated allowlist (%zu entries)\n",
-                count);
+        MD_LOG_I("published updated allowlist (%zu entries)", count);
 
     return ret;
 }
@@ -980,7 +968,7 @@ int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json) {
     /* Parse the JSON into a NostrEvent for publish_all */
     NostrEvent *ev = event_from_json(signed_event_json);
     if (!ev) {
-        fprintf(stderr, "nostr: publish_signed_json: failed to parse event\n");
+        MD_LOG_I("publish_signed_json: failed to parse event");
         return -1;
     }
 
@@ -988,7 +976,7 @@ int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json) {
     nostr_event_free(ev);
 
     if (ret == 0) {
-        fprintf(stderr, "nostr: published signed event\n");
+        MD_LOG_I("published signed event");
     }
 
     return ret;

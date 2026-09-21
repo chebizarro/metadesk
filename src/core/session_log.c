@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <cjson/cJSON.h>
+#include "log.h"
+#define MD_LOG_TAG "session_log"
 
 /* ── Event type names ────────────────────────────────────────── */
 
@@ -181,8 +183,7 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
             free(pk_hex);
         }
         if (sign_status != 0) {
-            fprintf(stderr, "session_log: ERROR: failed to sign %s event\n",
-                    md_session_log_event_name(type));
+            MD_LOG_E("ERROR: failed to sign %s event", md_session_log_event_name(type));
         }
     }
 
@@ -194,8 +195,7 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
     if (log->publish && log->nostr && signed_json) {
         int pret = md_nostr_publish_signed_json(log->nostr, signed_json);
         if (pret != 0) {
-            fprintf(stderr, "session_log: WARNING: failed to publish signed %s event\n",
-                    md_session_log_event_name(type));
+            MD_LOG_W("WARNING: failed to publish signed %s event", md_session_log_event_name(type));
         }
     }
 
@@ -205,12 +205,7 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
 
     free(content);
 
-    fprintf(stderr, "session_log: %s session=%s peer=%.*s detail=%s\n",
-            md_session_log_event_name(type),
-            session_id ? session_id : "(none)",
-            peer_pubkey ? 8 : 0,
-            peer_pubkey ? peer_pubkey : "",
-            detail ? detail : "(none)");
+    MD_LOG_I("%s session=%s peer=%.*s detail=%s", md_session_log_event_name(type), session_id ? session_id : "(none)", peer_pubkey ? 8 : 0, peer_pubkey ? peer_pubkey : "", detail ? detail : "(none)");
 
     return sign_status;
 }

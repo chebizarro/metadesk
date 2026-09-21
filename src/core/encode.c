@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "log.h"
+#define MD_LOG_TAG "encode"
 
 struct MdEncoder {
     MdEncoderConfig      config;
@@ -47,8 +49,7 @@ struct MdEncoder {
 
 static void warn_opt_failure(const char *codec_name, const char *opt_name, int ret) {
     if (ret < 0) {
-        fprintf(stderr, "encode: warning: %s option '%s' failed: %d\n",
-                codec_name ? codec_name : "encoder", opt_name, ret);
+        MD_LOG_W("warning: %s option '%s' failed: %d", codec_name ? codec_name : "encoder", opt_name, ret);
     }
 }
 

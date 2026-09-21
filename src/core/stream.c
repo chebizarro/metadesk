@@ -36,6 +36,8 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
+#include "log.h"
+#define MD_LOG_TAG "stream"
 
 /* ── Structures ──────────────────────────────────────────────── */
 
@@ -204,8 +206,7 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
 static void set_tcp_nodelay(int fd) {
     int flag = 1;
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
-        fprintf(stderr, "stream: warning: failed to set TCP_NODELAY: %s\n",
-                strerror(errno));
+        MD_LOG_W("warning: failed to set TCP_NODELAY: %s", strerror(errno));
     }
 }
 
@@ -277,8 +278,7 @@ static SSL_CTX *tls_server_ctx_from_files(const char *cert_path,
 
     if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1 ||
         SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1) {
-        fprintf(stderr, "stream: failed to load TLS cert/key from %s / %s\n",
-                cert_path, key_path);
+        MD_LOG_E("failed to load TLS cert/key from %s / %s", cert_path, key_path);
         SSL_CTX_free(ctx);
         return NULL;
     }
@@ -362,15 +362,15 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
         } else {
             srv->ssl_ctx = tls_server_ctx_self_signed();
             if (srv->ssl_ctx)
-                fprintf(stderr, "stream: using ephemeral self-signed TLS cert\n");
+                MD_LOG_I("using ephemeral self-signed TLS cert");
         }
         if (!srv->ssl_ctx) {
-            fprintf(stderr, "stream: ERROR — failed to initialize TLS context\n");
+            MD_LOG_E("ERROR — failed to initialize TLS context");
             close(fd);
             free(srv);
             return NULL;
         }
-        fprintf(stderr, "stream: TLS enabled (TLS 1.3)\n");
+        MD_LOG_I("TLS enabled (TLS 1.3)");
     }
 
     return srv;
@@ -394,7 +394,7 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
 
     char addr_str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &client_addr.sin6_addr, addr_str, sizeof(addr_str));
-    fprintf(stderr, "stream: accepted connection from %s\n", addr_str);
+    MD_LOG_I("accepted connection from %s", addr_str);
 
     /* TLS handshake if server has a TLS context */
     SSL *ssl = NULL;
@@ -406,13 +406,12 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
         }
         SSL_set_fd(ssl, client_fd);
         if (SSL_accept(ssl) != 1) {
-            fprintf(stderr, "stream: TLS handshake failed for %s\n", addr_str);
+            MD_LOG_E("TLS handshake failed for %s", addr_str);
             SSL_free(ssl);
             close(client_fd);
             return NULL;
         }
-        fprintf(stderr, "stream: TLS handshake complete (%s)\n",
-                SSL_get_version(ssl));
+        MD_LOG_I("TLS handshake complete (%s)", SSL_get_version(ssl));
     }
 
     return stream_from_fd(client_fd, ssl);
@@ -531,15 +530,14 @@ MdStream *md_stream_connect_tls(const char *host, uint16_t port,
         SSL_set1_host(ssl, host);
 
     if (SSL_connect(ssl) != 1) {
-        fprintf(stderr, "stream: TLS handshake failed connecting to %s:%u\n",
-                host, port);
+        MD_LOG_E("TLS handshake failed connecting to %s:%u", host, port);
         SSL_free(ssl);
         md_stream_destroy(s);
         return NULL;
     }
 
     s->ssl = ssl;
-    fprintf(stderr, "stream: TLS connected (%s)\n", SSL_get_version(ssl));
+    MD_LOG_I("TLS connected (%s)", SSL_get_version(ssl));
     return s;
 }
 
@@ -555,12 +553,11 @@ MdStream *md_stream_connect_fips(const char *npub, uint16_t port,
      * then falls back to direct computation. */
     char ipv6_str[MD_FIPS_IPV6_STRLEN];
     if (md_fips_resolve(npub, ipv6_str, sizeof(ipv6_str)) < 0) {
-        fprintf(stderr, "stream: failed to resolve FIPS address for npub\n");
+        MD_LOG_E("failed to resolve FIPS address for npub");
         return NULL;
     }
 
-    fprintf(stderr, "stream: FIPS resolved %.*s... → %s\n",
-            12, npub, ipv6_str);
+    MD_LOG_I("FIPS resolved %.*s... → %s", 12, npub, ipv6_str);
 
     /* Connect using the resolved IPv6 address */
     return md_stream_connect(ipv6_str, port, timeout_ms);

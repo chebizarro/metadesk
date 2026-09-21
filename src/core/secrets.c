@@ -27,6 +27,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include "log.h"
+#define MD_LOG_TAG "secrets"
 
 /* ── Constants ───────────────────────────────────────────────── */
 
@@ -342,11 +344,9 @@ static char *find_vault_id(MdSecrets *s, const char *vault_name) {
     char *body = http_get(s, "/v1/vaults", &body_len, &status);
     if (!body) {
         if (status == 401 || status == 403)
-            fprintf(stderr, "secrets: Connect auth failed (HTTP %ld) — check token\n",
-                    status);
+            MD_LOG_I("Connect auth failed (HTTP %ld) — check token", status);
         else if (status == 0)
-            fprintf(stderr, "secrets: Connect server unreachable at %s\n",
-                    s->connect_url);
+            MD_LOG_I("Connect server unreachable at %s", s->connect_url);
         return NULL;
     }
 
@@ -522,10 +522,7 @@ MdSecrets *md_secrets_create(const char *connect_url, const char *token) {
 
     if (!is_loopback_host(s->host) &&
         strncmp(connect_url, "http://", 7) == 0) {
-        fprintf(stderr,
-                "secrets: WARNING — 1Password Connect URL '%s' is non-loopback HTTP; "
-                "bearer token and secrets may traverse the network in plaintext\n",
-                connect_url);
+        MD_LOG_W("WARNING — 1Password Connect URL '%s' is non-loopback HTTP; bearer token and secrets may traverse the network in plaintext", connect_url);
     }
 
     /* Copy token into mlock'd region */
@@ -534,7 +531,7 @@ MdSecrets *md_secrets_create(const char *connect_url, const char *token) {
 
     /* Lock the token in memory to prevent swapping. */
     if (md_mem_lock(s->token, sizeof(s->token)) < 0) {
-        fprintf(stderr, "secrets: memory lock failed: %s\n", strerror(errno));
+        MD_LOG_I("memory lock failed: %s", strerror(errno));
         md_secure_zero(s->token, sizeof(s->token));
         free(s->host);
         free(s->connect_url);
@@ -560,15 +557,14 @@ int md_secrets_get(MdSecrets *s, const char *item_ref,
     /* Step 1: Find vault ID */
     char *vault_id = find_vault_id(s, vault_name);
     if (!vault_id) {
-        fprintf(stderr, "secrets: vault '%s' not found\n", vault_name);
+        MD_LOG_I("vault '%s' not found", vault_name);
         goto cleanup;
     }
 
     /* Step 2: Find item ID */
     char *item_id = find_item_id(s, vault_id, item_name);
     if (!item_id) {
-        fprintf(stderr, "secrets: item '%s' not found in vault '%s'\n",
-                item_name, vault_name);
+        MD_LOG_I("item '%s' not found in vault '%s'", item_name, vault_name);
         free(vault_id);
         goto cleanup;
     }
@@ -579,16 +575,14 @@ int md_secrets_get(MdSecrets *s, const char *item_ref,
     free(item_id);
 
     if (!value) {
-        fprintf(stderr, "secrets: field '%s' not found in item '%s'\n",
-                field_name, item_name);
+        MD_LOG_I("field '%s' not found in item '%s'", field_name, item_name);
         goto cleanup;
     }
 
     /* Copy value to caller's buffer. Refuse silent truncation. */
     size_t value_len = strlen(value);
     if (value_len > buf_len) {
-        fprintf(stderr, "secrets: output buffer too small for field '%s'\n",
-                field_name);
+        MD_LOG_I("output buffer too small for field '%s'", field_name);
         result = -1;
     } else {
         memcpy(buf, value, value_len);

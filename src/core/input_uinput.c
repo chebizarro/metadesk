@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <time.h>
+#include "log.h"
+#define MD_LOG_TAG "input_uinput"
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -55,7 +57,7 @@ static void uinput_delay(void) {
 static int create_keyboard(void) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "input_uinput: cannot open /dev/uinput: %s\n", strerror(errno));
+        MD_LOG_I("cannot open /dev/uinput: %s", strerror(errno));
         return -1;
     }
 
@@ -98,7 +100,7 @@ static int create_keyboard(void) {
 static int create_mouse(uint32_t screen_w, uint32_t screen_h) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "input_uinput: cannot open /dev/uinput: %s\n", strerror(errno));
+        MD_LOG_I("cannot open /dev/uinput: %s", strerror(errno));
         return -1;
     }
 
@@ -151,12 +153,7 @@ static bool uinput_dimensions_are_valid(const MdInputConfig *cfg) {
 
 static int uinput_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
     if (!uinput_dimensions_are_valid(cfg)) {
-        fprintf(stderr,
-                "input_uinput: ERROR — screen dimensions must be configured "
-                "and >= %u (got %ux%u)\n",
-                MD_INPUT_MIN_SCREEN_DIMENSION,
-                cfg ? cfg->screen_width : 0,
-                cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
         return -1;
     }
 
@@ -170,18 +167,17 @@ static int uinput_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
 
     st->kbd_fd = create_keyboard();
     if (st->kbd_fd < 0)
-        fprintf(stderr, "input_uinput: WARNING — keyboard device creation failed\n");
+        MD_LOG_W("WARNING — keyboard device creation failed");
 
     st->mouse_fd = create_mouse(st->screen_w, st->screen_h);
     if (st->mouse_fd < 0)
-        fprintf(stderr, "input_uinput: WARNING — mouse device creation failed\n");
+        MD_LOG_W("WARNING — mouse device creation failed");
 
     ctx->backend_data = st;
     ctx->ready = (st->kbd_fd >= 0 || st->mouse_fd >= 0);
 
     if (!ctx->ready)
-        fprintf(stderr, "input_uinput: ERROR — no virtual devices created. "
-                "Check /dev/uinput permissions.\n");
+        MD_LOG_E("ERROR — no virtual devices created. Check /dev/uinput permissions.");
 
     return 0; /* return success even if not ready — caller checks is_ready */
 }

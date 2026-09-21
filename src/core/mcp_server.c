@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include "log.h"
+#define MD_LOG_TAG "mcp"
 
 /* ── MCP protocol version ────────────────────────────────────── */
 
@@ -79,9 +81,7 @@ static int handle_initialize(MdMcpServer *s, const MdJsonRpcId *id,
         if (cJSON_IsString(pv)) {
             /* MCP spec: server should check compatibility */
             if (strcmp(pv->valuestring, MCP_PROTOCOL_VERSION) != 0) {
-                fprintf(stderr, "mcp: client protocol version '%s' "
-                        "(server supports '%s')\n",
-                        pv->valuestring, MCP_PROTOCOL_VERSION);
+                MD_LOG_I("client protocol version '%s' (server supports '%s')", pv->valuestring, MCP_PROTOCOL_VERSION);
                 /* Continue anyway — respond with our version per spec */
             }
         }
@@ -91,9 +91,7 @@ static int handle_initialize(MdMcpServer *s, const MdJsonRpcId *id,
         if (ci && cJSON_IsObject(ci)) {
             cJSON *name = cJSON_GetObjectItemCaseSensitive(ci, "name");
             cJSON *ver = cJSON_GetObjectItemCaseSensitive(ci, "version");
-            fprintf(stderr, "mcp: client=%s/%s\n",
-                    cJSON_IsString(name) ? name->valuestring : "unknown",
-                    cJSON_IsString(ver)  ? ver->valuestring  : "?");
+            MD_LOG_I("client=%s/%s", cJSON_IsString(name) ? name->valuestring : "unknown", cJSON_IsString(ver)  ? ver->valuestring  : "?");
         }
     }
 
@@ -134,8 +132,7 @@ static int handle_initialized(MdMcpServer *s)
         return 0;
     }
 
-    fprintf(stderr,
-            "mcp: ignoring initialized notification before initialize\n");
+    MD_LOG_I("ignoring initialized notification before initialize");
     return -1;
 }
 

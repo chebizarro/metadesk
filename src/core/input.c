@@ -14,6 +14,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include "log.h"
+#define MD_LOG_TAG "input"
 
 /* Small delay between synthetic events for reliability. */
 static void input_delay(void) {
@@ -146,10 +148,7 @@ static void input_apply_fallback_dimensions(MdInputConfig *cfg,
                                             const char *reason) {
     cfg->screen_width = MD_INPUT_FALLBACK_SCREEN_WIDTH;
     cfg->screen_height = MD_INPUT_FALLBACK_SCREEN_HEIGHT;
-    fprintf(stderr,
-            "input: WARNING — using fallback screen dimensions %ux%u (%s)\n",
-            cfg->screen_width, cfg->screen_height,
-            reason ? reason : "actual display dimensions unavailable");
+    MD_LOG_W("WARNING — using fallback screen dimensions %ux%u (%s)", cfg->screen_width, cfg->screen_height, reason ? reason : "actual display dimensions unavailable");
 }
 
 MdInput *md_input_create(const MdInputConfig *cfg) {
@@ -235,7 +234,7 @@ int md_input_key_combo(MdInput *inp, const char **keys, int key_count) {
     for (int i = 0; i < key_count; i++) {
         syms[i] = md_input_keysym_from_name(keys[i]);
         if (syms[i] == 0) {
-            fprintf(stderr, "input: unknown key name '%s'\n", keys[i]);
+            MD_LOG_I("unknown key name '%s'", keys[i]);
             return -1;
         }
     }
@@ -318,7 +317,7 @@ int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
 
     case MD_ACTION_UNKNOWN:
     default:
-        fprintf(stderr, "input: unknown action type %d\n", action->type);
+        MD_LOG_I("unknown action type %d", action->type);
         return -1;
     }
 }

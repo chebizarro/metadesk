@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <pthread.h>
+#include "log.h"
+#define MD_LOG_TAG "a11y_axui"
 
 /* Maximum tree depth to prevent infinite recursion */
 #define MD_AX_MAX_DEPTH 32
@@ -461,9 +463,7 @@ static int axui_create_observers(MdA11yCtx *ctx, AXObserverRecord **out_records,
             AXObserverRef observer = NULL;
             AXError err = AXObserverCreate(pid, axui_observer_cb, &observer);
             if (err != kAXErrorSuccess || !observer) {
-                fprintf(stderr,
-                        "a11y_axui: failed to create AXObserver for pid %d: %s\n",
-                        (int)pid, axui_ax_error_name(err));
+                MD_LOG_E("failed to create AXObserver for pid %d: %s", (int)pid, axui_ax_error_name(err));
                 CFRelease(app_elem);
                 continue;
             }
@@ -485,9 +485,7 @@ static int axui_create_observers(MdA11yCtx *ctx, AXObserverRecord **out_records,
                  * notification registered for this app. */
                 if (err != kAXErrorNotificationUnsupported &&
                     err != kAXErrorNotImplemented) {
-                    fprintf(stderr,
-                            "a11y_axui: failed to register AX notification for pid %d: %s\n",
-                            (int)pid, axui_ax_error_name(err));
+                    MD_LOG_E("failed to register AX notification for pid %d: %s", (int)pid, axui_ax_error_name(err));
                 }
             }
 
@@ -578,8 +576,7 @@ static int axui_init(MdA11yCtx *ctx) {
     NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
     Boolean trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
     if (!trusted) {
-        fprintf(stderr, "a11y_axui: accessibility permission not granted.\n"
-                "Please enable in System Settings > Privacy & Security > Accessibility.\n");
+        MD_LOG_I("accessibility permission not granted.\nPlease enable in System Settings > Privacy & Security > Accessibility.");
         /* Don't fail — permission may be granted while we're running.
          * get_tree will return empty results until granted. */
     }
@@ -682,8 +679,7 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     pthread_mutex_unlock(&st->lock);
 
     if (!AXIsProcessTrusted()) {
-        fprintf(stderr,
-                "a11y_axui: accessibility permission required for AXObserver subscriptions\n");
+        MD_LOG_I("accessibility permission required for AXObserver subscriptions");
         return -1;
     }
 
@@ -695,8 +691,7 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     AXObserverRecord *records = NULL;
     size_t record_count = 0;
     if (axui_create_observers(ctx, &records, &record_count) != 0) {
-        fprintf(stderr,
-                "a11y_axui: failed to create any AXObserver subscriptions\n");
+        MD_LOG_E("failed to create any AXObserver subscriptions");
         return -1;
     }
 

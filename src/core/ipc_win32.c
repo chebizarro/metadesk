@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "log.h"
+#define MD_LOG_TAG "ipc"
 
 /* ── Path construction ───────────────────────────────────────── */
 
@@ -162,8 +164,7 @@ MdIpcServer *md_ipc_listen(const char *name) {
                                         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED);
 
     if (srv->pipe == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "ipc: CreateNamedPipe failed for '%s': %lu\n",
-                srv->path, GetLastError());
+        MD_LOG_I("CreateNamedPipe failed for '%s': %lu", srv->path, GetLastError());
         free(srv);
         return NULL;
     }
@@ -247,7 +248,7 @@ MdIpcConn *md_ipc_connect(const char *name, uint32_t timeout_ms) {
     /* Wait for the pipe to become available */
     DWORD wait_ms = (timeout_ms > 0) ? timeout_ms : NMPWAIT_WAIT_FOREVER;
     if (!WaitNamedPipeA(path, wait_ms)) {
-        fprintf(stderr, "ipc: pipe '%s' not available: %lu\n", path, GetLastError());
+        MD_LOG_I("pipe '%s' not available: %lu", path, GetLastError());
         return NULL;
     }
 

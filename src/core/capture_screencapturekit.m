@@ -28,6 +28,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "log.h"
+#define MD_LOG_TAG "capture_sck"
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -192,7 +194,7 @@ static int sck_start(MdCaptureCtx *ctx) {
     if (@available(macOS 12.3, *)) {
         /* ok */
     } else {
-        fprintf(stderr, "capture: ScreenCaptureKit requires macOS 12.3+\n");
+        MD_LOG_I("ScreenCaptureKit requires macOS 12.3+");
         return -1;
     }
 
@@ -215,15 +217,14 @@ static int sck_start(MdCaptureCtx *ctx) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 
     if (!shareableContent || contentError) {
-        fprintf(stderr, "capture: failed to get shareable content: %s\n",
-                contentError ? [[contentError localizedDescription] UTF8String] : "unknown error");
+        MD_LOG_E("failed to get shareable content: %s", contentError ? [[contentError localizedDescription] UTF8String] : "unknown error");
         return -1;
     }
 
     /* Pick the main display (first in list) */
     NSArray<SCDisplay *> *displays = shareableContent.displays;
     if (displays.count == 0) {
-        fprintf(stderr, "capture: no displays found\n");
+        MD_LOG_I("no displays found");
         return -1;
     }
     SCDisplay *mainDisplay = displays[0];
@@ -263,8 +264,7 @@ static int sck_start(MdCaptureCtx *ctx) {
              sampleHandlerQueue:captureQueue
                       error:&addOutputError];
     if (addOutputError) {
-        fprintf(stderr, "capture: failed to add stream output: %s\n",
-                [[addOutputError localizedDescription] UTF8String]);
+        MD_LOG_E("failed to add stream output: %s", [[addOutputError localizedDescription] UTF8String]);
         return -1;
     }
 
@@ -284,8 +284,7 @@ static int sck_start(MdCaptureCtx *ctx) {
     dispatch_semaphore_wait(startSem, DISPATCH_TIME_FOREVER);
 
     if (startError) {
-        fprintf(stderr, "capture: failed to start capture: %s\n",
-                [[startError localizedDescription] UTF8String]);
+        MD_LOG_E("failed to start capture: %s", [[startError localizedDescription] UTF8String]);
         return -1;
     }
 
@@ -413,6 +412,6 @@ const MdCaptureBackend *md_capture_backend_create(void) {
     if (@available(macOS 12.3, *)) {
         return &screencapturekit_backend;
     }
-    fprintf(stderr, "capture: ScreenCaptureKit requires macOS 12.3+\n");
+    MD_LOG_I("ScreenCaptureKit requires macOS 12.3+");
     return NULL;
 }

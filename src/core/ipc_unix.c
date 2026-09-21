@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "log.h"
+#define MD_LOG_TAG "ipc"
 
 /* ── Path construction ───────────────────────────────────────── */
 
@@ -122,8 +124,7 @@ MdIpcServer *md_ipc_listen(const char *name) {
     }
 
     if (ipc_unlink_stale_socket(srv->path) < 0) {
-        fprintf(stderr, "ipc: refusing to replace non-socket endpoint '%s': %s\n",
-                srv->path, strerror(errno));
+        MD_LOG_I("refusing to replace non-socket endpoint '%s': %s", srv->path, strerror(errno));
         free(srv);
         return NULL;
     }
@@ -136,7 +137,7 @@ MdIpcServer *md_ipc_listen(const char *name) {
 
     struct sockaddr_un addr;
     if (ipc_fill_addr(srv->path, &addr) < 0) {
-        fprintf(stderr, "ipc: socket path too long for '%s'\n", srv->path);
+        MD_LOG_I("socket path too long for '%s'", srv->path);
         close(srv->fd);
         free(srv);
         return NULL;
@@ -149,7 +150,7 @@ MdIpcServer *md_ipc_listen(const char *name) {
 
     if (bind_ret < 0) {
         errno = bind_errno;
-        fprintf(stderr, "ipc: bind failed for '%s': %s\n", srv->path, strerror(errno));
+        MD_LOG_I("bind failed for '%s': %s", srv->path, strerror(errno));
         close(srv->fd);
         free(srv);
         return NULL;
@@ -157,7 +158,7 @@ MdIpcServer *md_ipc_listen(const char *name) {
 
     /* Ensure owner-only permissions even on platforms with unusual defaults. */
     if (chmod(srv->path, 0600) < 0) {
-        fprintf(stderr, "ipc: chmod failed for '%s': %s\n", srv->path, strerror(errno));
+        MD_LOG_I("chmod failed for '%s': %s", srv->path, strerror(errno));
         close(srv->fd);
         unlink(srv->path);
         free(srv);

@@ -25,6 +25,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include "log.h"
+#define MD_LOG_TAG "input_cgevent"
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -147,12 +149,7 @@ static bool cg_dimensions_are_valid(const MdInputConfig *cfg) {
 
 static int cg_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
     if (!cg_dimensions_are_valid(cfg)) {
-        fprintf(stderr,
-                "input_cgevent: ERROR — screen dimensions must be configured "
-                "and >= %u (got %ux%u)\n",
-                MD_INPUT_MIN_SCREEN_DIMENSION,
-                cfg ? cfg->screen_width : 0,
-                cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
         return -1;
     }
 
@@ -174,8 +171,7 @@ static int cg_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
         CFRelease(test);
         ctx->ready = true;
     } else {
-        fprintf(stderr, "input_cgevent: WARNING — cannot create CGEvent. "
-                "Check Input Monitoring permission.\n");
+        MD_LOG_W("WARNING — cannot create CGEvent. Check Input Monitoring permission.");
         ctx->ready = false;
     }
 
@@ -251,7 +247,7 @@ static int cg_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
 
     uint16_t vk = linux_key_to_mac_vk(keysym);
     if (vk == UINT16_MAX) {
-        fprintf(stderr, "input_cgevent: unknown keysym 0x%04x\n", keysym);
+        MD_LOG_I("unknown keysym 0x%04x", keysym);
         return -1;
     }
 

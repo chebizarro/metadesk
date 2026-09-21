@@ -28,6 +28,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include "log.h"
+#define MD_LOG_TAG "fips_addr"
 
 /* ── Bech32 decoder (for npub → raw bytes) ───────────────────── */
 
@@ -365,8 +367,7 @@ int md_fips_resolve(const char *npub,
 
     /* Fall back to deterministic address computation only.  This does not
      * prove that FIPS has discovered the peer or installed a usable route. */
-    fprintf(stderr, "fips: DNS resolution failed for %s, computing deterministic fallback address\n",
-            dns_name);
+    MD_LOG_I("DNS resolution failed for %s, computing deterministic fallback address", dns_name);
     return md_fips_addr_from_npub(npub, ipv6_out, ipv6_len);
 }
 

@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "log.h"
+#define MD_LOG_TAG "signer"
 #include "platform.h"
 #include <errno.h>
 
@@ -191,7 +193,7 @@ MdSigner *md_signer_create_direct(const char *sk_hex) {
     dk->sk_hex[64] = '\0';
 
     if (md_mem_lock(dk->sk_hex, sizeof(dk->sk_hex)) < 0) {
-        fprintf(stderr, "signer: WARNING — md_mem_lock failed: %s\n", strerror(errno));
+        MD_LOG_W("WARNING — md_mem_lock failed: %s", strerror(errno));
     }
 
     /* Derive public key */
@@ -217,8 +219,7 @@ MdSigner *md_signer_create_direct(const char *sk_hex) {
     /* Cache pubkey */
     s->pubkey_hex = strdup(dk->pk_hex);
 
-    fprintf(stderr, "signer: direct-key backend ready (pk=%.*s...)\n",
-            8, dk->pk_hex);
+    MD_LOG_I("direct-key backend ready (pk=%.*s...)", 8, dk->pk_hex);
     return s;
 }
 
@@ -323,7 +324,7 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     /* Parse bunker:// URI */
     NostrNip46BunkerURI parsed;
     if (nostr_nip46_uri_parse_bunker(bunker_uri, &parsed) != 0) {
-        fprintf(stderr, "signer: invalid bunker URI\n");
+        MD_LOG_E("invalid bunker URI");
         return NULL;
     }
 
@@ -336,7 +337,7 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
 
     /* Connect to bunker */
     if (nostr_nip46_client_connect(session, bunker_uri, NULL) != 0) {
-        fprintf(stderr, "signer: NIP-46 connect failed\n");
+        MD_LOG_I("NIP-46 connect failed");
         nostr_nip46_session_free(session);
         nostr_nip46_uri_bunker_free(&parsed);
         return NULL;
@@ -347,7 +348,7 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
 
     /* Start persistent relay connection */
     if (nostr_nip46_client_start(session) != 0) {
-        fprintf(stderr, "signer: NIP-46 relay connection failed\n");
+        MD_LOG_I("NIP-46 relay connection failed");
         nostr_nip46_session_free(session);
         nostr_nip46_uri_bunker_free(&parsed);
         return NULL;
@@ -357,7 +358,7 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     char *connect_result = NULL;
     if (nostr_nip46_client_connect_rpc(session, parsed.secret, NULL,
                                        &connect_result) != 0) {
-        fprintf(stderr, "signer: NIP-46 connect RPC failed\n");
+        MD_LOG_I("NIP-46 connect RPC failed");
         nostr_nip46_client_stop(session);
         nostr_nip46_session_free(session);
         nostr_nip46_uri_bunker_free(&parsed);
@@ -395,9 +396,9 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     char *pk = NULL;
     if (nip46_get_pubkey(s, &pk) == MD_SIGNER_OK) {
         s->pubkey_hex = pk;
-        fprintf(stderr, "signer: NIP-46 backend ready (pk=%.*s...)\n", 8, pk);
+        MD_LOG_I("NIP-46 backend ready (pk=%.*s...)", 8, pk);
     } else {
-        fprintf(stderr, "signer: NIP-46 backend ready (pubkey pending)\n");
+        MD_LOG_I("NIP-46 backend ready (pubkey pending)");
     }
 
     return s;
@@ -433,7 +434,7 @@ MdSigner *md_signer_create_nip46_from_session(
 MdSigner *md_signer_create_nip46(const char *bunker_uri,
                                  uint32_t timeout_ms) {
     (void)bunker_uri; (void)timeout_ms;
-    fprintf(stderr, "signer: NIP-46 backend not compiled\n");
+    MD_LOG_I("NIP-46 backend not compiled");
     return NULL;
 }
 
@@ -441,7 +442,7 @@ MdSigner *md_signer_create_nip46_from_session(
     struct NostrNip46Session *session,
     const char *remote_pubkey_hex) {
     (void)session; (void)remote_pubkey_hex;
-    fprintf(stderr, "signer: NIP-46 backend not compiled (test path)\n");
+    MD_LOG_I("NIP-46 backend not compiled (test path)");
     return NULL;
 }
 
@@ -550,7 +551,7 @@ MdSigner *md_signer_create_nip55l(void) {
     char *npub = NULL;
     int ret = nostr_nip55l_get_public_key(&npub);
     if (ret != 0 || !npub) {
-        fprintf(stderr, "signer: NIP-55L D-Bus signer not available\n");
+        MD_LOG_I("NIP-55L D-Bus signer not available");
         return NULL;
     }
 
@@ -558,7 +559,7 @@ MdSigner *md_signer_create_nip55l(void) {
     char *pk = npub_to_hex(npub);
     free(npub);
     if (!pk) {
-        fprintf(stderr, "signer: NIP-55L npub decode failed\n");
+        MD_LOG_I("NIP-55L npub decode failed");
         return NULL;
     }
 
@@ -570,15 +571,14 @@ MdSigner *md_signer_create_nip55l(void) {
     s->backend    = NULL;  /* stateless */
     s->pubkey_hex = pk;
 
-    fprintf(stderr, "signer: NIP-55L D-Bus backend ready (pk=%.*s...)\n",
-            8, pk);
+    MD_LOG_I("NIP-55L D-Bus backend ready (pk=%.*s...)", 8, pk);
     return s;
 }
 
 #else /* !MD_SIGNER_ENABLE_NIP55L */
 
 MdSigner *md_signer_create_nip55l(void) {
-    fprintf(stderr, "signer: NIP-55L backend not compiled\n");
+    MD_LOG_I("NIP-55L backend not compiled");
     return NULL;
 }
 
@@ -690,14 +690,14 @@ static const char *nip5f_default_socket_path(void) {
 MdSigner *md_signer_create_nip5f(const char *socket_path) {
     const char *path = socket_path ? socket_path : nip5f_default_socket_path();
     if (!path) {
-        fprintf(stderr, "signer: NIP-5F socket path not determined\n");
+        MD_LOG_I("NIP-5F socket path not determined");
         return NULL;
     }
 
     void *conn = NULL;
     int ret = nostr_nip5f_client_connect(path, &conn);
     if (ret != 0 || !conn) {
-        fprintf(stderr, "signer: NIP-5F connect failed: %s\n", path);
+        MD_LOG_I("NIP-5F connect failed: %s", path);
         return NULL;
     }
 
@@ -705,7 +705,7 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
     char *pk = NULL;
     ret = nostr_nip5f_client_get_public_key(conn, &pk);
     if (ret != 0 || !pk) {
-        fprintf(stderr, "signer: NIP-5F get_public_key failed\n");
+        MD_LOG_I("NIP-5F get_public_key failed");
         nostr_nip5f_client_close(conn);
         return NULL;
     }
@@ -735,8 +735,7 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
     s->backend    = st;
     s->pubkey_hex = pk;
 
-    fprintf(stderr, "signer: NIP-5F backend ready (pk=%.*s..., socket=%s)\n",
-            8, pk, path);
+    MD_LOG_I("NIP-5F backend ready (pk=%.*s..., socket=%s)", 8, pk, path);
     return s;
 }
 
@@ -744,7 +743,7 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
 
 MdSigner *md_signer_create_nip5f(const char *socket_path) {
     (void)socket_path;
-    fprintf(stderr, "signer: NIP-5F backend not compiled\n");
+    MD_LOG_I("NIP-5F backend not compiled");
     return NULL;
 }
 
@@ -765,8 +764,7 @@ MdSigner *md_signer_auto_detect(void) {
     s = md_signer_create_nip55l();
     if (s) return s;
 
-    fprintf(stderr, "signer: no local signer detected "
-            "(tried NIP-5F socket, NIP-55L D-Bus)\n");
+    MD_LOG_I("no local signer detected (tried NIP-5F socket, NIP-55L D-Bus)");
     return NULL;
 }
 

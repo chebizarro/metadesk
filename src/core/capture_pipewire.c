@@ -36,6 +36,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "log.h"
+#define MD_LOG_TAG "capture_pipewire"
 
 /* ══════════════════════════════════════════════════════════════
  * Portal ScreenCast D-Bus flow (xdg-desktop-portal)
@@ -185,7 +187,7 @@ static uint32_t portal_wait_response(PortalScreencast *p,
     dbus_error_init(&err);
     dbus_bus_add_match(p->bus, rule, &err);
     if (dbus_error_is_set(&err)) {
-        fprintf(stderr, "portal: add_match failed: %s\n", err.message);
+        MD_LOG_I("add_match failed: %s", err.message);
         dbus_error_free(&err);
         return UINT32_MAX;
     }
@@ -215,8 +217,7 @@ static uint32_t portal_wait_response(PortalScreencast *p,
             dbus_message_unref(msg);
         }
     }
-    fprintf(stderr, "portal: timeout waiting for Response on %s\n",
-            request_path);
+    MD_LOG_I("timeout waiting for Response on %s", request_path);
 
 done:
     dbus_bus_remove_match(p->bus, rule, NULL);
@@ -242,8 +243,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
     dbus_error_init(&err);
     portal->bus = dbus_bus_get(DBUS_BUS_SESSION, &err);
     if (!portal->bus) {
-        fprintf(stderr, "portal: cannot connect to session bus: %s\n",
-                err.message);
+        MD_LOG_I("cannot connect to session bus: %s", err.message);
         dbus_error_free(&err);
         return -1;
     }
@@ -279,7 +279,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         DBusMessage *resp = NULL;
         uint32_t rc = portal_wait_response(portal, req_path, 5000, &resp);
         if (rc != 0 || !resp) {
-            fprintf(stderr, "portal: CreateSession failed (rc=%u)\n", rc);
+            MD_LOG_I("CreateSession failed (rc=%u)", rc);
             if (resp) dbus_message_unref(resp);
             goto fail;
         }
@@ -291,14 +291,14 @@ static int portal_screencast_open(PortalScreencast *portal) {
 
         const char *sh = dict_lookup_string(&resp_args, "session_handle");
         if (!sh) {
-            fprintf(stderr, "portal: no session_handle in CreateSession response\n");
+            MD_LOG_I("no session_handle in CreateSession response");
             dbus_message_unref(resp);
             goto fail;
         }
         portal->session_handle = strdup(sh);
         dbus_message_unref(resp);
 
-        fprintf(stderr, "portal: session created: %s\n", portal->session_handle);
+        MD_LOG_I("session created: %s", portal->session_handle);
     }
 
     /* ── Step 2: SelectSources ─────────────────────────────── */
@@ -329,10 +329,10 @@ static int portal_screencast_open(PortalScreencast *portal) {
 
         uint32_t rc = portal_wait_response(portal, req_path, 5000, NULL);
         if (rc != 0) {
-            fprintf(stderr, "portal: SelectSources failed (rc=%u)\n", rc);
+            MD_LOG_I("SelectSources failed (rc=%u)", rc);
             goto fail;
         }
-        fprintf(stderr, "portal: sources selected (monitor, cursor embedded)\n");
+        MD_LOG_I("sources selected (monitor, cursor embedded)");
     }
 
     /* ── Step 3: Start (shows user consent dialog) ────────── */
@@ -364,7 +364,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         DBusMessage *resp = NULL;
         uint32_t rc = portal_wait_response(portal, req_path, 60000, &resp);
         if (rc != 0 || !resp) {
-            fprintf(stderr, "portal: Start failed or user cancelled (rc=%u)\n", rc);
+            MD_LOG_I("Start failed or user cancelled (rc=%u)", rc);
             if (resp) dbus_message_unref(resp);
             goto fail;
         }
@@ -400,7 +400,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
                     dbus_message_iter_recurse(&streams_arr, &stream_struct);
                     dbus_message_iter_get_basic(&stream_struct, &portal->node_id);
                     found_streams = true;
-                    fprintf(stderr, "portal: stream node_id=%u\n", portal->node_id);
+                    MD_LOG_I("stream node_id=%u", portal->node_id);
                 }
                 break;
             }
@@ -409,7 +409,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_unref(resp);
 
         if (!found_streams) {
-            fprintf(stderr, "portal: no streams in Start response\n");
+            MD_LOG_I("no streams in Start response");
             goto fail;
         }
     }
@@ -433,8 +433,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_unref(msg);
 
         if (!reply || dbus_error_is_set(&err)) {
-            fprintf(stderr, "portal: OpenPipeWireRemote failed: %s\n",
-                    err.message);
+            MD_LOG_I("OpenPipeWireRemote failed: %s", err.message);
             dbus_error_free(&err);
             goto fail;
         }
@@ -444,7 +443,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         if (!dbus_message_get_args(reply, &err,
                                   DBUS_TYPE_UNIX_FD, &fd,
                                   DBUS_TYPE_INVALID)) {
-            fprintf(stderr, "portal: cannot extract fd: %s\n", err.message);
+            MD_LOG_I("cannot extract fd: %s", err.message);
             dbus_error_free(&err);
             dbus_message_unref(reply);
             goto fail;
@@ -452,8 +451,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_unref(reply);
 
         portal->pw_fd = fd;
-        fprintf(stderr, "portal: PipeWire fd=%d, node_id=%u\n",
-                portal->pw_fd, portal->node_id);
+        MD_LOG_I("PipeWire fd=%d, node_id=%u", portal->pw_fd, portal->node_id);
     }
 
     return 0;
@@ -739,10 +737,10 @@ static int pw_start(MdCaptureCtx *ctx) {
                                          fcntl(pw->portal.pw_fd, F_DUPFD_CLOEXEC, 3),
                                          NULL, 0);
         stream_node_id = pw->portal.node_id;
-        fprintf(stderr, "capture: connected via portal (node=%u)\n", stream_node_id);
+        MD_LOG_I("connected via portal (node=%u)", stream_node_id);
     } else {
         /* Fallback: direct connection (works on X11 / test environments) */
-        fprintf(stderr, "capture: portal unavailable, falling back to direct connect\n");
+        MD_LOG_I("portal unavailable, falling back to direct connect");
         pw->core = pw_context_connect(pw->pw_ctx, NULL, 0);
     }
     if (!pw->core) {

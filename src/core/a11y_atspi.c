@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "log.h"
+#define MD_LOG_TAG "a11y_atspi"
 
 /* Maximum tree depth to prevent infinite recursion from cyclic trees */
 #define MD_ATSPI_MAX_DEPTH 32
@@ -260,12 +262,10 @@ static int atspi_register_change_events(AtspiState *st) {
         GError *error = NULL;
         if (!atspi_event_listener_register(st->listener, atspi_change_events[i], &error)) {
             if (error) {
-                fprintf(stderr, "a11y_atspi: failed to register %s: %s\n",
-                        atspi_change_events[i], error->message);
+                MD_LOG_E("failed to register %s: %s", atspi_change_events[i], error->message);
                 g_error_free(error);
             } else {
-                fprintf(stderr, "a11y_atspi: failed to register %s\n",
-                        atspi_change_events[i]);
+                MD_LOG_E("failed to register %s", atspi_change_events[i]);
             }
 
             for (size_t j = 0; j < i; j++) {
@@ -299,7 +299,7 @@ static int atspi_init_backend(MdA11yCtx *ctx) {
 
     int ret = atspi_init();
     if (ret < 0) {
-        fprintf(stderr, "a11y_atspi: failed to initialize AT-SPI2\n");
+        MD_LOG_E("failed to initialize AT-SPI2");
         free(st);
         return -1;
     }
@@ -316,7 +316,7 @@ static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
 
     AtspiAccessible *desktop = atspi_get_desktop(0);
     if (!desktop) {
-        fprintf(stderr, "a11y_atspi: failed to get desktop\n");
+        MD_LOG_E("failed to get desktop");
         return -1;
     }
 
@@ -390,7 +390,7 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     AtspiEventListener *listener = atspi_event_listener_new(
         atspi_change_event_cb, ctx, NULL);
     if (!listener) {
-        fprintf(stderr, "a11y_atspi: failed to create event listener\n");
+        MD_LOG_E("failed to create event listener");
         return -1;
     }
 

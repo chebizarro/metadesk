@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <pthread.h>
+#include "log.h"
+#define MD_LOG_TAG "agent"
 
 /* Maximum delta JSON size before falling back to full tree (64 KB) */
 #define MD_AGENT_MAX_DELTA_SIZE (64 * 1024)
@@ -142,13 +144,11 @@ static int agent_execute_locked(MdAgent *agent,
 
     int ret = md_action_parse(&action, (const char *)payload, payload_len);
     if (ret < 0) {
-        fprintf(stderr, "%s: failed to parse action JSON\n", log_tag);
+        MD_LOG_E("failed to parse action JSON");
         return -1;
     }
 
-    fprintf(stderr, "%s: action=%s target=%s\n", log_tag,
-            md_action_type_str(action.type),
-            action.target_id[0] ? action.target_id : "(none)");
+    MD_LOG_I("action=%s target=%s", md_action_type_str(action.type), action.target_id[0] ? action.target_id : "(none)");
 
     /* Resolve target_id to screen coordinates if needed */
     if (action.target_id[0] != '\0') {
@@ -178,8 +178,7 @@ static int agent_execute_locked(MdAgent *agent,
             case MD_ACTION_DBL_CLICK:
             case MD_ACTION_RIGHT_CLICK:
             case MD_ACTION_FOCUS:
-                fprintf(stderr, "%s: could not resolve target '%s'\n",
-                        log_tag, action.target_id);
+                MD_LOG_E("could not resolve target '%s'", action.target_id);
                 md_action_cleanup(&action);
                 return -1;
             default:
@@ -193,7 +192,7 @@ static int agent_execute_locked(MdAgent *agent,
     if (agent->input) {
         ret = md_input_execute_action(agent->input, &action);
         if (ret < 0) {
-            fprintf(stderr, "%s: action injection failed\n", log_tag);
+            MD_LOG_I("action injection failed");
             md_action_cleanup(&action);
             return -1;
         }

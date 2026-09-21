@@ -30,6 +30,8 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include "log.h"
+#define MD_LOG_TAG "input_sendinput"
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -148,12 +150,7 @@ static bool si_dimensions_are_valid(const MdInputConfig *cfg) {
 
 static int si_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
     if (!si_dimensions_are_valid(cfg)) {
-        fprintf(stderr,
-                "input_sendinput: ERROR — screen dimensions must be configured "
-                "and >= %u (got %ux%u)\n",
-                MD_INPUT_MIN_SCREEN_DIMENSION,
-                cfg ? cfg->screen_width : 0,
-                cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
         return -1;
     }
 
@@ -239,7 +236,7 @@ static int si_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
 
     WORD vk = linux_key_to_vk(keysym);
     if (vk == 0) {
-        fprintf(stderr, "input_sendinput: unknown keysym 0x%04x\n", keysym);
+        MD_LOG_I("unknown keysym 0x%04x", keysym);
         return -1;
     }
 
@@ -319,7 +316,7 @@ const MdInputBackend *md_input_backend_create(void) {
 
 extern "C"
 const MdInputBackend *md_input_backend_create(void) {
-    fprintf(stderr, "input: SendInput backend not available on this platform\n");
+    MD_LOG_I("SendInput backend not available on this platform");
     return nullptr;
 }
 
