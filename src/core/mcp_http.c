@@ -12,6 +12,7 @@
  * SSE client capacity is configurable.
  */
 #include "mcp_http.h"
+#include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -26,7 +27,8 @@
 #include <stdatomic.h>
 
 #define DEFAULT_MAX_SSE_CLIENTS 4
-#define MAX_REQUEST_SIZE        (1024 * 1024)  /* 1 MB max request body */
+/* 1 MB max request body — the protocol-level limit shared with stdio */
+#define MAX_REQUEST_SIZE        MD_MCP_MAX_MESSAGE_SIZE
 #define READ_BUF_SIZE     4096
 /* Bound how long a connection handler can block on reads — without it
  * an idle client parks a handler goroutine forever and wedges destroy. */
@@ -98,27 +100,24 @@ static char *capture_take_body(HttpResponseCapture *cap)
         return body;
     }
 
-    size_t total = 3; /* '[' + ']' + NUL */
-    for (size_t i = 0; i < cap->count; i++)
-        total += strlen(cap->items[i]) + (i > 0 ? 1 : 0);
-
-    char *body = malloc(total);
-    if (!body) {
-        cap->failed = true;
+    /* Multiple messages: return a JSON array (cJSON, not pointer
+     * arithmetic — one off-by-one here is a heap overflow). */
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr)
         return NULL;
+
+    for (size_t i = 0; i < cap->count; i++) {
+        cJSON *item = cJSON_Parse(cap->items[i]);
+        if (!item) {
+            cJSON_Delete(arr);
+            cap->failed = true;
+            return NULL;
+        }
+        cJSON_AddItemToArray(arr, item);
     }
 
-    char *p = body;
-    *p++ = '[';
-    for (size_t i = 0; i < cap->count; i++) {
-        if (i > 0)
-            *p++ = ',';
-        size_t len = strlen(cap->items[i]);
-        memcpy(p, cap->items[i], len);
-        p += len;
-    }
-    *p++ = ']';
-    *p = '\0';
+    char *body = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
     return body;
 }
 
@@ -141,7 +140,7 @@ static int http_capture_write(const char *json, size_t len, void *userdata)
  * Request responses never pass through here (they use the per-request
  * capture sink), so everything on this channel is a server-initiated
  * notification for SSE subscribers. */
-static int http_write_fn(const char *json, size_t len, void *userdata)
+int md_mcp_http_write(const char *json, size_t len, void *userdata)
 {
     MdMcpHttp *h = (MdMcpHttp *)userdata;
     if (!h || !json) return -1;
@@ -215,7 +214,6 @@ typedef struct {
     size_t body_len;
     size_t content_length;
     char content_type[128];  /* Content-Type header */
-    char session_id[128];    /* Mcp-Session-Id header */
 } HttpRequest;
 
 static bool is_json_content_type(const char *content_type)
@@ -304,19 +302,6 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
             if (ct_len >= sizeof(req->content_type))
                 ct_len = sizeof(req->content_type) - 1;
             memcpy(req->content_type, ct, ct_len);
-        }
-    }
-
-    /* Find Mcp-Session-Id */
-    const char *sid = strcasestr(header_start, "Mcp-Session-Id:");
-    if (sid && sid < headers_end) {
-        sid += 15;
-        while (*sid == ' ' || *sid == '\t') sid++;
-        const char *sid_end = strstr(sid, "\r\n");
-        if (sid_end && sid_end <= headers_end) {
-            size_t slen = (size_t)(sid_end - sid);
-            if (slen >= sizeof(req->session_id)) slen = sizeof(req->session_id) - 1;
-            memcpy(req->session_id, sid, slen);
         }
     }
 
@@ -693,17 +678,6 @@ void md_mcp_http_shutdown(MdMcpHttp *http)
     if (!http) return;
     atomic_store(&http->shutdown, true);
     close_sse_clients(http);
-}
-
-MdMcpWriteFn md_mcp_http_get_write_fn(MdMcpHttp *http)
-{
-    (void)http;
-    return http_write_fn;
-}
-
-void *md_mcp_http_get_write_userdata(MdMcpHttp *http)
-{
-    return http;
 }
 
 void md_mcp_http_destroy(MdMcpHttp *http)

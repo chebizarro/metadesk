@@ -58,16 +58,24 @@ typedef struct {
     cJSON       *data;     /* optional extra data, or NULL       */
 } MdJsonRpcError;
 
-/* ── Parse a JSON-RPC 2.0 request / notification ─────────────
+/* ── Parse a JSON-RPC 2.0 request / notification ─────────────────
  *
- * On success, fills `req` and returns 0.
- * On failure, returns -1 (malformed JSON or not a valid JSON-RPC 2.0 message).
+ * On success, fills `req` and returns MD_JSONRPC_OK.
+ * MD_JSONRPC_ERR_PARSE: the bytes are not JSON.
+ * MD_JSONRPC_ERR_INVALID: valid JSON, but not a JSON-RPC 2.0 message
+ * (spec: report as -32600 Invalid Request, not -32700).
  *
  * The caller MUST call md_jsonrpc_request_free() when done.
  * `req->params` points into the internal parse tree and is valid until free.
  */
-int md_jsonrpc_parse_request(MdJsonRpcRequest *req,
-                             const char *json, size_t json_len);
+typedef enum {
+    MD_JSONRPC_OK = 0,
+    MD_JSONRPC_ERR_INVALID = -1,
+    MD_JSONRPC_ERR_PARSE = -2,
+} MdJsonRpcParseResult;
+
+MdJsonRpcParseResult md_jsonrpc_parse_request(MdJsonRpcRequest *req,
+                                               const char *json, size_t json_len);
 
 /* Free all resources held by a parsed request. */
 void md_jsonrpc_request_free(MdJsonRpcRequest *req);

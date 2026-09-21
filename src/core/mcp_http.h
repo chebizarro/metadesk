@@ -49,8 +49,10 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
 
 /* Get the write function + userdata for MdMcpServerConfig.
  * The write function sends responses to the appropriate client. */
-MdMcpWriteFn md_mcp_http_get_write_fn(MdMcpHttp *http);
-void *md_mcp_http_get_write_userdata(MdMcpHttp *http);
+/* Broadcast one JSON message to all connected SSE clients. Matches
+ * MdMcpWriteFn; userdata is the MdMcpHttp*. Used as the server's
+ * notification sink. */
+int md_mcp_http_write(const char *json, size_t len, void *userdata);
 
 /* Destroy the HTTP transport. */
 void md_mcp_http_destroy(MdMcpHttp *http);

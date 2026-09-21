@@ -28,18 +28,6 @@ struct MdMcpBridge {
     MdInput           *input;
 };
 
-/* ── Write callback for stdio mode ───────────────────────────── */
-
-static int bridge_stdio_write(const char *json, size_t len, void *userdata)
-{
-    MdMcpBridge *b = (MdMcpBridge *)userdata;
-    if (!b || !b->stdio_ctx) return -1;
-
-    MdMcpWriteFn fn = md_mcp_stdio_get_write_fn(b->stdio_ctx);
-    void *ud = md_mcp_stdio_get_write_userdata(b->stdio_ctx);
-    return fn(json, len, ud);
-}
-
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
 MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
@@ -76,12 +64,12 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     if (!b->agent)
         goto fail;
 
-    /* 3. Create MCP server */
+    /* 3. Create MCP server. The notification write_fn is wired once a
+     * transport exists (steps 7/8) — the transport needs the server
+     * first, so it cannot be supplied here. */
     MdMcpServerConfig srv_cfg = {
         .server_name = "metadesk",
         .server_version = MD_MCP_BRIDGE_VERSION,
-        .write_fn = bridge_stdio_write,
-        .write_userdata = b,
     };
     b->server = md_mcp_server_create(&srv_cfg);
     if (!b->server)
@@ -114,6 +102,9 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
                                             config->stdio_out_fd);
         if (!b->stdio_ctx)
             goto fail;
+        /* stdio responses use per-request sinks; the server write_fn is
+         * the notification channel writing to this transport. */
+        md_mcp_server_set_write_fn(b->server, md_mcp_stdio_write, b->stdio_ctx);
     }
 
     /* 8. Create HTTP+SSE transport if requested */
@@ -128,9 +119,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
             goto fail;
         /* HTTP responses use per-request sinks; the server write_fn is
          * the notification (SSE) channel. */
-        md_mcp_server_set_write_fn(b->server,
-                                   md_mcp_http_get_write_fn(b->http_ctx),
-                                   md_mcp_http_get_write_userdata(b->http_ctx));
+        md_mcp_server_set_write_fn(b->server, md_mcp_http_write, b->http_ctx);
     }
 
     /* 9. Activate session */

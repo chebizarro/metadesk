@@ -54,41 +54,41 @@ void md_jsonrpc_id_free(MdJsonRpcId *id)
 
 /* ── Parse request ───────────────────────────────────────────── */
 
-int md_jsonrpc_parse_request(MdJsonRpcRequest *req,
-                             const char *json, size_t json_len)
+MdJsonRpcParseResult md_jsonrpc_parse_request(MdJsonRpcRequest *req,
+                                               const char *json, size_t json_len)
 {
     if (!req || !json || json_len == 0)
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
 
     memset(req, 0, sizeof(*req));
 
     cJSON *root = cJSON_ParseWithLength(json, json_len);
     if (!root)
-        return -1;
+        return MD_JSONRPC_ERR_PARSE;
 
     /* Must be an object */
     if (!cJSON_IsObject(root)) {
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
 
     /* "jsonrpc": "2.0" — required */
     cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "jsonrpc");
     if (!cJSON_IsString(ver) || strcmp(ver->valuestring, "2.0") != 0) {
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
 
     /* "method" — required, must be string */
     cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
     if (!cJSON_IsString(method) || method->valuestring[0] == '\0') {
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
     req->method = strdup(method->valuestring);
     if (!req->method) {
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
 
     /* "id" — optional (absent = notification) */
@@ -107,7 +107,7 @@ int md_jsonrpc_parse_request(MdJsonRpcRequest *req,
         /* id must be string, number, or null per spec */
         free(req->method);
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
 
     /* "params" — optional, must be object or array if present */
@@ -116,7 +116,7 @@ int md_jsonrpc_parse_request(MdJsonRpcRequest *req,
         md_jsonrpc_id_free(&req->id);
         free(req->method);
         cJSON_Delete(root);
-        return -1;
+        return MD_JSONRPC_ERR_INVALID;
     }
     req->params = params;  /* borrowed pointer into root */
 

@@ -33,10 +33,10 @@ void md_mcp_stdio_shutdown(MdMcpStdio *stdio_ctx);
 /* Destroy the stdio transport. */
 void md_mcp_stdio_destroy(MdMcpStdio *stdio_ctx);
 
-/* Get the write function + userdata for configuring MdMcpServerConfig.
- * This allows the server to write responses via this transport. */
-MdMcpWriteFn md_mcp_stdio_get_write_fn(MdMcpStdio *stdio_ctx);
-void *md_mcp_stdio_get_write_userdata(MdMcpStdio *stdio_ctx);
+/* Write one framed JSON message to the transport's output fd (newline
+ * delimited, thread-safe). Matches MdMcpWriteFn; userdata is the
+ * MdMcpStdio*. Used as the server's notification sink. */
+int md_mcp_stdio_write(const char *json, size_t len, void *userdata);
 
 #ifdef __cplusplus
 }

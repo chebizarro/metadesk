@@ -140,6 +140,8 @@ struct MdIpcServer {
 struct MdIpcConn {
     HANDLE pipe;
     bool   connected;
+    bool   is_server;   /* DisconnectNamedPipe is only valid on the
+                          server end of a named pipe */
 };
 
 /* ── Server API ──────────────────────────────────────────────── */
@@ -217,6 +219,7 @@ MdIpcConn *md_ipc_accept(MdIpcServer *srv, uint32_t timeout_ms) {
 
     conn->pipe = srv->pipe;
     conn->connected = true;
+    conn->is_server = true;
 
     /* Create a new pipe instance for the next accept */
     srv->pipe = ipc_create_named_pipe(
@@ -372,7 +375,8 @@ void md_ipc_close(MdIpcConn *conn) {
     if (!conn) return;
     if (conn->pipe != INVALID_HANDLE_VALUE) {
         FlushFileBuffers(conn->pipe);
-        DisconnectNamedPipe(conn->pipe);
+        if (conn->is_server)
+            DisconnectNamedPipe(conn->pipe);
         CloseHandle(conn->pipe);
     }
     free(conn);

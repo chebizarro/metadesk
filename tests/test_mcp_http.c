@@ -47,9 +47,7 @@ static MdMcpServer *make_mcp_server(void)
 
 static void wire_server_to_http(MdMcpServer *mcp, MdMcpHttp *http)
 {
-    assert(md_mcp_server_set_write_fn(mcp,
-                                      md_mcp_http_get_write_fn(http),
-                                      md_mcp_http_get_write_userdata(http)) == 0);
+    assert(md_mcp_server_set_write_fn(mcp, md_mcp_http_write, http) == 0);
 }
 
 /* ── Helper: raw TCP connect to localhost ─────────────────────── */
@@ -157,12 +155,10 @@ static void test_create_destroy(void)
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     assert(http != NULL);
 
-    /* Verify we can get write fn */
-    MdMcpWriteFn fn = md_mcp_http_get_write_fn(http);
+    /* The transport exposes its notification sink as a plain
+     * MdMcpWriteFn taking the MdMcpHttp* as userdata. */
+    MdMcpWriteFn fn = md_mcp_http_write;
     assert(fn != NULL);
-
-    void *ud = md_mcp_http_get_write_userdata(http);
-    assert(ud == http);
 
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);

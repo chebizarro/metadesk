@@ -74,11 +74,16 @@ typedef struct {
     void         *write_userdata;
 } MdMcpServerConfig;
 
-/* ── Capacity limits ─────────────────────────────────────────── */
+/* ── Capacity limits ───────────────────────────────────────── */
 
 #define MD_MCP_MAX_TOOLS       32
 #define MD_MCP_MAX_RESOURCES   16
 #define MD_MCP_MAX_SUBSCRIPTIONS 16
+
+/* Maximum size of a single JSON-RPC message, a property of the
+ * protocol — enforced by every transport (stdio aborts oversized
+ * lines, HTTP answers 413). */
+#define MD_MCP_MAX_MESSAGE_SIZE (1024 * 1024)
 
 /* ── Server lifecycle ────────────────────────────────────────── */
 

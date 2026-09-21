@@ -79,7 +79,7 @@ static void test_reject_malformed_json(void)
 {
     const char *json = "{not valid json";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_PARSE);
     PASS("reject malformed JSON");
 }
 
@@ -87,7 +87,7 @@ static void test_reject_missing_jsonrpc(void)
 {
     const char *json = "{\"method\":\"foo\",\"id\":1}";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_INVALID);
     PASS("reject missing jsonrpc field");
 }
 
@@ -95,7 +95,7 @@ static void test_reject_wrong_version(void)
 {
     const char *json = "{\"jsonrpc\":\"1.0\",\"method\":\"foo\",\"id\":1}";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_INVALID);
     PASS("reject wrong jsonrpc version");
 }
 
@@ -103,7 +103,7 @@ static void test_reject_missing_method(void)
 {
     const char *json = "{\"jsonrpc\":\"2.0\",\"id\":1}";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_INVALID);
     PASS("reject missing method");
 }
 
@@ -112,7 +112,7 @@ static void test_reject_invalid_params_type(void)
     const char *json = "{\"jsonrpc\":\"2.0\",\"method\":\"foo\","
                        "\"id\":1,\"params\":\"string\"}";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_INVALID);
     PASS("reject non-object/array params");
 }
 
@@ -121,7 +121,7 @@ static void test_reject_invalid_id_type(void)
     const char *json = "{\"jsonrpc\":\"2.0\",\"method\":\"foo\","
                        "\"id\":[1,2]}";
     MdJsonRpcRequest req;
-    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == -1);
+    assert(md_jsonrpc_parse_request(&req, json, strlen(json)) == MD_JSONRPC_ERR_INVALID);
     PASS("reject array id");
 }
 

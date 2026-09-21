@@ -275,7 +275,9 @@ static void test_tools_call_unknown(void)
     cJSON *resp = last_response();
     cJSON *err = cJSON_GetObjectItem(resp, "error");
     assert(err != NULL);
-    assert(cJSON_GetObjectItem(err, "code")->valueint == -32601);
+    /* Named-thing-not-registered answers INVALID_PARAMS, same as
+     * resources/read — the method itself exists. */
+    assert(cJSON_GetObjectItem(err, "code")->valueint == MD_JSONRPC_INVALID_PARAMS);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);

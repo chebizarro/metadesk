@@ -7,15 +7,25 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ── UI tree resource ────────────────────────────────────────── */
+/* Build the MCP resource `contents` array: one text item carrying
+ * `uri`, `mimeType`, and `text`. cJSON copies each string. */
+static cJSON *resource_text_contents(const char *uri, const char *mime,
+                                     const char *text)
+{
+    cJSON *contents = cJSON_CreateArray();
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "uri", uri);
+    cJSON_AddStringToObject(item, "mimeType", mime);
+    cJSON_AddStringToObject(item, "text", text);
+    cJSON_AddItemToArray(contents, item);
+    return contents;
+}
+
+/* ── UI tree resource ───────────────────────────── */
 
 static cJSON *read_ui_tree(void *userdata)
 {
     MdMcpResourceCtx *ctx = (MdMcpResourceCtx *)userdata;
-
-    cJSON *contents = cJSON_CreateArray();
-    cJSON *item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "uri", MD_MCP_URI_UI_TREE);
 
     /* Walk the accessibility tree */
     char *tree_text = NULL;
@@ -39,12 +49,9 @@ static cJSON *read_ui_tree(void *userdata)
         }
     }
 
-    cJSON_AddStringToObject(item, "mimeType", mime);
-    cJSON_AddStringToObject(item, "text",
-                            tree_text ? tree_text : "{\"root\":null}");
+    cJSON *contents = resource_text_contents(
+        MD_MCP_URI_UI_TREE, mime, tree_text ? tree_text : "{\"root\":null}");
     free(tree_text);
-
-    cJSON_AddItemToArray(contents, item);
     return contents;
 }
 
@@ -98,14 +105,9 @@ static cJSON *read_session_info(void *userdata)
     char *info_str = cJSON_PrintUnformatted(info);
     cJSON_Delete(info);
 
-    cJSON *contents = cJSON_CreateArray();
-    cJSON *item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "uri", MD_MCP_URI_SESSION_INFO);
-    cJSON_AddStringToObject(item, "mimeType", "application/json");
-    cJSON_AddStringToObject(item, "text", info_str ? info_str : "{}");
+    cJSON *contents = resource_text_contents(
+        MD_MCP_URI_SESSION_INFO, "application/json", info_str ? info_str : "{}");
     free(info_str);
-    cJSON_AddItemToArray(contents, item);
-
     return contents;
 }
 

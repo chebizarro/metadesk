@@ -30,7 +30,7 @@ struct MdMcpStdio {
 
 /* ── Write callback (called by MCP server to send responses) ── */
 
-static int stdio_write(const char *json, size_t len, void *userdata)
+int md_mcp_stdio_write(const char *json, size_t len, void *userdata)
 {
     MdMcpStdio *ctx = (MdMcpStdio *)userdata;
     if (!ctx || atomic_load(&ctx->shutdown)) return -1;
@@ -78,17 +78,6 @@ MdMcpStdio *md_mcp_stdio_create(MdMcpServer *server, int in_fd, int out_fd)
     return ctx;
 }
 
-MdMcpWriteFn md_mcp_stdio_get_write_fn(MdMcpStdio *stdio_ctx)
-{
-    (void)stdio_ctx;
-    return stdio_write;
-}
-
-void *md_mcp_stdio_get_write_userdata(MdMcpStdio *stdio_ctx)
-{
-    return stdio_ctx;
-}
-
 /* ── Run loop ────────────────────────────────────────────────── */
 
 int md_mcp_stdio_run(MdMcpStdio *ctx)
@@ -104,6 +93,12 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
     while (!atomic_load(&ctx->shutdown)) {
         /* Read a chunk */
         if (buf_len + 1 >= buf_cap) {
+            if (buf_cap >= MD_MCP_MAX_MESSAGE_SIZE) {
+                /* A peer that never sends a newline must not grow the
+                 * buffer until realloc fails — drop the connection. */
+                free(buf);
+                return -1;
+            }
             buf_cap *= 2;
             char *new_buf = realloc(buf, buf_cap);
             if (!new_buf) { free(buf); return -1; }
@@ -132,7 +127,7 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
             if (line_len > 0) {
                 md_mcp_server_handle_message_with_sink(ctx->server,
                                                        start, line_len,
-                                                       stdio_write, ctx);
+                                                       md_mcp_stdio_write, ctx);
             }
 
             start = newline + 1;

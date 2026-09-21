@@ -59,6 +59,7 @@ static int send_json(MdMcpServer *s, char *json)
     if (!json) return -1;
     MdMcpWriteFn fn = s->active_sink ? s->active_sink : s->write_fn;
     void *ud = s->active_sink ? s->active_sink_ud : s->write_userdata;
+    if (!fn) { free(json); return -1; }  /* no transport wired yet: drop */
     int rc = fn(json, strlen(json), ud);
     free(json);
     return rc;
@@ -183,7 +184,7 @@ static int handle_tools_call(MdMcpServer *s, const MdJsonRpcId *id,
         }
     }
     if (!tool) {
-        return send_error(s, id, MD_JSONRPC_METHOD_NOT_FOUND,
+        return send_error(s, id, MD_JSONRPC_INVALID_PARAMS,
                           "Unknown tool");
     }
 
@@ -378,10 +379,17 @@ static int dispatch_message(MdMcpServer *server,
                             const char *json, size_t len)
 {
     MdJsonRpcRequest req;
-    if (md_jsonrpc_parse_request(&req, json, len) != 0) {
-        /* Can't parse — send parse error with null id */
+    MdJsonRpcParseResult prc = md_jsonrpc_parse_request(&req, json, len);
+    if (prc != MD_JSONRPC_OK) {
+        /* Not JSON → -32700; valid JSON that isn't JSON-RPC 2.0 →
+         * -32600, per the spec. */
         MdJsonRpcId null_id = { .type = MD_JSONRPC_ID_NULL };
-        send_error(server, &null_id, MD_JSONRPC_PARSE_ERROR, "Parse error");
+        send_error(server, &null_id,
+                   prc == MD_JSONRPC_ERR_PARSE
+                       ? MD_JSONRPC_PARSE_ERROR
+                       : MD_JSONRPC_INVALID_REQUEST,
+                   prc == MD_JSONRPC_ERR_PARSE
+                       ? "Parse error" : "Invalid Request");
         return -1;
     }
 
@@ -405,7 +413,7 @@ static int dispatch_message(MdMcpServer *server,
     /* All other methods require the full initialize → initialized handshake. */
     if (atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED) {
         if (!md_jsonrpc_is_notification(&req)) {
-            rc = send_error(server, &req.id, MD_JSONRPC_INTERNAL_ERROR,
+            rc = send_error(server, &req.id, MD_JSONRPC_INVALID_REQUEST,
                             "Server not initialized");
         }
         md_jsonrpc_request_free(&req);
@@ -478,7 +486,10 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
 
 MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
 {
-    if (!config || !config->write_fn)
+    /* write_fn is optional at create time: it is the notification sink and
+     * is wired by the transport (which needs the server to exist first).
+     * Per-request responses use the active sink, not write_fn. */
+    if (!config)
         return NULL;
 
     MdMcpServer *s = calloc(1, sizeof(*s));
