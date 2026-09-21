@@ -719,8 +719,8 @@ In addition to the binary packet protocol (§3.1), metadesk provides an MCP serv
 - `metadesk-host --mcp` — stdio transport (newline-delimited JSON on stdin/stdout)
 - `metadesk-host --mcp-http [PORT]` — HTTP+SSE on port 7710 (Phase 2)
 
-**Tools exposed** (9 total, matching the action types in §3.2):
-`metadesk_click`, `metadesk_dbl_click`, `metadesk_right_click`, `metadesk_type`, `metadesk_key_combo`, `metadesk_scroll`, `metadesk_focus`, `metadesk_set_value`, `metadesk_screenshot`
+**Tools exposed** (9 total, one per action type in §3.2). The authoritative
+tool table with parameters lives in [AGENT_API.md](AGENT_API.md#tools).
 
 **Resources exposed:**
 - `metadesk://ui-tree` — full accessibility tree (JSON or compact format)

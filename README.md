@@ -143,17 +143,8 @@ metadesk exposes a [Model Context Protocol](https://modelcontextprotocol.io) ser
 
 ### Tools
 
-| Tool | Description | Key Params |
-|------|-------------|------------|
-| `metadesk_click` | Click a UI element | `target_id` |
-| `metadesk_dbl_click` | Double-click | `target_id` |
-| `metadesk_right_click` | Right-click | `target_id` |
-| `metadesk_type` | Type text into an element | `target_id`, `text` |
-| `metadesk_key_combo` | Press a key combination | `keys` (array) |
-| `metadesk_scroll` | Scroll | `target_id`, `dx`, `dy` |
-| `metadesk_focus` | Focus an element | `target_id` |
-| `metadesk_set_value` | Set a value directly | `target_id`, `text` |
-| `metadesk_screenshot` | Capture screen region | `region` [x,y,w,h] |
+The nine tools and their parameters are documented in the
+[Agent API Guide](docs/AGENT_API.md#tools) (the authoritative MCP surface).
 
 ### Resources
 
@@ -236,30 +227,18 @@ meson test -C build
 ```
 metadesk/
 ├── src/
-│   ├── core/           # libmetadesk — cross-platform core
-│   │   ├── a11y.h      # accessibility tree HAL
-│   │   ├── action.c/h    # action parse/encode
-│   │   ├── bitrate_ctrl.c/h # AIMD adaptive bitrate controller
-│   │   ├── capture.h   # screen capture HAL
-│   │   ├── decode.c/h  # FFmpeg H.264 decode
-│   │   ├── encode.c/h  # FFmpeg H.264 encode
-│   │   ├── fips_addr.c/h  # FIPS address derivation and DNS
-│   │   ├── fips_control.c/h # FIPS daemon control socket client
-│   │   ├── input.h     # input injection HAL
-│   │   ├── jsonrpc.c/h   # JSON-RPC 2.0 message layer
-│   │   ├── mcp_*.c/h   # MCP server, tools, resources, transports
-│   │   ├── nostr.c/h   # Nostr relay client (NIP-44/51)
-│   │   ├── session.c/h # session state machine
-│   │   ├── session_log.c/h # signed Nostr session event log
-│   │   ├── signer.c/h  # signing backend abstraction
-│   │   └── stream.c/h  # TCP framed transport
+│   ├── core/           # libmetadesk — cross-platform core (per-file layout: spec §6)
 │   ├── host/           # metadesk-host daemon
 │   └── client/         # metadesk-client (SDL2 + ImGui)
-├── tests/              # 21 test suites
+├── tests/              # unit + integration suites
 ├── tools/              # Diagnostic utilities
 ├── imgui_vendor/       # Vendored Dear ImGui sources (client)
 └── docs/               # Specification and API docs
 ```
+
+The authoritative per-file layout (with every platform backend) lives in
+[spec §6 Directory Structure](docs/metadesk-spec.md#6-directory-structure);
+the tree above is a top-level orientation only.
 
 ## Documentation
 
