@@ -130,34 +130,30 @@ MdAgent *md_agent_create(const MdAgentConfig *cfg) {
 static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
                                      uint32_t *seq);
 
-int md_agent_handle_action(MdAgent *agent, MdStream *stream,
-                           uint32_t *seq,
-                           const uint8_t *payload, uint32_t payload_len) {
-    if (!agent || !stream || !seq || !payload || payload_len == 0)
-        return -1;
-
-    /* 1. Parse the action JSON */
+/* ── Shared action pipeline ──────────────────────────────────────
+ * Steps 1–5: parse JSON → resolve target → inject → settle →
+ * invalidate the cached tree. Caller holds agent->mu.
+ * Returns 0 on success, -1 on failure. */
+static int agent_execute_locked(MdAgent *agent,
+                                const uint8_t *payload, uint32_t payload_len,
+                                const char *log_tag) {
     MdAction action;
     memset(&action, 0, sizeof(action));
 
     int ret = md_action_parse(&action, (const char *)payload, payload_len);
     if (ret < 0) {
-        fprintf(stderr, "agent: failed to parse action JSON\n");
+        fprintf(stderr, "%s: failed to parse action JSON\n", log_tag);
         return -1;
     }
 
-    fprintf(stderr, "agent: action=%s target=%s\n",
+    fprintf(stderr, "%s: action=%s target=%s\n", log_tag,
             md_action_type_str(action.type),
             action.target_id[0] ? action.target_id : "(none)");
 
-    pthread_mutex_lock(&agent->mu);
-
-    /* 2. Resolve target_id to screen coordinates if needed */
+    /* Resolve target_id to screen coordinates if needed */
     if (action.target_id[0] != '\0') {
         int tx, ty;
         if (resolve_target(agent, action.target_id, &tx, &ty) == 0) {
-            /* For mouse-based actions, use resolved coordinates.
-             * The action's region[0]/region[1] are used for click coords. */
             switch (action.type) {
             case MD_ACTION_CLICK:
             case MD_ACTION_DBL_CLICK:
@@ -182,10 +178,9 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
             case MD_ACTION_DBL_CLICK:
             case MD_ACTION_RIGHT_CLICK:
             case MD_ACTION_FOCUS:
-                fprintf(stderr, "agent: could not resolve target '%s'\n",
-                        action.target_id);
+                fprintf(stderr, "%s: could not resolve target '%s'\n",
+                        log_tag, action.target_id);
                 md_action_cleanup(&action);
-                pthread_mutex_unlock(&agent->mu);
                 return -1;
             default:
                 /* key_combo, type, etc. don't need coordinates */
@@ -194,13 +189,12 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
         }
     }
 
-    /* 3. Inject the action */
+    /* Inject the action */
     if (agent->input) {
         ret = md_input_execute_action(agent->input, &action);
         if (ret < 0) {
-            fprintf(stderr, "agent: action injection failed\n");
+            fprintf(stderr, "%s: action injection failed\n", log_tag);
             md_action_cleanup(&action);
-            pthread_mutex_unlock(&agent->mu);
             return -1;
         }
     }
@@ -208,45 +202,71 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
     md_action_cleanup(&action);
     agent->action_count++;
 
-    /* 4. Wait for UI to settle */
+    /* Wait for UI to settle */
     sleep_ms(agent->settle_ms);
 
-    /* 5. Invalidate cached tree (UI changed) */
+    /* Invalidate cached tree (UI changed) */
     if (agent->cached_tree) {
         md_a11y_node_free(agent->cached_tree);
         agent->cached_tree = NULL;
     }
 
-    /* 6. Compute and send delta */
+    return 0;
+}
+
+/* Step 6: render the post-action UI update as a string.
+ * Sets *out_is_delta when the result is a delta JSON (else full tree).
+ * Deltas larger than MD_AGENT_MAX_DELTA_SIZE fall back to a full tree.
+ * Caller holds agent->mu; caller frees the result. */
+static char *agent_render_update_locked(MdAgent *agent, bool *out_is_delta) {
+    if (!agent->a11y) return NULL;
+
+    int delta_count = 0;
+    MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
+
+    if (deltas && delta_count > 0) {
+        char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
+        md_a11y_delta_free(deltas, delta_count);
+        if (delta_json && strlen(delta_json) < MD_AGENT_MAX_DELTA_SIZE) {
+            *out_is_delta = true;
+            return delta_json;
+        }
+        free(delta_json);
+        /* Delta too large — fall through to a full tree */
+    }
+
+    /* No delta available or no changes detected — send a full tree */
+    MdA11yNode *root = md_a11y_walk(agent->a11y);
+    if (!root) return NULL;
+    char *tree_json = serialize_tree(root, agent->tree_format);
+    md_a11y_node_free(root);
+    *out_is_delta = false;
+    return tree_json;
+}
+
+int md_agent_handle_action(MdAgent *agent, MdStream *stream,
+                           uint32_t *seq,
+                           const uint8_t *payload, uint32_t payload_len) {
+    if (!agent || !stream || !seq || !payload || payload_len == 0)
+        return -1;
+
+    pthread_mutex_lock(&agent->mu);
+
+    if (agent_execute_locked(agent, payload, payload_len, "agent") < 0) {
+        pthread_mutex_unlock(&agent->mu);
+        return -1;
+    }
+
+    /* Compute and send the UI update */
     if (agent->a11y) {
-        int delta_count = 0;
-        MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
-
-        if (deltas && delta_count > 0) {
-            /* Serialize delta */
-            char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
-            if (delta_json) {
-                size_t len = strlen(delta_json);
-
-                if (len < MD_AGENT_MAX_DELTA_SIZE) {
-                    /* Send as delta */
-                    md_stream_send(stream, MD_PKT_UI_TREE_DELTA, (*seq)++,
-                                   (const uint8_t *)delta_json, (uint32_t)len);
-                } else {
-                    /* Delta too large — send full tree instead */
-                    free(delta_json);
-                    md_agent_send_tree_locked(agent, stream, seq);
-                    md_a11y_delta_free(deltas, delta_count);
-                    pthread_mutex_unlock(&agent->mu);
-                    return 0;
-                }
-                free(delta_json);
-            }
-            md_a11y_delta_free(deltas, delta_count);
-        } else {
-            /* No delta available or no changes detected.
-             * Send a full tree on the first interaction. */
-            md_agent_send_tree_locked(agent, stream, seq);
+        bool is_delta = false;
+        char *update = agent_render_update_locked(agent, &is_delta);
+        if (update) {
+            md_stream_send(stream,
+                           is_delta ? MD_PKT_UI_TREE_DELTA : MD_PKT_UI_TREE,
+                           (*seq)++,
+                           (const uint8_t *)update, (uint32_t)strlen(update));
+            free(update);
         }
     }
 
@@ -261,111 +281,18 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
     if (!agent || !payload || payload_len == 0)
         return NULL;
 
-    /* 1. Parse the action JSON */
-    MdAction action;
-    memset(&action, 0, sizeof(action));
+    pthread_mutex_lock(&agent->mu);
 
-    int ret = md_action_parse(&action, (const char *)payload, payload_len);
-    if (ret < 0) {
-        fprintf(stderr, "agent[mcp]: failed to parse action JSON\n");
+    if (agent_execute_locked(agent, payload, payload_len, "agent[mcp]") < 0) {
+        pthread_mutex_unlock(&agent->mu);
         return NULL;
     }
 
-    fprintf(stderr, "agent[mcp]: action=%s target=%s\n",
-            md_action_type_str(action.type),
-            action.target_id[0] ? action.target_id : "(none)");
-
-    pthread_mutex_lock(&agent->mu);
-
-    /* 2. Resolve target_id to screen coordinates if needed */
-    if (action.target_id[0] != '\0') {
-        int tx, ty;
-        if (resolve_target(agent, action.target_id, &tx, &ty) == 0) {
-            switch (action.type) {
-            case MD_ACTION_CLICK:
-            case MD_ACTION_DBL_CLICK:
-            case MD_ACTION_RIGHT_CLICK:
-                action.region[0] = tx;
-                action.region[1] = ty;
-                break;
-            case MD_ACTION_FOCUS:
-                action.region[0] = tx;
-                action.region[1] = ty;
-                action.type = MD_ACTION_CLICK;
-                break;
-            default:
-                break;
-            }
-        } else {
-            /* Coordinate actions with an unresolvable target must not fall
-             * through to a click at stale or (0,0) coordinates. */
-            switch (action.type) {
-            case MD_ACTION_CLICK:
-            case MD_ACTION_DBL_CLICK:
-            case MD_ACTION_RIGHT_CLICK:
-            case MD_ACTION_FOCUS:
-                fprintf(stderr, "agent[mcp]: could not resolve target '%s'\n",
-                        action.target_id);
-                md_action_cleanup(&action);
-                pthread_mutex_unlock(&agent->mu);
-                return NULL;
-            default:
-                /* key_combo, type, etc. don't need coordinates */
-                break;
-            }
-        }
-    }
-
-    /* 3. Inject the action */
-    if (agent->input) {
-        ret = md_input_execute_action(agent->input, &action);
-        if (ret < 0) {
-            fprintf(stderr, "agent[mcp]: action injection failed\n");
-            md_action_cleanup(&action);
-            pthread_mutex_unlock(&agent->mu);
-            return NULL;
-        }
-    }
-
-    md_action_cleanup(&action);
-
-    /* 4. Wait for UI to settle */
-    sleep_ms(agent->settle_ms);
-
-    /* 5. Invalidate cached tree */
-    if (agent->cached_tree) {
-        md_a11y_node_free(agent->cached_tree);
-        agent->cached_tree = NULL;
-    }
-
-    /* 6. Compute delta and return as string */
-    if (agent->a11y) {
-        int delta_count = 0;
-        MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
-
-        if (deltas && delta_count > 0) {
-            char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
-            md_a11y_delta_free(deltas, delta_count);
-            if (delta_json)
-                agent->action_count++;
-            pthread_mutex_unlock(&agent->mu);
-            return delta_json;  /* caller frees */
-        }
-
-        /* No delta — return full tree */
-        MdA11yNode *root = md_a11y_walk(agent->a11y);
-        if (root) {
-            char *tree_json = serialize_tree(root, agent->tree_format);
-            md_a11y_node_free(root);
-            if (tree_json)
-                agent->action_count++;
-            pthread_mutex_unlock(&agent->mu);
-            return tree_json;
-        }
-    }
+    bool is_delta = false;
+    char *out = agent_render_update_locked(agent, &is_delta);
 
     pthread_mutex_unlock(&agent->mu);
-    return NULL;
+    return out;  /* caller frees */
 }
 
 static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
