@@ -103,7 +103,7 @@ static char *serialize_tree(const MdA11yNode *root, MdTreeFormat fmt) {
     case MD_TREE_FORMAT_COMPACT:
         return md_a11y_to_compact(root);
     }
-    return md_a11y_to_json(root); /* default fallback */
+    return NULL; /* MdTreeFormat is exhaustive */
 }
 
 /* ── Public API ──────────────────────────────────────────────── */

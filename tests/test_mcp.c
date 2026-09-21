@@ -467,7 +467,7 @@ static void test_init_capabilities_reflect_registrations(void)
 
 /* ── Bridge lifecycle test ────────────────────────────────── */
 
-static void test_bridge_null_deps_fail_or_report_degraded(void)
+static void test_bridge_null_a11y_fails_create(void)
 {
     MdMcpBridgeConfig cfg = {
         .a11y = NULL,
@@ -478,24 +478,26 @@ static void test_bridge_null_deps_fail_or_report_degraded(void)
         .stdio_out_fd = -1,
     };
 
-    MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
-    if (bridge) {
-        assert(md_mcp_bridge_is_degraded(bridge));
-        md_mcp_bridge_destroy(bridge);
-    }
+    /* a11y is required — no silent degraded mode */
+    assert(md_mcp_bridge_create(&cfg) == NULL);
+    assert(md_mcp_bridge_create(NULL) == NULL);
 
-    PASS("bridge NULL deps fail or report degraded");
+    PASS("bridge NULL a11y fails create");
 }
 
-static void test_bridge_create_destroy_with_null_deps_graceful_degradation(void)
+static void test_bridge_create_destroy_with_stub_a11y(void)
 {
+    /* Minimal a11y stub: every vtable call fails safely. */
+    static const MdA11yBackend stub_vtable = {0};
+    MdA11yCtx stub_a11y = { .vtable = &stub_vtable };
+
     /* Create a bridge with pipe transport and missing production deps. */
     int in_pipe[2], out_pipe[2];
     pipe(in_pipe);
     pipe(out_pipe);
 
     MdMcpBridgeConfig cfg = {
-        .a11y = NULL,
+        .a11y = &stub_a11y,
         .input = NULL,
         .tree_format = MD_TREE_FORMAT_JSON,
         .settle_ms = 50,
@@ -505,9 +507,8 @@ static void test_bridge_create_destroy_with_null_deps_graceful_degradation(void)
 
     MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
     assert(bridge != NULL);
-    assert(md_mcp_bridge_is_degraded(bridge));
 
-    /* Session should be active, but explicitly degraded. */
+    /* Session should be active. */
     assert(md_mcp_bridge_get_state(bridge) == MD_SESSION_ACTIVE);
 
     /* Server should be accessible */
@@ -521,7 +522,7 @@ static void test_bridge_create_destroy_with_null_deps_graceful_degradation(void)
     close(out_pipe[0]);
     close(out_pipe[1]);
 
-    PASS("bridge create + destroy lifecycle with NULL deps graceful degradation");
+    PASS("bridge create + destroy lifecycle with stub a11y");
 }
 
 /* ── Resource registration tests ─────────────────────────────── */
@@ -607,7 +608,7 @@ static void test_resources_with_session(void)
 static void test_9_tools_register(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     assert(md_mcp_register_tools(s, &tool_ctx) == 0);
 
     do_init(s);
@@ -642,7 +643,7 @@ static void test_9_tools_register(void)
 static void test_tool_call_click_no_agent(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -672,7 +673,7 @@ static void test_tool_call_click_no_agent(void)
 static void test_tool_call_missing_target(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -696,7 +697,7 @@ static void test_tool_call_missing_target(void)
 static void test_tool_call_key_combo(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -738,7 +739,7 @@ static void test_tool_registration_failure_rolls_back(void)
         assert(md_mcp_server_register_tool(s, &tool) == 0);
     }
 
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     assert(md_mcp_register_tools(s, &tool_ctx) == -1);
     assert(tool_ctx._handler_ctxs == NULL);
 
@@ -787,8 +788,8 @@ int main(void)
     test_tool_call_key_combo();
     test_tool_registration_failure_rolls_back();
     test_resources_with_session();
-    test_bridge_null_deps_fail_or_report_degraded();
-    test_bridge_create_destroy_with_null_deps_graceful_degradation();
+    test_bridge_null_a11y_fails_create();
+    test_bridge_create_destroy_with_stub_a11y();
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();

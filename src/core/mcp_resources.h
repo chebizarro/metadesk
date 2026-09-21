@@ -17,6 +17,10 @@
 extern "C" {
 #endif
 
+/* Canonical resource URIs */
+#define MD_MCP_URI_UI_TREE     "metadesk://ui-tree"
+#define MD_MCP_URI_SESSION_INFO "metadesk://session-info"
+
 /* Context passed to MCP resource handlers. */
 typedef struct {
     MdA11yCtx    *a11y;        /* accessibility tree context         */

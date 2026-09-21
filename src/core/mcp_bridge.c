@@ -17,7 +17,6 @@ struct MdMcpBridge {
     MdAgent           *agent;
     MdMcpServer       *server;
     MdMcpStdio        *stdio_ctx;
-    bool               degraded;
 
     /* Contexts for tool/resource handlers (must outlive server) */
     MdMcpToolCtx       tool_ctx;
@@ -44,14 +43,14 @@ static int bridge_stdio_write(const char *json, size_t len, void *userdata)
 
 MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 {
-    if (!config) return NULL;
+    /* a11y is required (see mcp_bridge.h); input stays optional */
+    if (!config || !config->a11y) return NULL;
 
     MdMcpBridge *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
 
     b->a11y = config->a11y;
     b->input = config->input;
-    b->degraded = (config->a11y == NULL || config->input == NULL);
 
     /* 1. Initialize session */
     md_session_init(&b->session);
@@ -73,10 +72,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
                                             : MD_AGENT_DEFAULT_SETTLE_MS,
     };
     b->agent = md_agent_create(&agent_cfg);
-    if (!b->agent) {
-        free(b);
-        return NULL;
-    }
+    if (!b->agent)
+        goto fail;
 
     /* 3. Create MCP server */
     MdMcpServerConfig srv_cfg = {
@@ -86,35 +83,21 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
         .write_userdata = b,
     };
     b->server = md_mcp_server_create(&srv_cfg);
-    if (!b->server) {
-        md_agent_destroy(b->agent);
-        free(b);
-        return NULL;
-    }
+    if (!b->server)
+        goto fail;
 
     /* 4. Register tools */
     b->tool_ctx.agent = b->agent;
-    b->tool_ctx.a11y = config->a11y;
-    if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0) {
-        md_mcp_tools_cleanup(&b->tool_ctx);
-        md_mcp_server_destroy(b->server);
-        md_agent_destroy(b->agent);
-        free(b);
-        return NULL;
-    }
+    if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0)
+        goto fail;
 
     /* 5. Register resources */
     b->resource_ctx.a11y = config->a11y;
     b->resource_ctx.session = &b->session;
     b->resource_ctx.agent = b->agent;
     b->resource_ctx.tree_format = config->tree_format;
-    if (md_mcp_register_resources(b->server, &b->resource_ctx) != 0) {
-        md_mcp_tools_cleanup(&b->tool_ctx);
-        md_mcp_server_destroy(b->server);
-        md_agent_destroy(b->agent);
-        free(b);
-        return NULL;
-    }
+    if (md_mcp_register_resources(b->server, &b->resource_ctx) != 0)
+        goto fail;
 
     /* 6. Subscribe to a11y changes for notifications */
     if (config->a11y) {
@@ -128,19 +111,19 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
         b->stdio_ctx = md_mcp_stdio_create(b->server,
                                             config->stdio_in_fd,
                                             config->stdio_out_fd);
-        if (!b->stdio_ctx) {
-            md_mcp_tools_cleanup(&b->tool_ctx);
-            md_mcp_server_destroy(b->server);
-            md_agent_destroy(b->agent);
-            free(b);
-            return NULL;
-        }
+        if (!b->stdio_ctx)
+            goto fail;
     }
 
     /* 8. Activate session */
     md_session_activate(&b->session);
 
     return b;
+
+fail:
+    /* md_mcp_bridge_destroy is null-safe at every step */
+    md_mcp_bridge_destroy(b);
+    return NULL;
 }
 
 int md_mcp_bridge_run(MdMcpBridge *bridge)
@@ -165,11 +148,6 @@ void md_mcp_bridge_shutdown(MdMcpBridge *bridge)
 MdSessionState md_mcp_bridge_get_state(const MdMcpBridge *bridge)
 {
     return bridge ? bridge->session.state : MD_SESSION_IDLE;
-}
-
-bool md_mcp_bridge_is_degraded(const MdMcpBridge *bridge)
-{
-    return bridge ? bridge->degraded : false;
 }
 
 MdMcpServer *md_mcp_bridge_get_server(const MdMcpBridge *bridge)

@@ -15,7 +15,7 @@ static cJSON *read_ui_tree(void *userdata)
 
     cJSON *contents = cJSON_CreateArray();
     cJSON *item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "uri", "metadesk://ui-tree");
+    cJSON_AddStringToObject(item, "uri", MD_MCP_URI_UI_TREE);
 
     /* Walk the accessibility tree */
     char *tree_text = NULL;
@@ -100,7 +100,7 @@ static cJSON *read_session_info(void *userdata)
 
     cJSON *contents = cJSON_CreateArray();
     cJSON *item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "uri", "metadesk://session-info");
+    cJSON_AddStringToObject(item, "uri", MD_MCP_URI_SESSION_INFO);
     cJSON_AddStringToObject(item, "mimeType", "application/json");
     cJSON_AddStringToObject(item, "text", info_str ? info_str : "{}");
     free(info_str);
@@ -114,7 +114,7 @@ static cJSON *read_session_info(void *userdata)
 int md_mcp_notify_tree_changed(MdMcpServer *server)
 {
     if (!server) return -1;
-    return md_mcp_server_notify_resource_updated(server, "metadesk://ui-tree");
+    return md_mcp_server_notify_resource_updated(server, MD_MCP_URI_UI_TREE);
 }
 
 void md_mcp_a11y_change_cb(const MdA11yDelta *deltas, int count,
@@ -133,12 +133,13 @@ int md_mcp_register_resources(MdMcpServer *server, MdMcpResourceCtx *res_ctx)
     if (!server || !res_ctx) return -1;
 
     MdMcpResource ui_tree = {
-        .uri = "metadesk://ui-tree",
+        .uri = MD_MCP_URI_UI_TREE,
         .name = "UI Tree",
         .description = "Current accessibility tree of the remote desktop. "
                        "Returns the full tree in the negotiated format "
                        "(JSON or compact).",
-        .mime_type = "application/json",
+        .mime_type = res_ctx->tree_format == MD_TREE_FORMAT_COMPACT
+                         ? "text/plain" : "application/json",
         .read_handler = read_ui_tree,
         .userdata = res_ctx,
     };
@@ -146,7 +147,7 @@ int md_mcp_register_resources(MdMcpServer *server, MdMcpResourceCtx *res_ctx)
         return -1;
 
     MdMcpResource session_info = {
-        .uri = "metadesk://session-info",
+        .uri = MD_MCP_URI_SESSION_INFO,
         .name = "Session Info",
         .description = "Current session metadata: state, capabilities, "
                        "peer identity, and action count.",

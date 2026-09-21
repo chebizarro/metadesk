@@ -15,11 +15,10 @@
 extern "C" {
 #endif
 
-/* Context passed to all MCP tool handlers — holds references to the
- * agent and a11y subsystems needed to execute actions. */
+/* Context passed to all MCP tool handlers — holds the agent used to
+ * execute actions. */
 typedef struct {
     MdAgent   *agent;           /* agent handler for action dispatch   */
-    MdA11yCtx *a11y;            /* shared a11y context (for tree reads)*/
     void      *_handler_ctxs;   /* internal: heap-allocated per-tool contexts,
                                    freed by md_mcp_tools_cleanup()       */
 } MdMcpToolCtx;

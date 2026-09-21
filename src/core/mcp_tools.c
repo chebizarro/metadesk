@@ -6,7 +6,6 @@
  * and returns the resulting UI tree delta (or error) as MCP content.
  */
 #include "mcp_tools.h"
-#include "action.h"
 #include "a11y.h"
 #include <stdlib.h>
 #include <string.h>

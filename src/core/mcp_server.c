@@ -30,7 +30,6 @@ struct MdMcpServer {
     /* State */
     _Atomic int      init_state;
     pthread_mutex_t  sub_mu;   /* protects subscriptions only */
-    pthread_mutex_t  tool_mu;  /* serializes tool handlers with shared state */
     pthread_mutex_t  dispatch_mu; /* serializes request dispatch */
 
     /* Per-request response sink (set only while dispatching under
@@ -194,14 +193,12 @@ static int handle_tools_call(MdMcpServer *s, const MdJsonRpcId *id,
     /* Extract arguments */
     cJSON *arguments = cJSON_GetObjectItemCaseSensitive(params, "arguments");
 
-    /* Call handler. HTTP transport can dispatch requests concurrently;
-     * serialize tool callbacks because registered tools may share agent/input/a11y state. */
+    /* Call handler. Tool handlers own their synchronization
+     * (md_agent_handle_action_mcp takes agent->mu). */
     bool is_error = false;
     char *error_msg = NULL;
-    pthread_mutex_lock(&s->tool_mu);
     cJSON *content = tool->handler(arguments, &is_error, &error_msg,
                                    tool->userdata);
-    pthread_mutex_unlock(&s->tool_mu);
 
     /* Build result */
     cJSON *result = cJSON_CreateObject();
@@ -496,7 +493,6 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->write_userdata = config->write_userdata;
     atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
     pthread_mutex_init(&s->sub_mu, NULL);
-    pthread_mutex_init(&s->tool_mu, NULL);
     pthread_mutex_init(&s->dispatch_mu, NULL);
 
     return s;
@@ -516,7 +512,6 @@ void md_mcp_server_destroy(MdMcpServer *server)
     for (int i = 0; i < server->subscription_count; i++)
         free(server->subscriptions[i]);
 
-    pthread_mutex_destroy(&server->tool_mu);
     pthread_mutex_destroy(&server->sub_mu);
     pthread_mutex_destroy(&server->dispatch_mu);
     free(server->server_name);

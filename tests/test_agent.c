@@ -368,7 +368,7 @@ static int test_mcp_tool_requires_a11y_returns_error(void) {
     MdAgent *agent = md_agent_create(&cfg);
     assert(agent != NULL);
 
-    MdMcpToolCtx tool_ctx = { .agent = agent, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = agent };
     MdMcpServer *server = make_agent_mcp_server(&tool_ctx);
 
     const char *call = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":42,"

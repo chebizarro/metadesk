@@ -70,7 +70,7 @@ static TestHarness *harness_create(void)
                                         h->server_to_agent[1]);
 
     /* Register tools */
-    MdMcpToolCtx tool_ctx = { .agent = NULL, .a11y = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL };
     md_mcp_register_tools(h->server, &tool_ctx);
 
     return h;
