@@ -9,22 +9,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <stdbool.h>
+#include "md_test.h"
 
 static void test_keypair_generation(void) {
     char *sk = NULL, *pk = NULL;
     int ret = md_nostr_generate_keypair(&sk, &pk);
-    assert(ret == 0);
-    assert(sk != NULL);
-    assert(pk != NULL);
-    assert(strlen(sk) == 64); /* 32 bytes hex */
-    assert(strlen(pk) == 64);
+    MD_CHECK(ret == 0);
+    MD_CHECK(sk != NULL);
+    MD_CHECK(pk != NULL);
+    MD_CHECK(strlen(sk) == 64); /* 32 bytes hex */
+    MD_CHECK(strlen(pk) == 64);
 
     /* Verify consistency: deriving pubkey from sk should match pk */
     char *pk2 = md_nostr_get_pubkey(sk);
-    assert(pk2 != NULL);
-    assert(strcmp(pk, pk2) == 0);
+    MD_CHECK(pk2 != NULL);
+    MD_CHECK(strcmp(pk, pk2) == 0);
 
     free(pk2);
     memset(sk, 0, strlen(sk));
@@ -36,19 +36,19 @@ static void test_keypair_generation(void) {
 static void test_null_args(void) {
     /* NULL config should fail gracefully */
     MdNostr *n = md_nostr_create(NULL, NULL);
-    assert(n == NULL);
+    MD_CHECK(n == NULL);
 
     /* NULL sk should fail */
     MdNostrConfig cfg = { .sk_hex = NULL, .relay_urls = NULL, .relay_count = 0 };
     n = md_nostr_create(&cfg, NULL);
-    assert(n == NULL);
+    MD_CHECK(n == NULL);
 
     /* NULL args to key functions should not crash */
-    assert(md_nostr_get_pubkey(NULL) == NULL);
+    MD_CHECK(md_nostr_get_pubkey(NULL) == NULL);
 
     char *sk = NULL, *pk = NULL;
-    assert(md_nostr_generate_keypair(NULL, &pk) == -1);
-    assert(md_nostr_generate_keypair(&sk, NULL) == -1);
+    MD_CHECK(md_nostr_generate_keypair(NULL, &pk) == -1);
+    MD_CHECK(md_nostr_generate_keypair(&sk, NULL) == -1);
 
     printf("  PASS: null args handled\n");
 }
@@ -69,31 +69,31 @@ static void test_allowlist_default_deny(void) {
     /* Generate a real pubkey to use as the "requesting client" */
     char *sk = NULL, *pk = NULL;
     int ret = md_nostr_generate_keypair(&sk, &pk);
-    assert(ret == 0);
-    assert(pk != NULL);
+    MD_CHECK(ret == 0);
+    MD_CHECK(pk != NULL);
 
     /* NULL MdNostr → always deny */
-    assert(md_nostr_is_allowed(NULL, pk) == false);
-    assert(md_nostr_is_allowed(NULL, NULL) == false);
+    MD_CHECK(md_nostr_is_allowed(NULL, pk) == false);
+    MD_CHECK(md_nostr_is_allowed(NULL, NULL) == false);
 
     /* NULL MdNostr → no allowlist */
-    assert(md_nostr_has_allowlist(NULL) == false);
+    MD_CHECK(md_nostr_has_allowlist(NULL) == false);
 
     /* NULL pubkey → deny */
-    assert(md_nostr_is_allowed(NULL, "") == false);
+    MD_CHECK(md_nostr_is_allowed(NULL, "") == false);
 
     /* Allowlist add/remove with NULL nostr → error */
-    assert(md_nostr_allowlist_add(NULL, pk, NULL) == -1);
-    assert(md_nostr_allowlist_remove(NULL, pk) == -1);
+    MD_CHECK(md_nostr_allowlist_add(NULL, pk, NULL) == -1);
+    MD_CHECK(md_nostr_allowlist_remove(NULL, pk) == -1);
 
     /* Refresh with NULL → error */
-    assert(md_nostr_refresh_allowlist(NULL) == -1);
+    MD_CHECK(md_nostr_refresh_allowlist(NULL) == -1);
 
     /* Accessor functions with NULL nostr → safe defaults */
-    assert(md_nostr_allowlist_count(NULL) == 0);
+    MD_CHECK(md_nostr_allowlist_count(NULL) == 0);
 
     MdAllowlistEntry entry_out;
-    assert(md_nostr_allowlist_get_entry(NULL, 0, &entry_out) == -1);
+    MD_CHECK(md_nostr_allowlist_get_entry(NULL, 0, &entry_out) == -1);
 
     memset(sk, 0, strlen(sk));
     free(sk);
@@ -108,32 +108,32 @@ static void test_nip44_roundtrip(void) {
     int ret;
 
     ret = md_nostr_generate_keypair(&alice_sk, &alice_pk);
-    assert(ret == 0 && alice_sk && alice_pk);
+    MD_CHECK(ret == 0 && alice_sk && alice_pk);
     ret = md_nostr_generate_keypair(&bob_sk, &bob_pk);
-    assert(ret == 0 && bob_sk && bob_pk);
+    MD_CHECK(ret == 0 && bob_sk && bob_pk);
 
     /* Create direct-key signers */
     MdSigner *alice_signer = md_signer_create_direct(alice_sk);
-    assert(alice_signer != NULL);
+    MD_CHECK(alice_signer != NULL);
     MdSigner *bob_signer = md_signer_create_direct(bob_sk);
-    assert(bob_signer != NULL);
+    MD_CHECK(bob_signer != NULL);
 
     /* Alice encrypts a message for Bob */
     const char *plaintext = "session_request:{\"v\":1}";
     char *ciphertext = NULL;
     ret = md_signer_nip44_encrypt(alice_signer, bob_pk, plaintext, &ciphertext);
-    assert(ret == MD_SIGNER_OK);
-    assert(ciphertext != NULL);
-    assert(strlen(ciphertext) > 0);
+    MD_CHECK(ret == MD_SIGNER_OK);
+    MD_CHECK(ciphertext != NULL);
+    MD_CHECK(strlen(ciphertext) > 0);
     /* Ciphertext should be base64, not equal to plaintext */
-    assert(strcmp(ciphertext, plaintext) != 0);
+    MD_CHECK(strcmp(ciphertext, plaintext) != 0);
 
     /* Bob decrypts the message from Alice */
     char *decrypted = NULL;
     ret = md_signer_nip44_decrypt(bob_signer, alice_pk, ciphertext, &decrypted);
-    assert(ret == MD_SIGNER_OK);
-    assert(decrypted != NULL);
-    assert(strcmp(decrypted, plaintext) == 0);
+    MD_CHECK(ret == MD_SIGNER_OK);
+    MD_CHECK(decrypted != NULL);
+    MD_CHECK(strcmp(decrypted, plaintext) == 0);
 
     free(decrypted);
     free(ciphertext);
@@ -142,14 +142,14 @@ static void test_nip44_roundtrip(void) {
     const char *reply = "session_accept:{\"session_id\":\"abc-123\"}";
     ciphertext = NULL;
     ret = md_signer_nip44_encrypt(bob_signer, alice_pk, reply, &ciphertext);
-    assert(ret == MD_SIGNER_OK);
-    assert(ciphertext != NULL);
+    MD_CHECK(ret == MD_SIGNER_OK);
+    MD_CHECK(ciphertext != NULL);
 
     decrypted = NULL;
     ret = md_signer_nip44_decrypt(alice_signer, bob_pk, ciphertext, &decrypted);
-    assert(ret == MD_SIGNER_OK);
-    assert(decrypted != NULL);
-    assert(strcmp(decrypted, reply) == 0);
+    MD_CHECK(ret == MD_SIGNER_OK);
+    MD_CHECK(decrypted != NULL);
+    MD_CHECK(strcmp(decrypted, reply) == 0);
 
     free(decrypted);
     free(ciphertext);
@@ -173,27 +173,27 @@ static void test_nip44_wrong_key_fails(void) {
     int ret;
 
     ret = md_nostr_generate_keypair(&alice_sk, &alice_pk);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
     ret = md_nostr_generate_keypair(&bob_sk, &bob_pk);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
     ret = md_nostr_generate_keypair(&eve_sk, &eve_pk);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     MdSigner *alice = md_signer_create_direct(alice_sk);
     MdSigner *eve   = md_signer_create_direct(eve_sk);
-    assert(alice && eve);
+    MD_CHECK(alice && eve);
 
     /* Alice encrypts for Bob */
     char *ciphertext = NULL;
     ret = md_signer_nip44_encrypt(alice, bob_pk, "secret", &ciphertext);
-    assert(ret == MD_SIGNER_OK && ciphertext);
+    MD_CHECK(ret == MD_SIGNER_OK && ciphertext);
 
     /* Eve tries to decrypt — should fail (wrong key) */
     char *decrypted = NULL;
     ret = md_signer_nip44_decrypt(eve, alice_pk, ciphertext, &decrypted);
     /* Either returns error or decrypted garbage (not the original) */
     if (ret == MD_SIGNER_OK && decrypted) {
-        assert(strcmp(decrypted, "secret") != 0);
+        MD_CHECK(strcmp(decrypted, "secret") != 0);
         free(decrypted);
     }
 
@@ -230,7 +230,7 @@ static void test_bridge_lifecycle(void) {
     /* Create a direct-key signer */
     char *sk = NULL, *pk = NULL;
     int ret = md_nostr_generate_keypair(&sk, &pk);
-    assert(ret == 0 && sk && pk);
+    MD_CHECK(ret == 0 && sk && pk);
 
     /* Build config with dummy relays (won't connect, but won't crash).
      * Multiple URLs exercise relay snapshot allocation/free loops. */
@@ -259,17 +259,17 @@ static void test_bridge_lifecycle(void) {
 
     /* Verify pubkey is accessible and matches */
     const char *bridge_pk = md_nostr_get_npub(n);
-    assert(bridge_pk != NULL);
-    assert(strcmp(bridge_pk, pk) == 0);
+    MD_CHECK(bridge_pk != NULL);
+    MD_CHECK(strcmp(bridge_pk, pk) == 0);
 
     /* Verify signer is accessible */
     MdSigner *signer = md_nostr_get_signer(n);
-    assert(signer != NULL);
-    assert(md_signer_is_ready(signer));
+    MD_CHECK(signer != NULL);
+    MD_CHECK(md_signer_is_ready(signer));
 
     /* Verify allowlist starts empty (default deny) */
-    assert(md_nostr_has_allowlist(n) == false);
-    assert(md_nostr_is_allowed(n, pk) == false);
+    MD_CHECK(md_nostr_has_allowlist(n) == false);
+    MD_CHECK(md_nostr_is_allowed(n, pk) == false);
 
     /* Clean destroy (exercises dedup ring cleanup, relay cleanup, etc.) */
     md_nostr_destroy(n);
@@ -286,17 +286,17 @@ static void test_callback_struct_layout(void) {
     MdNostrCallbacks cbs = { 0 };
 
     /* All callbacks should start NULL */
-    assert(cbs.on_dm == NULL);
-    assert(cbs.dm_userdata == NULL);
-    assert(cbs.on_publish_result == NULL);
-    assert(cbs.publish_result_userdata == NULL);
+    MD_CHECK(cbs.on_dm == NULL);
+    MD_CHECK(cbs.dm_userdata == NULL);
+    MD_CHECK(cbs.on_publish_result == NULL);
+    MD_CHECK(cbs.publish_result_userdata == NULL);
 
     /* Set and verify each field */
     int dummy = 42;
     cbs.on_publish_result = test_publish_cb;
     cbs.publish_result_userdata = &dummy;
-    assert(cbs.on_publish_result == test_publish_cb);
-    assert(cbs.publish_result_userdata == &dummy);
+    MD_CHECK(cbs.on_publish_result == test_publish_cb);
+    MD_CHECK(cbs.publish_result_userdata == &dummy);
 
     printf("  PASS: callback struct layout\n");
 }
@@ -308,13 +308,13 @@ static void test_signer_sign_event_roundtrip(void) {
      * earlier keypair-generation-heavy tests. */
     const char *test_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     MdSigner *signer = md_signer_create_direct(test_sk);
-    assert(signer != NULL);
+    MD_CHECK(signer != NULL);
 
     /* Get the derived pubkey */
     char *pk = NULL;
     int ret = md_signer_get_pubkey(signer, &pk);
-    assert(ret == MD_SIGNER_OK && pk != NULL);
-    assert(strlen(pk) == 64);
+    MD_CHECK(ret == MD_SIGNER_OK && pk != NULL);
+    MD_CHECK(strlen(pk) == 64);
 
     /* Build a simple unsigned event JSON */
     char event_json[512];
@@ -325,14 +325,14 @@ static void test_signer_sign_event_roundtrip(void) {
     /* Sign it */
     char *signed_json = NULL;
     ret = md_signer_sign_event(signer, event_json, &signed_json);
-    assert(ret == MD_SIGNER_OK);
-    assert(signed_json != NULL);
+    MD_CHECK(ret == MD_SIGNER_OK);
+    MD_CHECK(signed_json != NULL);
 
     /* Signed JSON should contain "sig" and "id" fields */
-    assert(strstr(signed_json, "\"sig\"") != NULL);
-    assert(strstr(signed_json, "\"id\"") != NULL);
+    MD_CHECK(strstr(signed_json, "\"sig\"") != NULL);
+    MD_CHECK(strstr(signed_json, "\"id\"") != NULL);
     /* Should still contain the original pubkey */
-    assert(strstr(signed_json, pk) != NULL);
+    MD_CHECK(strstr(signed_json, pk) != NULL);
 
     free(signed_json);
     free(pk);
@@ -353,5 +353,5 @@ int main(void) {
      * threads that may leave OpenSSL PRNG in a non-reusable state. */
     test_bridge_lifecycle();
     printf("All nostr bridge tests passed.\n");
-    return 0;
+    return md_test_report();
 }

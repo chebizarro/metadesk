@@ -7,21 +7,10 @@
  */
 #include "bitrate_ctrl.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define RUN_TEST(fn) do {                                       \
-    tests_run++;                                                \
-    printf("  [%2d] %-50s ", tests_run, #fn);                   \
-    fn();                                                       \
-    tests_passed++;                                             \
-    printf("PASS\n");                                           \
-} while (0)
+#include "md_test.h"
 
 /* Helper: create controller with standard test config */
 static MdBitrateCtrl *make_ctrl(void) {
@@ -43,22 +32,22 @@ static MdBitrateCtrl *make_ctrl(void) {
 
 static void test_create_basic(void) {
     MdBitrateCtrl *ctrl = make_ctrl();
-    assert(ctrl != NULL);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) == 8000000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(ctrl != NULL);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) == 8000000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
 static void test_create_null(void) {
-    assert(md_bitrate_ctrl_create(NULL) == NULL);
+    MD_CHECK(md_bitrate_ctrl_create(NULL) == NULL);
 }
 
 static void test_create_defaults(void) {
     /* All zeros → should get sensible defaults */
     MdBitrateCtrlConfig cfg = {0};
     MdBitrateCtrl *ctrl = md_bitrate_ctrl_create(&cfg);
-    assert(ctrl != NULL);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) > 0);
+    MD_CHECK(ctrl != NULL);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) > 0);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -69,8 +58,8 @@ static void test_create_initial_bitrate(void) {
         .initial_bitrate = 5000000,
     };
     MdBitrateCtrl *ctrl = md_bitrate_ctrl_create(&cfg);
-    assert(ctrl != NULL);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) == 5000000);
+    MD_CHECK(ctrl != NULL);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) == 5000000);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -82,8 +71,8 @@ static void test_create_initial_clamped(void) {
         .initial_bitrate = 99000000,
     };
     MdBitrateCtrl *ctrl = md_bitrate_ctrl_create(&cfg);
-    assert(ctrl != NULL);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) == 5000000);
+    MD_CHECK(ctrl != NULL);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) == 5000000);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -94,8 +83,8 @@ static void test_decrease_on_high_rtt(void) {
     /* RTT = 200ms > 150ms threshold */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 200, 1000);
     /* 8M * 0.7 = 5.6M */
-    assert(br == 5600000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
+    MD_CHECK(br == 5600000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -103,12 +92,12 @@ static void test_decrease_cascading(void) {
     MdBitrateCtrl *ctrl = make_ctrl();
     /* Multiple high-RTT samples → keep decreasing */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 200, 1000);
-    assert(br == 5600000);
+    MD_CHECK(br == 5600000);
     br = md_bitrate_ctrl_update(ctrl, 200, 1100);
-    assert(br == 3920000);  /* 5.6M * 0.7 */
+    MD_CHECK(br == 3920000);  /* 5.6M * 0.7 */
     br = md_bitrate_ctrl_update(ctrl, 200, 1200);
-    assert(br == 2744000);  /* 3.92M * 0.7 */
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
+    MD_CHECK(br == 2744000);  /* 3.92M * 0.7 */
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -119,8 +108,8 @@ static void test_decrease_floor(void) {
     for (int i = 0; i < 50; i++) {
         br = md_bitrate_ctrl_update(ctrl, 500, (uint32_t)(1000 + i * 100));
     }
-    assert(br == 500000);  /* clamped to min */
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br == 500000);  /* clamped to min */
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -129,7 +118,7 @@ static void test_decrease_ignores_cooldown(void) {
     /* Two decreases in quick succession (< cooldown) — both should fire */
     uint32_t br1 = md_bitrate_ctrl_update(ctrl, 200, 1000);
     uint32_t br2 = md_bitrate_ctrl_update(ctrl, 200, 1001); /* 1ms later */
-    assert(br2 < br1);
+    MD_CHECK(br2 < br1);
     md_bitrate_ctrl_destroy(ctrl);
 }
 
@@ -148,21 +137,21 @@ static void test_increase_after_threshold(void) {
         .increase_threshold = 3,
     };
     MdBitrateCtrl *ctrl = md_bitrate_ctrl_create(&cfg);
-    assert(ctrl != NULL);
+    MD_CHECK(ctrl != NULL);
 
     /* First two low-RTT samples → hold (need 3 consecutive) */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 20, 2000);
-    assert(br == 4000000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br == 4000000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     br = md_bitrate_ctrl_update(ctrl, 20, 2500);
-    assert(br == 4000000);
+    MD_CHECK(br == 4000000);
 
     /* Third sample + past cooldown → increase */
     br = md_bitrate_ctrl_update(ctrl, 20, 3500);
     /* headroom = 8M - 4M = 4M, step = 4M * 0.1 = 400K */
-    assert(br == 4400000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_INCREASE);
+    MD_CHECK(br == 4400000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_INCREASE);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -182,12 +171,12 @@ static void test_increase_respects_cooldown(void) {
     /* First update → increase (threshold=1, time=0 so elapsed >= cooldown
      * since last_change_ms starts at 0) */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 20, 5000);
-    assert(br > 4000000);  /* increased */
+    MD_CHECK(br > 4000000);  /* increased */
 
     /* Immediate second update → should hold (cooldown not elapsed) */
     uint32_t br2 = md_bitrate_ctrl_update(ctrl, 20, 5100);
-    assert(br2 == br);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br2 == br);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -207,22 +196,22 @@ static void test_increase_to_ceiling(void) {
 
     /* headroom = 100K, step = 50K → 7.95M */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 10, 1000);
-    assert(br == 7950000);
+    MD_CHECK(br == 7950000);
 
     /* Next step → headroom = 50K, step = 25K → 7.975M */
     br = md_bitrate_ctrl_update(ctrl, 10, 2000);
-    assert(br == 7975000);
+    MD_CHECK(br == 7975000);
 
     /* Keep going until we hit max */
     for (int i = 0; i < 20; i++) {
         br = md_bitrate_ctrl_update(ctrl, 10, (uint32_t)(3000 + i * 200));
     }
-    assert(br == 8000000);
+    MD_CHECK(br == 8000000);
 
     /* At max, should hold */
     br = md_bitrate_ctrl_update(ctrl, 10, 20000);
-    assert(br == 8000000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br == 8000000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -233,14 +222,14 @@ static void test_hold_in_dead_zone(void) {
     MdBitrateCtrl *ctrl = make_ctrl();
     /* RTT = 100ms → between 50 and 150 → hold */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 100, 1000);
-    assert(br == 8000000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br == 8000000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     br = md_bitrate_ctrl_update(ctrl, 80, 2000);
-    assert(br == 8000000);
+    MD_CHECK(br == 8000000);
 
     br = md_bitrate_ctrl_update(ctrl, 120, 3000);
-    assert(br == 8000000);
+    MD_CHECK(br == 8000000);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -249,11 +238,11 @@ static void test_hold_at_boundary(void) {
     MdBitrateCtrl *ctrl = make_ctrl();
     /* RTT exactly at rtt_high → not above, so hold */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 150, 1000);
-    assert(br == 8000000);
+    MD_CHECK(br == 8000000);
 
     /* RTT exactly at rtt_low → not below, so hold (deadzone includes boundaries) */
     br = md_bitrate_ctrl_update(ctrl, 50, 2000);
-    assert(br == 8000000);
+    MD_CHECK(br == 8000000);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -281,13 +270,13 @@ static void test_consecutive_reset_on_dead_zone(void) {
 
     /* Two more low samples → still not 3 consecutive since reset */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 20, 1600);
-    assert(br == 4000000);
+    MD_CHECK(br == 4000000);
     br = md_bitrate_ctrl_update(ctrl, 20, 1800);
-    assert(br == 4000000);
+    MD_CHECK(br == 4000000);
 
     /* Third consecutive → now increase */
     br = md_bitrate_ctrl_update(ctrl, 20, 2000);
-    assert(br > 4000000);
+    MD_CHECK(br > 4000000);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -310,7 +299,7 @@ static void test_consecutive_reset_on_high_rtt(void) {
 
     /* High RTT resets counter AND decreases */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 200, 1400);
-    assert(br < 4000000);
+    MD_CHECK(br < 4000000);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -337,32 +326,32 @@ static void test_sawtooth_pattern(void) {
 
     /* Phase 1: congestion → decrease */
     br = md_bitrate_ctrl_update(ctrl, 300, t);
-    assert(br == 5600000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
+    MD_CHECK(br == 5600000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
 
     /* Phase 2: congestion clears → dead zone for a while */
     t += 500;
     br = md_bitrate_ctrl_update(ctrl, 80, t);
-    assert(br == 5600000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(br == 5600000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     /* Phase 3: RTT drops low → recovery ramp */
     t += 600;
     br = md_bitrate_ctrl_update(ctrl, 30, t); /* consecutive_low = 1 */
-    assert(br == 5600000);
+    MD_CHECK(br == 5600000);
 
     t += 600;
     br = md_bitrate_ctrl_update(ctrl, 30, t); /* consecutive_low = 2 → increase */
-    assert(br > 5600000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_INCREASE);
+    MD_CHECK(br > 5600000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_INCREASE);
 
     uint32_t recovered = br;
 
     /* Phase 4: another spike → decrease again */
     t += 100;
     br = md_bitrate_ctrl_update(ctrl, 250, t);
-    assert(br < recovered);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
+    MD_CHECK(br < recovered);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_DECREASE);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -374,12 +363,12 @@ static void test_reset(void) {
 
     /* Decrease bitrate */
     md_bitrate_ctrl_update(ctrl, 200, 1000);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) < 8000000);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) < 8000000);
 
     /* Reset → back to initial */
     md_bitrate_ctrl_reset(ctrl);
-    assert(md_bitrate_ctrl_get_bitrate(ctrl) == 8000000);
-    assert(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(ctrl) == 8000000);
+    MD_CHECK(md_bitrate_ctrl_get_action(ctrl) == MD_BITRATE_HOLD);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -387,9 +376,9 @@ static void test_reset(void) {
 /* ── Null safety ─────────────────────────────────────────────── */
 
 static void test_null_safety(void) {
-    assert(md_bitrate_ctrl_get_bitrate(NULL) == 0);
-    assert(md_bitrate_ctrl_get_action(NULL) == MD_BITRATE_HOLD);
-    assert(md_bitrate_ctrl_update(NULL, 100, 1000) == 0);
+    MD_CHECK(md_bitrate_ctrl_get_bitrate(NULL) == 0);
+    MD_CHECK(md_bitrate_ctrl_get_action(NULL) == MD_BITRATE_HOLD);
+    MD_CHECK(md_bitrate_ctrl_update(NULL, 100, 1000) == 0);
     md_bitrate_ctrl_reset(NULL);   /* should not crash */
     md_bitrate_ctrl_destroy(NULL); /* should not crash */
 }
@@ -408,7 +397,7 @@ static void test_zero_rtt(void) {
 
     /* RTT = 0 → below rtt_low → should increase */
     uint32_t br = md_bitrate_ctrl_update(ctrl, 0, 5000);
-    assert(br > 4000000);
+    MD_CHECK(br > 4000000);
 
     md_bitrate_ctrl_destroy(ctrl);
 }
@@ -456,6 +445,5 @@ int main(void) {
     RUN_TEST(test_zero_rtt);
 
     printf("\n==============================\n");
-    printf("%d/%d tests passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return md_test_report();
 }

@@ -10,14 +10,13 @@
 #include "mcp_tools.h"
 #include "mcp_stdio.h"
 #include "jsonrpc.h"
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "md_test.h"
 
-#define PASS(name) printf("  PASS  %s\n", name)
 
 /* ── Pipe-based test harness ─────────────────────────────────── */
 
@@ -136,9 +135,9 @@ static void test_stdio_init_and_ping(void)
                      "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}");
 
     char *resp = harness_recv(h);
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
     cJSON *r = cJSON_Parse(resp);
-    assert(cJSON_GetObjectItem(r, "result") != NULL);
+    MD_CHECK(cJSON_GetObjectItem(r, "result") != NULL);
     cJSON_Delete(r);
     free(resp);
 
@@ -148,10 +147,10 @@ static void test_stdio_init_and_ping(void)
     /* Send ping */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":2}");
     resp = harness_recv(h);
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
     r = cJSON_Parse(resp);
-    assert(cJSON_GetObjectItem(r, "result") != NULL);
-    assert(cJSON_GetObjectItem(r, "id")->valueint == 2);
+    MD_CHECK(cJSON_GetObjectItem(r, "result") != NULL);
+    MD_CHECK(cJSON_GetObjectItem(r, "id")->valueint == 2);
     cJSON_Delete(r);
     free(resp);
 
@@ -174,11 +173,11 @@ static void test_stdio_tools_list(void)
     /* List tools */
     harness_send(h, "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}");
     char *resp = harness_recv(h);
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
 
     cJSON *r = cJSON_Parse(resp);
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(r, "result"), "tools");
-    assert(cJSON_GetArraySize(tools) == 9);
+    MD_CHECK(cJSON_GetArraySize(tools) == 9);
     cJSON_Delete(r);
     free(resp);
 
@@ -202,13 +201,13 @@ static void test_stdio_tool_call(void)
                      "\"params\":{\"name\":\"metadesk_click\","
                      "\"arguments\":{\"target_id\":\"n42\"}}}");
     char *resp = harness_recv(h);
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
 
     cJSON *r = cJSON_Parse(resp);
     cJSON *result = cJSON_GetObjectItem(r, "result");
     cJSON *content = cJSON_GetObjectItem(result, "content");
-    assert(cJSON_IsArray(content));
-    assert(cJSON_GetArraySize(content) >= 1);
+    MD_CHECK(cJSON_IsArray(content));
+    MD_CHECK(cJSON_GetArraySize(content) >= 1);
     cJSON_Delete(r);
     free(resp);
 
@@ -227,5 +226,5 @@ int main(void)
     test_stdio_tool_call();
 
     printf("\nAll MCP stdio tests passed.\n");
-    return 0;
+    return md_test_report();
 }

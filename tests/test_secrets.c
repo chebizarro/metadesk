@@ -11,23 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) \
-    do { printf("  test: %s ... ", name); } while (0)
-#define PASS() \
-    do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
-
+#include "md_test.h"
 typedef struct {
     int listen_fd;
     int failures;
@@ -377,6 +366,5 @@ int main(void) {
     test_non_loopback_url_warning_path();
     test_secure_destroy();
 
-    printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return md_test_report();
 }

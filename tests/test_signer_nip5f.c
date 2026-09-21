@@ -29,17 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) \
-    do { printf("  test: %s ... ", name); } while (0)
-#define PASS() \
-    do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
-
+#include "md_test.h"
 /* ── Test key ────────────────────────────────────────────────── */
 static const char *TEST_SK =
     "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3";
@@ -403,9 +393,7 @@ int main(void) {
     if (server_setup() != 0) {
         fprintf(stderr, "  FATAL: server setup failed, skipping socket tests\n");
         server_teardown();
-        printf("\nResults: %d passed, %d failed (server tests skipped)\n",
-               tests_passed, tests_failed);
-        return tests_failed > 0 ? 1 : 0;
+        return md_test_report();
     }
 
     test_lifecycle();
@@ -418,6 +406,5 @@ int main(void) {
 
     server_teardown();
 
-    printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return md_test_report();
 }

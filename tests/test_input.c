@@ -12,8 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <unistd.h>
+#include "md_test.h"
 
 /* ── Mock backend for deterministic HAL error propagation tests ─ */
 
@@ -112,7 +112,7 @@ static int test_create_destroy(void) {
 
     /* Creation should succeed even if /dev/uinput is unavailable
      * (it just won't be "ready") */
-    assert(inp != NULL);
+    MD_CHECK(inp != NULL);
 
     if (md_input_is_ready(inp)) {
         printf("OK (devices created)\n");
@@ -130,7 +130,7 @@ static int test_create_defaults(void) {
     printf("  test_create_defaults... ");
 
     MdInput *inp = md_input_create(NULL);
-    assert(inp != NULL);
+    MD_CHECK(inp != NULL);
     md_input_destroy(inp);
 
     printf("OK\n");
@@ -153,11 +153,11 @@ static int test_action_dispatch(void) {
     action.type = MD_ACTION_CLICK;
     action.region[0] = 100;
     action.region[1] = 200;
-    assert(md_input_execute_action(&inp, &action) == 0);
-    assert(data.mouse_move_calls == 1);
-    assert(data.last_x == 100 && data.last_y == 200);
-    assert(data.mouse_button_calls == 2);
-    assert(data.button_pressed[MD_MOUSE_LEFT] == 0);
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.last_x == 100 && data.last_y == 200);
+    MD_CHECK(data.mouse_button_calls == 2);
+    MD_CHECK(data.button_pressed[MD_MOUSE_LEFT] == 0);
 
     /* Key combo: press ctrl, press s, release s, release ctrl */
     data = (MockInputData){0};
@@ -167,12 +167,12 @@ static int test_action_dispatch(void) {
     action.keys[0] = strdup("ctrl");
     action.keys[1] = strdup("s");
     action.key_count = 2;
-    assert(md_input_execute_action(&inp, &action) == 0);
-    assert(data.key_event_calls == 4);
-    assert(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
-    assert(data.keysyms[1] == 0x001F && data.key_pressed[1] == 1);
-    assert(data.keysyms[2] == 0x001F && data.key_pressed[2] == 0);
-    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.key_event_calls == 4);
+    MD_CHECK(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
+    MD_CHECK(data.keysyms[1] == 0x001F && data.key_pressed[1] == 1);
+    MD_CHECK(data.keysyms[2] == 0x001F && data.key_pressed[2] == 0);
+    MD_CHECK(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
     md_action_cleanup(&action);
 
     /* Type text */
@@ -181,9 +181,9 @@ static int test_action_dispatch(void) {
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_TYPE;
     strncpy(action.text, "Hello, world!", sizeof(action.text) - 1);
-    assert(md_input_execute_action(&inp, &action) == 0);
-    assert(data.type_text_calls == 1);
-    assert(strcmp(data.last_text, "Hello, world!") == 0);
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.type_text_calls == 1);
+    MD_CHECK(strcmp(data.last_text, "Hello, world!") == 0);
 
     /* Scroll */
     data = (MockInputData){0};
@@ -192,9 +192,9 @@ static int test_action_dispatch(void) {
     action.type = MD_ACTION_SCROLL;
     action.dx = 0;
     action.dy = 3;
-    assert(md_input_execute_action(&inp, &action) == 0);
-    assert(data.mouse_scroll_calls == 1);
-    assert(data.last_dx == 0 && data.last_dy == 3);
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.mouse_scroll_calls == 1);
+    MD_CHECK(data.last_dx == 0 && data.last_dy == 3);
 
     /* set_value: select-all (platform accel key) then type */
     data = (MockInputData){0};
@@ -202,26 +202,26 @@ static int test_action_dispatch(void) {
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_SET_VALUE;
     strncpy(action.text, "replacement", sizeof(action.text) - 1);
-    assert(md_input_execute_action(&inp, &action) == 0);
-    assert(data.key_event_calls == 4);
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.key_event_calls == 4);
 #ifdef __APPLE__
-    assert(data.keysyms[0] == 0x007D); /* meta/Cmd on macOS */
+    MD_CHECK(data.keysyms[0] == 0x007D); /* meta/Cmd on macOS */
 #else
-    assert(data.keysyms[0] == 0x001D); /* ctrl elsewhere */
+    MD_CHECK(data.keysyms[0] == 0x001D); /* ctrl elsewhere */
 #endif
-    assert(data.keysyms[1] == 0x001E); /* a */
-    assert(data.type_text_calls == 1);
-    assert(strcmp(data.last_text, "replacement") == 0);
+    MD_CHECK(data.keysyms[1] == 0x001E); /* a */
+    MD_CHECK(data.type_text_calls == 1);
+    MD_CHECK(strcmp(data.last_text, "replacement") == 0);
 
     /* Unknown action always fails */
     data = (MockInputData){0};
     inp = make_mock_input(&data, &mock_backend);
     memset(&action, 0, sizeof(action));
     action.type = MD_ACTION_UNKNOWN;
-    assert(md_input_execute_action(&inp, &action) == -1);
+    MD_CHECK(md_input_execute_action(&inp, &action) == -1);
 
     /* NULL action */
-    assert(md_input_execute_action(&inp, NULL) == -1);
+    MD_CHECK(md_input_execute_action(&inp, NULL) == -1);
 
     printf("OK\n");
     return 0;
@@ -238,23 +238,23 @@ static int test_action_from_json(void) {
     MdAction action;
     memset(&action, 0, sizeof(action));
     int ret = md_action_parse(&action, json, strlen(json));
-    assert(ret == 0);
-    assert(action.type == MD_ACTION_KEY_COMBO);
-    assert(action.key_count == 3);
-    assert(strcmp(action.keys[0], "ctrl") == 0);
-    assert(strcmp(action.keys[1], "shift") == 0);
-    assert(strcmp(action.keys[2], "t") == 0);
+    MD_CHECK(ret == 0);
+    MD_CHECK(action.type == MD_ACTION_KEY_COMBO);
+    MD_CHECK(action.key_count == 3);
+    MD_CHECK(strcmp(action.keys[0], "ctrl") == 0);
+    MD_CHECK(strcmp(action.keys[1], "shift") == 0);
+    MD_CHECK(strcmp(action.keys[2], "t") == 0);
 
     /* Dispatch through the mock backend — deterministic */
     MockInputData data = {0};
     MdInput inp = make_mock_input(&data, &mock_backend);
 
     ret = md_input_execute_action(&inp, &action);
-    assert(ret == 0);
-    assert(data.key_event_calls == 6); /* 3 presses + 3 releases */
-    assert(data.keysyms[0] == 0x001D); /* ctrl */
-    assert(data.keysyms[1] == 0x002A); /* shift */
-    assert(data.keysyms[2] == 0x0014); /* t */
+    MD_CHECK(ret == 0);
+    MD_CHECK(data.key_event_calls == 6); /* 3 presses + 3 releases */
+    MD_CHECK(data.keysyms[0] == 0x001D); /* ctrl */
+    MD_CHECK(data.keysyms[1] == 0x002A); /* shift */
+    MD_CHECK(data.keysyms[2] == 0x0014); /* t */
 
     md_action_cleanup(&action);
 
@@ -268,64 +268,64 @@ static int test_keysym_lookup(void) {
     printf("  test_keysym_lookup... ");
 
     /* Modifiers */
-    assert(md_input_keysym_from_name("ctrl")  == 0x001D);
-    assert(md_input_keysym_from_name("control") == 0x001D);
-    assert(md_input_keysym_from_name("shift") == 0x002A);
-    assert(md_input_keysym_from_name("alt")   == 0x0038);
-    assert(md_input_keysym_from_name("super") == 0x007D);
-    assert(md_input_keysym_from_name("meta")  == 0x007D);
-    assert(md_input_keysym_from_name("win")   == 0x007D);
+    MD_CHECK(md_input_keysym_from_name("ctrl")  == 0x001D);
+    MD_CHECK(md_input_keysym_from_name("control") == 0x001D);
+    MD_CHECK(md_input_keysym_from_name("shift") == 0x002A);
+    MD_CHECK(md_input_keysym_from_name("alt")   == 0x0038);
+    MD_CHECK(md_input_keysym_from_name("super") == 0x007D);
+    MD_CHECK(md_input_keysym_from_name("meta")  == 0x007D);
+    MD_CHECK(md_input_keysym_from_name("win")   == 0x007D);
 
     /* Special keys */
-    assert(md_input_keysym_from_name("enter")     == 0x001C);
-    assert(md_input_keysym_from_name("return")    == 0x001C);
-    assert(md_input_keysym_from_name("tab")       == 0x000F);
-    assert(md_input_keysym_from_name("escape")    == 0x0001);
-    assert(md_input_keysym_from_name("esc")       == 0x0001);
-    assert(md_input_keysym_from_name("backspace") == 0x000E);
-    assert(md_input_keysym_from_name("delete")    == 0x006F);
-    assert(md_input_keysym_from_name("space")     == 0x0039);
+    MD_CHECK(md_input_keysym_from_name("enter")     == 0x001C);
+    MD_CHECK(md_input_keysym_from_name("return")    == 0x001C);
+    MD_CHECK(md_input_keysym_from_name("tab")       == 0x000F);
+    MD_CHECK(md_input_keysym_from_name("escape")    == 0x0001);
+    MD_CHECK(md_input_keysym_from_name("esc")       == 0x0001);
+    MD_CHECK(md_input_keysym_from_name("backspace") == 0x000E);
+    MD_CHECK(md_input_keysym_from_name("delete")    == 0x006F);
+    MD_CHECK(md_input_keysym_from_name("space")     == 0x0039);
 
     /* Navigation */
-    assert(md_input_keysym_from_name("up")       == 0x0067);
-    assert(md_input_keysym_from_name("down")     == 0x006C);
-    assert(md_input_keysym_from_name("left")     == 0x0069);
-    assert(md_input_keysym_from_name("right")    == 0x006A);
-    assert(md_input_keysym_from_name("home")     == 0x0066);
-    assert(md_input_keysym_from_name("end")      == 0x006B);
-    assert(md_input_keysym_from_name("pageup")   == 0x0068);
-    assert(md_input_keysym_from_name("pagedown") == 0x006D);
+    MD_CHECK(md_input_keysym_from_name("up")       == 0x0067);
+    MD_CHECK(md_input_keysym_from_name("down")     == 0x006C);
+    MD_CHECK(md_input_keysym_from_name("left")     == 0x0069);
+    MD_CHECK(md_input_keysym_from_name("right")    == 0x006A);
+    MD_CHECK(md_input_keysym_from_name("home")     == 0x0066);
+    MD_CHECK(md_input_keysym_from_name("end")      == 0x006B);
+    MD_CHECK(md_input_keysym_from_name("pageup")   == 0x0068);
+    MD_CHECK(md_input_keysym_from_name("pagedown") == 0x006D);
 
     /* F-keys */
-    assert(md_input_keysym_from_name("f1")  == 0x003B);
-    assert(md_input_keysym_from_name("f12") == 0x0058);
+    MD_CHECK(md_input_keysym_from_name("f1")  == 0x003B);
+    MD_CHECK(md_input_keysym_from_name("f12") == 0x0058);
 
     /* Letters */
-    assert(md_input_keysym_from_name("a") == 0x001E);
-    assert(md_input_keysym_from_name("z") == 0x002C);
-    assert(md_input_keysym_from_name("s") == 0x001F);
+    MD_CHECK(md_input_keysym_from_name("a") == 0x001E);
+    MD_CHECK(md_input_keysym_from_name("z") == 0x002C);
+    MD_CHECK(md_input_keysym_from_name("s") == 0x001F);
 
     /* Digits */
-    assert(md_input_keysym_from_name("0") == 0x000B);
-    assert(md_input_keysym_from_name("1") == 0x0002);
-    assert(md_input_keysym_from_name("9") == 0x000A);
+    MD_CHECK(md_input_keysym_from_name("0") == 0x000B);
+    MD_CHECK(md_input_keysym_from_name("1") == 0x0002);
+    MD_CHECK(md_input_keysym_from_name("9") == 0x000A);
 
     /* Punctuation */
-    assert(md_input_keysym_from_name("-")  == 0x000C);
-    assert(md_input_keysym_from_name("=")  == 0x000D);
-    assert(md_input_keysym_from_name(",")  == 0x0033);
-    assert(md_input_keysym_from_name(".")  == 0x0034);
-    assert(md_input_keysym_from_name("/")  == 0x0035);
+    MD_CHECK(md_input_keysym_from_name("-")  == 0x000C);
+    MD_CHECK(md_input_keysym_from_name("=")  == 0x000D);
+    MD_CHECK(md_input_keysym_from_name(",")  == 0x0033);
+    MD_CHECK(md_input_keysym_from_name(".")  == 0x0034);
+    MD_CHECK(md_input_keysym_from_name("/")  == 0x0035);
 
     /* Case insensitivity */
-    assert(md_input_keysym_from_name("CTRL")  == 0x001D);
-    assert(md_input_keysym_from_name("Shift") == 0x002A);
-    assert(md_input_keysym_from_name("F1")    == 0x003B);
+    MD_CHECK(md_input_keysym_from_name("CTRL")  == 0x001D);
+    MD_CHECK(md_input_keysym_from_name("Shift") == 0x002A);
+    MD_CHECK(md_input_keysym_from_name("F1")    == 0x003B);
 
     /* Unknown → 0 */
-    assert(md_input_keysym_from_name("nonexistent") == 0);
-    assert(md_input_keysym_from_name(NULL)          == 0);
-    assert(md_input_keysym_from_name("")            == 0);
+    MD_CHECK(md_input_keysym_from_name("nonexistent") == 0);
+    MD_CHECK(md_input_keysym_from_name(NULL)          == 0);
+    MD_CHECK(md_input_keysym_from_name("")            == 0);
 
     printf("OK\n");
     return 0;
@@ -340,22 +340,22 @@ static int test_dbl_and_right_click(void) {
     MdInput inp = make_mock_input(&data, &mock_backend);
 
     /* Double click: two move+press+release cycles at (500,300) */
-    assert(md_input_dbl_click(&inp, 500, 300) == 0);
-    assert(data.mouse_move_calls == 2);
-    assert(data.mouse_button_calls == 4);
-    assert(data.last_x == 500 && data.last_y == 300);
+    MD_CHECK(md_input_dbl_click(&inp, 500, 300) == 0);
+    MD_CHECK(data.mouse_move_calls == 2);
+    MD_CHECK(data.mouse_button_calls == 4);
+    MD_CHECK(data.last_x == 500 && data.last_y == 300);
 
     /* Right click: one cycle on the right button */
     data = (MockInputData){0};
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_right_click(&inp, 500, 300) == 0);
-    assert(data.mouse_move_calls == 1);
-    assert(data.mouse_button_calls == 2);
-    assert(data.button_pressed[MD_MOUSE_RIGHT] == 0);
+    MD_CHECK(md_input_right_click(&inp, 500, 300) == 0);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.mouse_button_calls == 2);
+    MD_CHECK(data.button_pressed[MD_MOUSE_RIGHT] == 0);
 
     /* NULL input */
-    assert(md_input_dbl_click(NULL, 0, 0) == -1);
-    assert(md_input_right_click(NULL, 0, 0) == -1);
+    MD_CHECK(md_input_dbl_click(NULL, 0, 0) == -1);
+    MD_CHECK(md_input_right_click(NULL, 0, 0) == -1);
 
     printf("OK\n");
     return 0;
@@ -367,22 +367,22 @@ static int test_mouse_scroll(void) {
     printf("  test_mouse_scroll... ");
 
     /* scroll with NULL */
-    assert(md_input_scroll(NULL, 0, 3) == -1);
+    MD_CHECK(md_input_scroll(NULL, 0, 3) == -1);
 
     /* mouse_move with NULL */
-    assert(md_input_mouse_move(NULL, 100, 100) == -1);
+    MD_CHECK(md_input_mouse_move(NULL, 100, 100) == -1);
 
     /* Deterministic mock assertions */
     MockInputData data = {0};
     MdInput inp = make_mock_input(&data, &mock_backend);
 
-    assert(md_input_scroll(&inp, 0, 3) == 0);
-    assert(data.mouse_scroll_calls == 1);
-    assert(data.last_dy == 3);
+    MD_CHECK(md_input_scroll(&inp, 0, 3) == 0);
+    MD_CHECK(data.mouse_scroll_calls == 1);
+    MD_CHECK(data.last_dy == 3);
 
-    assert(md_input_mouse_move(&inp, 100, 200) == 0);
-    assert(data.mouse_move_calls == 1);
-    assert(data.last_x == 100 && data.last_y == 200);
+    MD_CHECK(md_input_mouse_move(&inp, 100, 200) == 0);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.last_x == 100 && data.last_y == 200);
 
     printf("OK\n");
     return 0;
@@ -395,25 +395,25 @@ static int test_type_key_combo_edges(void) {
 
     MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
     MdInput *inp = md_input_create(&cfg);
-    assert(inp != NULL);
+    MD_CHECK(inp != NULL);
 
     /* NULL text */
-    assert(md_input_type_text(inp, NULL) == -1);
-    assert(md_input_type_text(NULL, "hello") == -1);
+    MD_CHECK(md_input_type_text(inp, NULL) == -1);
+    MD_CHECK(md_input_type_text(NULL, "hello") == -1);
 
     /* NULL keys array */
-    assert(md_input_key_combo(inp, NULL, 1) == -1);
+    MD_CHECK(md_input_key_combo(inp, NULL, 1) == -1);
 
     /* Zero key count */
     const char *keys[] = {"ctrl"};
-    assert(md_input_key_combo(inp, keys, 0) == -1);
+    MD_CHECK(md_input_key_combo(inp, keys, 0) == -1);
 
     /* NULL input */
-    assert(md_input_key_combo(NULL, keys, 1) == -1);
+    MD_CHECK(md_input_key_combo(NULL, keys, 1) == -1);
 
     /* Unknown key name should fail */
     const char *bad_keys[] = {"nonexistent_key"};
-    assert(md_input_key_combo(inp, bad_keys, 1) == -1);
+    MD_CHECK(md_input_key_combo(inp, bad_keys, 1) == -1);
 
     md_input_destroy(inp);
     printf("OK\n");
@@ -428,38 +428,38 @@ static int test_click_backend_failure_propagation(void) {
     MockInputData data = {0};
     MdInput inp = make_mock_input(&data, &mock_backend);
 
-    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == 0);
-    assert(data.mouse_move_calls == 1);
-    assert(data.mouse_button_calls == 2);
-    assert(data.last_x == 10);
-    assert(data.last_y == 20);
-    assert(data.button_pressed[MD_MOUSE_LEFT] == 0);
+    MD_CHECK(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == 0);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.mouse_button_calls == 2);
+    MD_CHECK(data.last_x == 10);
+    MD_CHECK(data.last_y == 20);
+    MD_CHECK(data.button_pressed[MD_MOUSE_LEFT] == 0);
 
     data = (MockInputData){ .mouse_move_ret = -1 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
-    assert(data.mouse_move_calls == 1);
-    assert(data.mouse_button_calls == 0);
+    MD_CHECK(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.mouse_button_calls == 0);
 
     data = (MockInputData){ .mouse_button_fail_call = 1 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
-    assert(data.mouse_move_calls == 1);
-    assert(data.mouse_button_calls == 1);
+    MD_CHECK(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.mouse_button_calls == 1);
 
     data = (MockInputData){ .mouse_button_fail_call = 2 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
-    assert(data.mouse_move_calls == 1);
-    assert(data.mouse_button_calls == 2);
+    MD_CHECK(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    MD_CHECK(data.mouse_move_calls == 1);
+    MD_CHECK(data.mouse_button_calls == 2);
 
     static const MdInputBackend missing_button_backend = {
         .mouse_move = mock_mouse_move,
     };
     data = (MockInputData){0};
     inp = make_mock_input(&data, &missing_button_backend);
-    assert(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
-    assert(data.mouse_move_calls == 0);
+    MD_CHECK(md_input_click(&inp, 10, 20, MD_MOUSE_LEFT) == -1);
+    MD_CHECK(data.mouse_move_calls == 0);
 
     printf("OK\n");
     return 0;
@@ -474,29 +474,29 @@ static int test_key_combo_backend_failure_propagation(void) {
     MockInputData data = {0};
     MdInput inp = make_mock_input(&data, &mock_backend);
 
-    assert(md_input_key_combo(&inp, keys, 2) == 0);
-    assert(data.key_event_calls == 4);
-    assert(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
-    assert(data.keysyms[1] == 0x001E && data.key_pressed[1] == 1);
-    assert(data.keysyms[2] == 0x001E && data.key_pressed[2] == 0);
-    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
+    MD_CHECK(md_input_key_combo(&inp, keys, 2) == 0);
+    MD_CHECK(data.key_event_calls == 4);
+    MD_CHECK(data.keysyms[0] == 0x001D && data.key_pressed[0] == 1);
+    MD_CHECK(data.keysyms[1] == 0x001E && data.key_pressed[1] == 1);
+    MD_CHECK(data.keysyms[2] == 0x001E && data.key_pressed[2] == 0);
+    MD_CHECK(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
 
     data = (MockInputData){ .key_event_fail_call = 1 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_key_combo(&inp, keys, 2) == -1);
-    assert(data.key_event_calls == 1);
+    MD_CHECK(md_input_key_combo(&inp, keys, 2) == -1);
+    MD_CHECK(data.key_event_calls == 1);
 
     data = (MockInputData){ .key_event_fail_call = 2 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_key_combo(&inp, keys, 2) == -1);
-    assert(data.key_event_calls == 3); /* failed second press + ctrl cleanup */
-    assert(data.keysyms[2] == 0x001D && data.key_pressed[2] == 0);
+    MD_CHECK(md_input_key_combo(&inp, keys, 2) == -1);
+    MD_CHECK(data.key_event_calls == 3); /* failed second press + ctrl cleanup */
+    MD_CHECK(data.keysyms[2] == 0x001D && data.key_pressed[2] == 0);
 
     data = (MockInputData){ .key_event_fail_call = 3 };
     inp = make_mock_input(&data, &mock_backend);
-    assert(md_input_key_combo(&inp, keys, 2) == -1);
-    assert(data.key_event_calls == 4); /* release failure still releases rest */
-    assert(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
+    MD_CHECK(md_input_key_combo(&inp, keys, 2) == -1);
+    MD_CHECK(data.key_event_calls == 4); /* release failure still releases rest */
+    MD_CHECK(data.keysyms[3] == 0x001D && data.key_pressed[3] == 0);
 
     printf("OK\n");
     return 0;
@@ -507,7 +507,7 @@ static int test_key_combo_backend_failure_propagation(void) {
 static int test_lifecycle_edges(void) {
     printf("  test_lifecycle_edges... ");
 
-    assert(md_input_is_ready(NULL) == false);
+    MD_CHECK(md_input_is_ready(NULL) == false);
     md_input_destroy(NULL); /* should not crash */
 
     printf("OK\n");
@@ -537,5 +537,6 @@ int main(void) {
     failures += test_lifecycle_edges();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    return failures;
+    md_test_failures += failures;
+    return md_test_report();
 }

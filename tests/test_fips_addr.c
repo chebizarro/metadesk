@@ -14,19 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <arpa/inet.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) \
-    do { printf("  test: %s ... ", name); } while (0)
-#define PASS() \
-    do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
-
+#include "md_test.h"
 typedef struct FipsAddrVector {
     const char *name;
     const char *npub;
@@ -288,6 +277,5 @@ int main(void) {
     test_validation();
     test_error_handling();
 
-    printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return md_test_report();
 }

@@ -8,13 +8,12 @@
 #include "mcp_resources.h"
 #include "mcp_bridge.h"
 #include "jsonrpc.h"
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "md_test.h"
 
-#define PASS(name) printf("  PASS  %s\n", name)
 
 /* ── Capture transport ───────────────────────────────────────── */
 
@@ -42,7 +41,7 @@ static int capture_write(const char *json, size_t len, void *userdata)
 
 static cJSON *last_response(void)
 {
-    assert(g_response_count > 0);
+    MD_CHECK(g_response_count > 0);
     return cJSON_Parse(g_responses[g_response_count - 1]);
 }
 
@@ -119,17 +118,17 @@ static void test_initialize(void)
                        "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}";
     md_mcp_server_handle_message(s, init, strlen(init));
 
-    assert(g_response_count == 1);
+    MD_CHECK(g_response_count == 1);
     cJSON *resp = last_response();
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
 
     cJSON *result = cJSON_GetObjectItem(resp, "result");
-    assert(result != NULL);
-    assert(strcmp(cJSON_GetObjectItem(result, "protocolVersion")->valuestring,
+    MD_CHECK(result != NULL);
+    MD_CHECK(strcmp(cJSON_GetObjectItem(result, "protocolVersion")->valuestring,
                  MD_TEST_MCP_PROTOCOL) == 0);
 
     cJSON *info = cJSON_GetObjectItem(result, "serverInfo");
-    assert(strcmp(cJSON_GetObjectItem(info, "name")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(info, "name")->valuestring,
                  "metadesk-test") == 0);
 
     cJSON_Delete(resp);
@@ -145,7 +144,7 @@ static void test_reject_before_init(void)
     md_mcp_server_handle_message(s, ping, strlen(ping));
 
     cJSON *resp = last_response();
-    assert(cJSON_GetObjectItem(resp, "error") != NULL);
+    MD_CHECK(cJSON_GetObjectItem(resp, "error") != NULL);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -159,14 +158,14 @@ static void test_initialized_before_initialize_ignored(void)
     const char *initialized = "{\"jsonrpc\":\"2.0\","
                               "\"method\":\"notifications/initialized\"}";
     md_mcp_server_handle_message(s, initialized, strlen(initialized));
-    assert(!md_mcp_server_is_initialized(s));
-    assert(g_response_count == 0);
+    MD_CHECK(!md_mcp_server_is_initialized(s));
+    MD_CHECK(g_response_count == 0);
 
     const char *ping = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}";
     md_mcp_server_handle_message(s, ping, strlen(ping));
 
     cJSON *resp = last_response();
-    assert(cJSON_GetObjectItem(resp, "error") != NULL);
+    MD_CHECK(cJSON_GetObjectItem(resp, "error") != NULL);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -183,8 +182,8 @@ static void test_ping(void)
     md_mcp_server_handle_message(s, ping, strlen(ping));
 
     cJSON *resp = last_response();
-    assert(cJSON_GetObjectItem(resp, "result") != NULL);
-    assert(cJSON_GetObjectItem(resp, "id")->valueint == 99);
+    MD_CHECK(cJSON_GetObjectItem(resp, "result") != NULL);
+    MD_CHECK(cJSON_GetObjectItem(resp, "id")->valueint == 99);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -215,11 +214,11 @@ static void test_tools_list(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     cJSON *tools = cJSON_GetObjectItem(result, "tools");
-    assert(cJSON_IsArray(tools));
-    assert(cJSON_GetArraySize(tools) == 1);
+    MD_CHECK(cJSON_IsArray(tools));
+    MD_CHECK(cJSON_GetArraySize(tools) == 1);
 
     cJSON *t = cJSON_GetArrayItem(tools, 0);
-    assert(strcmp(cJSON_GetObjectItem(t, "name")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(t, "name")->valuestring,
                  "metadesk_click") == 0);
     cJSON_Delete(resp);
 
@@ -250,11 +249,11 @@ static void test_tools_call(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     cJSON *content = cJSON_GetObjectItem(result, "content");
-    assert(cJSON_IsArray(content));
-    assert(cJSON_GetArraySize(content) == 1);
+    MD_CHECK(cJSON_IsArray(content));
+    MD_CHECK(cJSON_GetArraySize(content) == 1);
 
     cJSON *item = cJSON_GetArrayItem(content, 0);
-    assert(strcmp(cJSON_GetObjectItem(item, "text")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(item, "text")->valuestring,
                  "clicked btn_ok") == 0);
     cJSON_Delete(resp);
 
@@ -274,10 +273,10 @@ static void test_tools_call_unknown(void)
 
     cJSON *resp = last_response();
     cJSON *err = cJSON_GetObjectItem(resp, "error");
-    assert(err != NULL);
+    MD_CHECK(err != NULL);
     /* Named-thing-not-registered answers INVALID_PARAMS, same as
      * resources/read — the method itself exists. */
-    assert(cJSON_GetObjectItem(err, "code")->valueint == MD_JSONRPC_INVALID_PARAMS);
+    MD_CHECK(cJSON_GetObjectItem(err, "code")->valueint == MD_JSONRPC_INVALID_PARAMS);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -306,11 +305,11 @@ static void test_resources_list(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     cJSON *resources = cJSON_GetObjectItem(result, "resources");
-    assert(cJSON_IsArray(resources));
-    assert(cJSON_GetArraySize(resources) == 1);
+    MD_CHECK(cJSON_IsArray(resources));
+    MD_CHECK(cJSON_GetArraySize(resources) == 1);
 
     cJSON *r = cJSON_GetArrayItem(resources, 0);
-    assert(strcmp(cJSON_GetObjectItem(r, "uri")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(r, "uri")->valuestring,
                  "metadesk://ui-tree") == 0);
     cJSON_Delete(resp);
 
@@ -339,8 +338,8 @@ static void test_resources_read(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     cJSON *contents = cJSON_GetObjectItem(result, "contents");
-    assert(cJSON_IsArray(contents));
-    assert(cJSON_GetArraySize(contents) == 1);
+    MD_CHECK(cJSON_IsArray(contents));
+    MD_CHECK(cJSON_GetArraySize(contents) == 1);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -365,17 +364,17 @@ static void test_resources_subscribe(void)
     const char *sub = "{\"jsonrpc\":\"2.0\",\"method\":\"resources/subscribe\","
                       "\"id\":7,\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
     md_mcp_server_handle_message(s, sub, strlen(sub));
-    assert(g_response_count == 1);
+    MD_CHECK(g_response_count == 1);
 
     /* Now a notification should be sent */
     clear_responses();
     md_mcp_server_notify_resource_updated(s, "metadesk://ui-tree");
-    assert(g_response_count == 1);
+    MD_CHECK(g_response_count == 1);
 
     cJSON *notif = cJSON_Parse(g_responses[0]);
-    assert(strcmp(cJSON_GetObjectItem(notif, "method")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(notif, "method")->valuestring,
                  "notifications/resources/updated") == 0);
-    assert(!cJSON_HasObjectItem(notif, "id"));
+    MD_CHECK(!cJSON_HasObjectItem(notif, "id"));
     cJSON_Delete(notif);
 
     /* Unsubscribe */
@@ -387,7 +386,7 @@ static void test_resources_subscribe(void)
     /* Notification should not be sent */
     clear_responses();
     md_mcp_server_notify_resource_updated(s, "metadesk://ui-tree");
-    assert(g_response_count == 0);
+    MD_CHECK(g_response_count == 0);
 
     md_mcp_server_destroy(s);
     PASS("resources/subscribe + unsubscribe");
@@ -404,8 +403,8 @@ static void test_unknown_method(void)
 
     cJSON *resp = last_response();
     cJSON *err = cJSON_GetObjectItem(resp, "error");
-    assert(err != NULL);
-    assert(cJSON_GetObjectItem(err, "code")->valueint == -32601);
+    MD_CHECK(err != NULL);
+    MD_CHECK(cJSON_GetObjectItem(err, "code")->valueint == -32601);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -420,7 +419,7 @@ static void test_parse_error(void)
 
     cJSON *resp = last_response();
     cJSON *err = cJSON_GetObjectItem(resp, "error");
-    assert(cJSON_GetObjectItem(err, "code")->valueint == -32700);
+    MD_CHECK(cJSON_GetObjectItem(err, "code")->valueint == -32700);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -453,10 +452,10 @@ static void test_init_capabilities_reflect_registrations(void)
     cJSON *resp = last_response();
     cJSON *caps = cJSON_GetObjectItem(
         cJSON_GetObjectItem(resp, "result"), "capabilities");
-    assert(cJSON_HasObjectItem(caps, "tools"));
-    assert(cJSON_HasObjectItem(caps, "resources"));
+    MD_CHECK(cJSON_HasObjectItem(caps, "tools"));
+    MD_CHECK(cJSON_HasObjectItem(caps, "resources"));
     cJSON *res_caps = cJSON_GetObjectItem(caps, "resources");
-    assert(cJSON_IsTrue(cJSON_GetObjectItem(res_caps, "subscribe")));
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(res_caps, "subscribe")));
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -477,8 +476,8 @@ static void test_bridge_null_a11y_fails_create(void)
     };
 
     /* a11y is required — no silent degraded mode */
-    assert(md_mcp_bridge_create(&cfg) == NULL);
-    assert(md_mcp_bridge_create(NULL) == NULL);
+    MD_CHECK(md_mcp_bridge_create(&cfg) == NULL);
+    MD_CHECK(md_mcp_bridge_create(NULL) == NULL);
 
     PASS("bridge NULL a11y fails create");
 }
@@ -504,13 +503,13 @@ static void test_bridge_create_destroy_with_stub_a11y(void)
     };
 
     MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
-    assert(bridge != NULL);
+    MD_CHECK(bridge != NULL);
 
     /* Session should be active. */
-    assert(md_mcp_bridge_get_state(bridge) == MD_SESSION_ACTIVE);
+    MD_CHECK(md_mcp_bridge_get_state(bridge) == MD_SESSION_ACTIVE);
 
     /* Server should be accessible */
-    assert(md_mcp_bridge_get_server(bridge) != NULL);
+    MD_CHECK(md_mcp_bridge_get_server(bridge) != NULL);
 
     /* Clean destroy */
     md_mcp_bridge_destroy(bridge);
@@ -543,7 +542,7 @@ static void test_resources_with_session(void)
         .agent = NULL,
         .tree_format = MD_TREE_FORMAT_JSON,
     };
-    assert(md_mcp_register_resources(s, &res_ctx) == 0);
+    MD_CHECK(md_mcp_register_resources(s, &res_ctx) == 0);
     do_init(s);
     clear_responses();
 
@@ -555,19 +554,19 @@ static void test_resources_with_session(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     cJSON *contents = cJSON_GetObjectItem(result, "contents");
-    assert(cJSON_IsArray(contents));
-    assert(cJSON_GetArraySize(contents) == 1);
+    MD_CHECK(cJSON_IsArray(contents));
+    MD_CHECK(cJSON_GetArraySize(contents) == 1);
 
     cJSON *item = cJSON_GetArrayItem(contents, 0);
     const char *text = cJSON_GetObjectItem(item, "text")->valuestring;
     cJSON *info = cJSON_Parse(text);
-    assert(info != NULL);
-    assert(strcmp(cJSON_GetObjectItem(info, "session_id")->valuestring,
+    MD_CHECK(info != NULL);
+    MD_CHECK(strcmp(cJSON_GetObjectItem(info, "session_id")->valuestring,
                  "test-uuid-123") == 0);
-    assert(strcmp(cJSON_GetObjectItem(info, "state")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(info, "state")->valuestring,
                  "active") == 0);
     cJSON *caps = cJSON_GetObjectItem(info, "capabilities");
-    assert(cJSON_GetArraySize(caps) == 2);
+    MD_CHECK(cJSON_GetArraySize(caps) == 2);
     cJSON_Delete(info);
     cJSON_Delete(resp);
 
@@ -580,9 +579,9 @@ static void test_resources_with_session(void)
     resp = last_response();
     result = cJSON_GetObjectItem(resp, "result");
     contents = cJSON_GetObjectItem(result, "contents");
-    assert(cJSON_GetArraySize(contents) == 1);
+    MD_CHECK(cJSON_GetArraySize(contents) == 1);
     item = cJSON_GetArrayItem(contents, 0);
-    assert(strcmp(cJSON_GetObjectItem(item, "uri")->valuestring,
+    MD_CHECK(strcmp(cJSON_GetObjectItem(item, "uri")->valuestring,
                  "metadesk://ui-tree") == 0);
     cJSON_Delete(resp);
 
@@ -594,7 +593,7 @@ static void test_resources_with_session(void)
     resp = last_response();
     cJSON *resources = cJSON_GetObjectItem(
         cJSON_GetObjectItem(resp, "result"), "resources");
-    assert(cJSON_GetArraySize(resources) == 2);
+    MD_CHECK(cJSON_GetArraySize(resources) == 2);
     cJSON_Delete(resp);
 
     md_mcp_server_destroy(s);
@@ -607,7 +606,7 @@ static void test_9_tools_register(void)
 {
     MdMcpServer *s = make_server();
     MdMcpToolCtx tool_ctx = { .agent = NULL };
-    assert(md_mcp_register_tools(s, &tool_ctx) == 0);
+    MD_CHECK(md_mcp_register_tools(s, &tool_ctx) == 0);
 
     do_init(s);
     clear_responses();
@@ -617,7 +616,7 @@ static void test_9_tools_register(void)
 
     cJSON *resp = last_response();
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
-    assert(cJSON_GetArraySize(tools) == 9);
+    MD_CHECK(cJSON_GetArraySize(tools) == 9);
 
     /* Verify known tool names */
     const char *expected[] = {
@@ -627,9 +626,9 @@ static void test_9_tools_register(void)
     };
     for (int i = 0; i < 9; i++) {
         cJSON *t = cJSON_GetArrayItem(tools, i);
-        assert(strcmp(cJSON_GetObjectItem(t, "name")->valuestring,
+        MD_CHECK(strcmp(cJSON_GetObjectItem(t, "name")->valuestring,
                      expected[i]) == 0);
-        assert(cJSON_HasObjectItem(t, "inputSchema"));
+        MD_CHECK(cJSON_HasObjectItem(t, "inputSchema"));
     }
     cJSON_Delete(resp);
 
@@ -654,13 +653,13 @@ static void test_tool_call_click_no_agent(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     /* No agent → isError=true with descriptive message */
-    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON *content = cJSON_GetObjectItem(result, "content");
-    assert(cJSON_IsArray(content));
-    assert(cJSON_GetArraySize(content) == 1);
+    MD_CHECK(cJSON_IsArray(content));
+    MD_CHECK(cJSON_GetArraySize(content) == 1);
     cJSON *text_item = cJSON_GetArrayItem(content, 0);
     const char *text = cJSON_GetObjectItem(text_item, "text")->valuestring;
-    assert(strstr(text, "no agent") != NULL);
+    MD_CHECK(strstr(text, "no agent") != NULL);
     cJSON_Delete(resp);
 
     md_mcp_tools_cleanup(&tool_ctx);
@@ -684,7 +683,7 @@ static void test_tool_call_missing_target(void)
 
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
-    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON_Delete(resp);
 
     md_mcp_tools_cleanup(&tool_ctx);
@@ -708,10 +707,10 @@ static void test_tool_call_key_combo(void)
     cJSON *resp = last_response();
     cJSON *result = cJSON_GetObjectItem(resp, "result");
     /* No agent → isError=true */
-    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON *content = cJSON_GetObjectItem(result, "content");
     const char *text = cJSON_GetObjectItem(cJSON_GetArrayItem(content, 0), "text")->valuestring;
-    assert(strstr(text, "no agent") != NULL);
+    MD_CHECK(strstr(text, "no agent") != NULL);
     cJSON_Delete(resp);
 
     md_mcp_tools_cleanup(&tool_ctx);
@@ -734,12 +733,12 @@ static void test_tool_registration_failure_rolls_back(void)
             .input_schema = schema,
             .handler = stub_tool_handler,
         };
-        assert(md_mcp_server_register_tool(s, &tool) == 0);
+        MD_CHECK(md_mcp_server_register_tool(s, &tool) == 0);
     }
 
     MdMcpToolCtx tool_ctx = { .agent = NULL };
-    assert(md_mcp_register_tools(s, &tool_ctx) == -1);
-    assert(tool_ctx._handler_ctxs == NULL);
+    MD_CHECK(md_mcp_register_tools(s, &tool_ctx) == -1);
+    MD_CHECK(tool_ctx._handler_ctxs == NULL);
 
     do_init(s);
     clear_responses();
@@ -748,10 +747,10 @@ static void test_tool_registration_failure_rolls_back(void)
 
     cJSON *resp = last_response();
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
-    assert(cJSON_GetArraySize(tools) == 24);
+    MD_CHECK(cJSON_GetArraySize(tools) == 24);
     for (int i = 0; i < cJSON_GetArraySize(tools); i++) {
         cJSON *t = cJSON_GetArrayItem(tools, i);
-        assert(strncmp(cJSON_GetObjectItem(t, "name")->valuestring,
+        MD_CHECK(strncmp(cJSON_GetObjectItem(t, "name")->valuestring,
                        "prefill_tool_", 13) == 0);
     }
     cJSON_Delete(resp);
@@ -791,5 +790,5 @@ int main(void)
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();
-    return 0;
+    return md_test_report();
 }

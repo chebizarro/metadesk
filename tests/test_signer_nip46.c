@@ -33,17 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) \
-    do { printf("  test: %s ... ", name); } while (0)
-#define PASS() \
-    do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
-
+#include "md_test.h"
 /* ── Deterministic test keys ─────────────────────────────────── */
 
 /* Client transport key (NIP-46 ephemeral, not the user's key) */
@@ -855,6 +845,5 @@ int main(void) {
     test_multiple_sign_events();
     test_error_method();
 
-    printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return md_test_report();
 }

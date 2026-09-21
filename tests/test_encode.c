@@ -11,8 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <limits.h>
+#include "md_test.h"
 
 static int g_encoded_count;
 static int g_decoded_count;
@@ -54,10 +54,10 @@ static void on_decode(const MdDecodedFrame *frame, void *userdata) {
     (void)userdata;
     g_decoded_count++;
     /* Verify frame has valid dimensions */
-    assert(frame->width == TEST_W);
-    assert(frame->height == TEST_H);
-    assert(frame->stride == TEST_W * 4);
-    assert(frame->data != NULL);
+    MD_CHECK(frame->width == TEST_W);
+    MD_CHECK(frame->height == TEST_H);
+    MD_CHECK(frame->stride == TEST_W * 4);
+    MD_CHECK(frame->data != NULL);
 }
 
 /* ── Test: encoder creation ──────────────────────────────────── */
@@ -66,15 +66,15 @@ static int test_encoder_create(void) {
     printf("  test_encoder_create... ");
 
     /* NULL config should fail */
-    assert(md_encoder_create(NULL) == NULL);
+    MD_CHECK(md_encoder_create(NULL) == NULL);
 
     /* Zero dimensions should fail */
     MdEncoderConfig cfg = { .width = 0, .height = 480 };
-    assert(md_encoder_create(&cfg) == NULL);
+    MD_CHECK(md_encoder_create(&cfg) == NULL);
 
     /* Odd dimensions should fail (NV12 requires even) */
     cfg.width = 641; cfg.height = 480;
-    assert(md_encoder_create(&cfg) == NULL);
+    MD_CHECK(md_encoder_create(&cfg) == NULL);
 
     /* Valid config should succeed */
     cfg.width = TEST_W;
@@ -84,11 +84,11 @@ static int test_encoder_create(void) {
     cfg.prefer_nvenc = true;
 
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     uint32_t w, h;
-    assert(md_encoder_get_size(enc, &w, &h) == 0);
-    assert(w == TEST_W && h == TEST_H);
+    MD_CHECK(md_encoder_get_size(enc, &w, &h) == 0);
+    MD_CHECK(w == TEST_W && h == TEST_H);
 
     printf("OK (%s)\n", md_encoder_is_hw(enc) ? "NVENC" : "x264");
     md_encoder_destroy(enc);
@@ -106,15 +106,15 @@ static int test_encoder_create_rejects_int_overflow(void) {
         .bitrate = MD_ENCODER_DEFAULT_BITRATE,
         .fps = 30,
     };
-    assert(md_encoder_create(&cfg) == NULL);
+    MD_CHECK(md_encoder_create(&cfg) == NULL);
 
     cfg.width = 2;
     cfg.height = (uint32_t)INT_MAX + 1u;
-    assert(md_encoder_create(&cfg) == NULL);
+    MD_CHECK(md_encoder_create(&cfg) == NULL);
 
     cfg.height = 2;
     cfg.fps = (uint32_t)INT_MAX + 1u;
-    assert(md_encoder_create(&cfg) == NULL);
+    MD_CHECK(md_encoder_create(&cfg) == NULL);
 
     printf("OK\n");
     return 0;
@@ -132,14 +132,14 @@ static int test_encoder_submit_rejects_short_stride(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     uint8_t *buf = calloc(1, (size_t)cfg.width * cfg.height * 4u);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
-    assert(md_encoder_submit(enc, buf, cfg.width * 4u - 1u, MD_PIX_FMT_BGRX,
+    MD_CHECK(md_encoder_submit(enc, buf, cfg.width * 4u - 1u, MD_PIX_FMT_BGRX,
                              0, NULL, NULL) == -1);
-    assert(md_encoder_submit(enc, buf, cfg.width - 1u, MD_PIX_FMT_NV12,
+    MD_CHECK(md_encoder_submit(enc, buf, cfg.width - 1u, MD_PIX_FMT_NV12,
                              0, NULL, NULL) == -1);
 
     free(buf);
@@ -162,11 +162,11 @@ static int test_encode_frames(void) {
     };
 
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
     g_encoded_count = 0;
 
@@ -176,14 +176,14 @@ static int test_encode_frames(void) {
                    (uint8_t)(i * 25), 128, 64);
         int ret = md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                     (int64_t)i, on_encode, NULL);
-        assert(ret == 0);
+        MD_CHECK(ret == 0);
     }
 
     /* Flush remaining */
     md_encoder_flush(enc, on_encode, NULL);
 
     /* Should have gotten some encoded packets */
-    assert(g_encoded_count > 0);
+    MD_CHECK(g_encoded_count > 0);
     printf("OK (%d packets from 10 frames)\n", g_encoded_count);
 
     free(buf);
@@ -205,14 +205,14 @@ static int test_roundtrip(void) {
     };
 
     MdEncoder *enc = md_encoder_create(&enc_cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
     g_encoded_count = 0;
     g_decoded_count = 0;
@@ -227,13 +227,13 @@ static int test_roundtrip(void) {
 
         int ret = md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                     (int64_t)i, on_encode, NULL);
-        assert(ret == 0);
+        MD_CHECK(ret == 0);
 
         /* If we got an encoded packet, submit to decoder */
         if (g_last_encoded_data && g_last_encoded_size > 0) {
             ret = md_decoder_submit(dec, g_last_encoded_data,
                                     g_last_encoded_size, (int64_t)i);
-            assert(ret == 0);
+            MD_CHECK(ret == 0);
 
             md_decoder_poll(dec, on_decode, NULL);
         }
@@ -250,7 +250,7 @@ static int test_roundtrip(void) {
     printf("OK (encoded=%d, decoded=%d)\n", g_encoded_count, g_decoded_count);
 
     /* Should have decoded at least some frames */
-    assert(g_decoded_count > 0);
+    MD_CHECK(g_decoded_count > 0);
 
     free(g_last_encoded_data);
     g_last_encoded_data = NULL;
@@ -267,7 +267,7 @@ static int test_decoder_create(void) {
     printf("  test_decoder_create... ");
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     /* Submit garbage data — should not crash, just return error */
     uint8_t garbage[16] = {0};
@@ -278,7 +278,7 @@ static int test_decoder_create(void) {
     /* Poll should return 0 frames (no valid input) */
     g_decoded_count = 0;
     md_decoder_poll(dec, on_decode, NULL);
-    assert(g_decoded_count == 0);
+    MD_CHECK(g_decoded_count == 0);
 
     printf("OK\n");
     md_decoder_destroy(dec);
@@ -291,10 +291,10 @@ static int test_decoder_submit_oversized(void) {
     printf("  test_decoder_submit_oversized... ");
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     uint8_t byte = 0;
-    assert(md_decoder_submit(dec, &byte, (size_t)INT_MAX + 1u, 0) == -1);
+    MD_CHECK(md_decoder_submit(dec, &byte, (size_t)INT_MAX + 1u, 0) == -1);
 
     md_decoder_destroy(dec);
     printf("OK\n");
@@ -325,12 +325,12 @@ static int test_decoder_poll_empty(void) {
     printf("  test_decoder_poll_empty... ");
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     g_decoded_count = 0;
     int nframes = md_decoder_poll(dec, on_decode, NULL);
-    assert(nframes == 0);
-    assert(g_decoded_count == 0);
+    MD_CHECK(nframes == 0);
+    MD_CHECK(g_decoded_count == 0);
 
     md_decoder_destroy(dec);
     printf("OK\n");
@@ -343,13 +343,13 @@ static int test_decoder_flush_empty(void) {
     printf("  test_decoder_flush_empty... ");
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     g_decoded_count = 0;
     int nframes = md_decoder_flush(dec, on_decode, NULL);
     /* Flush with no pending data should return 0 or succeed benignly */
-    assert(nframes >= 0);
-    assert(g_decoded_count == 0);
+    MD_CHECK(nframes >= 0);
+    MD_CHECK(g_decoded_count == 0);
 
     md_decoder_destroy(dec);
     printf("OK\n");
@@ -368,18 +368,18 @@ static int test_encoder_get_size_null(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     /* NULL output params */
-    assert(md_encoder_get_size(enc, NULL, NULL) == -1);
+    MD_CHECK(md_encoder_get_size(enc, NULL, NULL) == -1);
     uint32_t w;
-    assert(md_encoder_get_size(enc, &w, NULL) == -1);
+    MD_CHECK(md_encoder_get_size(enc, &w, NULL) == -1);
     uint32_t h;
-    assert(md_encoder_get_size(enc, NULL, &h) == -1);
+    MD_CHECK(md_encoder_get_size(enc, NULL, &h) == -1);
 
     /* Valid */
-    assert(md_encoder_get_size(enc, &w, &h) == 0);
-    assert(w == TEST_W && h == TEST_H);
+    MD_CHECK(md_encoder_get_size(enc, &w, &h) == 0);
+    MD_CHECK(w == TEST_W && h == TEST_H);
 
     md_encoder_destroy(enc);
     printf("OK\n");
@@ -398,14 +398,14 @@ static int test_decode_from_encoded(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     MdDecoder *dec = md_decoder_create();
-    assert(dec != NULL);
+    MD_CHECK(dec != NULL);
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
     g_encoded_count = 0;
     g_decoded_count = 0;
@@ -423,7 +423,7 @@ static int test_decode_from_encoded(void) {
         if (g_last_encoded_data && g_last_encoded_size > 0) {
             int ret = md_decoder_submit(dec, g_last_encoded_data,
                                         g_last_encoded_size, (int64_t)i);
-            assert(ret == 0);
+            MD_CHECK(ret == 0);
             md_decoder_poll(dec, on_decode, NULL);
         }
     }
@@ -455,7 +455,7 @@ static int test_encoder_get_bitrate(void) {
     printf("  test_encoder_get_bitrate... ");
 
     /* NULL encoder should return 0 */
-    assert(md_encoder_get_bitrate(NULL) == 0);
+    MD_CHECK(md_encoder_get_bitrate(NULL) == 0);
 
     MdEncoderConfig cfg = {
         .width = TEST_W,
@@ -464,18 +464,18 @@ static int test_encoder_get_bitrate(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     /* Should return the configured bitrate */
-    assert(md_encoder_get_bitrate(enc) == 5000000);
+    MD_CHECK(md_encoder_get_bitrate(enc) == 5000000);
 
     md_encoder_destroy(enc);
 
     /* Zero bitrate in config → should return default */
     cfg.bitrate = 0;
     enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_DEFAULT_BITRATE);
+    MD_CHECK(enc != NULL);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_DEFAULT_BITRATE);
     md_encoder_destroy(enc);
 
     printf("OK\n");
@@ -488,7 +488,7 @@ static int test_encoder_set_bitrate(void) {
     printf("  test_encoder_set_bitrate... ");
 
     /* NULL encoder should fail */
-    assert(md_encoder_set_bitrate(NULL, 4000000) == -1);
+    MD_CHECK(md_encoder_set_bitrate(NULL, 4000000) == -1);
 
     MdEncoderConfig cfg = {
         .width = TEST_W,
@@ -497,15 +497,15 @@ static int test_encoder_set_bitrate(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     /* Set a new bitrate */
-    assert(md_encoder_set_bitrate(enc, 4000000) == 0);
-    assert(md_encoder_get_bitrate(enc) == 4000000);
+    MD_CHECK(md_encoder_set_bitrate(enc, 4000000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == 4000000);
 
     /* Set again */
-    assert(md_encoder_set_bitrate(enc, 12000000) == 0);
-    assert(md_encoder_get_bitrate(enc) == 12000000);
+    MD_CHECK(md_encoder_set_bitrate(enc, 12000000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == 12000000);
 
     md_encoder_destroy(enc);
     printf("OK\n");
@@ -524,26 +524,26 @@ static int test_encoder_set_bitrate_clamp(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     /* Below minimum → clamped to MIN */
-    assert(md_encoder_set_bitrate(enc, 1000) == 0);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+    MD_CHECK(md_encoder_set_bitrate(enc, 1000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
 
     /* Zero → clamped to MIN */
-    assert(md_encoder_set_bitrate(enc, 0) == 0);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+    MD_CHECK(md_encoder_set_bitrate(enc, 0) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
 
     /* Above maximum → clamped to MAX */
-    assert(md_encoder_set_bitrate(enc, 500000000) == 0);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
+    MD_CHECK(md_encoder_set_bitrate(enc, 500000000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
 
     /* Exactly at bounds */
-    assert(md_encoder_set_bitrate(enc, MD_ENCODER_MIN_BITRATE) == 0);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
+    MD_CHECK(md_encoder_set_bitrate(enc, MD_ENCODER_MIN_BITRATE) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_MIN_BITRATE);
 
-    assert(md_encoder_set_bitrate(enc, MD_ENCODER_MAX_BITRATE) == 0);
-    assert(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
+    MD_CHECK(md_encoder_set_bitrate(enc, MD_ENCODER_MAX_BITRATE) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_MAX_BITRATE);
 
     md_encoder_destroy(enc);
     printf("OK\n");
@@ -562,48 +562,48 @@ static int test_encode_after_bitrate_change(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
     g_encoded_count = 0;
 
     /* Encode 5 frames at 8 Mbps */
     for (int i = 0; i < 5; i++) {
         fill_solid(buf, TEST_W, TEST_H, stride, 200, 100, 50);
-        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+        MD_CHECK(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                  (int64_t)i, on_encode, NULL) == 0);
     }
     int before = g_encoded_count;
 
     /* Change bitrate to 2 Mbps */
-    assert(md_encoder_set_bitrate(enc, 2000000) == 0);
-    assert(md_encoder_get_bitrate(enc) == 2000000);
+    MD_CHECK(md_encoder_set_bitrate(enc, 2000000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == 2000000);
 
     /* Encode 5 more frames at 2 Mbps */
     for (int i = 5; i < 10; i++) {
         fill_solid(buf, TEST_W, TEST_H, stride, 50, 200, 100);
-        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+        MD_CHECK(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                  (int64_t)i, on_encode, NULL) == 0);
     }
 
     /* Change bitrate to 16 Mbps */
-    assert(md_encoder_set_bitrate(enc, 16000000) == 0);
-    assert(md_encoder_get_bitrate(enc) == 16000000);
+    MD_CHECK(md_encoder_set_bitrate(enc, 16000000) == 0);
+    MD_CHECK(md_encoder_get_bitrate(enc) == 16000000);
 
     /* Encode 5 more frames at 16 Mbps */
     for (int i = 10; i < 15; i++) {
         fill_solid(buf, TEST_W, TEST_H, stride, 100, 50, 200);
-        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+        MD_CHECK(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                  (int64_t)i, on_encode, NULL) == 0);
     }
 
     md_encoder_flush(enc, on_encode, NULL);
 
     /* Should have encoded packets across all three bitrate settings */
-    assert(g_encoded_count > before);
+    MD_CHECK(g_encoded_count > before);
 
     printf("OK (%d packets from 15 frames, 3 bitrate levels)\n", g_encoded_count);
 
@@ -624,11 +624,11 @@ static int test_bitrate_rapid_changes(void) {
         .fps = 30,
     };
     MdEncoder *enc = md_encoder_create(&cfg);
-    assert(enc != NULL);
+    MD_CHECK(enc != NULL);
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
-    assert(buf != NULL);
+    MD_CHECK(buf != NULL);
 
     g_encoded_count = 0;
 
@@ -637,15 +637,15 @@ static int test_bitrate_rapid_changes(void) {
                            100000, 50000000, 2000000, 10000000, 4000000};
 
     for (int i = 0; i < 10; i++) {
-        assert(md_encoder_set_bitrate(enc, bitrates[i]) == 0);
+        MD_CHECK(md_encoder_set_bitrate(enc, bitrates[i]) == 0);
         fill_solid(buf, TEST_W, TEST_H, stride,
                    (uint8_t)(i * 25), (uint8_t)(255 - i * 25), 128);
-        assert(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
+        MD_CHECK(md_encoder_submit(enc, buf, stride, MD_PIX_FMT_BGRX,
                                  (int64_t)i, on_encode, NULL) == 0);
     }
 
     md_encoder_flush(enc, on_encode, NULL);
-    assert(g_encoded_count > 0);
+    MD_CHECK(g_encoded_count > 0);
 
     printf("OK (%d packets, 10 bitrate changes)\n", g_encoded_count);
 
@@ -680,5 +680,6 @@ int main(void) {
     failures += test_bitrate_rapid_changes();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    return failures;
+    md_test_failures += failures;
+    return md_test_report();
 }

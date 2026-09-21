@@ -20,17 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) \
-    do { printf("  test: %s ... ", name); } while (0)
-#define PASS() \
-    do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); tests_failed++; } while (0)
-
+#include "md_test.h"
 /* ── Helper: generate a test keypair ─────────────────────────── */
 
 static char *generate_test_sk(void) {
@@ -376,6 +366,5 @@ int main(void) {
     test_type_names();
     test_unavailable_backends();
 
-    printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return md_test_report();
 }

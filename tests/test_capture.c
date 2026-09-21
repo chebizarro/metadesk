@@ -8,12 +8,11 @@
  */
 #include "capture.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "md_test.h"
 
-#define PASS(name) printf("  PASS  %s\n", name)
 
 /* ── Mock backend state ──────────────────────────────────────── */
 
@@ -138,11 +137,11 @@ static MdCaptureCtx *create_mock_ctx(const MdCaptureConfig *cfg)
 static void test_null_safety(void)
 {
     /* All convenience functions should handle NULL without crashing */
-    assert(md_capture_start(NULL) == -1);
-    assert(md_capture_get_frame(NULL, NULL) == -1);
+    MD_CHECK(md_capture_start(NULL) == -1);
+    MD_CHECK(md_capture_get_frame(NULL, NULL) == -1);
     md_capture_release_frame(NULL, NULL);
-    assert(md_capture_is_active(NULL) == false);
-    assert(md_capture_get_size(NULL, NULL, NULL) == -1);
+    MD_CHECK(md_capture_is_active(NULL) == false);
+    MD_CHECK(md_capture_get_size(NULL, NULL, NULL) == -1);
     md_capture_stop(NULL);
     md_capture_destroy(NULL); /* should not crash */
 
@@ -154,12 +153,12 @@ static void test_create_and_destroy(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
-    assert(g_mock.init_called);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(g_mock.init_called);
 
     md_capture_destroy(ctx);
-    assert(g_mock.stop_called);
-    assert(g_mock.destroy_called);
+    MD_CHECK(g_mock.stop_called);
+    MD_CHECK(g_mock.destroy_called);
 
     PASS("create and destroy");
 }
@@ -169,19 +168,19 @@ static void test_is_active(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
 
     /* Not active until started */
-    assert(md_capture_is_active(ctx) == false);
+    MD_CHECK(md_capture_is_active(ctx) == false);
 
     /* Start → active */
-    assert(md_capture_start(ctx) == 0);
-    assert(md_capture_is_active(ctx) == true);
-    assert(g_mock.start_called);
+    MD_CHECK(md_capture_start(ctx) == 0);
+    MD_CHECK(md_capture_is_active(ctx) == true);
+    MD_CHECK(g_mock.start_called);
 
     /* Stop → inactive */
     md_capture_stop(ctx);
-    assert(md_capture_is_active(ctx) == false);
+    MD_CHECK(md_capture_is_active(ctx) == false);
 
     md_capture_destroy(ctx);
     PASS("is_active lifecycle");
@@ -192,16 +191,16 @@ static void test_get_size(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
 
     uint32_t w = 0, h = 0;
-    assert(md_capture_get_size(ctx, &w, &h) == 0);
-    assert(w == 640);
-    assert(h == 480);
+    MD_CHECK(md_capture_get_size(ctx, &w, &h) == 0);
+    MD_CHECK(w == 640);
+    MD_CHECK(h == 480);
 
     /* NULL output params */
-    assert(md_capture_get_size(ctx, NULL, &h) == -1);
-    assert(md_capture_get_size(ctx, &w, NULL) == -1);
+    MD_CHECK(md_capture_get_size(ctx, NULL, &h) == -1);
+    MD_CHECK(md_capture_get_size(ctx, &w, NULL) == -1);
 
     md_capture_destroy(ctx);
     PASS("get_size");
@@ -213,7 +212,7 @@ static void test_get_size_before_init(void)
     MdCaptureCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     uint32_t w, h;
-    assert(md_capture_get_size(&ctx, &w, &h) == -1);
+    MD_CHECK(md_capture_get_size(&ctx, &w, &h) == -1);
 
     PASS("get_size before init (zero dimensions)");
 }
@@ -223,30 +222,30 @@ static void test_get_frame_and_release(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
-    assert(md_capture_start(ctx) == 0);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(md_capture_start(ctx) == 0);
 
     MdFrame frame;
-    assert(md_capture_get_frame(ctx, &frame) == 0);
-    assert(frame.width == 640);
-    assert(frame.height == 480);
-    assert(frame.stride == 640 * 4);
-    assert(frame.format == MD_PIX_CAPTURE_RGBA);
-    assert(frame.buf_type == MD_BUF_CPU);
-    assert(frame.data != NULL);
-    assert(frame.seq == 1);
-    assert(g_mock.get_frame_count == 1);
+    MD_CHECK(md_capture_get_frame(ctx, &frame) == 0);
+    MD_CHECK(frame.width == 640);
+    MD_CHECK(frame.height == 480);
+    MD_CHECK(frame.stride == 640 * 4);
+    MD_CHECK(frame.format == MD_PIX_CAPTURE_RGBA);
+    MD_CHECK(frame.buf_type == MD_BUF_CPU);
+    MD_CHECK(frame.data != NULL);
+    MD_CHECK(frame.seq == 1);
+    MD_CHECK(g_mock.get_frame_count == 1);
 
     md_capture_release_frame(ctx, &frame);
-    assert(g_mock.release_count == 1);
+    MD_CHECK(g_mock.release_count == 1);
 
     /* Second frame increments seq */
-    assert(md_capture_get_frame(ctx, &frame) == 0);
-    assert(frame.seq == 2);
-    assert(g_mock.get_frame_count == 2);
+    MD_CHECK(md_capture_get_frame(ctx, &frame) == 0);
+    MD_CHECK(frame.seq == 2);
+    MD_CHECK(g_mock.get_frame_count == 2);
 
     md_capture_release_frame(ctx, &frame);
-    assert(g_mock.release_count == 2);
+    MD_CHECK(g_mock.release_count == 2);
 
     md_capture_destroy(ctx);
     PASS("get_frame and release");
@@ -262,9 +261,9 @@ static void test_config_passthrough(void)
     };
 
     MdCaptureCtx *ctx = create_mock_ctx(&cfg);
-    assert(ctx != NULL);
-    assert(ctx->config.target_fps == 30);
-    assert(ctx->config.show_cursor == false);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(ctx->config.target_fps == 30);
+    MD_CHECK(ctx->config.show_cursor == false);
 
     md_capture_destroy(ctx);
     PASS("config passthrough");
@@ -275,9 +274,9 @@ static void test_default_config(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
-    assert(ctx->config.target_fps == 60);
-    assert(ctx->config.show_cursor == true);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(ctx->config.target_fps == 60);
+    MD_CHECK(ctx->config.show_cursor == true);
 
     md_capture_destroy(ctx);
     PASS("default config");
@@ -288,11 +287,11 @@ static void test_stop_idempotent(void)
     memset(&g_mock, 0, sizeof(g_mock));
 
     MdCaptureCtx *ctx = create_mock_ctx(NULL);
-    assert(ctx != NULL);
-    assert(md_capture_start(ctx) == 0);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(md_capture_start(ctx) == 0);
 
     md_capture_stop(ctx);
-    assert(g_mock.stop_called == 1);
+    MD_CHECK(g_mock.stop_called == 1);
 
     /* destroy calls stop again — should not crash */
     md_capture_destroy(ctx);
@@ -316,5 +315,5 @@ int main(void)
     test_stop_idempotent();
 
     printf("\nAll capture tests passed.\n");
-    return 0;
+    return md_test_report();
 }

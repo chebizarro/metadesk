@@ -11,10 +11,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
+#include "md_test.h"
 
 /* Use a high ephemeral port to avoid conflicts */
 #define TEST_PORT 17700
@@ -25,7 +25,7 @@ static int test_server_lifecycle(void) {
     printf("  test_server_lifecycle... ");
 
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     md_stream_server_destroy(srv);
     printf("OK\n");
@@ -52,7 +52,7 @@ static int test_connect_and_send(void) {
 
     /* Start server */
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 1);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
@@ -62,51 +62,51 @@ static int test_connect_and_send(void) {
 
     /* Connect client */
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 1, 3000);
-    assert(client != NULL);
-    assert(md_stream_is_connected(client));
+    MD_CHECK(client != NULL);
+    MD_CHECK(md_stream_is_connected(client));
 
     /* Wait for server to accept */
     pthread_join(tid, NULL);
-    assert(st.client != NULL);
-    assert(md_stream_is_connected(st.client));
+    MD_CHECK(st.client != NULL);
+    MD_CHECK(md_stream_is_connected(st.client));
 
     /* Client sends a video frame packet */
     uint8_t payload[] = "hello from client";
     int ret = md_stream_send(client, MD_PKT_VIDEO_FRAME, 1,
                              payload, sizeof(payload));
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     /* Server receives it */
     MdPacketHeader hdr;
     uint8_t *recv_payload = NULL;
     ret = md_stream_recv(st.client, &hdr, &recv_payload, 3000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_VIDEO_FRAME);
-    assert(hdr.sequence == 1);
-    assert(hdr.payload_len == sizeof(payload));
-    assert(memcmp(recv_payload, payload, sizeof(payload)) == 0);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME);
+    MD_CHECK(hdr.sequence == 1);
+    MD_CHECK(hdr.payload_len == sizeof(payload));
+    MD_CHECK(memcmp(recv_payload, payload, sizeof(payload)) == 0);
     free(recv_payload);
 
     /* Server sends back */
     uint8_t reply[] = "hello from server";
     ret = md_stream_send(st.client, MD_PKT_SESSION_INFO, 42,
                          reply, sizeof(reply));
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     /* Client receives */
     recv_payload = NULL;
     ret = md_stream_recv(client, &hdr, &recv_payload, 3000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_SESSION_INFO);
-    assert(hdr.sequence == 42);
-    assert(memcmp(recv_payload, reply, sizeof(reply)) == 0);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_SESSION_INFO);
+    MD_CHECK(hdr.sequence == 42);
+    MD_CHECK(memcmp(recv_payload, reply, sizeof(reply)) == 0);
     free(recv_payload);
 
     /* Verify stats */
     MdStreamStats stats;
     md_stream_get_stats(client, &stats);
-    assert(stats.packets_sent == 1);
-    assert(stats.packets_recv == 1);
+    MD_CHECK(stats.packets_sent == 1);
+    MD_CHECK(stats.packets_recv == 1);
 
     md_stream_destroy(client);
     md_stream_destroy(st.client);
@@ -122,37 +122,37 @@ static int test_ping_pong(void) {
     printf("  test_ping_pong... ");
 
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 2);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 2, 3000);
-    assert(client != NULL);
+    MD_CHECK(client != NULL);
     pthread_join(tid, NULL);
-    assert(st.client != NULL);
+    MD_CHECK(st.client != NULL);
 
     /* Client sends ping */
     int ret = md_stream_send_ping(client);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     /* Server receives ping */
     MdPacketHeader hdr;
     uint8_t *payload = NULL;
     ret = md_stream_recv(st.client, &hdr, &payload, 3000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_PING);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_PING);
     free(payload);
 
     /* Server sends pong */
     ret = md_stream_send(st.client, MD_PKT_PONG, 0, NULL, 0);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     /* Client receives pong */
     ret = md_stream_recv(client, &hdr, &payload, 3000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_PONG);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_PONG);
     free(payload);
 
     /* Handle pong for RTT */
@@ -161,8 +161,8 @@ static int test_ping_pong(void) {
     MdStreamStats stats;
     md_stream_get_stats(client, &stats);
     /* RTT should be very small (localhost) — just verify it's recorded */
-    assert(stats.last_rtt_ms < 1000);
-    assert(stats.avg_rtt_ms < 1000);
+    MD_CHECK(stats.last_rtt_ms < 1000);
+    MD_CHECK(stats.avg_rtt_ms < 1000);
 
     printf("OK (rtt=%ums)\n", stats.last_rtt_ms);
 
@@ -178,28 +178,28 @@ static int test_empty_payload(void) {
     printf("  test_empty_payload... ");
 
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 3);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 3, 3000);
-    assert(client != NULL);
+    MD_CHECK(client != NULL);
     pthread_join(tid, NULL);
-    assert(st.client != NULL);
+    MD_CHECK(st.client != NULL);
 
     /* Send packet with no payload */
     int ret = md_stream_send(client, MD_PKT_PING, 99, NULL, 0);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     MdPacketHeader hdr;
     uint8_t *payload = NULL;
     ret = md_stream_recv(st.client, &hdr, &payload, 3000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_PING);
-    assert(hdr.payload_len == 0);
-    assert(payload == NULL);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_PING);
+    MD_CHECK(hdr.payload_len == 0);
+    MD_CHECK(payload == NULL);
 
     md_stream_destroy(client);
     md_stream_destroy(st.client);
@@ -215,21 +215,21 @@ static int test_recv_timeout(void) {
     printf("  test_recv_timeout... ");
 
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 4);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 4, 3000);
-    assert(client != NULL);
+    MD_CHECK(client != NULL);
     pthread_join(tid, NULL);
 
     /* Try to recv with a short timeout — should return 1 (timeout) */
     MdPacketHeader hdr;
     uint8_t *payload = NULL;
     int ret = md_stream_recv(client, &hdr, &payload, 100);
-    assert(ret == 1);
+    MD_CHECK(ret == 1);
 
     md_stream_destroy(client);
     md_stream_destroy(st.client);
@@ -247,7 +247,7 @@ static int test_tls_roundtrip(void) {
     /* Create TLS server with ephemeral self-signed cert */
     MdStreamTlsConfig tls_cfg = { .enabled = true };
     MdStreamServer *srv = md_stream_server_create_tls(NULL, TEST_PORT + 10, &tls_cfg);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
@@ -257,27 +257,27 @@ static int test_tls_roundtrip(void) {
     MdStreamTlsConfig client_tls = { .enabled = true, .verify_peer = false };
     MdStream *client = md_stream_connect_tls("127.0.0.1", TEST_PORT + 10,
                                              5000, &client_tls);
-    assert(client != NULL);
-    assert(md_stream_is_tls(client));
+    MD_CHECK(client != NULL);
+    MD_CHECK(md_stream_is_tls(client));
 
     pthread_join(tid, NULL);
-    assert(st.client != NULL);
-    assert(md_stream_is_tls(st.client));
+    MD_CHECK(st.client != NULL);
+    MD_CHECK(md_stream_is_tls(st.client));
 
     /* Send a packet through TLS and verify */
     const char *msg = "hello-tls";
     int ret = md_stream_send(client, MD_PKT_SESSION_INFO, 1,
                              (const uint8_t *)msg, (uint32_t)strlen(msg));
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     MdPacketHeader hdr;
     uint8_t *payload = NULL;
     ret = md_stream_recv(st.client, &hdr, &payload, 5000);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_SESSION_INFO);
-    assert(hdr.payload_len == strlen(msg));
-    assert(payload != NULL);
-    assert(memcmp(payload, msg, strlen(msg)) == 0);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_SESSION_INFO);
+    MD_CHECK(hdr.payload_len == strlen(msg));
+    MD_CHECK(payload != NULL);
+    MD_CHECK(memcmp(payload, msg, strlen(msg)) == 0);
     free(payload);
 
     md_stream_destroy(client);
@@ -294,19 +294,19 @@ static int test_plaintext_no_tls(void) {
     printf("  test_plaintext_no_tls... ");
 
     MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 11);
-    assert(srv != NULL);
+    MD_CHECK(srv != NULL);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &st);
 
     MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 11, 5000);
-    assert(client != NULL);
-    assert(!md_stream_is_tls(client));
+    MD_CHECK(client != NULL);
+    MD_CHECK(!md_stream_is_tls(client));
 
     pthread_join(tid, NULL);
-    assert(st.client != NULL);
-    assert(!md_stream_is_tls(st.client));
+    MD_CHECK(st.client != NULL);
+    MD_CHECK(!md_stream_is_tls(st.client));
 
     md_stream_destroy(client);
     md_stream_destroy(st.client);
@@ -333,6 +333,6 @@ int main(void) {
     failures += test_tls_roundtrip();
     failures += test_plaintext_no_tls();
 
-    printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    return failures;
+    md_test_failures += failures;
+    return md_test_report();
 }

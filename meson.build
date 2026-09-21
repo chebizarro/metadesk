@@ -15,7 +15,8 @@ host_os = host_machine.system()  # 'linux', 'darwin', 'windows'
 # Tests assert through bare assert(); never let NDEBUG compile them out,
 # or -Db_ndebug=true turns the suite into silent no-ops. No src/ file
 # uses assert, so this only affects tests.
-add_project_arguments('-UNDEBUG', language : 'c')
+# (Tests assert via MD_CHECK in tests/md_test.h, which is never gated by
+#  NDEBUG; src/ contains no assert() calls. No -UNDEBUG stopgap needed.)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 enable_client  = get_option('client')

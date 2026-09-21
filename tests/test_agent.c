@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include "md_test.h"
 
 /* ── Mock input backend for deterministic injection failures ─── */
 
@@ -93,8 +93,8 @@ static MdMcpServer *make_agent_mcp_server(MdMcpToolCtx *tool_ctx) {
         .write_fn = capture_agent_mcp_write,
     };
     MdMcpServer *server = md_mcp_server_create(&cfg);
-    assert(server != NULL);
-    assert(md_mcp_register_tools(server, tool_ctx) == 0);
+    MD_CHECK(server != NULL);
+    MD_CHECK(md_mcp_register_tools(server, tool_ctx) == 0);
 
     md_test_mcp_handshake(server);
     clear_agent_mcp_response();
@@ -114,8 +114,8 @@ static int test_create_destroy(void) {
     };
 
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(agent != NULL);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -126,7 +126,7 @@ static int test_create_destroy(void) {
 
 static int test_null_config(void) {
     printf("  test_null_config... ");
-    assert(md_agent_create(NULL) == NULL);
+    MD_CHECK(md_agent_create(NULL) == NULL);
     printf("OK\n");
     return 0;
 }
@@ -145,7 +145,7 @@ static int test_handle_action_no_deps(void) {
     };
 
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* We can't send packets without a real stream, but we can verify
      * the agent handles NULL stream gracefully */
@@ -153,9 +153,9 @@ static int test_handle_action_no_deps(void) {
                        "\"payload\":{}}";
     int ret = md_agent_handle_action(agent, NULL, NULL,
                                      (const uint8_t *)json, (uint32_t)strlen(json));
-    assert(ret == -1); /* should fail because stream is NULL */
+    MD_CHECK(ret == -1); /* should fail because stream is NULL */
 
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -185,13 +185,13 @@ static int test_with_live_deps(void) {
     };
 
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* Verify send_tree works with live AT-SPI2 but NULL stream
      * should return -1 (no stream) */
     uint32_t seq = 0;
     int ret = md_agent_send_tree(agent, NULL, &seq);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     md_agent_destroy(agent);
     md_a11y_destroy(a11y);
@@ -214,7 +214,7 @@ static int test_tree_format_config(void) {
         .settle_ms   = 50,
     };
     MdAgent *a1 = md_agent_create(&cfg1);
-    assert(a1 != NULL);
+    MD_CHECK(a1 != NULL);
     md_agent_destroy(a1);
 
     /* Compact format */
@@ -225,7 +225,7 @@ static int test_tree_format_config(void) {
         .settle_ms   = 50,
     };
     MdAgent *a2 = md_agent_create(&cfg2);
-    assert(a2 != NULL);
+    MD_CHECK(a2 != NULL);
     md_agent_destroy(a2);
 
     printf("OK\n");
@@ -244,20 +244,20 @@ static int test_send_tree_delta_null_stream(void) {
         .settle_ms   = 10,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     uint32_t seq = 0;
 
     /* send_tree with NULL stream should fail gracefully */
     int ret = md_agent_send_tree(agent, NULL, &seq);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     /* send_delta with NULL stream should fail gracefully */
     ret = md_agent_send_delta(agent, NULL, &seq);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     /* seq should not have been incremented */
-    assert(seq == 0);
+    MD_CHECK(seq == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -276,7 +276,7 @@ static int test_handle_various_actions(void) {
         .settle_ms   = 10,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* All these should fail (no stream) but not crash */
     const char *actions[] = {
@@ -292,11 +292,11 @@ static int test_handle_various_actions(void) {
         int ret = md_agent_handle_action(agent, NULL, NULL,
                                          (const uint8_t *)actions[i],
                                          (uint32_t)strlen(actions[i]));
-        assert(ret == -1); /* no stream → fail */
+        MD_CHECK(ret == -1); /* no stream → fail */
     }
 
     /* Action count should still be 0 (none completed successfully) */
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -317,7 +317,7 @@ static int test_injection_failure_propagates(void) {
         .settle_ms   = 1,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     const char *json = "{\"v\":1,\"action\":\"type\","
                        "\"payload\":{\"text\":\"hello\"}}";
@@ -325,24 +325,24 @@ static int test_injection_failure_propagates(void) {
     int ret = md_agent_handle_action(agent, (MdStream *)0x1, &seq,
                                      (const uint8_t *)json,
                                      (uint32_t)strlen(json));
-    assert(ret == -1);
-    assert(seq == 7);
-    assert(data.type_text_calls == 1);
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(ret == -1);
+    MD_CHECK(seq == 7);
+    MD_CHECK(data.type_text_calls == 1);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
     md_agent_destroy(agent);
 
     data = (AgentMockInputData){ .type_text_ret = -1 };
     input = make_agent_mock_input(&data);
     cfg.input = &input;
     agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     char *result = md_agent_handle_action_mcp(agent,
                                               (const uint8_t *)json,
                                               (uint32_t)strlen(json));
-    assert(result == NULL);
-    assert(data.type_text_calls == 1);
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(result == NULL);
+    MD_CHECK(data.type_text_calls == 1);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -361,7 +361,7 @@ static int test_mcp_tool_requires_a11y_returns_error(void) {
         .settle_ms   = 1,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     MdMcpToolCtx tool_ctx = { .agent = agent };
     MdMcpServer *server = make_agent_mcp_server(&tool_ctx);
@@ -370,21 +370,21 @@ static int test_mcp_tool_requires_a11y_returns_error(void) {
                        "\"params\":{\"name\":\"metadesk_click\","
                        "\"arguments\":{\"target_id\":\"btn_missing\"}}}";
     md_mcp_server_handle_message(server, call, strlen(call));
-    assert(g_agent_mcp_response != NULL);
+    MD_CHECK(g_agent_mcp_response != NULL);
 
     cJSON *resp = cJSON_Parse(g_agent_mcp_response);
-    assert(resp != NULL);
+    MD_CHECK(resp != NULL);
     cJSON *result = cJSON_GetObjectItem(resp, "result");
-    assert(result != NULL);
-    assert(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+    MD_CHECK(result != NULL);
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
     cJSON *content = cJSON_GetObjectItem(result, "content");
-    assert(cJSON_IsArray(content));
+    MD_CHECK(cJSON_IsArray(content));
     const char *text = cJSON_GetObjectItem(cJSON_GetArrayItem(content, 0),
                                            "text")->valuestring;
-    assert(strstr(text, "action execution failed") != NULL);
+    MD_CHECK(strstr(text, "action execution failed") != NULL);
     cJSON_Delete(resp);
 
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     clear_agent_mcp_response();
     md_mcp_tools_cleanup(&tool_ctx);
@@ -409,15 +409,15 @@ static int test_action_count_not_incremented_when_a11y_null(void) {
         .settle_ms   = 1,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     const char *json = "{\"v\":1,\"action\":\"click\","
                        "\"target_id\":\"btn_missing\",\"payload\":{}}";
     char *result = md_agent_handle_action_mcp(agent,
                                               (const uint8_t *)json,
                                               (uint32_t)strlen(json));
-    assert(result == NULL);
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(result == NULL);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -436,23 +436,23 @@ static int test_handle_invalid_payload(void) {
         .settle_ms   = 10,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* Invalid JSON */
     const char *bad = "{{not json}}";
     int ret = md_agent_handle_action(agent, NULL, NULL,
                                      (const uint8_t *)bad,
                                      (uint32_t)strlen(bad));
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     /* NULL payload */
     ret = md_agent_handle_action(agent, NULL, NULL, NULL, 0);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     /* Empty payload */
     ret = md_agent_handle_action(agent, NULL, NULL,
                                      (const uint8_t *)"", 0);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -471,7 +471,7 @@ static int test_default_settle(void) {
         .settle_ms   = 0,  /* should use default */
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* Just verify it was created — default settle_ms is internal */
     md_agent_destroy(agent);
@@ -491,7 +491,7 @@ static int test_handle_action_mcp(void) {
         .settle_ms   = 10,
     };
     MdAgent *agent = md_agent_create(&cfg);
-    assert(agent != NULL);
+    MD_CHECK(agent != NULL);
 
     /* With no a11y result, MCP handler should return an error (NULL),
      * not a placeholder success response. */
@@ -500,12 +500,12 @@ static int test_handle_action_mcp(void) {
     char *result = md_agent_handle_action_mcp(agent,
                                               (const uint8_t *)json,
                                               (uint32_t)strlen(json));
-    assert(result == NULL);
-    assert(md_agent_get_action_count(agent) == 0);
+    MD_CHECK(result == NULL);
+    MD_CHECK(md_agent_get_action_count(agent) == 0);
 
     /* NULL payload */
     result = md_agent_handle_action_mcp(agent, NULL, 0);
-    assert(result == NULL);
+    MD_CHECK(result == NULL);
 
     md_agent_destroy(agent);
     printf("OK\n");
@@ -534,5 +534,6 @@ int main(void) {
 
     clear_agent_mcp_response();
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    return failures;
+    md_test_failures += failures;
+    return md_test_report();
 }

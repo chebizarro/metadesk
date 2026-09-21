@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include "md_test.h"
 
 static int live_a11y_tests_enabled(void) {
     const char *v = getenv("MD_A11Y_LIVE_TESTS");
@@ -51,7 +51,7 @@ static void test_create_destroy(void) {
     }
 
     MdA11yCtx *ctx = md_a11y_create();
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
     md_a11y_destroy(ctx);
     printf("  PASS: create/destroy\n");
 }
@@ -72,13 +72,13 @@ static void test_json_serialization(void) {
     node_add_child(root, txt);
 
     char *json = md_a11y_to_json(root);
-    assert(json != NULL);
-    assert(strstr(json, "\"v\":1") != NULL);
-    assert(strstr(json, "\"id\":\"node_1\"") != NULL);
-    assert(strstr(json, "\"role\":\"frame\"") != NULL);
-    assert(strstr(json, "\"label\":\"gedit - untitled\"") != NULL);
-    assert(strstr(json, "\"id\":\"node_42\"") != NULL);
-    assert(strstr(json, "\"id\":\"node_44\"") != NULL);
+    MD_CHECK(json != NULL);
+    MD_CHECK(strstr(json, "\"v\":1") != NULL);
+    MD_CHECK(strstr(json, "\"id\":\"node_1\"") != NULL);
+    MD_CHECK(strstr(json, "\"role\":\"frame\"") != NULL);
+    MD_CHECK(strstr(json, "\"label\":\"gedit - untitled\"") != NULL);
+    MD_CHECK(strstr(json, "\"id\":\"node_42\"") != NULL);
+    MD_CHECK(strstr(json, "\"id\":\"node_44\"") != NULL);
 
     free(json);
     md_a11y_node_free(root);
@@ -97,22 +97,22 @@ static void test_compact_serialization(void) {
     node_add_child(root, txt);
 
     char *compact = md_a11y_to_compact(root);
-    assert(compact != NULL);
-    assert(strstr(compact, "v1 ts:") != NULL);
-    assert(strstr(compact, "WIN[1]") != NULL);
-    assert(strstr(compact, "BTN[42] Save") != NULL);
-    assert(strstr(compact, "*enabled*") != NULL);
-    assert(strstr(compact, "TXT[44]") != NULL);
-    assert(strstr(compact, "<focused>") != NULL);
+    MD_CHECK(compact != NULL);
+    MD_CHECK(strstr(compact, "v1 ts:") != NULL);
+    MD_CHECK(strstr(compact, "WIN[1]") != NULL);
+    MD_CHECK(strstr(compact, "BTN[42] Save") != NULL);
+    MD_CHECK(strstr(compact, "*enabled*") != NULL);
+    MD_CHECK(strstr(compact, "TXT[44]") != NULL);
+    MD_CHECK(strstr(compact, "<focused>") != NULL);
 
     /* §3.3.2: Text entries get quoted content with single quotes */
-    assert(strstr(compact, "'Hello'") != NULL);
+    MD_CHECK(strstr(compact, "'Hello'") != NULL);
     /* §3.3.2: <focused> appears before quoted content for text entries */
     {
         const char *focused = strstr(compact, "<focused>");
         const char *quoted = strstr(compact, "'Hello'");
-        assert(focused != NULL && quoted != NULL);
-        assert(focused < quoted);  /* <focused> before 'Hello' */
+        MD_CHECK(focused != NULL && quoted != NULL);
+        MD_CHECK(focused < quoted);  /* <focused> before 'Hello' */
     }
 
     free(compact);
@@ -146,20 +146,20 @@ static void test_compact_interactable_filtering(void) {
     node_add_child(dlg, chk);
 
     char *compact = md_a11y_to_compact(root);
-    assert(compact != NULL);
+    MD_CHECK(compact != NULL);
 
     /* Window (container) present */
-    assert(strstr(compact, "WIN[1]") != NULL);
+    MD_CHECK(strstr(compact, "WIN[1]") != NULL);
     /* Button under decorative panel still present */
-    assert(strstr(compact, "BTN[20] OK") != NULL);
+    MD_CHECK(strstr(compact, "BTN[20] OK") != NULL);
     /* Decorative nodes skipped */
-    assert(strstr(compact, "PNL") == NULL);   /* panel filtered out */
-    assert(strstr(compact, "LBL") == NULL);   /* label filtered out */
+    MD_CHECK(strstr(compact, "PNL") == NULL);   /* panel filtered out */
+    MD_CHECK(strstr(compact, "LBL") == NULL);   /* label filtered out */
     /* Dialog container present */
-    assert(strstr(compact, "DLG[40]") != NULL);
+    MD_CHECK(strstr(compact, "DLG[40]") != NULL);
     /* Check box with state */
-    assert(strstr(compact, "CHK[50] Remember") != NULL);
-    assert(strstr(compact, "*checked*") != NULL);
+    MD_CHECK(strstr(compact, "CHK[50] Remember") != NULL);
+    MD_CHECK(strstr(compact, "*checked*") != NULL);
 
     free(compact);
     md_a11y_node_free(root);
@@ -176,12 +176,12 @@ static void test_compact_text_empty(void) {
     node_add_child(root, txt);
 
     char *compact = md_a11y_to_compact(root);
-    assert(compact != NULL);
+    MD_CHECK(compact != NULL);
 
     /* Empty text gets quoted empty string */
-    assert(strstr(compact, "TXT[5] <focused> ''") != NULL);
+    MD_CHECK(strstr(compact, "TXT[5] <focused> ''") != NULL);
     /* enabled state still appended after quoted content */
-    assert(strstr(compact, "*enabled*") != NULL);
+    MD_CHECK(strstr(compact, "*enabled*") != NULL);
 
     free(compact);
     md_a11y_node_free(root);
@@ -197,10 +197,10 @@ static void test_delta_serialization(void) {
     };
 
     char *json = md_a11y_delta_to_json(&delta, 1);
-    assert(json != NULL);
-    assert(strstr(json, "\"op\":\"add\"") != NULL);
-    assert(strstr(json, "\"id\":\"node_5\"") != NULL);
-    assert(strstr(json, "\"parent_id\":\"node_1\"") != NULL);
+    MD_CHECK(json != NULL);
+    MD_CHECK(strstr(json, "\"op\":\"add\"") != NULL);
+    MD_CHECK(strstr(json, "\"id\":\"node_5\"") != NULL);
+    MD_CHECK(strstr(json, "\"parent_id\":\"node_1\"") != NULL);
 
     free(json);
     md_a11y_node_free(delta.node);
@@ -215,7 +215,7 @@ static void test_walk_tree(void) {
     }
 
     MdA11yCtx *ctx = md_a11y_create();
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
 
     MdA11yNode *root = md_a11y_walk(ctx);
     if (!root) {
@@ -226,19 +226,19 @@ static void test_walk_tree(void) {
     }
 
     /* Basic sanity: root should exist with role and id */
-    assert(root->id != NULL);
-    assert(root->role != NULL);
-    assert(strcmp(root->role, "desktop") == 0);
+    MD_CHECK(root->id != NULL);
+    MD_CHECK(root->role != NULL);
+    MD_CHECK(strcmp(root->role, "desktop") == 0);
 
     /* Serialize in both formats to verify end-to-end */
     char *json = md_a11y_to_json(root);
-    assert(json != NULL);
-    assert(strstr(json, "\"role\":\"desktop\"") != NULL);
+    MD_CHECK(json != NULL);
+    MD_CHECK(strstr(json, "\"role\":\"desktop\"") != NULL);
     free(json);
 
     char *compact = md_a11y_to_compact(root);
-    assert(compact != NULL);
-    assert(strstr(compact, "DSK[") != NULL);
+    MD_CHECK(compact != NULL);
+    MD_CHECK(strstr(compact, "DSK[") != NULL);
     free(compact);
 
     printf("  PASS: walk tree (%d children)\n", root->child_count);
@@ -253,7 +253,7 @@ static void test_diff(void) {
     }
 
     MdA11yCtx *ctx = md_a11y_create();
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
 
     /* First diff with no previous snapshot should return NULL */
     int delta_count = 0;
@@ -284,7 +284,7 @@ static void test_subscribe_changes(void) {
     }
 
     MdA11yCtx *ctx = md_a11y_create();
-    assert(ctx != NULL);
+    MD_CHECK(ctx != NULL);
 
     int rc = md_a11y_subscribe_changes(ctx, noop_change_cb, NULL);
     if (rc < 0) {
@@ -295,7 +295,7 @@ static void test_subscribe_changes(void) {
         return;
     }
 
-    assert(rc >= 0);
+    MD_CHECK(rc >= 0);
     md_a11y_destroy(ctx);
     printf("  PASS: subscribe changes\n");
 }
@@ -309,7 +309,7 @@ static void test_tree_patch_add(void) {
     node_add_child(root, btn);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Delta: add a new button under root */
     const char *delta = "[{\"op\":\"add\",\"parent_id\":\"r1\","
@@ -317,13 +317,13 @@ static void test_tree_patch_add(void) {
         "\"bounds\":{\"x\":100,\"y\":10,\"w\":80,\"h\":30},\"children\":[]}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
     /* Verify the new node appears */
-    assert(strstr(patched, "\"b2\"") != NULL);
-    assert(strstr(patched, "Cancel") != NULL);
+    MD_CHECK(strstr(patched, "\"b2\"") != NULL);
+    MD_CHECK(strstr(patched, "Cancel") != NULL);
     /* Original node still present */
-    assert(strstr(patched, "\"b1\"") != NULL);
+    MD_CHECK(strstr(patched, "\"b1\"") != NULL);
 
     free(patched);
     free(tree);
@@ -339,17 +339,17 @@ static void test_tree_patch_remove(void) {
     node_add_child(root, b2);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Delta: remove b1 */
     const char *delta = "[{\"op\":\"remove\",\"node\":{\"id\":\"b1\"}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
     /* b1 should be gone, b2 still present */
-    assert(strstr(patched, "\"b1\"") == NULL);
-    assert(strstr(patched, "\"b2\"") != NULL);
+    MD_CHECK(strstr(patched, "\"b1\"") == NULL);
+    MD_CHECK(strstr(patched, "\"b2\"") != NULL);
 
     free(patched);
     free(tree);
@@ -363,19 +363,19 @@ static void test_tree_patch_update(void) {
     node_add_child(root, btn);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Delta: update b1's label */
     const char *delta = "[{\"op\":\"update\","
         "\"node\":{\"id\":\"b1\",\"label\":\"Confirm\"}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
     /* New label should appear, old should not */
-    assert(strstr(patched, "Confirm") != NULL);
+    MD_CHECK(strstr(patched, "Confirm") != NULL);
     /* node id still present */
-    assert(strstr(patched, "\"b1\"") != NULL);
+    MD_CHECK(strstr(patched, "\"b1\"") != NULL);
 
     free(patched);
     free(tree);
@@ -391,7 +391,7 @@ static void test_tree_patch_multiple_ops(void) {
     node_add_child(root, b2);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Multiple ops: remove b1, update b2, add b3 */
     const char *delta =
@@ -402,11 +402,11 @@ static void test_tree_patch_multiple_ops(void) {
         "\"bounds\":{\"x\":0,\"y\":0,\"w\":80,\"h\":30},\"children\":[]}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
-    assert(strstr(patched, "\"b1\"") == NULL);     /* removed */
-    assert(strstr(patched, "Updated") != NULL);     /* updated */
-    assert(strstr(patched, "\"b3\"") != NULL);       /* added */
+    MD_CHECK(strstr(patched, "\"b1\"") == NULL);     /* removed */
+    MD_CHECK(strstr(patched, "Updated") != NULL);     /* updated */
+    MD_CHECK(strstr(patched, "\"b3\"") != NULL);       /* added */
 
     free(patched);
     free(tree);
@@ -415,10 +415,10 @@ static void test_tree_patch_multiple_ops(void) {
 }
 
 static void test_tree_patch_null_safety(void) {
-    assert(md_a11y_tree_patch(NULL, "[]") == NULL);
-    assert(md_a11y_tree_patch("{}", NULL) == NULL);
-    assert(md_a11y_tree_patch("not json", "[]") == NULL);
-    assert(md_a11y_tree_patch("{\"v\":1}", "not json") == NULL);
+    MD_CHECK(md_a11y_tree_patch(NULL, "[]") == NULL);
+    MD_CHECK(md_a11y_tree_patch("{}", NULL) == NULL);
+    MD_CHECK(md_a11y_tree_patch("not json", "[]") == NULL);
+    MD_CHECK(md_a11y_tree_patch("{\"v\":1}", "not json") == NULL);
 
     printf("  PASS: tree patch null safety\n");
 }
@@ -430,7 +430,7 @@ static void test_tree_patch_deep_add(void) {
     node_add_child(root, panel);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Add button under panel (p1), not root */
     const char *delta = "[{\"op\":\"add\",\"parent_id\":\"p1\","
@@ -438,10 +438,10 @@ static void test_tree_patch_deep_add(void) {
         "\"bounds\":{\"x\":5,\"y\":5,\"w\":100,\"h\":20},\"children\":[]}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
-    assert(strstr(patched, "\"m1\"") != NULL);
-    assert(strstr(patched, "File") != NULL);
+    MD_CHECK(strstr(patched, "\"m1\"") != NULL);
+    MD_CHECK(strstr(patched, "File") != NULL);
 
     free(patched);
     free(tree);
@@ -456,17 +456,17 @@ static void test_tree_patch_update_state(void) {
     node_add_child(root, btn);
 
     char *tree = md_a11y_to_json(root);
-    assert(tree != NULL);
+    MD_CHECK(tree != NULL);
 
     /* Update b1's state to focused */
     const char *delta = "[{\"op\":\"update\","
         "\"node\":{\"id\":\"b1\",\"state\":[\"focused\",\"pressed\"]}}]";
 
     char *patched = md_a11y_tree_patch(tree, delta);
-    assert(patched != NULL);
+    MD_CHECK(patched != NULL);
 
-    assert(strstr(patched, "focused") != NULL);
-    assert(strstr(patched, "pressed") != NULL);
+    MD_CHECK(strstr(patched, "focused") != NULL);
+    MD_CHECK(strstr(patched, "pressed") != NULL);
 
     free(patched);
     free(tree);
@@ -495,5 +495,5 @@ int main(void) {
     test_diff();
     test_subscribe_changes();
     printf("All a11y tests passed.\n");
-    return 0;
+    return md_test_report();
 }

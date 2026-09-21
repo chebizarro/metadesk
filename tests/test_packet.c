@@ -5,8 +5,8 @@
 #include "packet.h"
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
 #include <limits.h>
+#include "md_test.h"
 
 static void test_header_round_trip(void) {
     MdPacketHeader hdr_out = {
@@ -20,18 +20,18 @@ static void test_header_round_trip(void) {
 
     uint8_t buf[MD_PACKET_HEADER_SIZE];
     int ret = md_packet_header_write(&hdr_out, buf, sizeof(buf));
-    assert(ret == MD_PACKET_HEADER_SIZE);
+    MD_CHECK(ret == MD_PACKET_HEADER_SIZE);
 
     MdPacketHeader hdr_in;
     ret = md_packet_header_read(&hdr_in, buf, sizeof(buf));
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
-    assert(hdr_in.version == hdr_out.version);
-    assert(hdr_in.type == hdr_out.type);
-    assert(hdr_in.flags == hdr_out.flags);
-    assert(hdr_in.payload_len == hdr_out.payload_len);
-    assert(hdr_in.sequence == hdr_out.sequence);
-    assert(hdr_in.timestamp_ms == hdr_out.timestamp_ms);
+    MD_CHECK(hdr_in.version == hdr_out.version);
+    MD_CHECK(hdr_in.type == hdr_out.type);
+    MD_CHECK(hdr_in.flags == hdr_out.flags);
+    MD_CHECK(hdr_in.payload_len == hdr_out.payload_len);
+    MD_CHECK(hdr_in.sequence == hdr_out.sequence);
+    MD_CHECK(hdr_in.timestamp_ms == hdr_out.timestamp_ms);
 
     printf("  PASS: header round-trip\n");
 }
@@ -44,17 +44,17 @@ static void test_packet_encode_decode(void) {
     int total = md_packet_encode(MD_PKT_ACTION, 7, 12345,
                                  (const uint8_t *)payload, payload_len,
                                  buf, sizeof(buf));
-    assert(total == (int)(MD_PACKET_HEADER_SIZE + payload_len));
+    MD_CHECK(total == (int)(MD_PACKET_HEADER_SIZE + payload_len));
 
     MdPacketHeader hdr;
     const uint8_t *decoded_payload = NULL;
     int ret = md_packet_decode(buf, (size_t)total, &hdr, &decoded_payload);
-    assert(ret == 0);
-    assert(hdr.type == MD_PKT_ACTION);
-    assert(hdr.sequence == 7);
-    assert(hdr.timestamp_ms == 12345);
-    assert(hdr.payload_len == payload_len);
-    assert(memcmp(decoded_payload, payload, payload_len) == 0);
+    MD_CHECK(ret == 0);
+    MD_CHECK(hdr.type == MD_PKT_ACTION);
+    MD_CHECK(hdr.sequence == 7);
+    MD_CHECK(hdr.timestamp_ms == 12345);
+    MD_CHECK(hdr.payload_len == payload_len);
+    MD_CHECK(memcmp(decoded_payload, payload, payload_len) == 0);
 
     printf("  PASS: packet encode/decode\n");
 }
@@ -64,7 +64,7 @@ static void test_packet_encode_rejects_int_overflow(void) {
     int ret = md_packet_encode(MD_PKT_VIDEO_FRAME, 1, 2,
                                NULL, (uint32_t)INT_MAX,
                                buf, (size_t)INT_MAX + MD_PACKET_HEADER_SIZE + 1u);
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     printf("  PASS: packet encode int overflow rejected\n");
 }
@@ -75,7 +75,7 @@ static void test_bad_version(void) {
 
     MdPacketHeader hdr;
     int ret = md_packet_header_read(&hdr, buf, sizeof(buf));
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     printf("  PASS: bad version rejected\n");
 }
@@ -84,7 +84,7 @@ static void test_buffer_too_small(void) {
     MdPacketHeader hdr = { .version = MD_PROTOCOL_VERSION };
     uint8_t buf[4]; /* too small */
     int ret = md_packet_header_write(&hdr, buf, sizeof(buf));
-    assert(ret == -1);
+    MD_CHECK(ret == -1);
 
     printf("  PASS: buffer too small rejected\n");
 }
@@ -97,5 +97,5 @@ int main(void) {
     test_bad_version();
     test_buffer_too_small();
     printf("All packet tests passed.\n");
-    return 0;
+    return md_test_report();
 }

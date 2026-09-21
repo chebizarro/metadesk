@@ -10,7 +10,6 @@
 #include "mcp_http.h"
 #include "jsonrpc.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,8 +20,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include "md_test.h"
 
-#define PASS(name) printf("  PASS  %s\n", name)
 
 /* Dynamic port to avoid conflicts with other tests */
 static uint16_t g_test_port = 17710;
@@ -47,7 +46,7 @@ static MdMcpServer *make_mcp_server(void)
 
 static void wire_server_to_http(MdMcpServer *mcp, MdMcpHttp *http)
 {
-    assert(md_mcp_server_set_write_fn(mcp, md_mcp_http_write, http) == 0);
+    MD_CHECK(md_mcp_server_set_write_fn(mcp, md_mcp_http_write, http) == 0);
 }
 
 /* ── Helper: raw TCP connect to localhost ─────────────────────── */
@@ -115,10 +114,10 @@ static int sse_connect(uint16_t port, char *headers_buf,
 
 static void test_create_null(void)
 {
-    assert(md_mcp_http_create(NULL) == NULL);
+    MD_CHECK(md_mcp_http_create(NULL) == NULL);
 
     MdMcpHttpConfig cfg = { .server = NULL };
-    assert(md_mcp_http_create(&cfg) == NULL);
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
 
     PASS("create null config");
 }
@@ -126,14 +125,14 @@ static void test_create_null(void)
 static void test_create_invalid_bind_addr(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     MdMcpHttpConfig cfg = {
         .server = mcp,
         .bind_addr = "not-an-ip-address",
         .port = g_test_port++,
     };
-    assert(md_mcp_http_create(&cfg) == NULL);
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
 
     md_mcp_server_destroy(mcp);
     PASS("invalid bind address fails");
@@ -144,7 +143,7 @@ static void test_create_invalid_bind_addr(void)
 static void test_create_destroy(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -153,12 +152,12 @@ static void test_create_destroy(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     /* The transport exposes its notification sink as a plain
      * MdMcpWriteFn taking the MdMcpHttp* as userdata. */
     MdMcpWriteFn fn = md_mcp_http_write;
-    assert(fn != NULL);
+    MD_CHECK(fn != NULL);
 
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
@@ -193,7 +192,7 @@ static void *server_thread(void *arg)
 static void test_post_initialize(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -202,7 +201,7 @@ static void test_post_initialize(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
     wire_server_to_http(mcp, http);
 
     /* Start server in background */
@@ -225,11 +224,11 @@ static void test_post_initialize(void)
 
     char response[4096];
     int n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
-    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
-    assert(strstr(response, "\"result\"") != NULL);
-    assert(strstr(response, "\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\"") != NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    MD_CHECK(strstr(response, "Access-Control-Allow-Origin") == NULL);
+    MD_CHECK(strstr(response, "\"result\"") != NULL);
+    MD_CHECK(strstr(response, "\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\"") != NULL);
 
     /* Shutdown */
     md_mcp_http_shutdown(http);
@@ -244,7 +243,7 @@ static void test_post_initialize(void)
 static void test_invalid_content_length_rejected(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -253,7 +252,7 @@ static void test_invalid_content_length_rejected(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -268,8 +267,8 @@ static void test_invalid_content_length_rejected(void)
 
     char response[2048];
     int n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "400") != NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "400") != NULL);
 
     request =
         "POST /mcp HTTP/1.1\r\n"
@@ -278,8 +277,8 @@ static void test_invalid_content_length_rejected(void)
         "Content-Length: -1\r\n"
         "\r\n{}";
     n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "400") != NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "400") != NULL);
 
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
@@ -293,7 +292,7 @@ static void test_invalid_content_length_rejected(void)
 static void test_post_requires_json_content_type(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -302,7 +301,7 @@ static void test_post_requires_json_content_type(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -319,9 +318,9 @@ static void test_post_requires_json_content_type(void)
 
     char response[2048];
     int n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "415") != NULL);
-    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "415") != NULL);
+    MD_CHECK(strstr(response, "Access-Control-Allow-Origin") == NULL);
 
     snprintf(request, sizeof(request),
              "POST /mcp HTTP/1.1\r\n"
@@ -331,8 +330,8 @@ static void test_post_requires_json_content_type(void)
              "\r\n%s",
              port, strlen(body), body);
     n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "415") != NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "415") != NULL);
 
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
@@ -348,7 +347,7 @@ static void test_post_requires_json_content_type(void)
 static void test_get_404(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -357,7 +356,7 @@ static void test_get_404(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -366,9 +365,9 @@ static void test_get_404(void)
     const char *request = "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n";
     char response[2048];
     int n = http_request(port, request, response, sizeof(response));
-    assert(n > 0);
-    assert(strstr(response, "404") != NULL);
-    assert(strstr(response, "Access-Control-Allow-Origin") == NULL);
+    MD_CHECK(n > 0);
+    MD_CHECK(strstr(response, "404") != NULL);
+    MD_CHECK(strstr(response, "Access-Control-Allow-Origin") == NULL);
 
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
@@ -382,7 +381,7 @@ static void test_get_404(void)
 static void test_sse_multiline_data(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -391,7 +390,7 @@ static void test_sse_multiline_data(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -399,14 +398,14 @@ static void test_sse_multiline_data(void)
 
     char headers[1024];
     int fd = sse_connect(port, headers, sizeof(headers));
-    assert(fd >= 0);
-    assert(strstr(headers, "text/event-stream") != NULL);
+    MD_CHECK(fd >= 0);
+    MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
-    assert(md_mcp_http_send_sse(http, "multi", "line1\nline2", 11) == 0);
+    MD_CHECK(md_mcp_http_send_sse(http, "multi", "line1\nline2", 11) == 0);
 
     char event[1024];
     ssize_t n = read(fd, event, sizeof(event) - 1);
-    assert(n > 0);
+    MD_CHECK(n > 0);
     size_t total = (size_t)n;
     event[total] = '\0';
     for (int i = 0; i < 3 && strstr(event, "data: line2\n") == NULL; i++) {
@@ -415,10 +414,10 @@ static void test_sse_multiline_data(void)
         total += (size_t)n;
         event[total] = '\0';
     }
-    assert(strstr(event, "event: multi\n") != NULL);
-    assert(strstr(event, "data: line1\n") != NULL);
-    assert(strstr(event, "data: line2\n") != NULL);
-    assert(strstr(event, "data: line1\nline2") == NULL);
+    MD_CHECK(strstr(event, "event: multi\n") != NULL);
+    MD_CHECK(strstr(event, "data: line1\n") != NULL);
+    MD_CHECK(strstr(event, "data: line2\n") != NULL);
+    MD_CHECK(strstr(event, "data: line1\nline2") == NULL);
 
     close(fd);
     md_mcp_http_shutdown(http);
@@ -433,7 +432,7 @@ static void test_sse_multiline_data(void)
 static void test_sse_max_clients_config(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -443,7 +442,7 @@ static void test_sse_max_clients_config(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -451,14 +450,14 @@ static void test_sse_max_clients_config(void)
 
     char headers1[1024];
     int fd1 = sse_connect(port, headers1, sizeof(headers1));
-    assert(fd1 >= 0);
-    assert(strstr(headers1, "text/event-stream") != NULL);
-    assert(strstr(headers1, "Access-Control-Allow-Origin") == NULL);
+    MD_CHECK(fd1 >= 0);
+    MD_CHECK(strstr(headers1, "text/event-stream") != NULL);
+    MD_CHECK(strstr(headers1, "Access-Control-Allow-Origin") == NULL);
 
     char headers2[1024];
     int fd2 = sse_connect(port, headers2, sizeof(headers2));
-    assert(fd2 >= 0);
-    assert(strstr(headers2, "text/event-stream") != NULL);
+    MD_CHECK(fd2 >= 0);
+    MD_CHECK(strstr(headers2, "text/event-stream") != NULL);
 
     /* fd1's registration races with send_sse (headers are sent before
      * the client is added to the SSE list) — retry until it arrives. */
@@ -466,7 +465,7 @@ static void test_sse_max_clients_config(void)
     size_t total = 0;
     event[0] = '\0';
     for (int i = 0; i < 40 && strstr(event, "data: data") == NULL; i++) {
-        assert(md_mcp_http_send_sse(http, "test", "data", 4) == 0);
+        MD_CHECK(md_mcp_http_send_sse(http, "test", "data", 4) == 0);
         if (md_test_wait_readable(fd1, 100) != 1)
             continue;
         ssize_t n = read(fd1, event + total, sizeof(event) - 1 - total);
@@ -474,15 +473,15 @@ static void test_sse_max_clients_config(void)
         total += (size_t)n;
         event[total] = '\0';
     }
-    assert(strstr(event, "event: test") != NULL);
-    assert(strstr(event, "data: data") != NULL);
+    MD_CHECK(strstr(event, "event: test") != NULL);
+    MD_CHECK(strstr(event, "data: data") != NULL);
 
     ssize_t n = read(fd2, event, sizeof(event) - 1);
     if (n > 0) {
         event[n] = '\0';
-        assert(strstr(event, "event: test") == NULL);
+        MD_CHECK(strstr(event, "event: test") == NULL);
     } else {
-        assert(n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
+        MD_CHECK(n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
     }
 
     close(fd1);
@@ -501,7 +500,7 @@ static void test_sse_max_clients_config(void)
 static void test_shutdown(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -510,7 +509,7 @@ static void test_shutdown(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -519,7 +518,7 @@ static void test_shutdown(void)
     /* Shutdown should cause run to return */
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
-    assert(sa.result == 0); /* clean shutdown */
+    MD_CHECK(sa.result == 0); /* clean shutdown */
 
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
@@ -530,7 +529,7 @@ static void test_shutdown(void)
 static void test_shutdown_closes_sse_clients(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -539,7 +538,7 @@ static void test_shutdown_closes_sse_clients(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -547,16 +546,16 @@ static void test_shutdown_closes_sse_clients(void)
 
     char headers[1024];
     int fd = sse_connect(port, headers, sizeof(headers));
-    assert(fd >= 0);
-    assert(strstr(headers, "text/event-stream") != NULL);
+    MD_CHECK(fd >= 0);
+    MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
     md_mcp_http_shutdown(http);
     pthread_join(tid, NULL);
-    assert(sa.result == 0);
+    MD_CHECK(sa.result == 0);
 
     char buf[32];
     ssize_t n = read(fd, buf, sizeof(buf));
-    assert(n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET)));
+    MD_CHECK(n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET)));
     close(fd);
 
     md_mcp_http_destroy(http);
@@ -569,7 +568,7 @@ static void test_shutdown_closes_sse_clients(void)
 
 static void test_run_null(void)
 {
-    assert(md_mcp_http_run(NULL) == -1);
+    MD_CHECK(md_mcp_http_run(NULL) == -1);
     PASS("run null");
 }
 
@@ -578,7 +577,7 @@ static void test_run_null(void)
 static void test_sse_no_clients(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    assert(mcp != NULL);
+    MD_CHECK(mcp != NULL);
 
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
@@ -587,15 +586,15 @@ static void test_sse_no_clients(void)
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    assert(http != NULL);
+    MD_CHECK(http != NULL);
 
     /* SSE send with no clients should succeed (no-op) */
     int ret = md_mcp_http_send_sse(http, "test", "data", 4);
-    assert(ret == 0);
+    MD_CHECK(ret == 0);
 
     /* NULL args */
-    assert(md_mcp_http_send_sse(NULL, "e", "d", 1) == -1);
-    assert(md_mcp_http_send_sse(http, NULL, NULL, 0) == -1);
+    MD_CHECK(md_mcp_http_send_sse(NULL, "e", "d", 1) == -1);
+    MD_CHECK(md_mcp_http_send_sse(http, NULL, NULL, 0) == -1);
 
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
@@ -625,5 +624,5 @@ int main(void)
     test_shutdown_closes_sse_clients();
 
     printf("\nAll HTTP transport tests passed.\n");
-    return 0;
+    return md_test_report();
 }
