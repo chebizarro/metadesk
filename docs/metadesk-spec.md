@@ -557,8 +557,8 @@ metadesk/
 │   ├── encode_roundtrip.c            # encode/decode benchmark
 │   └── atspi_dump.c                  # a11y tree dump utility
 └── docs/
-    ├── metadesk-spec.md              # this document
-    └── metadesk-spec-phase-2.1.md    # Phase 2.1 implementation spec (archived)
+    ├── AGENT_API.md                  # agent client integration guide
+    └── metadesk-spec.md              # this document
 ```
 
 ---
