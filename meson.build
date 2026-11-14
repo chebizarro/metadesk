@@ -74,6 +74,8 @@ if _nostrc_build == '' and _nostrc_root != ''
   _nostrc_build = _nostrc_root / 'build'
 endif
 
+fs = import('fs')
+
 # nostrc headers: prefer the source tree (it is ahead of the installed
 # libnostr: publish_and_wait, event_middleware_ex, nostr_event_validate),
 # fall back to the installed headers.
@@ -84,12 +86,20 @@ if _nostrc_root != ''
   _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
   _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip17' / 'include'
 endif
+# nostrc generates export-macro headers (nostr-export.h, libgo-export.h,
+# nostr-json-export.h) into the CMake build tree; the source headers include
+# them unqualified.
+if _nostrc_build != ''
+  foreach d : ['libnostr', 'libgo', 'libjson']
+    if fs.is_dir(_nostrc_build / d / 'include')
+      _nostrc_inc_paths += _nostrc_build / d / 'include'
+    endif
+  endforeach
+endif
 foreach d : _sys_inc_dirs
   _nostrc_inc_paths += d / 'nostr'
 endforeach
 nostrc_inc = include_directories(_nostrc_inc_paths)
-
-fs = import('fs')
 
 # libnostr: prefer the build-tree static lib (matches the headers above)
 _nostrc_core = _nostrc_build / 'libnostr' / 'libnostr.a'
@@ -124,13 +134,19 @@ _go_fiber_lib = cc.find_library('go_fiber', required : false, dirs : _sys_lib_di
 if _libgo_lib.found() and _go_fiber_lib.found()
   dep_libgo = declare_dependency(dependencies : [_libgo_lib, _go_fiber_lib])
 elif _nostrc_build != ''
+  # nostrc renamed the libgo target to `nostrgo` (libnostrgo.a); older build
+  # trees still have liblibgo.a.
+  _libgo_a = _nostrc_build / 'libgo' / 'libnostrgo.a'
+  if not fs.exists(_libgo_a)
+    _libgo_a = _nostrc_build / 'libgo' / 'liblibgo.a'
+  endif
   dep_libgo = declare_dependency(
     link_args : [
-      _nostrc_build / 'libgo' / 'liblibgo.a',
+      _libgo_a,
       _nostrc_build / 'libgo' / 'libgo_fiber.a',
     ],
   )
-  message('libgo: using build-tree static libs from ' + _nostrc_build / 'libgo')
+  message('libgo: using build-tree static libs ' + _libgo_a + ' + libgo_fiber.a')
 else
   error('libgo/go_fiber not found. Install nostrc or set -Dnostrc_root=<path>')
 endif

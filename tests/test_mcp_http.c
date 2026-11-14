@@ -79,16 +79,25 @@ static int http_request(uint16_t port, const char *request,
     ssize_t w = write(fd, request, strlen(request));
     if (w <= 0) { close(fd); return -1; }
 
-    /* Read response with timeout */
+    /* Read response with timeout. The server writes headers and body in
+     * separate write() calls and then closes (Connection: close), so read
+     * until EOF rather than trusting a single read() to see both. */
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    ssize_t n = read(fd, resp_buf, resp_buf_len - 1);
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(fd, resp_buf + total, resp_buf_len - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total >= resp_buf_len - 1) break;
+    }
     close(fd);
 
-    if (n <= 0) return -1;
-    resp_buf[n] = '\0';
-    return (int)n;
+    if (total == 0) return -1;
+    resp_buf[total] = '\0';
+    return (int)total;
 }
 
 static int sse_connect(uint16_t port, char *headers_buf,
