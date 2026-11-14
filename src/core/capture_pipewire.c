@@ -884,9 +884,12 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
 
     pthread_mutex_lock(&pw->frame_lock);
 
-    /* Wait for a frame from the PipeWire thread */
-    while (!pw->frame_ready && ctx->active) {
-        /* Use a timed wait to periodically check active flag */
+    /* Wait for a frame from the PipeWire thread, but bound the wait: a
+     * screencast can sit in STREAMING (ctx->active) yet never deliver a
+     * buffer (GNOME/PipeWire can leave the stream "running" but idle).
+     * Returning -1 after ~1s lets the host's capture watchdog restart
+     * capture instead of this call blocking forever. */
+    for (int waited = 0; !pw->frame_ready && ctx->active && waited < 10; waited++) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 100000000L; /* 100ms timeout */
