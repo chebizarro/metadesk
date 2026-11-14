@@ -162,12 +162,18 @@ int md_renderer_update_frame(MdRenderer *r, const uint8_t *rgba,
 void md_renderer_begin_frame(MdRenderer *r) {
     if (!r || !r->open)
         return;
-    /* Reset the render state the overlay leaves behind each frame:
-     *  - scale: the overlay draws at DisplayFramebufferScale (2x on Retina);
-     *  - viewport: on a HiDPI macOS window the default viewport is the window
-     *    POINT size (e.g. 1512x908), so RenderCopy(NULL) would fill only the
-     *    top-left quarter of the 3024x1816 drawable. Force the viewport to the
-     *    full output in pixels so the video texture scales to the whole window;
+    /* Draw the whole frame — video AND the ImGui overlay — in one coordinate
+     * system: logical points at the HiDPI render scale. This keeps the
+     * overlay's hit-testing (ImGui works in points) aligned with where it is
+     * drawn, so dragging behaves correctly.
+     *
+     * Steps:
+     *  - viewport: force the full output in pixels. On a HiDPI macOS window
+     *    the default viewport is the window POINT size, which would clip the
+     *    frame to the top-left quarter of the drawable.
+     *  - scale: set to the HiDPI factor (output px / window pt). RenderCopy to
+     *    a point-sized dst then fills the whole window; ImGui geometry (also
+     *    in points) is scaled the same way.
      *  - clip: clear any leftover ImGui scissor rect. */
     int out_w = 0, out_h = 0;
     SDL_GetRendererOutputSize(r->sdl_renderer, &out_w, &out_h);
@@ -177,9 +183,12 @@ void md_renderer_begin_frame(MdRenderer *r) {
         SDL_RenderSetViewport(r->sdl_renderer, &vp);
     }
     SDL_RenderSetClipRect(r->sdl_renderer, NULL);
+    SDL_RenderSetScale(r->sdl_renderer, r->hidpi_scale_x, r->hidpi_scale_y);
     SDL_RenderClear(r->sdl_renderer);
-    if (r->texture)
-        SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, NULL);
+    if (r->texture) {
+        SDL_Rect dst = { 0, 0, (int)r->win_width, (int)r->win_height };
+        SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, &dst);
+    }
 }
 
 void md_renderer_end_frame(MdRenderer *r) {

@@ -54,28 +54,19 @@ static float smooth(float prev, float curr) {
 
 /* Draw the finished ImGui frame.
  *
- * The SDLRenderer2 backend scales clip rects by io.DisplayFramebufferScale
- * but passes vertex positions to SDL_RenderGeometryRaw() unscaled unless
- * the renderer already has a scale set — on HiDPI that draws the overlay at
- * half size, clips it with full-size rects, and leaves ImGui hit-testing
- * (done in logical window coords) ~2x off from the pixels on screen.
- * Set the renderer scale to the framebuffer scale for the duration of the
- * ImGui draw so geometry, clip rects and input all share logical coords;
- * restore it afterwards so the video blit path is unaffected. */
+ * The renderer is already at the HiDPI scale (set by md_renderer_begin_frame),
+ * so the SDLRenderer2 backend passes vertex positions in logical points and
+ * SDL scales them to pixels — the same coordinate space ImGui uses for layout
+ * and mouse hit-testing. Do NOT change the scale here: resetting it would put
+ * the overlay's drawn geometry and its hit-testing in different spaces and
+ * break dragging.
+ *
+ * No present here either: the caller draws the video first
+ * (md_renderer_begin_frame), then the overlay, then presents once
+ * (md_renderer_end_frame) — one present per frame, no flip-book trails. */
 static void render_draw_data(MdOverlay *o) {
     ImGui::Render();
-
-    const ImVec2 fb_scale = ImGui::GetIO().DisplayFramebufferScale;
-    float old_sx = 1.0f, old_sy = 1.0f;
-    SDL_RenderGetScale(o->renderer, &old_sx, &old_sy);
-    SDL_RenderSetScale(o->renderer, old_sx * fb_scale.x, old_sy * fb_scale.y);
-
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
-
-    SDL_RenderSetScale(o->renderer, old_sx, old_sy);
-    /* No present here: the caller draws the video frame first
-     * (md_renderer_begin_frame), then the overlay, then presents once
-     * (md_renderer_end_frame) — one present per frame, no flip-book trails. */
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
