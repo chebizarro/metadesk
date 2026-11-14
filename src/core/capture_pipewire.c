@@ -418,9 +418,10 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_unref(msg);
         free(token);
 
-        /* 60 s timeout — user needs time to interact with the dialog */
+        /* Generous timeout — the user needs time to find and approve the
+         * "Share your screen" consent dialog. */
         DBusMessage *resp = NULL;
-        uint32_t rc = portal_wait_response(portal, req_path, 60000, &resp);
+        uint32_t rc = portal_wait_response(portal, req_path, 180000, &resp);
         if (rc != 0 || !resp) {
             MD_LOG_I("Start failed or user cancelled (rc=%u)", rc);
             if (resp) dbus_message_unref(resp);
