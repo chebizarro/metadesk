@@ -936,6 +936,24 @@ static void pw_stop(MdCaptureCtx *ctx) {
         pthread_join(pw->thread, NULL);
         pw->thread_started = false;
     }
+
+    /* Tear down the per-start resources (stream, core, portal) so a later
+     * pw_start() can cleanly re-open them — used by the host's stall-recovery
+     * restart. The loop and context are kept and reused. The pw loop thread
+     * has been joined above, so touching these objects here is safe. */
+    pw_cleanup_start_resources(pw);
+}
+
+/* Delete the persisted screencast restore_token so the next pw_start() shows
+ * the consent dialog again (used after repeated capture failures). */
+static void pw_forget_authorization(MdCaptureCtx *ctx) {
+    (void)ctx;
+    char dir[512];
+    portal_token_path(dir, sizeof(dir));
+    char path[640];
+    snprintf(path, sizeof(path), "%s/screencast.token", dir);
+    if (unlink(path) == 0)
+        MD_LOG_I("cleared screencast restore_token (%s)", path);
 }
 
 static void pw_destroy(MdCaptureCtx *ctx) {
@@ -973,6 +991,7 @@ static const MdCaptureBackend pipewire_backend = {
     .release_frame = pw_release_frame,
     .stop          = pw_stop,
     .destroy       = pw_destroy,
+    .forget_authorization = pw_forget_authorization,
 };
 
 const MdCaptureBackend *md_capture_backend_create(void) {

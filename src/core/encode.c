@@ -39,6 +39,7 @@ struct MdEncoder {
     uint8_t             *nv12_buf;   /* NV12 plane data backing frame->data[]  */
     int                  nv12_size;  /* total NV12 buffer size                 */
     bool                 is_hw;      /* true if using NVENC                    */
+    bool                 force_keyframe; /* emit an IDR on the next frame       */
     int64_t              frame_idx;  /* monotonic frame counter for pts        */
 
     /* Encode callback — set during submit, used in receive loop */
@@ -359,6 +360,12 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
     if (pts >= 0)
         enc->frame_idx = pts + 1;
 
+    /* Force an IDR when requested (e.g. a new client connected and needs a
+     * decodable entry point); otherwise let the encoder pick the type. */
+    enc->frame->pict_type = enc->force_keyframe ? AV_PICTURE_TYPE_I
+                                                : AV_PICTURE_TYPE_NONE;
+    enc->force_keyframe = false;
+
     /* Send frame to encoder */
     ret = avcodec_send_frame(enc->ctx, enc->frame);
     if (ret < 0) {
@@ -400,6 +407,13 @@ int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata) {
     enc->cb = NULL;
     enc->cb_userdata = NULL;
     return ret < 0 ? -1 : ret;
+}
+
+/* Request that the next submitted frame be encoded as a keyframe (IDR), so a
+ * newly connected client has an immediate decodable entry point. */
+void md_encoder_force_keyframe(MdEncoder *enc) {
+    if (enc)
+        enc->force_keyframe = true;
 }
 
 /* ── Dynamic bitrate adjustment ──────────────────────────────── */

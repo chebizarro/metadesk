@@ -163,6 +163,11 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
 }
 
 #define HOST_CAPTURE_SIZE_WAIT_MS 2000
+/* Capture stall watchdog: if a client is connected but no frame arrives for
+ * this long, restart the capture backend; after this many failed restarts,
+ * drop the saved screencast authorization so the next start re-prompts. */
+#define HOST_CAPTURE_STALL_MS      4000
+#define HOST_CAPTURE_MAX_RESTARTS  2
 
 static bool host_dimensions_are_valid(uint32_t width, uint32_t height) {
     return width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
@@ -227,16 +232,59 @@ static void *capture_thread_func(void *arg) {
      * and left the stream permanently at frames=0. get_frame() returns a
      * frame whenever one is ready and -1 otherwise, so a short sleep on -1
      * keeps the thread alive and idle until buffers flow. */
+    uint32_t stall_deadline   = 0;      /* 0 = disarmed; else ms to restart   */
+    uint32_t restart_count    = 0;
+    bool     recovery_gave_up = false;
+
     while (g_running) {
+        pthread_mutex_lock(&ctx->client_mu);
+        bool has_client = (ctx->client != NULL);
+        pthread_mutex_unlock(&ctx->client_mu);
+        uint32_t now = md_stream_now_ms();
+
         MdFrame frame;
         if (md_capture_get_frame(cap, &frame) != 0) {
+            /* No frame. Watchdog: if a client is waiting but the (often
+             * restored) screencast has produced nothing for a while, restart
+             * capture; after repeated failures drop the saved restore_token
+             * so the next host start re-prompts for consent. */
+            if (has_client && !recovery_gave_up) {
+                if (stall_deadline == 0) {
+                    stall_deadline = now + HOST_CAPTURE_STALL_MS;
+                } else if (now >= stall_deadline) {
+                    restart_count++;
+                    md_capture_stop(cap);
+                    if (restart_count > HOST_CAPTURE_MAX_RESTARTS) {
+                        md_capture_forget_authorization(cap);
+                        recovery_gave_up = true;
+                        fprintf(stderr,
+                            "host: capture unrecoverable after %u restarts; "
+                            "cleared screencast authorization — restart the host "
+                            "and re-approve the screen-share prompt\n",
+                            HOST_CAPTURE_MAX_RESTARTS);
+                    } else {
+                        fprintf(stderr,
+                            "host: no capture frames for %dms with a client "
+                            "connected — restarting capture (attempt %u)\n",
+                            HOST_CAPTURE_STALL_MS, restart_count);
+                        if (md_capture_start(cap) != 0)
+                            fprintf(stderr, "host: capture restart failed\n");
+                        stall_deadline = now + HOST_CAPTURE_STALL_MS;
+                    }
+                }
+            } else if (!has_client) {
+                stall_deadline = 0;
+                restart_count = 0;
+                recovery_gave_up = false;
+            }
             usleep(10000);  /* 10 ms; no frame yet (warming up / paused) */
             continue;
         }
 
-        pthread_mutex_lock(&ctx->client_mu);
-        bool has_client = (ctx->client != NULL);
-        pthread_mutex_unlock(&ctx->client_mu);
+        /* Healthy frame: slide the watchdog forward (or disarm if idle). */
+        stall_deadline   = has_client ? (now + HOST_CAPTURE_STALL_MS) : 0;
+        restart_count    = 0;
+        recovery_gave_up = false;
 
         if (!ctx->encoder || !has_client) {
             md_capture_release_frame(cap, &frame);
@@ -1024,6 +1072,11 @@ int main(int argc, char **argv) {
         ctx.frames_encoded  = 0;
         ctx.frame_size_mismatch_warned = false;
 
+        /* The encoder is persistent across connections, so a new client joins
+         * mid-GOP with no decodable entry point. Force an IDR for it. */
+        if (encoder)
+            md_encoder_force_keyframe(encoder);
+
         /* Send initial UI tree to new client */
         if (agent && a11y) {
             md_agent_send_tree(agent, client, &ctx.pkt_seq);
@@ -1134,8 +1187,10 @@ int main(int argc, char **argv) {
         printf("host: client #%u disconnected (sent %u frames)\n",
                client_num, ctx.frames_sent);
 
-        /* Flush any buffered encoder output before destroying the stream */
-        md_encoder_flush(encoder, on_encoded, &ctx);
+        /* Do NOT flush the encoder here: md_encoder_flush() sends an EOF to the
+         * persistent encoder, which then refuses further frames and leaves the
+         * next client with frames=0. Any buffered packets would only go to the
+         * client that just left. The next client gets a forced keyframe above. */
 
         /* Null out client before destroying so capture thread stops sending */
         pthread_mutex_lock(&ctx.client_mu);

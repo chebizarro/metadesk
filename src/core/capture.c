@@ -70,6 +70,11 @@ void md_capture_stop(MdCaptureCtx *ctx) {
     ctx->vtable->stop(ctx);
 }
 
+void md_capture_forget_authorization(MdCaptureCtx *ctx) {
+    if (!ctx || !ctx->vtable || !ctx->vtable->forget_authorization) return;
+    ctx->vtable->forget_authorization(ctx);
+}
+
 void md_capture_destroy(MdCaptureCtx *ctx) {
     if (!ctx) return;
     md_capture_stop(ctx);

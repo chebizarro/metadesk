@@ -87,6 +87,11 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
 /* Flush encoder — signal end of stream and retrieve remaining packets. */
 int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata);
 
+/* Request that the next submitted frame be encoded as a keyframe (IDR).
+ * Use when a new client connects to a persistent encoder so it gets an
+ * immediate decodable entry point instead of waiting for the next GOP. */
+void md_encoder_force_keyframe(MdEncoder *enc);
+
 /* Query whether NVENC is being used (vs software fallback). */
 bool md_encoder_is_hw(const MdEncoder *enc);
 

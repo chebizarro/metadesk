@@ -76,6 +76,10 @@ typedef struct MdCaptureBackend {
     void  (*release_frame)(MdCaptureCtx *ctx, MdFrame *frame);
     void  (*stop)(MdCaptureCtx *ctx);
     void  (*destroy)(MdCaptureCtx *ctx);
+    /* Optional: forget any persisted capture authorization (e.g. the PipeWire
+     * screencast restore_token) so the next start re-prompts for consent.
+     * May be NULL. Kept last so positional vtable initializers stay valid. */
+    void  (*forget_authorization)(MdCaptureCtx *ctx);
 } MdCaptureBackend;
 
 /* ── Capture context ─────────────────────────────────────────── */
@@ -125,6 +129,10 @@ int md_capture_get_size(const MdCaptureCtx *ctx, uint32_t *width, uint32_t *heig
 
 /* Stop capture. */
 void md_capture_stop(MdCaptureCtx *ctx);
+
+/* Forget any persisted capture authorization so the next md_capture_start()
+ * requires fresh user consent. No-op if the backend doesn't support it. */
+void md_capture_forget_authorization(MdCaptureCtx *ctx);
 
 /* Stop and destroy capture context, freeing all resources. */
 void md_capture_destroy(MdCaptureCtx *ctx);
