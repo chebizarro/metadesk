@@ -54,6 +54,9 @@ static void install_signal_handlers(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    /* A client vanishing mid-send must be an EPIPE on that stream, not a
+     * fatal signal for the whole host (OpenSSL writes bypass MSG_NOSIGNAL). */
+    signal(SIGPIPE, SIG_IGN);
 }
 
 /* ── State shared between capture callback and main loop ─────── */
@@ -158,6 +161,9 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
 }
 
 #define HOST_CAPTURE_SIZE_WAIT_MS 2000
+/* Max time the capture thread waits for the stream to reach STREAMING
+ * (10 ms per tick) before giving up, after dimensions are already known. */
+#define HOST_CAPTURE_ACTIVE_WAIT_TICKS 500  /* ~5 s */
 
 static bool host_dimensions_are_valid(uint32_t width, uint32_t height) {
     return width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
@@ -214,6 +220,16 @@ static void *capture_thread_func(void *arg) {
     HostCtx       *ctx = ct->host;
     MdCaptureCtx  *cap = ct->capture;
 
+    /* A backend reports its dimensions at format-negotiation time but only
+     * becomes active once the stream reaches STREAMING, which can lag by
+     * hundreds of ms (notably PipeWire screencast on a slow/VM session).
+     * Wait for that transition so the thread doesn't exit before the first
+     * frame and leave the stream permanently at frames=0. */
+    for (int i = 0; i < HOST_CAPTURE_ACTIVE_WAIT_TICKS &&
+                    !md_capture_is_active(cap) && g_running; i++) {
+        usleep(10000);  /* 10 ms per tick */
+    }
+
     while (md_capture_is_active(cap) && g_running) {
         MdFrame frame;
         if (md_capture_get_frame(cap, &frame) != 0)
@@ -228,9 +244,13 @@ static void *capture_thread_func(void *arg) {
             continue;
         }
 
+        /* The encoder converts enc_w x enc_h pixels using the frame's
+         * stride, so a frame at most one row/column larger (odd display
+         * edge rounded down) is a safe crop; anything else is dropped. */
         uint32_t enc_w = 0, enc_h = 0;
         if (md_encoder_get_size(ctx->encoder, &enc_w, &enc_h) == 0 &&
-            (frame.width != enc_w || frame.height != enc_h)) {
+            (frame.width < enc_w || frame.height < enc_h ||
+             frame.width - enc_w > 1 || frame.height - enc_h > 1)) {
             if (!ctx->frame_size_mismatch_warned) {
                 fprintf(stderr,
                         "host: WARNING: dropping capture frames sized %ux%u; "
@@ -840,10 +860,15 @@ int main(int argc, char **argv) {
                                                   : "capture disabled");
     }
 
-    /* Initialize encoder (persistent across reconnections) */
+    /* Initialize encoder (persistent across reconnections).
+     * NV12/H.264 need even dimensions; a display with an odd edge (e.g. a
+     * 1512x909 VM screen) is cropped by one row/column at encode time, while
+     * input injection keeps the true display size. */
+    uint32_t enc_width  = display_width  & ~1u;
+    uint32_t enc_height = display_height & ~1u;
     MdEncoderConfig enc_cfg = {
-        .width        = display_width,
-        .height       = display_height,
+        .width        = enc_width,
+        .height       = enc_height,
         .bitrate      = bitrate,
         .fps          = fps,
         .prefer_nvenc = use_nvenc,
@@ -858,7 +883,7 @@ int main(int argc, char **argv) {
     }
     printf("host: encoder ready (%s, %ux%u)\n",
            md_encoder_is_hw(encoder) ? "NVENC" : "x264",
-           display_width, display_height);
+           enc_width, enc_height);
 
     /* Initialize input injection (persistent) */
     MdInputConfig input_cfg = {

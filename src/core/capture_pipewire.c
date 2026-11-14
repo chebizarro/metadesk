@@ -193,6 +193,19 @@ static uint32_t portal_wait_response(PortalScreencast *p,
         dbus_connection_read_write(p->bus, 100);
         DBusMessage *msg;
         while ((msg = dbus_connection_pop_message(p->bus)) != NULL) {
+            /* The portal answers a malformed call with a method error
+             * instead of a Response signal; surface it rather than
+             * silently waiting out the timeout. */
+            if (dbus_message_get_type(msg) == DBUS_MESSAGE_TYPE_ERROR) {
+                const char *detail = NULL;
+                dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &detail,
+                                      DBUS_TYPE_INVALID);
+                MD_LOG_I("portal call failed: %s%s%s",
+                         dbus_message_get_error_name(msg),
+                         detail ? ": " : "", detail ? detail : "");
+                dbus_message_unref(msg);
+                goto done;
+            }
             if (dbus_message_is_signal(msg, PORTAL_REQUEST, "Response")
                 && strcmp(dbus_message_get_path(msg), request_path) == 0) {
                 /* Parse response code (first arg) */
@@ -312,7 +325,10 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dict_append_sv_string(&dict, "handle_token", token);
         dict_append_sv_uint32(&dict, "types", PORTAL_SOURCE_MONITOR);
         dict_append_sv_uint32(&dict, "cursor_mode", PORTAL_CURSOR_EMBEDDED);
-        dict_append_sv_bool(&dict, "persist_mode", FALSE);
+        /* persist_mode is typed 'u' in the ScreenCast spec (0 = do not
+         * persist). Sending a boolean makes xdg-desktop-portal reject the
+         * call with a method error and never emit a Response. */
+        dict_append_sv_uint32(&dict, "persist_mode", 0);
         dbus_message_iter_close_container(&args, &dict);
 
         dbus_connection_send(portal->bus, msg, NULL);

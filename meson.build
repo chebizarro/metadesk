@@ -12,6 +12,14 @@ project('metadesk', ['c', 'cpp'],
 # ── Platform detection ───────────────────────────────────────────────────────
 host_os = host_machine.system()  # 'linux', 'darwin', 'windows'
 
+if host_os == 'linux'
+  # c_std=c17 (not gnu17) puts glibc in strict-ANSI mode, which hides POSIX and
+  # GNU declarations the Linux HAL needs: struct addrinfo (stream.c,
+  # fips_addr.c), F_DUPFD_CLOEXEC (capture_pipewire.c), and ssize_t/locale_t
+  # used by PipeWire's spa/utils/string.h. Opt back in project-wide.
+  add_project_arguments('-D_GNU_SOURCE', language : ['c', 'cpp'])
+endif
+
 # Tests assert through bare assert(); never let NDEBUG compile them out,
 # or -Db_ndebug=true turns the suite into silent no-ops. No src/ file
 # uses assert, so this only affects tests.
@@ -194,6 +202,11 @@ if host_os == 'linux'
   dep_atspi     = dependency('atspi-2',         version : '>=2.48')
   dep_udev      = dependency('libudev',         version : '>=252')
   dep_dbus      = dependency('dbus-1',          version : '>=1.14')
+  # a11y_atspi.c calls g_object_unref/g_boxed_free directly; atspi-2.pc only
+  # exposes gobject-2.0 privately, so link it explicitly.
+  dep_gobject   = dependency('gobject-2.0')
+  # uuid_generate/uuid_unparse_lower: libSystem on macOS, libuuid on Linux.
+  dep_uuid      = dependency('uuid')
 
   platform_hal_sources += files(
     'src/core/capture_pipewire.c',
@@ -201,7 +214,8 @@ if host_os == 'linux'
     'src/core/input_uinput.c',
     'src/core/ipc_unix.c',
   )
-  platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus]
+  platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus,
+                        dep_gobject, dep_uuid]
 
 elif host_os == 'darwin'
   add_languages('objc', required : true)

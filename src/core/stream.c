@@ -192,7 +192,14 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
             }
             total += (size_t)w;
         } else {
+            /* A peer that closed mid-send must surface as EPIPE, not kill
+             * the process: MSG_NOSIGNAL on Linux, SO_NOSIGPIPE (set in
+             * stream_from_fd) on macOS/BSD. */
+#ifdef MSG_NOSIGNAL
+            ssize_t w = send(s->fd, buf + total, n - total, MSG_NOSIGNAL);
+#else
             ssize_t w = write(s->fd, buf + total, n - total);
+#endif
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;
                 return -1;
@@ -223,6 +230,10 @@ static MdStream *stream_from_fd(int fd, SSL *ssl) {
     s->ssl = ssl;
     s->connected = true;
     set_tcp_nodelay(fd);
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     return s;
 }
 

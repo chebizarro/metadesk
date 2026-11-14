@@ -153,6 +153,8 @@ static bool uinput_dimensions_are_valid(const MdInputConfig *cfg) {
            cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
 }
 
+static void uinput_destroy(MdInputCtx *ctx);  /* defined below; used on init failure */
+
 static int uinput_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
     if (!uinput_dimensions_are_valid(cfg)) {
         MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
