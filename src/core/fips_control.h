@@ -25,6 +25,7 @@ extern "C" {
 #define MD_FIPS_CONTROL_PATH_MAX          256u
 
 #define MD_FIPS_CONTROL_RUN_SOCKET        "/run/fips/control.sock"
+#define MD_FIPS_CONTROL_VAR_RUN_SOCKET    "/var/run/fips/control.sock"
 #define MD_FIPS_CONTROL_XDG_SUFFIX        "/fips/control.sock"
 #define MD_FIPS_CONTROL_TMP_SOCKET        "/tmp/fips-control.sock"
 #define MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS 500u
@@ -86,8 +87,9 @@ const char *md_fips_peer_readiness_string(MdFipsPeerReadinessState state);
  * If socket_override is non-empty, it wins. Otherwise this follows the FIPS
  * documented client-side default order:
  *   1. /run/fips/control.sock if /run/fips exists
- *   2. $XDG_RUNTIME_DIR/fips/control.sock
- *   3. /tmp/fips-control.sock
+ *   2. /var/run/fips/control.sock on macOS/FreeBSD if /var/run/fips exists
+ *   3. $XDG_RUNTIME_DIR/fips/control.sock
+ *   4. /tmp/fips-control.sock
  *
  * Returns 0 on success, -1 if arguments are invalid or out is too small.
  */

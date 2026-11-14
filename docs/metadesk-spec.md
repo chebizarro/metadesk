@@ -85,7 +85,7 @@ The normal runtime uses an external FIPS daemon plus metadesk host/client proces
 
 | Process | Role | Key Dependencies |
 |---|---|---|
-| `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.3.x / v0.4.x runtime, run as system service or operator-managed process |
+| `fips` | External FIPS mesh daemon; owns TUN, `.fips` DNS/addressing, overlay discovery, STUN/NAT traversal, peer ACLs, retry/cooldown, and routes | Upstream FIPS v0.6.x runtime, run as system service or operator-managed process |
 | `metadesk-host` | Capture, encode, a11y walk, session auth | FFmpeg + platform capture/a11y/input backends; local FIPS control socket access |
 | `metadesk-client` | Human video client and/or agent transport endpoint | SDL2/ImGui for video; local FIPS control socket access |
 
@@ -93,14 +93,14 @@ The normal runtime uses an external FIPS daemon plus metadesk host/client proces
 
 The first supported migration scope is Linux and macOS. Both platforms use a Unix-domain FIPS control socket; Windows and OpenWrt are outside this first-pass metadesk integration scope even though upstream FIPS supports them.
 
-metadesk requires a current FIPS daemon with these capabilities enabled or available:
+metadesk requires an upstream FIPS v0.6.x daemon with these capabilities enabled or available:
 
 - TUN adapter routing for `fd00::/8` and `.fips` DNS/address derivation.
 - Control socket enabled, with `show_status`, `show_peers`, and `show_sessions` available for readiness checks.
-- Peer reachability configured in FIPS, either by static peers or by Nostr overlay discovery (`node.discovery.nostr.enabled`, operator-selected advert/DM relays, `peers[].via_nostr`, and appropriate UDP/TCP/Tor advert settings).
+- Peer reachability configured in FIPS, either by static peers or by Nostr overlay discovery (`node.rendezvous.nostr.enabled`, operator-selected `node.rendezvous.nostr.advert_relays` and `node.rendezvous.nostr.dm_relays`, `peers[].via_nostr`, and appropriate UDP/TCP/Tor advert settings).
 - FIPS-owned overlay adverts, traversal signaling, STUN, UDP hole punching, retry/cooldown, ACLs, and mesh route maintenance.
 
-On Linux and macOS, metadesk follows the FIPS client-side socket discovery order unless explicitly overridden: `/run/fips/control.sock`, `$XDG_RUNTIME_DIR/fips/control.sock`, then `/tmp/fips-control.sock`. Packaged services normally create a mode `0770`, group `fips` socket; users running metadesk must have permission to connect.
+On Linux and macOS, metadesk follows the FIPS client-side socket discovery order unless explicitly overridden: `/run/fips/control.sock` if `/run/fips` exists; `/var/run/fips/control.sock` on macOS and FreeBSD if `/var/run/fips` exists; `$XDG_RUNTIME_DIR/fips/control.sock` if `XDG_RUNTIME_DIR` is set and non-empty; then `/tmp/fips-control.sock`. Packaged services normally create a mode `0770`, group `fips` socket; users running metadesk must have permission to connect.
 
 Before dialing the frame channel, metadesk distinguishes these readiness failures:
 

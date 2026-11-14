@@ -28,6 +28,14 @@ static int run_fips_dir_exists(void)
 #endif
 }
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+static int var_run_fips_dir_exists(void)
+{
+    struct stat st;
+    return stat("/var/run/fips", &st) == 0 && S_ISDIR(st.st_mode);
+}
+#endif
+
 static void test_result_strings(void)
 {
     MD_CHECK(strcmp(md_fips_control_result_string(MD_FIPS_CONTROL_OK), "ok") == 0);
@@ -64,6 +72,10 @@ static void test_default_path_order(void)
     MD_CHECK(md_fips_control_resolve_socket_path(NULL, path, sizeof(path)) == 0);
     if (run_fips_dir_exists())
         MD_CHECK(strcmp(path, MD_FIPS_CONTROL_RUN_SOCKET) == 0);
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    else if (var_run_fips_dir_exists())
+        MD_CHECK(strcmp(path, MD_FIPS_CONTROL_VAR_RUN_SOCKET) == 0);
+#endif
     else
         MD_CHECK(strcmp(path, "/tmp/md-fips-control-xdg/fips/control.sock") == 0);
 
@@ -71,6 +83,10 @@ static void test_default_path_order(void)
     MD_CHECK(md_fips_control_resolve_socket_path(NULL, path, sizeof(path)) == 0);
     if (run_fips_dir_exists())
         MD_CHECK(strcmp(path, MD_FIPS_CONTROL_RUN_SOCKET) == 0);
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    else if (var_run_fips_dir_exists())
+        MD_CHECK(strcmp(path, MD_FIPS_CONTROL_VAR_RUN_SOCKET) == 0);
+#endif
     else
         MD_CHECK(strcmp(path, MD_FIPS_CONTROL_TMP_SOCKET) == 0);
 

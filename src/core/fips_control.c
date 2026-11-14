@@ -423,6 +423,11 @@ int md_fips_control_resolve_socket_path(const char *socket_override,
     if (stat("/run/fips", &st) == 0 && S_ISDIR(st.st_mode))
         return md_fc_copy_path(MD_FIPS_CONTROL_RUN_SOCKET, out, out_len);
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    if (stat("/var/run/fips", &st) == 0 && S_ISDIR(st.st_mode))
+        return md_fc_copy_path(MD_FIPS_CONTROL_VAR_RUN_SOCKET, out, out_len);
+#endif
+
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     if (runtime_dir && runtime_dir[0] != '\0')
         return md_fc_join_path(runtime_dir, MD_FIPS_CONTROL_XDG_SUFFIX,
