@@ -372,12 +372,13 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         case MD_INPUT_EV_MOVE:
             md_input_mouse_move(ctx->input, x, y);
             break;
-        case MD_INPUT_EV_BUTTON:
-            if (button == 3)
-                md_input_right_click(ctx->input, x, y);
-            else
-                md_input_click(ctx->input, x, y, button == 2 ? 2 : 1);
+        case MD_INPUT_EV_BUTTON: {
+            /* Wire buttons are 1=left, 2=middle, 3=right; md_input_click()
+             * uses 0=left, 1=right, 2=middle. */
+            int mb = (button == 2) ? 2 : (button == 3) ? 1 : 0;
+            md_input_click(ctx->input, x, y, mb);
             break;
+        }
         case MD_INPUT_EV_WHEEL:
             md_input_scroll(ctx->input, x, y);
             break;

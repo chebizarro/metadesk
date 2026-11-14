@@ -387,9 +387,15 @@ static bool map_to_remote(ClientCtx *ctx, int wx, int wy,
                           int16_t *rx, int16_t *ry) {
     if (!ctx->renderer || ctx->frame_w == 0 || ctx->frame_h == 0)
         return false;
-    uint32_t ww = 0, wh = 0;
-    if (md_renderer_get_window_size(ctx->renderer, &ww, &wh) != 0 ||
-        ww == 0 || wh == 0)
+    /* Use the LIVE window size, not the renderer's stored value: the OS may
+     * keep the window at a different size than we requested (e.g. zoomed to
+     * fill the screen), and the video is stretched to fill the whole window.
+     * SDL mouse coords are in the same point space as SDL_GetWindowSize. */
+    SDL_Window *win = (SDL_Window *)md_renderer_get_sdl_window(ctx->renderer);
+    int ww = 0, wh = 0;
+    if (win)
+        SDL_GetWindowSize(win, &ww, &wh);
+    if (ww <= 0 || wh <= 0)
         return false;
     long mx = (long)wx * (long)ctx->frame_w / (long)ww;
     long my = (long)wy * (long)ctx->frame_h / (long)wh;
