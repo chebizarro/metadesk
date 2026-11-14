@@ -16,6 +16,7 @@
 #include "encode.h"
 #include "a11y.h"
 #include "input.h"
+#include "input_event.h"
 #include "session.h"
 #include "packet.h"
 #include "stream.h"
@@ -66,6 +67,7 @@ typedef struct {
     MdStream     *client;
     pthread_mutex_t client_mu;  /* protects client pointer lifetime */
     MdAgent      *agent;
+    MdInput      *input;        /* raw human input injection (MD_PKT_INPUT) */
     MdNostr      *nostr;
     MdSession    *session;
     uint32_t      frame_seq;
@@ -161,9 +163,6 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
 }
 
 #define HOST_CAPTURE_SIZE_WAIT_MS 2000
-/* Max time the capture thread waits for the stream to reach STREAMING
- * (10 ms per tick) before giving up, after dimensions are already known. */
-#define HOST_CAPTURE_ACTIVE_WAIT_TICKS 500  /* ~5 s */
 
 static bool host_dimensions_are_valid(uint32_t width, uint32_t height) {
     return width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
@@ -220,20 +219,20 @@ static void *capture_thread_func(void *arg) {
     HostCtx       *ctx = ct->host;
     MdCaptureCtx  *cap = ct->capture;
 
-    /* A backend reports its dimensions at format-negotiation time but only
-     * becomes active once the stream reaches STREAMING, which can lag by
-     * hundreds of ms (notably PipeWire screencast on a slow/VM session).
-     * Wait for that transition so the thread doesn't exit before the first
-     * frame and leave the stream permanently at frames=0. */
-    for (int i = 0; i < HOST_CAPTURE_ACTIVE_WAIT_TICKS &&
-                    !md_capture_is_active(cap) && g_running; i++) {
-        usleep(10000);  /* 10 ms per tick */
-    }
-
-    while (md_capture_is_active(cap) && g_running) {
+    /* Loop on g_running, NOT on md_capture_is_active(): a backend reports its
+     * dimensions at format-negotiation time but may reach its streaming state
+     * much later, and a *restored* PipeWire screencast (reused restore_token)
+     * can deliver buffers without ever flipping our 'active' flag to
+     * STREAMING. Gating on 'active' dropped the thread before the first frame
+     * and left the stream permanently at frames=0. get_frame() returns a
+     * frame whenever one is ready and -1 otherwise, so a short sleep on -1
+     * keeps the thread alive and idle until buffers flow. */
+    while (g_running) {
         MdFrame frame;
-        if (md_capture_get_frame(cap, &frame) != 0)
-            break;
+        if (md_capture_get_frame(cap, &frame) != 0) {
+            usleep(10000);  /* 10 ms; no frame yet (warming up / paused) */
+            continue;
+        }
 
         pthread_mutex_lock(&ctx->client_mu);
         bool has_client = (ctx->client != NULL);
@@ -309,6 +308,61 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
             fprintf(stderr, "host: received action but no agent handler\n");
         }
         break;
+
+    case MD_PKT_INPUT: {
+        /* Raw human input from the video client. */
+        if (!ctx->input || !payload || hdr->payload_len == 0)
+            break;
+        uint8_t kind = 0, button = 0;
+        int16_t x = 0, y = 0;
+        uint16_t tlen = 0;
+        const char *text = NULL;
+        if (md_input_event_unpack(payload, hdr->payload_len, &kind, &button,
+                                  &x, &y, &text, &tlen) != 0)
+            break;
+        switch (kind) {
+        case MD_INPUT_EV_MOVE:
+            md_input_mouse_move(ctx->input, x, y);
+            break;
+        case MD_INPUT_EV_BUTTON:
+            if (button == 3)
+                md_input_right_click(ctx->input, x, y);
+            else
+                md_input_click(ctx->input, x, y, button == 2 ? 2 : 1);
+            break;
+        case MD_INPUT_EV_WHEEL:
+            md_input_scroll(ctx->input, x, y);
+            break;
+        case MD_INPUT_EV_KEY: {
+            const char *keys[MD_INPUT_MAX_COMBO_KEYS];
+            int kc = 0;
+            if (button & 1) keys[kc++] = "ctrl";
+            if (button & 2) keys[kc++] = "shift";
+            if (button & 4) keys[kc++] = "alt";
+            if (button & 8) keys[kc++] = "super";
+            char namez[64];
+            size_t nl = tlen < sizeof(namez) - 1 ? tlen : sizeof(namez) - 1;
+            if (text) memcpy(namez, text, nl);
+            namez[nl] = '\0';
+            if (kc < MD_INPUT_MAX_COMBO_KEYS && nl > 0) {
+                keys[kc++] = namez;
+                md_input_key_combo(ctx->input, keys, kc);
+            }
+            break;
+        }
+        case MD_INPUT_EV_TEXT: {
+            char txt[MD_INPUT_EVENT_MAX_TEXT + 1];
+            size_t tl = tlen < sizeof(txt) - 1 ? tlen : sizeof(txt) - 1;
+            if (text) memcpy(txt, text, tl);
+            txt[tl] = '\0';
+            md_input_type_text(ctx->input, txt);
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
 
     case MD_PKT_SESSION_INFO: {
         fprintf(stderr, "host: received session info\n");
@@ -918,6 +972,7 @@ int main(int argc, char **argv) {
     /* Set persistent host context fields */
     ctx.encoder = encoder;
     ctx.agent   = agent;
+    ctx.input   = input;  /* raw human input injection for MD_PKT_INPUT */
 
     /* Capture thread starts only after encoder/input are ready. */
     if (capture) {

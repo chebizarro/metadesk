@@ -140,8 +140,8 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
     return r;
 }
 
-int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
-                        uint32_t width, uint32_t height) {
+int md_renderer_update_frame(MdRenderer *r, const uint8_t *rgba,
+                             uint32_t width, uint32_t height) {
     if (!r || !r->open || !rgba || width == 0 || height == 0)
         return -1;
 
@@ -156,12 +156,44 @@ int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
         fprintf(stderr, "render: SDL_UpdateTexture failed: %s\n", SDL_GetError());
         return -1;
     }
+    return 0;
+}
 
-    /* Clear, copy texture (scaled to window), present */
+void md_renderer_begin_frame(MdRenderer *r) {
+    if (!r || !r->open)
+        return;
+    /* Reset the render state the overlay leaves behind each frame:
+     *  - scale: the overlay draws at DisplayFramebufferScale (2x on Retina);
+     *  - viewport: on a HiDPI macOS window the default viewport is the window
+     *    POINT size (e.g. 1512x908), so RenderCopy(NULL) would fill only the
+     *    top-left quarter of the 3024x1816 drawable. Force the viewport to the
+     *    full output in pixels so the video texture scales to the whole window;
+     *  - clip: clear any leftover ImGui scissor rect. */
+    int out_w = 0, out_h = 0;
+    SDL_GetRendererOutputSize(r->sdl_renderer, &out_w, &out_h);
+    SDL_RenderSetScale(r->sdl_renderer, 1.0f, 1.0f);
+    if (out_w > 0 && out_h > 0) {
+        SDL_Rect vp = { 0, 0, out_w, out_h };
+        SDL_RenderSetViewport(r->sdl_renderer, &vp);
+    }
+    SDL_RenderSetClipRect(r->sdl_renderer, NULL);
     SDL_RenderClear(r->sdl_renderer);
-    SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, NULL);
-    SDL_RenderPresent(r->sdl_renderer);
+    if (r->texture)
+        SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, NULL);
+}
 
+void md_renderer_end_frame(MdRenderer *r) {
+    if (!r || !r->open)
+        return;
+    SDL_RenderPresent(r->sdl_renderer);
+}
+
+int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
+                        uint32_t width, uint32_t height) {
+    if (md_renderer_update_frame(r, rgba, width, height) < 0)
+        return -1;
+    md_renderer_begin_frame(r);
+    md_renderer_end_frame(r);
     return 0;
 }
 

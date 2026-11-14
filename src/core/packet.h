@@ -26,6 +26,7 @@ typedef enum {
     MD_PKT_UI_TREE       = 0x03,
     MD_PKT_UI_TREE_DELTA = 0x04,
     MD_PKT_SCREENSHOT    = 0x05,
+    MD_PKT_INPUT         = 0x06,  /* raw human mouse/keyboard (client→host) */
     MD_PKT_PING          = 0x10,
     MD_PKT_PONG          = 0x11,
     MD_PKT_SESSION_INFO  = 0x20,

@@ -24,6 +24,10 @@
 #include "nostr.h"
 #include "a11y.h"
 #include "ui.h"
+#include "packet.h"
+#include "input_event.h"
+
+#include <SDL2/SDL.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +54,10 @@ typedef struct {
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
+    uint32_t      frame_w;              /* last decoded frame width  (remote px) */
+    uint32_t      frame_h;              /* last decoded frame height (remote px) */
+    MdStream     *stream;               /* active stream, for input forwarding    */
+    uint32_t      input_seq;            /* seq counter for MD_PKT_INPUT packets    */
 
     /* UI tree state (received from host agent) */
     char         *ui_tree_json;         /* latest full UI tree JSON (owned)   */
@@ -77,9 +85,12 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
     ctx->frames_decoded++;
 
     if (ctx->renderer) {
-        int ret = md_renderer_present(ctx->renderer, frame->data,
-                                      frame->width, frame->height);
-        if (ret == 0)
+        ctx->frame_w = frame->width;
+        ctx->frame_h = frame->height;
+        /* Upload only; the composite (video + overlay + single present) is
+         * driven from the main loop via render_client_overlay(). */
+        if (md_renderer_update_frame(ctx->renderer, frame->data,
+                                     frame->width, frame->height) == 0)
             ctx->frames_displayed++;
     }
 
@@ -335,9 +346,117 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     return stream;
 }
 
-/* Forward SDL events from the renderer's pump to the ImGui overlay. */
+/* Map an SDL non-text key to a name md_input understands, or NULL. */
+static const char *sdl_key_name(SDL_Keycode k) {
+    switch (k) {
+    case SDLK_RETURN: case SDLK_KP_ENTER: return "enter";
+    case SDLK_BACKSPACE: return "backspace";
+    case SDLK_TAB:       return "tab";
+    case SDLK_ESCAPE:    return "escape";
+    case SDLK_DELETE:    return "delete";
+    case SDLK_INSERT:    return "insert";
+    case SDLK_SPACE:     return "space";
+    case SDLK_UP:        return "up";
+    case SDLK_DOWN:      return "down";
+    case SDLK_LEFT:      return "left";
+    case SDLK_RIGHT:     return "right";
+    case SDLK_HOME:      return "home";
+    case SDLK_END:       return "end";
+    case SDLK_PAGEUP:    return "pageup";
+    case SDLK_PAGEDOWN:  return "pagedown";
+    case SDLK_F1: return "f1"; case SDLK_F2: return "f2"; case SDLK_F3: return "f3";
+    case SDLK_F4: return "f4"; case SDLK_F5: return "f5"; case SDLK_F6: return "f6";
+    case SDLK_F7: return "f7"; case SDLK_F8: return "f8"; case SDLK_F9: return "f9";
+    case SDLK_F10: return "f10"; case SDLK_F11: return "f11"; case SDLK_F12: return "f12";
+    default: return NULL;
+    }
+}
+
+/* Serialize and send one input event to the host. */
+static void send_input(ClientCtx *ctx, uint8_t kind, uint8_t button,
+                       int16_t x, int16_t y, const char *text, uint16_t tlen) {
+    if (!ctx->stream) return;
+    uint8_t buf[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_MAX_TEXT];
+    size_t n = md_input_event_pack(buf, sizeof(buf), kind, button, x, y, text, tlen);
+    if (n == 0) return;
+    md_stream_send(ctx->stream, MD_PKT_INPUT, ctx->input_seq++, buf, (uint32_t)n);
+}
+
+/* Map window-point coordinates to remote frame pixels. */
+static bool map_to_remote(ClientCtx *ctx, int wx, int wy,
+                          int16_t *rx, int16_t *ry) {
+    if (!ctx->renderer || ctx->frame_w == 0 || ctx->frame_h == 0)
+        return false;
+    uint32_t ww = 0, wh = 0;
+    if (md_renderer_get_window_size(ctx->renderer, &ww, &wh) != 0 ||
+        ww == 0 || wh == 0)
+        return false;
+    long mx = (long)wx * (long)ctx->frame_w / (long)ww;
+    long my = (long)wy * (long)ctx->frame_h / (long)wh;
+    if (mx < 0) mx = 0;
+    if (mx > (long)ctx->frame_w - 1) mx = (long)ctx->frame_w - 1;
+    if (my < 0) my = 0;
+    if (my > (long)ctx->frame_h - 1) my = (long)ctx->frame_h - 1;
+    *rx = (int16_t)mx;
+    *ry = (int16_t)my;
+    return true;
+}
+
+/* Translate an SDL input event to the remote and forward it, unless the
+ * ImGui overlay is consuming it (pointer over the panel, widget focused). */
+static void forward_input_event(ClientCtx *ctx, const SDL_Event *ev) {
+    if (!ctx->stream)
+        return;
+    int16_t rx, ry;
+    switch (ev->type) {
+    case SDL_MOUSEMOTION:
+        if (md_overlay_wants_mouse(ctx->overlay)) return;
+        if (map_to_remote(ctx, ev->motion.x, ev->motion.y, &rx, &ry))
+            send_input(ctx, MD_INPUT_EV_MOVE, 0, rx, ry, NULL, 0);
+        break;
+    case SDL_MOUSEBUTTONDOWN:
+        if (md_overlay_wants_mouse(ctx->overlay)) return;
+        if (map_to_remote(ctx, ev->button.x, ev->button.y, &rx, &ry)) {
+            uint8_t b = ev->button.button == SDL_BUTTON_RIGHT  ? 3 :
+                        ev->button.button == SDL_BUTTON_MIDDLE ? 2 : 1;
+            send_input(ctx, MD_INPUT_EV_BUTTON, b, rx, ry, NULL, 0);
+        }
+        break;
+    case SDL_MOUSEWHEEL:
+        if (md_overlay_wants_mouse(ctx->overlay)) return;
+        send_input(ctx, MD_INPUT_EV_WHEEL, 0,
+                   (int16_t)ev->wheel.x, (int16_t)ev->wheel.y, NULL, 0);
+        break;
+    case SDL_KEYDOWN: {
+        if (md_overlay_wants_keyboard(ctx->overlay)) return;
+        SDL_Keycode k = ev->key.keysym.sym;
+        char namebuf[2] = {0, 0};
+        const char *name = NULL;
+        if (k >= SDLK_a && k <= SDLK_z) { namebuf[0] = (char)k; name = namebuf; }
+        else if (k >= SDLK_0 && k <= SDLK_9) { namebuf[0] = (char)k; name = namebuf; }
+        else name = sdl_key_name(k);
+        if (!name) break;
+        /* Modifier bitmask: host rebuilds the key combo. Sending shift+"1"
+         * lets the host produce "!", shift+"a" -> "A", etc. */
+        uint8_t mods = 0;
+        SDL_Keymod m = (SDL_Keymod)ev->key.keysym.mod;
+        if (m & KMOD_CTRL)  mods |= 1;
+        if (m & KMOD_SHIFT) mods |= 2;
+        if (m & KMOD_ALT)   mods |= 4;
+        if (m & KMOD_GUI)   mods |= 8;
+        send_input(ctx, MD_INPUT_EV_KEY, mods, 0, 0, name, (uint16_t)strlen(name));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* Feed every SDL event to the overlay, then forward un-consumed input. */
 static void overlay_event_forward(void *event, void *userdata) {
-    md_overlay_handle_sdl_event((MdOverlay *)userdata, event);
+    ClientCtx *ctx = (ClientCtx *)userdata;
+    md_overlay_handle_sdl_event(ctx->overlay, event);
+    forward_input_event(ctx, (const SDL_Event *)event);
 }
 
 static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
@@ -371,8 +490,13 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
         .encoder_name = NULL,
     };
 
+    /* One composite per displayed frame: draw the latest video texture,
+     * then the overlay on top, then a single present. Drawing both into the
+     * same back buffer is what stops the overlay leaving ghost trails. */
+    md_renderer_begin_frame(ctx->renderer);
     md_overlay_new_frame(ctx->overlay);
     md_overlay_render(ctx->overlay, &overlay_stats);
+    md_renderer_end_frame(ctx->renderer);
 }
 
 static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
@@ -615,7 +739,7 @@ int main(int argc, char **argv) {
                 /* Single event pump: renderer forwards every event here */
                 md_renderer_set_event_callback(ctx.renderer,
                                                overlay_event_forward,
-                                               ctx.overlay);
+                                               &ctx);
             }
         }
     }
@@ -633,6 +757,7 @@ int main(int argc, char **argv) {
     while (g_running) {
         if (!stream || !md_stream_is_connected(stream)) {
             if (stream) {
+                ctx.stream = NULL;
                 md_stream_destroy(stream);
                 stream = NULL;
             }
@@ -672,6 +797,9 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Keep the input-forwarding path pointed at the live stream. */
+        ctx.stream = stream;
+
         /* Check SDL events (window close, Escape, etc.) */
         if (ctx.renderer) {
             if (md_renderer_poll_events(ctx.renderer) < 0) {
@@ -694,7 +822,8 @@ int main(int argc, char **argv) {
         }
         if (ret < 0) {
             /* Unexpected connection loss — enter reconnect loop. */
-            fprintf(stderr, "client: connection lost\n");
+                fprintf(stderr, "client: connection lost\n");
+            ctx.stream = NULL;
             md_stream_destroy(stream);
             stream = NULL;
             md_session_reset(&session);
@@ -718,6 +847,10 @@ int main(int argc, char **argv) {
 
             int64_t dec_elapsed = now_us() - dec_start;
             ctx.total_decode_us += dec_elapsed;
+
+            /* Composite the freshly decoded frame + overlay and present now,
+             * rather than waiting for the next recv timeout. */
+            render_client_overlay(&ctx, stream, last_stats_ms);
             break;
         }
 

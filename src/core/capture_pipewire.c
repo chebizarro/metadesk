@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #include "log.h"
 #define MD_LOG_TAG "capture_pipewire"
 
@@ -240,6 +241,50 @@ static void portal_screencast_close(PortalScreencast *portal);
  * On success, portal->pw_fd and portal->node_id are populated.
  * The caller must eventually call portal_screencast_close().
  */
+/* ── ScreenCast restore_token persistence ────────────────────────
+ * A restore_token returned by a persistent Start lets later runs re-open the
+ * same screencast without showing the consent dialog again. Persist it under
+ * XDG_STATE_HOME so capture survives host restarts after one approval. */
+static void portal_token_path(char *out, size_t n) {
+    const char *base = getenv("XDG_STATE_HOME");
+    if (base && base[0]) {
+        snprintf(out, n, "%s/metadesk", base);
+    } else {
+        const char *home = getenv("HOME");
+        snprintf(out, n, "%s/.local/state/metadesk", home ? home : "/tmp");
+    }
+}
+
+static size_t portal_load_token(char *buf, size_t n) {
+    if (n == 0) return 0;
+    char dir[512];
+    portal_token_path(dir, sizeof(dir));
+    char path[640];
+    snprintf(path, sizeof(path), "%s/screencast.token", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t len = fread(buf, 1, n - 1, f);
+    fclose(f);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+                       buf[len - 1] == ' '))
+        len--;
+    buf[len] = '\0';
+    return len;
+}
+
+static void portal_save_token(const char *tok) {
+    if (!tok || !tok[0]) return;
+    char dir[512];
+    portal_token_path(dir, sizeof(dir));
+    mkdir(dir, 0700); /* best effort; parent (~/.local/state) usually exists */
+    char path[640];
+    snprintf(path, sizeof(path), "%s/screencast.token", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputs(tok, f);
+    fclose(f);
+}
+
 static int portal_screencast_open(PortalScreencast *portal) {
     memset(portal, 0, sizeof(*portal));
     portal->pw_fd = -1;
@@ -325,10 +370,14 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dict_append_sv_string(&dict, "handle_token", token);
         dict_append_sv_uint32(&dict, "types", PORTAL_SOURCE_MONITOR);
         dict_append_sv_uint32(&dict, "cursor_mode", PORTAL_CURSOR_EMBEDDED);
-        /* persist_mode is typed 'u' in the ScreenCast spec (0 = do not
-         * persist). Sending a boolean makes xdg-desktop-portal reject the
-         * call with a method error and never emit a Response. */
-        dict_append_sv_uint32(&dict, "persist_mode", 0);
+        /* persist_mode 'u' (ScreenCast spec): 2 = persist until revoked, so a
+         * returned restore_token lets later runs skip the consent dialog.
+         * (It must be a uint32; a boolean makes the portal reject the call
+         * with a method error and never emit a Response.) */
+        dict_append_sv_uint32(&dict, "persist_mode", 2);
+        char rtoken[1024];
+        if (portal_load_token(rtoken, sizeof(rtoken)) > 0)
+            dict_append_sv_string(&dict, "restore_token", rtoken);
         dbus_message_iter_close_container(&args, &dict);
 
         dbus_connection_send(portal->bus, msg, NULL);
@@ -411,7 +460,15 @@ static int portal_screencast_open(PortalScreencast *portal) {
                     found_streams = true;
                     MD_LOG_I("stream node_id=%u", portal->node_id);
                 }
-                break;
+            } else if (strcmp(key, "restore_token") == 0) {
+                dbus_message_iter_next(&entry);
+                dbus_message_iter_recurse(&entry, &variant);
+                if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
+                    const char *rt = NULL;
+                    dbus_message_iter_get_basic(&variant, &rt);
+                    portal_save_token(rt);
+                    MD_LOG_I("screencast consent persisted (restore_token saved)");
+                }
             }
             dbus_message_iter_next(&results_arr);
         }

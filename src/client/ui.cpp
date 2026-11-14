@@ -73,7 +73,9 @@ static void render_draw_data(MdOverlay *o) {
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
 
     SDL_RenderSetScale(o->renderer, old_sx, old_sy);
-    SDL_RenderPresent(o->renderer);
+    /* No present here: the caller draws the video frame first
+     * (md_renderer_begin_frame), then the overlay, then presents once
+     * (md_renderer_end_frame) — one present per frame, no flip-book trails. */
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -267,6 +269,16 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
     ImGui::End();
 
     render_draw_data(o);
+}
+
+bool md_overlay_wants_mouse(MdOverlay *o) {
+    if (!o) return false;
+    return ImGui::GetIO().WantCaptureMouse;
+}
+
+bool md_overlay_wants_keyboard(MdOverlay *o) {
+    if (!o) return false;
+    return ImGui::GetIO().WantCaptureKeyboard;
 }
 
 void md_overlay_destroy(MdOverlay *o) {

@@ -26,12 +26,26 @@ typedef struct MdRenderer MdRenderer;
  * Returns NULL on failure (SDL2 not available, etc.). */
 MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *title);
 
-/* Present a decoded RGBA frame.
- * If width/height differ from the current texture, the texture is
- * recreated and the window is resized to match.
- * Returns 0 on success, -1 on error. */
+/* Present a decoded RGBA frame in one call (upload + draw + present).
+ * Kept for simple callers; the client composite path uses the split
+ * update/begin/end functions below so the overlay shares the same frame. */
 int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
                         uint32_t width, uint32_t height);
+
+/* Upload a decoded RGBA frame to the streaming texture without drawing or
+ * presenting. The texture is (re)created and the window resized on a
+ * resolution change. Returns 0 on success, -1 on error. */
+int md_renderer_update_frame(MdRenderer *r, const uint8_t *rgba,
+                             uint32_t width, uint32_t height);
+
+/* Begin a composite frame: reset scale to 1:1, clear, and draw the latest
+ * video texture to fill the window. Draw the overlay after this, then call
+ * md_renderer_end_frame() to present — exactly one present per displayed
+ * frame, so the overlay never flip-books against the video. */
+void md_renderer_begin_frame(MdRenderer *r);
+
+/* Finish a composite frame: present the back buffer. */
+void md_renderer_end_frame(MdRenderer *r);
 
 /* Process window events (close, resize).
  * Returns 0 if should continue, -1 if quit requested (window closed,

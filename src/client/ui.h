@@ -59,6 +59,12 @@ void md_overlay_handle_sdl_event(MdOverlay *o, void *event);
  * Call between md_overlay_new_frame() and the SDL_RenderPresent(). */
 void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats);
 
+/* True if ImGui is currently consuming mouse / keyboard input (e.g. the
+ * pointer is over the overlay panel or a widget is focused). The client
+ * uses these to avoid forwarding those events to the remote host. */
+bool md_overlay_wants_mouse(MdOverlay *o);
+bool md_overlay_wants_keyboard(MdOverlay *o);
+
 /* Destroy overlay and ImGui context. */
 void md_overlay_destroy(MdOverlay *o);
 
