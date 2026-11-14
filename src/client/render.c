@@ -125,8 +125,13 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
     /* Set scaling quality to linear for smooth resize */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 
-    r->win_width  = width;
-    r->win_height = height;
+    /* Query the size actually granted: the window manager may clamp the
+     * requested size to the display (macOS does), and the HiDPI scale is
+     * meaningless if computed against the size we asked for. */
+    int actual_w = 0, actual_h = 0;
+    SDL_GetWindowSize(r->window, &actual_w, &actual_h);
+    r->win_width  = actual_w > 0 ? (uint32_t)actual_w : width;
+    r->win_height = actual_h > 0 ? (uint32_t)actual_h : height;
     r->open = true;
 
     /* Compute HiDPI scale factor: renderer pixels vs window points */

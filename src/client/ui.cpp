@@ -52,6 +52,30 @@ static float smooth(float prev, float curr) {
     return prev * (1.0f - SMOOTH_ALPHA) + curr * SMOOTH_ALPHA;
 }
 
+/* Draw the finished ImGui frame.
+ *
+ * The SDLRenderer2 backend scales clip rects by io.DisplayFramebufferScale
+ * but passes vertex positions to SDL_RenderGeometryRaw() unscaled unless
+ * the renderer already has a scale set — on HiDPI that draws the overlay at
+ * half size, clips it with full-size rects, and leaves ImGui hit-testing
+ * (done in logical window coords) ~2x off from the pixels on screen.
+ * Set the renderer scale to the framebuffer scale for the duration of the
+ * ImGui draw so geometry, clip rects and input all share logical coords;
+ * restore it afterwards so the video blit path is unaffected. */
+static void render_draw_data(MdOverlay *o) {
+    ImGui::Render();
+
+    const ImVec2 fb_scale = ImGui::GetIO().DisplayFramebufferScale;
+    float old_sx = 1.0f, old_sy = 1.0f;
+    SDL_RenderGetScale(o->renderer, &old_sx, &old_sy);
+    SDL_RenderSetScale(o->renderer, old_sx * fb_scale.x, old_sy * fb_scale.y);
+
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+
+    SDL_RenderSetScale(o->renderer, old_sx, old_sy);
+    SDL_RenderPresent(o->renderer);
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 extern "C" {
@@ -140,10 +164,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.7f, 0.6f), "F1: stats");
         ImGui::End();
 
-        /* Finalize and render */
-        ImGui::Render();
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
-        SDL_RenderPresent(o->renderer);
+        render_draw_data(o);
         return;
     }
 
@@ -245,10 +266,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
     ImGui::End();
 
-    /* Finalize and render */
-    ImGui::Render();
-    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
-    SDL_RenderPresent(o->renderer);
+    render_draw_data(o);
 }
 
 void md_overlay_destroy(MdOverlay *o) {
