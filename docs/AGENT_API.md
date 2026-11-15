@@ -53,17 +53,20 @@ All tools are prefixed with `metadesk_`. Read tools take a fresh accessibility s
 | `metadesk_find` | optional `role`, `label_contains`, `state`, `limit` (default 50), `format` | Flat matching nodes: compact lines or a JSON array of node details |
 | `metadesk_subtree` | required `id`; optional `depth` (default 2), `format` | Subtree: compact text or a JSON node object with children |
 | `metadesk_node` | required `id` | JSON detail: `id`, `role`, `label`, `state` array, `bounds`, `child_count` |
-| `metadesk_focused` | none | JSON `{node, window}`: first focused node and nearest frame/window ancestor (or null window) |
-| `metadesk_windows` | none | JSON array of top-level frames/windows: `id`, `role`, `label`, `bounds` |
+| `metadesk_focused` | none | JSON `{node, window}`: first focused node and nearest frame/window/dialog/alert ancestor (or null window) |
+| `metadesk_windows` | none | JSON array of top-level frames/windows and modal dialogs/alerts: `id`, `role`, `label`, `bounds` |
 
 `role` and `state` use case-insensitive exact matches; `label_contains` is a
 case-insensitive substring. Filters combine with AND; matches follow tree order.
-`limit` must be a positive integer. `depth` is a non-negative integer counting
-child edges from the selected root (0 returns only that node). Top-level windows
-may be nested under desktop/application containers; nested windows are excluded.
+`limit` must be an integer from 1 to 500. `depth` must be an integer from 0 to 64,
+counting child edges from the selected root (0 returns only that node). An empty
+`label_contains` is equivalent to omitting the filter, including unlabelled nodes.
+Top-level windows may be nested under desktop/application containers; nested
+ordinary windows are excluded, but dialogs and alerts are included even when nested.
 
 `find` and `subtree` default to `format="compact"`; use `format="json"` per call.
-Targeted compact output includes all roles, including labels and panels.
+Targeted compact output includes all roles, including labels and panels;
+roles without an abbreviation retain their raw role string.
 The other three read tools always return JSON. Invalid arguments, missing nodes,
 missing focus, and unavailable snapshots return text content with `isError: true`.
 An unmatched find returns an empty list/text; no windows returns an empty array.
@@ -97,8 +100,10 @@ An unmatched find returns an empty list/text; no windows returns an empty array.
 The UI tree resource defaults to compact (`text/plain`). Start the host with
 `--mcp-tree-format=json` to select JSON (`application/json`), or
 `--mcp-tree-format=compact` to select compact explicitly. This option also works
-with `--mcp-http`; it does not change read-tool defaults. Post-action deltas
-always remain JSON; fallback full trees use the configured resource format.
+with `--mcp-http`; it does not change read-tool defaults. MCP action-tool results
+always remain JSON, whether a delta array or a fallback full tree; this option
+only controls the UI tree resource. Existing clients should pass
+`--mcp-tree-format=json` to retain the previous JSON resource format.
 
 ### Read the UI tree
 

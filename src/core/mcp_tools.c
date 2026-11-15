@@ -305,6 +305,9 @@ static cJSON *tool_handler(const cJSON *arguments,
 
 /* ── Accessibility read tools ───────────────────────────────── */
 
+#define MD_MCP_FIND_MAX_LIMIT 500
+#define MD_MCP_SUBTREE_MAX_DEPTH 64
+
 enum { READ_FIND = 1, READ_SUBTREE, READ_NODE, READ_FOCUSED, READ_WINDOWS };
 
 #define READ_STRING(nm, req) { nm, FIELD_STRING, req, NULL, 0, 0 }
@@ -334,7 +337,8 @@ static cJSON *build_read_schema(const FieldDef *fields, int count)
         cJSON *p = cJSON_GetObjectItemCaseSensitive(props, names[i]);
         if (!p) continue;
         cJSON_AddNumberToObject(p, "minimum", i == 0 ? 1 : 0);
-        cJSON_AddNumberToObject(p, "maximum", INT_MAX);
+        cJSON_AddNumberToObject(p, "maximum", i == 0
+            ? MD_MCP_FIND_MAX_LIMIT : MD_MCP_SUBTREE_MAX_DEPTH);
         cJSON_AddNumberToObject(p, "default", i == 0 ? 50 : 2);
     }
     return schema;
@@ -370,6 +374,8 @@ static bool valid_read_args(const cJSON *args, const cJSON *schema)
                 item->valuedouble != (double)item->valueint) return false;
             const cJSON *min = cJSON_GetObjectItemCaseSensitive(p, "minimum");
             if (min && item->valuedouble < min->valuedouble) return false;
+            const cJSON *max = cJSON_GetObjectItemCaseSensitive(p, "maximum");
+            if (max && item->valuedouble > max->valuedouble) return false;
         }
     }
     return true;
@@ -430,6 +436,10 @@ static cJSON *read_tool_handler(const cJSON *args, bool *is_error,
     case READ_FIND: {
         const cJSON *arg = cJSON_GetObjectItemCaseSensitive(args, "limit");
         int limit = arg ? arg->valueint : 50;
+        if (limit < 1 || limit > MD_MCP_FIND_MAX_LIMIT) {
+            error = "Invalid 'limit': expected an integer from 1 to 500";
+            break;
+        }
         const MdA11yNode **nodes = calloc((size_t)limit, sizeof(*nodes));
         if (!nodes) break;
         int count = md_a11y_find(root, read_string(args, "role"),
@@ -516,6 +526,8 @@ typedef struct {
 
 #define TOOL(nm, dsc, type, flds) \
     { nm, dsc, type, flds, (int)(sizeof(flds) / sizeof((flds)[0])), 0 }
+#define READ_TOOL(nm, dsc, kind, flds) \
+    { nm, dsc, 0, flds, (int)(sizeof(flds) / sizeof((flds)[0])), kind }
 
 static const ToolDef tool_defs[] = {
     TOOL("metadesk_click",       "Click a UI element by its accessibility node ID",
@@ -536,15 +548,15 @@ static const ToolDef tool_defs[] = {
          MD_ACTION_SET_VALUE,   fields_set_value),
     TOOL("metadesk_screenshot",  "Capture a screenshot (region or full screen)",
          MD_ACTION_SCREENSHOT,  fields_screenshot),
-    { "metadesk_find", "Find nodes by role, label substring and state (case-insensitive)",
-      0, fields_find, 5, READ_FIND },
-    { "metadesk_subtree", "Read a subtree; depth 0 includes only its root",
-      0, fields_subtree, 3, READ_SUBTREE },
-    { "metadesk_node", "Read JSON node detail including child_count",
-      0, fields_node, 1, READ_NODE },
-    { "metadesk_focused", "Read the focused node and its nearest frame/window ancestor as JSON",
+    READ_TOOL("metadesk_find", "Find nodes by role, label substring and state (case-insensitive)",
+              READ_FIND, fields_find),
+    READ_TOOL("metadesk_subtree", "Read a subtree; depth 0 includes only its root",
+              READ_SUBTREE, fields_subtree),
+    READ_TOOL("metadesk_node", "Read JSON node detail including child_count",
+              READ_NODE, fields_node),
+    { "metadesk_focused", "Read the focused node and its nearest frame/window/dialog/alert ancestor as JSON",
       0, NULL, 0, READ_FOCUSED },
-    { "metadesk_windows", "List top-level frames/windows as JSON",
+    { "metadesk_windows", "List top-level frames/windows and modal dialogs/alerts as JSON",
       0, NULL, 0, READ_WINDOWS },
 };
 

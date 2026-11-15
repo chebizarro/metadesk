@@ -529,8 +529,9 @@ static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
         for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        sb_appendf(sb, "%s[%s]", role_abbrev(node->role),
-                   node->id ? node->id : "?");
+        const char *role = all_roles && node->role && !role_lookup(node->role)
+            ? node->role : role_abbrev(node->role);
+        sb_appendf(sb, "%s[%s]", role, node->id ? node->id : "?");
 
         if (is_text_role(node->role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */

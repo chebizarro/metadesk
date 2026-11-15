@@ -15,8 +15,8 @@ static bool equal_ci(const char *a, const char *b)
 
 static bool contains_ci(const char *text, const char *part)
 {
-    if (!text) return false;
     if (!*part) return true;
+    if (!text) return false;
     for (; *text; text++) {
         const char *a = text, *b = part;
         while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
@@ -51,9 +51,15 @@ bool md_a11y_matches(const MdA11yNode *node, const char *role,
     return false;
 }
 
+static bool is_modal(const MdA11yNode *node)
+{
+    return node && (equal_ci(node->role, "dialog") || equal_ci(node->role, "alert"));
+}
+
 bool md_a11y_is_window(const MdA11yNode *node)
 {
-    return node && (equal_ci(node->role, "frame") || equal_ci(node->role, "window"));
+    return node && (equal_ci(node->role, "frame") || equal_ci(node->role, "window") ||
+                    is_modal(node));
 }
 
 static const MdA11yNode *focused(const MdA11yNode *node,
@@ -93,15 +99,22 @@ int md_a11y_find(const MdA11yNode *root, const char *role,
     return count;
 }
 
+static void visit_windows(const MdA11yNode *root, bool in_window,
+                           void (*visit)(const MdA11yNode *, void *),
+                           void *userdata)
+{
+    if (!root) return;
+    if (md_a11y_is_window(root)) {
+        if (!in_window || is_modal(root)) visit(root, userdata);
+        in_window = true;
+    }
+    for (int i = 0; root->children && i < root->child_count; i++)
+        visit_windows(root->children[i], in_window, visit, userdata);
+}
+
 void md_a11y_visit_windows(const MdA11yNode *root,
                             void (*visit)(const MdA11yNode *, void *),
                             void *userdata)
 {
-    if (!root) return;
-    if (md_a11y_is_window(root)) {
-        visit(root, userdata);
-        return;
-    }
-    for (int i = 0; root->children && i < root->child_count; i++)
-        md_a11y_visit_windows(root->children[i], visit, userdata);
+    visit_windows(root, false, visit, userdata);
 }

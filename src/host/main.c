@@ -464,7 +464,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
-    fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource format (default: compact)\n");
+    fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource only (default: compact); action results always JSON\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 

@@ -43,7 +43,7 @@ typedef enum {
 typedef struct {
     MdA11yCtx    *a11y;           /* shared a11y context (required)     */
     MdInput      *input;          /* shared input context (optional)    */
-    MdMcpTreeFormat tree_format;  /* DEFAULT (zero) selects compact     */
+    MdMcpTreeFormat tree_format;  /* resource only; DEFAULT=compact, actions=JSON */
     uint32_t      settle_ms;      /* settle time after actions (0=default) */
 
     /* Transport: use one of these */

@@ -723,14 +723,16 @@ In addition to the binary packet protocol (§3.1), metadesk provides an MCP serv
 - `metadesk_find(role?, label_contains?, state?, limit=50, format=compact|json)` — flat matches; case-insensitive exact role/state and substring label filters.
 - `metadesk_subtree(id, depth=2, format=compact|json)` — depth-bounded subtree (0 includes only the root).
 - `metadesk_node(id)` — JSON node detail with states, bounds and child count.
-- `metadesk_focused()` — JSON focused node and nearest frame/window ancestor.
-- `metadesk_windows()` — JSON top-level frames/windows, excluding nested windows.
+- `metadesk_focused()` — JSON focused node and nearest frame/window/dialog/alert ancestor.
+- `metadesk_windows()` — JSON top-level frames/windows and modal dialogs/alerts, including nested modals but excluding nested ordinary windows.
 
 The authoritative tool table lives in [AGENT_API.md](AGENT_API.md#available-tools).
 `find` and `subtree` default to compact; the other reads return JSON.
+`limit` is bounded to 1–500 and `depth` to 0–64.
 The UI tree resource defaults to compact (`text/plain`); the host switch
 `--mcp-tree-format=json|compact` selects its format (`application/json` for JSON).
-Post-action deltas remain JSON; fallback full trees honor the configured format.
+This switch only controls the resource, not read-tool defaults or action results.
+MCP action-tool results always use JSON, both delta arrays and fallback full trees.
 
 **Resources exposed:**
 - `metadesk://ui-tree` — full accessibility tree (JSON or compact format)

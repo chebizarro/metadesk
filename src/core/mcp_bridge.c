@@ -59,7 +59,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     MdAgentConfig agent_cfg = {
         .a11y = config->a11y,
         .input = config->input,
-        .tree_format = tree_format,
+        /* Action results are always JSON, including full-tree fallbacks. */
+        .tree_format = MD_TREE_FORMAT_JSON,
         .settle_ms = config->settle_ms > 0 ? config->settle_ms
                                             : MD_AGENT_DEFAULT_SETTLE_MS,
     };
