@@ -38,6 +38,9 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     MdMcpBridge *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
 
+    MdTreeFormat tree_format = config->tree_format == MD_MCP_TREE_FORMAT_JSON
+        ? MD_TREE_FORMAT_JSON : MD_TREE_FORMAT_COMPACT;
+
     b->a11y = config->a11y;
     b->input = config->input;
 
@@ -56,7 +59,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     MdAgentConfig agent_cfg = {
         .a11y = config->a11y,
         .input = config->input,
-        .tree_format = config->tree_format,
+        /* Action results are always JSON, including full-tree fallbacks. */
+        .tree_format = MD_TREE_FORMAT_JSON,
         .settle_ms = config->settle_ms > 0 ? config->settle_ms
                                             : MD_AGENT_DEFAULT_SETTLE_MS,
     };
@@ -77,6 +81,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     /* 4. Register tools */
     b->tool_ctx.agent = b->agent;
+    b->tool_ctx.a11y = config->a11y;
     if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0)
         goto fail;
 
@@ -84,7 +89,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     b->resource_ctx.a11y = config->a11y;
     b->resource_ctx.session = &b->session;
     b->resource_ctx.agent = b->agent;
-    b->resource_ctx.tree_format = config->tree_format;
+    b->resource_ctx.tree_format = tree_format;
     if (md_mcp_register_resources(b->server, &b->resource_ctx) != 0)
         goto fail;
 

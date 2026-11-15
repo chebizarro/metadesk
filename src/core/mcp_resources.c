@@ -29,7 +29,8 @@ static cJSON *read_ui_tree(void *userdata)
 
     /* Walk the accessibility tree */
     char *tree_text = NULL;
-    const char *mime = "application/json";
+    const char *mime = ctx->tree_format == MD_TREE_FORMAT_COMPACT
+        ? "text/plain" : "application/json";
 
     if (ctx->a11y) {
         MdA11yNode *root = md_a11y_walk(ctx->a11y);
@@ -50,7 +51,8 @@ static cJSON *read_ui_tree(void *userdata)
     }
 
     cJSON *contents = resource_text_contents(
-        MD_MCP_URI_UI_TREE, mime, tree_text ? tree_text : "{\"root\":null}");
+        MD_MCP_URI_UI_TREE, mime, tree_text ? tree_text :
+        (ctx->tree_format == MD_TREE_FORMAT_COMPACT ? "" : "{\"root\":null}"));
     free(tree_text);
     return contents;
 }

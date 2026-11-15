@@ -359,6 +359,7 @@ core_sources = files(
     'src/core/bitrate_ctrl.c',
     'src/core/decode.c',
   'src/core/a11y.c',
+  'src/core/a11y_query.c',
   'src/core/input.c',
   'src/core/session.c',
   'src/core/jsonrpc.c',
@@ -476,6 +477,13 @@ test_agent = executable('test_agent',
 )
 test('agent action handler', test_agent)
 
+test_mcp = executable('test_mcp',
+  files('tests/test_mcp.c'),
+  dependencies : [dep_metadesk],
+)
+test('MCP server core', test_mcp)
+test('MCP accessibility queries', test_mcp, args : ['--a11y-queries'])
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 # Diagnostic utilities (capture_frame, atspi_dump are useful for manual backend
 # triage; encode_roundtrip overlaps tests/test_encode.c) — opt-in.
@@ -534,12 +542,6 @@ test_jsonrpc = executable('test_jsonrpc',
   dependencies : [dep_metadesk],
 )
 test('JSON-RPC 2.0 message layer', test_jsonrpc)
-
-test_mcp = executable('test_mcp',
-  files('tests/test_mcp.c'),
-  dependencies : [dep_metadesk],
-)
-test('MCP server core', test_mcp)
 
 test_mcp_stdio = executable('test_mcp_stdio',
   files('tests/test_mcp_stdio.c'),

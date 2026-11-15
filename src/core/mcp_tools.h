@@ -1,6 +1,6 @@
 /*
  * metadesk — mcp_tools.h
- * MCP tool definitions for the 9 metadesk action types.
+ * MCP accessibility read tools and the 9 metadesk action types.
  *
  * Registers tools with an MdMcpServer so agents discover them via tools/list.
  * Tool handlers bridge MCP calls into the MdAgent action pipeline.
@@ -18,12 +18,13 @@ extern "C" {
 /* Context passed to all MCP tool handlers — holds the agent used to
  * execute actions. */
 typedef struct {
+    MdA11yCtx *a11y;            /* borrowed; fresh snapshots for read tools */
     MdAgent   *agent;           /* agent handler for action dispatch   */
     void      *_handler_ctxs;   /* internal: heap-allocated per-tool contexts,
                                    freed by md_mcp_tools_cleanup()       */
 } MdMcpToolCtx;
 
-/* Register all 9 metadesk action tools with the MCP server.
+/* Register all metadesk read and action tools with the MCP server.
  * The tool_ctx must remain valid for the lifetime of the server.
  * Returns 0 on success, -1 if any registration fails. */
 int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx);

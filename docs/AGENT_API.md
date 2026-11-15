@@ -32,7 +32,7 @@ The host reads JSON-RPC 2.0 messages from stdin and writes responses to stdout, 
 
 ## Available Tools
 
-All tools are prefixed with `metadesk_` and operate on accessibility tree node IDs.
+All tools are prefixed with `metadesk_`. Read tools take a fresh accessibility snapshot; actions target accessibility node IDs.
 
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
@@ -45,6 +45,31 @@ All tools are prefixed with `metadesk_` and operate on accessibility tree node I
 | `metadesk_focus` | Focus an element | `target_id` |
 | `metadesk_set_value` | Set a value directly | `target_id`, `text` |
 | `metadesk_screenshot` | Capture screen region | optional `region` [x,y,w,h] |
+
+### Accessibility read tools
+
+| Tool | Arguments | Result (inside text content) |
+|------|-----------|------------------------------|
+| `metadesk_find` | optional `role`, `label_contains`, `state`, `limit` (default 50), `format` | Flat matching nodes: compact lines or a JSON array of node details |
+| `metadesk_subtree` | required `id`; optional `depth` (default 2), `format` | Subtree: compact text or a JSON node object with children |
+| `metadesk_node` | required `id` | JSON detail: `id`, `role`, `label`, `state` array, `bounds`, `child_count` |
+| `metadesk_focused` | none | JSON `{node, window}`: first focused node and nearest frame/window/dialog/alert ancestor (or null window) |
+| `metadesk_windows` | none | JSON array of top-level frames/windows and modal dialogs/alerts: `id`, `role`, `label`, `bounds` |
+
+`role` and `state` use case-insensitive exact matches; `label_contains` is a
+case-insensitive substring. Filters combine with AND; matches follow tree order.
+`limit` must be an integer from 1 to 500. `depth` must be an integer from 0 to 64,
+counting child edges from the selected root (0 returns only that node). An empty
+`label_contains` is equivalent to omitting the filter, including unlabelled nodes.
+Top-level windows may be nested under desktop/application containers; nested
+ordinary windows are excluded, but dialogs and alerts are included even when nested.
+
+`find` and `subtree` default to `format="compact"`; use `format="json"` per call.
+Targeted compact output includes all roles, including labels and panels;
+roles without an abbreviation retain their raw role string.
+The other three read tools always return JSON. Invalid arguments, missing nodes,
+missing focus, and unavailable snapshots return text content with `isError: true`.
+An unmatched find returns an empty list/text; no windows returns an empty array.
 
 ### Example: Click a button
 
@@ -72,7 +97,17 @@ All tools are prefixed with `metadesk_` and operate on accessibility tree node I
 | `metadesk://ui-tree` | Current accessibility tree | `application/json` or `text/plain` |
 | `metadesk://session-info` | Session state and metadata | `application/json` |
 
+The UI tree resource defaults to compact (`text/plain`). Start the host with
+`--mcp-tree-format=json` to select JSON (`application/json`), or
+`--mcp-tree-format=compact` to select compact explicitly. This option also works
+with `--mcp-http`; it does not change read-tool defaults. MCP action-tool results
+always remain JSON, whether a delta array or a fallback full tree; this option
+only controls the UI tree resource. Existing clients should pass
+`--mcp-tree-format=json` to retain the previous JSON resource format.
+
 ### Read the UI tree
+
+Example with `--mcp-tree-format=json`:
 
 ```json
 → {"jsonrpc":"2.0","method":"resources/read","id":5,"params":{"uri":"metadesk://ui-tree"}}

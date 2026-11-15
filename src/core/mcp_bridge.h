@@ -32,11 +32,18 @@ extern "C" {
 /* Opaque bridge context */
 typedef struct MdMcpBridge MdMcpBridge;
 
+/* MCP defaults to compact without changing binary-session format values. */
+typedef enum {
+    MD_MCP_TREE_FORMAT_DEFAULT,
+    MD_MCP_TREE_FORMAT_COMPACT,
+    MD_MCP_TREE_FORMAT_JSON,
+} MdMcpTreeFormat;
+
 /* Configuration for creating an MCP bridge */
 typedef struct {
     MdA11yCtx    *a11y;           /* shared a11y context (required)     */
     MdInput      *input;          /* shared input context (optional)    */
-    MdTreeFormat  tree_format;    /* tree format for this session       */
+    MdMcpTreeFormat tree_format;  /* resource only; DEFAULT=compact, actions=JSON */
     uint32_t      settle_ms;      /* settle time after actions (0=default) */
 
     /* Transport: use one of these */

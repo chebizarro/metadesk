@@ -277,7 +277,7 @@ void md_a11y_delta_free(MdA11yDelta *deltas, int count) {
 
 /* ── JSON serialization (spec §3.3.1) ──────────────────────── */
 
-static cJSON *node_to_json(const MdA11yNode *node) {
+cJSON *md_a11y_node_to_json(const MdA11yNode *node, int depth) {
     if (!node) return NULL;
 
     cJSON *obj = cJSON_CreateObject();
@@ -306,10 +306,10 @@ static cJSON *node_to_json(const MdA11yNode *node) {
     cJSON_AddItemToObject(obj, "bounds", bounds);
 
     /* Children */
-    if (node->child_count > 0 && node->children) {
+    if (depth != 0 && node->child_count > 0 && node->children) {
         cJSON *children = cJSON_CreateArray();
         for (int i = 0; i < node->child_count; i++) {
-            cJSON *child = node_to_json(node->children[i]);
+            cJSON *child = md_a11y_node_to_json(node->children[i], depth < 0 ? -1 : depth - 1);
             if (child) cJSON_AddItemToArray(children, child);
         }
         cJSON_AddItemToObject(obj, "children", children);
@@ -338,7 +338,7 @@ char *md_a11y_to_json(const MdA11yNode *root) {
 
     cJSON_AddNumberToObject(doc, "v", 1);
     cJSON_AddNumberToObject(doc, "ts", (double)now_wall_ms());
-    cJSON_AddItemToObject(doc, "root", node_to_json(root));
+    cJSON_AddItemToObject(doc, "root", md_a11y_node_to_json(root, -1));
 
     char *str = cJSON_PrintUnformatted(doc);
     cJSON_Delete(doc);
@@ -520,16 +520,18 @@ static void compact_states(const MdA11yNode *node, StrBuf *sb) {
  * non-interactable nodes are skipped but their children are still walked
  * (so interactive elements nested under panels still appear).
  */
-static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb) {
+static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
+                         bool all_roles, int remaining) {
     if (!node) return;
-    bool emit = is_interactable(node->role);
+    bool emit = all_roles || is_interactable(node->role);
 
     if (emit) {
         for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        sb_appendf(sb, "%s[%s]", role_abbrev(node->role),
-                   node->id ? node->id : "?");
+        const char *role = all_roles && node->role && !role_lookup(node->role)
+            ? node->role : role_abbrev(node->role);
+        sb_appendf(sb, "%s[%s]", role, node->id ? node->id : "?");
 
         if (is_text_role(node->role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */
@@ -546,9 +548,11 @@ static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb) {
         sb_append(sb, "\n");
     }
 
+    if (remaining == 0) return;
     int child_depth = emit ? depth + 1 : depth;
     for (int i = 0; i < node->child_count && node->children; i++)
-        compact_node(node->children[i], child_depth, sb);
+        compact_node(node->children[i], child_depth, sb, all_roles,
+                     remaining < 0 ? -1 : remaining - 1);
 }
 
 char *md_a11y_to_compact(const MdA11yNode *root) {
@@ -556,10 +560,18 @@ char *md_a11y_to_compact(const MdA11yNode *root) {
 
     StrBuf sb = { 0 };
     sb_appendf(&sb, "v1 ts:%lu\n", (unsigned long)now_wall_ms());
-    compact_node(root, 0, &sb);
+    compact_node(root, 0, &sb, false, -1);
 
     if (sb.oom) { free(sb.buf); return NULL; }
     return sb.buf;  /* NUL-terminated; caller frees */
+}
+
+char *md_a11y_query_to_compact(const MdA11yNode *node, int depth) {
+    if (!node) return NULL;
+    StrBuf sb = { 0 };
+    compact_node(node, 0, &sb, true, depth);
+    if (sb.oom) { free(sb.buf); return NULL; }
+    return sb.buf;
 }
 
 /* ── Delta serialization (spec §3.3.3) ─────────────────────── */
@@ -583,7 +595,7 @@ char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count) {
         cJSON *entry = cJSON_CreateObject();
         cJSON_AddStringToObject(entry, "op", op_str(deltas[i].op));
         if (deltas[i].node) {
-            cJSON *nj = node_to_json(deltas[i].node);
+            cJSON *nj = md_a11y_node_to_json(deltas[i].node, -1);
             if (nj) cJSON_AddItemToObject(entry, "node", nj);
         }
         if (deltas[i].parent_id)
