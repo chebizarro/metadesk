@@ -469,7 +469,7 @@ static void test_bridge_null_a11y_fails_create(void)
     MdMcpBridgeConfig cfg = {
         .a11y = NULL,
         .input = NULL,
-        .tree_format = MD_TREE_FORMAT_JSON,
+        .tree_format = MD_MCP_TREE_FORMAT_JSON,
         .settle_ms = 50,
         .stdio_in_fd = -1,
         .stdio_out_fd = -1,
@@ -496,7 +496,7 @@ static void test_bridge_create_destroy_with_stub_a11y(void)
     MdMcpBridgeConfig cfg = {
         .a11y = &stub_a11y,
         .input = NULL,
-        .tree_format = MD_TREE_FORMAT_JSON,
+        .tree_format = MD_MCP_TREE_FORMAT_JSON,
         .settle_ms = 50,
         .stdio_in_fd = in_pipe[0],
         .stdio_out_fd = out_pipe[1],
@@ -602,7 +602,7 @@ static void test_resources_with_session(void)
 
 /* ── Tool registration tests ──────────────────────────────────── */
 
-static void test_9_tools_register(void)
+static void test_14_tools_register(void)
 {
     MdMcpServer *s = make_server();
     MdMcpToolCtx tool_ctx = { .agent = NULL };
@@ -616,25 +616,38 @@ static void test_9_tools_register(void)
 
     cJSON *resp = last_response();
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
-    MD_CHECK(cJSON_GetArraySize(tools) == 9);
+    MD_CHECK(cJSON_GetArraySize(tools) == 14);
 
     /* Verify known tool names */
     const char *expected[] = {
         "metadesk_click", "metadesk_dbl_click", "metadesk_right_click",
         "metadesk_type", "metadesk_key_combo", "metadesk_scroll",
-        "metadesk_focus", "metadesk_set_value", "metadesk_screenshot"
+        "metadesk_focus", "metadesk_set_value", "metadesk_screenshot",
+        "metadesk_find", "metadesk_subtree", "metadesk_node",
+        "metadesk_focused", "metadesk_windows"
     };
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 14; i++) {
         cJSON *t = cJSON_GetArrayItem(tools, i);
         MD_CHECK(strcmp(cJSON_GetObjectItem(t, "name")->valuestring,
                      expected[i]) == 0);
         MD_CHECK(cJSON_HasObjectItem(t, "inputSchema"));
     }
+    cJSON *find_schema = cJSON_GetObjectItem(cJSON_GetArrayItem(tools, 9), "inputSchema");
+    cJSON *props = cJSON_GetObjectItem(find_schema, "properties");
+    cJSON *format = cJSON_GetObjectItem(props, "format");
+    MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(format, "enum")) == 2);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(format, "default")), "compact") == 0);
+    MD_CHECK(cJSON_GetObjectItem(cJSON_GetObjectItem(props, "limit"), "default")->valueint == 50);
+    MD_CHECK(cJSON_IsFalse(cJSON_GetObjectItem(find_schema, "additionalProperties")));
+    cJSON *subtree_schema = cJSON_GetObjectItem(cJSON_GetArrayItem(tools, 10), "inputSchema");
+    MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(subtree_schema, "required")) == 1);
+    props = cJSON_GetObjectItem(subtree_schema, "properties");
+    MD_CHECK(cJSON_GetObjectItem(cJSON_GetObjectItem(props, "depth"), "default")->valueint == 2);
     cJSON_Delete(resp);
 
     md_mcp_tools_cleanup(&tool_ctx);
     md_mcp_server_destroy(s);
-    PASS("9 tools register with schemas");
+    PASS("14 tools register with schemas");
 }
 
 static void test_tool_call_click_no_agent(void)
@@ -718,14 +731,13 @@ static void test_tool_call_key_combo(void)
     PASS("tool call key_combo (no agent) returns isError");
 }
 
-static void test_tool_registration_failure_rolls_back(void)
+static void test_tool_registration_failure_rolls_back(int prefill)
 {
     MdMcpServer *s = make_server();
     char names[24][32];
 
-    /* Leave only 8 slots free so registering the 9 built-in tools fails
-     * after several have already been accepted by the server. */
-    for (int i = 0; i < 24; i++) {
+    /* Exercise failure within both the action and read registrations. */
+    for (int i = 0; i < prefill; i++) {
         snprintf(names[i], sizeof(names[i]), "prefill_tool_%02d", i);
         cJSON *schema = cJSON_CreateObject();
         MdMcpTool tool = {
@@ -747,7 +759,7 @@ static void test_tool_registration_failure_rolls_back(void)
 
     cJSON *resp = last_response();
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
-    MD_CHECK(cJSON_GetArraySize(tools) == 24);
+    MD_CHECK(cJSON_GetArraySize(tools) == prefill);
     for (int i = 0; i < cJSON_GetArraySize(tools); i++) {
         cJSON *t = cJSON_GetArrayItem(tools, i);
         MD_CHECK(strncmp(cJSON_GetObjectItem(t, "name")->valuestring,
@@ -760,10 +772,302 @@ static void test_tool_registration_failure_rolls_back(void)
     PASS("tool registration failure rolls back partial tools");
 }
 
+/* ── Targeted accessibility reads ───────────────────────────── */
+
+typedef struct {
+    int walks;
+    bool unavailable, no_focus, many_buttons, bare_focus;
+} QueryFixture;
+
+static MdA11yNode *query_node(const char *id, const char *role,
+                              const char *label, int children)
+{
+    MdA11yNode *node = calloc(1, sizeof(*node));
+    MD_CHECK(node != NULL);
+    node->id = strdup(id);
+    node->role = strdup(role);
+    node->label = strdup(label);
+    node->x = 10; node->y = 20; node->w = 300; node->h = 200;
+    node->child_count = children;
+    if (children) node->children = calloc((size_t)children, sizeof(*node->children));
+    return node;
+}
+
+static int query_get_tree(MdA11yCtx *ctx, MdA11yNode **out)
+{
+    QueryFixture *fixture = ctx->backend_data;
+    fixture->walks++;
+    if (fixture->unavailable) return -1;
+    if (fixture->many_buttons) {
+        MdA11yNode *root = query_node("root", "application", "Many buttons", 60);
+        for (int i = 0; i < 60; i++) {
+            char id[32];
+            snprintf(id, sizeof(id), "button_%d", i);
+            root->children[i] = query_node(id, "button", "Button", 0);
+        }
+        *out = root;
+        return 0;
+    }
+    if (fixture->bare_focus) {
+        MdA11yNode *root = query_node("alone", "button", "Standalone", 0);
+        root->states = calloc(2, sizeof(*root->states));
+        root->states[0] = strdup("focused");
+        root->state_count = 1;
+        *out = root;
+        return 0;
+    }
+    MdA11yNode *root = query_node("desktop", "desktop", "Desktop", 1);
+    MdA11yNode *app = root->children[0] = query_node("app", "application", "Editor", 2);
+    MdA11yNode *win = app->children[0] = query_node("win", "frame", "Editor window", 2);
+    MdA11yNode *panel = win->children[0] = query_node("panel", "panel", "Controls", 3);
+    MdA11yNode *save = panel->children[0] = query_node("save", "button", "Save As", 0);
+    panel->children[1] = query_node("cancel", "button", "Cancel", 0);
+    panel->children[2] = query_node("label", "label", "Saved files", 0);
+    win->children[1] = query_node("nested", "window", "Nested window", 0);
+    app->children[1] = query_node("other", "WINDOW", "Other window", 0);
+    save->state_count = fixture->no_focus ? 1 : 2;
+    save->states = calloc(3, sizeof(*save->states));
+    save->states[0] = strdup("enabled");
+    if (!fixture->no_focus) save->states[1] = strdup("focused");
+    *out = root;
+    return 0;
+}
+
+static cJSON *query_call(MdMcpServer *server, const char *name,
+                         const char *args, bool error)
+{
+    char *message = NULL;
+    MD_CHECK(asprintf(&message,
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"%s\",\"arguments\":%s}}", name, args) >= 0);
+    clear_responses();
+    md_mcp_server_handle_message(server, message, strlen(message));
+    free(message);
+    cJSON *response = last_response();
+    cJSON *result = cJSON_GetObjectItem(response, "result");
+    MD_CHECK(cJSON_IsObject(result));
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")) == error);
+    cJSON *content = cJSON_GetObjectItem(result, "content");
+    MD_CHECK(cJSON_GetArraySize(content) == 1);
+    cJSON *item = cJSON_GetArrayItem(content, 0);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(item, "type")), "text") == 0);
+    MD_CHECK(cJSON_IsString(cJSON_GetObjectItem(item, "text")));
+    cJSON *copy = cJSON_Duplicate(item, true);
+    cJSON_Delete(response);
+    return copy;
+}
+
+static const char *query_text(cJSON *content)
+{
+    return cJSON_GetStringValue(cJSON_GetObjectItem(content, "text"));
+}
+
+static cJSON *query_json(MdMcpServer *server, const char *name, const char *args)
+{
+    cJSON *content = query_call(server, name, args, false);
+    cJSON *value = cJSON_Parse(query_text(content));
+    MD_CHECK(value != NULL);
+    cJSON_Delete(content);
+    return value;
+}
+
+static void test_a11y_read_tools(void)
+{
+    QueryFixture fixture = {0};
+    static const MdA11yBackend backend = { .get_tree = query_get_tree };
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    MdMcpServer *server = make_server();
+    MdMcpToolCtx ctx = { .a11y = &a11y };
+    MD_CHECK(md_mcp_register_tools(server, &ctx) == 0);
+    do_init(server);
+
+    cJSON *value = query_json(server, "metadesk_find", "{\"role\":\"BUTTON\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 2);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "id")), "save") == 0);
+    MD_CHECK(!cJSON_HasObjectItem(cJSON_GetArrayItem(value, 0), "children"));
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"label_contains\":\"sAvE\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 2);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"state\":\"ENABLED\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 1);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"state\":\"enable\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 0);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"role\":\"button\",\"label_contains\":\"save\",\"state\":\"focused\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 1);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"role\":\"button\",\"limit\":1,\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 1);
+    cJSON_Delete(value);
+    cJSON *content = query_call(server, "metadesk_find", "{\"label_contains\":\"save\",\"limit\":1}", false);
+    MD_CHECK(strstr(query_text(content), "BTN[save]") != NULL);
+    MD_CHECK(strstr(query_text(content), "[label]") == NULL);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_find", "{\"role\":\"label\"}", false);
+    MD_CHECK(strstr(query_text(content), "LBL[label]") != NULL);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_find", "{\"role\":\"missing\"}", false);
+    MD_CHECK(strcmp(query_text(content), "") == 0);
+    cJSON_Delete(content);
+
+    for (int depth = 0; depth <= 2; depth++) {
+        char args[128];
+        snprintf(args, sizeof(args), "{\"id\":\"win\",\"depth\":%d,\"format\":\"json\"}", depth);
+        value = query_json(server, "metadesk_subtree", args);
+        cJSON *children = cJSON_GetObjectItem(value, "children");
+        MD_CHECK(cJSON_GetArraySize(children) == (depth ? 2 : 0));
+        if (depth) {
+            cJSON *grandchildren = cJSON_GetObjectItem(cJSON_GetArrayItem(children, 0), "children");
+            MD_CHECK(cJSON_GetArraySize(grandchildren) == (depth == 2 ? 3 : 0));
+            if (depth == 2)
+                MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(cJSON_GetArrayItem(grandchildren, 0), "children")) == 0);
+        }
+        cJSON_Delete(value);
+    }
+    content = query_call(server, "metadesk_subtree", "{\"id\":\"win\"}", false);
+    MD_CHECK(strstr(query_text(content), "WIN[win]") != NULL);
+    MD_CHECK(strstr(query_text(content), "PNL[panel]") != NULL);
+    MD_CHECK(strstr(query_text(content), "BTN[save]") != NULL);
+    MD_CHECK(strstr(query_text(content), "WIN[other]") == NULL);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_subtree", "{\"id\":\"win\",\"depth\":0}", false);
+    MD_CHECK(strstr(query_text(content), "PNL[panel]") == NULL);
+    cJSON_Delete(content);
+
+    value = query_json(server, "metadesk_node", "{\"id\":\"panel\"}");
+    MD_CHECK(cJSON_GetObjectItem(value, "child_count")->valueint == 3);
+    MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(value, "state")) == 0);
+    MD_CHECK(cJSON_GetObjectItem(cJSON_GetObjectItem(value, "bounds"), "w")->valueint == 300);
+    MD_CHECK(!cJSON_HasObjectItem(value, "children"));
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_focused", "{}");
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(value, "node"), "id")), "save") == 0);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(value, "window"), "id")), "win") == 0);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_windows", "{}");
+    MD_CHECK(cJSON_GetArraySize(value) == 2);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 1), "id")), "other") == 0);
+    MD_CHECK(!cJSON_HasObjectItem(cJSON_GetArrayItem(value, 0), "state"));
+    cJSON_Delete(value);
+
+    content = query_call(server, "metadesk_node", "{\"id\":\"missing\"}", true);
+    MD_CHECK(strstr(query_text(content), "not found") != NULL);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_subtree", "{\"id\":\"missing\"}", true);
+    cJSON_Delete(content);
+    fixture.many_buttons = true;
+    value = query_json(server, "metadesk_find", "{\"role\":\"button\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 50);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"role\":\"button\",\"limit\":51,\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 51);
+    cJSON_Delete(value);
+    content = query_call(server, "metadesk_find", "{\"role\":\"button\"}", false);
+    int lines = 0;
+    for (const char *p = query_text(content); *p; p++) if (*p == '\n') lines++;
+    MD_CHECK(lines == 50);
+    cJSON_Delete(content);
+    fixture.many_buttons = false;
+    fixture.bare_focus = true;
+    value = query_json(server, "metadesk_focused", "{}");
+    MD_CHECK(cJSON_IsNull(cJSON_GetObjectItem(value, "window")));
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_windows", "{}");
+    MD_CHECK(cJSON_GetArraySize(value) == 0);
+    cJSON_Delete(value);
+    fixture.bare_focus = false;
+    int walks = fixture.walks;
+    const char *bad_args[] = {
+        "{\"limit\":0}", "{\"limit\":1.5}", "{\"limit\":2147483648}",
+        "{\"format\":\"xml\"}", "{\"role\":2}", "{\"bogus\":true}", "[]"
+    };
+    for (size_t i = 0; i < sizeof(bad_args) / sizeof(bad_args[0]); i++) {
+        content = query_call(server, "metadesk_find", bad_args[i], true);
+        cJSON_Delete(content);
+    }
+    content = query_call(server, "metadesk_subtree", "{\"id\":\"win\",\"depth\":-1}", true);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_node", "{}", true);
+    cJSON_Delete(content);
+    content = query_call(server, "metadesk_windows", "{\"id\":\"win\"}", true);
+    cJSON_Delete(content);
+    MD_CHECK(fixture.walks == walks); /* reject bad args before walking */
+    fixture.no_focus = true;
+    content = query_call(server, "metadesk_focused", "{}", true);
+    cJSON_Delete(content);
+    MD_CHECK(fixture.walks == walks + 1); /* fresh snapshot on every valid call */
+    fixture.unavailable = true;
+    content = query_call(server, "metadesk_find", "{}", true);
+    MD_CHECK(strstr(query_text(content), "unavailable") != NULL);
+    cJSON_Delete(content);
+    md_mcp_server_destroy(server);
+    md_mcp_tools_cleanup(&ctx);
+    PASS("targeted a11y reads: filters, depth, detail, focus, windows and errors");
+}
+
+static void test_resource_tree_formats(void)
+{
+    static const MdA11yBackend backend = { .get_tree = query_get_tree };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    for (int i = 0; i < 3; i++) {
+        MdMcpBridgeConfig config = {
+            .a11y = &a11y,
+            .tree_format = (MdMcpTreeFormat)i,
+            .stdio_in_fd = -1,
+            .stdio_out_fd = -1,
+        };
+        MdMcpBridge *bridge = md_mcp_bridge_create(&config);
+        MD_CHECK(bridge != NULL);
+        MdMcpServer *server = md_mcp_bridge_get_server(bridge);
+        md_mcp_server_set_write_fn(server, capture_write, NULL);
+        do_init(server);
+        const char *mime = i == MD_MCP_TREE_FORMAT_JSON ? "application/json" : "text/plain";
+        const char *requests[] = {
+            "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"resources/list\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"resources/read\",\"params\":{\"uri\":\"metadesk://ui-tree\"}}"
+        };
+        for (int j = 0; j < 3; j++) {
+            fixture.unavailable = j == 2;
+            clear_responses();
+            const char *request = requests[j == 0 ? 0 : 1];
+            md_mcp_server_handle_message(server, request, strlen(request));
+            cJSON *response = last_response();
+            cJSON *result = cJSON_GetObjectItem(response, "result");
+            cJSON *items = cJSON_GetObjectItem(result, j == 0 ? "resources" : "contents");
+            cJSON *item = cJSON_GetArrayItem(items, 0);
+            MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(item, "mimeType")), mime) == 0);
+            if (j == 1) {
+                const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(item, "text"));
+                if (i == MD_MCP_TREE_FORMAT_JSON) {
+                    cJSON *tree = cJSON_Parse(text);
+                    MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(tree, "root")));
+                    cJSON_Delete(tree);
+                } else MD_CHECK(strncmp(text, "v1 ts:", 6) == 0);
+            }
+            cJSON_Delete(response);
+        }
+        fixture.unavailable = false;
+        cJSON *content = query_call(server, "metadesk_find", "{\"role\":\"label\"}", false);
+        MD_CHECK(strstr(query_text(content), "LBL[label]") != NULL);
+        cJSON_Delete(content);
+        md_mcp_bridge_destroy(bridge);
+    }
+    PASS("resource MIME and content match default/compact/JSON bridge formats");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--a11y-queries") == 0) {
+        test_a11y_read_tools();
+        test_resource_tree_formats();
+        clear_responses();
+        return md_test_report();
+    }
     printf("MCP server core tests:\n");
 
     test_initialize();
@@ -779,11 +1083,12 @@ int main(void)
     test_unknown_method();
     test_parse_error();
     test_init_capabilities_reflect_registrations();
-    test_9_tools_register();
+    test_14_tools_register();
     test_tool_call_click_no_agent();
     test_tool_call_missing_target();
     test_tool_call_key_combo();
-    test_tool_registration_failure_rolls_back();
+    test_tool_registration_failure_rolls_back(24);
+    test_tool_registration_failure_rolls_back(19);
     test_resources_with_session();
     test_bridge_null_a11y_fails_create();
     test_bridge_create_destroy_with_stub_a11y();

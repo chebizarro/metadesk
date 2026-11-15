@@ -1,12 +1,14 @@
 /*
  * metadesk — mcp_tools.c
- * MCP tool definitions and handlers for the 9 metadesk action types.
+ * MCP accessibility read tools and handlers for the 9 action types.
  *
  * One FieldDef table per tool drives BOTH the JSON Schema handed to
  * the LLM and the argument extraction/validation at call time — one
  * source of truth, so the two cannot disagree.
  */
 #include "mcp_tools.h"
+#include "a11y_query.h"
+#include <limits.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +236,8 @@ typedef struct {
     MdActionType   action_type;
     const FieldDef *fields;
     int            field_count;
+    int            read_kind;
+    const cJSON   *read_schema; /* borrowed from the registered tool */
 } ToolHandlerCtx;
 
 static cJSON *make_text_content(const char *text)
@@ -299,6 +303,206 @@ static cJSON *tool_handler(const cJSON *arguments,
     return result;
 }
 
+/* ── Accessibility read tools ───────────────────────────────── */
+
+enum { READ_FIND = 1, READ_SUBTREE, READ_NODE, READ_FOCUSED, READ_WINDOWS };
+
+#define READ_STRING(nm, req) { nm, FIELD_STRING, req, NULL, 0, 0 }
+static const FieldDef fields_find[] = {
+    READ_STRING("role", false), READ_STRING("label_contains", false),
+    READ_STRING("state", false), READ_STRING("format", false),
+    { "limit", FIELD_INT, false, NULL, 0, 0 },
+};
+static const FieldDef fields_subtree[] = {
+    READ_STRING("id", true), READ_STRING("format", false),
+    { "depth", FIELD_INT, false, NULL, 0, 0 },
+};
+static const FieldDef fields_node[] = { READ_STRING("id", true) };
+
+static cJSON *build_read_schema(const FieldDef *fields, int count)
+{
+    cJSON *schema = build_schema(fields, count);
+    cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
+    cJSON *format = cJSON_GetObjectItemCaseSensitive(props, "format");
+    if (format) {
+        cJSON *values = cJSON_CreateStringArray((const char *[]){"compact", "json"}, 2);
+        cJSON_AddItemToObject(format, "enum", values);
+        cJSON_AddStringToObject(format, "default", "compact");
+    }
+    const char *names[] = { "limit", "depth" };
+    for (int i = 0; i < 2; i++) {
+        cJSON *p = cJSON_GetObjectItemCaseSensitive(props, names[i]);
+        if (!p) continue;
+        cJSON_AddNumberToObject(p, "minimum", i == 0 ? 1 : 0);
+        cJSON_AddNumberToObject(p, "maximum", INT_MAX);
+        cJSON_AddNumberToObject(p, "default", i == 0 ? 50 : 2);
+    }
+    return schema;
+}
+
+/* The MCP registry advertises schemas but does not validate them itself.
+ * Validate the read schemas here, including additionalProperties. */
+static bool valid_read_args(const cJSON *args, const cJSON *schema)
+{
+    if (args && !cJSON_IsObject(args)) return false;
+    const cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
+    const cJSON *required = cJSON_GetObjectItemCaseSensitive(schema, "required");
+    const cJSON *item;
+    cJSON_ArrayForEach(item, required)
+        if (!cJSON_GetObjectItemCaseSensitive(args, item->valuestring)) return false;
+    cJSON_ArrayForEach(item, args) {
+        const cJSON *p = cJSON_GetObjectItemCaseSensitive(props, item->string);
+        if (!p) return false;
+        const char *type = cJSON_GetObjectItemCaseSensitive(p, "type")->valuestring;
+        if (strcmp(type, "string") == 0) {
+            if (!cJSON_IsString(item)) return false;
+            const cJSON *values = cJSON_GetObjectItemCaseSensitive(p, "enum");
+            if (values) {
+                bool found = false;
+                const cJSON *value;
+                cJSON_ArrayForEach(value, values)
+                    if (strcmp(item->valuestring, value->valuestring) == 0) found = true;
+                if (!found) return false;
+            }
+        } else {
+            if (!cJSON_IsNumber(item) || item->valuedouble < 0 ||
+                item->valuedouble > INT_MAX ||
+                item->valuedouble != (double)item->valueint) return false;
+            const cJSON *min = cJSON_GetObjectItemCaseSensitive(p, "minimum");
+            if (min && item->valuedouble < min->valuedouble) return false;
+        }
+    }
+    return true;
+}
+
+static const char *read_string(const cJSON *args, const char *name)
+{
+    return cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(args, name));
+}
+
+static cJSON *node_detail(const MdA11yNode *node)
+{
+    cJSON *obj = md_a11y_node_to_json(node, 0);
+    if (!obj) return NULL;
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, "children");
+    if (!cJSON_HasObjectItem(obj, "state"))
+        cJSON_AddItemToObject(obj, "state", cJSON_CreateArray());
+    cJSON_AddNumberToObject(obj, "child_count", node->child_count);
+    return obj;
+}
+
+static void append_window(const MdA11yNode *node, void *userdata)
+{
+    cJSON *obj = md_a11y_node_to_json(node, 0);
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, "children");
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, "state");
+    cJSON_AddItemToArray(userdata, obj);
+}
+
+static cJSON *read_tool_handler(const cJSON *args, bool *is_error,
+                                char **error_msg, void *userdata)
+{
+    ToolHandlerCtx *hctx = userdata;
+    const char *error = NULL;
+    MdA11yNode *root = NULL;
+    cJSON *value = NULL;
+    char *text = NULL;
+    if (!valid_read_args(args, hctx->read_schema)) {
+        error = "Invalid read tool arguments";
+        goto done;
+    }
+    root = hctx->ctx->a11y ? md_a11y_walk(hctx->ctx->a11y) : NULL;
+    if (!root) {
+        error = "Accessibility snapshot unavailable";
+        goto done;
+    }
+    const char *format = read_string(args, "format");
+    bool json = format && strcmp(format, "json") == 0;
+    const MdA11yNode *node = NULL;
+    if (hctx->read_kind == READ_NODE || hctx->read_kind == READ_SUBTREE) {
+        node = md_a11y_find_node_by_id(root, read_string(args, "id"));
+        if (!node) {
+            error = "Accessibility node not found";
+            goto done;
+        }
+    }
+    switch (hctx->read_kind) {
+    case READ_FIND: {
+        const cJSON *arg = cJSON_GetObjectItemCaseSensitive(args, "limit");
+        int limit = arg ? arg->valueint : 50;
+        const MdA11yNode **nodes = calloc((size_t)limit, sizeof(*nodes));
+        if (!nodes) break;
+        int count = md_a11y_find(root, read_string(args, "role"),
+                                 read_string(args, "label_contains"),
+                                 read_string(args, "state"), nodes, limit);
+        value = cJSON_CreateArray();
+        for (int i = 0; i < count; i++) {
+            if (json) {
+                cJSON_AddItemToArray(value, node_detail(nodes[i]));
+            } else {
+                char *line = md_a11y_query_to_compact(nodes[i], 0);
+                if (!line) { error = "Failed to serialize matching node"; break; }
+                cJSON_AddItemToArray(value, cJSON_CreateString(line));
+                free(line);
+            }
+        }
+        free(nodes);
+        if (!json && !error) {
+            size_t size = 1;
+            const cJSON *line;
+            cJSON_ArrayForEach(line, value) size += strlen(line->valuestring);
+            text = malloc(size);
+            if (text) {
+                char *p = text;
+                cJSON_ArrayForEach(line, value) {
+                    size_t len = strlen(line->valuestring);
+                    memcpy(p, line->valuestring, len);
+                    p += len;
+                }
+                *p = '\0';
+            }
+        }
+        break;
+    }
+    case READ_SUBTREE: {
+        const cJSON *arg = cJSON_GetObjectItemCaseSensitive(args, "depth");
+        int depth = arg ? arg->valueint : 2;
+        if (json) value = md_a11y_node_to_json(node, depth);
+        else text = md_a11y_query_to_compact(node, depth);
+        break;
+    }
+    case READ_NODE:
+        value = node_detail(node);
+        break;
+    case READ_FOCUSED: {
+        const MdA11yNode *window;
+        node = md_a11y_find_focused(root, &window);
+        if (!node) { error = "Focused node not found"; break; }
+        value = cJSON_CreateObject();
+        cJSON_AddItemToObject(value, "node", node_detail(node));
+        cJSON_AddItemToObject(value, "window", window ? node_detail(window) : cJSON_CreateNull());
+        break;
+    }
+    case READ_WINDOWS:
+        value = cJSON_CreateArray();
+        md_a11y_visit_windows(root, append_window, value);
+        break;
+    }
+    if (!text && value && (json || hctx->read_kind != READ_FIND))
+        text = cJSON_PrintUnformatted(value);
+    if (!text && !error) error = "Failed to serialize accessibility query";
+done:
+    md_a11y_node_free(root);
+    cJSON_Delete(value);
+    if (error) {
+        *is_error = true;
+        *error_msg = strdup(error);
+    }
+    cJSON *content = make_text_content(error ? error : text);
+    free(text);
+    return content;
+}
+
 /* ── Tool definitions ────────────────────────────────────────── */
 
 typedef struct {
@@ -307,10 +511,11 @@ typedef struct {
     MdActionType   action_type;
     const FieldDef *fields;
     int            field_count;
+    int            read_kind; /* zero for actions */
 } ToolDef;
 
 #define TOOL(nm, dsc, type, flds) \
-    { nm, dsc, type, flds, (int)(sizeof(flds) / sizeof((flds)[0])) }
+    { nm, dsc, type, flds, (int)(sizeof(flds) / sizeof((flds)[0])), 0 }
 
 static const ToolDef tool_defs[] = {
     TOOL("metadesk_click",       "Click a UI element by its accessibility node ID",
@@ -331,6 +536,16 @@ static const ToolDef tool_defs[] = {
          MD_ACTION_SET_VALUE,   fields_set_value),
     TOOL("metadesk_screenshot",  "Capture a screenshot (region or full screen)",
          MD_ACTION_SCREENSHOT,  fields_screenshot),
+    { "metadesk_find", "Find nodes by role, label substring and state (case-insensitive)",
+      0, fields_find, 5, READ_FIND },
+    { "metadesk_subtree", "Read a subtree; depth 0 includes only its root",
+      0, fields_subtree, 3, READ_SUBTREE },
+    { "metadesk_node", "Read JSON node detail including child_count",
+      0, fields_node, 1, READ_NODE },
+    { "metadesk_focused", "Read the focused node and its nearest frame/window ancestor as JSON",
+      0, NULL, 0, READ_FOCUSED },
+    { "metadesk_windows", "List top-level frames/windows as JSON",
+      0, NULL, 0, READ_WINDOWS },
 };
 
 #define TOOL_DEF_COUNT (sizeof(tool_defs) / sizeof(tool_defs[0]))
@@ -352,16 +567,19 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
         hctxs[i].action_type = tool_defs[i].action_type;
         hctxs[i].fields = tool_defs[i].fields;
         hctxs[i].field_count = tool_defs[i].field_count;
+        hctxs[i].read_kind = tool_defs[i].read_kind;
 
         MdMcpTool tool = {
             .name = tool_defs[i].name,
             .description = tool_defs[i].description,
-            .input_schema = build_schema(tool_defs[i].fields,
-                                         tool_defs[i].field_count),
-            .handler = tool_handler,
+            .input_schema = tool_defs[i].read_kind
+                ? build_read_schema(tool_defs[i].fields, tool_defs[i].field_count)
+                : build_schema(tool_defs[i].fields, tool_defs[i].field_count),
+            .handler = tool_defs[i].read_kind ? read_tool_handler : tool_handler,
             .userdata = &hctxs[i],
         };
 
+        hctxs[i].read_schema = tool.input_schema;
         if (!tool.input_schema || md_mcp_server_register_tool(server, &tool) != 0) {
             if (tool.input_schema)
                 cJSON_Delete(tool.input_schema);

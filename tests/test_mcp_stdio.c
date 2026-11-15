@@ -177,12 +177,12 @@ static void test_stdio_tools_list(void)
 
     cJSON *r = cJSON_Parse(resp);
     cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(r, "result"), "tools");
-    MD_CHECK(cJSON_GetArraySize(tools) == 9);
+    MD_CHECK(cJSON_GetArraySize(tools) == 14);
     cJSON_Delete(r);
     free(resp);
 
     harness_destroy(h);
-    PASS("stdio tools/list returns 9 tools");
+    PASS("stdio tools/list returns 14 tools");
 }
 
 static void test_stdio_tool_call(void)

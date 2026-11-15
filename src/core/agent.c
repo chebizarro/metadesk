@@ -17,6 +17,7 @@
  * for mouse-based actions (click, dbl_click, right_click).
  */
 #include "agent.h"
+#include "a11y_query.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,22 +44,6 @@ struct MdAgent {
 
 /* ── Target resolution ───────────────────────────────────────── */
 
-/* Recursively search for a node with matching ID. */
-static const MdA11yNode *find_node_by_id(const MdA11yNode *node,
-                                          const char *target_id) {
-    if (!node || !target_id) return NULL;
-
-    if (node->id && strcmp(node->id, target_id) == 0)
-        return node;
-
-    for (int i = 0; i < node->child_count && node->children; i++) {
-        const MdA11yNode *found = find_node_by_id(node->children[i], target_id);
-        if (found) return found;
-    }
-
-    return NULL;
-}
-
 /* Resolve a target_id to the center of the node's bounding box.
  * Returns 0 on success, -1 if node not found. */
 static int resolve_target(MdAgent *agent, const char *target_id,
@@ -74,7 +59,7 @@ static int resolve_target(MdAgent *agent, const char *target_id,
     if (!agent->cached_tree)
         return -1;
 
-    const MdA11yNode *node = find_node_by_id(agent->cached_tree, target_id);
+    const MdA11yNode *node = md_a11y_find_node_by_id(agent->cached_tree, target_id);
     if (!node)
         return -1;
 

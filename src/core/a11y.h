@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <cjson/cJSON.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,6 +115,12 @@ char *md_a11y_to_json(const MdA11yNode *root);
 
 /* Serialize node tree to compact format (spec §3.3.2). Caller frees. */
 char *md_a11y_to_compact(const MdA11yNode *root);
+
+/* Targeted serializers: depth 0 includes only root; -1 is unbounded.
+ * Unlike the full compact tree, targeted compact output includes every role.
+ * Caller owns the returned JSON object / string. */
+cJSON *md_a11y_node_to_json(const MdA11yNode *node, int depth);
+char *md_a11y_query_to_compact(const MdA11yNode *node, int depth);
 
 /* Serialize deltas to JSON (spec §3.3.3). Caller frees. */
 char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count);

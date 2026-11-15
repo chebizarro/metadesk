@@ -719,8 +719,18 @@ In addition to the binary packet protocol (§3.1), metadesk provides an MCP serv
 - `metadesk-host --mcp` — stdio transport (newline-delimited JSON on stdin/stdout)
 - `metadesk-host --mcp-http [PORT]` — HTTP+SSE on port 7710 (Phase 2)
 
-**Tools exposed** (9 total, one per action type in §3.2). The authoritative
-tool table with parameters lives in [AGENT_API.md](AGENT_API.md#tools).
+**Tools exposed** (14 total): nine action tools (§3.2), plus fresh-snapshot reads:
+- `metadesk_find(role?, label_contains?, state?, limit=50, format=compact|json)` — flat matches; case-insensitive exact role/state and substring label filters.
+- `metadesk_subtree(id, depth=2, format=compact|json)` — depth-bounded subtree (0 includes only the root).
+- `metadesk_node(id)` — JSON node detail with states, bounds and child count.
+- `metadesk_focused()` — JSON focused node and nearest frame/window ancestor.
+- `metadesk_windows()` — JSON top-level frames/windows, excluding nested windows.
+
+The authoritative tool table lives in [AGENT_API.md](AGENT_API.md#available-tools).
+`find` and `subtree` default to compact; the other reads return JSON.
+The UI tree resource defaults to compact (`text/plain`); the host switch
+`--mcp-tree-format=json|compact` selects its format (`application/json` for JSON).
+Post-action deltas remain JSON; fallback full trees honor the configured format.
 
 **Resources exposed:**
 - `metadesk://ui-tree` — full accessibility tree (JSON or compact format)

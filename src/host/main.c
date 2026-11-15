@@ -464,6 +464,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
+    fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource format (default: compact)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
 
@@ -569,6 +570,7 @@ int main(int argc, char **argv) {
     bool do_capture = true;
     bool mcp_stdio = false;
     bool mcp_http = false;
+    MdMcpTreeFormat mcp_tree_format = MD_MCP_TREE_FORMAT_DEFAULT;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
     uint32_t fips_ready_timeout_ms = 10000;
     const char *relay_urls[16];
@@ -610,6 +612,19 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--mcp") == 0)
             mcp_stdio = true;
+        else if (strncmp(argv[i], "--mcp-tree-format=", 18) == 0 ||
+                 strcmp(argv[i], "--mcp-tree-format") == 0) {
+            const char *format = argv[i][17] == '=' ? argv[i] + 18
+                : (i + 1 < argc ? argv[++i] : "");
+            if (strcmp(format, "json") == 0)
+                mcp_tree_format = MD_MCP_TREE_FORMAT_JSON;
+            else if (strcmp(format, "compact") == 0)
+                mcp_tree_format = MD_MCP_TREE_FORMAT_COMPACT;
+            else {
+                fprintf(stderr, "Invalid --mcp-tree-format: expected json or compact\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--mcp-http") == 0) {
             mcp_http = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
@@ -882,7 +897,7 @@ int main(int argc, char **argv) {
         MdMcpBridgeConfig mcp_cfg = {
             .a11y = mcp_a11y,
             .input = mcp_input,
-            .tree_format = MD_TREE_FORMAT_JSON,
+            .tree_format = mcp_tree_format,
             .settle_ms = 100,
             .stdio_in_fd = mcp_stdio ? STDIN_FILENO : -1,
             .stdio_out_fd = mcp_stdio ? STDOUT_FILENO : -1,
