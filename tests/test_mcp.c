@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "md_test.h"
 
 
@@ -783,8 +785,24 @@ typedef struct {
     MdA11yChangeCb change_cb;
     void *change_userdata;
     bool subscribe_fails;
+    int unsubscribes;
     MdA11ySnapshot *invalidate_during_walk;
 } QueryFixture;
+
+/* Stack-built MdA11yCtx fixtures need the mutexes md_a11y_create() sets up. */
+static void query_a11y_init(MdA11yCtx *a11y)
+{
+    MD_CHECK(pthread_mutex_init(&a11y->snapshot_mu, NULL) == 0);
+    MD_CHECK(pthread_mutex_init(&a11y->change_mu, NULL) == 0);
+    MD_CHECK(pthread_cond_init(&a11y->change_cv, NULL) == 0);
+}
+
+static void query_a11y_fini(MdA11yCtx *a11y)
+{
+    pthread_cond_destroy(&a11y->change_cv);
+    pthread_mutex_destroy(&a11y->change_mu);
+    pthread_mutex_destroy(&a11y->snapshot_mu);
+}
 
 static MdA11yNode *query_node(const char *id, const char *role,
                               const char *label, int children)
@@ -871,6 +889,27 @@ static int query_subscribe(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
     fixture->change_cb = cb;
     fixture->change_userdata = userdata;
     return 0;
+}
+
+static void query_unsubscribe(MdA11yCtx *ctx)
+{
+    QueryFixture *fixture = ctx->backend_data;
+    fixture->unsubscribes++;
+    fixture->change_cb = NULL;
+    fixture->change_userdata = NULL;
+}
+
+/* Simulate a backend change event exactly the way the real backends
+ * dispatch one: through md_a11y_change_begin()/_end() on the ctx.
+ * Returns whether a callback was actually invoked. */
+static bool query_fire_change(MdA11yCtx *ctx)
+{
+    MdA11yChangeCb cb = NULL;
+    void *userdata = NULL;
+    if (!md_a11y_change_begin(ctx, &cb, &userdata)) return false;
+    cb(NULL, 0, userdata);
+    md_a11y_change_end(ctx);
+    return true;
 }
 
 static cJSON *query_call(MdMcpServer *server, const char *name,
@@ -1132,10 +1171,11 @@ static void test_resource_tree_formats(void)
 {
     static const MdA11yBackend backend = {
         .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
     };
     QueryFixture fixture = {0};
     MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
-    MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+    query_a11y_init(&a11y);
     for (int i = 0; i < 3; i++) {
         MdMcpBridgeConfig config = {
             .a11y = &a11y,
@@ -1157,7 +1197,7 @@ static void test_resource_tree_formats(void)
         uint64_t first_ts = 0;
         for (int j = 0; j < 4; j++) {
             fixture.unavailable = j == 3;
-            if (j == 3) fixture.change_cb(NULL, 0, fixture.change_userdata);
+            if (j == 3) MD_CHECK(query_fire_change(&a11y));
             clear_responses();
             const char *request = requests[j == 0 ? 0 : 1];
             md_mcp_server_handle_message(server, request, strlen(request));
@@ -1209,7 +1249,8 @@ static void test_resource_tree_formats(void)
         md_a11y_node_free(a11y.last_snapshot);
         a11y.last_snapshot = NULL;
     }
-    pthread_mutex_destroy(&a11y.snapshot_mu);
+    MD_CHECK(fixture.unsubscribes == 3);
+    query_a11y_fini(&a11y);
     PASS("resource formats and JSON action fallback/deltas for default/compact/JSON bridges");
 }
 
@@ -1231,10 +1272,11 @@ static void test_shared_a11y_snapshot(void)
 {
     static const MdA11yBackend backend = {
         .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
     };
     QueryFixture fixture = {0};
     MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
-    MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+    query_a11y_init(&a11y);
     MdMcpBridgeConfig config = {
         .a11y = &a11y, .settle_ms = 1,
         .stdio_in_fd = -1, .stdio_out_fd = -1,
@@ -1266,7 +1308,7 @@ static void test_shared_a11y_snapshot(void)
     md_mcp_server_handle_message(server, subscribe, sizeof(subscribe) - 1);
     clear_responses();
     fixture.no_focus = true;
-    fixture.change_cb(NULL, 0, fixture.change_userdata);
+    MD_CHECK(query_fire_change(&a11y));
     cJSON *notification = last_response();
     MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(notification, "method")),
                     "notifications/resources/updated") == 0);
@@ -1296,7 +1338,7 @@ static void test_shared_a11y_snapshot(void)
 
     md_mcp_bridge_destroy(bridge);
     md_a11y_node_free(a11y.last_snapshot);
-    pthread_mutex_destroy(&a11y.snapshot_mu);
+    query_a11y_fini(&a11y);
     PASS("shared lazy snapshot: five reads, resource, change callback and actions");
 }
 
@@ -1354,13 +1396,14 @@ static void test_snapshot_invalidation_and_time(void)
 static void test_snapshot_subscribe_failure(void)
 {
     const MdA11yBackend backends[] = {
-        { .get_tree = query_get_tree, .subscribe_changes = query_subscribe },
+        { .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+          .unsubscribe_changes = query_unsubscribe },
         { .get_tree = query_get_tree },
     };
     for (size_t i = 0; i < sizeof(backends) / sizeof(backends[0]); i++) {
         QueryFixture fixture = { .subscribe_fails = true };
         MdA11yCtx a11y = { .vtable = &backends[i], .backend_data = &fixture };
-        MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+        query_a11y_init(&a11y);
         MdMcpBridgeConfig config = {
             .a11y = &a11y, .settle_ms = 1,
             .stdio_in_fd = -1, .stdio_out_fd = -1,
@@ -1384,9 +1427,180 @@ static void test_snapshot_subscribe_failure(void)
         read_cached_resource(server);
         MD_CHECK(fixture.walks == 5);
         md_mcp_bridge_destroy(bridge);
-        pthread_mutex_destroy(&a11y.snapshot_mu);
+        /* Nothing was subscribed, so destroy must not try to detach. */
+        MD_CHECK(fixture.unsubscribes == 0);
+        MD_CHECK(a11y.change_cb == NULL);
+        query_a11y_fini(&a11y);
     }
     PASS("failed or unsupported change subscription refreshes every read");
+}
+
+/* ── Unsubscribe / bridge teardown (md-6h0) ─────────────────────── */
+
+static void test_bridge_destroy_unsubscribes(void)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
+    };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    query_a11y_init(&a11y);
+
+    /* Nothing subscribed yet: unsubscribe reports failure, backend untouched. */
+    MD_CHECK(md_a11y_unsubscribe_changes(&a11y) == -1);
+    MD_CHECK(fixture.unsubscribes == 0);
+
+    MdMcpBridgeConfig config = {
+        .a11y = &a11y, .settle_ms = 1,
+        .stdio_in_fd = -1, .stdio_out_fd = -1,
+    };
+    MdMcpBridge *bridge = md_mcp_bridge_create(&config);
+    MD_CHECK(bridge != NULL);
+    md_mcp_server_set_write_fn(md_mcp_bridge_get_server(bridge), capture_write, NULL);
+    MD_CHECK(a11y.change_cb != NULL && fixture.change_cb != NULL);
+    MD_CHECK(query_fire_change(&a11y)); /* live: a change reaches the bridge */
+
+    md_mcp_bridge_destroy(bridge);
+
+    /* Destroy detached the callback before freeing the bridge... */
+    MD_CHECK(fixture.unsubscribes == 1);
+    MD_CHECK(a11y.change_cb == NULL && a11y.change_userdata == NULL);
+    MD_CHECK(fixture.change_cb == NULL);
+    /* ...so a late backend event finds nothing to invoke. */
+    MD_CHECK(!query_fire_change(&a11y));
+    MD_CHECK(a11y.change_in_flight == 0);
+    /* And a second unsubscribe is a no-op failure, not a double teardown. */
+    MD_CHECK(md_a11y_unsubscribe_changes(&a11y) == -1);
+    MD_CHECK(fixture.unsubscribes == 1);
+
+    md_a11y_node_free(a11y.last_snapshot);
+    query_a11y_fini(&a11y);
+    PASS("bridge destroy detaches the a11y change callback; unsubscribe without a subscription fails");
+}
+
+/* Counting latch (unnamed POSIX semaphores are unavailable on macOS). */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int count;
+} TestLatch;
+
+static void latch_init(TestLatch *l)
+{
+    MD_CHECK(pthread_mutex_init(&l->mu, NULL) == 0);
+    MD_CHECK(pthread_cond_init(&l->cv, NULL) == 0);
+    l->count = 0;
+}
+
+static void latch_fini(TestLatch *l)
+{
+    pthread_cond_destroy(&l->cv);
+    pthread_mutex_destroy(&l->mu);
+}
+
+static void latch_post(TestLatch *l)
+{
+    pthread_mutex_lock(&l->mu);
+    l->count++;
+    pthread_cond_broadcast(&l->cv);
+    pthread_mutex_unlock(&l->mu);
+}
+
+static void latch_wait(TestLatch *l)
+{
+    pthread_mutex_lock(&l->mu);
+    while (l->count == 0)
+        pthread_cond_wait(&l->cv, &l->mu);
+    l->count--;
+    pthread_mutex_unlock(&l->mu);
+}
+
+typedef struct {
+    MdA11yCtx *a11y;
+    TestLatch entered;        /* callback -> test: I am running          */
+    TestLatch release;        /* test -> callback: you may return        */
+    TestLatch unsub_started;  /* unsubscriber -> test: calling unsubscribe */
+    atomic_int finished;      /* set by the callback just before it returns */
+    int calls;
+    int unsub_rc;
+    int finished_at_unsub_return;
+} DrainFixture;
+
+static void drain_cb(const MdA11yDelta *deltas, int count, void *userdata)
+{
+    (void)deltas; (void)count;
+    DrainFixture *d = userdata;
+    d->calls++;
+    latch_post(&d->entered);
+    latch_wait(&d->release);
+    /* Widen the window: an unsubscribe that did not drain would return
+     * while we are still here and observe finished == 0. */
+    usleep(50 * 1000);
+    atomic_store(&d->finished, 1);
+}
+
+static void *drain_dispatch_thread(void *arg)
+{
+    DrainFixture *d = arg;
+    MD_CHECK(query_fire_change(d->a11y)); /* backend dispatch thread */
+    return NULL;
+}
+
+static void *drain_unsubscribe_thread(void *arg)
+{
+    DrainFixture *d = arg;
+    latch_post(&d->unsub_started);
+    d->unsub_rc = md_a11y_unsubscribe_changes(d->a11y);
+    d->finished_at_unsub_return = atomic_load(&d->finished);
+    return NULL;
+}
+
+static void test_unsubscribe_drains_in_flight_callback(void)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
+    };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    query_a11y_init(&a11y);
+
+    DrainFixture d = { .a11y = &a11y };
+    latch_init(&d.entered);
+    latch_init(&d.release);
+    latch_init(&d.unsub_started);
+
+    MD_CHECK(md_a11y_subscribe_changes(&a11y, drain_cb, &d) == 0);
+    MD_CHECK(a11y.change_cb == drain_cb && a11y.change_userdata == &d);
+
+    pthread_t dispatcher, unsubscriber;
+    MD_CHECK(pthread_create(&dispatcher, NULL, drain_dispatch_thread, &d) == 0);
+    latch_wait(&d.entered); /* the callback is now in flight and blocked */
+    pthread_mutex_lock(&a11y.change_mu);
+    MD_CHECK(a11y.change_in_flight == 1);
+    pthread_mutex_unlock(&a11y.change_mu);
+
+    MD_CHECK(pthread_create(&unsubscriber, NULL, drain_unsubscribe_thread, &d) == 0);
+    latch_wait(&d.unsub_started);
+    latch_post(&d.release); /* let the callback finish while unsubscribe waits */
+
+    MD_CHECK(pthread_join(unsubscriber, NULL) == 0);
+    MD_CHECK(pthread_join(dispatcher, NULL) == 0);
+
+    MD_CHECK(d.unsub_rc == 0);
+    MD_CHECK(d.calls == 1);
+    MD_CHECK(d.finished_at_unsub_return == 1); /* returned only after the callback */
+    MD_CHECK(a11y.change_cb == NULL && a11y.change_in_flight == 0);
+    MD_CHECK(fixture.unsubscribes == 1);
+    MD_CHECK(!query_fire_change(&a11y));
+    MD_CHECK(d.calls == 1);
+
+    latch_fini(&d.unsub_started);
+    latch_fini(&d.release);
+    latch_fini(&d.entered);
+    query_a11y_fini(&a11y);
+    PASS("unsubscribe drains an in-flight change callback before returning");
 }
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -1400,6 +1614,8 @@ int main(int argc, char **argv)
         test_snapshot_invalidation_and_time();
         test_snapshot_subscribe_failure();
         test_resource_tree_formats();
+        test_bridge_destroy_unsubscribes();
+        test_unsubscribe_drains_in_flight_callback();
         clear_responses();
         return md_test_report();
     }
