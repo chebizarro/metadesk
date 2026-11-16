@@ -139,6 +139,8 @@ static void *notify_worker(void *userdata)
 {
     MdMcpNotifyCoalescer *n = userdata;
     pthread_mutex_lock(&n->mu);
+    unsigned failures = 0;
+    uint64_t retry_ns = 0;
     while (!n->stop) {
         while (!n->dirty && !n->stop)
             pthread_cond_wait(&n->cv, &n->mu);
@@ -146,6 +148,7 @@ static void *notify_worker(void *userdata)
         uint64_t deadline = n->last_ns + (uint64_t)n->quiet_ms * 1000000;
         uint64_t cap = n->first_ns + 200000000ULL;
         if (deadline > cap) deadline = cap;
+        if (retry_ns) deadline = retry_ns;
         uint64_t now = notify_now_ns();
         if (now < deadline) {
 #ifdef __APPLE__
@@ -162,8 +165,18 @@ static void *notify_worker(void *userdata)
         }
         n->dirty = false;
         pthread_mutex_unlock(&n->mu);
-        md_mcp_notify_tree_changed(n->server);
+        int rc = md_mcp_notify_tree_changed(n->server);
         pthread_mutex_lock(&n->mu);
+        if (rc < 0 && !n->stop && ++failures < 3) {
+            n->dirty = true;
+            retry_ns = notify_now_ns() + 200000000ULL;
+        } else {
+            /* Success starts a fresh burst; the third failure drops this
+             * burst, including hints accumulated during its failed writes. */
+            if (rc < 0) n->dirty = false;
+            failures = 0;
+            retry_ns = 0;
+        }
     }
     pthread_mutex_unlock(&n->mu);
     return NULL;
@@ -218,10 +231,12 @@ static void notify_dirty(MdMcpNotifyCoalescer *n)
 {
     pthread_mutex_lock(&n->mu);
     uint64_t now = notify_now_ns();
-    if (!n->dirty) n->first_ns = now;
+    if (!n->dirty) {
+        n->first_ns = now;
+        n->dirty = true;
+        pthread_cond_signal(&n->cv);
+    }
     n->last_ns = now;
-    n->dirty = true;
-    pthread_cond_signal(&n->cv);
     pthread_mutex_unlock(&n->mu);
 }
 

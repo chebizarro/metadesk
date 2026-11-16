@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <sched.h>
 #include "md_test.h"
 
 
@@ -1279,7 +1280,7 @@ static void test_shared_a11y_snapshot(void)
     MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
     query_a11y_init(&a11y);
     MdMcpBridgeConfig config = {
-        .a11y = &a11y, .settle_ms = 1,
+        .a11y = &a11y, .settle_ms = 1, .notify_sync = true,
         .stdio_in_fd = -1, .stdio_out_fd = -1,
     };
     MdMcpBridge *bridge = md_mcp_bridge_create(&config);
@@ -1809,7 +1810,7 @@ static void *hint_flood_thread(void *userdata)
     MD_CHECK(query_fire_change(f->a11y));
     latch_post(&f->started);
     /* Adversarial producer: stop only once destroy detaches the callback. */
-    while (query_fire_change(f->a11y)) {}
+    while (query_fire_change(f->a11y)) sched_yield();
     return NULL;
 }
 
@@ -1829,6 +1830,7 @@ static void test_bridge_destroy_blocked_write(uint32_t coalesce_ms)
         .a11y = &a11y, .settle_ms = 1, .stdio_in_fd = -1, .stdio_out_fd = -1,
     };
     config.notify_coalesce_ms = coalesce_ms;
+    config.notify_sync = coalesce_ms == 0;
     f.bridge = md_mcp_bridge_create(&config);
     MD_CHECK(f.bridge != NULL);
     f.server = md_mcp_bridge_get_server(f.bridge);
@@ -1888,7 +1890,7 @@ static int hint_notify_write(const char *json, size_t len, void *userdata)
     return 0;
 }
 
-static void test_hint_coalescing(uint32_t quiet_ms)
+static void test_hint_coalescing(uint32_t quiet_ms, bool sync)
 {
     static const MdA11yBackend backend = {
         .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
@@ -1899,6 +1901,7 @@ static void test_hint_coalescing(uint32_t quiet_ms)
     query_a11y_init(&a11y);
     MdMcpBridgeConfig config = {
         .a11y = &a11y, .settle_ms = 1, .notify_coalesce_ms = quiet_ms,
+        .notify_sync = sync,
         .stdio_in_fd = -1, .stdio_out_fd = -1,
     };
     MdMcpBridge *bridge = md_mcp_bridge_create(&config);
@@ -1919,7 +1922,7 @@ static void test_hint_coalescing(uint32_t quiet_ms)
 
     for (int i = 0; i < 100; i++) MD_CHECK(query_fire_change(&a11y));
     MD_CHECK(fixture.walks == walks); /* hints never call get_tree */
-    int expected = quiet_ms ? 1 : 100;
+    int expected = sync ? 100 : 1;
     for (int i = 0; i < expected; i++) MD_CHECK(latch_wait_ms(&notifications, 2000));
     MD_CHECK(!latch_wait_ms(&notifications, 60)); /* exactly one per burst */
 
@@ -1937,8 +1940,8 @@ static void test_hint_coalescing(uint32_t quiet_ms)
 
     /* A second 50-hint burst: disabled mode preserves 50 synchronous writes. */
     for (int i = 0; i < 50; i++) MD_CHECK(query_fire_change(&a11y));
-    expected = quiet_ms ? 1 : 50;
-    if (!quiet_ms) MD_CHECK(latch_count(&notifications) == 50);
+    expected = sync ? 50 : 1;
+    if (sync) MD_CHECK(latch_count(&notifications) == 50);
     for (int i = 0; i < expected; i++) MD_CHECK(latch_wait_ms(&notifications, 2000));
     MD_CHECK(!latch_wait_ms(&notifications, 60));
 
@@ -1991,6 +1994,63 @@ static void test_hint_coalescing_cap(void)
     latch_fini(&notifications);
     clear_responses();
     PASS("continuous hints notify at the maximum latency cap");
+}
+
+typedef struct {
+    int fail_count;
+    atomic_int calls;
+    TestLatch attempts, delivered;
+} RetrySink;
+
+static int retry_notify_write(const char *json, size_t len, void *userdata)
+{
+    RetrySink *sink = userdata;
+    int attempt = atomic_fetch_add(&sink->calls, 1) + 1;
+    latch_post(&sink->attempts);
+    if (attempt <= sink->fail_count) return -1;
+    return hint_notify_write(json, len, &sink->delivered);
+}
+
+static void test_hint_notification_retry(int fail_count)
+{
+    MdMcpServerConfig config = { .write_fn = capture_write };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MD_CHECK(server != NULL);
+    md_test_mcp_handshake(server);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(server, subscribe, sizeof(subscribe) - 1) == 0);
+    RetrySink sink = { .fail_count = fail_count };
+    atomic_init(&sink.calls, 0);
+    latch_init(&sink.attempts);
+    latch_init(&sink.delivered);
+    md_mcp_server_set_write_fn(server, retry_notify_write, &sink);
+    MdMcpResourceCtx ctx = { .server = server };
+    ctx.notifier = md_mcp_notify_coalescer_create(server, 20);
+    MD_CHECK(ctx.notifier != NULL);
+    md_mcp_a11y_change_cb(NULL, 0, &ctx);
+    MD_CHECK(latch_wait_ms(&sink.attempts, 2000));
+    /* Retries must wait a cap window, not spin on a failing sink. */
+    MD_CHECK(!latch_wait_ms(&sink.attempts, 100));
+    MD_CHECK(latch_wait_ms(&sink.attempts, 2000));
+    MD_CHECK(latch_wait_ms(&sink.attempts, 2000));
+    if (fail_count == 2) MD_CHECK(latch_wait_ms(&sink.delivered, 2000));
+    MD_CHECK(!latch_wait_ms(&sink.attempts, 300));
+    MD_CHECK(latch_count(&sink.delivered) == 0);
+    MD_CHECK(atomic_load(&sink.calls) == 3);
+    if (fail_count == 3) {
+        /* Giving up one burst must not prevent delivery of the next. */
+        md_mcp_a11y_change_cb(NULL, 0, &ctx);
+        MD_CHECK(latch_wait_ms(&sink.delivered, 2000));
+        MD_CHECK(atomic_load(&sink.calls) == 4);
+    }
+    md_mcp_server_quiesce(server);
+    md_mcp_notify_coalescer_destroy(ctx.notifier);
+    md_mcp_server_destroy(server);
+    latch_fini(&sink.attempts);
+    latch_fini(&sink.delivered);
+    clear_responses();
+    PASS("transient notification failures retry at 200 ms, bounded to three attempts");
 }
 
 static void counting_cb_a(const MdA11yDelta *deltas, int count, void *userdata)
@@ -2076,8 +2136,11 @@ int main(int argc, char **argv)
         test_unsubscribe_drains_in_flight_callback();
         test_bridge_destroy_blocked_write(0);
         test_bridge_destroy_blocked_write(20);
-        test_hint_coalescing(20);
-        test_hint_coalescing(0);
+        test_hint_coalescing(20, false);
+        test_hint_coalescing(0, true);
+        test_hint_coalescing(0, false);
+        test_hint_notification_retry(2);
+        test_hint_notification_retry(3);
         test_hint_coalescing_cap();
         test_subscribe_refuses_second_owner();
         clear_responses();
