@@ -969,6 +969,16 @@ static void test_a11y_read_tools(void)
     MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "id")), "save") == 0);
     MD_CHECK(!cJSON_HasObjectItem(cJSON_GetArrayItem(value, 0), "children"));
     cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"role\":\"frame\",\"label_contains\":\"Nested\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 1);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "id")), "nested") == 0);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "role")), "window") == 0);
+    cJSON_Delete(value);
+    value = query_json(server, "metadesk_find", "{\"role\":\"push button\",\"label_contains\":\"Save As\",\"format\":\"json\"}");
+    MD_CHECK(cJSON_GetArraySize(value) == 1);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "id")), "save") == 0);
+    MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(value, 0), "role")), "button") == 0);
+    cJSON_Delete(value);
     value = query_json(server, "metadesk_find", "{\"label_contains\":\"sAvE\",\"format\":\"json\"}");
     MD_CHECK(cJSON_GetArraySize(value) == 2);
     cJSON_Delete(value);
@@ -1142,10 +1152,10 @@ static void test_a11y_modal_and_label_queries(void)
     fixture.unusual_nodes = true;
     md_a11y_snapshot_invalidate(snapshot);
     cJSON *content = query_call(server, "metadesk_find", "{\"role\":\"heading\"}", false);
-    MD_CHECK(strcmp(query_text(content), "heading[heading] Welcome\n") == 0);
+    MD_CHECK(strcmp(query_text(content), "HDG[heading] Welcome\n") == 0);
     cJSON_Delete(content);
     content = query_call(server, "metadesk_subtree", "{\"id\":\"root\"}", false);
-    MD_CHECK(strstr(query_text(content), "heading[heading] Welcome") != NULL);
+    MD_CHECK(strstr(query_text(content), "HDG[heading] Welcome") != NULL);
     cJSON_Delete(content);
     cJSON *all = query_json(server, "metadesk_find", "{\"format\":\"json\"}");
     cJSON *empty = query_json(server, "metadesk_find", "{\"label_contains\":\"\",\"format\":\"json\"}");
@@ -1159,7 +1169,7 @@ static void test_a11y_modal_and_label_queries(void)
     MdA11yNode *root = md_a11y_walk(&a11y);
     char *compact = md_a11y_to_compact(root);
     MD_CHECK(compact != NULL);
-    MD_CHECK(strstr(compact, "heading") == NULL); /* full-tree filtering is unchanged */
+    MD_CHECK(strstr(compact, "heading") == NULL); /* Preserve the original full-tree interactable set. */
     MD_CHECK(strstr(compact, "BTN[unlabelled]") != NULL);
     free(compact);
     md_a11y_node_free(root);

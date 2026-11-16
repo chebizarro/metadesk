@@ -75,44 +75,54 @@ static char *bstr_to_cstr(BSTR bstr) {
     return str;
 }
 
-/* Map UIA ControlTypeId to platform-neutral role string */
+#define MD_UIA_ROLES(X) \
+    X(UIA_ButtonControlTypeId, MD_A11Y_ROLE_BUTTON) \
+    X(UIA_CheckBoxControlTypeId, MD_A11Y_ROLE_CHECK_BOX) \
+    X(UIA_RadioButtonControlTypeId, MD_A11Y_ROLE_RADIO_BUTTON) \
+    X(UIA_ComboBoxControlTypeId, MD_A11Y_ROLE_COMBO_BOX) \
+    X(UIA_EditControlTypeId, MD_A11Y_ROLE_TEXT) \
+    X(UIA_ListControlTypeId, MD_A11Y_ROLE_LIST) \
+    X(UIA_ListItemControlTypeId, MD_A11Y_ROLE_LIST_ITEM) \
+    X(UIA_MenuControlTypeId, MD_A11Y_ROLE_MENU) \
+    X(UIA_MenuBarControlTypeId, MD_A11Y_ROLE_MENU) \
+    X(UIA_MenuItemControlTypeId, MD_A11Y_ROLE_MENU_ITEM) \
+    X(UIA_TabControlTypeId, MD_A11Y_ROLE_PAGE_TAB_LIST) \
+    X(UIA_TabItemControlTypeId, MD_A11Y_ROLE_TAB) \
+    X(UIA_TreeControlTypeId, MD_A11Y_ROLE_TREE) \
+    X(UIA_TreeItemControlTypeId, MD_A11Y_ROLE_TREE_ITEM) \
+    X(UIA_SliderControlTypeId, MD_A11Y_ROLE_SLIDER) \
+    X(UIA_ScrollBarControlTypeId, MD_A11Y_ROLE_SCROLL_BAR) \
+    X(UIA_ProgressBarControlTypeId, MD_A11Y_ROLE_PROGRESS_BAR) \
+    X(UIA_StatusBarControlTypeId, MD_A11Y_ROLE_STATUS_BAR) \
+    X(UIA_ToolBarControlTypeId, MD_A11Y_ROLE_TOOL_BAR) \
+    X(UIA_WindowControlTypeId, MD_A11Y_ROLE_WINDOW) \
+    X(UIA_PaneControlTypeId, MD_A11Y_ROLE_PANEL) \
+    X(UIA_GroupControlTypeId, MD_A11Y_ROLE_PANEL) \
+    X(UIA_TextControlTypeId, MD_A11Y_ROLE_LABEL) \
+    X(UIA_ImageControlTypeId, MD_A11Y_ROLE_IMAGE) \
+    X(UIA_HyperlinkControlTypeId, MD_A11Y_ROLE_LINK) \
+    X(UIA_DocumentControlTypeId, MD_A11Y_ROLE_DOCUMENT) \
+    X(UIA_TableControlTypeId, MD_A11Y_ROLE_TABLE) \
+    X(UIA_HeaderControlTypeId, MD_A11Y_ROLE_HEADING) \
+    X(UIA_DataGridControlTypeId, MD_A11Y_ROLE_TABLE) \
+    X(UIA_DataItemControlTypeId, MD_A11Y_ROLE_TABLE_CELL) \
+    X(UIA_SplitButtonControlTypeId, MD_A11Y_ROLE_BUTTON) \
+    X(UIA_SpinnerControlTypeId, MD_A11Y_ROLE_SPIN_BUTTON) \
+    X(UIA_ToolTipControlTypeId, MD_A11Y_ROLE_TOOL_TIP)
+
+#define MD_UIA_ASSERT(native, role) static_assert(role >= 0 && role < MD_A11Y_ROLE_COUNT, "invalid UIA role");
+MD_UIA_ROLES(MD_UIA_ASSERT)
+#undef MD_UIA_ASSERT
+static const struct { CONTROLTYPEID native; enum MdA11yRole role; } uia_roles[] = {
+#define MD_UIA_ROW(native, role) { native, role },
+    MD_UIA_ROLES(MD_UIA_ROW)
+#undef MD_UIA_ROW
+};
+#undef MD_UIA_ROLES
 static const char *control_type_to_role(CONTROLTYPEID ctid) {
-    switch (ctid) {
-    case UIA_ButtonControlTypeId:        return "push button";
-    case UIA_CheckBoxControlTypeId:      return "check box";
-    case UIA_RadioButtonControlTypeId:   return "radio button";
-    case UIA_ComboBoxControlTypeId:      return "combo box";
-    case UIA_EditControlTypeId:          return "text";
-    case UIA_ListControlTypeId:          return "list";
-    case UIA_ListItemControlTypeId:      return "list item";
-    case UIA_MenuControlTypeId:          return "menu";
-    case UIA_MenuBarControlTypeId:       return "menu bar";
-    case UIA_MenuItemControlTypeId:      return "menu item";
-    case UIA_TabControlTypeId:           return "page tab list";
-    case UIA_TabItemControlTypeId:       return "page tab";
-    case UIA_TreeControlTypeId:          return "tree";
-    case UIA_TreeItemControlTypeId:      return "tree item";
-    case UIA_SliderControlTypeId:        return "slider";
-    case UIA_ScrollBarControlTypeId:     return "scroll bar";
-    case UIA_ProgressBarControlTypeId:   return "progress bar";
-    case UIA_StatusBarControlTypeId:     return "status bar";
-    case UIA_ToolBarControlTypeId:       return "tool bar";
-    case UIA_WindowControlTypeId:        return "window";
-    case UIA_PaneControlTypeId:          return "panel";
-    case UIA_GroupControlTypeId:         return "panel";
-    case UIA_TextControlTypeId:          return "label";
-    case UIA_ImageControlTypeId:         return "image";
-    case UIA_HyperlinkControlTypeId:     return "link";
-    case UIA_DocumentControlTypeId:      return "document";
-    case UIA_TableControlTypeId:         return "table";
-    case UIA_HeaderControlTypeId:        return "heading";
-    case UIA_DataGridControlTypeId:      return "table";
-    case UIA_DataItemControlTypeId:      return "table cell";
-    case UIA_SplitButtonControlTypeId:   return "push button";
-    case UIA_SpinnerControlTypeId:       return "spin button";
-    case UIA_ToolTipControlTypeId:       return "tool tip";
-    default:                             return "unknown";
-    }
+    for (const auto &entry : uia_roles)
+        if (entry.native == ctid) return md_a11y_role_name(entry.role);
+    return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
 }
 
 /* Extract states from UIA element properties */
@@ -123,17 +133,17 @@ static void extract_states(IUIAutomationElement *elem, MdA11yNode *node) {
     BOOL boolVal;
 
     if (SUCCEEDED(elem->get_CurrentIsEnabled(&boolVal)) && boolVal)
-        states[count++] = _strdup("enabled");
+        states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_ENABLED));
 
     if (SUCCEEDED(elem->get_CurrentHasKeyboardFocus(&boolVal)) && boolVal)
-        states[count++] = _strdup("focused");
+        states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSED));
 
     if (SUCCEEDED(elem->get_CurrentIsKeyboardFocusable(&boolVal)) && boolVal)
-        states[count++] = _strdup("focusable");
+        states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSABLE));
 
     if (SUCCEEDED(elem->get_CurrentIsOffscreen(&boolVal)) && !boolVal) {
-        states[count++] = _strdup("visible");
-        states[count++] = _strdup("showing");
+        states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_VISIBLE));
+        states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_SHOWING));
     }
 
     if (count > 0) {
@@ -325,7 +335,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     }
 
     root->id = _strdup("desktop");
-    root->role = _strdup("desktop");
+    root->role = _strdup(md_a11y_role_name(MD_A11Y_ROLE_DESKTOP));
     root->label = _strdup("Desktop");
 
     /* Walk top-level children (application windows) */
@@ -696,6 +706,11 @@ static void uia_destroy(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+static bool uia_is_connected(const MdA11yCtx *ctx) {
+    const auto *st = static_cast<const UIAState *>(ctx->backend_data);
+    return st && st->automation != nullptr;
+}
+
 /* Positional: must match the MdA11yBackend member order in a11y.h. */
 static const MdA11yBackend uia_backend = {
     uia_init,
@@ -703,6 +718,7 @@ static const MdA11yBackend uia_backend = {
     uia_subscribe_changes,
     uia_unsubscribe_changes,
     uia_destroy,
+    uia_is_connected,
 };
 
 extern "C"

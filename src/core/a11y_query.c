@@ -43,12 +43,27 @@ const MdA11yNode *md_a11y_find_node_by_id(const MdA11yNode *node, const char *id
 bool md_a11y_matches(const MdA11yNode *node, const char *role,
                      const char *label_contains, const char *state)
 {
-    if (!node || (role && !equal_ci(node->role, role)) ||
-        (label_contains && !contains_ci(node->label, label_contains)))
+    if (!node || (label_contains && !contains_ci(node->label, label_contains)))
         return false;
+    if (role) {
+        enum MdA11yRole actual = md_a11y_role_lookup(node->role);
+        enum MdA11yRole wanted = md_a11y_role_lookup(role);
+        if (actual != MD_A11Y_ROLE_UNKNOWN && wanted != MD_A11Y_ROLE_UNKNOWN) {
+            if (actual != wanted) return false;
+        } else if (!equal_ci(node->role, role)) {
+            return false;
+        }
+    }
     if (!state) return true;
-    for (int i = 0; node->states && i < node->state_count; i++)
-        if (equal_ci(node->states[i], state)) return true;
+    enum MdA11yState wanted = md_a11y_state_lookup(state);
+    for (int i = 0; node->states && i < node->state_count; i++) {
+        enum MdA11yState actual = md_a11y_state_lookup(node->states[i]);
+        if (actual != MD_A11Y_STATE_UNKNOWN && wanted != MD_A11Y_STATE_UNKNOWN) {
+            if (actual == wanted) return true;
+        } else if (equal_ci(node->states[i], state)) {
+            return true;
+        }
+    }
     return false;
 }
 

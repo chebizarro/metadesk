@@ -3,6 +3,7 @@
  * Accessibility tree HAL tests (serialisation + live backend if available).
  */
 #include "a11y.h"
+#include "a11y_query.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,29 @@ static void test_node_alloc_free(void) {
     printf("  PASS: node alloc/free\n");
 }
 
+static bool fixture_is_connected(const MdA11yCtx *ctx) {
+    return ctx->backend_data && *(const bool *)ctx->backend_data;
+}
+
+static void test_liveness(void) {
+    MD_CHECK(!md_a11y_is_connected(NULL));
+    MdA11yBackend backend = { 0 };
+    MdA11yCtx ctx = { .vtable = &backend };
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    bool connected = false;
+    ctx.backend_data = &connected;
+    MD_CHECK(md_a11y_is_connected(&ctx)); /* legacy fallback */
+    backend.is_connected = fixture_is_connected;
+    MD_CHECK(!md_a11y_is_connected(&ctx)); /* allocation is not liveness */
+    connected = true;
+    MD_CHECK(md_a11y_is_connected(&ctx));
+    connected = false;
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    ctx.backend_data = NULL;
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    printf("  PASS: backend liveness callback and legacy fallback\n");
+}
+
 static void test_create_destroy(void) {
     if (!live_a11y_tests_enabled()) {
         printf("  SKIP: create/destroy live backend (set MD_A11Y_LIVE_TESTS=1)\n");
@@ -54,6 +78,7 @@ static void test_create_destroy(void) {
 
     MdA11yCtx *ctx = md_a11y_create();
     MD_CHECK(ctx != NULL);
+    MD_CHECK(md_a11y_is_connected(ctx));
     md_a11y_destroy(ctx);
     printf("  PASS: create/destroy\n");
 }
@@ -210,6 +235,146 @@ static void test_delta_serialization(void) {
     printf("  PASS: delta serialization\n");
 }
 
+#ifdef __APPLE__
+extern size_t md_a11y_axui_role_mapping_count(void);
+extern enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index);
+extern const char *md_a11y_axui_native_role_at(size_t index);
+extern const char *md_a11y_axui_normalize_role(const char *ax_role);
+#endif
+
+static void test_compact_table_filtering(void) {
+    MdA11yNode *table = make_node("table", "table", "Data", 0, 0, 100, 100);
+    for (int r = 0; r < 3; r++) {
+        char id[16];
+        snprintf(id, sizeof(id), "row%d", r);
+        MdA11yNode *row = make_node(id, "table row", "Row", 0, 0, 100, 10);
+        node_add_child(table, row);
+        for (int c = 0; c < 2; c++) {
+            snprintf(id, sizeof(id), "cell%d%d", r, c);
+            node_add_child(row, make_node(id, "table cell", "Cell", 0, 0, 50, 10));
+        }
+    }
+    char *compact = md_a11y_to_compact_at(table, 0);
+    MD_CHECK(compact && strcmp(compact, "v1 ts:0\nTBL[table] Data\n") == 0);
+    free(compact);
+    md_a11y_node_free(table);
+
+    static const enum MdA11yRole original_interactable[] = {
+        MD_A11Y_ROLE_WINDOW, MD_A11Y_ROLE_APPLICATION, MD_A11Y_ROLE_DESKTOP,
+        MD_A11Y_ROLE_DIALOG, MD_A11Y_ROLE_BUTTON, MD_A11Y_ROLE_TOGGLE_BUTTON,
+        MD_A11Y_ROLE_TEXT, MD_A11Y_ROLE_MENU, MD_A11Y_ROLE_MENU_ITEM,
+        MD_A11Y_ROLE_CHECK_BOX, MD_A11Y_ROLE_RADIO_BUTTON, MD_A11Y_ROLE_COMBO_BOX,
+        MD_A11Y_ROLE_LIST, MD_A11Y_ROLE_LIST_ITEM, MD_A11Y_ROLE_TAB,
+        MD_A11Y_ROLE_LINK, MD_A11Y_ROLE_SLIDER, MD_A11Y_ROLE_SPIN_BUTTON,
+        MD_A11Y_ROLE_TREE, MD_A11Y_ROLE_TABLE,
+    };
+    for (int i = 0; i < MD_A11Y_ROLE_COUNT; i++) {
+        bool expected = false;
+        for (size_t j = 0; j < sizeof(original_interactable) / sizeof(original_interactable[0]); j++)
+            if ((enum MdA11yRole)i == original_interactable[j]) expected = true;
+        MD_CHECK(md_a11y_role_is_interactable_enum((enum MdA11yRole)i) == expected);
+        MD_CHECK(md_a11y_role_is_interactable(md_a11y_role_name((enum MdA11yRole)i)) == expected);
+    }
+    printf("  PASS: compact 3x2 table golden and original interactable set\n");
+}
+
+static void test_vocab(void) {
+    for (int i = 0; i < MD_A11Y_ROLE_COUNT; i++) {
+        const char *name = md_a11y_role_name((enum MdA11yRole)i);
+        MD_CHECK(md_a11y_role_lookup(name) == (enum MdA11yRole)i);
+        for (int j = 0; j < i; j++) {
+            const char *other = md_a11y_role_name((enum MdA11yRole)j);
+            MD_CHECK(strcmp(name, other) != 0);
+            MD_CHECK(strcmp(md_a11y_role_abbrev(name), md_a11y_role_abbrev(other)) != 0);
+        }
+    }
+#define CHECK_ALIAS(name, role) \
+    MD_CHECK(role >= 0 && role < MD_A11Y_ROLE_COUNT); \
+    MD_CHECK(md_a11y_role_lookup(name) == role);
+    MD_A11Y_ROLE_ALIASES(CHECK_ALIAS)
+#undef CHECK_ALIAS
+    for (int i = 0; i < MD_A11Y_STATE_COUNT; i++) {
+        const char *name = md_a11y_state_name((enum MdA11yState)i);
+        MD_CHECK(name != NULL);
+        MD_CHECK(md_a11y_state_lookup(name) == (enum MdA11yState)i);
+    }
+    MD_CHECK(md_a11y_role_lookup(NULL) == MD_A11Y_ROLE_UNKNOWN);
+    MD_CHECK(md_a11y_state_lookup("not-a-state") == MD_A11Y_STATE_UNKNOWN);
+#ifdef __APPLE__
+    MD_CHECK(md_a11y_axui_role_mapping_count() > 0);
+    for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++) {
+        enum MdA11yRole role = md_a11y_axui_role_mapping_at(i);
+        MD_CHECK(role >= MD_A11Y_ROLE_UNKNOWN && role < MD_A11Y_ROLE_COUNT);
+        MD_CHECK(md_a11y_role_lookup(md_a11y_role_name(role)) == role);
+        const char *native = md_a11y_axui_native_role_at(i);
+        MD_CHECK(native != NULL);
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role(native), md_a11y_role_name(role)) == 0);
+    }
+    static const struct { const char *native; enum MdA11yRole role; } added_roles[] = {
+        { "AXMenuButton", MD_A11Y_ROLE_BUTTON },
+        { "AXColorWell", MD_A11Y_ROLE_COLOR_CHOOSER },
+        { "AXDateField", MD_A11Y_ROLE_DATE_EDITOR },
+        { "AXTimeField", MD_A11Y_ROLE_DATE_EDITOR },
+        { "AXIncrementor", MD_A11Y_ROLE_SPIN_BUTTON },
+        { "AXLevelIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+        { "AXBusyIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+        { "AXGrid", MD_A11Y_ROLE_TABLE },
+        { "AXDockItem", MD_A11Y_ROLE_BUTTON },
+        { "AXRadioGroup", MD_A11Y_ROLE_PANEL },
+        { "AXPopover", MD_A11Y_ROLE_DIALOG },
+        { "AXListMarker", MD_A11Y_ROLE_LABEL },
+        { "AXOpaqueProviderGroup", MD_A11Y_ROLE_PANEL },
+        { "AXRuler", MD_A11Y_ROLE_UNKNOWN },
+        { "AXRulerMarker", MD_A11Y_ROLE_UNKNOWN },
+        { "AXUnknown", MD_A11Y_ROLE_UNKNOWN },
+        { "AXSystemWide", MD_A11Y_ROLE_UNKNOWN },
+    };
+    for (size_t i = 0; i < sizeof(added_roles) / sizeof(added_roles[0]); i++)
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role(added_roles[i].native),
+                        md_a11y_role_name(added_roles[i].role)) == 0);
+    for (int i = 0; i < 2; i++)
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role("AXUnmappedReviewFixture"), "unknown") == 0);
+#endif
+    MD_CHECK(md_a11y_role_lookup("header") == MD_A11Y_ROLE_PANEL);
+    MD_CHECK(md_a11y_role_lookup("footer") == MD_A11Y_ROLE_PANEL);
+    MdA11yNode custom = { .id = "custom", .role = "vendor widget", .label = "Custom" };
+    char *raw_states[] = { "vendor state", "focused", NULL };
+    custom.states = raw_states;
+    custom.state_count = 3;
+    MD_CHECK(md_a11y_matches(&custom, "VENDOR WIDGET", NULL, "VENDOR STATE"));
+    MD_CHECK(md_a11y_matches(&custom, NULL, NULL, "FOCUSED"));
+    MD_CHECK(!md_a11y_matches(&custom, "button", NULL, NULL));
+    MD_CHECK(!md_a11y_matches(&custom, NULL, NULL, "enabled"));
+    custom.states = NULL;
+    custom.state_count = 0;
+    char *targeted = md_a11y_query_to_compact(&custom, 0);
+    MD_CHECK(targeted && strcmp(targeted, "vendor widget[custom] Custom\n") == 0);
+    free(targeted);
+    char *full = md_a11y_to_compact_at(&custom, 0);
+    MD_CHECK(full && strcmp(full, "v1 ts:0\n") == 0);
+    free(full);
+    printf("  PASS: shared vocabulary and native role mappings\n");
+}
+
+static void check_live_vocab(const MdA11yNode *node, int *unknown_roles) {
+    enum MdA11yRole role = md_a11y_role_lookup(node->role);
+    if (role == MD_A11Y_ROLE_UNKNOWN) {
+        printf("  live unknown role: %s (id=%s)\n", node->role ? node->role : "(null)",
+               node->id ? node->id : "?");
+        (*unknown_roles)++;
+    }
+    /* UNKNOWN is a documented canonical sentinel, not an ad-hoc native string. */
+    MD_CHECK(node->role && strcmp(node->role, md_a11y_role_name(role)) == 0);
+    for (int i = 0; i < node->state_count; i++) {
+        enum MdA11yState state = md_a11y_state_lookup(node->states[i]);
+        if (state == MD_A11Y_STATE_UNKNOWN)
+            printf("  live unknown state: %s\n", node->states[i] ? node->states[i] : "(null)");
+        MD_CHECK(state != MD_A11Y_STATE_UNKNOWN);
+    }
+    for (int i = 0; i < node->child_count; i++)
+        check_live_vocab(node->children[i], unknown_roles);
+}
+
 static void test_walk_tree(void) {
     if (!live_a11y_tests_enabled()) {
         printf("  SKIP: walk tree live backend (set MD_A11Y_LIVE_TESTS=1)\n");
@@ -231,6 +396,10 @@ static void test_walk_tree(void) {
     MD_CHECK(root->id != NULL);
     MD_CHECK(root->role != NULL);
     MD_CHECK(strcmp(root->role, "desktop") == 0);
+
+    int unknown_roles = 0;
+    check_live_vocab(root, &unknown_roles);
+    printf("  live vocabulary: %d unknown-role nodes\n", unknown_roles);
 
     /* Serialize in both formats to verify end-to-end */
     char *json = md_a11y_to_json(root);
@@ -523,6 +692,9 @@ static void test_tree_patch_update_state(void) {
 int main(void) {
     printf("test_a11y:\n");
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
+    test_liveness();
+    test_vocab();
+    test_compact_table_filtering();
     test_node_alloc_free();
     test_create_destroy();
     test_json_serialization();

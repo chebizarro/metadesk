@@ -13,6 +13,7 @@
 #ifndef MD_A11Y_H
 #define MD_A11Y_H
 
+#include "a11y_vocab.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
@@ -77,6 +78,9 @@ typedef struct MdA11yBackend {
      * idempotent and safe when nothing is subscribed. */
     void  (*unsubscribe_changes)(MdA11yCtx *ctx);
     void  (*destroy)(MdA11yCtx *ctx);
+    /* Unlike capture's active / input's ready, a11y reports backend liveness.
+     * Optional for fixture/legacy backends: NULL uses backend_data != NULL. */
+    bool  (*is_connected)(const MdA11yCtx *ctx);
 } MdA11yBackend;
 
 /* ── A11y context ────────────────────────────────────────────── */

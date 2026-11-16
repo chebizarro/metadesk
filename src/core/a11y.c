@@ -346,7 +346,10 @@ int md_a11y_unsubscribe_changes(MdA11yCtx *ctx) {
 }
 
 bool md_a11y_is_connected(const MdA11yCtx *ctx) {
-    return ctx && ctx->backend_data; /* backends set backend_data on init */
+    if (!ctx) return false;
+    if (ctx->vtable && ctx->vtable->is_connected)
+        return ctx->vtable->is_connected(ctx);
+    return ctx->backend_data != NULL;
 }
 
 void md_a11y_destroy(MdA11yCtx *ctx) {
@@ -479,97 +482,25 @@ char *md_a11y_to_json_at(const MdA11yNode *root, uint64_t ts_ms) {
  *     MNU[45] File
  */
 
-/* Role abbreviation map */
-/*
- * One role vocabulary, one table. role_abbrev() and is_interactable() were
- * two parallel strcmp cascades over the same set of roles that had to be kept
- * in sync by hand; they now read a single source of truth. `alt` is an
- * accepted synonym for the same role (or NULL).
- */
-typedef struct {
-    const char *role;
-    const char *alt;
-    const char *abbrev;
-    bool        interactable;
-} RoleInfo;
-
-static const RoleInfo role_table[] = {
-    /* Containers — always shown for structural context */
-    { "frame",         "window",  "WIN", true  },
-    { "application",   NULL,      "APP", true  },
-    { "desktop frame", "desktop", "DSK", true  },
-    { "dialog",        NULL,      "DLG", true  },
-    /* Interactive controls — the primary targets */
-    { "push button",   "button",  "BTN", true  },
-    { "toggle button", NULL,      "TGL", true  },
-    { "text",          "entry",   "TXT", true  },
-    { "menu",          "menu bar","MNU", true  },
-    { "menu item",     NULL,      "MNI", true  },
-    { "check box",     NULL,      "CHK", true  },
-    { "radio button",  NULL,      "RAD", true  },
-    { "combo box",     NULL,      "CMB", true  },
-    { "list",          NULL,      "LST", true  },
-    { "list item",     NULL,      "LI",  true  },
-    { "tab",           NULL,      "TAB", true  },
-    { "page tab",      NULL,      "PTB", true  },
-    { "link",          NULL,      "LNK", true  },
-    { "slider",        NULL,      "SLD", true  },
-    { "spin button",   NULL,      "SPN", true  },
-    { "tree",          NULL,      "TRE", true  },
-    { "table",         NULL,      "TBL", true  },
-    /* Decorative / structural — skipped in compact output (children walked) */
-    { "panel",         "filler",  "PNL", false },
-    { "label",         NULL,      "LBL", false },
-    { "scroll bar",    NULL,      "SCR", false },
-    { "separator",     NULL,      "SEP", false },
-    { "tool bar",      NULL,      "TBR", false },
-    { "image",         NULL,      "IMG", false },
-    { "status bar",    NULL,      "STS", false },
-    { "page tab list", NULL,      "PTL", false },
-    { "split pane",    NULL,      "SPL", false },
-    { "progress bar",  NULL,      "PRG", false },
-};
-
-static const RoleInfo *role_lookup(const char *role) {
-    if (!role) return NULL;
-    for (size_t i = 0; i < sizeof(role_table) / sizeof(role_table[0]); i++) {
-        if (strcmp(role, role_table[i].role) == 0 ||
-            (role_table[i].alt && strcmp(role, role_table[i].alt) == 0))
-            return &role_table[i];
-    }
-    return NULL;
-}
-
-static const char *role_abbrev(const char *role) {
-    if (!role) return "???";
-    const RoleInfo *ri = role_lookup(role);
-    return ri ? ri->abbrev : "UNK";
-}
-
-/*
- * Interactable classification: true if the node should be emitted in compact
- * output. Containers (WIN/APP/DSK/DLG) show for structure; leaf controls
- * (BTN/TXT/MNU/CHK/...) are the targets; decorative roles are skipped (their
- * children are still walked).
- */
-static bool is_interactable(const char *role) {
-    const RoleInfo *ri = role_lookup(role);
-    return ri && ri->interactable;
-}
-
 /* Returns true if the role is a text input (content should be quoted) */
-static bool is_text_role(const char *role) {
-    if (!role) return false;
-    return strcmp(role, "text") == 0 || strcmp(role, "entry") == 0;
+static bool is_text_role(enum MdA11yRole role) {
+    return role == MD_A11Y_ROLE_TEXT;
 }
 
-static int has_state(const MdA11yNode *node, const char *state) {
-    if (!node->states) return 0;
-    for (int i = 0; i < node->state_count; i++) {
-        if (node->states[i] && strcmp(node->states[i], state) == 0)
-            return 1;
+_Static_assert(MD_A11Y_STATE_COUNT <= 64, "compact state mask capacity exceeded");
+
+static uint64_t compact_state_mask(const MdA11yNode *node) {
+    uint64_t mask = 0;
+    for (int i = 0; node->states && i < node->state_count; i++) {
+        enum MdA11yState state = md_a11y_state_lookup(node->states[i]);
+        if (state != MD_A11Y_STATE_UNKNOWN)
+            mask |= UINT64_C(1) << state;
     }
-    return 0;
+    return mask;
+}
+
+static bool has_state(uint64_t mask, enum MdA11yState state) {
+    return (mask & (UINT64_C(1) << state)) != 0;
 }
 
 /* ── Growable string builder ──────────────────────────────────
@@ -616,18 +547,18 @@ static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
 }
 
 /* Append state annotations in priority order. */
-static void compact_states(const MdA11yNode *node, StrBuf *sb) {
-    static const struct { const char *state; const char *fmt; } state_map[] = {
-        { "focused",  " <focused>" },
-        { "enabled",  " *enabled*" },
-        { "disabled", " *disabled*" },
-        { "checked",  " *checked*" },
-        { "selected", " *selected*" },
-        { "pressed",  " *pressed*" },
-        { "expanded", " *expanded*" },
+static void compact_states(uint64_t states, StrBuf *sb) {
+    static const struct { enum MdA11yState state; const char *fmt; } state_map[] = {
+        { MD_A11Y_STATE_FOCUSED,  " <focused>" },
+        { MD_A11Y_STATE_ENABLED,  " *enabled*" },
+        { MD_A11Y_STATE_DISABLED, " *disabled*" },
+        { MD_A11Y_STATE_CHECKED,  " *checked*" },
+        { MD_A11Y_STATE_SELECTED, " *selected*" },
+        { MD_A11Y_STATE_PRESSED,  " *pressed*" },
+        { MD_A11Y_STATE_EXPANDED, " *expanded*" },
     };
     for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++)
-        if (has_state(node, state_map[i].state))
+        if (has_state(states, state_map[i].state))
             sb_append(sb, state_map[i].fmt);
 }
 
@@ -639,26 +570,28 @@ static void compact_states(const MdA11yNode *node, StrBuf *sb) {
 static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
                          bool all_roles, int remaining) {
     if (!node) return;
-    bool emit = all_roles || is_interactable(node->role);
+    enum MdA11yRole resolved_role = md_a11y_role_lookup(node->role);
+    bool emit = all_roles || md_a11y_role_is_interactable_enum(resolved_role);
 
     if (emit) {
+        uint64_t states = compact_state_mask(node);
         for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        const char *role = all_roles && node->role && !role_lookup(node->role)
-            ? node->role : role_abbrev(node->role);
+        const char *role = all_roles && node->role && resolved_role == MD_A11Y_ROLE_UNKNOWN
+            ? node->role : (node->role ? md_a11y_role_abbrev_enum(resolved_role) : "???");
         sb_appendf(sb, "%s[%s]", role, node->id ? node->id : "?");
 
-        if (is_text_role(node->role)) {
+        if (is_text_role(resolved_role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */
-            if (has_state(node, "focused")) sb_append(sb, " <focused>");
+            if (has_state(states, MD_A11Y_STATE_FOCUSED)) sb_append(sb, " <focused>");
             sb_appendf(sb, " '%s'", node->label ? node->label : "");
-            if (has_state(node, "enabled"))  sb_append(sb, " *enabled*");
-            if (has_state(node, "disabled")) sb_append(sb, " *disabled*");
+            if (has_state(states, MD_A11Y_STATE_ENABLED))  sb_append(sb, " *enabled*");
+            if (has_state(states, MD_A11Y_STATE_DISABLED)) sb_append(sb, " *disabled*");
         } else {
             const char *label = node->label ? node->label : "";
             if (label[0]) sb_appendf(sb, " %s", label);
-            compact_states(node, sb);
+            compact_states(states, sb);
         }
 
         sb_append(sb, "\n");

@@ -77,65 +77,114 @@ static char *make_node_id(AXUIState *st) {
 
 
 
-/* Normalize AX role strings to platform-neutral names matching AT-SPI2 */
-static const char *normalize_role(const char *ax_role) {
-    if (!ax_role) return "unknown";
+/* Typed AX mappings: no raw native role escapes into a tree. */
+static const struct { const char *ax_role; enum MdA11yRole role; } ax_roles[] = {
+    { "AXApplication", MD_A11Y_ROLE_APPLICATION },
+    { "AXWindow", MD_A11Y_ROLE_WINDOW },
+    { "AXButton", MD_A11Y_ROLE_BUTTON },
+    { "AXCheckBox", MD_A11Y_ROLE_CHECK_BOX },
+    { "AXRadioButton", MD_A11Y_ROLE_RADIO_BUTTON },
+    { "AXTextField", MD_A11Y_ROLE_TEXT },
+    { "AXTextArea", MD_A11Y_ROLE_TEXT },
+    { "AXStaticText", MD_A11Y_ROLE_LABEL },
+    { "AXImage", MD_A11Y_ROLE_IMAGE },
+    { "AXGroup", MD_A11Y_ROLE_PANEL },
+    { "AXList", MD_A11Y_ROLE_LIST },
+    { "AXTable", MD_A11Y_ROLE_TABLE },
+    { "AXRow", MD_A11Y_ROLE_TABLE_ROW },
+    { "AXColumn", MD_A11Y_ROLE_TABLE_COLUMN },
+    { "AXCell", MD_A11Y_ROLE_TABLE_CELL },
+    { "AXScrollArea", MD_A11Y_ROLE_SCROLL_PANE },
+    { "AXScrollBar", MD_A11Y_ROLE_SCROLL_BAR },
+    { "AXSlider", MD_A11Y_ROLE_SLIDER },
+    { "AXMenuBar", MD_A11Y_ROLE_MENU },
+    { "AXMenu", MD_A11Y_ROLE_MENU },
+    { "AXMenuItem", MD_A11Y_ROLE_MENU_ITEM },
+    { "AXToolbar", MD_A11Y_ROLE_TOOL_BAR },
+    { "AXTabGroup", MD_A11Y_ROLE_PAGE_TAB_LIST },
+    { "AXTab", MD_A11Y_ROLE_TAB },
+    { "AXComboBox", MD_A11Y_ROLE_COMBO_BOX },
+    { "AXPopUpButton", MD_A11Y_ROLE_COMBO_BOX },
+    { "AXProgressIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXLink", MD_A11Y_ROLE_LINK },
+    { "AXWebArea", MD_A11Y_ROLE_DOCUMENT_WEB },
+    { "AXSheet", MD_A11Y_ROLE_DIALOG },
+    { "AXDialog", MD_A11Y_ROLE_DIALOG },
+    { "AXSplitGroup", MD_A11Y_ROLE_SPLIT_PANE },
+    { "AXOutline", MD_A11Y_ROLE_TREE },
+    { "AXOutlineRow", MD_A11Y_ROLE_TREE_ITEM },
+    { "AXHeading", MD_A11Y_ROLE_HEADING },
+    { "AXMenuBarItem", MD_A11Y_ROLE_MENU_ITEM },
+    { "AXValueIndicator", MD_A11Y_ROLE_LABEL },
+    { "AXSplitter", MD_A11Y_ROLE_SEPARATOR },
+    { "AXDisclosureTriangle", MD_A11Y_ROLE_TOGGLE_BUTTON },
+    { "AXMenuButton", MD_A11Y_ROLE_BUTTON },
+    { "AXColorWell", MD_A11Y_ROLE_COLOR_CHOOSER },
+    { "AXDateField", MD_A11Y_ROLE_DATE_EDITOR },
+    { "AXTimeField", MD_A11Y_ROLE_DATE_EDITOR },
+    { "AXIncrementor", MD_A11Y_ROLE_SPIN_BUTTON },
+    { "AXLevelIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXBusyIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXGrid", MD_A11Y_ROLE_TABLE },
+    { "AXDockItem", MD_A11Y_ROLE_BUTTON },
+    { "AXRadioGroup", MD_A11Y_ROLE_PANEL },
+    { "AXPopover", MD_A11Y_ROLE_DIALOG },
+    { "AXListMarker", MD_A11Y_ROLE_LABEL },
+    { "AXOpaqueProviderGroup", MD_A11Y_ROLE_PANEL },
+    { "AXRuler", MD_A11Y_ROLE_UNKNOWN },
+    { "AXRulerMarker", MD_A11Y_ROLE_UNKNOWN },
+    { "AXUnknown", MD_A11Y_ROLE_UNKNOWN },
+    { "AXSystemWide", MD_A11Y_ROLE_UNKNOWN },
+};
 
-    /* Map common AX roles to platform-neutral names */
-    if (strcmp(ax_role, "AXApplication") == 0)  return "application";
-    if (strcmp(ax_role, "AXWindow") == 0)       return "window";
-    if (strcmp(ax_role, "AXButton") == 0)       return "push button";
-    if (strcmp(ax_role, "AXCheckBox") == 0)     return "check box";
-    if (strcmp(ax_role, "AXRadioButton") == 0)  return "radio button";
-    if (strcmp(ax_role, "AXTextField") == 0)    return "text";
-    if (strcmp(ax_role, "AXTextArea") == 0)     return "text";
-    if (strcmp(ax_role, "AXStaticText") == 0)   return "label";
-    if (strcmp(ax_role, "AXImage") == 0)        return "image";
-    if (strcmp(ax_role, "AXGroup") == 0)        return "panel";
-    if (strcmp(ax_role, "AXList") == 0)         return "list";
-    if (strcmp(ax_role, "AXTable") == 0)        return "table";
-    if (strcmp(ax_role, "AXRow") == 0)          return "table row";
-    if (strcmp(ax_role, "AXColumn") == 0)       return "table column";
-    if (strcmp(ax_role, "AXCell") == 0)         return "table cell";
-    if (strcmp(ax_role, "AXScrollArea") == 0)   return "scroll pane";
-    if (strcmp(ax_role, "AXScrollBar") == 0)    return "scroll bar";
-    if (strcmp(ax_role, "AXSlider") == 0)       return "slider";
-    if (strcmp(ax_role, "AXMenuBar") == 0)      return "menu bar";
-    if (strcmp(ax_role, "AXMenu") == 0)         return "menu";
-    if (strcmp(ax_role, "AXMenuItem") == 0)     return "menu item";
-    if (strcmp(ax_role, "AXToolbar") == 0)      return "tool bar";
-    if (strcmp(ax_role, "AXTabGroup") == 0)     return "page tab list";
-    if (strcmp(ax_role, "AXTab") == 0)          return "page tab";
-    if (strcmp(ax_role, "AXComboBox") == 0)     return "combo box";
-    if (strcmp(ax_role, "AXPopUpButton") == 0)  return "combo box";
-    if (strcmp(ax_role, "AXProgressIndicator") == 0) return "progress bar";
-    if (strcmp(ax_role, "AXLink") == 0)         return "link";
-    if (strcmp(ax_role, "AXWebArea") == 0)      return "document web";
-    if (strcmp(ax_role, "AXSheet") == 0)        return "dialog";
-    if (strcmp(ax_role, "AXDialog") == 0)       return "dialog";
-    if (strcmp(ax_role, "AXSplitGroup") == 0)   return "split pane";
-    if (strcmp(ax_role, "AXOutline") == 0)      return "tree";
-    if (strcmp(ax_role, "AXOutlineRow") == 0)   return "tree item";
-    if (strcmp(ax_role, "AXHeading") == 0)      return "heading";
-
-    /* Fallback: strip "AX" prefix and lowercase for unrecognized roles.
-     * e.g. "AXSystemWide" → "systemwide", "AXBrowser" → "browser" */
-    if (strncmp(ax_role, "AX", 2) == 0 && ax_role[2] != '\0') {
-        static _Thread_local char fallback[128];
-        const char *src = ax_role + 2;
-        size_t i = 0;
-        for (; src[i] && i < sizeof(fallback) - 1; i++)
-            fallback[i] = (char)tolower((unsigned char)src[i]);
-        fallback[i] = '\0';
-        return fallback;
+/* Used by the native drift test; iterates the actual production mapping. */
+size_t md_a11y_axui_role_mapping_count(void) {
+    return sizeof(ax_roles) / sizeof(ax_roles[0]);
+}
+enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index) {
+    return index < md_a11y_axui_role_mapping_count()
+        ? ax_roles[index].role : MD_A11Y_ROLE_UNKNOWN;
+}
+/* Bounded process-lifetime set. Once full, suppress new diagnostics rather
+ * than logging repeatedly; store complete names to avoid truncation collisions. */
+static void log_unmapped_role_once(const char *role) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static char *seen[32];
+    static size_t count;
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(seen[i], role) == 0) {
+            pthread_mutex_unlock(&lock);
+            return;
+        }
     }
-
-    return ax_role;
+    if (count < sizeof(seen) / sizeof(seen[0])) {
+        char *copy = strdup(role);
+        if (copy) {
+            seen[count++] = copy;
+            MD_LOG_I("unmapped AX role: %s", role);
+        }
+    }
+    pthread_mutex_unlock(&lock);
 }
 
+static const char *normalize_role(const char *ax_role) {
+    if (ax_role) {
+        for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++)
+            if (strcmp(ax_role, ax_roles[i].ax_role) == 0)
+                return md_a11y_role_name(ax_roles[i].role);
+        log_unmapped_role_once(ax_role);
+    }
+    return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
+}
 
-
-
+/* Native test seams exercise the production string mapping without CF. */
+const char *md_a11y_axui_normalize_role(const char *ax_role) {
+    return normalize_role(ax_role);
+}
+const char *md_a11y_axui_native_role_at(size_t index) {
+    return index < md_a11y_axui_role_mapping_count() ? ax_roles[index].ax_role : NULL;
+}
 
 /* ── Tree walking ────────────────────────────────────────────── */
 
@@ -227,8 +276,8 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
         node->label = vals ? batch_get_string(vals, AX_DESC) : NULL;
     }
     if (!node->label || node->label[0] == '\0') {
-        if (node->role && (strcmp(node->role, "label") == 0 ||
-                          strcmp(node->role, "text") == 0)) {
+        enum MdA11yRole role = md_a11y_role_lookup(node->role);
+        if (role == MD_A11Y_ROLE_LABEL || role == MD_A11Y_ROLE_TEXT) {
             free(node->label);
             node->label = vals ? batch_get_string(vals, AX_VALUE) : NULL;
         }
@@ -244,25 +293,25 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
             CFTypeRef v = CFArrayGetValueAtIndex(vals, AX_ENABLED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("enabled");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_ENABLED));
 
             /* Focused */
             v = CFArrayGetValueAtIndex(vals, AX_FOCUSED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("focused");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSED));
 
             /* Selected */
             v = CFArrayGetValueAtIndex(vals, AX_SELECTED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("selected");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_SELECTED));
 
             /* Visible/showing if position exists */
             v = CFArrayGetValueAtIndex(vals, AX_POS);
             if (v && v != kCFNull) {
-                states[scount++] = strdup("visible");
-                states[scount++] = strdup("showing");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_VISIBLE));
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_SHOWING));
             }
         }
 
@@ -580,7 +629,7 @@ static int axui_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     if (!root) return -1;
 
     root->id = strdup("desktop");
-    root->role = strdup("desktop");
+    root->role = strdup(md_a11y_role_name(MD_A11Y_ROLE_DESKTOP));
     root->label = strdup("Desktop");
 
     /* Get all running applications */
@@ -794,7 +843,14 @@ static void axui_destroy(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+static bool axui_is_connected(const MdA11yCtx *ctx) {
+    const AXUIState *st = ctx->backend_data;
+    /* Tree walks need trust, not observers: change subscriptions are optional. */
+    return st && st->connected && AXIsProcessTrusted();
+}
+
 static const MdA11yBackend axui_backend = {
+    .is_connected      = axui_is_connected,
     .init              = axui_init,
     .get_tree          = axui_get_tree,
     .subscribe_changes   = axui_subscribe_changes,
