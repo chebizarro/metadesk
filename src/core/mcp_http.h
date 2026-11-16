@@ -30,7 +30,7 @@ typedef struct {
     const char   *bind_addr;     /* NULL for localhost only            */
     uint16_t      port;          /* 0 for default (7710)              */
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
-    int           sse_write_timeout_ms; /* per-client event budget; <=0: 2000ms */
+    int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
 } MdMcpHttpConfig;
 
 /* Create an HTTP+SSE transport.

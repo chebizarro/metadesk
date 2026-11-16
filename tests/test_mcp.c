@@ -1641,6 +1641,91 @@ static bool latch_wait_ms(TestLatch *l, int timeout_ms)
     return ready;
 }
 
+typedef struct {
+    MdMcpServer *server;
+    TestLatch entered, release, notified;
+    int request_writes, default_writes;
+    int notify_rc, set_rc, quiesced_rc, dispatch_rc;
+    bool released;
+} SinkFixture;
+
+static int request_sink(const char *json, size_t len, void *userdata)
+{
+    (void)json; (void)len;
+    ((SinkFixture *)userdata)->request_writes++;
+    return 0;
+}
+
+static int default_sink(const char *json, size_t len, void *userdata)
+{
+    (void)json; (void)len;
+    ((SinkFixture *)userdata)->default_writes++;
+    return 0;
+}
+
+static cJSON *blocked_sink_tool(const cJSON *args, bool *is_error,
+                                char **error_msg, void *userdata)
+{
+    (void)args; (void)is_error; (void)error_msg;
+    SinkFixture *f = userdata;
+    md_mcp_server_notify_resource_updated(f->server, MD_MCP_URI_UI_TREE);
+    latch_post(&f->entered);
+    f->released = latch_wait_ms(&f->release, 5000);
+    return cJSON_CreateArray();
+}
+
+static void *sink_dispatch_thread(void *userdata)
+{
+    SinkFixture *f = userdata;
+    const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+                           "\"params\":{\"name\":\"blocked\"}}";
+    f->dispatch_rc = md_mcp_server_handle_message_with_sink(
+        f->server, request, sizeof(request) - 1, request_sink, f);
+    return NULL;
+}
+
+static void *sink_notify_thread(void *userdata)
+{
+    SinkFixture *f = userdata;
+    f->notify_rc = md_mcp_server_notify_resource_updated(f->server, MD_MCP_URI_UI_TREE);
+    f->set_rc = md_mcp_server_set_write_fn(f->server, default_sink, f);
+    md_mcp_server_quiesce(f->server);
+    f->quiesced_rc = md_mcp_server_notify_resource_updated(f->server, MD_MCP_URI_UI_TREE);
+    latch_post(&f->notified);
+    return NULL;
+}
+
+static void test_notification_during_dispatch(void)
+{
+    SinkFixture f = {0};
+    latch_init(&f.entered); latch_init(&f.release); latch_init(&f.notified);
+    MdMcpServerConfig cfg = { .write_fn = default_sink, .write_userdata = &f };
+    f.server = md_mcp_server_create(&cfg);
+    MD_CHECK(f.server != NULL);
+    md_test_mcp_handshake(f.server);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(f.server, subscribe, sizeof(subscribe) - 1) == 0);
+    MdMcpTool tool = { .name = "blocked", .handler = blocked_sink_tool, .userdata = &f };
+    MD_CHECK(md_mcp_server_register_tool(f.server, &tool) == 0);
+    f.default_writes = 0;
+    pthread_t dispatch, notify;
+    MD_CHECK(pthread_create(&dispatch, NULL, sink_dispatch_thread, &f) == 0);
+    MD_CHECK(latch_wait_ms(&f.entered, 2000));
+    MD_CHECK(pthread_create(&notify, NULL, sink_notify_thread, &f) == 0);
+    /* All three sink operations must finish while the tool still waits. */
+    MD_CHECK(latch_wait_ms(&f.notified, 1000));
+    latch_post(&f.release);
+    MD_CHECK(pthread_join(notify, NULL) == 0);
+    MD_CHECK(pthread_join(dispatch, NULL) == 0);
+    MD_CHECK(f.released && f.dispatch_rc == 0);
+    MD_CHECK(f.notify_rc == 0 && f.set_rc == 0 && f.quiesced_rc == -1);
+    MD_CHECK(f.request_writes == 2 && f.default_writes == 1);
+    md_mcp_server_destroy(f.server);
+    latch_fini(&f.entered); latch_fini(&f.release); latch_fini(&f.notified);
+    PASS("notification routing and quiesce do not wait for a blocked tool dispatch");
+}
+
 static void test_notification_quiesce(void)
 {
     MdMcpServerConfig cfg = { .write_fn = capture_write };
@@ -1860,6 +1945,7 @@ int main(int argc, char **argv)
     test_resources_read();
     test_resources_subscribe();
     test_notification_quiesce();
+    test_notification_during_dispatch();
     test_unknown_method();
     test_parse_error();
     test_init_capabilities_reflect_registrations();

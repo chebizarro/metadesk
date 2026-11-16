@@ -16,6 +16,7 @@
  * failure counter.
  */
 #include <stdio.h>
+#include "io_util.h"
 
 static int md_test_failures = 0;
 static int md_test_checks   = 0;

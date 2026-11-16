@@ -32,11 +32,14 @@ struct MdMcpServer {
     /* State */
     _Atomic int      init_state;
     pthread_mutex_t  sub_mu;   /* protects subscriptions only */
-    pthread_mutex_t  dispatch_mu; /* serializes dispatch and sink selection */
-    bool            quiesced;    /* protected by dispatch_mu */
+    pthread_mutex_t  dispatch_mu; /* serializes request dispatch */
+    pthread_mutex_t  sink_mu;     /* short-lived sink/owner metadata lock */
+    bool            quiesced;    /* protected by sink_mu */
+    bool            dispatch_active;
+    pthread_t       dispatch_owner;
 
-    /* Per-request response sink (set only while dispatching under
-     * dispatch_mu). When active, responses go here instead of write_fn. */
+    /* Per-request sink and owner are published under sink_mu. Only the
+     * dispatch owner may use this sink; other threads use write_fn. */
     MdMcpWriteFn     active_sink;
     void            *active_sink_ud;
 
@@ -58,8 +61,10 @@ struct MdMcpServer {
 static int send_json(MdMcpServer *s, char *json)
 {
     if (!json) return -1;
+    pthread_mutex_lock(&s->sink_mu);
     MdMcpWriteFn fn = s->active_sink ? s->active_sink : s->write_fn;
     void *ud = s->active_sink ? s->active_sink_ud : s->write_userdata;
+    pthread_mutex_unlock(&s->sink_mu);
     if (!fn) { free(json); return -1; }  /* no transport wired yet: drop */
     int rc = fn(json, strlen(json), ud);
     free(json);
@@ -356,13 +361,20 @@ int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
         return -1;
 
     pthread_mutex_lock(&server->dispatch_mu);
+    pthread_mutex_lock(&server->sink_mu);
+    server->dispatch_active = true;
+    server->dispatch_owner = pthread_self();
     server->active_sink = sink;
     server->active_sink_ud = sink_ud;
+    pthread_mutex_unlock(&server->sink_mu);
 
     int rc = dispatch_message(server, json, len);
 
+    pthread_mutex_lock(&server->sink_mu);
+    server->dispatch_active = false;
     server->active_sink = NULL;
     server->active_sink_ud = NULL;
+    pthread_mutex_unlock(&server->sink_mu);
     pthread_mutex_unlock(&server->dispatch_mu);
     return rc;
 }
@@ -463,13 +475,17 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
         atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED)
         return -1;
 
-    pthread_mutex_lock(&server->dispatch_mu);
+    pthread_mutex_lock(&server->sink_mu);
     if (server->quiesced) {
-        pthread_mutex_unlock(&server->dispatch_mu);
+        pthread_mutex_unlock(&server->sink_mu);
         return -1;
     }
-    MdMcpWriteFn fn = server->active_sink ? server->active_sink : server->write_fn;
-    void *ud = server->active_sink ? server->active_sink_ud : server->write_userdata;
+    bool own_sink = server->dispatch_active &&
+                    pthread_equal(server->dispatch_owner, pthread_self()) &&
+                    server->active_sink;
+    MdMcpWriteFn fn = own_sink ? server->active_sink : server->write_fn;
+    void *ud = own_sink ? server->active_sink_ud : server->write_userdata;
+    pthread_mutex_unlock(&server->sink_mu);
 
     /* Check if subscribed (protected by sub_mu) */
     pthread_mutex_lock(&server->sub_mu);
@@ -481,13 +497,13 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
         }
     }
     pthread_mutex_unlock(&server->sub_mu);
-    pthread_mutex_unlock(&server->dispatch_mu);
     if (!subscribed) return 0;
     if (!fn) return -1;
 
     /* A copied sink may run after quiesce. Transport writes must be bounded,
      * and callers must drain notifications before freeing the transport.
-     * During dispatch the outer recursive lock keeps active_sink alive. */
+     * Only the dispatch owner uses active_sink, so its lifetime is local to
+     * that request. No event thread waits for dispatch_mu. */
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "uri", uri);
 
@@ -502,9 +518,9 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
 void md_mcp_server_quiesce(MdMcpServer *server)
 {
     if (!server) return;
-    pthread_mutex_lock(&server->dispatch_mu);
+    pthread_mutex_lock(&server->sink_mu);
     server->quiesced = true;
-    pthread_mutex_unlock(&server->dispatch_mu);
+    pthread_mutex_unlock(&server->sink_mu);
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
@@ -526,12 +542,9 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->write_userdata = config->write_userdata;
     atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
     pthread_mutex_init(&s->sub_mu, NULL);
-    /* Tool handlers may emit a notification during request dispatch. */
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&s->dispatch_mu, &attr);
-    pthread_mutexattr_destroy(&attr);
+    /* Nested request dispatch remains unsupported (non-recursive). */
+    pthread_mutex_init(&s->dispatch_mu, NULL);
+    pthread_mutex_init(&s->sink_mu, NULL);
 
     return s;
 }
@@ -552,6 +565,7 @@ void md_mcp_server_destroy(MdMcpServer *server)
 
     pthread_mutex_destroy(&server->sub_mu);
     pthread_mutex_destroy(&server->dispatch_mu);
+    pthread_mutex_destroy(&server->sink_mu);
     free(server->server_name);
     free(server->server_version);
     free(server);
@@ -635,9 +649,9 @@ int md_mcp_server_set_write_fn(MdMcpServer *server,
     if (!server)
         return -1;
 
-    pthread_mutex_lock(&server->dispatch_mu);
+    pthread_mutex_lock(&server->sink_mu);
     server->write_fn = write_fn;
     server->write_userdata = write_userdata;
-    pthread_mutex_unlock(&server->dispatch_mu);
+    pthread_mutex_unlock(&server->sink_mu);
     return 0;
 }

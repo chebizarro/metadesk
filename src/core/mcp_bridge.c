@@ -187,9 +187,10 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
 {
     if (!bridge) return;
 
-    /* Stop new notifications before draining the callback. A notification
-     * that already copied its sink finishes within the transport write budget.
-     * Everything it touches (resource_ctx, server, snapshot) stays alive. */
+    /* Stop new notifications before draining the callback. Transport work
+     * is bounded by one write timeout (the entire SSE broadcast), plus any
+     * in-flight dispatch using the serialized output. This does not impose
+     * a deadline on tool execution itself. Keep callback dependencies alive. */
     md_mcp_server_quiesce(bridge->server);
     if (bridge->a11y_subscribed) {
         md_a11y_unsubscribe_changes(bridge->a11y);

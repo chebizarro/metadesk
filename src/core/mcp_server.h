@@ -117,7 +117,8 @@ int md_mcp_server_handle_message(MdMcpServer *server,
  * server's write_fn; server-initiated notifications continue to use
  * write_fn. This is the correct channel for request/response transports
  * (HTTP) — no thread-local routing, no mutable global.
- * Dispatch is serialized across concurrent callers.
+ * Dispatch is serialized across concurrent callers. Nested dispatch on the
+ * same server is unsupported (the dispatch mutex is non-recursive).
  * Returns 0 on success, -1 on error. */
 int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
                                            const char *json, size_t len,

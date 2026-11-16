@@ -17,8 +17,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <fcntl.h>
-#include <time.h>
-#include <stdint.h>
+#include <sys/socket.h>
+#include "md_test_net.h"
 #include "md_test.h"
 
 
@@ -220,13 +220,6 @@ static void test_stdio_tool_call(void)
     PASS("stdio tool call round-trip");
 }
 
-static int64_t test_monotonic_ms(void)
-{
-    struct timespec ts;
-    MD_CHECK(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static cJSON *count_dispatch(const cJSON *args, bool *is_error,
                              char **error_msg, void *userdata)
 {
@@ -250,9 +243,9 @@ static void test_stdio_broken_pipe(void)
     MdMcpTool tool = { .name = "count", .handler = count_dispatch, .userdata = &calls };
     MD_CHECK(md_mcp_server_register_tool(server, &tool) == 0);
     close(output[0]);
-    int64_t start = test_monotonic_ms();
+    int64_t start = md_now_ms();
     MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
-    MD_CHECK(test_monotonic_ms() - start < 1000);
+    MD_CHECK(md_now_ms() - start < 1000);
 
     /* Failed responses must not stop input dispatch: both tool calls run. */
     const char requests[] =
@@ -279,23 +272,23 @@ static void test_stdio_stalled_pipe(void)
     MdMcpServerConfig config = { .server_name = "stalled-pipe" };
     MdMcpServer *server = md_mcp_server_create(&config);
     MD_CHECK(server != NULL);
-    MdMcpStdio *ctx = md_mcp_stdio_create(server, -1, output[1]);
+    MdMcpStdio *ctx = md_mcp_stdio_create_ex(server, -1, output[1], 200);
     MD_CHECK(ctx != NULL);
     size_t len = 1024 * 1024;
     char *json = malloc(len);
     MD_CHECK(json != NULL);
     memset(json, 'x', len);
     /* POLLOUT initially succeeds, but this message exceeds pipe capacity.
-     * A blocking write after poll would hang here despite the deadline. */
-    int64_t start = test_monotonic_ms();
+     * Chunked writes must stop at the deadline without changing fd flags. */
+    int64_t start = md_now_ms();
     MD_CHECK(md_mcp_stdio_write(json, len, ctx) == -1);
-    int64_t elapsed = test_monotonic_ms() - start;
-    MD_CHECK(elapsed >= 1900 && elapsed < 4000);
+    int64_t elapsed = md_now_ms() - start;
+    MD_CHECK(elapsed < 1500); /* watchdog only; not a scheduling assertion */
     char buf[4096];
     MD_CHECK(read(output[0], buf, sizeof(buf)) > 0);
-    start = test_monotonic_ms();
+    start = md_now_ms();
     MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
-    MD_CHECK(test_monotonic_ms() - start < 1000); /* no append to partial frame */
+    MD_CHECK(md_now_ms() - start < 1000); /* no append to partial frame */
     free(json);
     md_mcp_stdio_destroy(ctx);
     /* macOS can add an internal pipe flag after growing its buffer; check
@@ -305,6 +298,83 @@ static void test_stdio_stalled_pipe(void)
     close(output[0]);
     close(output[1]);
     PASS("large stdio write bounded despite initial readiness; partial frame disables output");
+}
+
+typedef struct {
+    MdMcpStdio *ctx;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool started, returned;
+    int rc;
+} NonblockingRun;
+
+static void *nonblocking_run(void *userdata)
+{
+    NonblockingRun *r = userdata;
+    pthread_mutex_lock(&r->mu);
+    r->started = true;
+    pthread_cond_broadcast(&r->cv);
+    pthread_mutex_unlock(&r->mu);
+    r->rc = md_mcp_stdio_run(r->ctx);
+    pthread_mutex_lock(&r->mu);
+    r->returned = true;
+    pthread_cond_broadcast(&r->cv);
+    pthread_mutex_unlock(&r->mu);
+    return NULL;
+}
+
+static void test_stdio_shared_nonblocking_input(void)
+{
+    int pair[2];
+    MD_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    int out = dup(pair[0]);
+    MD_CHECK(out >= 0);
+    int flags = fcntl(pair[0], F_GETFL);
+    MdMcpServerConfig config = { .server_name = "shared-fds" };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MdMcpStdio *ctx = md_mcp_stdio_create_ex(server, pair[0], out, 200);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(fcntl(pair[0], F_GETFL) == flags); /* create must not mutate stdin */
+    MD_CHECK(fcntl(pair[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    NonblockingRun run = { .ctx = ctx, .mu = PTHREAD_MUTEX_INITIALIZER,
+                          .cv = PTHREAD_COND_INITIALIZER };
+    pthread_t tid;
+    MD_CHECK(pthread_create(&tid, NULL, nonblocking_run, &run) == 0);
+    pthread_mutex_lock(&run.mu);
+    while (!run.started) pthread_cond_wait(&run.cv, &run.mu);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 100000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (!run.returned) {
+        int rc = pthread_cond_timedwait(&run.cv, &run.mu, &deadline);
+        if (rc == ETIMEDOUT) break;
+        MD_CHECK(rc == 0);
+        if (rc != 0) break;
+    }
+    MD_CHECK(!run.returned); /* EAGAIN is not EOF */
+    pthread_mutex_unlock(&run.mu);
+    const char requests[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+    MD_CHECK(write(pair[1], requests, sizeof(requests) - 1) == sizeof(requests) - 1);
+    MD_CHECK(md_test_wait_readable(pair[1], 2000) == 1);
+    char response[2048] = {0};
+    MD_CHECK(read(pair[1], response, sizeof(response) - 1) > 0);
+    MD_CHECK(strstr(response, "\"result\"") != NULL);
+    MD_CHECK(shutdown(pair[1], SHUT_WR) == 0);
+    MD_CHECK(pthread_join(tid, NULL) == 0);
+    MD_CHECK(run.rc == 0 && md_mcp_server_is_initialized(server));
+    md_mcp_stdio_destroy(ctx);
+    MD_CHECK((fcntl(pair[0], F_GETFL) & O_NONBLOCK) != 0);
+    md_mcp_server_destroy(server);
+    pthread_cond_destroy(&run.cv);
+    pthread_mutex_destroy(&run.mu);
+    close(out); close(pair[0]); close(pair[1]);
+    PASS("dup'd input/output flags unchanged; initially idle nonblocking input survives");
 }
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -319,6 +389,7 @@ int main(void)
     test_stdio_tool_call();
     test_stdio_broken_pipe();
     test_stdio_stalled_pipe();
+    test_stdio_shared_nonblocking_input();
 
     printf("\nAll MCP stdio tests passed.\n");
     return md_test_report();

@@ -16,7 +16,7 @@
 #include "log.h"
 #include <fcntl.h>
 #include <poll.h>
-#include <time.h>
+#include "io_util.h"
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +41,13 @@
 
 /* ── Server struct ───────────────────────────────────────────── */
 
+typedef struct {
+    int fd;
+    bool ready; /* false while the handler owns the header write */
+    size_t sent;
+    bool failed;
+} SseClient;
+
 struct MdMcpHttp {
     MdMcpServer    *mcp_server;
     int             listen_fd;
@@ -48,7 +55,7 @@ struct MdMcpHttp {
     atomic_bool     shutdown;
 
     /* SSE client file descriptors */
-    int            *sse_clients;
+    SseClient      *sse_clients;
     int             sse_count;
     int             sse_max_clients;
     int             sse_write_timeout_ms;
@@ -158,59 +165,7 @@ int md_mcp_http_write(const char *json, size_t len, void *userdata)
 
 /* ── HTTP response helpers ───────────────────────────────────── */
 
-static int write_all(int fd, const void *buf, size_t len)
-{
-    const char *p = (const char *)buf;
-    while (len > 0) {
-#ifdef MSG_NOSIGNAL
-        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-#else
-        ssize_t n = send(fd, p, len, 0); /* SO_NOSIGPIPE set on accept */
-#endif
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int64_t monotonic_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* SSE sockets are nonblocking: poll readiness alone cannot bound a large
- * blocking send. All pieces of one event share the same deadline. */
-static int sse_write_all(int fd, const char *buf, size_t len, int64_t deadline)
-{
-    while (len > 0) {
-        int64_t remaining = deadline - monotonic_ms();
-        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
-        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-        int rc = poll(&pfd, 1, (int)remaining);
-        if (rc < 0 && errno == EINTR) continue;
-        if (rc == 0) { errno = ETIMEDOUT; return -1; }
-        if (rc < 0) return -1;
-#ifdef MSG_NOSIGNAL
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-#else
-        ssize_t n = send(fd, buf, len, 0);
-#endif
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-            continue;
-        if (n <= 0) return -1;
-        buf += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static void send_http_response(int fd, int status, const char *status_text,
+static void send_http_response(MdMcpHttp *h, int fd, int status, const char *status_text,
                                const char *content_type,
                                const char *body, size_t body_len)
 {
@@ -223,17 +178,20 @@ static void send_http_response(int fd, int status, const char *status_text,
         "\r\n",
         status, status_text, content_type, body_len);
 
-    if (hlen > 0)
-        write_all(fd, header, (size_t)hlen);
+    int64_t deadline = md_now_ms() + h->sse_write_timeout_ms;
+    if (hlen <= 0 || (size_t)hlen >= sizeof(header) ||
+        md_fd_write_deadline(fd, header, (size_t)hlen, deadline, true, NULL) < 0)
+        return;
     if (body && body_len > 0)
-        write_all(fd, body, body_len);
+        md_fd_write_deadline(fd, body, body_len, deadline, true, NULL);
+    /* The handler always closes the fd, including on timeout/partial reply. */
 }
 
 /* Plain-text error/short response — length computed, never hand-counted. */
-static void send_http_text(int fd, int status, const char *status_text,
+static void send_http_text(MdMcpHttp *h, int fd, int status, const char *status_text,
                            const char *msg)
 {
-    send_http_response(fd, status, status_text, "text/plain",
+    send_http_response(h, fd, status, status_text, "text/plain",
                        msg, strlen(msg));
 }
 
@@ -245,7 +203,7 @@ static int send_sse_headers(int fd, int64_t deadline)
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
-    return sse_write_all(fd, headers, strlen(headers), deadline);
+    return md_fd_write_deadline(fd, headers, strlen(headers), deadline, true, NULL);
 }
 
 /* ── Parse minimal HTTP request ──────────────────────────────── */
@@ -365,8 +323,15 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     /* Bound read waits so idle connections cannot park a handler */
     struct timeval rcv_timeout = { .tv_sec = CLIENT_READ_TIMEOUT_SEC,
                                    .tv_usec = 0 };
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
-               &rcv_timeout, sizeof(rcv_timeout));
+    struct timeval snd_timeout = { .tv_sec = h->sse_write_timeout_ms / 1000,
+        .tv_usec = (h->sse_write_timeout_ms % 1000) * 1000 };
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &rcv_timeout, sizeof(rcv_timeout)) < 0 ||
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &snd_timeout, sizeof(snd_timeout)) < 0) {
+        close(client_fd);
+        return;
+    }
 
     /* Heap-allocate the request buffer to handle larger payloads */
     size_t buf_cap = READ_BUF_SIZE * 4;
@@ -390,7 +355,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             /* Check Content-Length and enforce limit */
             size_t content_len = 0;
             if (parse_content_length(buf, body_start, &content_len) < 0) {
-                send_http_text(client_fd, 400, "Bad Request",
+                send_http_text(h, client_fd, 400, "Bad Request",
                                "Invalid Content-Length\n");
                 free(buf);
                 close(client_fd);
@@ -399,7 +364,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
             /* Reject oversized requests */
             if (content_len > MAX_REQUEST_SIZE) {
-                send_http_text(client_fd, 413, "Content Too Large",
+                send_http_text(h, client_fd, 413, "Content Too Large",
                                "Request body too large\n");
                 free(buf);
                 close(client_fd);
@@ -427,7 +392,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
     HttpRequest req;
     if (parse_http_request(buf, total, &req) != 0) {
-        send_http_text(client_fd, 400, "Bad Request", "Bad request\n");
+        send_http_text(h, client_fd, 400, "Bad Request", "Bad request\n");
         free(buf);
         close(client_fd);
         return;
@@ -437,7 +402,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     /* All POSTs must carry JSON-RPC as application/json. */
     if (strcmp(req.method, "POST") == 0 &&
         !is_json_content_type(req.content_type)) {
-        send_http_text(client_fd, 415, "Unsupported Media Type",
+        send_http_text(h, client_fd, 415, "Unsupported Media Type",
                        "Unsupported media type\n");
         free(req.body);
         close(client_fd);
@@ -448,7 +413,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "POST") == 0) {
         /* JSON-RPC request */
         if (!req.body || req.body_len == 0) {
-            send_http_text(client_fd, 400, "Bad Request", "Empty body\n");
+            send_http_text(h, client_fd, 400, "Bad Request", "Empty body\n");
         } else {
             /* Dispatch to MCP server with a per-request capture sink —
              * this request's response(s) come back through it. */
@@ -462,41 +427,52 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             capture_free(&capture);
 
             if (capture_failed) {
-                send_http_text(client_fd, 500, "Internal Server Error",
+                send_http_text(h, client_fd, 500, "Internal Server Error",
                                "Response capture failed\n");
             } else if (resp) {
-                send_http_response(client_fd, 200, "OK",
+                send_http_response(h, client_fd, 200, "OK",
                                    "application/json", resp, strlen(resp));
                 free(resp);
             } else {
-                send_http_text(client_fd, 202, "Accepted", "");
+                send_http_text(h, client_fd, 202, "Accepted", "");
             }
         }
         free(req.body);
         close(client_fd);
 
     } else if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "GET") == 0) {
-        /* Publish headers and registration under one lock: a client that
-         * sees the headers can immediately receive the next broadcast. */
-        int flags = fcntl(client_fd, F_GETFL);
-        if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        pthread_mutex_lock(&h->sse_mu);
+        if (h->sse_count >= h->sse_max_clients || atomic_load(&h->shutdown)) {
+            pthread_mutex_unlock(&h->sse_mu);
+            send_http_text(h, client_fd, 503, "Service Unavailable", "SSE capacity exhausted\n");
             free(req.body);
             close(client_fd);
             return;
         }
+        /* Reserve capacity, but broadcasts skip this fd until headers finish.
+         * The handler owns it while unready; shutdown must not close/reuse it. */
+        h->sse_clients[h->sse_count++] = (SseClient){ .fd = client_fd };
+        pthread_mutex_unlock(&h->sse_mu);
+
+        int flags = fcntl(client_fd, F_GETFL);
+        bool ready = flags >= 0 && fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+            send_sse_headers(client_fd, md_now_ms() + h->sse_write_timeout_ms) == 0;
         pthread_mutex_lock(&h->sse_mu);
-        if (send_sse_headers(client_fd, monotonic_ms() + h->sse_write_timeout_ms) == 0 &&
-            h->sse_count < h->sse_max_clients) {
-            h->sse_clients[h->sse_count++] = client_fd;
-        } else {
-            close(client_fd);
+        for (int i = 0; i < h->sse_count; i++) {
+            if (h->sse_clients[i].fd != client_fd) continue;
+            if (ready && !atomic_load(&h->shutdown)) {
+                h->sse_clients[i].ready = true;
+            } else {
+                close(client_fd);
+                h->sse_clients[i] = h->sse_clients[--h->sse_count];
+            }
+            break;
         }
         pthread_mutex_unlock(&h->sse_mu);
-        /* Don't close — kept open for SSE */
         free(req.body);
 
     } else {
-        send_http_text(client_fd, 404, "Not Found", "Not found\n");
+        send_http_text(h, client_fd, 404, "Not Found", "Not found\n");
         free(req.body);
         close(client_fd);
     }
@@ -520,31 +496,37 @@ static void *handle_client_thread(void *arg) {
 
 /* ── SSE send ────────────────────────────────────────────────── */
 
-static int write_sse_data_lines(int fd, const char *data, size_t data_len,
-                                int64_t deadline)
+/* Encode once so each client can advance independently within one budget. */
+static char *make_sse_frame(const char *event, const char *data, size_t len,
+                             size_t *frame_len)
 {
-    if (data_len == 0)
-        return sse_write_all(fd, "data: \n", 7, deadline);
-
+    char header[128];
+    int hlen = event ? snprintf(header, sizeof(header), "event: %s\n", event) : 0;
+    if (hlen < 0 || (size_t)hlen >= sizeof(header) || len > (SIZE_MAX - 136) / 8)
+        return NULL;
+    size_t lines = 1;
+    for (size_t i = 0; i + 1 < len; i++)
+        if (data[i] == '\n') lines++;
+    char *frame = malloc((size_t)hlen + len + lines * 7 + 1);
+    if (!frame) return NULL;
+    char *out = frame;
+    memcpy(out, header, (size_t)hlen);
+    out += hlen;
     size_t pos = 0;
-    while (pos < data_len) {
+    do {
         const char *line = data + pos;
-        const char *nl = memchr(line, '\n', data_len - pos);
-        size_t line_len = nl ? (size_t)(nl - line) : data_len - pos;
-        if (line_len > 0 && line[line_len - 1] == '\r')
-            line_len--;
-
-        if (sse_write_all(fd, "data: ", 6, deadline) < 0 ||
-            (line_len > 0 && sse_write_all(fd, line, line_len, deadline) < 0) ||
-            sse_write_all(fd, "\n", 1, deadline) < 0)
-            return -1;
-
-        if (!nl)
-            break;
+        const char *nl = memchr(line, '\n', len - pos);
+        size_t n = nl ? (size_t)(nl - line) : len - pos;
+        if (n > 0 && line[n - 1] == '\r') n--;
+        memcpy(out, "data: ", 6); out += 6;
+        memcpy(out, line, n); out += n;
+        *out++ = '\n';
+        if (!nl) break;
         pos = (size_t)(nl - data) + 1;
-    }
-
-    return 0;
+    } while (pos < len);
+    *out++ = '\n';
+    *frame_len = (size_t)(out - frame);
+    return frame;
 }
 
 int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
@@ -552,38 +534,58 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
 {
     if (!http || !data) return -1;
 
+    size_t frame_len;
+    char *frame = make_sse_frame(event, data, data_len, &frame_len);
+    if (!frame) return -1;
     pthread_mutex_lock(&http->sse_mu);
-
-    for (int i = 0; i < http->sse_count; ) {
-        int ok = 0;
-        int64_t deadline = monotonic_ms() + http->sse_write_timeout_ms;
-
-        if (event) {
-            char event_buf[128];
-            int hlen = snprintf(event_buf, sizeof(event_buf),
-                                "event: %s\n", event);
-            if (hlen <= 0 || (size_t)hlen >= sizeof(event_buf) ||
-                sse_write_all(http->sse_clients[i], event_buf, (size_t)hlen, deadline) < 0)
-                ok = -1;
+    int64_t deadline = md_now_ms() + http->sse_write_timeout_ms;
+    struct pollfd *fds = calloc((size_t)http->sse_max_clients, sizeof(*fds));
+    if (!fds) {
+        pthread_mutex_unlock(&http->sse_mu);
+        free(frame);
+        return -1;
+    }
+    int pending = 0;
+    for (int i = 0; i < http->sse_count; i++) {
+        SseClient *c = &http->sse_clients[i];
+        c->sent = 0;
+        c->failed = false;
+        fds[i] = (struct pollfd){ .fd = c->ready ? c->fd : -1, .events = POLLOUT };
+        if (c->ready) pending++;
+    }
+    while (pending > 0) {
+        int64_t remaining = deadline - md_now_ms();
+        if (remaining <= 0) break;
+        int rc = poll(fds, (nfds_t)http->sse_count, (int)remaining);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) break;
+        for (int i = 0; i < http->sse_count; i++) {
+            if (fds[i].fd < 0 || !fds[i].revents) continue;
+            SseClient *c = &http->sse_clients[i];
+            ssize_t n = md_socket_write(c->fd, frame + c->sent, frame_len - c->sent);
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+            if (n <= 0) c->failed = true;
+            else c->sent += (size_t)n;
+            if (c->failed || c->sent == frame_len) {
+                fds[i].fd = -1;
+                pending--;
+            }
         }
-
-        if (ok == 0 &&
-            (write_sse_data_lines(http->sse_clients[i], data, data_len, deadline) < 0 ||
-             sse_write_all(http->sse_clients[i], "\n", 1, deadline) < 0))
-            ok = -1;
-
-        if (ok < 0) {
-            /* Log once per dropped client; keep delivering to healthy peers. */
+    }
+    for (int i = 0; i < http->sse_count; ) {
+        SseClient *c = &http->sse_clients[i];
+        if (c->ready && (c->failed || c->sent != frame_len)) {
             MD_LOG_W("dropping SSE client after failed or timed-out write");
-            close(http->sse_clients[i]);
-            http->sse_clients[i] = http->sse_clients[http->sse_count - 1];
-            http->sse_count--;
+            close(c->fd);
+            *c = http->sse_clients[--http->sse_count];
         } else {
             i++;
         }
     }
-
+    free(fds);
     pthread_mutex_unlock(&http->sse_mu);
+    free(frame);
     return 0;
 }
 
@@ -592,9 +594,14 @@ static void close_sse_clients(MdMcpHttp *http)
     if (!http) return;
 
     pthread_mutex_lock(&http->sse_mu);
-    for (int i = 0; i < http->sse_count; i++)
-        close(http->sse_clients[i]);
-    http->sse_count = 0;
+    for (int i = 0; i < http->sse_count; ) {
+        if (http->sse_clients[i].ready) {
+            close(http->sse_clients[i].fd);
+            http->sse_clients[i] = http->sse_clients[--http->sse_count];
+        } else {
+            i++; /* header writer owns this fd and observes shutdown */
+        }
+    }
     pthread_mutex_unlock(&http->sse_mu);
 }
 
