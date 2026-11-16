@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 #define MD_MCP_HTTP_DEFAULT_PORT 7710
+#define MD_MCP_SSE_WRITE_TIMEOUT_MS 2000
 
 typedef struct MdMcpHttp MdMcpHttp;
 
@@ -29,6 +30,7 @@ typedef struct {
     const char   *bind_addr;     /* NULL for localhost only            */
     uint16_t      port;          /* 0 for default (7710)              */
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
+    int           sse_write_timeout_ms; /* per-client event budget; <=0: 2000ms */
 } MdMcpHttpConfig;
 
 /* Create an HTTP+SSE transport.

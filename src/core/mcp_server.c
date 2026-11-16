@@ -32,7 +32,8 @@ struct MdMcpServer {
     /* State */
     _Atomic int      init_state;
     pthread_mutex_t  sub_mu;   /* protects subscriptions only */
-    pthread_mutex_t  dispatch_mu; /* serializes request dispatch */
+    pthread_mutex_t  dispatch_mu; /* serializes dispatch and sink selection */
+    bool            quiesced;    /* protected by dispatch_mu */
 
     /* Per-request response sink (set only while dispatching under
      * dispatch_mu). When active, responses go here instead of write_fn. */
@@ -462,6 +463,14 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
         atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED)
         return -1;
 
+    pthread_mutex_lock(&server->dispatch_mu);
+    if (server->quiesced) {
+        pthread_mutex_unlock(&server->dispatch_mu);
+        return -1;
+    }
+    MdMcpWriteFn fn = server->active_sink ? server->active_sink : server->write_fn;
+    void *ud = server->active_sink ? server->active_sink_ud : server->write_userdata;
+
     /* Check if subscribed (protected by sub_mu) */
     pthread_mutex_lock(&server->sub_mu);
     bool subscribed = false;
@@ -472,14 +481,30 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
         }
     }
     pthread_mutex_unlock(&server->sub_mu);
+    pthread_mutex_unlock(&server->dispatch_mu);
     if (!subscribed) return 0;
+    if (!fn) return -1;
 
+    /* A copied sink may run after quiesce. Transport writes must be bounded,
+     * and callers must drain notifications before freeing the transport.
+     * During dispatch the outer recursive lock keeps active_sink alive. */
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "uri", uri);
 
     char *json = md_jsonrpc_make_notification(
         "notifications/resources/updated", params);
-    return send_json(server, json);
+    if (!json) return -1;
+    int rc = fn(json, strlen(json), ud);
+    free(json);
+    return rc;
+}
+
+void md_mcp_server_quiesce(MdMcpServer *server)
+{
+    if (!server) return;
+    pthread_mutex_lock(&server->dispatch_mu);
+    server->quiesced = true;
+    pthread_mutex_unlock(&server->dispatch_mu);
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
@@ -501,7 +526,12 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->write_userdata = config->write_userdata;
     atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
     pthread_mutex_init(&s->sub_mu, NULL);
-    pthread_mutex_init(&s->dispatch_mu, NULL);
+    /* Tool handlers may emit a notification during request dispatch. */
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s->dispatch_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
 
     return s;
 }
@@ -602,10 +632,12 @@ int md_mcp_server_set_write_fn(MdMcpServer *server,
                                MdMcpWriteFn write_fn,
                                void *write_userdata)
 {
-    if (!server || !write_fn)
+    if (!server)
         return -1;
 
+    pthread_mutex_lock(&server->dispatch_mu);
     server->write_fn = write_fn;
     server->write_userdata = write_userdata;
+    pthread_mutex_unlock(&server->dispatch_mu);
     return 0;
 }

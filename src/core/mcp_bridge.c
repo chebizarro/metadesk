@@ -146,7 +146,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     return b;
 
 fail:
-    /* md_mcp_bridge_destroy is null-safe at every step */
+    /* destroy also quiesces a partially constructed server before draining. */
     md_mcp_bridge_destroy(b);
     return NULL;
 }
@@ -187,9 +187,10 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
 {
     if (!bridge) return;
 
-    /* First: detach the a11y change callback and wait for any in-flight
-     * invocation. Everything it touches (resource_ctx, server, snapshot)
-     * is freed below. */
+    /* Stop new notifications before draining the callback. A notification
+     * that already copied its sink finishes within the transport write budget.
+     * Everything it touches (resource_ctx, server, snapshot) stays alive. */
+    md_mcp_server_quiesce(bridge->server);
     if (bridge->a11y_subscribed) {
         md_a11y_unsubscribe_changes(bridge->a11y);
         bridge->a11y_subscribed = false;

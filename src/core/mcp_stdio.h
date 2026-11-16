@@ -19,7 +19,9 @@ typedef struct MdMcpStdio MdMcpStdio;
 
 /* Create a stdio transport wired to the given MCP server.
  * in_fd: file descriptor to read from (e.g. STDIN_FILENO)
- * out_fd: file descriptor to write to (e.g. STDOUT_FILENO) */
+ * out_fd: file descriptor to write to (e.g. STDOUT_FILENO).
+ * Borrowed output must be exclusively written through this transport; it is
+ * made nonblocking until destroy restores its flags. Host must ignore SIGPIPE. */
 MdMcpStdio *md_mcp_stdio_create(MdMcpServer *server, int in_fd, int out_fd);
 
 /* Run the blocking event loop. Returns when EOF is reached on in_fd
@@ -35,7 +37,9 @@ void md_mcp_stdio_destroy(MdMcpStdio *stdio_ctx);
 
 /* Write one framed JSON message to the transport's output fd (newline
  * delimited, thread-safe). Matches MdMcpWriteFn; userdata is the
- * MdMcpStdio*. Used as the server's notification sink. */
+ * MdMcpStdio*. Responses and notifications have a 2000ms write budget.
+ * Returns -1 on failure; a partial frame permanently disables output to avoid
+ * corrupting subsequent JSON. Used as the server's notification sink. */
 int md_mcp_stdio_write(const char *json, size_t len, void *userdata);
 
 #ifdef __cplusplus

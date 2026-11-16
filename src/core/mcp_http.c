@@ -12,6 +12,11 @@
  * SSE client capacity is configurable.
  */
 #include "mcp_http.h"
+#define MD_LOG_TAG "mcp-http"
+#include "log.h"
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +51,7 @@ struct MdMcpHttp {
     int            *sse_clients;
     int             sse_count;
     int             sse_max_clients;
+    int             sse_write_timeout_ms;
     pthread_mutex_t sse_mu;
 
     /* Tracks in-flight handler goroutines for graceful shutdown */
@@ -156,12 +162,49 @@ static int write_all(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
     while (len > 0) {
-        ssize_t n = write(fd, p, len);
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, p, len, 0); /* SO_NOSIGPIPE set on accept */
+#endif
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
             return -1;
         p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* SSE sockets are nonblocking: poll readiness alone cannot bound a large
+ * blocking send. All pieces of one event share the same deadline. */
+static int sse_write_all(int fd, const char *buf, size_t len, int64_t deadline)
+{
+    while (len > 0) {
+        int64_t remaining = deadline - monotonic_ms();
+        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int rc = poll(&pfd, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc == 0) { errno = ETIMEDOUT; return -1; }
+        if (rc < 0) return -1;
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, buf, len, 0);
+#endif
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (n <= 0) return -1;
+        buf += (size_t)n;
         len -= (size_t)n;
     }
     return 0;
@@ -194,7 +237,7 @@ static void send_http_text(int fd, int status, const char *status_text,
                        msg, strlen(msg));
 }
 
-static void send_sse_headers(int fd)
+static int send_sse_headers(int fd, int64_t deadline)
 {
     const char *headers =
         "HTTP/1.1 200 OK\r\n"
@@ -202,7 +245,7 @@ static void send_sse_headers(int fd)
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
-    write_all(fd, headers, strlen(headers));
+    return sse_write_all(fd, headers, strlen(headers), deadline);
 }
 
 /* ── Parse minimal HTTP request ──────────────────────────────── */
@@ -433,11 +476,17 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         close(client_fd);
 
     } else if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "GET") == 0) {
-        /* SSE stream */
-        send_sse_headers(client_fd);
-
+        /* Publish headers and registration under one lock: a client that
+         * sees the headers can immediately receive the next broadcast. */
+        int flags = fcntl(client_fd, F_GETFL);
+        if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            free(req.body);
+            close(client_fd);
+            return;
+        }
         pthread_mutex_lock(&h->sse_mu);
-        if (h->sse_count < h->sse_max_clients) {
+        if (send_sse_headers(client_fd, monotonic_ms() + h->sse_write_timeout_ms) == 0 &&
+            h->sse_count < h->sse_max_clients) {
             h->sse_clients[h->sse_count++] = client_fd;
         } else {
             close(client_fd);
@@ -471,10 +520,11 @@ static void *handle_client_thread(void *arg) {
 
 /* ── SSE send ────────────────────────────────────────────────── */
 
-static int write_sse_data_lines(int fd, const char *data, size_t data_len)
+static int write_sse_data_lines(int fd, const char *data, size_t data_len,
+                                int64_t deadline)
 {
     if (data_len == 0)
-        return write_all(fd, "data: \n", 7);
+        return sse_write_all(fd, "data: \n", 7, deadline);
 
     size_t pos = 0;
     while (pos < data_len) {
@@ -484,9 +534,9 @@ static int write_sse_data_lines(int fd, const char *data, size_t data_len)
         if (line_len > 0 && line[line_len - 1] == '\r')
             line_len--;
 
-        if (write_all(fd, "data: ", 6) < 0 ||
-            (line_len > 0 && write_all(fd, line, line_len) < 0) ||
-            write_all(fd, "\n", 1) < 0)
+        if (sse_write_all(fd, "data: ", 6, deadline) < 0 ||
+            (line_len > 0 && sse_write_all(fd, line, line_len, deadline) < 0) ||
+            sse_write_all(fd, "\n", 1, deadline) < 0)
             return -1;
 
         if (!nl)
@@ -506,23 +556,25 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
 
     for (int i = 0; i < http->sse_count; ) {
         int ok = 0;
+        int64_t deadline = monotonic_ms() + http->sse_write_timeout_ms;
 
         if (event) {
             char event_buf[128];
             int hlen = snprintf(event_buf, sizeof(event_buf),
                                 "event: %s\n", event);
             if (hlen <= 0 || (size_t)hlen >= sizeof(event_buf) ||
-                write_all(http->sse_clients[i], event_buf, (size_t)hlen) < 0)
+                sse_write_all(http->sse_clients[i], event_buf, (size_t)hlen, deadline) < 0)
                 ok = -1;
         }
 
         if (ok == 0 &&
-            (write_sse_data_lines(http->sse_clients[i], data, data_len) < 0 ||
-             write_all(http->sse_clients[i], "\n", 1) < 0))
+            (write_sse_data_lines(http->sse_clients[i], data, data_len, deadline) < 0 ||
+             sse_write_all(http->sse_clients[i], "\n", 1, deadline) < 0))
             ok = -1;
 
         if (ok < 0) {
-            /* Client disconnected — remove from list */
+            /* Log once per dropped client; keep delivering to healthy peers. */
+            MD_LOG_W("dropping SSE client after failed or timed-out write");
             close(http->sse_clients[i]);
             http->sse_clients[i] = http->sse_clients[http->sse_count - 1];
             http->sse_count--;
@@ -560,6 +612,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     atomic_init(&h->shutdown, false);
     h->sse_max_clients = config->max_clients > 0
         ? config->max_clients : DEFAULT_MAX_SSE_CLIENTS;
+    h->sse_write_timeout_ms = config->sse_write_timeout_ms > 0
+        ? config->sse_write_timeout_ms : MD_MCP_SSE_WRITE_TIMEOUT_MS;
     h->sse_clients = calloc((size_t)h->sse_max_clients,
                             sizeof(*h->sse_clients));
     if (!h->sse_clients) {
@@ -654,6 +708,14 @@ int md_mcp_http_run(MdMcpHttp *http)
         if (FD_ISSET(http->listen_fd, &readfds)) {
             int client = accept(http->listen_fd, NULL, NULL);
             if (client >= 0) {
+#ifdef SO_NOSIGPIPE
+                int no_sigpipe = 1;
+                if (setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE,
+                               &no_sigpipe, sizeof(no_sigpipe)) < 0) {
+                    close(client);
+                    continue;
+                }
+#endif
                 /* Spawn a goroutine per connection so POST processing
                  * doesn't block the accept loop. */
                 HandlerArg *ha = malloc(sizeof(HandlerArg));
