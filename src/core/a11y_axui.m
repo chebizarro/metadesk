@@ -77,65 +77,73 @@ static char *make_node_id(AXUIState *st) {
 
 
 
-/* Normalize AX role strings to platform-neutral names matching AT-SPI2 */
-static const char *normalize_role(const char *ax_role) {
-    if (!ax_role) return "unknown";
+/* Typed AX mappings: no raw native role escapes into a tree. */
+static const struct { CFStringRef ax_role; enum MdA11yRole role; } ax_roles[] = {
+    { CFSTR("AXApplication"), MD_A11Y_ROLE_APPLICATION },
+    { CFSTR("AXWindow"), MD_A11Y_ROLE_WINDOW },
+    { CFSTR("AXButton"), MD_A11Y_ROLE_BUTTON },
+    { CFSTR("AXCheckBox"), MD_A11Y_ROLE_CHECK_BOX },
+    { CFSTR("AXRadioButton"), MD_A11Y_ROLE_RADIO_BUTTON },
+    { CFSTR("AXTextField"), MD_A11Y_ROLE_TEXT },
+    { CFSTR("AXTextArea"), MD_A11Y_ROLE_TEXT },
+    { CFSTR("AXStaticText"), MD_A11Y_ROLE_LABEL },
+    { CFSTR("AXImage"), MD_A11Y_ROLE_IMAGE },
+    { CFSTR("AXGroup"), MD_A11Y_ROLE_PANEL },
+    { CFSTR("AXList"), MD_A11Y_ROLE_LIST },
+    { CFSTR("AXTable"), MD_A11Y_ROLE_TABLE },
+    { CFSTR("AXRow"), MD_A11Y_ROLE_TABLE_ROW },
+    { CFSTR("AXColumn"), MD_A11Y_ROLE_TABLE_COLUMN },
+    { CFSTR("AXCell"), MD_A11Y_ROLE_TABLE_CELL },
+    { CFSTR("AXScrollArea"), MD_A11Y_ROLE_SCROLL_PANE },
+    { CFSTR("AXScrollBar"), MD_A11Y_ROLE_SCROLL_BAR },
+    { CFSTR("AXSlider"), MD_A11Y_ROLE_SLIDER },
+    { CFSTR("AXMenuBar"), MD_A11Y_ROLE_MENU },
+    { CFSTR("AXMenu"), MD_A11Y_ROLE_MENU },
+    { CFSTR("AXMenuItem"), MD_A11Y_ROLE_MENU_ITEM },
+    { CFSTR("AXToolbar"), MD_A11Y_ROLE_TOOL_BAR },
+    { CFSTR("AXTabGroup"), MD_A11Y_ROLE_PAGE_TAB_LIST },
+    { CFSTR("AXTab"), MD_A11Y_ROLE_TAB },
+    { CFSTR("AXComboBox"), MD_A11Y_ROLE_COMBO_BOX },
+    { CFSTR("AXPopUpButton"), MD_A11Y_ROLE_COMBO_BOX },
+    { CFSTR("AXProgressIndicator"), MD_A11Y_ROLE_PROGRESS_BAR },
+    { CFSTR("AXLink"), MD_A11Y_ROLE_LINK },
+    { CFSTR("AXWebArea"), MD_A11Y_ROLE_DOCUMENT_WEB },
+    { CFSTR("AXSheet"), MD_A11Y_ROLE_DIALOG },
+    { CFSTR("AXDialog"), MD_A11Y_ROLE_DIALOG },
+    { CFSTR("AXSplitGroup"), MD_A11Y_ROLE_SPLIT_PANE },
+    { CFSTR("AXOutline"), MD_A11Y_ROLE_TREE },
+    { CFSTR("AXOutlineRow"), MD_A11Y_ROLE_TREE_ITEM },
+    { CFSTR("AXHeading"), MD_A11Y_ROLE_HEADING },
+    { CFSTR("AXMenuBarItem"), MD_A11Y_ROLE_MENU_ITEM },
+    { CFSTR("AXValueIndicator"), MD_A11Y_ROLE_LABEL },
+    { CFSTR("AXSplitter"), MD_A11Y_ROLE_SEPARATOR },
+    { CFSTR("AXDisclosureTriangle"), MD_A11Y_ROLE_TOGGLE_BUTTON },
+};
 
-    /* Map common AX roles to platform-neutral names */
-    if (strcmp(ax_role, "AXApplication") == 0)  return "application";
-    if (strcmp(ax_role, "AXWindow") == 0)       return "window";
-    if (strcmp(ax_role, "AXButton") == 0)       return "push button";
-    if (strcmp(ax_role, "AXCheckBox") == 0)     return "check box";
-    if (strcmp(ax_role, "AXRadioButton") == 0)  return "radio button";
-    if (strcmp(ax_role, "AXTextField") == 0)    return "text";
-    if (strcmp(ax_role, "AXTextArea") == 0)     return "text";
-    if (strcmp(ax_role, "AXStaticText") == 0)   return "label";
-    if (strcmp(ax_role, "AXImage") == 0)        return "image";
-    if (strcmp(ax_role, "AXGroup") == 0)        return "panel";
-    if (strcmp(ax_role, "AXList") == 0)         return "list";
-    if (strcmp(ax_role, "AXTable") == 0)        return "table";
-    if (strcmp(ax_role, "AXRow") == 0)          return "table row";
-    if (strcmp(ax_role, "AXColumn") == 0)       return "table column";
-    if (strcmp(ax_role, "AXCell") == 0)         return "table cell";
-    if (strcmp(ax_role, "AXScrollArea") == 0)   return "scroll pane";
-    if (strcmp(ax_role, "AXScrollBar") == 0)    return "scroll bar";
-    if (strcmp(ax_role, "AXSlider") == 0)       return "slider";
-    if (strcmp(ax_role, "AXMenuBar") == 0)      return "menu bar";
-    if (strcmp(ax_role, "AXMenu") == 0)         return "menu";
-    if (strcmp(ax_role, "AXMenuItem") == 0)     return "menu item";
-    if (strcmp(ax_role, "AXToolbar") == 0)      return "tool bar";
-    if (strcmp(ax_role, "AXTabGroup") == 0)     return "page tab list";
-    if (strcmp(ax_role, "AXTab") == 0)          return "page tab";
-    if (strcmp(ax_role, "AXComboBox") == 0)     return "combo box";
-    if (strcmp(ax_role, "AXPopUpButton") == 0)  return "combo box";
-    if (strcmp(ax_role, "AXProgressIndicator") == 0) return "progress bar";
-    if (strcmp(ax_role, "AXLink") == 0)         return "link";
-    if (strcmp(ax_role, "AXWebArea") == 0)      return "document web";
-    if (strcmp(ax_role, "AXSheet") == 0)        return "dialog";
-    if (strcmp(ax_role, "AXDialog") == 0)       return "dialog";
-    if (strcmp(ax_role, "AXSplitGroup") == 0)   return "split pane";
-    if (strcmp(ax_role, "AXOutline") == 0)      return "tree";
-    if (strcmp(ax_role, "AXOutlineRow") == 0)   return "tree item";
-    if (strcmp(ax_role, "AXHeading") == 0)      return "heading";
-
-    /* Fallback: strip "AX" prefix and lowercase for unrecognized roles.
-     * e.g. "AXSystemWide" → "systemwide", "AXBrowser" → "browser" */
-    if (strncmp(ax_role, "AX", 2) == 0 && ax_role[2] != '\0') {
-        static _Thread_local char fallback[128];
-        const char *src = ax_role + 2;
-        size_t i = 0;
-        for (; src[i] && i < sizeof(fallback) - 1; i++)
-            fallback[i] = (char)tolower((unsigned char)src[i]);
-        fallback[i] = '\0';
-        return fallback;
-    }
-
-    return ax_role;
+/* Used by the native drift test; iterates the actual production mapping. */
+size_t md_a11y_axui_role_mapping_count(void) {
+    return sizeof(ax_roles) / sizeof(ax_roles[0]);
 }
-
-
-
-
+enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index) {
+    return index < md_a11y_axui_role_mapping_count()
+        ? ax_roles[index].role : MD_A11Y_ROLE_UNKNOWN;
+}
+static const char *normalize_role(const char *ax_role) {
+    if (ax_role) {
+        CFStringRef native = CFStringCreateWithCString(NULL, ax_role, kCFStringEncodingUTF8);
+        if (native) {
+            for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++) {
+                if (CFEqual(native, ax_roles[i].ax_role)) {
+                    CFRelease(native);
+                    return md_a11y_role_name(ax_roles[i].role);
+                }
+            }
+            CFRelease(native);
+        }
+        MD_LOG_W("unmapped AX role: %s", ax_role);
+    }
+    return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
+}
 
 /* ── Tree walking ────────────────────────────────────────────── */
 
@@ -244,25 +252,25 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
             CFTypeRef v = CFArrayGetValueAtIndex(vals, AX_ENABLED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("enabled");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_ENABLED));
 
             /* Focused */
             v = CFArrayGetValueAtIndex(vals, AX_FOCUSED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("focused");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSED));
 
             /* Selected */
             v = CFArrayGetValueAtIndex(vals, AX_SELECTED);
             if (v && v != kCFNull && CFGetTypeID(v) == CFBooleanGetTypeID()
                 && CFBooleanGetValue((CFBooleanRef)v))
-                states[scount++] = strdup("selected");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_SELECTED));
 
             /* Visible/showing if position exists */
             v = CFArrayGetValueAtIndex(vals, AX_POS);
             if (v && v != kCFNull) {
-                states[scount++] = strdup("visible");
-                states[scount++] = strdup("showing");
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_VISIBLE));
+                states[scount++] = strdup(md_a11y_state_name(MD_A11Y_STATE_SHOWING));
             }
         }
 
@@ -580,7 +588,7 @@ static int axui_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     if (!root) return -1;
 
     root->id = strdup("desktop");
-    root->role = strdup("desktop");
+    root->role = strdup(md_a11y_role_name(MD_A11Y_ROLE_DESKTOP));
     root->label = strdup("Desktop");
 
     /* Get all running applications */

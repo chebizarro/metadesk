@@ -479,94 +479,16 @@ char *md_a11y_to_json_at(const MdA11yNode *root, uint64_t ts_ms) {
  *     MNU[45] File
  */
 
-/* Role abbreviation map */
-/*
- * One role vocabulary, one table. role_abbrev() and is_interactable() were
- * two parallel strcmp cascades over the same set of roles that had to be kept
- * in sync by hand; they now read a single source of truth. `alt` is an
- * accepted synonym for the same role (or NULL).
- */
-typedef struct {
-    const char *role;
-    const char *alt;
-    const char *abbrev;
-    bool        interactable;
-} RoleInfo;
-
-static const RoleInfo role_table[] = {
-    /* Containers — always shown for structural context */
-    { "frame",         "window",  "WIN", true  },
-    { "application",   NULL,      "APP", true  },
-    { "desktop frame", "desktop", "DSK", true  },
-    { "dialog",        NULL,      "DLG", true  },
-    /* Interactive controls — the primary targets */
-    { "push button",   "button",  "BTN", true  },
-    { "toggle button", NULL,      "TGL", true  },
-    { "text",          "entry",   "TXT", true  },
-    { "menu",          "menu bar","MNU", true  },
-    { "menu item",     NULL,      "MNI", true  },
-    { "check box",     NULL,      "CHK", true  },
-    { "radio button",  NULL,      "RAD", true  },
-    { "combo box",     NULL,      "CMB", true  },
-    { "list",          NULL,      "LST", true  },
-    { "list item",     NULL,      "LI",  true  },
-    { "tab",           NULL,      "TAB", true  },
-    { "page tab",      NULL,      "PTB", true  },
-    { "link",          NULL,      "LNK", true  },
-    { "slider",        NULL,      "SLD", true  },
-    { "spin button",   NULL,      "SPN", true  },
-    { "tree",          NULL,      "TRE", true  },
-    { "table",         NULL,      "TBL", true  },
-    /* Decorative / structural — skipped in compact output (children walked) */
-    { "panel",         "filler",  "PNL", false },
-    { "label",         NULL,      "LBL", false },
-    { "scroll bar",    NULL,      "SCR", false },
-    { "separator",     NULL,      "SEP", false },
-    { "tool bar",      NULL,      "TBR", false },
-    { "image",         NULL,      "IMG", false },
-    { "status bar",    NULL,      "STS", false },
-    { "page tab list", NULL,      "PTL", false },
-    { "split pane",    NULL,      "SPL", false },
-    { "progress bar",  NULL,      "PRG", false },
-};
-
-static const RoleInfo *role_lookup(const char *role) {
-    if (!role) return NULL;
-    for (size_t i = 0; i < sizeof(role_table) / sizeof(role_table[0]); i++) {
-        if (strcmp(role, role_table[i].role) == 0 ||
-            (role_table[i].alt && strcmp(role, role_table[i].alt) == 0))
-            return &role_table[i];
-    }
-    return NULL;
-}
-
-static const char *role_abbrev(const char *role) {
-    if (!role) return "???";
-    const RoleInfo *ri = role_lookup(role);
-    return ri ? ri->abbrev : "UNK";
-}
-
-/*
- * Interactable classification: true if the node should be emitted in compact
- * output. Containers (WIN/APP/DSK/DLG) show for structure; leaf controls
- * (BTN/TXT/MNU/CHK/...) are the targets; decorative roles are skipped (their
- * children are still walked).
- */
-static bool is_interactable(const char *role) {
-    const RoleInfo *ri = role_lookup(role);
-    return ri && ri->interactable;
-}
-
 /* Returns true if the role is a text input (content should be quoted) */
 static bool is_text_role(const char *role) {
     if (!role) return false;
-    return strcmp(role, "text") == 0 || strcmp(role, "entry") == 0;
+    return md_a11y_role_lookup(role) == MD_A11Y_ROLE_TEXT;
 }
 
-static int has_state(const MdA11yNode *node, const char *state) {
+static int has_state(const MdA11yNode *node, enum MdA11yState state) {
     if (!node->states) return 0;
     for (int i = 0; i < node->state_count; i++) {
-        if (node->states[i] && strcmp(node->states[i], state) == 0)
+        if (node->states[i] && md_a11y_state_lookup(node->states[i]) == state)
             return 1;
     }
     return 0;
@@ -617,14 +539,14 @@ static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
 
 /* Append state annotations in priority order. */
 static void compact_states(const MdA11yNode *node, StrBuf *sb) {
-    static const struct { const char *state; const char *fmt; } state_map[] = {
-        { "focused",  " <focused>" },
-        { "enabled",  " *enabled*" },
-        { "disabled", " *disabled*" },
-        { "checked",  " *checked*" },
-        { "selected", " *selected*" },
-        { "pressed",  " *pressed*" },
-        { "expanded", " *expanded*" },
+    static const struct { enum MdA11yState state; const char *fmt; } state_map[] = {
+        { MD_A11Y_STATE_FOCUSED,  " <focused>" },
+        { MD_A11Y_STATE_ENABLED,  " *enabled*" },
+        { MD_A11Y_STATE_DISABLED, " *disabled*" },
+        { MD_A11Y_STATE_CHECKED,  " *checked*" },
+        { MD_A11Y_STATE_SELECTED, " *selected*" },
+        { MD_A11Y_STATE_PRESSED,  " *pressed*" },
+        { MD_A11Y_STATE_EXPANDED, " *expanded*" },
     };
     for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++)
         if (has_state(node, state_map[i].state))
@@ -639,22 +561,22 @@ static void compact_states(const MdA11yNode *node, StrBuf *sb) {
 static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
                          bool all_roles, int remaining) {
     if (!node) return;
-    bool emit = all_roles || is_interactable(node->role);
+    bool emit = all_roles || md_a11y_role_is_interactable(node->role);
 
     if (emit) {
         for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        const char *role = all_roles && node->role && !role_lookup(node->role)
-            ? node->role : role_abbrev(node->role);
+        const char *role = all_roles && node->role && md_a11y_role_lookup(node->role) == MD_A11Y_ROLE_UNKNOWN
+            ? node->role : md_a11y_role_abbrev(node->role);
         sb_appendf(sb, "%s[%s]", role, node->id ? node->id : "?");
 
         if (is_text_role(node->role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */
-            if (has_state(node, "focused")) sb_append(sb, " <focused>");
+            if (has_state(node, MD_A11Y_STATE_FOCUSED)) sb_append(sb, " <focused>");
             sb_appendf(sb, " '%s'", node->label ? node->label : "");
-            if (has_state(node, "enabled"))  sb_append(sb, " *enabled*");
-            if (has_state(node, "disabled")) sb_append(sb, " *disabled*");
+            if (has_state(node, MD_A11Y_STATE_ENABLED))  sb_append(sb, " *enabled*");
+            if (has_state(node, MD_A11Y_STATE_DISABLED)) sb_append(sb, " *disabled*");
         } else {
             const char *label = node->label ? node->label : "";
             if (label[0]) sb_appendf(sb, " %s", label);

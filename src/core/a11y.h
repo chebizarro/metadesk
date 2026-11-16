@@ -13,6 +13,7 @@
 #ifndef MD_A11Y_H
 #define MD_A11Y_H
 
+#include "a11y_vocab.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>

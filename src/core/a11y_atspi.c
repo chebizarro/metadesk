@@ -29,6 +29,10 @@
 /* Maximum children per node to prevent OOM on enormous trees */
 #define MD_ATSPI_MAX_CHILDREN 256
 
+#define MD_ATSPI_ROLE_ASSERT(native, role) _Static_assert(role >= 0 && role < MD_A11Y_ROLE_COUNT, "invalid AT-SPI role");
+MD_A11Y_ROLE_ALIASES(MD_ATSPI_ROLE_ASSERT)
+#undef MD_ATSPI_ROLE_ASSERT
+
 /* ── Backend-private state ───────────────────────────────────── */
 
 typedef struct {
@@ -81,23 +85,23 @@ static void extract_states(AtspiStateSet *state_set, MdA11yNode *node) {
         const char *name = NULL;
 
         switch (st) {
-        case ATSPI_STATE_ACTIVE:     name = "active";     break;
-        case ATSPI_STATE_ENABLED:    name = "enabled";    break;
-        case ATSPI_STATE_FOCUSED:    name = "focused";    break;
-        case ATSPI_STATE_VISIBLE:    name = "visible";    break;
-        case ATSPI_STATE_SHOWING:    name = "showing";    break;
-        case ATSPI_STATE_SELECTED:   name = "selected";   break;
-        case ATSPI_STATE_CHECKED:    name = "checked";    break;
-        case ATSPI_STATE_EDITABLE:   name = "editable";   break;
-        case ATSPI_STATE_EXPANDABLE: name = "expandable"; break;
-        case ATSPI_STATE_EXPANDED:   name = "expanded";   break;
-        case ATSPI_STATE_FOCUSABLE:  name = "focusable";  break;
-        case ATSPI_STATE_SENSITIVE:  name = "sensitive";   break;
-        case ATSPI_STATE_SELECTABLE: name = "selectable"; break;
-        case ATSPI_STATE_MODAL:      name = "modal";      break;
-        case ATSPI_STATE_MULTI_LINE: name = "multiline";  break;
-        case ATSPI_STATE_SINGLE_LINE:name = "singleline"; break;
-        case ATSPI_STATE_DEFUNCT:    name = "defunct";     break;
+        case ATSPI_STATE_ACTIVE:     name = md_a11y_state_name(MD_A11Y_STATE_ACTIVE);     break;
+        case ATSPI_STATE_ENABLED:    name = md_a11y_state_name(MD_A11Y_STATE_ENABLED);    break;
+        case ATSPI_STATE_FOCUSED:    name = md_a11y_state_name(MD_A11Y_STATE_FOCUSED);    break;
+        case ATSPI_STATE_VISIBLE:    name = md_a11y_state_name(MD_A11Y_STATE_VISIBLE);    break;
+        case ATSPI_STATE_SHOWING:    name = md_a11y_state_name(MD_A11Y_STATE_SHOWING);    break;
+        case ATSPI_STATE_SELECTED:   name = md_a11y_state_name(MD_A11Y_STATE_SELECTED);   break;
+        case ATSPI_STATE_CHECKED:    name = md_a11y_state_name(MD_A11Y_STATE_CHECKED);    break;
+        case ATSPI_STATE_EDITABLE:   name = md_a11y_state_name(MD_A11Y_STATE_EDITABLE);   break;
+        case ATSPI_STATE_EXPANDABLE: name = md_a11y_state_name(MD_A11Y_STATE_EXPANDABLE); break;
+        case ATSPI_STATE_EXPANDED:   name = md_a11y_state_name(MD_A11Y_STATE_EXPANDED);   break;
+        case ATSPI_STATE_FOCUSABLE:  name = md_a11y_state_name(MD_A11Y_STATE_FOCUSABLE);  break;
+        case ATSPI_STATE_SENSITIVE:  name = md_a11y_state_name(MD_A11Y_STATE_SENSITIVE);   break;
+        case ATSPI_STATE_SELECTABLE: name = md_a11y_state_name(MD_A11Y_STATE_SELECTABLE); break;
+        case ATSPI_STATE_MODAL:      name = md_a11y_state_name(MD_A11Y_STATE_MODAL);      break;
+        case ATSPI_STATE_MULTI_LINE: name = md_a11y_state_name(MD_A11Y_STATE_MULTILINE);  break;
+        case ATSPI_STATE_SINGLE_LINE:name = md_a11y_state_name(MD_A11Y_STATE_SINGLELINE); break;
+        case ATSPI_STATE_DEFUNCT:    name = md_a11y_state_name(MD_A11Y_STATE_DEFUNCT);     break;
         default: break;
         }
 
@@ -137,7 +141,7 @@ static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,
     /* Role */
     gchar *role_name = atspi_accessible_get_role_name(acc, &error);
     if (role_name) {
-        node->role = strdup(role_name);
+        node->role = strdup(md_a11y_role_name(md_a11y_role_lookup(role_name)));
         g_free(role_name);
     }
     if (error) { g_error_free(error); error = NULL; }
@@ -402,7 +406,7 @@ static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     st->next_id = 0;
 
     root->id = strdup("desktop");
-    root->role = strdup("desktop");
+    root->role = strdup(md_a11y_role_name(MD_A11Y_ROLE_DESKTOP));
     root->label = strdup("Desktop");
 
     if (app_count > 0) {

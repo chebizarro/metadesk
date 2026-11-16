@@ -210,6 +210,70 @@ static void test_delta_serialization(void) {
     printf("  PASS: delta serialization\n");
 }
 
+#ifdef __APPLE__
+extern size_t md_a11y_axui_role_mapping_count(void);
+extern enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index);
+#endif
+
+static void test_vocab(void) {
+    for (int i = 0; i < MD_A11Y_ROLE_COUNT; i++) {
+        const char *name = md_a11y_role_name((enum MdA11yRole)i);
+        MD_CHECK(md_a11y_role_lookup(name) == (enum MdA11yRole)i);
+        for (int j = 0; j < i; j++) {
+            const char *other = md_a11y_role_name((enum MdA11yRole)j);
+            MD_CHECK(strcmp(name, other) != 0);
+            MD_CHECK(strcmp(md_a11y_role_abbrev(name), md_a11y_role_abbrev(other)) != 0);
+        }
+    }
+#define CHECK_ALIAS(name, role) \
+    MD_CHECK(role >= 0 && role < MD_A11Y_ROLE_COUNT); \
+    MD_CHECK(md_a11y_role_lookup(name) == role);
+    MD_A11Y_ROLE_ALIASES(CHECK_ALIAS)
+#undef CHECK_ALIAS
+    for (int i = 0; i < MD_A11Y_STATE_COUNT; i++) {
+        const char *name = md_a11y_state_name((enum MdA11yState)i);
+        MD_CHECK(name != NULL);
+        MD_CHECK(md_a11y_state_lookup(name) == (enum MdA11yState)i);
+    }
+    MD_CHECK(md_a11y_role_lookup(NULL) == MD_A11Y_ROLE_UNKNOWN);
+    MD_CHECK(md_a11y_state_lookup("not-a-state") == MD_A11Y_STATE_UNKNOWN);
+#ifdef __APPLE__
+    MD_CHECK(md_a11y_axui_role_mapping_count() > 0);
+    for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++) {
+        enum MdA11yRole role = md_a11y_axui_role_mapping_at(i);
+        MD_CHECK(role > MD_A11Y_ROLE_UNKNOWN && role < MD_A11Y_ROLE_COUNT);
+        MD_CHECK(md_a11y_role_lookup(md_a11y_role_name(role)) == role);
+    }
+#endif
+    MdA11yNode custom = { .id = "custom", .role = "vendor widget", .label = "Custom" };
+    char *targeted = md_a11y_query_to_compact(&custom, 0);
+    MD_CHECK(targeted && strcmp(targeted, "vendor widget[custom] Custom\n") == 0);
+    free(targeted);
+    char *full = md_a11y_to_compact_at(&custom, 0);
+    MD_CHECK(full && strcmp(full, "v1 ts:0\n") == 0);
+    free(full);
+    printf("  PASS: shared vocabulary and native role mappings\n");
+}
+
+static void check_live_vocab(const MdA11yNode *node, int *unknown_roles) {
+    enum MdA11yRole role = md_a11y_role_lookup(node->role);
+    if (role == MD_A11Y_ROLE_UNKNOWN) {
+        printf("  live unknown role: %s (id=%s)\n", node->role ? node->role : "(null)",
+               node->id ? node->id : "?");
+        (*unknown_roles)++;
+    }
+    /* UNKNOWN is a documented canonical sentinel, not an ad-hoc native string. */
+    MD_CHECK(node->role && strcmp(node->role, md_a11y_role_name(role)) == 0);
+    for (int i = 0; i < node->state_count; i++) {
+        enum MdA11yState state = md_a11y_state_lookup(node->states[i]);
+        if (state == MD_A11Y_STATE_UNKNOWN)
+            printf("  live unknown state: %s\n", node->states[i] ? node->states[i] : "(null)");
+        MD_CHECK(state != MD_A11Y_STATE_UNKNOWN);
+    }
+    for (int i = 0; i < node->child_count; i++)
+        check_live_vocab(node->children[i], unknown_roles);
+}
+
 static void test_walk_tree(void) {
     if (!live_a11y_tests_enabled()) {
         printf("  SKIP: walk tree live backend (set MD_A11Y_LIVE_TESTS=1)\n");
@@ -231,6 +295,10 @@ static void test_walk_tree(void) {
     MD_CHECK(root->id != NULL);
     MD_CHECK(root->role != NULL);
     MD_CHECK(strcmp(root->role, "desktop") == 0);
+
+    int unknown_roles = 0;
+    check_live_vocab(root, &unknown_roles);
+    printf("  live vocabulary: %d unknown-role nodes\n", unknown_roles);
 
     /* Serialize in both formats to verify end-to-end */
     char *json = md_a11y_to_json(root);
@@ -523,6 +591,7 @@ static void test_tree_patch_update_state(void) {
 int main(void) {
     printf("test_a11y:\n");
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
+    test_vocab();
     test_node_alloc_free();
     test_create_destroy();
     test_json_serialization();
