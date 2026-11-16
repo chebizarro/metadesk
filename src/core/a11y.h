@@ -121,6 +121,9 @@ char *md_a11y_to_compact(const MdA11yNode *root);
  * Caller owns the returned JSON object / string. */
 cJSON *md_a11y_node_to_json(const MdA11yNode *node, int depth);
 char *md_a11y_query_to_compact(const MdA11yNode *node, int depth);
+/* Serialize matches into one compact buffer, without descendants.
+ * Returns an allocated empty string for zero matches. Caller frees. */
+char *md_a11y_matches_to_compact(const MdA11yNode *const *nodes, int count);
 
 /* Serialize deltas to JSON (spec §3.3.3). Caller frees. */
 char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count);

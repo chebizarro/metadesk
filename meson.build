@@ -360,6 +360,7 @@ core_sources = files(
     'src/core/decode.c',
   'src/core/a11y.c',
   'src/core/a11y_query.c',
+  'src/core/a11y_snapshot.c',
   'src/core/input.c',
   'src/core/session.c',
   'src/core/jsonrpc.c',

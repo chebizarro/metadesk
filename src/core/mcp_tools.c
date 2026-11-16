@@ -290,6 +290,7 @@ static cJSON *tool_handler(const cJSON *arguments,
     char *result_str = md_agent_handle_action_mcp(
         ctx->agent,
         (const uint8_t *)action_json, (uint32_t)strlen(action_json));
+    md_a11y_snapshot_invalidate(ctx->snapshot);
     free(action_json);
 
     if (!result_str) {
@@ -346,39 +347,39 @@ static cJSON *build_read_schema(const FieldDef *fields, int count)
 
 /* The MCP registry advertises schemas but does not validate them itself.
  * Validate the read schemas here, including additionalProperties. */
-static bool valid_read_args(const cJSON *args, const cJSON *schema)
+static const char *invalid_read_field(const cJSON *args, const cJSON *schema)
 {
-    if (args && !cJSON_IsObject(args)) return false;
+    if (args && !cJSON_IsObject(args)) return "arguments";
     const cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
     const cJSON *required = cJSON_GetObjectItemCaseSensitive(schema, "required");
     const cJSON *item;
     cJSON_ArrayForEach(item, required)
-        if (!cJSON_GetObjectItemCaseSensitive(args, item->valuestring)) return false;
+        if (!cJSON_GetObjectItemCaseSensitive(args, item->valuestring)) return item->valuestring;
     cJSON_ArrayForEach(item, args) {
         const cJSON *p = cJSON_GetObjectItemCaseSensitive(props, item->string);
-        if (!p) return false;
+        if (!p) return item->string;
         const char *type = cJSON_GetObjectItemCaseSensitive(p, "type")->valuestring;
         if (strcmp(type, "string") == 0) {
-            if (!cJSON_IsString(item)) return false;
+            if (!cJSON_IsString(item)) return item->string;
             const cJSON *values = cJSON_GetObjectItemCaseSensitive(p, "enum");
             if (values) {
                 bool found = false;
                 const cJSON *value;
                 cJSON_ArrayForEach(value, values)
                     if (strcmp(item->valuestring, value->valuestring) == 0) found = true;
-                if (!found) return false;
+                if (!found) return item->string;
             }
         } else {
             if (!cJSON_IsNumber(item) || item->valuedouble < 0 ||
                 item->valuedouble > INT_MAX ||
-                item->valuedouble != (double)item->valueint) return false;
+                item->valuedouble != (double)item->valueint) return item->string;
             const cJSON *min = cJSON_GetObjectItemCaseSensitive(p, "minimum");
-            if (min && item->valuedouble < min->valuedouble) return false;
+            if (min && item->valuedouble < min->valuedouble) return item->string;
             const cJSON *max = cJSON_GetObjectItemCaseSensitive(p, "maximum");
-            if (max && item->valuedouble > max->valuedouble) return false;
+            if (max && item->valuedouble > max->valuedouble) return item->string;
         }
     }
-    return true;
+    return NULL;
 }
 
 static const char *read_string(const cJSON *args, const char *name)
@@ -410,14 +411,20 @@ static cJSON *read_tool_handler(const cJSON *args, bool *is_error,
 {
     ToolHandlerCtx *hctx = userdata;
     const char *error = NULL;
-    MdA11yNode *root = NULL;
+    const MdA11yNode *root = NULL;
+    bool acquired = false;
     cJSON *value = NULL;
     char *text = NULL;
-    if (!valid_read_args(args, hctx->read_schema)) {
-        error = "Invalid read tool arguments";
+    char validation_error[256];
+    const char *field = invalid_read_field(args, hctx->read_schema);
+    if (field) {
+        snprintf(validation_error, sizeof(validation_error),
+                 "Invalid '%s': read tool argument violates schema", field);
+        error = validation_error;
         goto done;
     }
-    root = hctx->ctx->a11y ? md_a11y_walk(hctx->ctx->a11y) : NULL;
+    root = md_a11y_snapshot_acquire(hctx->ctx->snapshot);
+    acquired = true;
     if (!root) {
         error = "Accessibility snapshot unavailable";
         goto done;
@@ -445,33 +452,14 @@ static cJSON *read_tool_handler(const cJSON *args, bool *is_error,
         int count = md_a11y_find(root, read_string(args, "role"),
                                  read_string(args, "label_contains"),
                                  read_string(args, "state"), nodes, limit);
-        value = cJSON_CreateArray();
-        for (int i = 0; i < count; i++) {
-            if (json) {
+        if (json) {
+            value = cJSON_CreateArray();
+            for (int i = 0; i < count; i++)
                 cJSON_AddItemToArray(value, node_detail(nodes[i]));
-            } else {
-                char *line = md_a11y_query_to_compact(nodes[i], 0);
-                if (!line) { error = "Failed to serialize matching node"; break; }
-                cJSON_AddItemToArray(value, cJSON_CreateString(line));
-                free(line);
-            }
+        } else {
+            text = md_a11y_matches_to_compact(nodes, count);
         }
         free(nodes);
-        if (!json && !error) {
-            size_t size = 1;
-            const cJSON *line;
-            cJSON_ArrayForEach(line, value) size += strlen(line->valuestring);
-            text = malloc(size);
-            if (text) {
-                char *p = text;
-                cJSON_ArrayForEach(line, value) {
-                    size_t len = strlen(line->valuestring);
-                    memcpy(p, line->valuestring, len);
-                    p += len;
-                }
-                *p = '\0';
-            }
-        }
         break;
     }
     case READ_SUBTREE: {
@@ -502,7 +490,7 @@ static cJSON *read_tool_handler(const cJSON *args, bool *is_error,
         text = cJSON_PrintUnformatted(value);
     if (!text && !error) error = "Failed to serialize accessibility query";
 done:
-    md_a11y_node_free(root);
+    if (acquired) md_a11y_snapshot_release(hctx->ctx->snapshot);
     cJSON_Delete(value);
     if (error) {
         *is_error = true;

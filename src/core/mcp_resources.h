@@ -9,7 +9,7 @@
 #define MD_MCP_RESOURCES_H
 
 #include "mcp_server.h"
-#include "a11y.h"
+#include "a11y_snapshot.h"
 #include "session.h"
 #include "agent.h"
 
@@ -23,7 +23,8 @@ extern "C" {
 
 /* Context passed to MCP resource handlers. */
 typedef struct {
-    MdA11yCtx    *a11y;        /* accessibility tree context         */
+    MdA11ySnapshot *snapshot;  /* borrowed; shared MCP read snapshot */
+    MdMcpServer  *server;      /* notification destination           */
     MdSession    *session;     /* current session state               */
     MdAgent      *agent;       /* agent handler (for action count)    */
     MdTreeFormat  tree_format; /* negotiated tree format              */
@@ -41,8 +42,8 @@ int md_mcp_register_resources(MdMcpServer *server, MdMcpResourceCtx *res_ctx);
 int md_mcp_notify_tree_changed(MdMcpServer *server);
 
 /* A11y change callback suitable for md_a11y_subscribe_changes().
- * Pass the MdMcpServer* as userdata. Triggers resource-updated
- * notification for metadesk://ui-tree. */
+ * Pass the MdMcpResourceCtx* as userdata (must outlive callbacks).
+ * Invalidates its snapshot before notifying metadesk://ui-tree. */
 void md_mcp_a11y_change_cb(const MdA11yDelta *deltas, int count,
                            void *userdata);
 

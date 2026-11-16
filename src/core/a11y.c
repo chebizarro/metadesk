@@ -574,6 +574,15 @@ char *md_a11y_query_to_compact(const MdA11yNode *node, int depth) {
     return sb.buf;
 }
 
+char *md_a11y_matches_to_compact(const MdA11yNode *const *nodes, int count) {
+    StrBuf sb = { 0 };
+    sb_append(&sb, "");
+    for (int i = 0; i < count; i++)
+        compact_node(nodes[i], 0, &sb, true, 0);
+    if (sb.oom) { free(sb.buf); return NULL; }
+    return sb.buf;
+}
+
 /* ── Delta serialization (spec §3.3.3) ─────────────────────── */
 
 static const char *op_str(MdA11yOp op) {

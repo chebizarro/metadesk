@@ -10,6 +10,7 @@
 
 #include "mcp_server.h"
 #include "agent.h"
+#include "a11y_snapshot.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,7 +19,7 @@ extern "C" {
 /* Context passed to all MCP tool handlers — holds the agent used to
  * execute actions. */
 typedef struct {
-    MdA11yCtx *a11y;            /* borrowed; fresh snapshots for read tools */
+    MdA11ySnapshot *snapshot;   /* borrowed; shared MCP read snapshot */
     MdAgent   *agent;           /* agent handler for action dispatch   */
     void      *_handler_ctxs;   /* internal: heap-allocated per-tool contexts,
                                    freed by md_mcp_tools_cleanup()       */
