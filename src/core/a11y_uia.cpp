@@ -458,22 +458,7 @@ private:
         if (!st_ || !st_->ctx || !st_->lock_initialized)
             return;
 
-        /* begin() copies the callback and marks it in flight so
-         * md_a11y_unsubscribe_changes can wait for us; it returns false
-         * once unsubscribed. No lock is held while the diff and callback
-         * run (md_a11y_diff re-enters get_tree, which takes st->lock). */
-        MdA11yChangeCb cb = nullptr;
-        void *userdata = nullptr;
-        if (!md_a11y_change_begin(st_->ctx, &cb, &userdata))
-            return;
-
-        /* Diff via the shared engine in a11y.c (snapshot lives on the ctx) */
-        int delta_count = 0;
-        MdA11yDelta *deltas = md_a11y_diff(st_->ctx, &delta_count);
-        cb(deltas, delta_count, userdata);
-        md_a11y_delta_free(deltas, delta_count);
-
-        md_a11y_change_end(st_->ctx);
+        md_a11y_change_dispatch(st_->ctx);
     }
 
     volatile LONG refs_;

@@ -277,6 +277,14 @@ void md_a11y_change_end(MdA11yCtx *ctx) {
     pthread_mutex_unlock(&ctx->change_mu);
 }
 
+void md_a11y_change_dispatch(MdA11yCtx *ctx) {
+    MdA11yChangeCb cb;
+    void *userdata;
+    if (!md_a11y_change_begin(ctx, &cb, &userdata)) return;
+    cb(NULL, 0, userdata);
+    md_a11y_change_end(ctx);
+}
+
 /* Clear the registration and wait for in-flight dispatches to return.
  * Returns false if no callback was registered. */
 static bool change_clear_and_drain(MdA11yCtx *ctx) {
@@ -343,8 +351,7 @@ bool md_a11y_is_connected(const MdA11yCtx *ctx) {
 
 void md_a11y_destroy(MdA11yCtx *ctx) {
     if (!ctx) return;
-    /* Drain any live subscription before the backend (and last_snapshot,
-     * which the diff inside a dispatch reads) goes away. */
+    /* Drain any live subscription before the backend and snapshots go away. */
     md_a11y_unsubscribe_changes(ctx);
     if (ctx->vtable && ctx->vtable->destroy)
         ctx->vtable->destroy(ctx);

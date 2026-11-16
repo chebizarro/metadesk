@@ -256,19 +256,7 @@ static void atspi_change_event_cb(AtspiEvent *event, void *user_data) {
     MdA11yCtx *ctx = user_data;
     AtspiState *st = ctx ? ctx->backend_data : NULL;
 
-    /* begin() copies the callback and marks it in flight so
-     * md_a11y_unsubscribe_changes can wait for us; it returns false once
-     * unsubscribed. No lock is held while the diff and callback run:
-     * md_a11y_diff re-enters get_tree, which takes st->lock. */
-    MdA11yChangeCb cb = NULL;
-    void *cb_userdata = NULL;
-    if (st && md_a11y_change_begin(ctx, &cb, &cb_userdata)) {
-        int delta_count = 0;
-        MdA11yDelta *deltas = md_a11y_diff(ctx, &delta_count);
-        cb(deltas, delta_count, cb_userdata);
-        md_a11y_delta_free(deltas, delta_count);
-        md_a11y_change_end(ctx);
-    }
+    if (st) md_a11y_change_dispatch(ctx);
 
     if (event)
         g_boxed_free(ATSPI_TYPE_EVENT, event);
