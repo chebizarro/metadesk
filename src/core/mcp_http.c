@@ -589,6 +589,19 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
     return 0;
 }
 
+int md_mcp_http_sse_client_count(const MdMcpHttp *http)
+{
+    if (!http) return 0;
+    /* Logical constness: only the synchronization state is modified. */
+    pthread_mutex_t *mu = &((MdMcpHttp *)http)->sse_mu;
+    pthread_mutex_lock(mu);
+    int count = 0;
+    for (int i = 0; i < http->sse_count; i++)
+        if (http->sse_clients[i].ready) count++;
+    pthread_mutex_unlock(mu);
+    return count;
+}
+
 static void close_sse_clients(MdMcpHttp *http)
 {
     if (!http) return;

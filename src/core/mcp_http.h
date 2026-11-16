@@ -56,6 +56,10 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
  * notification sink. */
 int md_mcp_http_write(const char *json, size_t len, void *userdata);
 
+/* Test/diagnostic support: snapshot the number of ready SSE clients under
+ * the client-list lock. Returns 0 for NULL. */
+int md_mcp_http_sse_client_count(const MdMcpHttp *http);
+
 /* Destroy the HTTP transport. */
 void md_mcp_http_destroy(MdMcpHttp *http);
 
