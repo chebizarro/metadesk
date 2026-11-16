@@ -331,13 +331,17 @@ static uint64_t now_wall_ms(void) {
 }
 
 char *md_a11y_to_json(const MdA11yNode *root) {
+    return md_a11y_to_json_at(root, now_wall_ms());
+}
+
+char *md_a11y_to_json_at(const MdA11yNode *root, uint64_t ts_ms) {
     if (!root) return NULL;
 
     cJSON *doc = cJSON_CreateObject();
     if (!doc) return NULL;
 
     cJSON_AddNumberToObject(doc, "v", 1);
-    cJSON_AddNumberToObject(doc, "ts", (double)now_wall_ms());
+    cJSON_AddNumberToObject(doc, "ts", (double)ts_ms);
     cJSON_AddItemToObject(doc, "root", md_a11y_node_to_json(root, -1));
 
     char *str = cJSON_PrintUnformatted(doc);
@@ -556,10 +560,14 @@ static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
 }
 
 char *md_a11y_to_compact(const MdA11yNode *root) {
+    return md_a11y_to_compact_at(root, now_wall_ms());
+}
+
+char *md_a11y_to_compact_at(const MdA11yNode *root, uint64_t ts_ms) {
     if (!root) return NULL;
 
     StrBuf sb = { 0 };
-    sb_appendf(&sb, "v1 ts:%lu\n", (unsigned long)now_wall_ms());
+    sb_appendf(&sb, "v1 ts:%llu\n", (unsigned long long)ts_ms);
     compact_node(root, 0, &sb, false, -1);
 
     if (sb.oom) { free(sb.buf); return NULL; }
@@ -570,6 +578,15 @@ char *md_a11y_query_to_compact(const MdA11yNode *node, int depth) {
     if (!node) return NULL;
     StrBuf sb = { 0 };
     compact_node(node, 0, &sb, true, depth);
+    if (sb.oom) { free(sb.buf); return NULL; }
+    return sb.buf;
+}
+
+char *md_a11y_matches_to_compact(const MdA11yNode *const *nodes, int count) {
+    if (count == 0) return strdup("");
+    StrBuf sb = { 0 };
+    for (int i = 0; i < count; i++)
+        compact_node(nodes[i], 0, &sb, true, 0);
     if (sb.oom) { free(sb.buf); return NULL; }
     return sb.buf;
 }

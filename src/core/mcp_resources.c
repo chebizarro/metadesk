@@ -27,27 +27,28 @@ static cJSON *read_ui_tree(void *userdata)
 {
     MdMcpResourceCtx *ctx = (MdMcpResourceCtx *)userdata;
 
-    /* Walk the accessibility tree */
+    /* Serialize the same lazy snapshot used by read tools. */
     char *tree_text = NULL;
     const char *mime = ctx->tree_format == MD_TREE_FORMAT_COMPACT
         ? "text/plain" : "application/json";
 
-    if (ctx->a11y) {
-        MdA11yNode *root = md_a11y_walk(ctx->a11y);
+    if (ctx->snapshot) {
+        const MdA11yNode *root = md_a11y_snapshot_acquire(ctx->snapshot);
         if (root) {
+            uint64_t ts_ms = md_a11y_snapshot_time_ms(ctx->snapshot);
             switch (ctx->tree_format) {
             case MD_TREE_FORMAT_COMPACT:
-                tree_text = md_a11y_to_compact(root);
+                tree_text = md_a11y_to_compact_at(root, ts_ms);
                 mime = "text/plain";
                 break;
             case MD_TREE_FORMAT_JSON:
             default:
-                tree_text = md_a11y_to_json(root);
+                tree_text = md_a11y_to_json_at(root, ts_ms);
                 mime = "application/json";
                 break;
             }
-            md_a11y_node_free(root);
         }
+        md_a11y_snapshot_release(ctx->snapshot);
     }
 
     cJSON *contents = resource_text_contents(
@@ -126,8 +127,10 @@ void md_mcp_a11y_change_cb(const MdA11yDelta *deltas, int count,
 {
     (void)deltas;
     (void)count;
-    MdMcpServer *server = (MdMcpServer *)userdata;
-    md_mcp_notify_tree_changed(server);
+    MdMcpResourceCtx *ctx = userdata;
+    if (!ctx) return;
+    md_a11y_snapshot_invalidate(ctx->snapshot);
+    md_mcp_notify_tree_changed(ctx->server);
 }
 
 /* ── Registration ────────────────────────────────────────────── */

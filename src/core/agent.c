@@ -115,7 +115,7 @@ MdAgent *md_agent_create(const MdAgentConfig *cfg) {
 }
 
 static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
-                                     uint32_t *seq);
+                                     uint32_t *seq, bool missing_ok);
 
 /* ── Shared action pipeline ──────────────────────────────────────
  * Steps 1–5: parse JSON → resolve target → inject → settle →
@@ -206,7 +206,8 @@ static char *agent_render_update_locked(MdAgent *agent, bool *out_is_delta) {
     if (!agent->a11y) return NULL;
 
     int delta_count = 0;
-    MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
+    MdA11yDelta *deltas = agent->tree_format == MD_TREE_FORMAT_JSON
+        ? md_a11y_diff(agent->a11y, &delta_count) : NULL;
 
     if (deltas && delta_count > 0) {
         char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
@@ -280,14 +281,14 @@ char *md_agent_handle_action_mcp(MdAgent *agent,
 }
 
 static int md_agent_send_tree_locked(MdAgent *agent, MdStream *stream,
-                                     uint32_t *seq) {
+                                     uint32_t *seq, bool missing_ok) {
     if (!agent || !stream || !seq || !agent->a11y)
         return -1;
 
     /* Walk the full tree */
     MdA11yNode *root = md_a11y_walk(agent->a11y);
     if (!root)
-        return -1;
+        return missing_ok ? 0 : -1;
 
     /* Update cached tree */
     if (agent->cached_tree)
@@ -315,7 +316,7 @@ int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq) {
         return -1;
 
     pthread_mutex_lock(&agent->mu);
-    int ret = md_agent_send_tree_locked(agent, stream, seq);
+    int ret = md_agent_send_tree_locked(agent, stream, seq, false);
     pthread_mutex_unlock(&agent->mu);
     return ret;
 }
@@ -325,6 +326,11 @@ int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq) {
         return -1;
 
     pthread_mutex_lock(&agent->mu);
+    if (agent->tree_format == MD_TREE_FORMAT_COMPACT) {
+        int ret = md_agent_send_tree_locked(agent, stream, seq, true);
+        pthread_mutex_unlock(&agent->mu);
+        return ret;
+    }
 
     int delta_count = 0;
     MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);

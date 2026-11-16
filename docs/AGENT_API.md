@@ -147,7 +147,7 @@ Subscribe to get notified when the UI tree changes:
 6. Repeat from step 3
 ```
 
-The tool result contains the UI tree delta after the action was executed and the UI settled. This eliminates the need to re-read the full tree after each action.
+The tool result contains a JSON UI tree delta (or a fallback full JSON tree) after the action was executed and the UI settled. This eliminates the need to re-read the full tree after each action. On the stream API, JSON sessions likewise receive JSON deltas (`MD_PKT_UI_TREE_DELTA`), while compact sessions receive full compact snapshot replacements (`MD_PKT_UI_TREE`) after every action.
 
 For applications with partial accessibility coverage, use `metadesk_screenshot` to capture specific regions as a vision fallback.
 

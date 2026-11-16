@@ -116,11 +116,19 @@ char *md_a11y_to_json(const MdA11yNode *root);
 /* Serialize node tree to compact format (spec §3.3.2). Caller frees. */
 char *md_a11y_to_compact(const MdA11yNode *root);
 
+/* Full-tree serializers with the snapshot's wall-clock timestamp.
+ * The non-_at variants above use the current time. Caller frees. */
+char *md_a11y_to_json_at(const MdA11yNode *root, uint64_t ts_ms);
+char *md_a11y_to_compact_at(const MdA11yNode *root, uint64_t ts_ms);
+
 /* Targeted serializers: depth 0 includes only root; -1 is unbounded.
  * Unlike the full compact tree, targeted compact output includes every role.
  * Caller owns the returned JSON object / string. */
 cJSON *md_a11y_node_to_json(const MdA11yNode *node, int depth);
 char *md_a11y_query_to_compact(const MdA11yNode *node, int depth);
+/* Serialize matches into one compact buffer, without descendants.
+ * Returns an allocated empty string for zero matches. Caller frees. */
+char *md_a11y_matches_to_compact(const MdA11yNode *const *nodes, int count);
 
 /* Serialize deltas to JSON (spec §3.3.3). Caller frees. */
 char *md_a11y_delta_to_json(const MdA11yDelta *deltas, int count);

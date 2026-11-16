@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <string.h>
 
+/* Keep case folding portable to MSVC (no strcasecmp/strcasestr). */
 static bool equal_ci(const char *a, const char *b)
 {
     if (!a || !b) return false;

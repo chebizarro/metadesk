@@ -64,8 +64,10 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
  * Called on initial connection or when client requests a full refresh. */
 int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq);
 
-/* Send a UI tree delta to the client.
- * Computes diff against the previous snapshot. */
+/* JSON sessions: send a delta against the previous snapshot, if changed.
+ * Compact sessions: send a full compact snapshot as MD_PKT_UI_TREE.
+ * Returns 0 if sent or nothing is available (including a NULL walk),
+ * -1 on invalid arguments, serialization failure, or stream send failure. */
 int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq);
 
 /* Handle an action and return the result as a string (for MCP integration).

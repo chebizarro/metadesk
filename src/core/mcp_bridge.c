@@ -6,6 +6,8 @@
  * Registers tools, resources, and a11y change notifications.
  */
 #include "mcp_bridge.h"
+#define MD_LOG_TAG "mcp-bridge"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -15,6 +17,7 @@
 struct MdMcpBridge {
     MdSession          session;
     MdAgent           *agent;
+    MdA11ySnapshot    *snapshot;
     MdMcpServer       *server;
     MdMcpStdio        *stdio_ctx;
     MdMcpHttp         *http_ctx;
@@ -43,6 +46,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     b->a11y = config->a11y;
     b->input = config->input;
+    b->snapshot = md_a11y_snapshot_create(config->a11y);
+    if (!b->snapshot) goto fail;
 
     /* 1. Initialize session */
     md_session_init(&b->session);
@@ -81,12 +86,13 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     /* 4. Register tools */
     b->tool_ctx.agent = b->agent;
-    b->tool_ctx.a11y = config->a11y;
+    b->tool_ctx.snapshot = b->snapshot;
     if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0)
         goto fail;
 
     /* 5. Register resources */
-    b->resource_ctx.a11y = config->a11y;
+    b->resource_ctx.snapshot = b->snapshot;
+    b->resource_ctx.server = b->server;
     b->resource_ctx.session = &b->session;
     b->resource_ctx.agent = b->agent;
     b->resource_ctx.tree_format = tree_format;
@@ -94,10 +100,11 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
         goto fail;
 
     /* 6. Subscribe to a11y changes for notifications */
-    if (config->a11y) {
-        md_a11y_subscribe_changes(config->a11y,
+    if (md_a11y_subscribe_changes(config->a11y,
                                   md_mcp_a11y_change_cb,
-                                  b->server);
+                                  &b->resource_ctx) < 0) {
+        MD_LOG_W("accessibility change subscription failed; refreshing on every read");
+        md_a11y_snapshot_set_caching(b->snapshot, false);
     }
 
     /* 7. Create stdio transport if requested */
@@ -188,6 +195,7 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
         md_mcp_server_destroy(bridge->server);
     if (bridge->agent)
         md_agent_destroy(bridge->agent);
+    md_a11y_snapshot_destroy(bridge->snapshot);
 
     free(bridge);
 }

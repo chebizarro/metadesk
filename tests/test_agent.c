@@ -512,6 +512,87 @@ static int test_handle_action_mcp(void) {
     return 0;
 }
 
+/* Deterministic tree changes without a platform accessibility service. */
+static int agent_fake_tree(MdA11yCtx *ctx, MdA11yNode **out) {
+    int *walks = ctx->backend_data;
+    if (*walks < 0) return -1;
+    MdA11yNode *node = calloc(1, sizeof(*node));
+    node->id = strdup("btn1");
+    node->role = strdup("button");
+    node->label = strdup((*walks)++ == 0 ? "Before" : "After");
+    *out = node;
+    return 0;
+}
+
+static int test_format_aware_updates(void) {
+    printf("  test_format_aware_updates... ");
+    const MdA11yBackend backend = { .get_tree = agent_fake_tree };
+    MdStreamServer *server = NULL;
+    uint16_t port;
+    /* Stream servers do not expose the assigned port for a port-0 bind. */
+    for (port = 17820; port < 17884; port++) {
+        server = md_stream_server_create(NULL, port);
+        if (server) break;
+    }
+    MD_CHECK(server != NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", port, 3000);
+    MD_CHECK(client != NULL);
+    MdStream *host = md_stream_server_accept(server, 3000);
+    MD_CHECK(host != NULL);
+
+    for (int compact = 0; compact <= 1; compact++) {
+        int walks = 0;
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = &walks };
+        MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+        int count = 0;
+        MdA11yDelta *initial = md_a11y_diff(&a11y, &count);
+        md_a11y_delta_free(initial, count);
+        MdAgentConfig cfg = {
+            .a11y = &a11y,
+            .tree_format = compact ? MD_TREE_FORMAT_COMPACT : MD_TREE_FORMAT_JSON,
+            .settle_ms = 1,
+        };
+        MdAgent *agent = md_agent_create(&cfg);
+        MD_CHECK(agent != NULL);
+        uint32_t seq = 0;
+        const char action[] = "{\"v\":1,\"action\":\"click\",\"payload\":{}}";
+        MD_CHECK(md_agent_handle_action(agent, host, &seq,
+                  (const uint8_t *)action, sizeof(action) - 1) == 0);
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(client, &hdr, &payload, 3000) == 0);
+        MD_CHECK(hdr.type == (compact ? MD_PKT_UI_TREE : MD_PKT_UI_TREE_DELTA));
+        if (compact) {
+            MD_CHECK(hdr.payload_len >= 6 && memcmp(payload, "v1 ts:", 6) == 0);
+        } else {
+            cJSON *delta = cJSON_ParseWithLength((const char *)payload, hdr.payload_len);
+            MD_CHECK(cJSON_IsArray(delta) && cJSON_GetArraySize(delta) == 1);
+            cJSON_Delete(delta);
+        }
+        free(payload);
+        if (compact) {
+            MD_CHECK(md_agent_send_delta(agent, host, &seq) == 0);
+            MD_CHECK(md_stream_recv(client, &hdr, &payload, 3000) == 0);
+            MD_CHECK(hdr.type == MD_PKT_UI_TREE);
+            MD_CHECK(hdr.payload_len >= 6 && memcmp(payload, "v1 ts:", 6) == 0);
+            free(payload);
+        }
+        walks = -1; /* unavailable tree is a no-op for both update formats */
+        uint32_t previous_seq = seq;
+        MD_CHECK(md_agent_send_delta(agent, host, &seq) == 0);
+        MD_CHECK(seq == previous_seq);
+        MD_CHECK(md_agent_send_tree(agent, host, &seq) == -1);
+        md_agent_destroy(agent);
+        md_a11y_node_free(a11y.last_snapshot);
+        pthread_mutex_destroy(&a11y.snapshot_mu);
+    }
+    md_stream_destroy(host);
+    md_stream_destroy(client);
+    md_stream_server_destroy(server);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -531,6 +612,7 @@ int main(void) {
     failures += test_handle_invalid_payload();
     failures += test_default_settle();
     failures += test_handle_action_mcp();
+    failures += test_format_aware_updates();
 
     clear_agent_mcp_response();
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
