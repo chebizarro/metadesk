@@ -52,9 +52,8 @@ struct UIAState {
     HANDLE              stop_event;
     HANDLE              ready_event;
     HRESULT             subscribe_hr;
-    int                 subscribed;
-    MdA11yChangeCb      change_cb;
-    void               *change_userdata;
+    int                 subscribed;      /* handlers registered; the callback
+                                          * itself lives on the MdA11yCtx */
 };
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -459,25 +458,22 @@ private:
         if (!st_ || !st_->ctx || !st_->lock_initialized)
             return;
 
+        /* begin() copies the callback and marks it in flight so
+         * md_a11y_unsubscribe_changes can wait for us; it returns false
+         * once unsubscribed. No lock is held while the diff and callback
+         * run (md_a11y_diff re-enters get_tree, which takes st->lock). */
         MdA11yChangeCb cb = nullptr;
         void *userdata = nullptr;
-
-        EnterCriticalSection(&st_->lock);
-        if (st_->subscribed && st_->change_cb) {
-            cb = st_->change_cb;
-            userdata = st_->change_userdata;
-        }
-        LeaveCriticalSection(&st_->lock);
+        if (!md_a11y_change_begin(st_->ctx, &cb, &userdata))
+            return;
 
         /* Diff via the shared engine in a11y.c (snapshot lives on the ctx) */
-        MdA11yDelta *deltas = nullptr;
         int delta_count = 0;
-        if (cb)
-            deltas = md_a11y_diff(st_->ctx, &delta_count);
-
-        if (cb)
-            cb(deltas, delta_count, userdata);
+        MdA11yDelta *deltas = md_a11y_diff(st_->ctx, &delta_count);
+        cb(deltas, delta_count, userdata);
         md_a11y_delta_free(deltas, delta_count);
+
+        md_a11y_change_end(st_->ctx);
     }
 
     volatile LONG refs_;
@@ -590,16 +586,18 @@ static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
+static void uia_teardown_subscription(UIAState *st);
+
 static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                  void *userdata) {
     auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
     if (!st || !st->connected || !st->lock_initialized || !cb)
         return -1;
+    (void)userdata; /* callback + userdata are stored on ctx by a11y.c */
 
     EnterCriticalSection(&st->lock);
     if (st->subscribed) {
-        st->change_cb = cb;
-        st->change_userdata = userdata;
+        /* Handlers already registered; a11y.c swapped the callback. */
         LeaveCriticalSection(&st->lock);
         return 0;
     }
@@ -607,8 +605,6 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         LeaveCriticalSection(&st->lock);
         return -1;
     }
-    st->change_cb = cb;
-    st->change_userdata = userdata;
     st->subscribe_hr = E_PENDING;
     LeaveCriticalSection(&st->lock);
 
@@ -619,10 +615,6 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         if (st->ready_event) CloseHandle(st->ready_event);
         st->stop_event = nullptr;
         st->ready_event = nullptr;
-        EnterCriticalSection(&st->lock);
-        st->change_cb = nullptr;
-        st->change_userdata = nullptr;
-        LeaveCriticalSection(&st->lock);
         return -1;
     }
 
@@ -633,10 +625,6 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         CloseHandle(st->ready_event);
         st->stop_event = nullptr;
         st->ready_event = nullptr;
-        EnterCriticalSection(&st->lock);
-        st->change_cb = nullptr;
-        st->change_userdata = nullptr;
-        LeaveCriticalSection(&st->lock);
         return -1;
     }
 
@@ -648,17 +636,7 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     LeaveCriticalSection(&st->lock);
 
     if (FAILED(hr)) {
-        WaitForSingleObject(st->event_thread, INFINITE);
-        CloseHandle(st->event_thread);
-        CloseHandle(st->stop_event);
-        CloseHandle(st->ready_event);
-        st->event_thread = nullptr;
-        st->stop_event = nullptr;
-        st->ready_event = nullptr;
-        EnterCriticalSection(&st->lock);
-        st->change_cb = nullptr;
-        st->change_userdata = nullptr;
-        LeaveCriticalSection(&st->lock);
+        uia_teardown_subscription(st);
         MD_LOG_E("failed to subscribe UIA events: 0x%08lx", hr);
         return -1;
     }
@@ -666,20 +644,30 @@ static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     return 0;
 }
 
-static void uia_destroy(MdA11yCtx *ctx) {
-    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+/* Single teardown path shared by unsubscribe, the subscribe failure path
+ * and destroy. Signals the event thread to stop and joins it; on its way
+ * out that thread calls RemoveStructureChangedEventHandler /
+ * RemoveFocusChangedEventHandler for whatever it registered and releases
+ * the UIAChangeHandler (see uia_event_thread_proc), so the join is what
+ * guarantees UIA will not call back into us afterwards. The user callback
+ * is not touched here — a11y.c has already cleared and drained it before
+ * calling us. Idempotent. */
+static void uia_teardown_subscription(UIAState *st) {
     if (!st) return;
 
     if (st->lock_initialized) {
         EnterCriticalSection(&st->lock);
-        st->connected = 0;
         st->subscribed = 0;
-        st->change_cb = nullptr;
-        st->change_userdata = nullptr;
         LeaveCriticalSection(&st->lock);
     }
 
     if (st->event_thread) {
+        /* No quit-before-loop race here, unlike the GLib/CFRunLoop
+         * backends: stop_event is a manual-reset event, so the signal is
+         * sticky and MsgWaitForMultipleObjects returns immediately even if
+         * the thread has not reached its wait yet. Subscribe also blocks on
+         * ready_event, so by the time anyone can tear down, the thread is
+         * already in (or past) its wait loop. */
         if (st->stop_event)
             SetEvent(st->stop_event);
         WaitForSingleObject(st->event_thread, INFINITE);
@@ -694,6 +682,25 @@ static void uia_destroy(MdA11yCtx *ctx) {
         CloseHandle(st->ready_event);
         st->ready_event = nullptr;
     }
+}
+
+static void uia_unsubscribe_changes(MdA11yCtx *ctx) {
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+    if (!st) return;
+    uia_teardown_subscription(st);
+}
+
+static void uia_destroy(MdA11yCtx *ctx) {
+    auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
+    if (!st) return;
+
+    if (st->lock_initialized) {
+        EnterCriticalSection(&st->lock);
+        st->connected = 0;
+        LeaveCriticalSection(&st->lock);
+    }
+
+    uia_teardown_subscription(st);
 
     SAFE_RELEASE(st->walker);
     SAFE_RELEASE(st->automation);
@@ -710,10 +717,12 @@ static void uia_destroy(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+/* Positional: must match the MdA11yBackend member order in a11y.h. */
 static const MdA11yBackend uia_backend = {
     uia_init,
     uia_get_tree,
     uia_subscribe_changes,
+    uia_unsubscribe_changes,
     uia_destroy,
 };
 
