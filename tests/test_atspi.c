@@ -4,6 +4,10 @@
  */
 #include "a11y.h"
 #include "a11y_query.h"
+#ifdef __linux__
+#include "atspi.h"
+#include <atspi/atspi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -689,11 +693,73 @@ static void test_tree_patch_update_state(void) {
     printf("  PASS: tree patch update state\n");
 }
 
+#ifdef __linux__
+/* md-03d: the AT-SPI backend used to size node->states to the full
+ * AtspiStateSet length but only fill the mapped entries, leaving NULL holes
+ * for states metadesk has no vocabulary for (HORIZONTAL, OPAQUE, ...).
+ * Exercise the mapping with a synthetic state set — no a11y bus needed. */
+static void test_atspi_state_compaction(void) {
+    AtspiStateType raw[] = {
+        ATSPI_STATE_ACTIVE,
+        ATSPI_STATE_HORIZONTAL,          /* unmapped */
+        ATSPI_STATE_FOCUSED,
+        ATSPI_STATE_MANAGES_DESCENDANTS, /* unmapped */
+        ATSPI_STATE_OPAQUE,              /* unmapped */
+        ATSPI_STATE_ENABLED,
+    };
+    GArray *arr = g_array_sized_new(FALSE, FALSE, sizeof(AtspiStateType),
+                                    (guint)(sizeof(raw) / sizeof(raw[0])));
+    g_array_append_vals(arr, raw, (guint)(sizeof(raw) / sizeof(raw[0])));
+    AtspiStateSet *set = atspi_state_set_new(arr);
+    g_array_free(arr, TRUE);
+    MD_CHECK(set != NULL);
+
+    MdA11yNode *node = calloc(1, sizeof(*node));
+    MD_CHECK(node != NULL);
+    md_atspi_extract_states(set, node);
+
+    MD_CHECK(node->state_count == 3);
+    MD_CHECK(node->states != NULL);
+    for (int i = 0; i < node->state_count; i++)
+        MD_CHECK(node->states[i] != NULL);
+    /* AtspiStateSet is a bitset: get_states() yields enum order, not
+     * insertion order, so check membership rather than position. */
+    bool saw_active = false, saw_focused = false, saw_enabled = false;
+    for (int i = 0; node->states && i < node->state_count; i++) {
+        if (!node->states[i]) continue;
+        if (strcmp(node->states[i], "active") == 0)  saw_active = true;
+        if (strcmp(node->states[i], "focused") == 0) saw_focused = true;
+        if (strcmp(node->states[i], "enabled") == 0) saw_enabled = true;
+    }
+    MD_CHECK(saw_active && saw_focused && saw_enabled);
+
+    /* All-unmapped set: no array, count stays zero. */
+    MdA11yNode *empty = calloc(1, sizeof(*empty));
+    MD_CHECK(empty != NULL);
+    AtspiStateType none[] = { ATSPI_STATE_HORIZONTAL, ATSPI_STATE_OPAQUE };
+    GArray *arr2 = g_array_sized_new(FALSE, FALSE, sizeof(AtspiStateType), 2);
+    g_array_append_vals(arr2, none, 2);
+    AtspiStateSet *set2 = atspi_state_set_new(arr2);
+    g_array_free(arr2, TRUE);
+    md_atspi_extract_states(set2, empty);
+    MD_CHECK(empty->state_count == 0 && empty->states == NULL);
+
+    md_a11y_node_free(node);
+    md_a11y_node_free(empty);
+    g_object_unref(set);
+    g_object_unref(set2);
+    PASS("AT-SPI state extraction compacts unmapped states (no NULL holes)");
+}
+#endif
+
 int main(void) {
     printf("test_a11y:\n");
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
     test_liveness();
     test_vocab();
+#ifdef __linux__
+    test_atspi_state_compaction();
+#endif
     test_compact_table_filtering();
     test_node_alloc_free();
     test_create_destroy();
