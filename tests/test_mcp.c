@@ -13,6 +13,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <errno.h>
+#include <time.h>
 #include "md_test.h"
 
 
@@ -1613,6 +1615,152 @@ static void test_unsubscribe_drains_in_flight_callback(void)
     PASS("unsubscribe drains an in-flight change callback before returning");
 }
 
+/* Timed condition waits are watchdogs/assertions, never scheduling sleeps. */
+static bool latch_wait_ms(TestLatch *l, int timeout_ms)
+{
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return false;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&l->mu);
+    while (l->count == 0) {
+        int rc = pthread_cond_timedwait(&l->cv, &l->mu, &deadline);
+        if (rc == ETIMEDOUT) break;
+        if (rc != 0) {
+            pthread_mutex_unlock(&l->mu);
+            return false;
+        }
+    }
+    bool ready = l->count > 0;
+    if (ready) l->count--;
+    pthread_mutex_unlock(&l->mu);
+    return ready;
+}
+
+static void test_notification_quiesce(void)
+{
+    MdMcpServerConfig cfg = { .write_fn = capture_write };
+    MdMcpServer *s = md_mcp_server_create(&cfg);
+    MD_CHECK(s != NULL);
+    md_test_mcp_handshake(s);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(s, subscribe, sizeof(subscribe) - 1) == 0);
+    clear_responses();
+    MD_CHECK(md_mcp_server_notify_resource_updated(s, MD_MCP_URI_UI_TREE) == 0);
+    MD_CHECK(g_response_count == 1);
+    MD_CHECK(md_mcp_server_set_write_fn(s, NULL, NULL) == 0);
+    MD_CHECK(md_mcp_server_notify_resource_updated(s, MD_MCP_URI_UI_TREE) == -1);
+    MD_CHECK(g_response_count == 1);
+    MD_CHECK(md_mcp_server_set_write_fn(s, capture_write, NULL) == 0);
+    md_mcp_server_quiesce(s);
+    md_mcp_server_quiesce(s); /* idempotent */
+    MD_CHECK(md_mcp_server_notify_resource_updated(s, MD_MCP_URI_UI_TREE) == -1);
+    MD_CHECK(md_mcp_server_notify_resource_updated(s, "unsubscribed") == -1);
+    MD_CHECK(g_response_count == 1);
+    md_mcp_server_destroy(s);
+    clear_responses();
+    PASS("quiesce rejects new notifications without invoking sink; NULL detaches");
+}
+
+typedef struct {
+    QueryFixture query; /* first: reused fake backend callbacks */
+    MdA11yCtx *a11y;
+    MdMcpBridge *bridge;
+    MdMcpServer *server;
+    TestLatch entered, release, started, returned;
+    int calls;
+    bool released, stayed_alive, fired, quiesced;
+} BridgeDrainFixture;
+
+static int blocked_bridge_write(const char *json, size_t len, void *userdata)
+{
+    (void)json; (void)len;
+    BridgeDrainFixture *f = userdata;
+    f->calls++;
+    if (f->calls == 1) {
+        latch_post(&f->entered);
+        f->released = latch_wait_ms(&f->release, 5000);
+        f->stayed_alive = latch_count(&f->returned) == 0;
+    }
+    return 0;
+}
+
+static void bridge_drain_unsubscribe(MdA11yCtx *ctx)
+{
+    BridgeDrainFixture *f = ctx->backend_data;
+    /* Destroy itself must quiesce; this test never calls quiesce manually. */
+    f->quiesced = md_mcp_server_notify_resource_updated(f->server, MD_MCP_URI_UI_TREE) == -1;
+    query_unsubscribe(ctx);
+}
+
+static void *bridge_change_thread(void *arg)
+{
+    BridgeDrainFixture *f = arg;
+    f->fired = query_fire_change(f->a11y);
+    return NULL;
+}
+
+static void *bridge_destroy_thread(void *arg)
+{
+    BridgeDrainFixture *f = arg;
+    latch_post(&f->started);
+    md_mcp_bridge_destroy(f->bridge);
+    latch_post(&f->returned);
+    return NULL;
+}
+
+static void test_bridge_destroy_blocked_write(void)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = bridge_drain_unsubscribe,
+    };
+    BridgeDrainFixture f = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &f };
+    query_a11y_init(&a11y);
+    f.a11y = &a11y;
+    latch_init(&f.entered); latch_init(&f.release);
+    latch_init(&f.started); latch_init(&f.returned);
+    MdMcpBridgeConfig config = {
+        .a11y = &a11y, .settle_ms = 1, .stdio_in_fd = -1, .stdio_out_fd = -1,
+    };
+    f.bridge = md_mcp_bridge_create(&config);
+    MD_CHECK(f.bridge != NULL);
+    f.server = md_mcp_bridge_get_server(f.bridge);
+    MD_CHECK(md_mcp_server_set_write_fn(f.server, capture_write, NULL) == 0);
+    md_test_mcp_handshake(f.server);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(f.server, subscribe, sizeof(subscribe) - 1) == 0);
+    clear_responses();
+    MD_CHECK(md_mcp_server_set_write_fn(f.server, blocked_bridge_write, &f) == 0);
+
+    pthread_t change_tid, destroy_tid;
+    MD_CHECK(pthread_create(&change_tid, NULL, bridge_change_thread, &f) == 0);
+    MD_CHECK(latch_wait_ms(&f.entered, 2000));
+    MD_CHECK(pthread_create(&destroy_tid, NULL, bridge_destroy_thread, &f) == 0);
+    MD_CHECK(latch_wait_ms(&f.started, 2000));
+    MD_CHECK(!latch_wait_ms(&f.returned, 100));
+    latch_post(&f.release);
+    MD_CHECK(latch_wait_ms(&f.returned, 2000));
+    MD_CHECK(pthread_join(destroy_tid, NULL) == 0);
+    MD_CHECK(pthread_join(change_tid, NULL) == 0);
+    MD_CHECK(f.calls == 1 && f.query.unsubscribes == 1);
+    MD_CHECK(f.released && f.stayed_alive && f.fired && f.quiesced);
+    MD_CHECK(!query_fire_change(&a11y));
+    MD_CHECK(a11y.change_in_flight == 0);
+    latch_fini(&f.entered); latch_fini(&f.release);
+    latch_fini(&f.started); latch_fini(&f.returned);
+    md_a11y_node_free(a11y.last_snapshot);
+    query_a11y_fini(&a11y);
+    PASS("bridge destroy waits for blocked transport then completes within bound");
+}
+
 static void counting_cb_a(const MdA11yDelta *deltas, int count, void *userdata)
 {
     (void)deltas; (void)count;
@@ -1694,6 +1842,7 @@ int main(int argc, char **argv)
         test_resource_tree_formats();
         test_bridge_destroy_unsubscribes();
         test_unsubscribe_drains_in_flight_callback();
+        test_bridge_destroy_blocked_write();
         test_subscribe_refuses_second_owner();
         clear_responses();
         return md_test_report();
@@ -1710,6 +1859,7 @@ int main(int argc, char **argv)
     test_resources_list();
     test_resources_read();
     test_resources_subscribe();
+    test_notification_quiesce();
     test_unknown_method();
     test_parse_error();
     test_init_capabilities_reflect_registrations();

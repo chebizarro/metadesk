@@ -15,6 +15,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <time.h>
+#include <stdint.h>
 #include "md_test.h"
 
 
@@ -25,6 +29,7 @@ typedef struct {
     int server_to_agent[2];   /* server writes, agent reads */
     MdMcpServer *server;
     MdMcpStdio  *stdio_ctx;
+    MdMcpToolCtx tool_ctx;
     pthread_t    server_thread;
 } TestHarness;
 
@@ -70,8 +75,7 @@ static TestHarness *harness_create(void)
                                         h->server_to_agent[1]);
 
     /* Register tools */
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
-    md_mcp_register_tools(h->server, &tool_ctx);
+    md_mcp_register_tools(h->server, &h->tool_ctx);
 
     return h;
 }
@@ -113,11 +117,12 @@ static void harness_destroy(TestHarness *h)
     close(h->agent_to_server[1]);
     pthread_join(h->server_thread, NULL);
 
+    md_mcp_stdio_destroy(h->stdio_ctx);
     close(h->agent_to_server[0]);
     close(h->server_to_agent[0]);
     close(h->server_to_agent[1]);
 
-    md_mcp_stdio_destroy(h->stdio_ctx);
+    md_mcp_tools_cleanup(&h->tool_ctx);
     md_mcp_server_destroy(h->server);
     free(h);
 }
@@ -215,15 +220,105 @@ static void test_stdio_tool_call(void)
     PASS("stdio tool call round-trip");
 }
 
+static int64_t test_monotonic_ms(void)
+{
+    struct timespec ts;
+    MD_CHECK(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static cJSON *count_dispatch(const cJSON *args, bool *is_error,
+                             char **error_msg, void *userdata)
+{
+    (void)args; (void)is_error; (void)error_msg;
+    (*(int *)userdata)++;
+    return cJSON_CreateArray();
+}
+
+static void test_stdio_broken_pipe(void)
+{
+    int input[2], output[2];
+    MD_CHECK(pipe(input) == 0 && pipe(output) == 0);
+    MdMcpServerConfig config = { .server_name = "broken-pipe" };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MD_CHECK(server != NULL);
+    MdMcpStdio *ctx = md_mcp_stdio_create(server, input[0], output[1]);
+    MD_CHECK(ctx != NULL);
+    MD_CHECK(md_mcp_server_set_write_fn(server, md_mcp_stdio_write, ctx) == 0);
+    md_test_mcp_handshake(server);
+    int calls = 0;
+    MdMcpTool tool = { .name = "count", .handler = count_dispatch, .userdata = &calls };
+    MD_CHECK(md_mcp_server_register_tool(server, &tool) == 0);
+    close(output[0]);
+    int64_t start = test_monotonic_ms();
+    MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
+    MD_CHECK(test_monotonic_ms() - start < 1000);
+
+    /* Failed responses must not stop input dispatch: both tool calls run. */
+    const char requests[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"count\"}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"count\"}}\n";
+    MD_CHECK(write(input[1], requests, sizeof(requests) - 1) == sizeof(requests) - 1);
+    close(input[1]);
+    MD_CHECK(md_mcp_stdio_run(ctx) == 0);
+    MD_CHECK(md_mcp_server_is_initialized(server));
+    MD_CHECK(calls == 2);
+    md_mcp_stdio_destroy(ctx);
+    md_mcp_server_destroy(server);
+    close(input[0]);
+    close(output[1]);
+    PASS("closed stdout pipe returns promptly without SIGPIPE; input dispatch survives");
+}
+
+static void test_stdio_stalled_pipe(void)
+{
+    int output[2];
+    MD_CHECK(pipe(output) == 0);
+    int flags = fcntl(output[1], F_GETFL);
+    MD_CHECK(flags >= 0);
+    MdMcpServerConfig config = { .server_name = "stalled-pipe" };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MD_CHECK(server != NULL);
+    MdMcpStdio *ctx = md_mcp_stdio_create(server, -1, output[1]);
+    MD_CHECK(ctx != NULL);
+    size_t len = 1024 * 1024;
+    char *json = malloc(len);
+    MD_CHECK(json != NULL);
+    memset(json, 'x', len);
+    /* POLLOUT initially succeeds, but this message exceeds pipe capacity.
+     * A blocking write after poll would hang here despite the deadline. */
+    int64_t start = test_monotonic_ms();
+    MD_CHECK(md_mcp_stdio_write(json, len, ctx) == -1);
+    int64_t elapsed = test_monotonic_ms() - start;
+    MD_CHECK(elapsed >= 1900 && elapsed < 4000);
+    char buf[4096];
+    MD_CHECK(read(output[0], buf, sizeof(buf)) > 0);
+    start = test_monotonic_ms();
+    MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
+    MD_CHECK(test_monotonic_ms() - start < 1000); /* no append to partial frame */
+    free(json);
+    md_mcp_stdio_destroy(ctx);
+    /* macOS can add an internal pipe flag after growing its buffer; check
+     * the status flag the transport actually owns, not that internal bit. */
+    MD_CHECK((fcntl(output[1], F_GETFL) & O_NONBLOCK) == (flags & O_NONBLOCK));
+    md_mcp_server_destroy(server);
+    close(output[0]);
+    close(output[1]);
+    PASS("large stdio write bounded despite initial readiness; partial frame disables output");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
 {
+    MD_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR); /* same policy as host main */
     printf("MCP stdio transport tests:\n");
 
     test_stdio_init_and_ping();
     test_stdio_tools_list();
     test_stdio_tool_call();
+    test_stdio_broken_pipe();
+    test_stdio_stalled_pipe();
 
     printf("\nAll MCP stdio tests passed.\n");
     return md_test_report();
