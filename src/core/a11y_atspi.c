@@ -14,6 +14,7 @@
  * See spec §3.3 and §10 for tree formats and agent API.
  */
 #include "a11y.h"
+#include "atspi.h"   /* md_atspi_extract_states prototype (test seam) */
 
 #include <atspi/atspi.h>
 
@@ -63,28 +64,11 @@ static char *make_node_id(AtspiState *st) {
     return strdup(buf);
 }
 
-static void extract_states(AtspiStateSet *state_set, MdA11yNode *node) {
-    if (!state_set) return;
-
-    GArray *states = atspi_state_set_get_states(state_set);
-    if (!states || states->len == 0) {
-        if (states) g_array_free(states, TRUE);
-        return;
-    }
-
-    node->state_count = (int)states->len;
-    node->states = calloc((size_t)node->state_count, sizeof(char *));
-    if (!node->states) {
-        node->state_count = 0;
-        g_array_free(states, TRUE);
-        return;
-    }
-
-    for (guint i = 0; i < states->len; i++) {
-        AtspiStateType st = g_array_index(states, AtspiStateType, i);
-        const char *name = NULL;
-
-        switch (st) {
+/* Map one AT-SPI state to its canonical wire name, or NULL if metadesk has
+ * no vocabulary entry for it (e.g. HORIZONTAL, OPAQUE, MANAGES_DESCENDANTS). */
+static const char *atspi_state_name(AtspiStateType st) {
+    const char *name = NULL;
+    switch (st) {
         case ATSPI_STATE_ACTIVE:     name = md_a11y_state_name(MD_A11Y_STATE_ACTIVE);     break;
         case ATSPI_STATE_ENABLED:    name = md_a11y_state_name(MD_A11Y_STATE_ENABLED);    break;
         case ATSPI_STATE_FOCUSED:    name = md_a11y_state_name(MD_A11Y_STATE_FOCUSED);    break;
@@ -104,12 +88,50 @@ static void extract_states(AtspiStateSet *state_set, MdA11yNode *node) {
         case ATSPI_STATE_DEFUNCT:    name = md_a11y_state_name(MD_A11Y_STATE_DEFUNCT);     break;
         default: break;
         }
+    return name;
+}
 
-        if (name)
-            node->states[i] = strdup(name);
+/* Fill node->states with the canonical names of the mapped states only.
+ * The array is compacted: state_count is the number of mapped states and
+ * there are never NULL holes, so consumers may index states[0..count) freely.
+ * Unmapped AT-SPI states are dropped (they have no metadesk vocabulary). */
+void md_atspi_extract_states(AtspiStateSet *state_set, MdA11yNode *node) {
+    if (!state_set || !node) return;
+
+    GArray *states = atspi_state_set_get_states(state_set);
+    if (!states || states->len == 0) {
+        if (states) g_array_free(states, TRUE);
+        return;
     }
 
+    char **names = calloc((size_t)states->len, sizeof(char *));
+    if (!names) {
+        g_array_free(states, TRUE);
+        return;
+    }
+
+    int count = 0;
+    for (guint i = 0; i < states->len; i++) {
+        const char *name =
+            atspi_state_name(g_array_index(states, AtspiStateType, i));
+        if (!name) continue;
+        char *dup = strdup(name);
+        if (!dup) continue;
+        names[count++] = dup;
+    }
     g_array_free(states, TRUE);
+
+    if (count == 0) {
+        free(names);
+        return;
+    }
+
+    node->states = names;
+    node->state_count = count;
+}
+
+static void extract_states(AtspiStateSet *state_set, MdA11yNode *node) {
+    md_atspi_extract_states(state_set, node);
 }
 
 static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,

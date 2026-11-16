@@ -36,4 +36,14 @@ typedef MdA11yDelta  MdAtspiDelta;
 #define md_atspi_delta_free(d,c)   md_a11y_delta_free((d),(c))
 #define md_atspi_destroy(t)        md_a11y_destroy(t)
 
+#ifdef __linux__
+/* AT-SPI backend seam (Linux only). Fills node->states with the canonical
+ * names of the mapped states in `state_set`; the array is compacted (no NULL
+ * entries, state_count == number of mapped states). Exposed so tests can
+ * exercise the mapping with a synthetic AtspiStateSet without an a11y bus.
+ * The forward typedef matches libatspi's own declaration. */
+typedef struct _AtspiStateSet AtspiStateSet;
+void md_atspi_extract_states(AtspiStateSet *state_set, MdA11yNode *node);
+#endif
+
 #endif /* MD_ATSPI_H */
