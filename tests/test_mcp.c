@@ -782,6 +782,8 @@ typedef struct {
     const char *modal_role;
     MdA11yChangeCb change_cb;
     void *change_userdata;
+    bool subscribe_fails;
+    MdA11ySnapshot *invalidate_during_walk;
 } QueryFixture;
 
 static MdA11yNode *query_node(const char *id, const char *role,
@@ -802,6 +804,10 @@ static int query_get_tree(MdA11yCtx *ctx, MdA11yNode **out)
 {
     QueryFixture *fixture = ctx->backend_data;
     fixture->walks++;
+    if (fixture->invalidate_during_walk) {
+        md_a11y_snapshot_invalidate(fixture->invalidate_during_walk);
+        fixture->invalidate_during_walk = NULL;
+    }
     if (fixture->unavailable) return -1;
     if (fixture->modal_role) {
         MdA11yNode *root = query_node("root", "application", "Editor", 2);
@@ -861,6 +867,7 @@ static int query_get_tree(MdA11yCtx *ctx, MdA11yNode **out)
 static int query_subscribe(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
 {
     QueryFixture *fixture = ctx->backend_data;
+    if (fixture->subscribe_fails) return -1;
     fixture->change_cb = cb;
     fixture->change_userdata = userdata;
     return 0;
@@ -1147,9 +1154,10 @@ static void test_resource_tree_formats(void)
             "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"resources/list\"}",
             "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"resources/read\",\"params\":{\"uri\":\"metadesk://ui-tree\"}}"
         };
-        for (int j = 0; j < 3; j++) {
-            fixture.unavailable = j == 2;
-            if (j == 2) fixture.change_cb(NULL, 0, fixture.change_userdata);
+        uint64_t first_ts = 0;
+        for (int j = 0; j < 4; j++) {
+            fixture.unavailable = j == 3;
+            if (j == 3) fixture.change_cb(NULL, 0, fixture.change_userdata);
             clear_responses();
             const char *request = requests[j == 0 ? 0 : 1];
             md_mcp_server_handle_message(server, request, strlen(request));
@@ -1158,14 +1166,22 @@ static void test_resource_tree_formats(void)
             cJSON *items = cJSON_GetObjectItem(result, j == 0 ? "resources" : "contents");
             cJSON *item = cJSON_GetArrayItem(items, 0);
             MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(item, "mimeType")), mime) == 0);
-            if (j == 1) {
+            if (j == 1 || j == 2) {
                 const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(item, "text"));
+                uint64_t ts;
                 if (i == MD_MCP_TREE_FORMAT_JSON) {
                     cJSON *tree = cJSON_Parse(text);
                     MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(tree, "root")));
+                    ts = (uint64_t)cJSON_GetObjectItem(tree, "ts")->valuedouble;
                     cJSON_Delete(tree);
-                } else MD_CHECK(strncmp(text, "v1 ts:", 6) == 0);
-            } else if (j == 2) {
+                } else {
+                    MD_CHECK(strncmp(text, "v1 ts:", 6) == 0);
+                    ts = strtoull(text + 6, NULL, 10);
+                }
+                MD_CHECK(ts > 0);
+                if (j == 1) first_ts = ts;
+                else MD_CHECK(ts == first_ts); /* cached walk, not read time */
+            } else if (j == 3) {
                 const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(item, "text"));
                 MD_CHECK(strcmp(text, i == MD_MCP_TREE_FORMAT_JSON ? "{\"root\":null}" : "") == 0);
             }
@@ -1284,6 +1300,95 @@ static void test_shared_a11y_snapshot(void)
     PASS("shared lazy snapshot: five reads, resource, change callback and actions");
 }
 
+static void test_snapshot_invalidation_and_time(void)
+{
+    static const MdA11yBackend backend = { .get_tree = query_get_tree };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    MdA11ySnapshot *snapshot = md_a11y_snapshot_create(&a11y);
+    MD_CHECK(snapshot != NULL);
+    fixture.invalidate_during_walk = snapshot;
+    const MdA11yNode *root = md_a11y_snapshot_acquire(snapshot);
+    MD_CHECK(root != NULL && fixture.walks == 1);
+    MD_CHECK(md_a11y_snapshot_time_ms(snapshot) > 0);
+
+    const uint64_t fixed_ts = 1234567890123ULL;
+    char *json = md_a11y_to_json_at(root, fixed_ts);
+    cJSON *tree = cJSON_Parse(json);
+    MD_CHECK(tree != NULL);
+    MD_CHECK(cJSON_GetObjectItem(tree, "ts")->valuedouble == (double)fixed_ts);
+    cJSON_Delete(tree);
+    free(json);
+    char *compact = md_a11y_to_compact_at(root, fixed_ts);
+    MD_CHECK(compact && strncmp(compact, "v1 ts:1234567890123\n", 20) == 0);
+    free(compact);
+    md_a11y_snapshot_release(snapshot);
+
+    /* The invalidation inside get_tree must survive completion of that walk. */
+    MD_CHECK(md_a11y_snapshot_acquire(snapshot) != NULL);
+    MD_CHECK(fixture.walks == 2);
+    uint64_t time_ms = md_a11y_snapshot_time_ms(snapshot);
+    md_a11y_snapshot_release(snapshot);
+    MD_CHECK(md_a11y_snapshot_acquire(snapshot) != NULL);
+    MD_CHECK(fixture.walks == 2 && md_a11y_snapshot_time_ms(snapshot) == time_ms);
+    /* Must return even while this thread holds the read lock. */
+    md_a11y_snapshot_invalidate(snapshot);
+    md_a11y_snapshot_release(snapshot);
+    MD_CHECK(md_a11y_snapshot_acquire(snapshot) != NULL);
+    MD_CHECK(fixture.walks == 3);
+    md_a11y_snapshot_release(snapshot);
+
+    fixture.unavailable = true;
+    md_a11y_snapshot_invalidate(snapshot);
+    MD_CHECK(md_a11y_snapshot_acquire(snapshot) == NULL);
+    MD_CHECK(md_a11y_snapshot_time_ms(snapshot) == 0);
+    md_a11y_snapshot_release(snapshot);
+    fixture.unavailable = false;
+    MD_CHECK(md_a11y_snapshot_acquire(snapshot) != NULL);
+    MD_CHECK(fixture.walks == 5);
+    md_a11y_snapshot_release(snapshot);
+    md_a11y_snapshot_destroy(snapshot);
+    PASS("non-blocking invalidation during walk/read and snapshot timestamps");
+}
+
+static void test_snapshot_subscribe_failure(void)
+{
+    const MdA11yBackend backends[] = {
+        { .get_tree = query_get_tree, .subscribe_changes = query_subscribe },
+        { .get_tree = query_get_tree },
+    };
+    for (size_t i = 0; i < sizeof(backends) / sizeof(backends[0]); i++) {
+        QueryFixture fixture = { .subscribe_fails = true };
+        MdA11yCtx a11y = { .vtable = &backends[i], .backend_data = &fixture };
+        MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+        MdMcpBridgeConfig config = {
+            .a11y = &a11y, .settle_ms = 1,
+            .stdio_in_fd = -1, .stdio_out_fd = -1,
+        };
+        MdMcpBridge *bridge = md_mcp_bridge_create(&config);
+        MD_CHECK(bridge != NULL && fixture.walks == 0);
+        MdMcpServer *server = md_mcp_bridge_get_server(bridge);
+        md_mcp_server_set_write_fn(server, capture_write, NULL);
+        do_init(server);
+        cJSON *value = query_json(server, "metadesk_find", "{\"format\":\"json\"}");
+        cJSON_Delete(value);
+        MD_CHECK(fixture.walks == 1);
+        value = query_json(server, "metadesk_node", "{\"id\":\"save\"}");
+        cJSON_Delete(value);
+        MD_CHECK(fixture.walks == 2);
+        cJSON *content = query_call(server, "metadesk_subtree", "{\"id\":\"win\"}", false);
+        cJSON_Delete(content);
+        MD_CHECK(fixture.walks == 3);
+        read_cached_resource(server);
+        MD_CHECK(fixture.walks == 4);
+        read_cached_resource(server);
+        MD_CHECK(fixture.walks == 5);
+        md_mcp_bridge_destroy(bridge);
+        pthread_mutex_destroy(&a11y.snapshot_mu);
+    }
+    PASS("failed or unsupported change subscription refreshes every read");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -1292,6 +1397,8 @@ int main(int argc, char **argv)
         test_a11y_read_tools();
         test_a11y_modal_and_label_queries();
         test_shared_a11y_snapshot();
+        test_snapshot_invalidation_and_time();
+        test_snapshot_subscribe_failure();
         test_resource_tree_formats();
         clear_responses();
         return md_test_report();

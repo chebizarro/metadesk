@@ -6,6 +6,8 @@
  * Registers tools, resources, and a11y change notifications.
  */
 #include "mcp_bridge.h"
+#define MD_LOG_TAG "mcp-bridge"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -98,10 +100,11 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
         goto fail;
 
     /* 6. Subscribe to a11y changes for notifications */
-    if (config->a11y) {
-        md_a11y_subscribe_changes(config->a11y,
+    if (md_a11y_subscribe_changes(config->a11y,
                                   md_mcp_a11y_change_cb,
-                                  &b->resource_ctx);
+                                  &b->resource_ctx) < 0) {
+        MD_LOG_W("accessibility change subscription failed; refreshing on every read");
+        md_a11y_snapshot_set_caching(b->snapshot, false);
     }
 
     /* 7. Create stdio transport if requested */
