@@ -904,13 +904,15 @@ int main(int argc, char **argv) {
                         free(ctx.ui_tree_json);
                         ctx.ui_tree_json = patched;
                         ctx.ui_tree_len = strlen(patched);
+                        ctx.tree_updates++;
+                        if (ctx.tree_updates <= 3 || (ctx.tree_updates % 100) == 0) {
+                            fprintf(stderr, "client: applied UI tree delta (%u bytes, update #%u)\n",
+                                    hdr.payload_len, ctx.tree_updates);
+                        }
+                    } else {
+                        fprintf(stderr, "client: warning: UI tree delta patch failed\n");
                     }
                 }
-            }
-            ctx.tree_updates++;
-            if (ctx.tree_updates <= 3 || (ctx.tree_updates % 100) == 0) {
-                fprintf(stderr, "client: applied UI tree delta (%u bytes, update #%u)\n",
-                        hdr.payload_len, ctx.tree_updates);
             }
             break;
 

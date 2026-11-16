@@ -51,7 +51,7 @@ The codebase is cross-platform from day one. Platform-specific functionality (sc
 ┌────────────────────────────────────────────────────────────┐
 │  Platform UI layer                                         │
 │  Human: SDL2 window + Dear ImGui overlay (all platforms)   │
-│  Agent: structured JSON / compact-markup API               │
+│  Agent: structured JSON / compact-text API               │
 ├────────────────────────────────────────────────────────────┤
 │  C17 core  (libmetadesk — no UI deps)                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐   │
@@ -299,7 +299,7 @@ WIN[1] gedit - untitled
 
 #### 3.3.3 Delta packets — `MD_PKT_UI_TREE_DELTA`
 
-Delta packets carry only changed nodes using the same formats above, with an added `"op"` field: `"add"` | `"remove"` | `"update"`.
+JSON sessions receive JSON delta arrays in `MD_PKT_UI_TREE_DELTA`, carrying changed nodes with an `"op"` field: `"add"` | `"remove"` | `"update"` (or a full JSON snapshot when a delta is unavailable or too large). Compact sessions receive a full compact snapshot replacement in `MD_PKT_UI_TREE` after each action; compact deltas are not supported.
 
 ---
 

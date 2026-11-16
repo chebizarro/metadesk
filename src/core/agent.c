@@ -206,7 +206,8 @@ static char *agent_render_update_locked(MdAgent *agent, bool *out_is_delta) {
     if (!agent->a11y) return NULL;
 
     int delta_count = 0;
-    MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
+    MdA11yDelta *deltas = agent->tree_format == MD_TREE_FORMAT_JSON
+        ? md_a11y_diff(agent->a11y, &delta_count) : NULL;
 
     if (deltas && delta_count > 0) {
         char *delta_json = md_a11y_delta_to_json(deltas, delta_count);
@@ -325,6 +326,11 @@ int md_agent_send_delta(MdAgent *agent, MdStream *stream, uint32_t *seq) {
         return -1;
 
     pthread_mutex_lock(&agent->mu);
+    if (agent->tree_format == MD_TREE_FORMAT_COMPACT) {
+        int ret = md_agent_send_tree_locked(agent, stream, seq);
+        pthread_mutex_unlock(&agent->mu);
+        return ret;
+    }
 
     int delta_count = 0;
     MdA11yDelta *deltas = md_a11y_diff(agent->a11y, &delta_count);
