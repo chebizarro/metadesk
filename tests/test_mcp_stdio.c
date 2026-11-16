@@ -275,7 +275,7 @@ static void test_stdio_stalled_pipe(void)
     size_t len = 1024 * 1024;
     char *json = malloc(len);
     MD_CHECK(json != NULL);
-    memset(json, 'x', len);
+    for (size_t i = 0; i < len; i++) json[i] = (char)('a' + i % 26);
     /* POLLOUT initially succeeds, but this message exceeds pipe capacity.
      * Chunked writes must stop at the deadline without changing fd flags. */
     /* Meson's suite timeout is the liveness guard, not elapsed CPU time. */
@@ -287,7 +287,8 @@ static void test_stdio_stalled_pipe(void)
     size_t queued = 0;
     ssize_t n;
     while ((n = read(output[0], buf, sizeof(buf))) > 0) {
-        MD_CHECK(memcmp(buf, json, (size_t)n) == 0);
+        MD_CHECK(queued + (size_t)n <= len &&
+                 memcmp(buf, json + queued, (size_t)n) == 0);
         queued += (size_t)n;
     }
     MD_CHECK(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));

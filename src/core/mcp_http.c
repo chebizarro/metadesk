@@ -59,6 +59,7 @@ struct MdMcpHttp {
     int             sse_count;
     int             sse_max_clients;
     int             sse_write_timeout_ms;
+    int             sse_sndbuf;
     pthread_mutex_t sse_mu;
 
     /* Tracks in-flight handler goroutines for graceful shutdown */
@@ -457,6 +458,10 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         int flags = fcntl(client_fd, F_GETFL);
         bool ready = flags >= 0 && fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
             send_sse_headers(client_fd, md_now_ms() + h->sse_write_timeout_ms) == 0;
+        /* 0 = never touched; verified by inspection, kernel autotuning makes a behavioural check non-deterministic. */
+        if (ready && h->sse_sndbuf > 0)
+            ready = setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
+                               &h->sse_sndbuf, sizeof(h->sse_sndbuf)) == 0;
         pthread_mutex_lock(&h->sse_mu);
         for (int i = 0; i < h->sse_count; i++) {
             if (h->sse_clients[i].fd != client_fd) continue;
@@ -589,17 +594,32 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
     return 0;
 }
 
-int md_mcp_http_sse_client_count(const MdMcpHttp *http)
+int md_mcp_http_sse_client_count(MdMcpHttp *http)
 {
     if (!http) return 0;
-    /* Logical constness: only the synchronization state is modified. */
-    pthread_mutex_t *mu = &((MdMcpHttp *)http)->sse_mu;
-    pthread_mutex_lock(mu);
+    pthread_mutex_lock(&http->sse_mu);
     int count = 0;
     for (int i = 0; i < http->sse_count; i++)
         if (http->sse_clients[i].ready) count++;
-    pthread_mutex_unlock(mu);
+    pthread_mutex_unlock(&http->sse_mu);
     return count;
+}
+
+int md_mcp_http_sse_client_sndbuf(MdMcpHttp *http, int index)
+{
+    if (!http || index < 0) return -1;
+    int sndbuf = -1;
+    pthread_mutex_lock(&http->sse_mu);
+    for (int i = 0; i < http->sse_count; i++) {
+        if (!http->sse_clients[i].ready || index-- != 0) continue;
+        socklen_t len = sizeof(sndbuf);
+        if (getsockopt(http->sse_clients[i].fd, SOL_SOCKET, SO_SNDBUF,
+                       &sndbuf, &len) < 0)
+            sndbuf = -1;
+        break;
+    }
+    pthread_mutex_unlock(&http->sse_mu);
+    return sndbuf;
 }
 
 static void close_sse_clients(MdMcpHttp *http)
@@ -634,6 +654,7 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         ? config->max_clients : DEFAULT_MAX_SSE_CLIENTS;
     h->sse_write_timeout_ms = config->sse_write_timeout_ms > 0
         ? config->sse_write_timeout_ms : MD_MCP_SSE_WRITE_TIMEOUT_MS;
+    h->sse_sndbuf = config->sse_sndbuf;
     h->sse_clients = calloc((size_t)h->sse_max_clients,
                             sizeof(*h->sse_clients));
     if (!h->sse_clients) {
