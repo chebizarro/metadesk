@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <time.h>
 #include "md_test.h"
 
 static int live_a11y_tests_enabled(void) {
@@ -271,10 +273,27 @@ static void test_diff(void) {
     md_a11y_destroy(ctx);
 }
 
-static void noop_change_cb(const MdA11yDelta *deltas, int count, void *userdata) {
-    (void)deltas;
-    (void)count;
-    (void)userdata;
+static int (*live_get_tree)(MdA11yCtx *, MdA11yNode **);
+static atomic_int live_walks;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int hints;
+} LiveHints;
+
+static int counted_live_get_tree(MdA11yCtx *ctx, MdA11yNode **out) {
+    atomic_fetch_add(&live_walks, 1);
+    return live_get_tree(ctx, out);
+}
+
+static void live_change_cb(const MdA11yDelta *deltas, int count, void *userdata) {
+    LiveHints *h = userdata;
+    MD_CHECK(deltas == NULL && count == 0);
+    pthread_mutex_lock(&h->mu);
+    h->hints++;
+    pthread_cond_signal(&h->cv);
+    pthread_mutex_unlock(&h->mu);
 }
 
 static void test_subscribe_changes(void) {
@@ -286,16 +305,42 @@ static void test_subscribe_changes(void) {
     MdA11yCtx *ctx = md_a11y_create();
     MD_CHECK(ctx != NULL);
 
-    int rc = md_a11y_subscribe_changes(ctx, noop_change_cb, NULL);
+    MdA11yBackend counted = *ctx->vtable;
+    live_get_tree = counted.get_tree;
+    atomic_store(&live_walks, 0);
+    counted.get_tree = counted_live_get_tree;
+    ctx->vtable = &counted;
+    LiveHints hints = { .mu = PTHREAD_MUTEX_INITIALIZER,
+                        .cv = PTHREAD_COND_INITIALIZER };
+    int rc = md_a11y_subscribe_changes(ctx, live_change_cb, &hints);
     if (rc < 0) {
         /* Accessibility bus may not be available in CI/headless environments.
          * Windows UIA subscriptions also require an interactive desktop. */
         printf("  SKIP: subscribe changes (no accessibility event bus)\n");
+        pthread_cond_destroy(&hints.cv);
+        pthread_mutex_destroy(&hints.mu);
         md_a11y_destroy(ctx);
         return;
     }
 
     MD_CHECK(rc >= 0);
+    int seeded_walks = atomic_load(&live_walks);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&hints.mu);
+    while (!hints.hints) {
+        if (pthread_cond_timedwait(&hints.cv, &hints.mu, &deadline) != 0) break;
+    }
+    pthread_mutex_unlock(&hints.mu);
+    MD_CHECK(md_a11y_unsubscribe_changes(ctx) == 0);
+    MD_CHECK(atomic_load(&live_walks) == seeded_walks);
+    if (hints.hints)
+        printf("  PASS: %d live change hints caused zero get_tree calls\n", hints.hints);
+    else
+        printf("  SKIP: live hint walk check (no OS event during observation)\n");
+    pthread_cond_destroy(&hints.cv);
+    pthread_mutex_destroy(&hints.mu);
     md_a11y_destroy(ctx);
     printf("  PASS: subscribe changes\n");
 }

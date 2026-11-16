@@ -103,6 +103,12 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     if (md_mcp_register_resources(b->server, &b->resource_ctx) != 0)
         goto fail;
 
+    if (config->notify_coalesce_ms) {
+        b->resource_ctx.notifier = md_mcp_notify_coalescer_create(
+            b->server, config->notify_coalesce_ms);
+        if (!b->resource_ctx.notifier) goto fail;
+    }
+
     /* 6. Subscribe to a11y changes for notifications */
     if (md_a11y_subscribe_changes(config->a11y,
                                   md_mcp_a11y_change_cb,
@@ -196,6 +202,9 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
         md_a11y_unsubscribe_changes(bridge->a11y);
         bridge->a11y_subscribed = false;
     }
+
+    md_mcp_notify_coalescer_destroy(bridge->resource_ctx.notifier);
+    bridge->resource_ctx.notifier = NULL;
 
     md_session_disconnect(&bridge->session);
 

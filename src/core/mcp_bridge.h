@@ -29,6 +29,10 @@
 extern "C" {
 #endif
 
+#ifndef MD_MCP_NOTIFY_COALESCE_MS
+#define MD_MCP_NOTIFY_COALESCE_MS 50
+#endif
+
 /* Opaque bridge context */
 typedef struct MdMcpBridge MdMcpBridge;
 
@@ -44,6 +48,9 @@ typedef struct {
     MdA11yCtx    *a11y;           /* shared a11y context (required)     */
     MdInput      *input;          /* shared input context (optional)    */
     MdMcpTreeFormat tree_format;  /* resource only; DEFAULT=compact, actions=JSON */
+    /* Host default: MD_MCP_NOTIFY_COALESCE_MS; 0 disables coalescing.
+     * Nonzero quiet windows are capped at 200 ms. */
+    uint32_t      notify_coalesce_ms;
     uint32_t      settle_ms;      /* settle time after actions (0=default) */
 
     /* Transport: use one of these */

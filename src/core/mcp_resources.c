@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <time.h>
 
 /* Build the MCP resource `contents` array: one text item carrying
  * `uri`, `mimeType`, and `text`. cJSON copies each string. */
@@ -116,6 +118,113 @@ static cJSON *read_session_info(void *userdata)
 
 /* ── Notifications ───────────────────────────────────────────── */
 
+struct MdMcpNotifyCoalescer {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t thread;
+    MdMcpServer *server;
+    uint32_t quiet_ms;
+    bool stop, dirty;
+    uint64_t first_ns, last_ns;
+};
+
+static uint64_t notify_now_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static void *notify_worker(void *userdata)
+{
+    MdMcpNotifyCoalescer *n = userdata;
+    pthread_mutex_lock(&n->mu);
+    while (!n->stop) {
+        while (!n->dirty && !n->stop)
+            pthread_cond_wait(&n->cv, &n->mu);
+        if (n->stop) break;
+        uint64_t deadline = n->last_ns + (uint64_t)n->quiet_ms * 1000000;
+        uint64_t cap = n->first_ns + 200000000ULL;
+        if (deadline > cap) deadline = cap;
+        uint64_t now = notify_now_ns();
+        if (now < deadline) {
+#ifdef __APPLE__
+            uint64_t remaining = deadline - now;
+            struct timespec wait = { (time_t)(remaining / 1000000000ULL),
+                                    (long)(remaining % 1000000000ULL) };
+            pthread_cond_timedwait_relative_np(&n->cv, &n->mu, &wait);
+#else
+            struct timespec wait = { (time_t)(deadline / 1000000000ULL),
+                                    (long)(deadline % 1000000000ULL) };
+            pthread_cond_timedwait(&n->cv, &n->mu, &wait);
+#endif
+            continue; /* recompute after every hint or spurious wake */
+        }
+        n->dirty = false;
+        pthread_mutex_unlock(&n->mu);
+        md_mcp_notify_tree_changed(n->server);
+        pthread_mutex_lock(&n->mu);
+    }
+    pthread_mutex_unlock(&n->mu);
+    return NULL;
+}
+
+MdMcpNotifyCoalescer *md_mcp_notify_coalescer_create(MdMcpServer *server,
+                                                  uint32_t quiet_ms)
+{
+    if (!server || !quiet_ms) return NULL;
+    MdMcpNotifyCoalescer *n = calloc(1, sizeof(*n));
+    if (!n) return NULL;
+    n->server = server;
+    n->quiet_ms = quiet_ms > 200 ? 200 : quiet_ms;
+    if (pthread_mutex_init(&n->mu, NULL) != 0) goto fail;
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) goto fail_mu;
+#ifndef __APPLE__
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) != 0) {
+        pthread_condattr_destroy(&attr);
+        goto fail_mu;
+    }
+#endif
+    int rc = pthread_cond_init(&n->cv, &attr);
+    pthread_condattr_destroy(&attr);
+    if (rc != 0) goto fail_mu;
+    if (pthread_create(&n->thread, NULL, notify_worker, n) != 0) {
+        pthread_cond_destroy(&n->cv);
+        goto fail_mu;
+    }
+    return n;
+fail_mu:
+    pthread_mutex_destroy(&n->mu);
+fail:
+    free(n);
+    return NULL;
+}
+
+void md_mcp_notify_coalescer_destroy(MdMcpNotifyCoalescer *n)
+{
+    if (!n) return;
+    pthread_mutex_lock(&n->mu);
+    n->stop = true;
+    pthread_cond_signal(&n->cv);
+    pthread_mutex_unlock(&n->mu);
+    pthread_join(n->thread, NULL);
+    pthread_cond_destroy(&n->cv);
+    pthread_mutex_destroy(&n->mu);
+    free(n);
+}
+
+static void notify_dirty(MdMcpNotifyCoalescer *n)
+{
+    pthread_mutex_lock(&n->mu);
+    uint64_t now = notify_now_ns();
+    if (!n->dirty) n->first_ns = now;
+    n->last_ns = now;
+    n->dirty = true;
+    pthread_cond_signal(&n->cv);
+    pthread_mutex_unlock(&n->mu);
+}
+
 int md_mcp_notify_tree_changed(MdMcpServer *server)
 {
     if (!server) return -1;
@@ -130,7 +239,10 @@ void md_mcp_a11y_change_cb(const MdA11yDelta *deltas, int count,
     MdMcpResourceCtx *ctx = userdata;
     if (!ctx) return;
     md_a11y_snapshot_invalidate(ctx->snapshot);
-    md_mcp_notify_tree_changed(ctx->server);
+    if (ctx->notifier)
+        notify_dirty(ctx->notifier);
+    else
+        md_mcp_notify_tree_changed(ctx->server);
 }
 
 /* ── Registration ────────────────────────────────────────────── */

@@ -902,16 +902,15 @@ static void query_unsubscribe(MdA11yCtx *ctx)
 }
 
 /* Simulate a backend change event exactly the way the real backends
- * dispatch one: through md_a11y_change_begin()/_end() on the ctx.
- * Returns whether a callback was actually invoked. */
+ * dispatch one: through md_a11y_change_dispatch() on the ctx.
+ * Returns whether a callback was registered before dispatch. */
 static bool query_fire_change(MdA11yCtx *ctx)
 {
-    MdA11yChangeCb cb = NULL;
-    void *userdata = NULL;
-    if (!md_a11y_change_begin(ctx, &cb, &userdata)) return false;
-    cb(NULL, 0, userdata);
-    md_a11y_change_end(ctx);
-    return true;
+    pthread_mutex_lock(&ctx->change_mu);
+    bool subscribed = ctx->change_cb != NULL;
+    pthread_mutex_unlock(&ctx->change_mu);
+    md_a11y_change_dispatch(ctx);
+    return subscribed;
 }
 
 static cJSON *query_call(MdMcpServer *server, const char *name,
@@ -1799,7 +1798,22 @@ static void *bridge_destroy_thread(void *arg)
     return NULL;
 }
 
-static void test_bridge_destroy_blocked_write(void)
+typedef struct {
+    MdA11yCtx *a11y;
+    TestLatch started;
+} HintFlood;
+
+static void *hint_flood_thread(void *userdata)
+{
+    HintFlood *f = userdata;
+    MD_CHECK(query_fire_change(f->a11y));
+    latch_post(&f->started);
+    /* Adversarial producer: stop only once destroy detaches the callback. */
+    while (query_fire_change(f->a11y)) {}
+    return NULL;
+}
+
+static void test_bridge_destroy_blocked_write(uint32_t coalesce_ms)
 {
     static const MdA11yBackend backend = {
         .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
@@ -1814,6 +1828,7 @@ static void test_bridge_destroy_blocked_write(void)
     MdMcpBridgeConfig config = {
         .a11y = &a11y, .settle_ms = 1, .stdio_in_fd = -1, .stdio_out_fd = -1,
     };
+    config.notify_coalesce_ms = coalesce_ms;
     f.bridge = md_mcp_bridge_create(&config);
     MD_CHECK(f.bridge != NULL);
     f.server = md_mcp_bridge_get_server(f.bridge);
@@ -1828,6 +1843,16 @@ static void test_bridge_destroy_blocked_write(void)
     pthread_t change_tid, destroy_tid;
     MD_CHECK(pthread_create(&change_tid, NULL, bridge_change_thread, &f) == 0);
     MD_CHECK(latch_wait_ms(&f.entered, 2000));
+    /* Queue another burst while the notifier is inside its first sink.
+     * Destroy must join that worker and discard its pending dirty state. */
+    HintFlood flood = { .a11y = &a11y };
+    pthread_t flood_tid;
+    if (coalesce_ms) {
+        for (int i = 0; i < 50; i++) MD_CHECK(query_fire_change(&a11y));
+        latch_init(&flood.started);
+        MD_CHECK(pthread_create(&flood_tid, NULL, hint_flood_thread, &flood) == 0);
+        MD_CHECK(latch_wait_ms(&flood.started, 2000));
+    }
     MD_CHECK(pthread_create(&destroy_tid, NULL, bridge_destroy_thread, &f) == 0);
     MD_CHECK(latch_wait_ms(&f.started, 2000));
     MD_CHECK(!latch_wait_ms(&f.returned, 100));
@@ -1835,6 +1860,10 @@ static void test_bridge_destroy_blocked_write(void)
     MD_CHECK(latch_wait_ms(&f.returned, 2000));
     MD_CHECK(pthread_join(destroy_tid, NULL) == 0);
     MD_CHECK(pthread_join(change_tid, NULL) == 0);
+    if (coalesce_ms) {
+        MD_CHECK(pthread_join(flood_tid, NULL) == 0);
+        latch_fini(&flood.started);
+    }
     MD_CHECK(f.calls == 1 && f.query.unsubscribes == 1);
     MD_CHECK(f.released && f.stayed_alive && f.fired && f.quiesced);
     MD_CHECK(!query_fire_change(&a11y));
@@ -1844,6 +1873,124 @@ static void test_bridge_destroy_blocked_write(void)
     md_a11y_node_free(a11y.last_snapshot);
     query_a11y_fini(&a11y);
     PASS("bridge destroy waits for blocked transport then completes within bound");
+}
+
+/* A sink latch counts only notifications, not handshake/read responses. */
+static int hint_notify_write(const char *json, size_t len, void *userdata)
+{
+    (void)len;
+    cJSON *message = cJSON_Parse(json);
+    MD_CHECK(message != NULL);
+    const char *method = cJSON_GetStringValue(cJSON_GetObjectItem(message, "method"));
+    MD_CHECK(method && strcmp(method, "notifications/resources/updated") == 0);
+    latch_post(userdata);
+    cJSON_Delete(message);
+    return 0;
+}
+
+static void test_hint_coalescing(uint32_t quiet_ms)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
+    };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    query_a11y_init(&a11y);
+    MdMcpBridgeConfig config = {
+        .a11y = &a11y, .settle_ms = 1, .notify_coalesce_ms = quiet_ms,
+        .stdio_in_fd = -1, .stdio_out_fd = -1,
+    };
+    MdMcpBridge *bridge = md_mcp_bridge_create(&config);
+    MD_CHECK(bridge != NULL);
+    MdMcpServer *server = md_mcp_bridge_get_server(bridge);
+    md_mcp_server_set_write_fn(server, capture_write, NULL);
+    md_test_mcp_handshake(server);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(server, subscribe, sizeof(subscribe) - 1) == 0);
+    const char read[] = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\","
+                        "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(server, read, sizeof(read) - 1) == 0);
+    int walks = fixture.walks;
+    TestLatch notifications;
+    latch_init(&notifications);
+    md_mcp_server_set_write_fn(server, hint_notify_write, &notifications);
+
+    for (int i = 0; i < 100; i++) MD_CHECK(query_fire_change(&a11y));
+    MD_CHECK(fixture.walks == walks); /* hints never call get_tree */
+    int expected = quiet_ms ? 1 : 100;
+    for (int i = 0; i < expected; i++) MD_CHECK(latch_wait_ms(&notifications, 2000));
+    MD_CHECK(!latch_wait_ms(&notifications, 60)); /* exactly one per burst */
+
+    /* Read immediately after a hint, before the coalescer's quiet window:
+     * invalidation must not be delayed until notification delivery. */
+    MD_CHECK(query_fire_change(&a11y));
+    MD_CHECK(md_mcp_server_handle_message_with_sink(server, read, sizeof(read) - 1,
+                                            capture_write, NULL) == 0);
+    MD_CHECK(fixture.walks == walks + 1);
+    MD_CHECK(md_mcp_server_handle_message_with_sink(server, read, sizeof(read) - 1,
+                                            capture_write, NULL) == 0);
+    MD_CHECK(fixture.walks == walks + 1);
+    MD_CHECK(latch_wait_ms(&notifications, 2000));
+    MD_CHECK(!latch_wait_ms(&notifications, 60));
+
+    /* A second 50-hint burst: disabled mode preserves 50 synchronous writes. */
+    for (int i = 0; i < 50; i++) MD_CHECK(query_fire_change(&a11y));
+    expected = quiet_ms ? 1 : 50;
+    if (!quiet_ms) MD_CHECK(latch_count(&notifications) == 50);
+    for (int i = 0; i < expected; i++) MD_CHECK(latch_wait_ms(&notifications, 2000));
+    MD_CHECK(!latch_wait_ms(&notifications, 60));
+
+    /* Pending dirty state is discarded on teardown; no late sink calls. */
+    md_mcp_server_quiesce(server);
+    for (int i = 0; i < 50; i++) MD_CHECK(query_fire_change(&a11y));
+    md_mcp_bridge_destroy(bridge);
+    MD_CHECK(latch_count(&notifications) == 0);
+    MD_CHECK(!query_fire_change(&a11y));
+    MD_CHECK(fixture.unsubscribes == 1);
+    latch_fini(&notifications);
+
+    /* Fail transport creation after notifier startup and subscription. */
+    config.stdio_in_fd = 0;
+    config.stdio_out_fd = -1;
+    MD_CHECK(md_mcp_bridge_create(&config) == NULL);
+    MD_CHECK(fixture.unsubscribes == 2);
+    MD_CHECK(!query_fire_change(&a11y));
+    query_a11y_fini(&a11y);
+    clear_responses();
+    PASS("hints do zero walks, invalidate immediately, coalesce bursts and stop at quiesce");
+}
+
+static void test_hint_coalescing_cap(void)
+{
+    MdMcpServerConfig config = { .write_fn = capture_write };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MD_CHECK(server != NULL);
+    md_test_mcp_handshake(server);
+    const char subscribe[] = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\","
+                             "\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+    MD_CHECK(md_mcp_server_handle_message(server, subscribe, sizeof(subscribe) - 1) == 0);
+    TestLatch notifications;
+    latch_init(&notifications);
+    md_mcp_server_set_write_fn(server, hint_notify_write, &notifications);
+    MdMcpResourceCtx ctx = { .server = server };
+    ctx.notifier = md_mcp_notify_coalescer_create(server, 200);
+    MD_CHECK(ctx.notifier != NULL);
+    /* Keep the quiet deadline moving. A notification must arrive while
+     * hints are still arriving, rather than waiting for the stream to end. */
+    bool notified = false;
+    for (int i = 0; i < 40; i++) {
+        md_mcp_a11y_change_cb(NULL, 0, &ctx);
+        if (latch_wait_ms(&notifications, 10)) { notified = true; break; }
+    }
+    MD_CHECK(notified);
+    md_mcp_server_quiesce(server);
+    md_mcp_notify_coalescer_destroy(ctx.notifier);
+    md_mcp_server_destroy(server);
+    latch_fini(&notifications);
+    clear_responses();
+    PASS("continuous hints notify at the maximum latency cap");
 }
 
 static void counting_cb_a(const MdA11yDelta *deltas, int count, void *userdata)
@@ -1927,7 +2074,11 @@ int main(int argc, char **argv)
         test_resource_tree_formats();
         test_bridge_destroy_unsubscribes();
         test_unsubscribe_drains_in_flight_callback();
-        test_bridge_destroy_blocked_write();
+        test_bridge_destroy_blocked_write(0);
+        test_bridge_destroy_blocked_write(20);
+        test_hint_coalescing(20);
+        test_hint_coalescing(0);
+        test_hint_coalescing_cap();
         test_subscribe_refuses_second_owner();
         clear_responses();
         return md_test_report();

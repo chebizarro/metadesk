@@ -895,6 +895,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "host[mcp]: WARNING: input unavailable\n");
 
         MdMcpBridgeConfig mcp_cfg = {
+            .notify_coalesce_ms = MD_MCP_NOTIFY_COALESCE_MS,
             .a11y = mcp_a11y,
             .input = mcp_input,
             .tree_format = mcp_tree_format,
