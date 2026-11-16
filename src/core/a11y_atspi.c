@@ -37,9 +37,8 @@ typedef struct {
     GMutex               lock;           /* protects next_id + backend state      */
     AtspiEventListener  *listener;       /* push-change listener registered below */
     GThread             *event_thread;   /* runs the AT-SPI/GLib event loop       */
-    MdA11yChangeCb       change_cb;
-    void                *change_userdata;
-    gboolean             subscribed;
+    gboolean             subscribed;     /* listener registered; the callback
+                                          * itself lives on the MdA11yCtx         */
     gboolean             event_loop_running;
 } AtspiState;
 
@@ -230,29 +229,25 @@ static void atspi_change_event_cb(AtspiEvent *event, void *user_data) {
     if (!ctx) return;
 
     AtspiState *st = ctx->backend_data;
-    if (!st) return;
+    if (!st) {
+        if (event) g_boxed_free(ATSPI_TYPE_EVENT, event);
+        return;
+    }
 
+    /* begin() copies the callback and marks it in flight so
+     * md_a11y_unsubscribe_changes can wait for us; it returns false once
+     * unsubscribed. No lock is held while the diff and callback run:
+     * md_a11y_diff re-enters get_tree, which takes st->lock. */
     MdA11yChangeCb cb = NULL;
     void *cb_userdata = NULL;
-
-    g_mutex_lock(&st->lock);
-    if (st->subscribed && st->change_cb) {
-        cb = st->change_cb;
-        cb_userdata = st->change_userdata;
-    }
-    g_mutex_unlock(&st->lock);
-
-    /* Diff outside the backend lock: md_a11y_diff re-enters get_tree,
-     * which takes the same lock. */
-    MdA11yDelta *deltas = NULL;
-    int delta_count = 0;
-    if (cb)
-        deltas = md_a11y_diff(ctx, &delta_count);
-
-    if (cb)
+    if (md_a11y_change_begin(ctx, &cb, &cb_userdata)) {
+        int delta_count = 0;
+        MdA11yDelta *deltas = md_a11y_diff(ctx, &delta_count);
         cb(deltas, delta_count, cb_userdata);
+        md_a11y_delta_free(deltas, delta_count);
+        md_a11y_change_end(ctx);
+    }
 
-    md_a11y_delta_free(deltas, delta_count);
     if (event)
         g_boxed_free(ATSPI_TYPE_EVENT, event);
 }
@@ -281,14 +276,54 @@ static int atspi_register_change_events(AtspiState *st) {
     return 0;
 }
 
-static void atspi_deregister_change_events(AtspiState *st) {
-    if (!st || !st->listener) return;
+static void atspi_deregister_change_events(AtspiEventListener *listener) {
+    if (!listener) return;
 
     for (size_t i = 0; i < sizeof(atspi_change_events) / sizeof(atspi_change_events[0]); i++) {
         GError *error = NULL;
-        atspi_event_listener_deregister(st->listener, atspi_change_events[i], &error);
+        atspi_event_listener_deregister(listener, atspi_change_events[i], &error);
         if (error) g_error_free(error);
     }
+}
+
+/* Single teardown path shared by unsubscribe, the subscribe failure path
+ * and destroy: deregister every change event, stop and join the GLib event
+ * loop thread, drop the listener. The user callback is not touched here —
+ * a11y.c has already cleared and drained it before calling us.
+ *
+ * Dispatch runs on the GLib main loop that atspi_event_main() spins on the
+ * backend-owned event thread, so joining that thread is what guarantees
+ * no listener callback is still executing when this returns. Should the
+ * host ever drive the default GMainContext from the calling thread
+ * instead, events are dispatched on *this* thread and there is nothing to
+ * wait for; the self-join guard below covers that (and the documented
+ * "unsubscribe inside the callback" misuse) without deadlocking.
+ * Idempotent. */
+static void atspi_teardown_subscription(AtspiState *st) {
+    if (!st) return;
+
+    g_mutex_lock(&st->lock);
+    AtspiEventListener *listener = st->listener;
+    GThread *event_thread = st->event_thread;
+    gboolean stop_loop = event_thread != NULL || st->event_loop_running;
+    st->listener = NULL;
+    st->event_thread = NULL;
+    st->subscribed = FALSE;
+    g_mutex_unlock(&st->lock);
+
+    atspi_deregister_change_events(listener);
+
+    if (stop_loop)
+        atspi_event_quit();
+    if (event_thread) {
+        if (event_thread == g_thread_self())
+            g_thread_unref(event_thread);
+        else
+            g_thread_join(event_thread);
+    }
+
+    if (listener)
+        g_object_unref(listener);
 }
 
 /* ── Vtable implementation ───────────────────────────────────── */
@@ -377,11 +412,11 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                    void *userdata) {
     AtspiState *st = ctx ? ctx->backend_data : NULL;
     if (!st || !st->connected || !cb) return -1;
+    (void)userdata; /* callback + userdata are stored on ctx by a11y.c */
 
     g_mutex_lock(&st->lock);
     if (st->subscribed) {
-        st->change_cb = cb;
-        st->change_userdata = userdata;
+        /* Listener already registered; a11y.c swapped the callback. */
         g_mutex_unlock(&st->lock);
         return 0;
     }
@@ -396,15 +431,11 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
 
     g_mutex_lock(&st->lock);
     st->listener = listener;
-    st->change_cb = cb;
-    st->change_userdata = userdata;
     g_mutex_unlock(&st->lock);
 
     if (atspi_register_change_events(st) != 0) {
         g_mutex_lock(&st->lock);
         st->listener = NULL;
-        st->change_cb = NULL;
-        st->change_userdata = NULL;
         g_mutex_unlock(&st->lock);
         g_object_unref(listener);
         return -1;
@@ -421,43 +452,30 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         md_a11y_delta_free(seed, seeded);
     }
 
-    st->event_thread = g_thread_new("md-atspi-events",
-                                    atspi_event_loop_thread, st);
-    if (!st->event_thread) {
-        atspi_deregister_change_events(st);
-        g_mutex_lock(&st->lock);
-        st->subscribed = FALSE;
-        st->listener = NULL;
-        st->change_cb = NULL;
-        st->change_userdata = NULL;
-        g_mutex_unlock(&st->lock);
-        g_object_unref(listener);
+    GThread *event_thread = g_thread_new("md-atspi-events",
+                                         atspi_event_loop_thread, st);
+    g_mutex_lock(&st->lock);
+    st->event_thread = event_thread;
+    g_mutex_unlock(&st->lock);
+    if (!event_thread) {
+        atspi_teardown_subscription(st);
         return -1;
     }
 
     return 0;
 }
 
+static void atspi_unsubscribe_changes(MdA11yCtx *ctx) {
+    AtspiState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return;
+    atspi_teardown_subscription(st);
+}
+
 static void atspi_destroy_backend(MdA11yCtx *ctx) {
     AtspiState *st = ctx->backend_data;
     if (!st) return;
 
-    atspi_deregister_change_events(st);
-
-    g_mutex_lock(&st->lock);
-    st->subscribed = FALSE;
-    st->change_cb = NULL;
-    st->change_userdata = NULL;
-    gboolean stop_loop = st->event_thread != NULL || st->event_loop_running;
-    g_mutex_unlock(&st->lock);
-
-    if (stop_loop)
-        atspi_event_quit();
-    if (st->event_thread)
-        g_thread_join(st->event_thread);
-
-    if (st->listener)
-        g_object_unref(st->listener);
+    atspi_teardown_subscription(st);
 
     atspi_exit();
 
@@ -471,8 +489,9 @@ static void atspi_destroy_backend(MdA11yCtx *ctx) {
 static const MdA11yBackend atspi_backend = {
     .init              = atspi_init_backend,
     .get_tree          = atspi_get_tree,
-    .subscribe_changes = atspi_subscribe_changes,
-    .destroy           = atspi_destroy_backend,
+    .subscribe_changes   = atspi_subscribe_changes,
+    .unsubscribe_changes = atspi_unsubscribe_changes,
+    .destroy             = atspi_destroy_backend,
 };
 
 const MdA11yBackend *md_a11y_backend_create(void) {

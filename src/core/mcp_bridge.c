@@ -29,6 +29,10 @@ struct MdMcpBridge {
     /* Borrowed references */
     MdA11yCtx         *a11y;
     MdInput           *input;
+
+    /* True while md_mcp_a11y_change_cb is registered on a11y with
+     * &resource_ctx as userdata; destroy must detach it first. */
+    bool               a11y_subscribed;
 };
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
@@ -105,6 +109,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
                                   &b->resource_ctx) < 0) {
         MD_LOG_W("accessibility change subscription failed; refreshing on every read");
         md_a11y_snapshot_set_caching(b->snapshot, false);
+    } else {
+        b->a11y_subscribed = true;
     }
 
     /* 7. Create stdio transport if requested */
@@ -180,6 +186,14 @@ MdMcpServer *md_mcp_bridge_get_server(const MdMcpBridge *bridge)
 void md_mcp_bridge_destroy(MdMcpBridge *bridge)
 {
     if (!bridge) return;
+
+    /* First: detach the a11y change callback and wait for any in-flight
+     * invocation. Everything it touches (resource_ctx, server, snapshot)
+     * is freed below. */
+    if (bridge->a11y_subscribed) {
+        md_a11y_unsubscribe_changes(bridge->a11y);
+        bridge->a11y_subscribed = false;
+    }
 
     md_session_disconnect(&bridge->session);
 

@@ -7,6 +7,8 @@
  * formats is implemented here (platform-independent).
  */
 #include "a11y.h"
+#define MD_LOG_TAG "a11y"
+#include "log.h"
 
 #include <cjson/cJSON.h>
 #include <stdlib.h>
@@ -26,8 +28,12 @@ MdA11yCtx *md_a11y_create(void) {
 
     ctx->vtable = vtable;
     pthread_mutex_init(&ctx->snapshot_mu, NULL);
+    pthread_mutex_init(&ctx->change_mu, NULL);
+    pthread_cond_init(&ctx->change_cv, NULL);
 
     if (ctx->vtable->init(ctx) != 0) {
+        pthread_cond_destroy(&ctx->change_cv);
+        pthread_mutex_destroy(&ctx->change_mu);
         pthread_mutex_destroy(&ctx->snapshot_mu);
         free(ctx);
         return NULL;
@@ -231,10 +237,84 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
     return deltas;
 }
 
+/* ── Change subscription + in-flight drain ───────────────────── */
+
+bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
+                          void **out_userdata) {
+    if (!ctx || !out_cb || !out_userdata) return false;
+
+    pthread_mutex_lock(&ctx->change_mu);
+    if (!ctx->change_cb) {
+        pthread_mutex_unlock(&ctx->change_mu);
+        return false;
+    }
+    *out_cb = ctx->change_cb;
+    *out_userdata = ctx->change_userdata;
+    ctx->change_in_flight++;
+    ctx->change_thread = pthread_self();
+    pthread_mutex_unlock(&ctx->change_mu);
+    return true;
+}
+
+void md_a11y_change_end(MdA11yCtx *ctx) {
+    if (!ctx) return;
+
+    pthread_mutex_lock(&ctx->change_mu);
+    if (ctx->change_in_flight > 0 && --ctx->change_in_flight == 0)
+        pthread_cond_broadcast(&ctx->change_cv);
+    pthread_mutex_unlock(&ctx->change_mu);
+}
+
+/* Clear the registration and wait for in-flight dispatches to return.
+ * Returns false if no callback was registered. */
+static bool change_clear_and_drain(MdA11yCtx *ctx) {
+    pthread_mutex_lock(&ctx->change_mu);
+    bool had_cb = ctx->change_cb != NULL;
+    ctx->change_cb = NULL;
+    ctx->change_userdata = NULL;
+    while (ctx->change_in_flight > 0) {
+        if (pthread_equal(ctx->change_thread, pthread_self())) {
+            /* Called from inside the callback: the only in-flight dispatch
+             * is our own caller. Waiting would deadlock, so return without
+             * the drain guarantee (documented as unsupported). */
+            MD_LOG_E("md_a11y_unsubscribe_changes called from inside the change callback");
+            break;
+        }
+        pthread_cond_wait(&ctx->change_cv, &ctx->change_mu);
+    }
+    pthread_mutex_unlock(&ctx->change_mu);
+    return had_cb;
+}
+
 int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata) {
-    if (!ctx || !ctx->vtable || !ctx->vtable->subscribe_changes)
+    if (!ctx || !cb || !ctx->vtable || !ctx->vtable->subscribe_changes)
         return -1;
-    return ctx->vtable->subscribe_changes(ctx, cb, userdata);
+
+    /* Publish the callback before the backend registers OS listeners so an
+     * event that fires during registration is not lost. */
+    pthread_mutex_lock(&ctx->change_mu);
+    ctx->change_cb = cb;
+    ctx->change_userdata = userdata;
+    pthread_mutex_unlock(&ctx->change_mu);
+
+    int rc = ctx->vtable->subscribe_changes(ctx, cb, userdata);
+    if (rc < 0)
+        change_clear_and_drain(ctx);
+    return rc;
+}
+
+int md_a11y_unsubscribe_changes(MdA11yCtx *ctx) {
+    if (!ctx) return -1;
+
+    /* Order matters: clear + drain first so the backend teardown below
+     * never races a dispatch that still holds the old callback. */
+    if (!change_clear_and_drain(ctx))
+        return -1;
+
+    if (!ctx->vtable || !ctx->vtable->unsubscribe_changes)
+        return -1;
+    ctx->vtable->unsubscribe_changes(ctx);
+    return 0;
 }
 
 bool md_a11y_is_connected(const MdA11yCtx *ctx) {
@@ -243,9 +323,14 @@ bool md_a11y_is_connected(const MdA11yCtx *ctx) {
 
 void md_a11y_destroy(MdA11yCtx *ctx) {
     if (!ctx) return;
+    /* Drain any live subscription before the backend (and last_snapshot,
+     * which the diff inside a dispatch reads) goes away. */
+    md_a11y_unsubscribe_changes(ctx);
     if (ctx->vtable && ctx->vtable->destroy)
         ctx->vtable->destroy(ctx);
     md_a11y_node_free(ctx->last_snapshot);
+    pthread_cond_destroy(&ctx->change_cv);
+    pthread_mutex_destroy(&ctx->change_mu);
     pthread_mutex_destroy(&ctx->snapshot_mu);
     free(ctx);
 }

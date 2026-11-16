@@ -62,9 +62,8 @@ typedef struct {
     int                event_thread_started;
     CFRunLoopRef       event_run_loop;
     int                stop_requested;   /* set before CFRunLoopRun races */
-    MdA11yChangeCb     change_cb;
-    void              *change_userdata;
-    int                subscribed;
+    int                subscribed;       /* observers registered; the callback
+                                          * itself lives on the MdA11yCtx */
 } AXUIState;
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -394,27 +393,21 @@ static void axui_observer_cb(AXObserverRef observer, AXUIElementRef element,
         AXUIState *st = ctx->backend_data;
         if (!st) return;
 
+        /* begin() copies the callback and marks it in flight so
+         * md_a11y_unsubscribe_changes can wait for us; it returns false
+         * once unsubscribed. No lock is held while the diff and callback
+         * run: md_a11y_diff re-enters get_tree, which takes st->lock. */
         MdA11yChangeCb cb = NULL;
         void *cb_userdata = NULL;
+        if (!md_a11y_change_begin(ctx, &cb, &cb_userdata))
+            return;
 
-        pthread_mutex_lock(&st->lock);
-        if (st->subscribed && st->change_cb) {
-            cb = st->change_cb;
-            cb_userdata = st->change_userdata;
-        }
-        pthread_mutex_unlock(&st->lock);
-
-        /* Diff outside the backend lock: md_a11y_diff re-enters
-         * get_tree, which takes the same lock. */
-        MdA11yDelta *deltas = NULL;
         int delta_count = 0;
-        if (cb)
-            deltas = md_a11y_diff(ctx, &delta_count);
-
-        if (cb)
-            cb(deltas, delta_count, cb_userdata);
-
+        MdA11yDelta *deltas = md_a11y_diff(ctx, &delta_count);
+        cb(deltas, delta_count, cb_userdata);
         md_a11y_delta_free(deltas, delta_count);
+
+        md_a11y_change_end(ctx);
     }
 }
 
@@ -666,11 +659,11 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                   void *userdata) {
     AXUIState *st = ctx ? ctx->backend_data : NULL;
     if (!st || !st->connected || !cb) return -1;
+    (void)userdata; /* callback + userdata are stored on ctx by a11y.c */
 
     pthread_mutex_lock(&st->lock);
     if (st->subscribed) {
-        st->change_cb = cb;
-        st->change_userdata = userdata;
+        /* Observers already registered; a11y.c swapped the callback. */
         pthread_mutex_unlock(&st->lock);
         return 0;
     }
@@ -695,8 +688,6 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
 
     pthread_mutex_lock(&st->lock);
     if (st->subscribed) {
-        st->change_cb = cb;
-        st->change_userdata = userdata;
         pthread_mutex_unlock(&st->lock);
         axui_release_observer_records(records, record_count);
         return 0;
@@ -704,8 +695,6 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
 
     st->observers = records;
     st->observer_count = record_count;
-    st->change_cb = cb;
-    st->change_userdata = userdata;
 
     /* Seed the diff baseline so the first notification emits real deltas
      * rather than being consumed as the initial snapshot. The diff engine
@@ -725,8 +714,6 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     if (err != 0) {
         pthread_mutex_lock(&st->lock);
         st->subscribed = 0;
-        st->change_cb = NULL;
-        st->change_userdata = NULL;
         AXObserverRecord *cleanup_records = st->observers;
         size_t cleanup_count = st->observer_count;
         st->observers = NULL;
@@ -744,19 +731,25 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     return 0;
 }
 
-static void axui_destroy(MdA11yCtx *ctx) {
-    AXUIState *st = ctx->backend_data;
-    if (!st) return;
-
+/* Single teardown path shared by unsubscribe and destroy. Stops the
+ * backend-owned run loop thread (which removes its CFRunLoop sources on
+ * the way out), joins it, then removes every AX notification and releases
+ * the observers. The user callback is not touched here: a11y.c has already
+ * cleared and drained it before calling us.
+ *
+ * The observers are scheduled only on the backend's own thread, never on
+ * the caller's run loop, so joining that thread is what guarantees no
+ * AXObserver callback is still executing when this returns. If this were
+ * ever reached from the event thread itself (unsubscribe inside the
+ * callback — documented as unsupported) the join is skipped to avoid
+ * self-deadlock. Idempotent. */
+static void axui_teardown_subscription(AXUIState *st) {
     pthread_t event_thread;
     int join_thread = 0;
     CFRunLoopRef run_loop = NULL;
 
     pthread_mutex_lock(&st->lock);
-    st->connected = 0;
     st->subscribed = 0;
-    st->change_cb = NULL;
-    st->change_userdata = NULL;
     /* Order matters: stop_requested is set under the same lock the
      * thread uses to publish its run loop, so the stop can never be
      * lost to a thread that has not started running yet. */
@@ -768,6 +761,7 @@ static void axui_destroy(MdA11yCtx *ctx) {
     if (st->event_thread_started) {
         event_thread = st->event_thread;
         join_thread = 1;
+        st->event_thread_started = 0;
     }
     pthread_mutex_unlock(&st->lock);
 
@@ -787,6 +781,23 @@ static void axui_destroy(MdA11yCtx *ctx) {
     pthread_mutex_unlock(&st->lock);
 
     axui_release_observer_records(records, record_count);
+}
+
+static void axui_unsubscribe_changes(MdA11yCtx *ctx) {
+    AXUIState *st = ctx ? ctx->backend_data : NULL;
+    if (!st) return;
+    axui_teardown_subscription(st);
+}
+
+static void axui_destroy(MdA11yCtx *ctx) {
+    AXUIState *st = ctx->backend_data;
+    if (!st) return;
+
+    pthread_mutex_lock(&st->lock);
+    st->connected = 0;
+    pthread_mutex_unlock(&st->lock);
+
+    axui_teardown_subscription(st);
     pthread_mutex_destroy(&st->lock);
     free(st);
     ctx->backend_data = NULL;
@@ -797,8 +808,9 @@ static void axui_destroy(MdA11yCtx *ctx) {
 static const MdA11yBackend axui_backend = {
     .init              = axui_init,
     .get_tree          = axui_get_tree,
-    .subscribe_changes = axui_subscribe_changes,
-    .destroy           = axui_destroy,
+    .subscribe_changes   = axui_subscribe_changes,
+    .unsubscribe_changes = axui_unsubscribe_changes,
+    .destroy             = axui_destroy,
 };
 
 const MdA11yBackend *md_a11y_backend_create(void) {

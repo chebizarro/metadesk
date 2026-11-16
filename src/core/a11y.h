@@ -63,7 +63,16 @@ typedef void (*MdA11yChangeCb)(const MdA11yDelta *deltas, int count,
 typedef struct MdA11yBackend {
     int   (*init)(MdA11yCtx *ctx);
     int   (*get_tree)(MdA11yCtx *ctx, MdA11yNode **out_root);
+    /* Register OS-level change listeners. The callback itself is stored on
+     * the MdA11yCtx by a11y.c before this is called; backends must not keep
+     * their own copy — they dispatch through md_a11y_change_begin()/_end(). */
     int   (*subscribe_changes)(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
+    /* Tear down the OS-level listeners registered by subscribe_changes and
+     * stop/join any dispatch thread the backend owns. Called by a11y.c only
+     * after the callback has been cleared and in-flight dispatches drained,
+     * so the backend never has to touch the user callback here. Must be
+     * idempotent and safe when nothing is subscribed. */
+    void  (*unsubscribe_changes)(MdA11yCtx *ctx);
     void  (*destroy)(MdA11yCtx *ctx);
 } MdA11yBackend;
 
@@ -79,6 +88,18 @@ struct MdA11yCtx {
      * three backends. */
     MdA11yNode          *last_snapshot;
     pthread_mutex_t      snapshot_mu;
+
+    /* Live change-callback registration and in-flight guard, owned by
+     * a11y.c. Backends never store the callback themselves: every dispatch
+     * is bracketed by md_a11y_change_begin()/md_a11y_change_end() so that
+     * md_a11y_unsubscribe_changes() can clear the registration and wait for
+     * a dispatch that already copied it to finish. */
+    pthread_mutex_t      change_mu;
+    pthread_cond_t       change_cv;
+    MdA11yChangeCb       change_cb;
+    void                *change_userdata;
+    int                  change_in_flight;
+    pthread_t            change_thread;   /* dispatcher of the in-flight callback */
 };
 
 /* ── Factory ─────────────────────────────────────────────────── */
@@ -105,8 +126,46 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count);
 
 /* Subscribe to live accessibility tree changes.
  * Returns a non-negative backend handle (or 0 if no fd is exposed) on success,
- * -1 if not supported by the backend. */
+ * -1 if not supported by the backend. The callback is invoked from a
+ * backend-owned dispatch thread, never from inside this call. */
 int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
+
+/* Detach the change callback registered with md_a11y_subscribe_changes().
+ *
+ * Drain guarantee: when this returns, the callback is not running on any
+ * thread and will never be invoked again, so the caller may free whatever
+ * `userdata` points at. Internally the registration is cleared first, then
+ * the call blocks until every dispatch that had already copied the callback
+ * has returned, and only then are the backend's OS listeners and dispatch
+ * thread torn down.
+ *
+ * Must NOT be called from inside the change callback itself: the caller
+ * would be waiting for its own invocation to finish. (That case is detected
+ * and does not deadlock, but the drain guarantee cannot hold for it.)
+ * Do not call while holding any lock the callback may take.
+ *
+ * Returns 0 on success, -1 if nothing was subscribed or the backend cannot
+ * detach its listeners (the callback is still cleared and drained in the
+ * latter case, so it stays safe to free userdata). */
+int md_a11y_unsubscribe_changes(MdA11yCtx *ctx);
+
+/* ── Backend dispatch helpers (for backend implementations only) ─────
+ *
+ * Backends bracket every change dispatch with these two calls:
+ *
+ *     MdA11yChangeCb cb; void *ud;
+ *     if (md_a11y_change_begin(ctx, &cb, &ud)) {
+ *         ... compute deltas, cb(deltas, n, ud) ...
+ *         md_a11y_change_end(ctx);
+ *     }
+ *
+ * begin returns false (and nothing may be dispatched) once the callback
+ * has been unsubscribed; otherwise it hands back the registered callback
+ * and marks it in flight until end() so unsubscribe can wait for it.
+ * Neither call holds a lock while the callback runs. */
+bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
+                          void **out_userdata);
+void md_a11y_change_end(MdA11yCtx *ctx);
 
 /* ── Serialization (spec §3.3) ───────────────────────────────── */
 
