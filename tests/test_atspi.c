@@ -324,7 +324,8 @@ static void test_subscribe_changes(void) {
     }
 
     MD_CHECK(rc >= 0);
-    int seeded_walks = atomic_load(&live_walks);
+    int subscribe_walks = atomic_load(&live_walks);
+    MD_CHECK(subscribe_walks == 0); /* subscribing must not walk or seed agent diff state */
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 2;
@@ -334,7 +335,7 @@ static void test_subscribe_changes(void) {
     }
     pthread_mutex_unlock(&hints.mu);
     MD_CHECK(md_a11y_unsubscribe_changes(ctx) == 0);
-    MD_CHECK(atomic_load(&live_walks) == seeded_walks);
+    MD_CHECK(atomic_load(&live_walks) == subscribe_walks);
     if (hints.hints)
         printf("  PASS: %d live change hints caused zero get_tree calls\n", hints.hints);
     else

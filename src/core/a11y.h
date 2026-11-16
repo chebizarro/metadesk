@@ -94,7 +94,7 @@ struct MdA11yCtx {
 
     /* Live change-callback registration and in-flight guard, owned by
      * a11y.c. Backends never store the callback themselves: every dispatch
-     * is bracketed by md_a11y_change_begin()/md_a11y_change_end() so that
+     * uses md_a11y_change_dispatch() so that
      * md_a11y_unsubscribe_changes() can clear the registration and wait for
      * a dispatch that already copied it to finish. */
     pthread_mutex_t      change_mu;
@@ -157,20 +157,6 @@ int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
  * detach its listeners (the callback is still cleared and drained in the
  * latter case, so it stays safe to free userdata). */
 int md_a11y_unsubscribe_changes(MdA11yCtx *ctx);
-
-/* ── Backend dispatch helpers (for backend implementations only) ─────
- *
- * Backends use md_a11y_change_dispatch() for hint-only delivery.
- * The begin/end primitives below bracket callback invocation and are also
- * available to dispatchers that already have content (without a tree walk).
- *
- * begin returns false (and nothing may be dispatched) once the callback
- * has been unsubscribed; otherwise it hands back the registered callback
- * and marks it in flight until end() so unsubscribe can wait for it.
- * Neither call holds a lock while the callback runs. */
-bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
-                          void **out_userdata);
-void md_a11y_change_end(MdA11yCtx *ctx);
 
 /* Dispatch a hint without walking the tree; participates in unsubscribe drain. */
 void md_a11y_change_dispatch(MdA11yCtx *ctx);

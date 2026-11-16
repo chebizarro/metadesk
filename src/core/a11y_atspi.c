@@ -475,16 +475,9 @@ static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
         return -1;
     }
 
-    /* Seed the diff baseline so the first push event can emit meaningful
-     * deltas instead of being consumed as the initial snapshot. */
     g_mutex_lock(&st->lock);
     st->subscribed = TRUE;
     g_mutex_unlock(&st->lock);
-    {
-        int seeded = 0;
-        MdA11yDelta *seed = md_a11y_diff(ctx, &seeded);
-        md_a11y_delta_free(seed, seeded);
-    }
 
     /* Reset the thread handshake before spawning (a previous subscription
      * may have left stop_requested/thread_exited set). */

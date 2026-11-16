@@ -41,7 +41,7 @@ extern "C" {
 struct UIAState {
     IUIAutomation      *automation;
     IUIAutomationTreeWalker *walker;
-    MdA11yCtx          *ctx;         /* back-pointer for md_a11y_diff */
+    MdA11yCtx          *ctx;         /* back-pointer for change hints */
     int                 connected;
     int                 com_initialized;
     uint64_t            next_id;
@@ -502,12 +502,6 @@ static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
         hr = E_OUTOFMEMORY;
 
     if (SUCCEEDED(hr)) {
-        /* Seed the baseline before the first pushed event so callbacks emit
-         * computed deltas instead of consuming the initial snapshot. */
-        int seeded = 0;
-        MdA11yDelta *seed = md_a11y_diff(st->ctx, &seeded);
-        md_a11y_delta_free(seed, seeded);
-
         auto *focus_handler =
             static_cast<IUIAutomationFocusChangedEventHandler *>(handler);
         auto *structure_handler =

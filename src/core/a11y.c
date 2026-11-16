@@ -246,7 +246,7 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
  * (UIA) where several begin() calls can overlap. */
 static _Thread_local int md_a11y_dispatch_depth;
 
-bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
+static bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
                           void **out_userdata) {
     if (!ctx || !out_cb || !out_userdata) return false;
 
@@ -263,7 +263,7 @@ bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
     return true;
 }
 
-void md_a11y_change_end(MdA11yCtx *ctx) {
+static void md_a11y_change_end(MdA11yCtx *ctx) {
     if (!ctx) return;
 
     pthread_mutex_lock(&ctx->change_mu);
