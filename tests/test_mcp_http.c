@@ -119,6 +119,29 @@ static int sse_connect(uint16_t port, char *headers_buf,
     return fd;
 }
 
+/* Headers may arrive before the handler publishes ready=true. Use an SSE
+ * probe/ack rather than sleeps to establish readiness for broadcast tests. */
+static void wait_sse_ready(MdMcpHttp *http, int fd)
+{
+    bool ready = false;
+    for (int i = 0; i < 20 && !ready; i++) {
+        MD_CHECK(md_mcp_http_send_sse(http, "ready", "", 0) == 0);
+        if (md_test_wait_readable(fd, 100) != 1) continue;
+        const char expected[] = "event: ready\ndata: \n\n";
+        char buf[sizeof(expected)];
+        size_t total = 0;
+        while (total < sizeof(expected) - 1) {
+            ssize_t n = read(fd, buf + total, sizeof(expected) - 1 - total);
+            if (n <= 0) break;
+            total += (size_t)n;
+        }
+        ready = total == sizeof(expected) - 1 &&
+                memcmp(buf, expected, total) == 0;
+        if (!ready) break;
+    }
+    MD_CHECK(ready);
+}
+
 /* ── Test: NULL config ───────────────────────────────────────── */
 
 static void test_create_null(void)
@@ -410,6 +433,7 @@ static void test_sse_multiline_data(void)
     MD_CHECK(fd >= 0);
     MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
+    wait_sse_ready(http, fd);
     MD_CHECK(md_mcp_http_send_sse(http, "multi", "line1\nline2", 11) == 0);
 
     char event[1024];
@@ -466,7 +490,8 @@ static void test_sse_max_clients_config(void)
     char headers2[1024];
     int fd2 = sse_connect(port, headers2, sizeof(headers2));
     MD_CHECK(fd2 >= 0);
-    MD_CHECK(strstr(headers2, "text/event-stream") != NULL);
+    MD_CHECK(strstr(headers2, "503 Service Unavailable") != NULL);
+    MD_CHECK(strstr(headers2, "text/event-stream") == NULL);
 
     /* fd1's registration races with send_sse (headers are sent before
      * the client is added to the SSE list) — retry until it arrives. */
@@ -502,6 +527,188 @@ static void test_sse_max_clients_config(void)
     md_mcp_server_destroy(mcp);
 
     PASS("SSE max_clients config");
+}
+
+typedef struct {
+    int fd;
+    const char *frame;
+    size_t frame_len;
+    size_t count;
+    bool matched;
+} SseReader;
+
+static void *read_sse_frames(void *arg)
+{
+    SseReader *r = arg;
+    size_t total = 0, expected = r->frame_len * r->count;
+    char buf[16384];
+    while (total < expected) {
+        if (md_test_wait_readable(r->fd, 5000) != 1) return NULL;
+        size_t want = expected - total;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        ssize_t n = read(r->fd, buf, want);
+        if (n <= 0) return NULL;
+        for (ssize_t i = 0; i < n; i++)
+            if (buf[i] != r->frame[(total + (size_t)i) % r->frame_len])
+                return NULL;
+        total += (size_t)n;
+    }
+    r->matched = true;
+    return NULL;
+}
+
+static void test_sse_stalled_client(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    MD_CHECK(mcp != NULL);
+    md_test_mcp_handshake(mcp);
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = {
+        .server = mcp, .port = port, .max_clients = 5,
+        .sse_write_timeout_ms = 200,
+    };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    wire_server_to_http(mcp, http);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t server_tid, reader_tid;
+    MD_CHECK(pthread_create(&server_tid, NULL, server_thread, &sa) == 0);
+
+    char headers[1024];
+    int stalled[4];
+    int rcvbuf = 1024;
+    for (int i = 0; i < 4; i++) {
+        stalled[i] = sse_connect(port, headers, sizeof(headers));
+        MD_CHECK(stalled[i] >= 0);
+        wait_sse_ready(http, stalled[i]);
+        MD_CHECK(setsockopt(stalled[i], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+    }
+    int healthy = sse_connect(port, headers, sizeof(headers));
+    MD_CHECK(healthy >= 0);
+    wait_sse_ready(http, healthy);
+    /* Discard the readiness probes from stalled sockets before stalling. */
+    for (int i = 0; i < 4; i++) {
+        char buf[1024];
+        while (recv(stalled[i], buf, sizeof(buf), MSG_DONTWAIT) > 0) {}
+    }
+
+    size_t len = 256 * 1024;
+    char *json = malloc(len + 1);
+    MD_CHECK(json != NULL);
+    memset(json, 'x', len);
+    json[0] = '"'; json[len - 1] = '"'; json[len] = '\0';
+    char *frame = malloc(len + 32);
+    MD_CHECK(frame != NULL);
+    int frame_len = snprintf(frame, len + 32, "event: message\ndata: %s\n\n", json);
+    SseReader reader = { .fd = healthy, .frame = frame,
+                         .frame_len = (size_t)frame_len, .count = 128 };
+    MD_CHECK(pthread_create(&reader_tid, NULL, read_sse_frames, &reader) == 0);
+    /* Never read stalled while broadcasting: exceed its kernel buffering.
+     * The healthy reader checks every byte, including short-write framing. */
+    for (size_t i = 0; i < reader.count; i++) {
+        int64_t start = md_now_ms();
+        MD_CHECK(md_mcp_http_write(json, len, http) == 0);
+        MD_CHECK(md_now_ms() - start < 650); /* not four separate 200ms waits */
+    }
+    MD_CHECK(pthread_join(reader_tid, NULL) == 0);
+    MD_CHECK(reader.matched);
+
+    /* A dropped client reaches EOF after its already queued bytes. */
+    size_t queued = 0;
+    int64_t drain_deadline = md_now_ms() + 5000;
+    bool dropped = false;
+    while (md_now_ms() < drain_deadline) {
+        if (md_test_wait_readable(stalled[0], 1000) != 1) break;
+        char buf[16384];
+        ssize_t n = read(stalled[0], buf, sizeof(buf));
+        if (n == 0) { dropped = true; break; }
+        if (n < 0) break;
+        queued += (size_t)n;
+    }
+    MD_CHECK(dropped);
+    MD_CHECK(queued < reader.frame_len * reader.count);
+
+    /* Both the healthy stream and HTTP request dispatch remain usable. */
+    MD_CHECK(md_mcp_http_write("{}", 2, http) == 0);
+    SseReader final = { .fd = healthy, .frame = "event: message\ndata: {}\n\n",
+                       .frame_len = strlen("event: message\ndata: {}\n\n"), .count = 1 };
+    read_sse_frames(&final);
+    MD_CHECK(final.matched);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}";
+    char request[512], response[2048];
+    snprintf(request, sizeof(request),
+             "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    MD_CHECK(http_request(port, request, response, sizeof(response)) > 0);
+    MD_CHECK(strstr(response, "200 OK") && strstr(response, "\"id\":42") &&
+             strstr(response, "\"result\""));
+
+    free(frame);
+    free(json);
+    for (int i = 0; i < 4; i++) close(stalled[i]);
+    close(healthy);
+    md_mcp_http_shutdown(http);
+    MD_CHECK(pthread_join(server_tid, NULL) == 0);
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+    PASS("stalled SSE client dropped within budget; healthy stream and POST survive");
+}
+
+static cJSON *large_resource(void *userdata)
+{
+    (void)userdata;
+    size_t len = 16 * 1024 * 1024;
+    char *text = malloc(len + 1);
+    if (!text) return NULL;
+    memset(text, 'x', len);
+    text[len] = '\0';
+    cJSON *contents = cJSON_CreateArray();
+    cJSON_AddItemToArray(contents, cJSON_CreateString(text));
+    free(text);
+    return contents;
+}
+
+static void test_stalled_post_destroy(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    md_test_mcp_handshake(mcp);
+    MdMcpResource resource = {
+        .uri = "test://large", .name = "large", .read_handler = large_resource,
+    };
+    MD_CHECK(md_mcp_server_register_resource(mcp, &resource) == 0);
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = { .server = mcp, .port = port, .sse_write_timeout_ms = 200 };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    MD_CHECK(pthread_create(&tid, NULL, server_thread, &sa) == 0);
+    int fd = tcp_connect(port), rcvbuf = 1024;
+    MD_CHECK(fd >= 0);
+    MD_CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\","
+                       "\"params\":{\"uri\":\"test://large\"}}";
+    char request[512], headers[1024] = {0};
+    snprintf(request, sizeof(request),
+             "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    MD_CHECK(write(fd, request, strlen(request)) == (ssize_t)strlen(request));
+    size_t n = 0;
+    /* Read only the header as the handshake; never drain the large body. */
+    while (n + 1 < sizeof(headers)) {
+        if (md_test_wait_readable(fd, 3000) != 1 || read(fd, headers + n, 1) != 1) break;
+        headers[++n] = '\0';
+        if (strstr(headers, "\r\n\r\n")) break;
+    }
+    MD_CHECK(strstr(headers, "200 OK") != NULL);
+    int64_t start = md_now_ms();
+    md_mcp_http_shutdown(http);
+    MD_CHECK(pthread_join(tid, NULL) == 0);
+    md_mcp_http_destroy(http); /* must drain the stalled POST handler */
+    MD_CHECK(md_now_ms() - start < 2000);
+    close(fd);
+    md_mcp_server_destroy(mcp);
+    PASS("stalled large POST response cannot wedge transport destroy");
 }
 
 /* ── Test: shutdown flag stops run loop ──────────────────────── */
@@ -628,6 +835,8 @@ int main(void)
     test_post_requires_json_content_type();
     test_get_404();
     test_sse_multiline_data();
+    test_sse_stalled_client();
+    test_stalled_post_destroy();
     test_sse_max_clients_config();
     test_shutdown();
     test_shutdown_closes_sse_clients();

@@ -6,6 +6,11 @@
  * to the MCP server, writes responses to out_fd.
  */
 #include "mcp_stdio.h"
+#define MD_LOG_TAG "mcp-stdio"
+#include "log.h"
+#include "io_util.h"
+#include <poll.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,6 +22,7 @@
 /* ── Initial line buffer size ────────────────────────────────── */
 
 #define INITIAL_BUF_SIZE 4096
+#define MD_MCP_STDIO_WRITE_TIMEOUT_MS 2000
 
 /* ── stdio context ───────────────────────────────────────────── */
 
@@ -24,6 +30,10 @@ struct MdMcpStdio {
     MdMcpServer    *server;
     int             in_fd;
     int             out_fd;
+    bool            out_is_socket;
+    int             write_timeout_ms;
+    bool            write_error_logged;
+    bool            output_failed; /* partial frame cannot be safely resumed */
     atomic_bool     shutdown;
     pthread_mutex_t write_mu;  /* serialize writes to out_fd */
 };
@@ -37,37 +47,51 @@ int md_mcp_stdio_write(const char *json, size_t len, void *userdata)
 
     pthread_mutex_lock(&ctx->write_mu);
 
-    /* Write JSON + newline atomically */
-    ssize_t written = 0;
-    size_t total = 0;
-    while (total < len) {
-        written = write(ctx->out_fd, json + total, len - total);
-        if (written <= 0) {
-            pthread_mutex_unlock(&ctx->write_mu);
-            return -1;
-        }
-        total += (size_t)written;
-    }
-
-    /* Write trailing newline */
-    char nl = '\n';
-    if (write(ctx->out_fd, &nl, 1) != 1) {
+    if (ctx->output_failed || atomic_load(&ctx->shutdown)) {
         pthread_mutex_unlock(&ctx->write_mu);
         return -1;
     }
 
+    /* Responses and notifications share a budget, including the newline. */
+    int64_t deadline = md_now_ms() + ctx->write_timeout_ms;
+    size_t total = 0;
+    int rc = md_fd_write_deadline(ctx->out_fd, json, len, deadline,
+                                  ctx->out_is_socket, &total);
+    if (rc == 0)
+        rc = md_fd_write_deadline(ctx->out_fd, "\n", 1, deadline,
+                                  ctx->out_is_socket, &total);
+    if (rc < 0) {
+        /* Do not append another JSON message to a truncated frame. Input
+         * dispatch remains live, but this output channel is no longer usable. */
+        if (total > 0) ctx->output_failed = true;
+        if (!ctx->write_error_logged) {
+            MD_LOG_W("dropping stdio message after failed or timed-out write");
+            ctx->write_error_logged = true;
+        }
+    }
     pthread_mutex_unlock(&ctx->write_mu);
-    return 0;
+    return rc;
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
 MdMcpStdio *md_mcp_stdio_create(MdMcpServer *server, int in_fd, int out_fd)
 {
-    if (!server) return NULL;
+    return md_mcp_stdio_create_ex(server, in_fd, out_fd, MD_MCP_STDIO_WRITE_TIMEOUT_MS);
+}
+
+MdMcpStdio *md_mcp_stdio_create_ex(MdMcpServer *server, int in_fd, int out_fd,
+                                  int write_timeout_ms)
+{
+    struct stat st;
+    if (!server || fstat(out_fd, &st) < 0) return NULL;
 
     MdMcpStdio *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
+
+    ctx->out_is_socket = S_ISSOCK(st.st_mode);
+    ctx->write_timeout_ms = write_timeout_ms > 0
+        ? write_timeout_ms : MD_MCP_STDIO_WRITE_TIMEOUT_MS;
 
     ctx->server = server;
     ctx->in_fd = in_fd;
@@ -106,6 +130,14 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
         }
 
         ssize_t n = read(ctx->in_fd, buf + buf_len, buf_cap - buf_len - 1);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* A launcher may supply nonblocking input. Wait for readiness,
+             * not EOF; the bounded wait also observes explicit shutdown. */
+            struct pollfd pfd = { .fd = ctx->in_fd, .events = POLLIN };
+            int rc = poll(&pfd, 1, 100);
+            if (rc < 0 && errno != EINTR) break;
+            continue;
+        }
         if (n <= 0) {
             /* EOF or error */
             if (n == 0 || (n < 0 && errno != EINTR)) {

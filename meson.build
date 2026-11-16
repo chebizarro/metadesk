@@ -349,6 +349,7 @@ endif
 # Platform-agnostic sources (compiled on all platforms)
 core_sources = files(
   'src/core/log.c',
+  'src/core/io_util.c',
   'src/core/agent.c',
   'src/core/action.c',
   'src/core/fips_addr.c',

@@ -117,7 +117,8 @@ int md_mcp_server_handle_message(MdMcpServer *server,
  * server's write_fn; server-initiated notifications continue to use
  * write_fn. This is the correct channel for request/response transports
  * (HTTP) — no thread-local routing, no mutable global.
- * Dispatch is serialized across concurrent callers.
+ * Dispatch is serialized across concurrent callers. Nested dispatch on the
+ * same server is unsupported (the dispatch mutex is non-recursive).
  * Returns 0 on success, -1 on error. */
 int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
                                            const char *json, size_t len,
@@ -130,12 +131,17 @@ int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
 int md_mcp_server_notify_resource_updated(MdMcpServer *server,
                                           const char *uri);
 
+/* Permanently reject new notifications; does not drain an already copied
+ * sink. Drain callback producers before destroying their transport. */
+void md_mcp_server_quiesce(MdMcpServer *server);
+
 /* ── State query ─────────────────────────────────────────────── */
 
 bool md_mcp_server_is_initialized(const MdMcpServer *server);
 
 /* Update the server transport write callback. Intended for transports that
- * must be created after the server/bridge exists (for example HTTP). */
+ * must be created after the server/bridge exists (for example HTTP).
+ * NULL detaches the sink; like quiesce, this does not drain copied sinks. */
 int md_mcp_server_set_write_fn(MdMcpServer *server,
                                MdMcpWriteFn write_fn,
                                void *write_userdata);
