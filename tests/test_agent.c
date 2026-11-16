@@ -515,6 +515,7 @@ static int test_handle_action_mcp(void) {
 /* Deterministic tree changes without a platform accessibility service. */
 static int agent_fake_tree(MdA11yCtx *ctx, MdA11yNode **out) {
     int *walks = ctx->backend_data;
+    if (*walks < 0) return -1;
     MdA11yNode *node = calloc(1, sizeof(*node));
     node->id = strdup("btn1");
     node->role = strdup("button");
@@ -526,9 +527,15 @@ static int agent_fake_tree(MdA11yCtx *ctx, MdA11yNode **out) {
 static int test_format_aware_updates(void) {
     printf("  test_format_aware_updates... ");
     const MdA11yBackend backend = { .get_tree = agent_fake_tree };
-    MdStreamServer *server = md_stream_server_create(NULL, 17820);
+    MdStreamServer *server = NULL;
+    uint16_t port;
+    /* Stream servers do not expose the assigned port for a port-0 bind. */
+    for (port = 17820; port < 17884; port++) {
+        server = md_stream_server_create(NULL, port);
+        if (server) break;
+    }
     MD_CHECK(server != NULL);
-    MdStream *client = md_stream_connect("127.0.0.1", 17820, 3000);
+    MdStream *client = md_stream_connect("127.0.0.1", port, 3000);
     MD_CHECK(client != NULL);
     MdStream *host = md_stream_server_accept(server, 3000);
     MD_CHECK(host != NULL);
@@ -570,6 +577,11 @@ static int test_format_aware_updates(void) {
             MD_CHECK(hdr.payload_len >= 6 && memcmp(payload, "v1 ts:", 6) == 0);
             free(payload);
         }
+        walks = -1; /* unavailable tree is a no-op for both update formats */
+        uint32_t previous_seq = seq;
+        MD_CHECK(md_agent_send_delta(agent, host, &seq) == 0);
+        MD_CHECK(seq == previous_seq);
+        MD_CHECK(md_agent_send_tree(agent, host, &seq) == -1);
         md_agent_destroy(agent);
         md_a11y_node_free(a11y.last_snapshot);
         pthread_mutex_destroy(&a11y.snapshot_mu);

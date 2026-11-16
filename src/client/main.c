@@ -63,6 +63,7 @@ typedef struct {
     char         *ui_tree_json;         /* latest full UI tree JSON (owned)   */
     size_t        ui_tree_len;          /* byte length of ui_tree_json        */
     uint32_t      tree_updates;         /* count of tree/delta packets recv'd */
+    uint32_t      tree_patch_failures;  /* independently throttled warnings */
 
     /* Nostr session negotiation state */
     char          expected_host_pk[128]; /* pubkey hex of host we're connecting to */
@@ -910,7 +911,10 @@ int main(int argc, char **argv) {
                                     hdr.payload_len, ctx.tree_updates);
                         }
                     } else {
-                        fprintf(stderr, "client: warning: UI tree delta patch failed\n");
+                        ctx.tree_patch_failures++;
+                        if (ctx.tree_patch_failures <= 3 || (ctx.tree_patch_failures % 100) == 0) {
+                            fprintf(stderr, "client: warning: UI tree delta patch failed\n");
+                        }
                     }
                 }
             }
