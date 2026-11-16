@@ -541,8 +541,10 @@ static void *axui_event_loop_thread(void *data) {
         }
         pthread_mutex_unlock(&st->lock);
 
-        /* Event-driven: axui_destroy stops this via CFRunLoopStop —
-         * no polling wake-up needed. */
+        /* Event-driven: teardown stops this by enqueuing a CFRunLoopStop
+         * block on this loop (see axui_teardown_subscription) — no polling
+         * wake-up needed, and the stop is honoured even if it was enqueued
+         * between the publish above and this call. */
         CFRunLoopRun();
 
         pthread_mutex_lock(&st->lock);
@@ -766,7 +768,17 @@ static void axui_teardown_subscription(AXUIState *st) {
     pthread_mutex_unlock(&st->lock);
 
     if (run_loop) {
-        CFRunLoopStop(run_loop);
+        /* CFRunLoopStop() only takes effect on a loop that is currently
+         * running (it flags the current mode), so a stop issued between the
+         * thread publishing its loop and entering CFRunLoopRun() would be
+         * lost and the join below would hang. Enqueue the stop as a block
+         * instead: the run loop keeps it and performs it on its next pass in
+         * this mode, whether the loop is already running or about to start,
+         * and CFRunLoopStop from inside the loop is never lost. */
+        CFRunLoopPerformBlock(run_loop, kCFRunLoopDefaultMode, ^{
+            CFRunLoopStop(CFRunLoopGetCurrent());
+        });
+        CFRunLoopWakeUp(run_loop);
         CFRelease(run_loop);
     }
 

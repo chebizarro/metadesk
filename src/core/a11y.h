@@ -99,7 +99,6 @@ struct MdA11yCtx {
     MdA11yChangeCb       change_cb;
     void                *change_userdata;
     int                  change_in_flight;
-    pthread_t            change_thread;   /* dispatcher of the in-flight callback */
 };
 
 /* ── Factory ─────────────────────────────────────────────────── */
@@ -127,7 +126,12 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count);
 /* Subscribe to live accessibility tree changes.
  * Returns a non-negative backend handle (or 0 if no fd is exposed) on success,
  * -1 if not supported by the backend. The callback is invoked from a
- * backend-owned dispatch thread, never from inside this call. */
+ * backend-owned dispatch thread, never from inside this call.
+ *
+ * A context holds at most one subscription. Subscribing while a different
+ * (cb, userdata) pair is registered fails with -1 and leaves the existing
+ * subscription untouched; re-subscribing the identical pair is a no-op
+ * success. Callers must therefore only unsubscribe what they subscribed. */
 int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
 
 /* Detach the change callback registered with md_a11y_subscribe_changes().
@@ -141,8 +145,10 @@ int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
  *
  * Must NOT be called from inside the change callback itself: the caller
  * would be waiting for its own invocation to finish. (That case is detected
- * and does not deadlock, but the drain guarantee cannot hold for it.)
- * Do not call while holding any lock the callback may take.
+ * per thread, logged, and does not deadlock — the drain still waits for
+ * every *other* in-flight dispatch — but the guarantee cannot hold for the
+ * caller's own invocation.) Do not call while holding any lock the callback
+ * may take.
  *
  * Returns 0 on success, -1 if nothing was subscribed or the backend cannot
  * detach its listeners (the callback is still cleared and drained in the

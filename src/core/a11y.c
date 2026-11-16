@@ -239,6 +239,13 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
 
 /* ── Change subscription + in-flight drain ───────────────────── */
 
+/* Per-thread nesting depth of md_a11y_change_begin()/_end(). Lets the
+ * drain tell its own (misused, re-entrant) dispatch apart from other
+ * threads' in-flight dispatches without a per-ctx "current thread" slot,
+ * which would be unsound for backends that dispatch from a thread pool
+ * (UIA) where several begin() calls can overlap. */
+static _Thread_local int md_a11y_dispatch_depth;
+
 bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
                           void **out_userdata) {
     if (!ctx || !out_cb || !out_userdata) return false;
@@ -251,7 +258,7 @@ bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
     *out_cb = ctx->change_cb;
     *out_userdata = ctx->change_userdata;
     ctx->change_in_flight++;
-    ctx->change_thread = pthread_self();
+    md_a11y_dispatch_depth++;
     pthread_mutex_unlock(&ctx->change_mu);
     return true;
 }
@@ -260,28 +267,32 @@ void md_a11y_change_end(MdA11yCtx *ctx) {
     if (!ctx) return;
 
     pthread_mutex_lock(&ctx->change_mu);
-    if (ctx->change_in_flight > 0 && --ctx->change_in_flight == 0)
-        pthread_cond_broadcast(&ctx->change_cv);
+    if (md_a11y_dispatch_depth > 0)
+        md_a11y_dispatch_depth--;
+    if (ctx->change_in_flight > 0)
+        ctx->change_in_flight--;
+    /* Wake drainers on every decrement: a drainer calling from inside the
+     * callback waits for in_flight to drop to its own depth, not to 0. */
+    pthread_cond_broadcast(&ctx->change_cv);
     pthread_mutex_unlock(&ctx->change_mu);
 }
 
 /* Clear the registration and wait for in-flight dispatches to return.
  * Returns false if no callback was registered. */
 static bool change_clear_and_drain(MdA11yCtx *ctx) {
+    /* Dispatches this thread itself is inside (normally 0). Waiting for
+     * those would deadlock, so the drain waits only for everyone else. */
+    int my_depth = md_a11y_dispatch_depth;
+    if (my_depth > 0)
+        MD_LOG_E("md_a11y_unsubscribe_changes called from inside the change callback; "
+                 "draining other dispatchers only");
+
     pthread_mutex_lock(&ctx->change_mu);
     bool had_cb = ctx->change_cb != NULL;
     ctx->change_cb = NULL;
     ctx->change_userdata = NULL;
-    while (ctx->change_in_flight > 0) {
-        if (pthread_equal(ctx->change_thread, pthread_self())) {
-            /* Called from inside the callback: the only in-flight dispatch
-             * is our own caller. Waiting would deadlock, so return without
-             * the drain guarantee (documented as unsupported). */
-            MD_LOG_E("md_a11y_unsubscribe_changes called from inside the change callback");
-            break;
-        }
+    while (ctx->change_in_flight > my_depth)
         pthread_cond_wait(&ctx->change_cv, &ctx->change_mu);
-    }
     pthread_mutex_unlock(&ctx->change_mu);
     return had_cb;
 }
@@ -290,9 +301,18 @@ int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
     if (!ctx || !cb || !ctx->vtable || !ctx->vtable->subscribe_changes)
         return -1;
 
+    /* One subscription per context: never silently replace a live one, or
+     * two owners sharing a ctx could detach each other. */
+    pthread_mutex_lock(&ctx->change_mu);
+    if (ctx->change_cb) {
+        bool same = ctx->change_cb == cb && ctx->change_userdata == userdata;
+        pthread_mutex_unlock(&ctx->change_mu);
+        if (!same)
+            MD_LOG_E("a11y change subscription already held by another callback");
+        return same ? 0 : -1;
+    }
     /* Publish the callback before the backend registers OS listeners so an
      * event that fires during registration is not lost. */
-    pthread_mutex_lock(&ctx->change_mu);
     ctx->change_cb = cb;
     ctx->change_userdata = userdata;
     pthread_mutex_unlock(&ctx->change_mu);

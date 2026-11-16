@@ -13,7 +13,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include "md_test.h"
 
 
@@ -785,7 +784,7 @@ typedef struct {
     MdA11yChangeCb change_cb;
     void *change_userdata;
     bool subscribe_fails;
-    int unsubscribes;
+    int subscribes, unsubscribes;
     MdA11ySnapshot *invalidate_during_walk;
 } QueryFixture;
 
@@ -886,6 +885,7 @@ static int query_subscribe(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
 {
     QueryFixture *fixture = ctx->backend_data;
     if (fixture->subscribe_fails) return -1;
+    fixture->subscribes++;
     fixture->change_cb = cb;
     fixture->change_userdata = userdata;
     return 0;
@@ -1516,15 +1516,22 @@ static void latch_wait(TestLatch *l)
     pthread_mutex_unlock(&l->mu);
 }
 
+static int latch_count(TestLatch *l)
+{
+    pthread_mutex_lock(&l->mu);
+    int count = l->count;
+    pthread_mutex_unlock(&l->mu);
+    return count;
+}
+
 typedef struct {
     MdA11yCtx *a11y;
-    TestLatch entered;        /* callback -> test: I am running          */
-    TestLatch release;        /* test -> callback: you may return        */
+    TestLatch entered;        /* callback -> test: I am running            */
+    TestLatch release;        /* test -> callback: you may return          */
     TestLatch unsub_started;  /* unsubscriber -> test: calling unsubscribe */
-    atomic_int finished;      /* set by the callback just before it returns */
+    TestLatch unsub_returned; /* unsubscriber -> all: unsubscribe returned */
     int calls;
     int unsub_rc;
-    int finished_at_unsub_return;
 } DrainFixture;
 
 static void drain_cb(const MdA11yDelta *deltas, int count, void *userdata)
@@ -1534,10 +1541,11 @@ static void drain_cb(const MdA11yDelta *deltas, int count, void *userdata)
     d->calls++;
     latch_post(&d->entered);
     latch_wait(&d->release);
-    /* Widen the window: an unsubscribe that did not drain would return
-     * while we are still here and observe finished == 0. */
-    usleep(50 * 1000);
-    atomic_store(&d->finished, 1);
+    /* Only widens the window for a non-draining unsubscribe to be caught;
+     * the check below is the correctness mechanism, not the sleep. */
+    usleep(10 * 1000);
+    /* Drain guarantee: unsubscribe must still be blocked while we run. */
+    MD_CHECK(latch_count(&d->unsub_returned) == 0);
 }
 
 static void *drain_dispatch_thread(void *arg)
@@ -1552,7 +1560,7 @@ static void *drain_unsubscribe_thread(void *arg)
     DrainFixture *d = arg;
     latch_post(&d->unsub_started);
     d->unsub_rc = md_a11y_unsubscribe_changes(d->a11y);
-    d->finished_at_unsub_return = atomic_load(&d->finished);
+    latch_post(&d->unsub_returned);
     return NULL;
 }
 
@@ -1570,6 +1578,7 @@ static void test_unsubscribe_drains_in_flight_callback(void)
     latch_init(&d.entered);
     latch_init(&d.release);
     latch_init(&d.unsub_started);
+    latch_init(&d.unsub_returned);
 
     MD_CHECK(md_a11y_subscribe_changes(&a11y, drain_cb, &d) == 0);
     MD_CHECK(a11y.change_cb == drain_cb && a11y.change_userdata == &d);
@@ -1590,17 +1599,86 @@ static void test_unsubscribe_drains_in_flight_callback(void)
 
     MD_CHECK(d.unsub_rc == 0);
     MD_CHECK(d.calls == 1);
-    MD_CHECK(d.finished_at_unsub_return == 1); /* returned only after the callback */
+    MD_CHECK(latch_count(&d.unsub_returned) == 1);
     MD_CHECK(a11y.change_cb == NULL && a11y.change_in_flight == 0);
     MD_CHECK(fixture.unsubscribes == 1);
     MD_CHECK(!query_fire_change(&a11y));
     MD_CHECK(d.calls == 1);
 
+    latch_fini(&d.unsub_returned);
     latch_fini(&d.unsub_started);
     latch_fini(&d.release);
     latch_fini(&d.entered);
     query_a11y_fini(&a11y);
     PASS("unsubscribe drains an in-flight change callback before returning");
+}
+
+static void counting_cb_a(const MdA11yDelta *deltas, int count, void *userdata)
+{
+    (void)deltas; (void)count;
+    (*(int *)userdata)++;
+}
+
+static void counting_cb_b(const MdA11yDelta *deltas, int count, void *userdata)
+{
+    (void)deltas; (void)count;
+    (*(int *)userdata) += 100;
+}
+
+static void test_subscribe_refuses_second_owner(void)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
+    };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    query_a11y_init(&a11y);
+
+    int first = 0, second = 0;
+    MD_CHECK(md_a11y_subscribe_changes(&a11y, counting_cb_a, &first) == 0);
+    MD_CHECK(fixture.subscribes == 1 && fixture.change_cb == counting_cb_a);
+
+    /* A different callback, or the same callback with different userdata,
+     * is refused and leaves the first subscription intact. */
+    MD_CHECK(md_a11y_subscribe_changes(&a11y, counting_cb_b, &second) == -1);
+    MD_CHECK(md_a11y_subscribe_changes(&a11y, counting_cb_a, &second) == -1);
+    MD_CHECK(a11y.change_cb == counting_cb_a && a11y.change_userdata == &first);
+    MD_CHECK(fixture.subscribes == 1);
+    MD_CHECK(query_fire_change(&a11y));
+    MD_CHECK(first == 1 && second == 0);
+
+    /* Re-subscribing the identical pair is a no-op success. */
+    MD_CHECK(md_a11y_subscribe_changes(&a11y, counting_cb_a, &first) == 0);
+    MD_CHECK(fixture.subscribes == 1);
+
+    MD_CHECK(md_a11y_unsubscribe_changes(&a11y) == 0);
+    MD_CHECK(fixture.unsubscribes == 1);
+    MD_CHECK(!query_fire_change(&a11y));
+    MD_CHECK(first == 1 && second == 0);
+
+    /* Two bridges on one ctx: the loser must not detach the winner. */
+    MdMcpBridgeConfig config = {
+        .a11y = &a11y, .settle_ms = 1,
+        .stdio_in_fd = -1, .stdio_out_fd = -1,
+    };
+    MdMcpBridge *winner = md_mcp_bridge_create(&config);
+    MD_CHECK(winner != NULL && fixture.subscribes == 2);
+    MdMcpBridge *loser = md_mcp_bridge_create(&config);
+    MD_CHECK(loser != NULL && fixture.subscribes == 2); /* refused, falls back */
+    MdA11yChangeCb winner_cb = a11y.change_cb;
+    void *winner_ud = a11y.change_userdata;
+    MD_CHECK(winner_cb != NULL);
+    md_mcp_bridge_destroy(loser);
+    MD_CHECK(fixture.unsubscribes == 1); /* loser did not unsubscribe */
+    MD_CHECK(a11y.change_cb == winner_cb && a11y.change_userdata == winner_ud);
+    md_mcp_bridge_destroy(winner);
+    MD_CHECK(fixture.unsubscribes == 2);
+    MD_CHECK(a11y.change_cb == NULL);
+
+    md_a11y_node_free(a11y.last_snapshot);
+    query_a11y_fini(&a11y);
+    PASS("second subscriber is refused; identical re-subscribe is a no-op; loser bridge does not detach winner");
 }
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -1616,6 +1694,7 @@ int main(int argc, char **argv)
         test_resource_tree_formats();
         test_bridge_destroy_unsubscribes();
         test_unsubscribe_drains_in_flight_callback();
+        test_subscribe_refuses_second_owner();
         clear_responses();
         return md_test_report();
     }

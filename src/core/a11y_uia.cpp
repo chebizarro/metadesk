@@ -662,6 +662,12 @@ static void uia_teardown_subscription(UIAState *st) {
     }
 
     if (st->event_thread) {
+        /* No quit-before-loop race here, unlike the GLib/CFRunLoop
+         * backends: stop_event is a manual-reset event, so the signal is
+         * sticky and MsgWaitForMultipleObjects returns immediately even if
+         * the thread has not reached its wait yet. Subscribe also blocks on
+         * ready_event, so by the time anyone can tear down, the thread is
+         * already in (or past) its wait loop. */
         if (st->stop_event)
             SetEvent(st->stop_event);
         WaitForSingleObject(st->event_thread, INFINITE);
