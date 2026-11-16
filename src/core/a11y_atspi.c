@@ -370,8 +370,8 @@ static int atspi_init_backend(MdA11yCtx *ctx) {
     if (!st) return -1;
 
     int ret = atspi_init();
-    if (ret < 0) {
-        MD_LOG_E("failed to initialize AT-SPI2");
+    if (ret != 0 && ret != 1) {
+        MD_LOG_E("failed to initialize AT-SPI2 (code %d)", ret);
         free(st);
         return -1;
     }
@@ -532,7 +532,13 @@ static void atspi_destroy_backend(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+static bool atspi_is_connected(const MdA11yCtx *ctx) {
+    const AtspiState *st = ctx->backend_data;
+    return st && st->connected;
+}
+
 static const MdA11yBackend atspi_backend = {
+    .is_connected      = atspi_is_connected,
     .init              = atspi_init_backend,
     .get_tree          = atspi_get_tree,
     .subscribe_changes   = atspi_subscribe_changes,

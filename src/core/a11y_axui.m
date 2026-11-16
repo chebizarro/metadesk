@@ -802,7 +802,14 @@ static void axui_destroy(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+static bool axui_is_connected(const MdA11yCtx *ctx) {
+    const AXUIState *st = ctx->backend_data;
+    /* Tree walks need trust, not observers: change subscriptions are optional. */
+    return st && st->connected && AXIsProcessTrusted();
+}
+
 static const MdA11yBackend axui_backend = {
+    .is_connected      = axui_is_connected,
     .init              = axui_init,
     .get_tree          = axui_get_tree,
     .subscribe_changes   = axui_subscribe_changes,

@@ -876,7 +876,7 @@ int main(int argc, char **argv) {
 
         /* Initialize a11y + input for MCP mode */
         MdA11yCtx *mcp_a11y = md_a11y_create();
-        if (mcp_a11y)
+        if (md_a11y_is_connected(mcp_a11y))
             printf("host[mcp]: accessibility tree connected\n");
         else
             fprintf(stderr, "host[mcp]: WARNING: a11y unavailable\n");
@@ -1018,7 +1018,7 @@ int main(int argc, char **argv) {
 
     /* Initialize accessibility tree walker (persistent) */
     MdA11yCtx *a11y = md_a11y_create();
-    if (!a11y) {
+    if (!md_a11y_is_connected(a11y)) {
         fprintf(stderr, "WARNING: accessibility tree unavailable — agent mode disabled\n");
     } else {
         printf("host: accessibility tree connected\n");

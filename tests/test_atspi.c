@@ -46,6 +46,29 @@ static void test_node_alloc_free(void) {
     printf("  PASS: node alloc/free\n");
 }
 
+static bool fixture_is_connected(const MdA11yCtx *ctx) {
+    return ctx->backend_data && *(const bool *)ctx->backend_data;
+}
+
+static void test_liveness(void) {
+    MD_CHECK(!md_a11y_is_connected(NULL));
+    MdA11yBackend backend = { 0 };
+    MdA11yCtx ctx = { .vtable = &backend };
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    bool connected = false;
+    ctx.backend_data = &connected;
+    MD_CHECK(md_a11y_is_connected(&ctx)); /* legacy fallback */
+    backend.is_connected = fixture_is_connected;
+    MD_CHECK(!md_a11y_is_connected(&ctx)); /* allocation is not liveness */
+    connected = true;
+    MD_CHECK(md_a11y_is_connected(&ctx));
+    connected = false;
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    ctx.backend_data = NULL;
+    MD_CHECK(!md_a11y_is_connected(&ctx));
+    printf("  PASS: backend liveness callback and legacy fallback\n");
+}
+
 static void test_create_destroy(void) {
     if (!live_a11y_tests_enabled()) {
         printf("  SKIP: create/destroy live backend (set MD_A11Y_LIVE_TESTS=1)\n");
@@ -54,6 +77,7 @@ static void test_create_destroy(void) {
 
     MdA11yCtx *ctx = md_a11y_create();
     MD_CHECK(ctx != NULL);
+    MD_CHECK(md_a11y_is_connected(ctx));
     md_a11y_destroy(ctx);
     printf("  PASS: create/destroy\n");
 }
@@ -591,6 +615,7 @@ static void test_tree_patch_update_state(void) {
 int main(void) {
     printf("test_a11y:\n");
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
+    test_liveness();
     test_vocab();
     test_node_alloc_free();
     test_create_destroy();

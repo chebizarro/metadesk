@@ -706,6 +706,11 @@ static void uia_destroy(MdA11yCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+static bool uia_is_connected(const MdA11yCtx *ctx) {
+    const auto *st = static_cast<const UIAState *>(ctx->backend_data);
+    return st && st->automation != nullptr;
+}
+
 /* Positional: must match the MdA11yBackend member order in a11y.h. */
 static const MdA11yBackend uia_backend = {
     uia_init,
@@ -713,6 +718,7 @@ static const MdA11yBackend uia_backend = {
     uia_subscribe_changes,
     uia_unsubscribe_changes,
     uia_destroy,
+    uia_is_connected,
 };
 
 extern "C"

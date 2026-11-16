@@ -346,7 +346,10 @@ int md_a11y_unsubscribe_changes(MdA11yCtx *ctx) {
 }
 
 bool md_a11y_is_connected(const MdA11yCtx *ctx) {
-    return ctx && ctx->backend_data; /* backends set backend_data on init */
+    if (!ctx) return false;
+    if (ctx->vtable && ctx->vtable->is_connected)
+        return ctx->vtable->is_connected(ctx);
+    return ctx->backend_data != NULL;
 }
 
 void md_a11y_destroy(MdA11yCtx *ctx) {
