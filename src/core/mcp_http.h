@@ -31,6 +31,9 @@ typedef struct {
     uint16_t      port;          /* 0 for default (7710)              */
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
     int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
+    int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;
+                                  * positive: bound per-client buffering,
+                                  * 0: leave the kernel default unchanged */
 } MdMcpHttpConfig;
 
 /* Create an HTTP+SSE transport.
@@ -55,6 +58,14 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
  * MdMcpWriteFn; userdata is the MdMcpHttp*. Used as the server's
  * notification sink. */
 int md_mcp_http_write(const char *json, size_t len, void *userdata);
+
+/* Test/diagnostic support: snapshot the number of ready SSE clients under
+ * the client-list lock. Returns 0 for NULL. */
+int md_mcp_http_sse_client_count(MdMcpHttp *http);
+
+/* Test/diagnostic getsockopt(SO_SNDBUF) snapshot for a ready-client index.
+ * Returns -1 for an invalid index or socket-option error. */
+int md_mcp_http_sse_client_sndbuf(MdMcpHttp *http, int index);
 
 /* Destroy the HTTP transport. */
 void md_mcp_http_destroy(MdMcpHttp *http);

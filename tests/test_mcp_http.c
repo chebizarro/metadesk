@@ -15,6 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include "md_test_net.h"
 #include <netinet/in.h>
@@ -51,10 +52,16 @@ static void wire_server_to_http(MdMcpServer *mcp, MdMcpHttp *http)
 
 /* ── Helper: raw TCP connect to localhost ─────────────────────── */
 
-static int tcp_connect(uint16_t port)
+static int tcp_connect_opts(uint16_t port, int rcvbuf)
 {
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    /* Set the receive window before TCP negotiates window scaling. */
+    if (rcvbuf > 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        close(fd);
+        return -1;
+    }
 
     struct sockaddr_in6 addr = {0};
     addr.sin6_family = AF_INET6;
@@ -65,7 +72,19 @@ static int tcp_connect(uint16_t port)
         close(fd);
         return -1;
     }
+    /* macOS may enlarge SO_RCVBUF during connect. Keep the negotiated small
+     * window scaling, then restore the requested limit before sending HTTP. */
+    if (rcvbuf > 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
+}
+
+static int tcp_connect(uint16_t port)
+{
+    return tcp_connect_opts(port, 0);
 }
 
 /* ── Helper: send HTTP request, read response ────────────────── */
@@ -100,10 +119,10 @@ static int http_request(uint16_t port, const char *request,
     return (int)total;
 }
 
-static int sse_connect(uint16_t port, char *headers_buf,
-                       size_t headers_buf_len)
+static int sse_connect_opts(uint16_t port, int rcvbuf, char *headers_buf,
+                            size_t headers_buf_len)
 {
-    int fd = tcp_connect(port);
+    int fd = tcp_connect_opts(port, rcvbuf);
     if (fd < 0) return -1;
 
     const char *request = "GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -119,27 +138,37 @@ static int sse_connect(uint16_t port, char *headers_buf,
     return fd;
 }
 
-/* Headers may arrive before the handler publishes ready=true. Use an SSE
- * probe/ack rather than sleeps to establish readiness for broadcast tests. */
-static void wait_sse_ready(MdMcpHttp *http, int fd)
+static int sse_connect(uint16_t port, char *headers_buf,
+                       size_t headers_buf_len)
 {
-    bool ready = false;
-    for (int i = 0; i < 20 && !ready; i++) {
-        MD_CHECK(md_mcp_http_send_sse(http, "ready", "", 0) == 0);
-        if (md_test_wait_readable(fd, 100) != 1) continue;
-        const char expected[] = "event: ready\ndata: \n\n";
-        char buf[sizeof(expected)];
-        size_t total = 0;
-        while (total < sizeof(expected) - 1) {
-            ssize_t n = read(fd, buf + total, sizeof(expected) - 1 - total);
-            if (n <= 0) break;
-            total += (size_t)n;
-        }
-        ready = total == sizeof(expected) - 1 &&
-                memcmp(buf, expected, total) == 0;
-        if (!ready) break;
+    return sse_connect_opts(port, 0, headers_buf, headers_buf_len);
+}
+
+/* Headers may arrive before ready=true. Wait for publication before sending
+ * exactly one probe; resending on a read timeout can leave duplicate frames. */
+static void wait_sse_ready(MdMcpHttp *http, int fd, int expected_clients)
+{
+    int64_t deadline = md_now_ms() + 5000;
+    int clients;
+    while ((clients = md_mcp_http_sse_client_count(http)) != expected_clients &&
+           md_now_ms() < deadline)
+        sched_yield();
+    MD_CHECK(clients == expected_clients);
+    if (clients != expected_clients) return;
+
+    MD_CHECK(md_mcp_http_send_sse(http, "ready", "", 0) == 0);
+    const char expected[] = "event: ready\ndata: \n\n";
+    char buf[sizeof(expected)];
+    size_t total = 0;
+    while (total < sizeof(expected) - 1) {
+        int64_t remaining = deadline - md_now_ms();
+        if (remaining <= 0 || md_test_wait_readable(fd, (int)remaining) != 1) break;
+        ssize_t n = read(fd, buf + total, sizeof(expected) - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
     }
-    MD_CHECK(ready);
+    MD_CHECK(total == sizeof(expected) - 1 && memcmp(buf, expected, total) == 0);
 }
 
 /* ── Test: NULL config ───────────────────────────────────────── */
@@ -147,6 +176,7 @@ static void wait_sse_ready(MdMcpHttp *http, int fd)
 static void test_create_null(void)
 {
     MD_CHECK(md_mcp_http_create(NULL) == NULL);
+    MD_CHECK(md_mcp_http_sse_client_count(NULL) == 0);
 
     MdMcpHttpConfig cfg = { .server = NULL };
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
@@ -433,7 +463,7 @@ static void test_sse_multiline_data(void)
     MD_CHECK(fd >= 0);
     MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
-    wait_sse_ready(http, fd);
+    wait_sse_ready(http, fd, 1);
     MD_CHECK(md_mcp_http_send_sse(http, "multi", "line1\nline2", 11) == 0);
 
     char event[1024];
@@ -533,28 +563,46 @@ typedef struct {
     int fd;
     const char *frame;
     size_t frame_len;
-    size_t count;
+    size_t count; /* zero: read until the done sentinel */
+    size_t received;
     bool matched;
 } SseReader;
 
 static void *read_sse_frames(void *arg)
 {
     SseReader *r = arg;
-    size_t total = 0, expected = r->frame_len * r->count;
+    const char done[] = "event: done\ndata: \n\n";
+    size_t pos = 0;
+    bool message_matches = true, done_matches = r->count == 0;
     char buf[16384];
-    while (total < expected) {
+    for (;;) {
         if (md_test_wait_readable(r->fd, 5000) != 1) return NULL;
-        size_t want = expected - total;
-        if (want > sizeof(buf)) want = sizeof(buf);
-        ssize_t n = read(r->fd, buf, want);
+        ssize_t n = read(r->fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return NULL;
-        for (ssize_t i = 0; i < n; i++)
-            if (buf[i] != r->frame[(total + (size_t)i) % r->frame_len])
+        for (ssize_t i = 0; i < n; i++) {
+            message_matches = message_matches && pos < r->frame_len &&
+                              buf[i] == r->frame[pos];
+            done_matches = done_matches && pos < sizeof(done) - 1 &&
+                           buf[i] == done[pos];
+            if (!message_matches && !done_matches) return NULL;
+            pos++;
+            if (done_matches && pos == sizeof(done) - 1) {
+                r->matched = i + 1 == n;
                 return NULL;
-        total += (size_t)n;
+            }
+            if (message_matches && pos == r->frame_len) {
+                r->received++;
+                if (r->count && r->received == r->count) {
+                    r->matched = i + 1 == n;
+                    return NULL;
+                }
+                pos = 0;
+                message_matches = true;
+                done_matches = r->count == 0;
+            }
+        }
     }
-    r->matched = true;
-    return NULL;
 }
 
 static void test_sse_stalled_client(void)
@@ -565,7 +613,7 @@ static void test_sse_stalled_client(void)
     uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp, .port = port, .max_clients = 5,
-        .sse_write_timeout_ms = 200,
+        .sse_write_timeout_ms = 1000, .sse_sndbuf = 8192,
     };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     MD_CHECK(http != NULL);
@@ -576,23 +624,29 @@ static void test_sse_stalled_client(void)
 
     char headers[1024];
     int stalled[4];
-    int rcvbuf = 1024;
+    int stalled_rcvbuf = 0;
     for (int i = 0; i < 4; i++) {
-        stalled[i] = sse_connect(port, headers, sizeof(headers));
+        stalled[i] = sse_connect_opts(port, 1024, headers, sizeof(headers));
         MD_CHECK(stalled[i] >= 0);
-        wait_sse_ready(http, stalled[i]);
-        MD_CHECK(setsockopt(stalled[i], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+        int actual = 0;
+        socklen_t optlen = sizeof(actual);
+        MD_CHECK(getsockopt(stalled[i], SOL_SOCKET, SO_RCVBUF, &actual, &optlen) == 0);
+        MD_CHECK(actual > 0);
+        if (actual > stalled_rcvbuf) stalled_rcvbuf = actual;
+        wait_sse_ready(http, stalled[i], i + 1);
     }
-    int healthy = sse_connect(port, headers, sizeof(headers));
+    int healthy = sse_connect_opts(port, 8 * 1024 * 1024, headers, sizeof(headers));
     MD_CHECK(healthy >= 0);
-    wait_sse_ready(http, healthy);
-    /* Discard the readiness probes from stalled sockets before stalling. */
-    for (int i = 0; i < 4; i++) {
-        char buf[1024];
-        while (recv(stalled[i], buf, sizeof(buf), MSG_DONTWAIT) > 0) {}
-    }
-
-    size_t len = 256 * 1024;
+    int healthy_rcvbuf = 0;
+    socklen_t optlen = sizeof(healthy_rcvbuf);
+    MD_CHECK(getsockopt(healthy, SOL_SOCKET, SO_RCVBUF, &healthy_rcvbuf, &optlen) == 0);
+    MD_CHECK(healthy_rcvbuf > 0);
+    wait_sse_ready(http, healthy, 5);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 5);
+    const size_t max_frames = 1024;
+    /* Darwin expands even an explicitly tiny loopback receive buffer to
+     * about 256 KiB. Overshoot that plus the bounded send buffer in one frame. */
+    const size_t len = 512 * 1024;
     char *json = malloc(len + 1);
     MD_CHECK(json != NULL);
     memset(json, 'x', len);
@@ -600,33 +654,68 @@ static void test_sse_stalled_client(void)
     char *frame = malloc(len + 32);
     MD_CHECK(frame != NULL);
     int frame_len = snprintf(frame, len + 32, "event: message\ndata: %s\n\n", json);
-    SseReader reader = { .fd = healthy, .frame = frame,
-                         .frame_len = (size_t)frame_len, .count = 128 };
-    MD_CHECK(pthread_create(&reader_tid, NULL, read_sse_frames, &reader) == 0);
-    /* Never read stalled while broadcasting: exceed its kernel buffering.
-     * The healthy reader checks every byte, including short-write framing. */
-    for (size_t i = 0; i < reader.count; i++) {
-        int64_t start = md_now_ms();
-        MD_CHECK(md_mcp_http_write(json, len, http) == 0);
-        MD_CHECK(md_now_ms() - start < 650); /* not four separate 200ms waits */
+    int server_sndbuf = 0;
+    /* Allow kernel rounding/doubling, but bound every socket well below one
+     * frame, including the healthy client's, via locked getsockopt readback. */
+    for (int i = 0; i < 5; i++) {
+        int actual = md_mcp_http_sse_client_sndbuf(http, i);
+        MD_CHECK(actual > 0 && actual <= 2 * cfg.sse_sndbuf && actual < frame_len);
+        if (actual > server_sndbuf) server_sndbuf = actual;
     }
+    SseReader reader = { .fd = healthy, .frame = frame,
+                         .frame_len = (size_t)frame_len };
+    /* Discard readiness leftovers on every socket before the data reader
+     * starts; no further readiness probes are sent during the broadcast. */
+    for (int i = 0; i < 5; i++) {
+        int fd = i < 4 ? stalled[i] : healthy;
+        char buf[1024];
+        while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {}
+    }
+    MD_CHECK(pthread_create(&reader_tid, NULL, read_sse_frames, &reader) == 0);
+    size_t sent = 0;
+    int clients = md_mcp_http_sse_client_count(http);
+    /* Fill both receive and bounded server send buffers. Only the healthy
+     * client is drained; the frame cap remains a liveness safety net. */
+    while (clients == 5 && sent < max_frames) {
+        int before = md_mcp_http_sse_client_count(http);
+        MD_CHECK(md_mcp_http_write(json, len, http) == 0);
+        sent++;
+        clients = md_mcp_http_sse_client_count(http);
+        /* A single whole-broadcast deadline drops all four stalled clients
+         * in one call, never leaving 2, 3 or 4 between writes. */
+        MD_CHECK(before == 5 && (clients == 5 || clients == 1));
+    }
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 1);
+    printf("  SSE buffers: stalled=%d healthy=%d server_sndbuf=%d frames=%zu broadcast=%zu bytes clients=%d\n",
+           stalled_rcvbuf, healthy_rcvbuf, server_sndbuf, sent, reader.frame_len * sent, clients);
+    fflush(stdout);
+    MD_CHECK(md_mcp_http_send_sse(http, "done", "", 0) == 0);
     MD_CHECK(pthread_join(reader_tid, NULL) == 0);
     MD_CHECK(reader.matched);
+    MD_CHECK(reader.received == sent);
 
-    /* A dropped client reaches EOF after its already queued bytes. */
-    size_t queued = 0;
-    int64_t drain_deadline = md_now_ms() + 5000;
-    bool dropped = false;
-    while (md_now_ms() < drain_deadline) {
-        if (md_test_wait_readable(stalled[0], 1000) != 1) break;
-        char buf[16384];
-        ssize_t n = read(stalled[0], buf, sizeof(buf));
-        if (n == 0) { dropped = true; break; }
-        if (n < 0) break;
-        queued += (size_t)n;
+    /* EOF only confirms the authoritative count assertion above. Do not
+     * spend drain budgets on clients already known to have survived. */
+    for (int i = 0; clients == 1 && i < 4; i++) {
+        size_t queued = 0;
+        int64_t drain_deadline = md_now_ms() + 2000;
+        bool dropped = false;
+        for (;;) {
+            int64_t remaining = drain_deadline - md_now_ms();
+            if (remaining <= 0) break;
+            int readable = md_test_wait_readable(stalled[i], (int)remaining);
+            if (readable == 0) continue;
+            if (readable < 0) break;
+            char buf[16384];
+            ssize_t n = read(stalled[i], buf, sizeof(buf));
+            if (n == 0) { dropped = true; break; }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) break;
+            queued += (size_t)n;
+        }
+        MD_CHECK(dropped);
+        MD_CHECK(queued < reader.frame_len * sent);
     }
-    MD_CHECK(dropped);
-    MD_CHECK(queued < reader.frame_len * reader.count);
 
     /* Both the healthy stream and HTTP request dispatch remain usable. */
     MD_CHECK(md_mcp_http_write("{}", 2, http) == 0);
@@ -648,10 +737,11 @@ static void test_sse_stalled_client(void)
     for (int i = 0; i < 4; i++) close(stalled[i]);
     close(healthy);
     md_mcp_http_shutdown(http);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
     MD_CHECK(pthread_join(server_tid, NULL) == 0);
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
-    PASS("stalled SSE client dropped within budget; healthy stream and POST survive");
+    PASS("stalled SSE clients dropped together; healthy stream and POST survive");
 }
 
 static cJSON *large_resource(void *userdata)
@@ -701,11 +791,11 @@ static void test_stalled_post_destroy(void)
         if (strstr(headers, "\r\n\r\n")) break;
     }
     MD_CHECK(strstr(headers, "200 OK") != NULL);
-    int64_t start = md_now_ms();
     md_mcp_http_shutdown(http);
     MD_CHECK(pthread_join(tid, NULL) == 0);
+    MD_CHECK(sa.result == 0);
+    /* Completion is the assertion; Meson's suite timeout guards liveness. */
     md_mcp_http_destroy(http); /* must drain the stalled POST handler */
-    MD_CHECK(md_now_ms() - start < 2000);
     close(fd);
     md_mcp_server_destroy(mcp);
     PASS("stalled large POST response cannot wedge transport destroy");

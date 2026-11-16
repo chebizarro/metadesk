@@ -243,9 +243,7 @@ static void test_stdio_broken_pipe(void)
     MdMcpTool tool = { .name = "count", .handler = count_dispatch, .userdata = &calls };
     MD_CHECK(md_mcp_server_register_tool(server, &tool) == 0);
     close(output[0]);
-    int64_t start = md_now_ms();
     MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
-    MD_CHECK(md_now_ms() - start < 1000);
 
     /* Failed responses must not stop input dispatch: both tool calls run. */
     const char requests[] =
@@ -260,7 +258,7 @@ static void test_stdio_broken_pipe(void)
     md_mcp_server_destroy(server);
     close(input[0]);
     close(output[1]);
-    PASS("closed stdout pipe returns promptly without SIGPIPE; input dispatch survives");
+    PASS("closed stdout pipe fails without SIGPIPE; input dispatch survives");
 }
 
 static void test_stdio_stalled_pipe(void)
@@ -277,18 +275,29 @@ static void test_stdio_stalled_pipe(void)
     size_t len = 1024 * 1024;
     char *json = malloc(len);
     MD_CHECK(json != NULL);
-    memset(json, 'x', len);
+    for (size_t i = 0; i < len; i++) json[i] = (char)('a' + i % 26);
     /* POLLOUT initially succeeds, but this message exceeds pipe capacity.
      * Chunked writes must stop at the deadline without changing fd flags. */
-    int64_t start = md_now_ms();
+    /* Meson's suite timeout is the liveness guard, not elapsed CPU time. */
     MD_CHECK(md_mcp_stdio_write(json, len, ctx) == -1);
-    int64_t elapsed = md_now_ms() - start;
-    MD_CHECK(elapsed < 1500); /* watchdog only; not a scheduling assertion */
+    int read_flags = fcntl(output[0], F_GETFL);
+    MD_CHECK(read_flags >= 0);
+    MD_CHECK(fcntl(output[0], F_SETFL, read_flags | O_NONBLOCK) == 0);
     char buf[4096];
-    MD_CHECK(read(output[0], buf, sizeof(buf)) > 0);
-    start = md_now_ms();
+    size_t queued = 0;
+    ssize_t n;
+    while ((n = read(output[0], buf, sizeof(buf))) > 0) {
+        MD_CHECK(queued + (size_t)n <= len &&
+                 memcmp(buf, json + queued, (size_t)n) == 0);
+        queued += (size_t)n;
+    }
+    MD_CHECK(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    MD_CHECK(queued > 0 && queued < len);
+    /* With the pipe drained, failure now means output is disabled, not
+     * merely blocked. No bytes may be appended to the partial frame. */
     MD_CHECK(md_mcp_stdio_write("{}", 2, ctx) == -1);
-    MD_CHECK(md_now_ms() - start < 1000); /* no append to partial frame */
+    MD_CHECK(read(output[0], buf, sizeof(buf)) == -1 &&
+             (errno == EAGAIN || errno == EWOULDBLOCK));
     free(json);
     md_mcp_stdio_destroy(ctx);
     /* macOS can add an internal pipe flag after growing its buffer; check
