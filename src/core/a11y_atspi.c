@@ -143,6 +143,8 @@ static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,
     if (role_name) {
         node->role = strdup(md_a11y_role_name(md_a11y_role_lookup(role_name)));
         g_free(role_name);
+    } else {
+        node->role = strdup(md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN));
     }
     if (error) { g_error_free(error); error = NULL; }
 

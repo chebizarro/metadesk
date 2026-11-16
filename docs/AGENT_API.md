@@ -64,6 +64,13 @@ counting child edges from the selected root (0 returns only that node). An empty
 Top-level windows may be nested under desktop/application containers; nested
 ordinary windows are excluded, but dialogs and alerts are included even when nested.
 
+### Role vocabulary
+
+Canonical role names are defined in `src/core/a11y_vocab.h`. Backends normalise
+native and AT-SPI role names at the boundary. `metadesk_find` accepts aliases:
+for example, `frame` matches `window` and `push button` matches `button`.
+Unknown external roles and states retain case-insensitive literal matching.
+
 `find` and `subtree` default to `format="compact"`; use `format="json"` per call.
 Targeted compact output includes all roles, including labels and panels;
 roles without an abbreviation retain their raw role string.
@@ -111,7 +118,7 @@ Example with `--mcp-tree-format=json`:
 
 ```json
 → {"jsonrpc":"2.0","method":"resources/read","id":5,"params":{"uri":"metadesk://ui-tree"}}
-← {"jsonrpc":"2.0","id":5,"result":{"contents":[{"uri":"metadesk://ui-tree","mimeType":"application/json","text":"{\"v\":1,\"ts\":1700000000000,\"root\":{\"id\":\"n1\",\"role\":\"frame\",\"label\":\"gedit - untitled\",\"state\":[\"visible\",\"active\"],\"bounds\":{\"x\":0,\"y\":0,\"w\":1920,\"h\":1080},\"children\":[{\"id\":\"n42\",\"role\":\"button\",\"label\":\"Save\",\"state\":[\"enabled\"],\"bounds\":{\"x\":100,\"y\":50,\"w\":80,\"h\":30},\"children\":[]}]}}"}]}}
+← {"jsonrpc":"2.0","id":5,"result":{"contents":[{"uri":"metadesk://ui-tree","mimeType":"application/json","text":"{\"v\":1,\"ts\":1700000000000,\"root\":{\"id\":\"n1\",\"role\":\"window\",\"label\":\"gedit - untitled\",\"state\":[\"visible\",\"active\"],\"bounds\":{\"x\":0,\"y\":0,\"w\":1920,\"h\":1080},\"children\":[{\"id\":\"n42\",\"role\":\"button\",\"label\":\"Save\",\"state\":[\"enabled\"],\"bounds\":{\"x\":100,\"y\":50,\"w\":80,\"h\":30},\"children\":[]}]}}"}]}}
 ```
 
 ### Read session info

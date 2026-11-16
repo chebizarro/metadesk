@@ -268,6 +268,12 @@ Valid action values: `click`, `dbl_click`, `right_click`, `type`, `key_combo`, `
 
 Two formats are defined. The host sends whichever the client negotiated during session setup. Both formats are platform-agnostic — the HAL normalises all platform accessibility APIs into a common node model before serialisation.
 
+#### Role vocabulary
+
+Canonical role names come from `src/core/a11y_vocab.h`. Backends normalise native
+and AT-SPI role names at the boundary. `metadesk_find` accepts aliases such as
+`frame` for `window` and `push button` for `button`.
+
 #### 3.3.1 Full tree (structured JSON) — `MD_PKT_UI_TREE`
 
 ```json
@@ -276,7 +282,7 @@ Two formats are defined. The host sends whichever the client negotiated during s
   "ts": 1700000000000,
   "root": {
     "id": "node_1",
-    "role": "frame",
+    "role": "window",
     "label": "gedit - untitled",
     "state": ["visible", "active"],
     "bounds": { "x": 0, "y": 0, "w": 1920, "h": 1080 },

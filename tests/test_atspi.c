@@ -3,6 +3,7 @@
  * Accessibility tree HAL tests (serialisation + live backend if available).
  */
 #include "a11y.h"
+#include "a11y_query.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,7 +238,45 @@ static void test_delta_serialization(void) {
 #ifdef __APPLE__
 extern size_t md_a11y_axui_role_mapping_count(void);
 extern enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index);
+extern const char *md_a11y_axui_native_role_at(size_t index);
+extern const char *md_a11y_axui_normalize_role(const char *ax_role);
 #endif
+
+static void test_compact_table_filtering(void) {
+    MdA11yNode *table = make_node("table", "table", "Data", 0, 0, 100, 100);
+    for (int r = 0; r < 3; r++) {
+        char id[16];
+        snprintf(id, sizeof(id), "row%d", r);
+        MdA11yNode *row = make_node(id, "table row", "Row", 0, 0, 100, 10);
+        node_add_child(table, row);
+        for (int c = 0; c < 2; c++) {
+            snprintf(id, sizeof(id), "cell%d%d", r, c);
+            node_add_child(row, make_node(id, "table cell", "Cell", 0, 0, 50, 10));
+        }
+    }
+    char *compact = md_a11y_to_compact_at(table, 0);
+    MD_CHECK(compact && strcmp(compact, "v1 ts:0\nTBL[table] Data\n") == 0);
+    free(compact);
+    md_a11y_node_free(table);
+
+    static const enum MdA11yRole original_interactable[] = {
+        MD_A11Y_ROLE_WINDOW, MD_A11Y_ROLE_APPLICATION, MD_A11Y_ROLE_DESKTOP,
+        MD_A11Y_ROLE_DIALOG, MD_A11Y_ROLE_BUTTON, MD_A11Y_ROLE_TOGGLE_BUTTON,
+        MD_A11Y_ROLE_TEXT, MD_A11Y_ROLE_MENU, MD_A11Y_ROLE_MENU_ITEM,
+        MD_A11Y_ROLE_CHECK_BOX, MD_A11Y_ROLE_RADIO_BUTTON, MD_A11Y_ROLE_COMBO_BOX,
+        MD_A11Y_ROLE_LIST, MD_A11Y_ROLE_LIST_ITEM, MD_A11Y_ROLE_TAB,
+        MD_A11Y_ROLE_LINK, MD_A11Y_ROLE_SLIDER, MD_A11Y_ROLE_SPIN_BUTTON,
+        MD_A11Y_ROLE_TREE, MD_A11Y_ROLE_TABLE,
+    };
+    for (int i = 0; i < MD_A11Y_ROLE_COUNT; i++) {
+        bool expected = false;
+        for (size_t j = 0; j < sizeof(original_interactable) / sizeof(original_interactable[0]); j++)
+            if ((enum MdA11yRole)i == original_interactable[j]) expected = true;
+        MD_CHECK(md_a11y_role_is_interactable_enum((enum MdA11yRole)i) == expected);
+        MD_CHECK(md_a11y_role_is_interactable(md_a11y_role_name((enum MdA11yRole)i)) == expected);
+    }
+    printf("  PASS: compact 3x2 table golden and original interactable set\n");
+}
 
 static void test_vocab(void) {
     for (int i = 0; i < MD_A11Y_ROLE_COUNT; i++) {
@@ -265,11 +304,49 @@ static void test_vocab(void) {
     MD_CHECK(md_a11y_axui_role_mapping_count() > 0);
     for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++) {
         enum MdA11yRole role = md_a11y_axui_role_mapping_at(i);
-        MD_CHECK(role > MD_A11Y_ROLE_UNKNOWN && role < MD_A11Y_ROLE_COUNT);
+        MD_CHECK(role >= MD_A11Y_ROLE_UNKNOWN && role < MD_A11Y_ROLE_COUNT);
         MD_CHECK(md_a11y_role_lookup(md_a11y_role_name(role)) == role);
+        const char *native = md_a11y_axui_native_role_at(i);
+        MD_CHECK(native != NULL);
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role(native), md_a11y_role_name(role)) == 0);
     }
+    static const struct { const char *native; enum MdA11yRole role; } added_roles[] = {
+        { "AXMenuButton", MD_A11Y_ROLE_BUTTON },
+        { "AXColorWell", MD_A11Y_ROLE_COLOR_CHOOSER },
+        { "AXDateField", MD_A11Y_ROLE_DATE_EDITOR },
+        { "AXTimeField", MD_A11Y_ROLE_DATE_EDITOR },
+        { "AXIncrementor", MD_A11Y_ROLE_SPIN_BUTTON },
+        { "AXLevelIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+        { "AXBusyIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+        { "AXGrid", MD_A11Y_ROLE_TABLE },
+        { "AXDockItem", MD_A11Y_ROLE_BUTTON },
+        { "AXRadioGroup", MD_A11Y_ROLE_PANEL },
+        { "AXPopover", MD_A11Y_ROLE_DIALOG },
+        { "AXListMarker", MD_A11Y_ROLE_LABEL },
+        { "AXOpaqueProviderGroup", MD_A11Y_ROLE_PANEL },
+        { "AXRuler", MD_A11Y_ROLE_UNKNOWN },
+        { "AXRulerMarker", MD_A11Y_ROLE_UNKNOWN },
+        { "AXUnknown", MD_A11Y_ROLE_UNKNOWN },
+        { "AXSystemWide", MD_A11Y_ROLE_UNKNOWN },
+    };
+    for (size_t i = 0; i < sizeof(added_roles) / sizeof(added_roles[0]); i++)
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role(added_roles[i].native),
+                        md_a11y_role_name(added_roles[i].role)) == 0);
+    for (int i = 0; i < 2; i++)
+        MD_CHECK(strcmp(md_a11y_axui_normalize_role("AXUnmappedReviewFixture"), "unknown") == 0);
 #endif
+    MD_CHECK(md_a11y_role_lookup("header") == MD_A11Y_ROLE_PANEL);
+    MD_CHECK(md_a11y_role_lookup("footer") == MD_A11Y_ROLE_PANEL);
     MdA11yNode custom = { .id = "custom", .role = "vendor widget", .label = "Custom" };
+    char *raw_states[] = { "vendor state", "focused", NULL };
+    custom.states = raw_states;
+    custom.state_count = 3;
+    MD_CHECK(md_a11y_matches(&custom, "VENDOR WIDGET", NULL, "VENDOR STATE"));
+    MD_CHECK(md_a11y_matches(&custom, NULL, NULL, "FOCUSED"));
+    MD_CHECK(!md_a11y_matches(&custom, "button", NULL, NULL));
+    MD_CHECK(!md_a11y_matches(&custom, NULL, NULL, "enabled"));
+    custom.states = NULL;
+    custom.state_count = 0;
     char *targeted = md_a11y_query_to_compact(&custom, 0);
     MD_CHECK(targeted && strcmp(targeted, "vendor widget[custom] Custom\n") == 0);
     free(targeted);
@@ -617,6 +694,7 @@ int main(void) {
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
     test_liveness();
     test_vocab();
+    test_compact_table_filtering();
     test_node_alloc_free();
     test_create_destroy();
     test_json_serialization();

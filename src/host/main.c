@@ -876,10 +876,13 @@ int main(int argc, char **argv) {
 
         /* Initialize a11y + input for MCP mode */
         MdA11yCtx *mcp_a11y = md_a11y_create();
-        if (md_a11y_is_connected(mcp_a11y))
+        if (md_a11y_is_connected(mcp_a11y)) {
             printf("host[mcp]: accessibility tree connected\n");
-        else
+        } else {
             fprintf(stderr, "host[mcp]: WARNING: a11y unavailable\n");
+            md_a11y_destroy(mcp_a11y);
+            mcp_a11y = NULL;
+        }
 
         uint32_t mcp_screen_w = 0, mcp_screen_h = 0;
         host_apply_fallback_dimensions(&mcp_screen_w, &mcp_screen_h,
@@ -1020,6 +1023,8 @@ int main(int argc, char **argv) {
     MdA11yCtx *a11y = md_a11y_create();
     if (!md_a11y_is_connected(a11y)) {
         fprintf(stderr, "WARNING: accessibility tree unavailable — agent mode disabled\n");
+        md_a11y_destroy(a11y);
+        a11y = NULL;
     } else {
         printf("host: accessibility tree connected\n");
     }

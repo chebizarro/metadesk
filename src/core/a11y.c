@@ -483,18 +483,24 @@ char *md_a11y_to_json_at(const MdA11yNode *root, uint64_t ts_ms) {
  */
 
 /* Returns true if the role is a text input (content should be quoted) */
-static bool is_text_role(const char *role) {
-    if (!role) return false;
-    return md_a11y_role_lookup(role) == MD_A11Y_ROLE_TEXT;
+static bool is_text_role(enum MdA11yRole role) {
+    return role == MD_A11Y_ROLE_TEXT;
 }
 
-static int has_state(const MdA11yNode *node, enum MdA11yState state) {
-    if (!node->states) return 0;
-    for (int i = 0; i < node->state_count; i++) {
-        if (node->states[i] && md_a11y_state_lookup(node->states[i]) == state)
-            return 1;
+_Static_assert(MD_A11Y_STATE_COUNT <= 64, "compact state mask capacity exceeded");
+
+static uint64_t compact_state_mask(const MdA11yNode *node) {
+    uint64_t mask = 0;
+    for (int i = 0; node->states && i < node->state_count; i++) {
+        enum MdA11yState state = md_a11y_state_lookup(node->states[i]);
+        if (state != MD_A11Y_STATE_UNKNOWN)
+            mask |= UINT64_C(1) << state;
     }
-    return 0;
+    return mask;
+}
+
+static bool has_state(uint64_t mask, enum MdA11yState state) {
+    return (mask & (UINT64_C(1) << state)) != 0;
 }
 
 /* ── Growable string builder ──────────────────────────────────
@@ -541,7 +547,7 @@ static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
 }
 
 /* Append state annotations in priority order. */
-static void compact_states(const MdA11yNode *node, StrBuf *sb) {
+static void compact_states(uint64_t states, StrBuf *sb) {
     static const struct { enum MdA11yState state; const char *fmt; } state_map[] = {
         { MD_A11Y_STATE_FOCUSED,  " <focused>" },
         { MD_A11Y_STATE_ENABLED,  " *enabled*" },
@@ -552,7 +558,7 @@ static void compact_states(const MdA11yNode *node, StrBuf *sb) {
         { MD_A11Y_STATE_EXPANDED, " *expanded*" },
     };
     for (size_t i = 0; i < sizeof(state_map) / sizeof(state_map[0]); i++)
-        if (has_state(node, state_map[i].state))
+        if (has_state(states, state_map[i].state))
             sb_append(sb, state_map[i].fmt);
 }
 
@@ -564,26 +570,28 @@ static void compact_states(const MdA11yNode *node, StrBuf *sb) {
 static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
                          bool all_roles, int remaining) {
     if (!node) return;
-    bool emit = all_roles || md_a11y_role_is_interactable(node->role);
+    enum MdA11yRole resolved_role = md_a11y_role_lookup(node->role);
+    bool emit = all_roles || md_a11y_role_is_interactable_enum(resolved_role);
 
     if (emit) {
+        uint64_t states = compact_state_mask(node);
         for (int i = 0; i < depth; i++) sb_append(sb, "  ");
 
         /* ROLE[id] */
-        const char *role = all_roles && node->role && md_a11y_role_lookup(node->role) == MD_A11Y_ROLE_UNKNOWN
-            ? node->role : md_a11y_role_abbrev(node->role);
+        const char *role = all_roles && node->role && resolved_role == MD_A11Y_ROLE_UNKNOWN
+            ? node->role : (node->role ? md_a11y_role_abbrev_enum(resolved_role) : "???");
         sb_appendf(sb, "%s[%s]", role, node->id ? node->id : "?");
 
-        if (is_text_role(node->role)) {
+        if (is_text_role(resolved_role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */
-            if (has_state(node, MD_A11Y_STATE_FOCUSED)) sb_append(sb, " <focused>");
+            if (has_state(states, MD_A11Y_STATE_FOCUSED)) sb_append(sb, " <focused>");
             sb_appendf(sb, " '%s'", node->label ? node->label : "");
-            if (has_state(node, MD_A11Y_STATE_ENABLED))  sb_append(sb, " *enabled*");
-            if (has_state(node, MD_A11Y_STATE_DISABLED)) sb_append(sb, " *disabled*");
+            if (has_state(states, MD_A11Y_STATE_ENABLED))  sb_append(sb, " *enabled*");
+            if (has_state(states, MD_A11Y_STATE_DISABLED)) sb_append(sb, " *disabled*");
         } else {
             const char *label = node->label ? node->label : "";
             if (label[0]) sb_appendf(sb, " %s", label);
-            compact_states(node, sb);
+            compact_states(states, sb);
         }
 
         sb_append(sb, "\n");

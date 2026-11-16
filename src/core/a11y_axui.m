@@ -78,46 +78,63 @@ static char *make_node_id(AXUIState *st) {
 
 
 /* Typed AX mappings: no raw native role escapes into a tree. */
-static const struct { CFStringRef ax_role; enum MdA11yRole role; } ax_roles[] = {
-    { CFSTR("AXApplication"), MD_A11Y_ROLE_APPLICATION },
-    { CFSTR("AXWindow"), MD_A11Y_ROLE_WINDOW },
-    { CFSTR("AXButton"), MD_A11Y_ROLE_BUTTON },
-    { CFSTR("AXCheckBox"), MD_A11Y_ROLE_CHECK_BOX },
-    { CFSTR("AXRadioButton"), MD_A11Y_ROLE_RADIO_BUTTON },
-    { CFSTR("AXTextField"), MD_A11Y_ROLE_TEXT },
-    { CFSTR("AXTextArea"), MD_A11Y_ROLE_TEXT },
-    { CFSTR("AXStaticText"), MD_A11Y_ROLE_LABEL },
-    { CFSTR("AXImage"), MD_A11Y_ROLE_IMAGE },
-    { CFSTR("AXGroup"), MD_A11Y_ROLE_PANEL },
-    { CFSTR("AXList"), MD_A11Y_ROLE_LIST },
-    { CFSTR("AXTable"), MD_A11Y_ROLE_TABLE },
-    { CFSTR("AXRow"), MD_A11Y_ROLE_TABLE_ROW },
-    { CFSTR("AXColumn"), MD_A11Y_ROLE_TABLE_COLUMN },
-    { CFSTR("AXCell"), MD_A11Y_ROLE_TABLE_CELL },
-    { CFSTR("AXScrollArea"), MD_A11Y_ROLE_SCROLL_PANE },
-    { CFSTR("AXScrollBar"), MD_A11Y_ROLE_SCROLL_BAR },
-    { CFSTR("AXSlider"), MD_A11Y_ROLE_SLIDER },
-    { CFSTR("AXMenuBar"), MD_A11Y_ROLE_MENU },
-    { CFSTR("AXMenu"), MD_A11Y_ROLE_MENU },
-    { CFSTR("AXMenuItem"), MD_A11Y_ROLE_MENU_ITEM },
-    { CFSTR("AXToolbar"), MD_A11Y_ROLE_TOOL_BAR },
-    { CFSTR("AXTabGroup"), MD_A11Y_ROLE_PAGE_TAB_LIST },
-    { CFSTR("AXTab"), MD_A11Y_ROLE_TAB },
-    { CFSTR("AXComboBox"), MD_A11Y_ROLE_COMBO_BOX },
-    { CFSTR("AXPopUpButton"), MD_A11Y_ROLE_COMBO_BOX },
-    { CFSTR("AXProgressIndicator"), MD_A11Y_ROLE_PROGRESS_BAR },
-    { CFSTR("AXLink"), MD_A11Y_ROLE_LINK },
-    { CFSTR("AXWebArea"), MD_A11Y_ROLE_DOCUMENT_WEB },
-    { CFSTR("AXSheet"), MD_A11Y_ROLE_DIALOG },
-    { CFSTR("AXDialog"), MD_A11Y_ROLE_DIALOG },
-    { CFSTR("AXSplitGroup"), MD_A11Y_ROLE_SPLIT_PANE },
-    { CFSTR("AXOutline"), MD_A11Y_ROLE_TREE },
-    { CFSTR("AXOutlineRow"), MD_A11Y_ROLE_TREE_ITEM },
-    { CFSTR("AXHeading"), MD_A11Y_ROLE_HEADING },
-    { CFSTR("AXMenuBarItem"), MD_A11Y_ROLE_MENU_ITEM },
-    { CFSTR("AXValueIndicator"), MD_A11Y_ROLE_LABEL },
-    { CFSTR("AXSplitter"), MD_A11Y_ROLE_SEPARATOR },
-    { CFSTR("AXDisclosureTriangle"), MD_A11Y_ROLE_TOGGLE_BUTTON },
+static const struct { const char *ax_role; enum MdA11yRole role; } ax_roles[] = {
+    { "AXApplication", MD_A11Y_ROLE_APPLICATION },
+    { "AXWindow", MD_A11Y_ROLE_WINDOW },
+    { "AXButton", MD_A11Y_ROLE_BUTTON },
+    { "AXCheckBox", MD_A11Y_ROLE_CHECK_BOX },
+    { "AXRadioButton", MD_A11Y_ROLE_RADIO_BUTTON },
+    { "AXTextField", MD_A11Y_ROLE_TEXT },
+    { "AXTextArea", MD_A11Y_ROLE_TEXT },
+    { "AXStaticText", MD_A11Y_ROLE_LABEL },
+    { "AXImage", MD_A11Y_ROLE_IMAGE },
+    { "AXGroup", MD_A11Y_ROLE_PANEL },
+    { "AXList", MD_A11Y_ROLE_LIST },
+    { "AXTable", MD_A11Y_ROLE_TABLE },
+    { "AXRow", MD_A11Y_ROLE_TABLE_ROW },
+    { "AXColumn", MD_A11Y_ROLE_TABLE_COLUMN },
+    { "AXCell", MD_A11Y_ROLE_TABLE_CELL },
+    { "AXScrollArea", MD_A11Y_ROLE_SCROLL_PANE },
+    { "AXScrollBar", MD_A11Y_ROLE_SCROLL_BAR },
+    { "AXSlider", MD_A11Y_ROLE_SLIDER },
+    { "AXMenuBar", MD_A11Y_ROLE_MENU },
+    { "AXMenu", MD_A11Y_ROLE_MENU },
+    { "AXMenuItem", MD_A11Y_ROLE_MENU_ITEM },
+    { "AXToolbar", MD_A11Y_ROLE_TOOL_BAR },
+    { "AXTabGroup", MD_A11Y_ROLE_PAGE_TAB_LIST },
+    { "AXTab", MD_A11Y_ROLE_TAB },
+    { "AXComboBox", MD_A11Y_ROLE_COMBO_BOX },
+    { "AXPopUpButton", MD_A11Y_ROLE_COMBO_BOX },
+    { "AXProgressIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXLink", MD_A11Y_ROLE_LINK },
+    { "AXWebArea", MD_A11Y_ROLE_DOCUMENT_WEB },
+    { "AXSheet", MD_A11Y_ROLE_DIALOG },
+    { "AXDialog", MD_A11Y_ROLE_DIALOG },
+    { "AXSplitGroup", MD_A11Y_ROLE_SPLIT_PANE },
+    { "AXOutline", MD_A11Y_ROLE_TREE },
+    { "AXOutlineRow", MD_A11Y_ROLE_TREE_ITEM },
+    { "AXHeading", MD_A11Y_ROLE_HEADING },
+    { "AXMenuBarItem", MD_A11Y_ROLE_MENU_ITEM },
+    { "AXValueIndicator", MD_A11Y_ROLE_LABEL },
+    { "AXSplitter", MD_A11Y_ROLE_SEPARATOR },
+    { "AXDisclosureTriangle", MD_A11Y_ROLE_TOGGLE_BUTTON },
+    { "AXMenuButton", MD_A11Y_ROLE_BUTTON },
+    { "AXColorWell", MD_A11Y_ROLE_COLOR_CHOOSER },
+    { "AXDateField", MD_A11Y_ROLE_DATE_EDITOR },
+    { "AXTimeField", MD_A11Y_ROLE_DATE_EDITOR },
+    { "AXIncrementor", MD_A11Y_ROLE_SPIN_BUTTON },
+    { "AXLevelIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXBusyIndicator", MD_A11Y_ROLE_PROGRESS_BAR },
+    { "AXGrid", MD_A11Y_ROLE_TABLE },
+    { "AXDockItem", MD_A11Y_ROLE_BUTTON },
+    { "AXRadioGroup", MD_A11Y_ROLE_PANEL },
+    { "AXPopover", MD_A11Y_ROLE_DIALOG },
+    { "AXListMarker", MD_A11Y_ROLE_LABEL },
+    { "AXOpaqueProviderGroup", MD_A11Y_ROLE_PANEL },
+    { "AXRuler", MD_A11Y_ROLE_UNKNOWN },
+    { "AXRulerMarker", MD_A11Y_ROLE_UNKNOWN },
+    { "AXUnknown", MD_A11Y_ROLE_UNKNOWN },
+    { "AXSystemWide", MD_A11Y_ROLE_UNKNOWN },
 };
 
 /* Used by the native drift test; iterates the actual production mapping. */
@@ -128,21 +145,45 @@ enum MdA11yRole md_a11y_axui_role_mapping_at(size_t index) {
     return index < md_a11y_axui_role_mapping_count()
         ? ax_roles[index].role : MD_A11Y_ROLE_UNKNOWN;
 }
+/* Bounded process-lifetime set. Once full, suppress new diagnostics rather
+ * than logging repeatedly; store complete names to avoid truncation collisions. */
+static void log_unmapped_role_once(const char *role) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static char *seen[32];
+    static size_t count;
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(seen[i], role) == 0) {
+            pthread_mutex_unlock(&lock);
+            return;
+        }
+    }
+    if (count < sizeof(seen) / sizeof(seen[0])) {
+        char *copy = strdup(role);
+        if (copy) {
+            seen[count++] = copy;
+            MD_LOG_I("unmapped AX role: %s", role);
+        }
+    }
+    pthread_mutex_unlock(&lock);
+}
+
 static const char *normalize_role(const char *ax_role) {
     if (ax_role) {
-        CFStringRef native = CFStringCreateWithCString(NULL, ax_role, kCFStringEncodingUTF8);
-        if (native) {
-            for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++) {
-                if (CFEqual(native, ax_roles[i].ax_role)) {
-                    CFRelease(native);
-                    return md_a11y_role_name(ax_roles[i].role);
-                }
-            }
-            CFRelease(native);
-        }
-        MD_LOG_W("unmapped AX role: %s", ax_role);
+        for (size_t i = 0; i < md_a11y_axui_role_mapping_count(); i++)
+            if (strcmp(ax_role, ax_roles[i].ax_role) == 0)
+                return md_a11y_role_name(ax_roles[i].role);
+        log_unmapped_role_once(ax_role);
     }
     return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
+}
+
+/* Native test seams exercise the production string mapping without CF. */
+const char *md_a11y_axui_normalize_role(const char *ax_role) {
+    return normalize_role(ax_role);
+}
+const char *md_a11y_axui_native_role_at(size_t index) {
+    return index < md_a11y_axui_role_mapping_count() ? ax_roles[index].ax_role : NULL;
 }
 
 /* ── Tree walking ────────────────────────────────────────────── */
@@ -235,8 +276,8 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
         node->label = vals ? batch_get_string(vals, AX_DESC) : NULL;
     }
     if (!node->label || node->label[0] == '\0') {
-        if (node->role && (strcmp(node->role, "label") == 0 ||
-                          strcmp(node->role, "text") == 0)) {
+        enum MdA11yRole role = md_a11y_role_lookup(node->role);
+        if (role == MD_A11Y_ROLE_LABEL || role == MD_A11Y_ROLE_TEXT) {
             free(node->label);
             node->label = vals ? batch_get_string(vals, AX_VALUE) : NULL;
         }

@@ -40,33 +40,33 @@
     X(PAGE_TAB_LIST, "page tab list", "PTL", false) \
     X(SPLIT_PANE, "split pane", "SPL", false) \
     X(PROGRESS_BAR, "progress bar", "PRG", false) \
-    X(TREE_ITEM, "tree item", "TRI", true) \
-    X(TABLE_ROW, "table row", "ROW", true) \
-    X(TABLE_COLUMN, "table column", "COL", true) \
-    X(TABLE_CELL, "table cell", "CEL", true) \
+    X(TREE_ITEM, "tree item", "TRI", false) \
+    X(TABLE_ROW, "table row", "ROW", false) \
+    X(TABLE_COLUMN, "table column", "COL", false) \
+    X(TABLE_CELL, "table cell", "CEL", false) \
     X(SCROLL_PANE, "scroll pane", "SCP", false) \
-    X(DOCUMENT, "document", "DOC", true) \
-    X(DOCUMENT_WEB, "document web", "WEB", true) \
-    X(HEADING, "heading", "HDG", true) \
+    X(DOCUMENT, "document", "DOC", false) \
+    X(DOCUMENT_WEB, "document web", "WEB", false) \
+    X(HEADING, "heading", "HDG", false) \
     X(TOOL_TIP, "tool tip", "TIP", false) \
-    X(CALENDAR, "calendar", "CAL", true) \
+    X(CALENDAR, "calendar", "CAL", false) \
     X(CANVAS, "canvas", "CNV", false) \
-    X(COLOR_CHOOSER, "color chooser", "CLR", true) \
-    X(DATE_EDITOR, "date editor", "DAT", true) \
-    X(FILE_CHOOSER, "file chooser", "FIL", true) \
-    X(FONT_CHOOSER, "font chooser", "FNT", true) \
-    X(COLUMN_HEADER, "column header", "CLH", true) \
-    X(ROW_HEADER, "row header", "RWH", true) \
+    X(COLOR_CHOOSER, "color chooser", "CLR", false) \
+    X(DATE_EDITOR, "date editor", "DAT", false) \
+    X(FILE_CHOOSER, "file chooser", "FIL", false) \
+    X(FONT_CHOOSER, "font chooser", "FNT", false) \
+    X(COLUMN_HEADER, "column header", "CLH", false) \
+    X(ROW_HEADER, "row header", "RWH", false) \
     X(PARAGRAPH, "paragraph", "PAR", false) \
     X(SECTION, "section", "SEC", false) \
-    X(FORM, "form", "FRM", true) \
-    X(TERMINAL, "terminal", "TRM", true) \
+    X(FORM, "form", "FRM", false) \
+    X(TERMINAL, "terminal", "TRM", false) \
     X(NOTIFICATION, "notification", "NTF", false) \
     X(CHART, "chart", "CHT", false) \
-    X(DOCUMENT_SPREADSHEET, "document spreadsheet", "XLS", true) \
-    X(DOCUMENT_PRESENTATION, "document presentation", "PRS", true) \
-    X(DOCUMENT_TEXT, "document text", "DTX", true) \
-    X(DOCUMENT_EMAIL, "document email", "EML", true) \
+    X(DOCUMENT_SPREADSHEET, "document spreadsheet", "XLS", false) \
+    X(DOCUMENT_PRESENTATION, "document presentation", "PRS", false) \
+    X(DOCUMENT_TEXT, "document text", "DTX", false) \
+    X(DOCUMENT_EMAIL, "document email", "EML", false) \
     X(ARTICLE, "article", "ART", false) \
     X(LANDMARK, "landmark", "LMK", false) \
     X(COMMENT, "comment", "CMT", false) \
@@ -111,7 +111,7 @@
     X("tree table", MD_A11Y_ROLE_TREE) \
     X("viewport", MD_A11Y_ROLE_SCROLL_PANE) \
     X("extended", MD_A11Y_ROLE_UNKNOWN) \
-    X("header", MD_A11Y_ROLE_HEADING) \
+    X("header", MD_A11Y_ROLE_PANEL) \
     X("footer", MD_A11Y_ROLE_PANEL) \
     X("ruler", MD_A11Y_ROLE_UNKNOWN) \
     X("autocomplete", MD_A11Y_ROLE_COMBO_BOX) \
@@ -205,22 +205,27 @@ static inline enum MdA11yRole md_a11y_role_lookup(const char *name) {
 #undef MD_ALIAS_LOOKUP
     return MD_A11Y_ROLE_UNKNOWN;
 }
-static inline const char *md_a11y_role_abbrev(const char *name) {
-    if (!name) return "???";
-    switch (md_a11y_role_lookup(name)) {
+static inline const char *md_a11y_role_abbrev_enum(enum MdA11yRole role) {
+    switch (role) {
 #define MD_ROLE_ABBREV(id, wire, abbr, interactive) case MD_A11Y_ROLE_##id: return abbr;
         MD_A11Y_ROLES(MD_ROLE_ABBREV)
 #undef MD_ROLE_ABBREV
         default: return "UNK";
     }
 }
-static inline bool md_a11y_role_is_interactable(const char *name) {
-    switch (md_a11y_role_lookup(name)) {
+static inline const char *md_a11y_role_abbrev(const char *name) {
+    return name ? md_a11y_role_abbrev_enum(md_a11y_role_lookup(name)) : "???";
+}
+static inline bool md_a11y_role_is_interactable_enum(enum MdA11yRole role) {
+    switch (role) {
 #define MD_ROLE_INTERACTIVE(id, wire, abbr, interactive) case MD_A11Y_ROLE_##id: return interactive;
         MD_A11Y_ROLES(MD_ROLE_INTERACTIVE)
 #undef MD_ROLE_INTERACTIVE
         default: return false;
     }
+}
+static inline bool md_a11y_role_is_interactable(const char *name) {
+    return md_a11y_role_is_interactable_enum(md_a11y_role_lookup(name));
 }
 static inline const char *md_a11y_state_name(enum MdA11yState state) {
     switch (state) {
