@@ -16,16 +16,17 @@
  * failure counter.
  */
 #include <stdio.h>
+#include <stdatomic.h>
 #include "io_util.h"
 
-static int md_test_failures = 0;
-static int md_test_checks   = 0;
+static _Atomic int md_test_failures = 0;
+static _Atomic int md_test_checks   = 0;
 static const char *md_test_name = "";
 
 #define MD_CHECK(cond) do {                                            \
-        md_test_checks++;                                              \
+        atomic_fetch_add(&md_test_checks, 1);                          \
         if (!(cond)) {                                                 \
-            md_test_failures++;                                        \
+            atomic_fetch_add(&md_test_failures, 1);                     \
             fprintf(stderr, "  FAIL %s:%d: MD_CHECK(%s)%s%s\n",        \
                     __FILE__, __LINE__, #cond,                         \
                     md_test_name[0] ? " in " : "", md_test_name);      \
@@ -33,9 +34,9 @@ static const char *md_test_name = "";
     } while (0)
 
 #define MD_CHECK_MSG(cond, msg) do {                                   \
-        md_test_checks++;                                              \
+        atomic_fetch_add(&md_test_checks, 1);                          \
         if (!(cond)) {                                                 \
-            md_test_failures++;                                        \
+            atomic_fetch_add(&md_test_failures, 1);                     \
             fprintf(stderr, "  FAIL %s:%d: %s\n",                      \
                     __FILE__, __LINE__, (msg));                        \
         }                                                              \
@@ -52,7 +53,7 @@ static const char *md_test_name = "";
 #define PASS(...)    printf("  PASS\n")
 #endif
 #ifndef FAIL
-#define FAIL(msg)    do { md_test_failures++;                          \
+#define FAIL(msg)    do { atomic_fetch_add(&md_test_failures, 1);       \
                           printf("FAIL: %s\n", (msg)); } while (0)
 #endif
 #ifndef RUN_TEST

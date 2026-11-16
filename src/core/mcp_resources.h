@@ -21,12 +21,15 @@ extern "C" {
 #define MD_MCP_URI_UI_TREE     "metadesk://ui-tree"
 #define MD_MCP_URI_SESSION_INFO "metadesk://session-info"
 
+typedef struct MdMcpNotifyCoalescer MdMcpNotifyCoalescer;
+
 /* Context passed to MCP resource handlers. */
 typedef struct {
     MdA11ySnapshot *snapshot;  /* borrowed; shared MCP read snapshot */
     MdMcpServer  *server;      /* notification destination           */
     MdSession    *session;     /* current session state               */
     MdAgent      *agent;       /* agent handler (for action count)    */
+    MdMcpNotifyCoalescer *notifier; /* optional; NULL = synchronous hints */
     MdTreeFormat  tree_format; /* negotiated tree format              */
 } MdMcpResourceCtx;
 
@@ -37,9 +40,15 @@ int md_mcp_register_resources(MdMcpServer *server, MdMcpResourceCtx *res_ctx);
 
 /* Notify the MCP server that the UI tree has changed.
  * Only sends a notification if the client has subscribed to metadesk://ui-tree.
- * Call this after md_a11y_diff() detects changes.
+ * Call this after an accessibility change hint.
  * Returns 0 on success, -1 on error. */
 int md_mcp_notify_tree_changed(MdMcpServer *server);
+
+/* Start after server creation, stop after unsubscribe/drain and before transports.
+ * create returns NULL on failure; quiet_ms must be nonzero (capped at 200). */
+MdMcpNotifyCoalescer *md_mcp_notify_coalescer_create(MdMcpServer *server,
+                                                  uint32_t quiet_ms);
+void md_mcp_notify_coalescer_destroy(MdMcpNotifyCoalescer *notifier);
 
 /* A11y change callback suitable for md_a11y_subscribe_changes().
  * Pass the MdMcpResourceCtx* as userdata (must outlive callbacks).

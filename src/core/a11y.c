@@ -246,7 +246,7 @@ MdA11yDelta *md_a11y_diff(MdA11yCtx *ctx, int *delta_count) {
  * (UIA) where several begin() calls can overlap. */
 static _Thread_local int md_a11y_dispatch_depth;
 
-bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
+static bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
                           void **out_userdata) {
     if (!ctx || !out_cb || !out_userdata) return false;
 
@@ -263,7 +263,7 @@ bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
     return true;
 }
 
-void md_a11y_change_end(MdA11yCtx *ctx) {
+static void md_a11y_change_end(MdA11yCtx *ctx) {
     if (!ctx) return;
 
     pthread_mutex_lock(&ctx->change_mu);
@@ -275,6 +275,14 @@ void md_a11y_change_end(MdA11yCtx *ctx) {
      * callback waits for in_flight to drop to its own depth, not to 0. */
     pthread_cond_broadcast(&ctx->change_cv);
     pthread_mutex_unlock(&ctx->change_mu);
+}
+
+void md_a11y_change_dispatch(MdA11yCtx *ctx) {
+    MdA11yChangeCb cb;
+    void *userdata;
+    if (!md_a11y_change_begin(ctx, &cb, &userdata)) return;
+    cb(NULL, 0, userdata);
+    md_a11y_change_end(ctx);
 }
 
 /* Clear the registration and wait for in-flight dispatches to return.
@@ -343,8 +351,7 @@ bool md_a11y_is_connected(const MdA11yCtx *ctx) {
 
 void md_a11y_destroy(MdA11yCtx *ctx) {
     if (!ctx) return;
-    /* Drain any live subscription before the backend (and last_snapshot,
-     * which the diff inside a dispatch reads) goes away. */
+    /* Drain any live subscription before the backend and snapshots go away. */
     md_a11y_unsubscribe_changes(ctx);
     if (ctx->vtable && ctx->vtable->destroy)
         ctx->vtable->destroy(ctx);

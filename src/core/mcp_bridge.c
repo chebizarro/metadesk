@@ -30,10 +30,20 @@ struct MdMcpBridge {
     MdA11yCtx         *a11y;
     MdInput           *input;
 
-    /* True while md_mcp_a11y_change_cb is registered on a11y with
-     * &resource_ctx as userdata; destroy must detach it first. */
+    /* True while bridge_a11y_change_cb is registered on a11y with
+     * this bridge as userdata; destroy must detach it first. */
     bool               a11y_subscribed;
+    /* Serialize notifier installation with hints already arriving after subscribe. */
+    pthread_mutex_t    notify_mu;
 };
+
+static void bridge_a11y_change_cb(const MdA11yDelta *deltas, int count, void *userdata)
+{
+    MdMcpBridge *b = userdata;
+    pthread_mutex_lock(&b->notify_mu);
+    md_mcp_a11y_change_cb(deltas, count, &b->resource_ctx);
+    pthread_mutex_unlock(&b->notify_mu);
+}
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
@@ -44,6 +54,10 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     MdMcpBridge *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
+    if (pthread_mutex_init(&b->notify_mu, NULL) != 0) {
+        free(b);
+        return NULL;
+    }
 
     MdTreeFormat tree_format = config->tree_format == MD_MCP_TREE_FORMAT_JSON
         ? MD_TREE_FORMAT_JSON : MD_TREE_FORMAT_COMPACT;
@@ -105,12 +119,20 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     /* 6. Subscribe to a11y changes for notifications */
     if (md_a11y_subscribe_changes(config->a11y,
-                                  md_mcp_a11y_change_cb,
-                                  &b->resource_ctx) < 0) {
+                                  bridge_a11y_change_cb, b) < 0) {
         MD_LOG_W("accessibility change subscription failed; refreshing on every read");
         md_a11y_snapshot_set_caching(b->snapshot, false);
     } else {
         b->a11y_subscribed = true;
+        if (!config->notify_sync) {
+            uint32_t quiet_ms = config->notify_coalesce_ms
+                ? config->notify_coalesce_ms : MD_MCP_NOTIFY_COALESCE_MS;
+            pthread_mutex_lock(&b->notify_mu);
+            b->resource_ctx.notifier = md_mcp_notify_coalescer_create(b->server, quiet_ms);
+            pthread_mutex_unlock(&b->notify_mu);
+            if (!b->resource_ctx.notifier)
+                MD_LOG_W("notification coalescer unavailable; notifying synchronously");
+        }
     }
 
     /* 7. Create stdio transport if requested */
@@ -197,6 +219,9 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
         bridge->a11y_subscribed = false;
     }
 
+    md_mcp_notify_coalescer_destroy(bridge->resource_ctx.notifier);
+    bridge->resource_ctx.notifier = NULL;
+
     md_session_disconnect(&bridge->session);
 
     if (bridge->stdio_ctx)
@@ -213,5 +238,6 @@ void md_mcp_bridge_destroy(MdMcpBridge *bridge)
         md_agent_destroy(bridge->agent);
     md_a11y_snapshot_destroy(bridge->snapshot);
 
+    pthread_mutex_destroy(&bridge->notify_mu);
     free(bridge);
 }

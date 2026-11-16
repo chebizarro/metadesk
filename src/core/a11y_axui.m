@@ -393,21 +393,7 @@ static void axui_observer_cb(AXObserverRef observer, AXUIElementRef element,
         AXUIState *st = ctx->backend_data;
         if (!st) return;
 
-        /* begin() copies the callback and marks it in flight so
-         * md_a11y_unsubscribe_changes can wait for us; it returns false
-         * once unsubscribed. No lock is held while the diff and callback
-         * run: md_a11y_diff re-enters get_tree, which takes st->lock. */
-        MdA11yChangeCb cb = NULL;
-        void *cb_userdata = NULL;
-        if (!md_a11y_change_begin(ctx, &cb, &cb_userdata))
-            return;
-
-        int delta_count = 0;
-        MdA11yDelta *deltas = md_a11y_diff(ctx, &delta_count);
-        cb(deltas, delta_count, cb_userdata);
-        md_a11y_delta_free(deltas, delta_count);
-
-        md_a11y_change_end(ctx);
+        md_a11y_change_dispatch(ctx);
     }
 }
 
@@ -698,18 +684,9 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     st->observers = records;
     st->observer_count = record_count;
 
-    /* Seed the diff baseline so the first notification emits real deltas
-     * rather than being consumed as the initial snapshot. The diff engine
-     * lives in a11y.c and takes the snapshot mutex, so seed after
-     * releasing the backend lock. */
     st->subscribed = 1;
     st->stop_requested = 0;  /* thread handshake starts clear */
     pthread_mutex_unlock(&st->lock);
-    {
-        int seeded = 0;
-        MdA11yDelta *seed = md_a11y_diff(ctx, &seeded);
-        md_a11y_delta_free(seed, seeded);
-    }
 
     int err = pthread_create(&st->event_thread, NULL,
                              axui_event_loop_thread, st);

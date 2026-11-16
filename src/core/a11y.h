@@ -55,6 +55,9 @@ typedef struct {
 
 /* ── Change subscription callback ────────────────────────────── */
 
+/* Change hint, not a delta feed: deltas may be NULL and count zero.
+ * Consumers needing content must pull via md_a11y_walk(), md_a11y_diff(),
+ * or the MCP snapshot. */
 typedef void (*MdA11yChangeCb)(const MdA11yDelta *deltas, int count,
                                void *userdata);
 
@@ -65,7 +68,7 @@ typedef struct MdA11yBackend {
     int   (*get_tree)(MdA11yCtx *ctx, MdA11yNode **out_root);
     /* Register OS-level change listeners. The callback itself is stored on
      * the MdA11yCtx by a11y.c before this is called; backends must not keep
-     * their own copy — they dispatch through md_a11y_change_begin()/_end(). */
+     * their own copy — they dispatch through md_a11y_change_dispatch(). */
     int   (*subscribe_changes)(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata);
     /* Tear down the OS-level listeners registered by subscribe_changes and
      * stop/join any dispatch thread the backend owns. Called by a11y.c only
@@ -91,7 +94,7 @@ struct MdA11yCtx {
 
     /* Live change-callback registration and in-flight guard, owned by
      * a11y.c. Backends never store the callback themselves: every dispatch
-     * is bracketed by md_a11y_change_begin()/md_a11y_change_end() so that
+     * uses md_a11y_change_dispatch() so that
      * md_a11y_unsubscribe_changes() can clear the registration and wait for
      * a dispatch that already copied it to finish. */
     pthread_mutex_t      change_mu;
@@ -155,23 +158,8 @@ int md_a11y_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb, void *userdata)
  * latter case, so it stays safe to free userdata). */
 int md_a11y_unsubscribe_changes(MdA11yCtx *ctx);
 
-/* ── Backend dispatch helpers (for backend implementations only) ─────
- *
- * Backends bracket every change dispatch with these two calls:
- *
- *     MdA11yChangeCb cb; void *ud;
- *     if (md_a11y_change_begin(ctx, &cb, &ud)) {
- *         ... compute deltas, cb(deltas, n, ud) ...
- *         md_a11y_change_end(ctx);
- *     }
- *
- * begin returns false (and nothing may be dispatched) once the callback
- * has been unsubscribed; otherwise it hands back the registered callback
- * and marks it in flight until end() so unsubscribe can wait for it.
- * Neither call holds a lock while the callback runs. */
-bool md_a11y_change_begin(MdA11yCtx *ctx, MdA11yChangeCb *out_cb,
-                          void **out_userdata);
-void md_a11y_change_end(MdA11yCtx *ctx);
+/* Dispatch a hint without walking the tree; participates in unsubscribe drain. */
+void md_a11y_change_dispatch(MdA11yCtx *ctx);
 
 /* ── Serialization (spec §3.3) ───────────────────────────────── */
 
