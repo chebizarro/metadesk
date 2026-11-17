@@ -314,31 +314,163 @@ core_deps = [
 ] + platform_hal_deps
 
 # ── Signer backend deps + compile flags ─────────────────────────────────────
-signer_c_args = []
-if enable_nip46
-  dep_nip46 = dependency('nostr-nip46', required : false)
-  if not dep_nip46.found()
-    dep_nip46 = meson.get_compiler('c').find_library('nostr-nip46', required : true)
+# Diagnose stale nostrc objects after a system libwebsockets upgrade, including
+# the all-off configuration (test_nostr also creates websocket contexts).
+# CMake's cache is evidence of the dependency version, not an object ABI probe.
+if _nostrc_build != '' and fs.exists(_nostrc_build / 'CMakeCache.txt')
+  _lws_current = dependency('libwebsockets', required : false)
+  if _lws_current.found()
+    _lws_ssl_headers = dependency('openssl', required : false)
+    if meson.can_run_host_binaries() and _lws_ssl_headers.found()
+      _lws_abi = cc.run('''
+        #include <libwebsockets.h>
+        #include <stdio.h>
+        int main(void) {
+          const char *runtime = lws_get_library_version();
+          printf("headers=%s library=%s", LWS_LIBRARY_VERSION, runtime);
+          int major, minor, patch;
+          return sscanf(runtime, "%d.%d.%d", &major, &minor, &patch) != 3 ||
+            major != LWS_LIBRARY_VERSION_MAJOR || minor != LWS_LIBRARY_VERSION_MINOR ||
+            patch != LWS_LIBRARY_VERSION_PATCH;
+        }
+        ''', name : 'libwebsockets header/library version agreement',
+        dependencies : [dep_websockets,
+          _lws_current.partial_dependency(compile_args : true, includes : true),
+          _lws_ssl_headers.partial_dependency(compile_args : true, includes : true)])
+      if not _lws_abi.compiled() or _lws_abi.returncode() != 0
+        warning('libwebsockets header/library check failed: ' + _lws_abi.stdout() +
+          '. Align the headers and library before rebuilding nostrc.')
+      endif
+    endif
+    foreach _line : fs.read(_nostrc_build / 'CMakeCache.txt').split('\n')
+      if _line.startswith('LWS_VERSION:INTERNAL=')
+        _lws_cached = _line.split('=')[1]
+        if _lws_cached.split('-')[0] != _lws_current.version().split('-')[0]
+          warning('nostrc was configured with libwebsockets ' + _lws_cached +
+            ', but pkg-config now reports ' + _lws_current.version() +
+            '. Reconfigure and rebuild nostrc against the current headers and library; ' +
+            'stale objects can crash in lws_create_context. See docs/build-signers.md.')
+        endif
+      endif
+    endforeach
   endif
-  core_deps += dep_nip46
+endif
+
+signer_c_args = []
+_signer_components = {}
+if enable_nip46
+  _signer_components += {'nip46' : ['nostr_nip46_core'], 'nip04' : ['nip04']}
+  core_deps += dependency('jansson', required : true)
   signer_c_args += '-DMD_SIGNER_ENABLE_NIP46'
 endif
 if enable_nip55l
-  dep_nip55l = dependency('nostr-nip55l', required : false)
-  if not dep_nip55l.found()
-    dep_nip55l = meson.get_compiler('c').find_library('nostr-nip55l', required : true)
+  _signer_components += {
+    'nip55l' : ['nostr_nip55l_core'],
+    'nip04' : ['nip04'],
+    'nip06' : ['nip06'],
+    'nip49' : ['nostr_nip49_glib', 'nostr_nip49_core'],
+  }
+  core_deps += [dependency('gio-2.0', version : '>=2.76'),
+                dependency('libsodium', required : true)]
+  if host_os == 'darwin'
+    core_deps += dependency('appleframeworks', modules : ['Security', 'CoreFoundation'])
+  elif host_os == 'linux'
+    core_deps += dependency('libsecret-1', required : true)
+    _secret_lib = cc.find_library('gnostr-secret', dirs : _sys_lib_dirs, required : false)
+    if not _secret_lib.found() and _nostrc_build != ''
+      _secret_lib = cc.find_library('gnostr-secret',
+        dirs : [_nostrc_build / 'gnome' / 'seahorse'], required : false)
+    endif
+    if not _secret_lib.found()
+      error('NIP-55L needs gnostr-secret. Build the nostrc gnostr-secret target or install it.')
+    endif
+    core_deps += _secret_lib
   endif
-  dep_gio = dependency('gio-2.0', version : '>=2.76')
-  core_deps += [dep_nip55l, dep_gio]
   signer_c_args += '-DMD_SIGNER_ENABLE_NIP55L'
 endif
 if enable_nip5f
-  dep_nip5f = dependency('nostr-nip5f', required : false)
-  if not dep_nip5f.found()
-    dep_nip5f = meson.get_compiler('c').find_library('nostr-nip5f', required : true)
-  endif
-  core_deps += dep_nip5f
+  _signer_components += {'nip5f' : ['nostr_nip5f_core']}
   signer_c_args += '-DMD_SIGNER_ENABLE_NIP5F'
+endif
+
+# nostrc does not ship pkg-config metadata for these adapters. Discover the
+# installed archive/shared library first, then the CMake build-tree library.
+# Unlike nip51/nip98, the adapters contain multiple objects: link the archive.
+_signer_inc_paths = []
+_signer_libraries = {}
+foreach _component, _libraries : _signer_components
+  if _nostrc_root != ''
+    _signer_inc_paths += _nostrc_root / 'nips' / _component / 'include'
+  endif
+  if _nostrc_build != '' and fs.is_dir(_nostrc_build / 'nips' / _component / 'include')
+    _signer_inc_paths += _nostrc_build / 'nips' / _component / 'include'
+  endif
+  # Some nostrc installs nest the public header tree below include/nostr/nipXX.
+  foreach _prefix : _sys_inc_dirs + ['/usr/local/include', '/usr/include']
+    if fs.is_dir(_prefix / 'nostr' / _component)
+      _signer_inc_paths += _prefix / 'nostr' / _component
+    endif
+  endforeach
+  foreach _library : _libraries
+    _signer_lib = cc.find_library(_library, dirs : _sys_lib_dirs, required : false)
+    if not _signer_lib.found() and _nostrc_build != ''
+      _signer_lib = cc.find_library(_library,
+        dirs : [_nostrc_build / 'nips' / _component], required : false)
+    endif
+    if not _signer_lib.found()
+      error(_library + ' not found. Build the nostrc ' + _library +
+            ' target and set -Dnostrc_build_dir=<path>, or install it.')
+    endif
+    _signer_libraries += {_library : _signer_lib}
+  endforeach
+endforeach
+# Installed archives can lag behind the source headers. Check the entry points
+# used by Metadesk with the full transitive link set before accepting them.
+_signer_apis = {
+  'nip46' : ['nostr_nip46_core', ['nostr_nip46_client_sign_event']],
+  'nip55l' : ['nostr_nip55l_core', ['nostr_nip55l_sign_event_json']],
+  'nip5f' : ['nostr_nip5f_core', ['nostr_nip5f_client_sign_event', 'nostr_nip5f_server_start']],
+}
+foreach _component, _api : _signer_apis
+  _library = _api[0]
+  if _signer_libraries.has_key(_library)
+    _other_signer_deps = []
+    foreach _name, _dep : _signer_libraries
+      if _name != _library
+        _other_signer_deps += _dep
+      endif
+    endforeach
+    _signer_lib = _signer_libraries[_library]
+    foreach _function : _api[1]
+      if not cc.has_function(_function, dependencies : [_signer_lib] + _other_signer_deps + core_deps)
+        if _nostrc_build != ''
+          _signer_lib = cc.find_library(_library,
+            dirs : [_nostrc_build / 'nips' / _component], required : true)
+        endif
+        if not cc.has_function(_function, dependencies : [_signer_lib] + _other_signer_deps + core_deps)
+          error(_library + ' cannot link ' + _function + '. Rebuild the nostrc target against current headers and dependencies.')
+        endif
+        message(_library + ': using compatible build-tree library')
+        _signer_libraries += {_library : _signer_lib}
+      endif
+    endforeach
+  endif
+endforeach
+foreach _name, _dep : _signer_libraries
+  core_deps += _dep
+endforeach
+if enable_nip46 or enable_nip55l or enable_nip5f
+  core_deps += declare_dependency(include_directories : include_directories(_signer_inc_paths))
+endif
+# Also consumed by the backend-specific integration tests below.
+if enable_nip46
+  dep_nip46 = _signer_libraries['nostr_nip46_core']
+endif
+if enable_nip55l
+  dep_nip55l = _signer_libraries['nostr_nip55l_core']
+endif
+if enable_nip5f
+  dep_nip5f = _signer_libraries['nostr_nip5f_core']
 endif
 
 # ── Vendored subprojects ────────────────────────────────────────────────────
@@ -604,10 +736,7 @@ if enable_nip5f
 endif
 
 if enable_nip55l
-  dep_nip19_test = dependency('nostr-nip19', required : false)
-  if not dep_nip19_test.found()
-    dep_nip19_test = meson.get_compiler('c').find_library('nip19', required : true)
-  endif
+  dep_nip19_test = dep_nip19
   test_signer_nip55l = executable('test_signer_nip55l',
     files('tests/test_signer_nip55l.c'),
     dependencies : [dep_metadesk, dep_nip55l, dep_nip19_test],
@@ -617,10 +746,7 @@ if enable_nip55l
 endif
 
 if enable_nip46
-  dep_nip04_test = dependency('nostr-nip04', required : false)
-  if not dep_nip04_test.found()
-    dep_nip04_test = meson.get_compiler('c').find_library('nip04', required : true)
-  endif
+  dep_nip04_test = _signer_libraries['nip04']
   test_signer_nip46 = executable('test_signer_nip46',
     files('tests/test_signer_nip46.c'),
     dependencies : [dep_metadesk, dep_nip46, dep_nip04_test],
