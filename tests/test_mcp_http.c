@@ -9,6 +9,13 @@
 #include "md_mcp_fixture.h"
 #include "mcp_http.h"
 #include "jsonrpc.h"
+#include <nostr-event.h>
+#include <nostr-keys.h>
+#include <nostr/nip98/nip98.h>
+#include <nostr/nip19/nip19.h>
+#include <openssl/sha.h>
+#include <sys/stat.h>
+#include <time.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,8 +31,8 @@
 #include "md_test.h"
 
 
-/* Dynamic port to avoid conflicts with other tests */
-static uint16_t g_test_port = 17710;
+/* Separate range from test_stream (17700..17711), which runs in parallel. */
+static uint16_t g_test_port = 18710;
 
 /* ── Helper: create a minimal MCP server ─────────────────────── */
 
@@ -908,12 +915,304 @@ static void test_sse_no_clients(void)
     PASS("SSE send no clients");
 }
 
+/* Auth tests use real signed events and raw HTTP, not mocked validation. */
+static const char auth_sk[] = "0000000000000000000000000000000000000000000000000000000000000001";
+static const char auth_body[] = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":9}";
+
+static char *test_npub(void)
+{
+    char *hex = nostr_key_get_public(auth_sk);
+    MD_CHECK(hex != NULL);
+    unsigned char pk[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned value;
+        MD_CHECK(sscanf(hex + 2*i, "%2x", &value) == 1);
+        pk[i] = (unsigned char)value;
+    }
+    free(hex);
+    char *npub = NULL;
+    MD_CHECK(nostr_nip19_encode_npub(pk, &npub) == 0);
+    return npub;
+}
+
+static char *signed_auth(const char *url, const char *method, const char *payload,
+                         int age, bool bad_sig, bool unknown, bool wrong_kind)
+{
+    char hash_hex[65];
+    if (payload) {
+        unsigned char hash[32];
+        SHA256((const unsigned char *)payload, strlen(payload), hash);
+        for (int i = 0; i < 32; i++) snprintf(hash_hex + 2*i, 3, "%02x", hash[i]);
+    }
+    NostrEvent *event = nostr_nip98_create_auth_event(url, method, payload ? hash_hex : NULL);
+    MD_CHECK(event != NULL);
+    nostr_event_set_created_at(event, (int64_t)time(NULL) + age);
+    /* Unique content keeps independently signed requests distinct even in the
+     * same second. Replaying a header below still reuses the exact event id. */
+    static unsigned nonce;
+    char content[384];
+    snprintf(content, sizeof(content), "auth-test-%u-%0320u", ++nonce, 0);
+    nostr_event_set_content(event, content);
+    if (wrong_kind) nostr_event_set_kind(event, 1);
+    const char *sk2 = "0000000000000000000000000000000000000000000000000000000000000002";
+    MD_CHECK(nostr_event_sign(event, unknown ? sk2 : auth_sk) == 0);
+    if (bad_sig) nostr_event_set_sig(event,
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "0000000000000000000000000000000000000000000000000000000000000000");
+    char *header = nostr_nip98_create_auth_header(event);
+    nostr_event_free(event);
+    MD_CHECK(header != NULL);
+    return header;
+}
+
+/* Read through headers only: successful SSE must not wait for a close. */
+static int auth_status(uint16_t port, const char *method, const char *path,
+                       const char *host, const char *auth, const char *extra)
+{
+    char request[8192], response[1024] = {0};
+    int len = snprintf(request, sizeof(request),
+        "%s %s HTTP/1.1\r\n%s%s%s%s%s%s"
+        "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+        method, path, host ? "Host: " : "", host ? host : "", host ? "\r\n" : "",
+        auth ? "Authorization: " : "", auth ? auth : "", auth ? "\r\n" : "",
+        strcmp(method, "POST") == 0 ? strlen(auth_body) : 0,
+        strcmp(method, "POST") == 0 ? auth_body : "");
+    MD_CHECK(len > 0 && len < (int)sizeof(request));
+    if (extra) {
+        char *headers_end = strstr(request, "\r\n\r\n");
+        size_t offset = (size_t)(headers_end + 2 - request), added = strlen(extra);
+        MD_CHECK((size_t)len + added < sizeof(request));
+        memmove(request + offset + added, request + offset, (size_t)len - offset + 1);
+        memcpy(request + offset, extra, added);
+        len += (int)added;
+    }
+    int fd = tcp_connect(port);
+    MD_CHECK(fd >= 0);
+    if (fd < 0) return -1;
+    int64_t deadline = md_now_ms() + 3000;
+    MD_CHECK(md_fd_write_deadline(fd, request, (size_t)len, deadline, true, NULL) == 0);
+    size_t total = 0;
+    while (!strstr(response, "\r\n\r\n") && total < sizeof(response)-1) {
+        int64_t left = deadline - md_now_ms();
+        if (left <= 0 || md_test_wait_readable(fd, (int)left) != 1) break;
+        ssize_t n = read(fd, response + total, sizeof(response)-1-total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        response[total] = 0;
+    }
+    close(fd);
+    int status = -1;
+    MD_CHECK(sscanf(response, "HTTP/1.1 %d", &status) == 1);
+    return status;
+}
+
+static void test_auth_configuration(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    MdMcpHttpConfig cfg = { .server = mcp, .port = g_test_port++, .bind_addr = "0.0.0.0" };
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    cfg.bind_addr = "::";
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    cfg.bind_addr = NULL;
+    char token_path[] = "/tmp/md-http-token-XXXXXX";
+    int fd = mkstemp(token_path);
+    MD_CHECK(fd >= 0);
+    MD_CHECK(write(fd, "test-secret\n", 12) == 12);
+    close(fd);
+    cfg.token_file = token_path;
+    MD_CHECK(chmod(token_path, 0644) == 0);
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    MD_CHECK(chmod(token_path, 0600) == 0);
+    FILE *token_file = fopen(token_path, "wb");
+    MD_CHECK(token_file != NULL);
+    const char malformed[] = "a\0long-secret\n";
+    MD_CHECK(fwrite(malformed, 1, sizeof(malformed)-1, token_file) == sizeof(malformed)-1);
+    fclose(token_file);
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    token_file = fopen(token_path, "w");
+    MD_CHECK(token_file != NULL);
+    MD_CHECK(fputs("test-secret\n", token_file) >= 0);
+    fclose(token_file);
+    cfg.bind_addr = "0.0.0.0";
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    md_mcp_http_destroy(http);
+    cfg.bind_addr = NULL;
+    cfg.token_file = "/nonexistent/md-token";
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    cfg.token_file = NULL;
+    const char *invalid_npub[] = {"npub1invalid"};
+    cfg.allow_npubs = invalid_npub; cfg.allow_npub_count = 1;
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    cfg.allow_npub_count = 0;
+    const char *bad_urls[] = {"https://example.com/mcp?x=1", "https://user@example.com/mcp",
+                              "https://example.com/other", "https://example.com:99999/mcp"};
+    cfg.public_url_count = 1;
+    for (size_t i = 0; i < sizeof(bad_urls)/sizeof(bad_urls[0]); i++) {
+        cfg.public_urls = &bad_urls[i];
+        MD_CHECK(md_mcp_http_create(&cfg) == NULL);
+    }
+    cfg.public_url_count = 0;
+    char allow_path[] = "/tmp/md-http-allow-XXXXXX";
+    fd = mkstemp(allow_path);
+    MD_CHECK(fd >= 0);
+    close(fd);
+    cfg.allow_file = allow_path;
+    MD_CHECK(md_mcp_http_create(&cfg) == NULL); /* explicit empty list fails closed */
+    FILE *file = fopen(allow_path, "w");
+    char *npub = test_npub();
+    fprintf(file, "# allowed agent\n\n%s\n", npub);
+    fclose(file);
+    cfg.bind_addr = "0.0.0.0";
+    http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    md_mcp_http_destroy(http);
+    free(npub);
+    unlink(token_path); unlink(allow_path);
+    md_mcp_server_destroy(mcp);
+    PASS("auth startup credentials, permissions, URL validation and allow-file");
+}
+
+static void test_http_auth(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    char token_path[] = "/tmp/md-http-auth-XXXXXX";
+    int fd = mkstemp(token_path);
+    MD_CHECK(fd >= 0);
+    MD_CHECK(write(fd, "test-secret\n", 12) == 12);
+    close(fd);
+    char *npub = test_npub();
+    const char *npubs[] = {npub};
+    const char *urls[] = {"https://agent.example/mcp", "http://proxy.example:8000/mcp"};
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = { .server = mcp, .port = port, .token_file = token_path,
+        .allow_npubs = npubs, .allow_npub_count = 1,
+        .public_urls = urls, .public_url_count = 2 };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    /* Config is owned by the server, not borrowed from its caller/files. */
+    unlink(token_path); free(npub);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    const char *methods[] = {"POST", "GET"};
+    for (int m = 0; m < 2; m++) {
+        const char *method = methods[m];
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", NULL, NULL) == 401);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer wrong", NULL) == 401);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Basic abc", NULL) == 401);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Nostr invalid", NULL) == 401);
+        MD_CHECK(auth_status(port, method, "/mcp", "evil.example", "Bearer test-secret", NULL) == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", NULL, "Bearer test-secret", NULL) == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost.evil", "Bearer test-secret", NULL) == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer test-secret", "oRiGiN:\r\n") == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer test-secret",
+                             "Origin: http://localhost\r\n") == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer test-secret",
+                             "Host: evil.example\r\n") == 403);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer test-secret",
+                             "Authorization: Bearer test-secret\r\n") == 401);
+        const struct { const char *url, *signed_method, *payload; int age; bool sig, unknown, kind; } invalid[] = {
+            {"https://evil.example/mcp", method, auth_body, 0, false, false, false},
+            {urls[0], m ? "POST" : "GET", auth_body, 0, false, false, false},
+            {urls[0], method, auth_body, -120, false, false, false},
+            {urls[0], method, auth_body, 120, false, false, false},
+            {urls[0], method, auth_body, 0, true, false, false},
+            {urls[0], method, auth_body, 0, false, true, false},
+            {urls[0], method, auth_body, 0, false, false, true},
+        };
+        for (size_t i = 0; i < sizeof(invalid)/sizeof(invalid[0]); i++) {
+            char *header = signed_auth(invalid[i].url, invalid[i].signed_method, invalid[i].payload,
+                                      invalid[i].age, invalid[i].sig, invalid[i].unknown, invalid[i].kind);
+            MD_CHECK(auth_status(port, method, "/mcp", "agent.example", header, NULL) == 401);
+            free(header);
+        }
+        char *header = signed_auth(urls[0], method, auth_body, 0, false, false, false);
+        /* Large signed header fits the existing 4096-byte read chunk. */
+        printf("  %s signed Authorization header: %zu bytes\n", method, strlen(header));
+        MD_CHECK(strlen(header) >= 1000 && strlen(header) < 1400);
+        MD_CHECK(auth_status(port, method, "/mcp", "agent.example:443", header, NULL) == 200);
+        MD_CHECK(auth_status(port, method, "/mcp", "agent.example", header, NULL) == 401);
+        free(header);
+        MD_CHECK(auth_status(port, method, "/mcp", "localhost", "Bearer test-secret", NULL) == 200);
+    }
+    /* POST requires payload, unlike bodyless SSE. */
+    char *header = signed_auth(urls[0], "POST", NULL, 0, false, false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "agent.example", header, NULL) == 401);
+    free(header);
+    header = signed_auth(urls[0], "POST", "different body", 0, false, false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "agent.example", header, NULL) == 401);
+    free(header);
+    header = signed_auth(urls[1], "POST", auth_body, 0, false, false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "PrOxY.Example:8000", header, NULL) == 200);
+    free(header);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "proxy.example:8001", "Bearer test-secret", NULL) == 403);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "proxy.example", "Bearer test-secret", NULL) == 403);
+    const char *forms[] = {"localhost", "127.0.0.1", "[::1]"};
+    for (size_t i = 0; i < 3; i++) {
+        char url[128];
+        snprintf(url, sizeof(url), "http://%s:%u/mcp", forms[i], port);
+        header = signed_auth(url, "POST", auth_body, 0, false, false, false);
+        MD_CHECK(auth_status(port, "POST", "/mcp", forms[i], header, NULL) == 200);
+        free(header);
+    }
+    /* Health probes remain usable without auth and never reserve an SSE slot. */
+    int clients = md_mcp_http_sse_client_count(http);
+    for (int i = 0; i < 5; i++)
+        MD_CHECK(auth_status(port, "GET", "/healthz", "localhost", NULL, NULL) == 200);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == clients);
+    MD_CHECK(auth_status(port, "GET", "/healthz", "evil.example", NULL, NULL) == 403);
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+    PASS("bearer and NIP-98 POST/SSE authentication, replay, payload, Host/Origin, healthz");
+}
+
+static void test_unauthenticated_guards_and_read_budget(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    uint16_t port = g_test_port++;
+    MdMcpHttpConfig cfg = { .server = mcp, .port = port };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", NULL, NULL) == 200);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "foreign.example", NULL, NULL) == 403);
+    MD_CHECK(auth_status(port, "GET", "/mcp", "localhost", NULL, "Origin: null\r\n") == 403);
+    MD_CHECK(auth_status(port, "GET", "/healthz", "localhost", NULL, NULL) == 200);
+    /* No Host hidden inside X-Host; no Content-Length hidden in X-* either. */
+    MD_CHECK(auth_status(port, "POST", "/mcp", NULL, NULL, "X-Host: localhost\r\n") == 403);
+    int fd = tcp_connect(port);
+    MD_CHECK(fd >= 0);
+    const char *partial = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{";
+    int64_t start = md_now_ms();
+    MD_CHECK(write(fd, partial, strlen(partial)) == (ssize_t)strlen(partial));
+    MD_CHECK(md_test_wait_readable(fd, 3000) == 1);
+    char response[1024] = {0};
+    ssize_t n = read(fd, response, sizeof(response)-1);
+    MD_CHECK(n > 0 && strstr(response, "400 Bad Request") != NULL);
+    MD_CHECK(md_now_ms() - start < 3000);
+    close(fd);
+    md_mcp_http_shutdown(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+    MD_CHECK(md_now_ms() - start < 5000);
+    md_mcp_server_destroy(mcp);
+    PASS("always-on guards without credentials and read/shutdown budget");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
 {
     printf("test_mcp_http: HTTP+SSE transport tests\n");
 
+    test_auth_configuration();
+    test_http_auth();
+    test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();
     test_create_destroy();

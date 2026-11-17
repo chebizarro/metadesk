@@ -93,6 +93,10 @@ if _nostrc_root != ''
   _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
   _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
   _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip17' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip98' / 'include'
+  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip19' / 'include'
+  _nostrc_inc_paths += _nostrc_build / 'nips' / 'nip98' / 'include'
+  _nostrc_inc_paths += _nostrc_build / 'nips' / 'nip19' / 'include'
 endif
 # nostrc generates export-macro headers (nostr-export.h, libgo-export.h,
 # nostr-json-export.h) into the CMake build tree; the source headers include
@@ -134,6 +138,19 @@ elif _nostrc_build != ''
 else
   error('nostr_nip51_core not found. Install nostrc or set -Dnostrc_root=<path>')
 endif
+
+# NIP-98 HTTP auth and NIP-19 npub allowlist decoding.
+dep_nip98_lib = cc.find_library('nostr_nip98', required : false, dirs : _sys_lib_dirs)
+if dep_nip98_lib.found()
+  dep_nip98 = dep_nip98_lib
+elif _nostrc_build != ''
+  _nip98_obj = _nostrc_build / 'nips' / 'nip98' / 'CMakeFiles' / 'nostr_nip98.dir' / 'src' / 'nip98.c.o'
+  dep_nip98 = declare_dependency(link_args : [_nip98_obj])
+  message('nip98: using build-tree object: ' + _nip98_obj)
+else
+  error('nostr_nip98 not found. Install nostrc or set -Dnostrc_build_dir=<path>')
+endif
+dep_nip19 = cc.find_library('nip19', required : true, dirs : _sys_lib_dirs)
 
 # nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
 # libgo — try installed library first, fallback to build-tree static libs
@@ -279,6 +296,8 @@ core_deps = [
   dep_nostr,
   dep_nip44,
   dep_nip51,
+  dep_nip98,
+  dep_nip19,
   dep_nip17,
   dep_nip11,
   dep_curl,

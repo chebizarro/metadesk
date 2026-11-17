@@ -153,6 +153,12 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
             .server = b->server,
             .bind_addr = config->http_bind_addr,
             .port = config->http_port,
+            .token_file = config->http_token_file,
+            .public_urls = config->http_public_urls,
+            .public_url_count = config->http_public_url_count,
+            .allow_npubs = config->http_allow_npubs,
+            .allow_npub_count = config->http_allow_npub_count,
+            .allow_file = config->http_allow_file,
         };
         b->http_ctx = md_mcp_http_create(&http_cfg);
         if (!b->http_ctx)

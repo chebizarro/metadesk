@@ -463,6 +463,10 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --relay URL      Relay URL (default: " MD_DEFAULT_RELAY ")\n");
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
+    fprintf(stderr, "  --mcp-token-file PATH  MCP HTTP bearer token file (mode 0600)\n");
+    fprintf(stderr, "  --mcp-public-url URL   Accepted exact NIP-98 /mcp URL (repeatable)\n");
+    fprintf(stderr, "  --mcp-allow-npub NPUB  MCP HTTP authorized signer (repeatable)\n");
+    fprintf(stderr, "  --mcp-allow-file PATH  MCP HTTP npub allowlist (one per line)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource only (default: compact); action results always JSON\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
@@ -570,6 +574,9 @@ int main(int argc, char **argv) {
     bool do_capture = true;
     bool mcp_stdio = false;
     bool mcp_http = false;
+    const char *mcp_token_file = NULL, *mcp_allow_file = NULL;
+    const char *mcp_public_urls[32], *mcp_allow_npubs[32];
+    size_t mcp_public_url_count = 0, mcp_allow_npub_count = 0;
     MdMcpTreeFormat mcp_tree_format = MD_MCP_TREE_FORMAT_DEFAULT;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
     uint32_t fips_ready_timeout_ms = 10000;
@@ -624,6 +631,24 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid --mcp-tree-format: expected json or compact\n");
                 return 1;
             }
+        }
+        else if (strcmp(argv[i], "--mcp-token-file") == 0 && i + 1 < argc)
+            mcp_token_file = argv[++i];
+        else if (strcmp(argv[i], "--mcp-allow-file") == 0 && i + 1 < argc)
+            mcp_allow_file = argv[++i];
+        else if (strcmp(argv[i], "--mcp-public-url") == 0 && i + 1 < argc) {
+            if (mcp_public_url_count == 32) {
+                fprintf(stderr, "Too many --mcp-public-url values (max 32)\n");
+                return 1;
+            }
+            mcp_public_urls[mcp_public_url_count++] = argv[++i];
+        }
+        else if (strcmp(argv[i], "--mcp-allow-npub") == 0 && i + 1 < argc) {
+            if (mcp_allow_npub_count == 32) {
+                fprintf(stderr, "Too many --mcp-allow-npub values (max 32)\n");
+                return 1;
+            }
+            mcp_allow_npubs[mcp_allow_npub_count++] = argv[++i];
         }
         else if (strcmp(argv[i], "--mcp-http") == 0) {
             mcp_http = true;
@@ -901,6 +926,12 @@ int main(int argc, char **argv) {
             .a11y = mcp_a11y,
             .input = mcp_input,
             .tree_format = mcp_tree_format,
+            .http_token_file = mcp_token_file,
+            .http_public_urls = mcp_public_urls,
+            .http_public_url_count = mcp_public_url_count,
+            .http_allow_npubs = mcp_allow_npubs,
+            .http_allow_npub_count = mcp_allow_npub_count,
+            .http_allow_file = mcp_allow_file,
             .settle_ms = 100,
             .stdio_in_fd = mcp_stdio ? STDIN_FILENO : -1,
             .stdio_out_fd = mcp_stdio ? STDOUT_FILENO : -1,

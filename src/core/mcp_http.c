@@ -2,9 +2,10 @@
  * metadesk — mcp_http.c
  * Minimal HTTP/1.1 + SSE transport for MCP server.
  *
- * Handles two endpoints:
+ * Handles three endpoints:
  *   POST /mcp — receives JSON-RPC, returns JSON-RPC response
  *   GET  /mcp — establishes SSE stream for notifications
+ *   GET  /healthz — transport liveness only (no SSE slot, no credential)
  *
  * Concurrent: each accepted connection is handled by a go()
  * goroutine so POST processing doesn't block the accept loop.
@@ -30,6 +31,13 @@
 #include <arpa/inet.h>
 #include <go.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
+#include <ctype.h>
+#include <openssl/sha.h>
+#include <openssl/crypto.h>
+#include <nostr-event.h>
+#include <nostr/nip98/nip98.h>
+#include <nostr/nip19/nip19.h>
 
 #define DEFAULT_MAX_SSE_CLIENTS 4
 /* 1 MB max request body — the protocol-level limit shared with stdio */
@@ -37,7 +45,17 @@
 #define READ_BUF_SIZE     4096
 /* Bound how long a connection handler can block on reads — without it
  * an idle client parks a handler goroutine forever and wedges destroy. */
-#define CLIENT_READ_TIMEOUT_SEC 30
+/* Total request-read budget < 5 s SIGTERM target < 30 s container grace.
+ * An absolute deadline, not a per-read timeout, also bounds slow trickles. */
+#define CLIENT_READ_TIMEOUT_SEC 2
+#define AUTH_REPLAY_CAPACITY 1024
+#define AUTH_MAX_NPUBS 1024
+#define AUTH_MAX_URLS 32
+
+typedef struct {
+    char id[65];
+    int64_t expires_ms;
+} AuthReplay;
 
 /* ── Server struct ───────────────────────────────────────────── */
 
@@ -61,6 +79,14 @@ struct MdMcpHttp {
     int             sse_write_timeout_ms;
     int             sse_sndbuf;
     pthread_mutex_t sse_mu;
+
+    char           *token;
+    char          **public_urls;
+    size_t          public_url_count;
+    char          (*allowed_keys)[65];
+    size_t          allowed_key_count;
+    AuthReplay      replay[AUTH_REPLAY_CAPACITY];
+    pthread_mutex_t auth_mu;
 
     /* Tracks in-flight handler goroutines for graceful shutdown */
     GoWaitGroup     handler_wg;
@@ -216,7 +242,268 @@ typedef struct {
     size_t body_len;
     size_t content_length;
     char content_type[128];  /* Content-Type header */
+    char host[320];
+    char authorization[4096]; /* signed NIP-98 events are typically ~1 KB */
+    bool origin;
+    bool bad_host;
+    bool bad_auth;
 } HttpRequest;
+
+/* Parse a strict HTTP authority. DNS names are case-insensitive; IP literals
+ * are rendered canonically. No userinfo, percent escapes, or ambiguous ports. */
+static bool parse_authority(const char *text, char host[256], unsigned *port)
+{
+    size_t len = strlen(text);
+    if (!len || len >= 320) return false;
+    const char *end = text + len, *p = NULL;
+    if (*text == '[') {
+        const char *bracket = strchr(text, ']');
+        if (!bracket || bracket - text >= 128) return false;
+        char ip[128];
+        memcpy(ip, text + 1, (size_t)(bracket - text - 1));
+        ip[bracket - text - 1] = 0;
+        struct in6_addr addr;
+        if (inet_pton(AF_INET6, ip, &addr) != 1 ||
+            !inet_ntop(AF_INET6, &addr, host, 256)) return false;
+        p = bracket + 1;
+    } else {
+        p = strchr(text, ':');
+        if (!p) p = end;
+        size_t n = (size_t)(p - text);
+        if (!n || n >= 256) return false;
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)text[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '.')) return false;
+            host[i] = (char)tolower(c);
+        }
+        host[n] = 0;
+    }
+    *port = 0;
+    if (p == end) return true;
+    if (*p++ != ':' || p == end) return false;
+    unsigned value = 0;
+    for (; p < end; p++) {
+        if (*p < '0' || *p > '9') return false;
+        value = value * 10 + (unsigned)(*p - '0');
+        if (value > 65535) return false;
+    }
+    if (!value) return false;
+    *port = value;
+    return true;
+}
+
+static bool loopback_host(const char *host)
+{
+    if (strcmp(host, "localhost") == 0) return true;
+    struct in_addr v4;
+    if (inet_pton(AF_INET, host, &v4) == 1)
+        return (ntohl(v4.s_addr) >> 24) == 127;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET6, host, &v6) != 1) return false;
+    return IN6_IS_ADDR_LOOPBACK(&v6) ||
+        (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127);
+}
+
+static bool url_authority(const char *url, char host[256], unsigned *port)
+{
+    unsigned default_port;
+    const char *start;
+    if (strncmp(url, "http://", 7) == 0) {
+        start = url + 7;
+        default_port = 80;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        start = url + 8;
+        default_port = 443;
+    } else return false;
+    const char *path = strchr(start, '/');
+    if (!path || strcmp(path, "/mcp") != 0 || path - start >= 320) return false;
+    char authority[320];
+    memcpy(authority, start, (size_t)(path - start));
+    authority[path - start] = 0;
+    if (!parse_authority(authority, host, port)) return false;
+    if (!*port) *port = default_port;
+    return true;
+}
+
+static bool host_allowed(MdMcpHttp *h, const HttpRequest *req)
+{
+    char host[256];
+    unsigned port;
+    if (req->bad_host || !parse_authority(req->host, host, &port)) return false;
+    if (loopback_host(host)) return true;
+    for (size_t i = 0; i < h->public_url_count; i++) {
+        char public_host[256];
+        unsigned public_port;
+        if (url_authority(h->public_urls[i], public_host, &public_port) &&
+            strcmp(host, public_host) == 0 &&
+            (port ? port : (strncmp(h->public_urls[i], "https://", 8) == 0 ? 443u : 80u))
+                == public_port) return true;
+    }
+    return false;
+}
+
+static void auth_free(MdMcpHttp *h)
+{
+    if (h->token) { OPENSSL_cleanse(h->token, strlen(h->token)); free(h->token); }
+    for (size_t i = 0; i < h->public_url_count; i++) free(h->public_urls[i]);
+    free(h->public_urls);
+    free(h->allowed_keys);
+}
+
+static bool add_npub(MdMcpHttp *h, const char *npub)
+{
+    unsigned char pk[32];
+    if (!npub || nostr_nip19_decode_npub(npub, pk) != 0 ||
+        h->allowed_key_count == AUTH_MAX_NPUBS) return false;
+    char (*keys)[65] = realloc(h->allowed_keys,
+                              (h->allowed_key_count + 1) * sizeof(*keys));
+    if (!keys) return false;
+    h->allowed_keys = keys;
+    char *hex = keys[h->allowed_key_count++];
+    for (size_t i = 0; i < sizeof(pk); i++) snprintf(hex + 2*i, 3, "%02x", pk[i]);
+    return true;
+}
+
+static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
+{
+    if (cfg->public_url_count > AUTH_MAX_URLS ||
+        (cfg->public_url_count && !cfg->public_urls) ||
+        cfg->allow_npub_count > AUTH_MAX_NPUBS ||
+        (cfg->allow_npub_count && !cfg->allow_npubs)) return false;
+    if (cfg->token_file) {
+        int fd = open(cfg->token_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) return false;
+        struct stat st;
+        char token[4096];
+        ssize_t n = -1;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+            (st.st_mode & 07777) == 0600 && st.st_size > 0 && st.st_size < 4080)
+            n = read(fd, token, sizeof(token) - 1);
+        close(fd);
+        if (n <= 0 || n != st.st_size) return false;
+        if (token[n-1] == '\n') n--;
+        if (n && token[n-1] == '\r') n--;
+        token[n] = 0;
+        if (!n) return false;
+        for (ssize_t i = 0; i < n; i++)
+            if (!token[i] || (!isalnum((unsigned char)token[i]) && !strchr("-._~+/=", token[i]))) {
+                OPENSSL_cleanse(token, sizeof(token));
+                return false;
+            }
+        h->token = strdup(token);
+        OPENSSL_cleanse(token, sizeof(token));
+        if (!h->token) return false;
+    }
+    h->public_urls = calloc(cfg->public_url_count + 1, sizeof(char *));
+    if (!h->public_urls) return false;
+    for (size_t i = 0; i < cfg->public_url_count; i++) {
+        char host[256];
+        unsigned port;
+        if (!cfg->public_urls[i] || !url_authority(cfg->public_urls[i], host, &port)) return false;
+        char *url = strdup(cfg->public_urls[i]);
+        if (!url) return false;
+        h->public_urls[h->public_url_count++] = url;
+    }
+    for (size_t i = 0; i < cfg->allow_npub_count; i++)
+        if (!add_npub(h, cfg->allow_npubs[i])) return false;
+    if (cfg->allow_file) {
+        FILE *file = fopen(cfg->allow_file, "r");
+        if (!file) return false;
+        char line[256];
+        bool valid = true;
+        while (fgets(line, sizeof(line), file)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            char *end = p + strlen(p);
+            while (end > p && isspace((unsigned char)end[-1])) *--end = 0;
+            if (*p && *p != '#' && !add_npub(h, p)) { valid = false; break; }
+        }
+        if (ferror(file)) valid = false;
+        fclose(file);
+        /* An explicitly configured but empty allowlist is an error, not
+         * a silent fallback to unauthenticated loopback service. */
+        if (!valid || !h->allowed_key_count) return false;
+    }
+    if (!h->token && !h->allowed_key_count) {
+        if (cfg->bind_addr && !loopback_host(cfg->bind_addr)) {
+            MD_LOG_E("non-loopback MCP HTTP bind requires credentials");
+            return false;
+        }
+        MD_LOG_W("MCP HTTP has no credential: loopback clients are unauthenticated");
+    }
+    return true;
+}
+
+static bool signed_url_allowed(MdMcpHttp *h, const char *url)
+{
+    if (!url) return false;
+    for (size_t i = 0; i < h->public_url_count; i++)
+        if (strcmp(url, h->public_urls[i]) == 0) return true;
+    const char *forms[] = {"127.0.0.1", "localhost", "[::1]"};
+    char expected[96];
+    for (size_t i = 0; i < sizeof(forms)/sizeof(forms[0]); i++) {
+        snprintf(expected, sizeof(expected), "http://%s:%u/mcp", forms[i], h->port);
+        if (strcmp(url, expected) == 0) return true;
+        if (h->port == 80) {
+            snprintf(expected, sizeof(expected), "http://%s/mcp", forms[i]);
+            if (strcmp(url, expected) == 0) return true;
+        }
+    }
+    return false;
+}
+
+static bool authenticate(MdMcpHttp *h, const HttpRequest *req)
+{
+    if (req->bad_auth) return false;
+    if (!h->token && !h->allowed_key_count) return true;
+    if (h->token && strncasecmp(req->authorization, "Bearer ", 7) == 0) {
+        const char *token = req->authorization + 7;
+        return strlen(token) == strlen(h->token) &&
+            CRYPTO_memcmp(token, h->token, strlen(h->token)) == 0;
+    }
+    if (!h->allowed_key_count) return false;
+    NostrEvent *event = NULL;
+    if (nostr_nip98_parse_auth_header(req->authorization, &event) != NOSTR_NIP98_OK)
+        return false;
+    const char *url = nostr_nip98_get_url(event);
+    bool ok = signed_url_allowed(h, url);
+    char payload_hex[65];
+    NostrNip98ValidateOptions opts = {0};
+    if (strcmp(req->method, "POST") == 0) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256((const unsigned char *)(req->body ? req->body : ""), req->body_len, hash);
+        for (size_t i = 0; i < sizeof(hash); i++) snprintf(payload_hex + 2*i, 3, "%02x", hash[i]);
+        opts.expected_payload_hash = payload_hex;
+    }
+    if (ok) ok = nostr_nip98_validate_auth_event(event, url, req->method, &opts) == NOSTR_NIP98_OK;
+    const char *pk = nostr_event_get_pubkey(event);
+    bool allowed = false;
+    for (size_t i = 0; pk && i < h->allowed_key_count; i++)
+        if (strcmp(pk, h->allowed_keys[i]) == 0) { allowed = true; break; }
+    ok = ok && allowed;
+    if (ok) {
+        char *id = nostr_event_get_id(event);
+        if (!id) { nostr_event_free(event); return false; }
+        int64_t now = md_now_ms();
+        int slot = -1;
+        pthread_mutex_lock(&h->auth_mu);
+        for (int i = 0; i < AUTH_REPLAY_CAPACITY; i++) {
+            if (h->replay[i].expires_ms > now) {
+                if (strcmp(h->replay[i].id, id) == 0) { ok = false; break; }
+            } else slot = i;
+        }
+        /* Never evict a live id: exhaustion must fail closed. */
+        if (ok && slot >= 0) {
+            snprintf(h->replay[slot].id, sizeof(h->replay[slot].id), "%s", id);
+            h->replay[slot].expires_ms = now + 2 * NOSTR_NIP98_DEFAULT_TIME_WINDOW * 1000 + 1;
+        } else ok = false;
+        pthread_mutex_unlock(&h->auth_mu);
+        free(id);
+    }
+    nostr_event_free(event);
+    return ok;
+}
 
 static bool is_json_content_type(const char *content_type)
 {
@@ -243,9 +530,18 @@ static int parse_content_length(const char *header_start, const char *headers_en
 {
     *content_length = 0;
 
-    const char *cl = strcasestr(header_start, "Content-Length:");
-    if (!cl || cl >= headers_end)
-        return 0;
+    const char *cl = NULL;
+    for (const char *p = header_start; p < headers_end; ) {
+        const char *end = strstr(p, "\r\n");
+        if (!end || end > headers_end) return -1;
+        if (strncasecmp(p, "Transfer-Encoding:", 18) == 0) return -1;
+        if (strncasecmp(p, "Content-Length:", 15) == 0) {
+            if (cl) return -1;
+            cl = p;
+        }
+        p = end + 2;
+    }
+    if (!cl) return 0;
 
     cl += 15;
     while (cl < headers_end && (*cl == ' ' || *cl == '\t'))
@@ -277,7 +573,10 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
     const char *end = strstr(buf, "\r\n");
     if (!end) return -1;
 
-    if (sscanf(buf, "%7s %63s", req->method, req->path) != 2)
+    char version[16];
+    int consumed = 0;
+    if (sscanf(buf, "%7s %63s %15s%n", req->method, req->path, version, &consumed) != 3 ||
+        buf + consumed != end || strcmp(version, "HTTP/1.1") != 0)
         return -1;
 
     /* Parse headers */
@@ -291,26 +590,49 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
                              &req->content_length) < 0)
         return -1;
 
-    /* Find Content-Type */
-    const char *ct = strcasestr(header_start, "Content-Type:");
-    if (ct && ct < headers_end) {
-        ct += 13;
-        while (*ct == ' ' || *ct == '\t') ct++;
-        const char *ct_end = strstr(ct, "\r\n");
-        if (ct_end && ct_end <= headers_end) {
-            while (ct_end > ct && (ct_end[-1] == ' ' || ct_end[-1] == '\t'))
-                ct_end--;
-            size_t ct_len = (size_t)(ct_end - ct);
-            if (ct_len >= sizeof(req->content_type))
-                ct_len = sizeof(req->content_type) - 1;
-            memcpy(req->content_type, ct, ct_len);
+    /* Header names must match whole lines, not substrings (e.g. X-Host).
+     * Reject folding and ambiguous duplicates instead of guessing. */
+    bool host_seen = false, auth_seen = false, type_seen = false;
+    for (const char *p = header_start; p < headers_end; ) {
+        const char *line_end = strstr(p, "\r\n");
+        const char *colon = memchr(p, ':', (size_t)(line_end - p));
+        if (!colon || colon == p) return -1;
+        for (const char *q = p; q < colon; q++)
+            if (!isalnum((unsigned char)*q) && !strchr("!#$%&'*+-.^_`|~", *q)) return -1;
+        const char *value = colon + 1, *value_end = line_end;
+        while (value < value_end && (*value == ' ' || *value == '\t')) value++;
+        while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+        for (const char *q = value; q < value_end; q++)
+            if ((unsigned char)*q < 32 || (unsigned char)*q == 127) return -1;
+        size_t key_len = (size_t)(colon - p), len = (size_t)(value_end - value);
+        char *dest = NULL;
+        size_t cap = 0;
+        if (key_len == 6 && strncasecmp(p, "Origin", 6) == 0) req->origin = true;
+        if (key_len == 4 && strncasecmp(p, "Host", 4) == 0) {
+            req->bad_host |= host_seen || len >= sizeof(req->host);
+            host_seen = true;
+            dest = req->host; cap = sizeof(req->host);
+        } else if (key_len == 13 && strncasecmp(p, "Authorization", 13) == 0) {
+            req->bad_auth |= auth_seen || len >= sizeof(req->authorization);
+            auth_seen = true;
+            dest = req->authorization; cap = sizeof(req->authorization);
+        } else if (key_len == 12 && strncasecmp(p, "Content-Type", 12) == 0) {
+            if (type_seen || len >= sizeof(req->content_type)) return -1;
+            type_seen = true;
+            dest = req->content_type; cap = sizeof(req->content_type);
         }
+        if (dest && len < cap) { memcpy(dest, value, len); dest[len] = 0; }
+        p = line_end + 2;
     }
 
     /* Extract body */
     size_t available = buf_len - (size_t)(body_start - buf);
-    if (req->content_length > 0 && available >= req->content_length) {
-        req->body = strndup(body_start, req->content_length);
+    if (available < req->content_length) return -1;
+    if (req->content_length > 0) {
+        req->body = malloc(req->content_length + 1);
+        if (!req->body) return -1;
+        memcpy(req->body, body_start, req->content_length);
+        req->body[req->content_length] = 0;
         req->body_len = req->content_length;
     }
 
@@ -342,10 +664,19 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         return;
     }
     size_t total = 0;
+    buf[0] = 0;
+    int64_t read_deadline = md_now_ms() + CLIENT_READ_TIMEOUT_SEC * 1000;
 
     /* Read the full request — headers + body */
     while (total < buf_cap - 1) {
-        ssize_t n = read(client_fd, buf + total, buf_cap - 1 - total);
+        int64_t remaining = read_deadline - md_now_ms();
+        if (remaining <= 0 || atomic_load(&h->shutdown)) break;
+        struct pollfd pfd = { .fd = client_fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) break;
+        ssize_t n = recv(client_fd, buf + total, buf_cap - 1 - total, MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
@@ -399,6 +730,29 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         return;
     }
     free(buf);
+
+    if (req.origin || !host_allowed(h, &req)) {
+        send_http_text(h, client_fd, 403, "Forbidden", "Forbidden\n");
+        free(req.body);
+        close(client_fd);
+        return;
+    }
+    if (strcmp(req.path, "/healthz") == 0 && strcmp(req.method, "GET") == 0) {
+        bool stopping = atomic_load(&h->shutdown);
+        send_http_text(h, client_fd, stopping ? 503 : 200,
+                       stopping ? "Service Unavailable" : "OK", stopping ? "stopping\n" : "ok\n");
+        free(req.body);
+        close(client_fd);
+        return;
+    }
+    if (strcmp(req.path, "/mcp") == 0 &&
+        (strcmp(req.method, "POST") == 0 || strcmp(req.method, "GET") == 0) &&
+        !authenticate(h, &req)) {
+        send_http_text(h, client_fd, 401, "Unauthorized", "Unauthorized\n");
+        free(req.body);
+        close(client_fd);
+        return;
+    }
 
     /* All POSTs must carry JSON-RPC as application/json. */
     if (strcmp(req.method, "POST") == 0 &&
@@ -650,6 +1004,12 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     h->mcp_server = config->server;
     h->port = config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT;
     atomic_init(&h->shutdown, false);
+    if (!auth_init(h, config)) {
+        MD_LOG_E("invalid MCP HTTP authentication configuration");
+        auth_free(h);
+        free(h);
+        return NULL;
+    }
     h->sse_max_clients = config->max_clients > 0
         ? config->max_clients : DEFAULT_MAX_SSE_CLIENTS;
     h->sse_write_timeout_ms = config->sse_write_timeout_ms > 0
@@ -658,10 +1018,12 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     h->sse_clients = calloc((size_t)h->sse_max_clients,
                             sizeof(*h->sse_clients));
     if (!h->sse_clients) {
+        auth_free(h);
         free(h);
         return NULL;
     }
     pthread_mutex_init(&h->sse_mu, NULL);
+    pthread_mutex_init(&h->auth_mu, NULL);
     go_wait_group_init(&h->handler_wg);
 
     /* Create listening socket */
@@ -669,6 +1031,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     if (h->listen_fd < 0) {
         go_wait_group_destroy(&h->handler_wg);
         pthread_mutex_destroy(&h->sse_mu);
+        pthread_mutex_destroy(&h->auth_mu);
+        auth_free(h);
         free(h->sse_clients);
         free(h);
         return NULL;
@@ -697,6 +1061,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
                 close(h->listen_fd);
                 go_wait_group_destroy(&h->handler_wg);
                 pthread_mutex_destroy(&h->sse_mu);
+                pthread_mutex_destroy(&h->auth_mu);
+                auth_free(h);
                 free(h->sse_clients);
                 free(h);
                 return NULL;
@@ -710,6 +1076,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         close(h->listen_fd);
         go_wait_group_destroy(&h->handler_wg);
         pthread_mutex_destroy(&h->sse_mu);
+        pthread_mutex_destroy(&h->auth_mu);
+        auth_free(h);
         free(h->sse_clients);
         free(h);
         return NULL;
@@ -719,6 +1087,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         close(h->listen_fd);
         go_wait_group_destroy(&h->handler_wg);
         pthread_mutex_destroy(&h->sse_mu);
+        pthread_mutex_destroy(&h->auth_mu);
+        auth_free(h);
         free(h->sse_clients);
         free(h);
         return NULL;
@@ -798,6 +1168,8 @@ void md_mcp_http_destroy(MdMcpHttp *http)
         close(http->listen_fd);
 
     pthread_mutex_destroy(&http->sse_mu);
+    pthread_mutex_destroy(&http->auth_mu);
+    auth_free(http);
     free(http->sse_clients);
     free(http);
 }
