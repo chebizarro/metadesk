@@ -1,5 +1,5 @@
 #!/bin/sh
-# validated on Docker 29.1.3 / rootless Podman 4.9.3 (bundle consumed); see validation.md.
+# validated on Docker 29.1.3 / rootless Podman 4.9.3 (bundle consumed, fixture + live GNOME); see validation.md.
 # Producer validated on Ubuntu 24.04 aarch64, outside either runtime image.
 # THROWAWAY LOCAL PRODUCER: md-kb7 inherits bundle-contract.md, NOT this script.
 # Run on matching Ubuntu 24.04/architecture; never runs inside the runtime image.

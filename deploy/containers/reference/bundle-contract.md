@@ -1,4 +1,4 @@
-<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture consumption; see validation.md. -->
+<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME consumption; see validation.md. -->
 # Tier A runtime bundle contract
 
 This is the md-kb7 handoff. `throwaway-bundle.sh` is a **throwaway local producer**,
@@ -7,7 +7,8 @@ not supported packaging, a release pipeline, or a reproducible-build claim.
 ## Producer and input
 
 Build on Ubuntu 24.04 with the same architecture as the runtime base. Validation
-uses aarch64, metadesk `8157ac0`, and the existing `/home/bizarro/nostrc/_build`.
+uses aarch64, metadesk `8157ac0` (fixture) / `92ab2cf2` (live GNOME), and the
+existing `/home/bizarro/nostrc/_build`.
 The producer needs Meson/Ninja, the normal metadesk development dependencies,
 `patchelf`, `ldd`, and Python. The image never compiles source.
 

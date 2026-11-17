@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture cells; see validation.md.
+# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells; see validation.md.
 """Readiness only: existing D-Bus tooling and /healthz, never GET /mcp."""
 import os
 import re

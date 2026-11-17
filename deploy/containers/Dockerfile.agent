@@ -1,4 +1,4 @@
-# validated on Docker 29.1.3 (build/run), rootless Podman 4.9.3 (loaded/run), fixture cells.
+# validated on Docker 29.1.3 (build/run), rootless Podman 4.9.3 (loaded/run), fixture + live GNOME cells.
 # Podman-native build unvalidated; see reference/validation.md.
 # Runtime only: produce runtime-bundle outside this image. Pin BASE for validation.
 ARG BASE=ubuntu:24.04

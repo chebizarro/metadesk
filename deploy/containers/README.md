@@ -1,8 +1,8 @@
-<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture cells only; see reference/validation.md. -->
+<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells; see reference/validation.md. -->
 # Tier A: attached-desktop MCP observation
 
 Local reference, not release packaging. Ubuntu 24.04/aarch64 evidence and
-**pending/blocked cells**: [validation](reference/validation.md).
+**remaining pending cells**: [validation](reference/validation.md).
 No FIPS/mesh, Kubernetes, video, devices, or registry publication.
 
 ## Prepare the operator-managed desktop
@@ -87,7 +87,7 @@ perform MCP initialization. Docker `on-failure` supplies engine restart backoff;
 health is readiness only and does not cause restarts. Known bus-loss detection
 prevents logout recovery today (md-ah9.15). Do not test it by logging out a user.
 
-## Rootless Podman (explicit CLI, not this Compose file)
+## Rootless Podman CLI
 
 Load/build the same image locally. Keep-ID preserves the desktop's host UID.
 Podman 4.9.3 needs `U` on the **private tmpfs**; it rejects tmpfs `uid=/gid=`.
@@ -126,6 +126,50 @@ failure and explicitly restart. Fixed backoff was exercised at 2 s in validation
 the conservative 5 s operational setting is unvalidated. Recreate when session
 socket identity/path changes. No claim of automatic logout/relogin recovery.
 
-For controlled test reproduction use `reference/fixture.py`, `smoke_mcp.py`, and
-`validate.py`; the results doc gives the isolated-session setup and cleanup.
+## Rootless Podman Compose (tested compatibility API)
+
+The Docker file alone is **not** a rootless Podman manifest. Layer the supplied
+override, which uses keep-ID, replaces Docker's AppArmor option, drops the
+Docker-only IPv6 sysctl and uses `U` only on the private runtime tmpfs. This was
+validated with Docker Compose **2.40.3** talking to rootless Podman **4.9.3**;
+`podman-compose` and other Compose providers are unvalidated. Rootless AppArmor
+remains disabled on the tested VM. The override requires `!override` / `!reset`.
+
+With the desktop/secret environment above exported, use a task-owned API socket
+(not the rootful Docker socket); keep its service foreground in another terminal:
+
+```sh
+podman system service --time=0 "unix:$PWD/podman-api.sock"
+# In the client terminal, invoke the installed Compose plugin directly:
+export DOCKER_HOST="unix://$PWD/podman-api.sock"
+/usr/libexec/docker/cli-plugins/docker-compose -p metadesk-agent \
+  -f compose.agent.yaml -f compose.agent.podman.yaml \
+  up -d --no-build --wait --wait-timeout 45
+# Use the same host/project/files for exec, stop, and down --volumes.
+# Stop only this task's API service and remove its socket after down.
+unset DOCKER_HOST
+```
+
+## Safe live validation
+
+From the isolated task root with a mode-0600 `mcp-token`, after building/loading
+the image and loading the Docker AppArmor profile:
+
+```sh
+python3 deploy/containers/reference/validate.py docker --live
+python3 deploy/containers/reference/validate.py podman --live
+```
+
+Live mode discovers GetAddress on `/run/user/1000/bus` (including `bus_0`), checks
+calculator's window, buttons and display text nodes via both MCP transports,
+and re-verifies the live socket and calculator after each container run and
+cleanup. It never writes a test alias in the live AT-SPI directory or simulates
+bus loss. `--dump-tree` is opt-in because real desktop trees can contain private
+text; `--expect` can require additional tree labels. This cell deliberately
+requires calculator, not just any app name. Do not use fixture mode with a live
+session-address file.
+
+For controlled fixture reproduction use `reference/fixture.py`, `smoke_mcp.py`,
+and default `validate.py`; the results doc gives the isolated-session setup.
+Set a private `XDG_RUNTIME_DIR` **before** starting `dbus-run-session`/GetAddress.
 Never repoint or kill the real desktop bus. Health logs do not contain tree data.
