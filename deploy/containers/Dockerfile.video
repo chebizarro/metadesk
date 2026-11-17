@@ -1,0 +1,32 @@
+# validated on rootless Podman 4.9.3 / Ubuntu 24.04 aarch64; see reference/video-validation.md.
+# Run with --init; reference/validate-video.py supplies the isolated run contract.
+# Runtime-only, throwaway local bundle producer: reference/throwaway-bundle.sh.
+ARG BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+FROM ${BASE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      sway=1.9-1build2 libwlroots12t64=0.17.1-2.1build1 swaybg \
+      xdg-desktop-portal-wlr=0.7.1-1build2 \
+      xdg-desktop-portal=1.18.4-1ubuntu2.24.04.3 \
+      pipewire=1.0.5-1ubuntu3.3 libspa-0.2-modules=1.0.5-1ubuntu3.3 \
+      wireplumber=0.4.17-1ubuntu4.1 dbus-daemon libglib2.0-bin \
+      wayland-utils python3 ca-certificates libgcc-s1 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && userdel ubuntu && groupadd -g 1000 metadesk \
+    && useradd -u 1000 -g 1000 -m -d /home/metadesk metadesk \
+    && mkdir /run/metadesk && chown 1000:1000 /run/metadesk
+COPY runtime-bundle/opt/metadesk/ /opt/metadesk/
+COPY reference/sway-session.sh /opt/metadesk/sway-session.sh
+RUN cd /opt/metadesk && sha256sum -c SHA256SUMS \
+    && printf '/opt/metadesk/lib\n' > /etc/ld.so.conf.d/metadesk.conf \
+    && ldconfig && chmod 0755 /opt/metadesk/sway-session.sh \
+    && ldd /opt/metadesk/bin/metadesk-host > /tmp/closure \
+    && ! grep -q 'not found' /tmp/closure && rm /tmp/closure
+ENV HOME=/home/metadesk XDG_RUNTIME_DIR=/run/metadesk \
+    XDG_STATE_HOME=/home/metadesk/.local/state \
+    XDG_CONFIG_HOME=/home/metadesk/.config XDG_CURRENT_DESKTOP=sway \
+    XDG_SESSION_TYPE=wayland WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \
+    WLR_RENDERER=pixman
+USER 1000:1000
+ENTRYPOINT ["/opt/metadesk/sway-session.sh"]
+# Supply a capture consumer explicitly; no remote listeners or input by default.
+CMD ["swaymsg", "-t", "get_outputs"]

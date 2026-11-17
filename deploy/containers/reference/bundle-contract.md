@@ -63,5 +63,16 @@ runtime modules rather than treating ldd alone as proof.
    PipeWire mounts; test SIGTERM including the preparation phase.
 
 Only local images are produced. No registry publishing, signing, promotion,
-FIPS, video deployment, or Kubernetes is provided here. Delete the disposable
-bundle/build directories after testing; keep evidence, not binary artifacts.
+FIPS, video deployment, or Kubernetes is provided by this Tier A contract. Delete
+the disposable bundle/build directories after testing; keep evidence, not binaries.
+
+## Experimental Tier B extension (md-ah9.8)
+
+`Dockerfile.video` consumes the same throwaway bundle, but installs the distro
+PipeWire/SPA runtime modules, WirePlumber configuration/scripts, portal services,
+Sway and renderer dependencies separately. `-Dclient=false` retains the host's
+PipeWire/FFmpeg/x264 links; it is not a capture-free or encoder-free closure.
+Neither `ldd` nor this Tier A contract qualifies those dynamic features. See
+[video-validation.md](video-validation.md) for pinned versions, real capture
+results, the failed device-free cell, optional render-node access, and the
+capture-only test harness. No backend token/state belongs in either image.
