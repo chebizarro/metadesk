@@ -531,6 +531,30 @@ static void sb_append(StrBuf *sb, const char *s) {
     sb->buf[sb->len] = '\0';
 }
 
+/* Append an accessible label for the line-based compact format (spec §3.3.2).
+ * Accessible names may legitimately contain CR/LF/TAB (e.g. the Windows
+ * taskbar clock, tray tooltips); emitting them verbatim would split one node
+ * across lines. Each run of control bytes (< 0x20, 0x7F) becomes one space.
+ * UTF-8 multi-byte sequences are all >= 0x80 and pass through untouched. */
+static void sb_append_label(StrBuf *sb, const char *s) {
+    if (sb->oom || !s) return;
+    size_t n = strlen(s);
+    sb_reserve(sb, n);
+    if (sb->oom) return;
+    bool in_ctrl = false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7F) {
+            if (!in_ctrl) sb->buf[sb->len++] = ' ';
+            in_ctrl = true;
+        } else {
+            sb->buf[sb->len++] = (char)c;
+            in_ctrl = false;
+        }
+    }
+    sb->buf[sb->len] = '\0';
+}
+
 static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
     if (sb->oom) return;
     va_list ap;
@@ -585,12 +609,17 @@ static void compact_node(const MdA11yNode *node, int depth, StrBuf *sb,
         if (is_text_role(resolved_role)) {
             /* text entry: <focused> before quoted content (spec §3.3.2) */
             if (has_state(states, MD_A11Y_STATE_FOCUSED)) sb_append(sb, " <focused>");
-            sb_appendf(sb, " '%s'", node->label ? node->label : "");
+            sb_append(sb, " '");
+            sb_append_label(sb, node->label ? node->label : "");
+            sb_append(sb, "'");
             if (has_state(states, MD_A11Y_STATE_ENABLED))  sb_append(sb, " *enabled*");
             if (has_state(states, MD_A11Y_STATE_DISABLED)) sb_append(sb, " *disabled*");
         } else {
             const char *label = node->label ? node->label : "";
-            if (label[0]) sb_appendf(sb, " %s", label);
+            if (label[0]) {
+                sb_append(sb, " ");
+                sb_append_label(sb, label);
+            }
             compact_states(states, sb);
         }
 
