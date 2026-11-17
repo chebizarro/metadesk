@@ -19,6 +19,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include "md_test.h"
 
 
@@ -2340,6 +2342,165 @@ static void test_supervised_desktop_loss(void)
     PASS("supervised desktop loss exits nonzero and completes cleanup with stdin still open");
 }
 
+typedef struct {
+    atomic_bool connected;
+    int entered_fd;
+    int release_fd;
+    bool lose_desktop;
+    bool returned;
+} InFlightFixture;
+
+static bool in_flight_connected(const MdA11yCtx *ctx)
+{
+    InFlightFixture *fixture = ctx->backend_data;
+    return atomic_load(&fixture->connected);
+}
+
+static int in_flight_tree(MdA11yCtx *ctx, MdA11yNode **out)
+{
+    InFlightFixture *fixture = ctx->backend_data;
+    if (fixture->lose_desktop) atomic_store(&fixture->connected, false);
+    if (write(fixture->entered_fd, "E", 1) != 1) return -1;
+    struct pollfd pfd = { .fd = fixture->release_fd, .events = POLLIN };
+    char release;
+    if (poll(&pfd, 1, 4000) <= 0 || read(pfd.fd, &release, 1) != 1)
+        return -1;
+    *out = query_node("desktop", "application", "in-flight", 0);
+    fixture->returned = true;
+    return *out ? 0 : -1;
+}
+
+static int in_flight_connect(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port),
+                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    if (fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) return fd;
+    if (fd >= 0) close(fd);
+    return -1;
+}
+
+static bool in_flight_sse_headers(int fd)
+{
+    char headers[2048];
+    size_t used = 0;
+    int64_t deadline = host_test_now_ms() + 5000;
+    while (used + 1 < sizeof(headers)) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int64_t left = deadline - host_test_now_ms();
+        if (left <= 0 || poll(&pfd, 1, (int)left) <= 0 || read(fd, headers + used, 1) != 1)
+            return false;
+        headers[++used] = 0;
+        if (strstr(headers, "\r\n\r\n")) return strstr(headers, "200 OK") != NULL;
+    }
+    return false;
+}
+
+static void test_supervised_in_flight(bool desktop_loss)
+{
+    /* The bridge API uses port zero to disable HTTP. Reserve an ephemeral
+     * loopback port, then hand it to the child before opening clients. */
+    int reservation = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = { .sin_family = AF_INET,
+                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t addr_len = sizeof(addr);
+    if (reservation < 0 || bind(reservation, (struct sockaddr *)&addr, sizeof(addr)) ||
+        getsockname(reservation, (struct sockaddr *)&addr, &addr_len)) {
+        MD_CHECK(false);
+        if (reservation >= 0) close(reservation);
+        return;
+    }
+    uint16_t port = ntohs(addr.sin_port);
+    close(reservation);
+    int out[2], entered[2], release[2], done[2];
+    MD_CHECK(pipe(out) == 0 && pipe(entered) == 0 &&
+             pipe(release) == 0 && pipe(done) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(out[0]); close(entered[0]);
+        close(release[1]); close(done[0]);
+        sigset_t signals;
+        sigemptyset(&signals);
+        sigaddset(&signals, SIGTERM);
+        sigaddset(&signals, SIGINT);
+        if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0) _exit(2);
+        InFlightFixture *fixture = calloc(1, sizeof(*fixture));
+        if (!fixture) _exit(2);
+        atomic_init(&fixture->connected, true);
+        fixture->entered_fd = entered[1];
+        fixture->release_fd = release[0];
+        fixture->lose_desktop = desktop_loss;
+        const MdA11yBackend backend = {
+            .is_connected = in_flight_connected, .get_tree = in_flight_tree,
+        };
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = fixture };
+        query_a11y_init(&a11y);
+        MdMcpBridgeConfig cfg = {
+            .a11y = &a11y, .stdio_in_fd = -1,
+            .http_port = port, .http_bind_addr = "127.0.0.1",
+        };
+        MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
+        if (!bridge) _exit(2);
+        md_test_mcp_handshake(md_mcp_bridge_get_server(bridge));
+        if (write(out[1], "R", 1) != 1) _exit(2);
+        int rc = md_mcp_bridge_run_supervised(bridge);
+        md_mcp_bridge_destroy(bridge);
+        md_a11y_node_free(a11y.last_snapshot);
+        query_a11y_fini(&a11y);
+        if (!fixture->returned) _exit(2);
+        free(fixture);
+        if (write(done[1], "D", 1) != 1) _exit(2);
+        _exit(rc < 0 ? 1 : 0);
+    }
+    MD_CHECK(pid > 0);
+    close(out[1]); close(entered[1]);
+    close(release[0]); close(done[1]);
+    if (pid > 0) {
+        char marker = 0;
+        struct pollfd pfd = { .fd = out[0], .events = POLLIN };
+        MD_CHECK(poll(&pfd, 1, 5000) > 0 && read(out[0], &marker, 1) == 1 && marker == 'R');
+        int sse = in_flight_connect(port);
+        const char get[] = "GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        MD_CHECK(sse >= 0 && write(sse, get, sizeof(get)-1) == sizeof(get)-1);
+        MD_CHECK(in_flight_sse_headers(sse));
+        int post = in_flight_connect(port);
+        const char body[] = "{\"jsonrpc\":\"2.0\",\"method\":\"resources/read\",\"id\":2,\"params\":{\"uri\":\"metadesk://ui-tree\"}}";
+        char request[1024];
+        int length = snprintf(request, sizeof(request), "POST /mcp HTTP/1.1\r\nHost: localhost\r\n"
+                              "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                              sizeof(body)-1, body);
+        MD_CHECK(post >= 0 && write(post, request, (size_t)length) == length);
+        pfd.fd = entered[0];
+        MD_CHECK(poll(&pfd, 1, 5000) > 0 &&
+                 read(entered[0], &marker, 1) == 1 && marker == 'E');
+        int64_t started = host_test_now_ms();
+        if (!desktop_loss) MD_CHECK(kill(pid, SIGTERM) == 0);
+        /* SSE closure acknowledges that the real supervisor shut down HTTP
+         * while the POST is still inside the held backend call. */
+        pfd.fd = sse;
+        MD_CHECK(poll(&pfd, 1, 3000) > 0 && read(sse, &marker, 1) == 0);
+        pfd.fd = done[0];
+        MD_CHECK(poll(&pfd, 1, 0) == 0);
+        MD_CHECK(write(release[1], "R", 1) == 1);
+        int64_t left = 5000 - (host_test_now_ms() - started);
+        int ready = left > 0 ? poll(&pfd, 1, (int)left) : 0;
+        MD_CHECK(ready > 0);
+        if (ready <= 0) kill(pid, SIGKILL);
+        else MD_CHECK(read(done[0], &marker, 1) == 1 && marker == 'D');
+        int status = 0;
+        MD_CHECK(waitpid(pid, &status, 0) == pid);
+        MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == (desktop_loss ? 1 : 0));
+        MD_CHECK(host_test_now_ms() - started < 5000);
+        printf("  in-flight HTTP %s: %lld ms, cleanup status=%d\n",
+               desktop_loss ? "desktop loss" : "SIGTERM",
+               (long long)(host_test_now_ms() - started), status);
+        close(sse); close(post);
+    }
+    close(out[0]); close(entered[0]); close(release[1]); close(done[0]);
+    PASS(desktop_loss ? "desktop loss during in-flight backend call drains and exits within 5 s" :
+                        "SIGTERM during in-flight backend call drains and exits within 5 s");
+}
+
 static void test_host_cli_rejections(const char *host)
 {
     const char *options[][6] = {
@@ -2513,6 +2674,8 @@ int main(int argc, char **argv)
     test_bridge_null_a11y_fails_create();
     test_bridge_create_destroy_with_stub_a11y();
     test_supervised_desktop_loss();
+    test_supervised_in_flight(false);
+    test_supervised_in_flight(true);
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();

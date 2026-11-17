@@ -553,7 +553,7 @@ host_sources = files('src/host/main.c')
 host_includes = [core_inc]
 host_c_args = []
 
-executable('metadesk-host', host_sources,
+metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
   dependencies : [dep_metadesk],
   c_args : host_c_args,
@@ -586,6 +586,13 @@ test_atspi = executable('test_atspi',
   dependencies : [dep_metadesk],
 )
 test('a11y tree serialisation', test_atspi)
+if host_machine.system() == 'linux'
+  test('a11y private bus loss', test_atspi,
+    args : ['--private-bus-loss', metadesk_host.full_path()],
+    depends : metadesk_host,
+    timeout : 45,
+  )
+endif
 
 # Live-backend checks hang/fail without an a11y bus or AX permission, so
 # they are opt-in: configure with -Dlive_tests=true, run via
