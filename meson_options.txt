@@ -5,12 +5,12 @@ option('tools', type : 'boolean', value : false,
 option('client',   type : 'boolean', value : true,
        description : 'Build the human video client (requires SDL2 + Dear ImGui)')
 option('signer_nip46', type : 'boolean', value : false,
-       description : 'Enable NIP-46 Nostr Connect remote signer backend (requires nostrc nip46)')
+       description : 'Enable NIP-46 Nostr Connect remote signer backend (requires nostr_nip46_core, NIP-04 and Jansson)')
 option('signer_nip55l', type : 'boolean', value : false,
-       description : 'Enable NIP-55L D-Bus local signer backend (requires nostrc nip55l + GIO)')
+       description : 'Enable NIP-55L D-Bus local signer backend (requires nostr_nip55l_core, NIP-04/06/19/49, GIO and platform key storage)')
 option('signer_nip5f', type : 'boolean', value : false,
-       description : 'Enable NIP-5F Unix socket signer backend (requires nostrc nip5f)')
+       description : 'Enable NIP-5F Unix socket signer backend (requires nostr_nip5f_core)')
 option('nostrc_root', type : 'string', value : '',
-       description : 'Path to nostrc project root (for uninstalled libgo/nip51; leave empty if fully installed)')
+       description : 'Path to nostrc project root (for uninstalled libraries and signer headers; leave empty if fully installed)')
 option('nostrc_build_dir', type : 'string', value : '',
        description : 'Path to nostrc CMake build dir (defaults to nostrc_root/build if nostrc_root is set)')
