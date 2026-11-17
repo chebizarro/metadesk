@@ -12,21 +12,25 @@ Artifact excerpts below are partial reference shapes; the accompanying contracts
 
 Work items to file as spin-offs of `md-ah9` (details in §6; file impact in §4; privilege detail in §3.5). "Size" is rough: S ≤ a few days, M ≈ 1–2 weeks, L ≈ 3+ weeks.
 
-Corrected against the 2026-11-14 design review (`docs/reviews/container-runtime-plan-critique-2026-11-14.md`); see §7 for the code-verified corrections and open decisions those IDs reference. Spin-off work items (W1–W9) are **not yet filed** in bd.
+Corrected against the 2026-11-14 design review (`docs/reviews/container-runtime-plan-critique-2026-11-14.md`); see §7 for the code-verified corrections and open decisions those IDs reference. **Re-cut 2026-11-16 after all §7.4 decisions; filed in bd as children of md-ah9 (IDs in the table).** P0 remains md-ah9 itself, since `deploy/containers/` is not drafted yet.
 
 | # | Goal | Done when | Key files | Depends on | Size |
 |---|------|-----------|-----------|------------|------|
 | P0 | Land this spec + reference artifact drafts | Plan updated; artifacts drafted; md-kb7/md-5zi review requested; bundle-ownership (§7) decided | `docs/plans/container-runtime-2026-11-14.md`, `deploy/containers/*` | — | S |
-| W1 | MCP container lifecycle, transport, **security/correctness** (**code**) | Input-requiring tools error under `--no-input` (no fake success); Host/Origin reject on HTTP; host actually calls `md_mcp_bridge_shutdown`; wakeable stdio; blocking a11y unsubscribe (3 backends); read-timeout < 5 s SIGTERM < grace; no MCP-branch leak; §3.3 acceptance + Nostr Protocol Review | `src/host/main.c`, `src/core/mcp_{bridge,http,stdio,server}.*`, `a11y.*`, `a11y_atspi.c`, `a11y_axui.m`, `a11y_uia.cpp`, `agent.c`, `tests/test_mcp*` | P0 | L |
-| W2 | Validate attached-desktop MCP host (Docker + rootless Podman) | Expected app tree via MCP; negative identity/socket tests fail clearly; no port 7700/capture/device | `deploy/containers/{Dockerfile.agent,reference/*}` | W1, bundle (§7.2) | M |
-| W3 | FIPS **binary-session** sidecar reference (re-tiered, §7.1) | Only mesh owns TUN/NET_ADMIN; netns-holder so restart recovers; paired with `--npub`/`fips_control` host-or-client, not Tier-A MCP | `deploy/containers/{compose.agent.yaml,kubernetes/*}` | W4/W7, pinned FIPS adapter | M |
-| W3b | Kubernetes agent-only Pod reference | Node pinning, `hostPath` desktop sockets, RBAC port-forward, clean termination | `deploy/containers/kubernetes/agent-pod.yaml` | W2 | M |
-| W4 | Sway headless portal-capture reference | Pinned compositor/backend capability + frame-delivery report (capture only) | `deploy/containers/reference/sway-session.sh`, `Dockerfile.video` (new) | P0 video decision | M |
-| W5 | Linux Wayland virtual-input backend for wlroots (**code**) | Target-only pointer/keyboard via existing HAL; explicit `wayland` selection, no uinput fallback | `src/core/input_wayland.c`, `input.c/.h`, `src/host/main.c`, `meson*`, `tests/test_input.c` | W4 (soft) | M |
-| W6 | Unattended portal policy + secure restore-token lifecycle (**code**) | Fail-closed capture, bounded consent, atomic 0600 token, no auto-delete on no-frames | `src/core/capture_pipewire.c`, `capture.*`, host CLI, capture tests | W4 (soft) | M |
-| W7 | Container client qualification (decode-only + GUI) | Separate headless vs display authorization results | client build; `deploy/containers/*` | md-5zi | S |
-| W8 | Add container acceptance cells to md-5zi | Cells incorporated into the owning matrix (individual cells mark "pending W1/W4") | md-5zi matrix | P0 | S |
-| W9 | Consume md-ah9 runtime-bundle/deploy contract in md-kb7 | Packaging handoff acknowledged; publishing stays in md-kb7 | `deploy/containers/reference/bundle-contract.md` | P0 | S |
+| W1 `md-ah9.1` | MCP container lifecycle and correctness (**code**) | `--no-input` unregisters input tools, with an `is_error` runtime backstop (no fake success, `agent.c:177`, `mcp_bridge.c:73`); a signal thread calls `md_mcp_bridge_shutdown`; read timeout < 5 s SIGTERM < grace; exits nonzero on a11y loss (`md_a11y_is_connected`, Q4); `--mcp-http-bind`/`--no-input`; `/healthz`; no MCP-branch leak. *(Wakeable stdio and blocking unsubscribe have already landed, §7.0)* | `src/host/main.c`, `src/core/mcp_{bridge,http,server}.*`, `agent.c`, `tests/test_mcp*` | P0 | M |
+| W1b `md-ah9.2` | MCP HTTP auth (**code**, §7.7) | Host/Origin always enforced; bearer token file; NIP-98 with replay cache, mandatory payload hash, `--mcp-public-url`, npub allowlist (flag/file); all 401/403 tests; Nostr Protocol Review | `src/core/mcp_http.*`, `meson.build` (nip98), `tests/test_mcp_http.c` | P0 | M |
+| W1c `md-ah9.3` | NIP-98 allowlist sourced from the host account's NIP-51 `metadesk-allowlist` | Live REQ subscription, no polling; updates without restart | `src/core/mcp_http.*`, allowlist code | W1b, md-70v (P2.7 host role) | S |
+| W2 `md-ah9.4` | Validate attached-desktop MCP host (Docker + rootless Podman) | Expected app tree via MCP; negative tests fail clearly; no 7700/capture/device; explicit `127.0.0.1`; token secret; restart-policy recovery; **throwaway bundle procedure** + `bundle-contract.md` (Q1) | `deploy/containers/{Dockerfile.agent,reference/*}` | W1, W1b | M |
+| W3 `md-ah9.5` | FIPS mesh reference: **Tier A + pass-through auth proxy** (Q6 step 1) | Only mesh owns TUN/NET_ADMIN; proxy forwards `Authorization`/`Host`; a remote agent succeeds with NIP-98 or the token and an unauthenticated peer gets 401; netns-holder restart recovery | `deploy/containers/compose.agent.yaml` | W2, W1b, pinned FIPS adapter | M |
+| W3v `md-ah9.6` | FIPS **binary-session** reference, Tier B/C1 (Q6 step 2) | Nostr negotiation + stream over the mesh between containers | `deploy/containers/*` | W4, W7 | M |
+| W3b `md-ah9.7` | Kubernetes Pod for the **Tier B** Sway session (Q7: deferred from Tier A) | Restricted Pod Security (exceptions documented); clean termination; `/healthz` probes | `deploy/containers/kubernetes/video-pod.yaml` | W4, W5 | M |
+| W4 `md-ah9.8` | Sway headless portal-capture reference | Pinned compositor/backend capability + frame-delivery report (capture only) | `deploy/containers/reference/sway-session.sh`, `Dockerfile.video` (new) | P0 video decision | M |
+| W5 `md-ah9.9` | Linux Wayland virtual-input backend for wlroots (**code**) | Target-only pointer/keyboard via existing HAL; explicit `wayland` selection, no uinput fallback | `src/core/input_wayland.c`, `input.c/.h`, `src/host/main.c`, `meson*`, `tests/test_input.c` | W4 (soft) | M |
+| W6 `md-ah9.10` | Unattended portal policy + secure restore-token lifecycle (**code**) | Fail-closed capture, bounded consent, atomic 0600 token, no auto-delete on no-frames (reconcile with the capture watchdog's `md_capture_forget_authorization` in `host/main.c`) | `src/core/capture_pipewire.c`, `capture.*`, host CLI, capture tests | W4 (soft) | M |
+| W7 `md-ah9.11` | Container client qualification (decode-only + GUI) | Separate headless vs display authorization results | client build; `deploy/containers/*` | md-5zi | S |
+| W8 `md-ah9.12` | Add container acceptance cells to md-5zi | Cells incorporated into the owning matrix (individual cells mark "pending W1/W4") | md-5zi matrix | P0 | S |
+| W9 `md-ah9.13` | Consume md-ah9 runtime-bundle/deploy contract in md-kb7 | Packaging handoff acknowledged; publishing stays in md-kb7 | `deploy/containers/reference/bundle-contract.md` | W2 | S |
+| W10 `md-ah9.14` | `metadesk mcp-proxy` stdio↔HTTP NIP-98 signing shim (§7.7) | Any stdio MCP client reaches W1b via NIP-98 using an `MdSigner` | `src/host/` or new tool, tests | W1b | S |
 
 # 2. Current-state analysis
 
@@ -891,16 +895,16 @@ Work landed since the review shrinks W1:
 ### 7.3 Index/ownership corrections
 - **Runtime-bundle circularity:** W2 needs a bundle but W9 has md-kb7 *consuming* md-ah9's contract — nobody produces the first bundle. Decide: md-ah9 ships a throwaway local procedure (`meson install --destdir` + DT_NEEDED closure check) in `bundle-contract.md`, or W2 is blocked on md-kb7 tooling.
 - **W8 depends on P0** (propose cells), not W1–W4; **W9 path** is `reference/bundle-contract.md`; **W4 creates** `Dockerfile.video`+`sway-session.sh` (no Tier-B artifacts existed); **W5/W6 soft-depend** on W4 (buildable against a host xdpw / any nested wlroots); **K8s agent-only Pod** is its own item (W3b).
-- **Phase-0 exit criterion** "every open architectural question has a decision" is not yet met. Bundle ownership, auth and bind are decided (§7.4 Q1–Q3, 2026-11-16). The FIPS tier, desktop-loss recovery, `--no-input` surface and K8s scope remain open (§7.4 Q4–Q7).
+- **Phase-0 exit criterion** "every open architectural question has a decision" is **met** (§7.4 Q1–Q7, all decided 2026-11-16). P0 still needs the `deploy/containers/` drafts.
 
 ### 7.4 Open decisions (answers change design or order)
 1. ~~Who builds the first runtime bundle?~~ **Resolved 2026-11-16: md-ah9 throwaway.** W2 ships `reference/bundle-contract.md` plus a clearly-labelled throwaway procedure (`meson install --destdir`, `-Dclient=false`, DT_NEEDED closure check against the image). md-kb7 inherits the *contract*, not the script. W2 is not blocked on md-kb7.
 2. ~~In-process MCP HTTP auth?~~ **Resolved 2026-11-16: Host/Origin checks + file-mounted bearer token (option C), plus NIP-98 as a second accepted credential.** See §7.7.
 3. ~~Reference HTTP bind?~~ **Resolved 2026-11-16: explicit `127.0.0.1`** in all reference artifacts via `--mcp-http-bind 127.0.0.1` (W1 adds the flag). The code default stays `[::1]`. W2/W3 still validate Docker-without-IPv6 and IPv4-dialing port-forwards on the pinned runtime versions.
-4. Desktop-loss policy — host exits on bus loss (restart-policy recovery) vs stay-up-unready + runbook?
-5. `--no-input` tool surface — unregister input tools from `tools/list`, or keep listed and return errors (plan's choice, needs §7.1)?
-6. Which tier does the FIPS reference serve (Tier B/C1 vs Tier A + proxy)?
-7. Is the agent-only Kubernetes Pod (W3b) in md-ah9 scope or deferred to md-5zi?
+4. ~~Desktop-loss policy?~~ **Resolved 2026-11-16: exit on loss.** The host exits nonzero when `md_a11y_is_connected()` goes false, and the container restart policy (with backoff) recovers. A restart re-resolves the new session's sockets. Readiness reports not-ready while logged out (W1, W2).
+5. ~~`--no-input` tool surface?~~ **Resolved 2026-11-16: both.** Under `--no-input`, input tools are not registered in `tools/list` (deploy-time). If input becomes unavailable at runtime, they return `is_error` naming the capability. Fake success is removed either way (W1).
+6. ~~Which tier does the FIPS reference serve?~~ **Resolved 2026-11-16: B, then A.** First Tier A plus a pass-through auth proxy on the mesh (W3). The binary-session Tier B/C1 reference follows once video lands (W3v).
+7. ~~Agent-only Kubernetes Pod?~~ **Resolved 2026-11-16: deferred to Tier B.** There is no Tier A K8s Pod. W3b becomes a Pod for the isolated Sway session, after W4/W5, at P4.
 
 ### 7.7 MCP HTTP authentication design (resolves §7.4 Q2)
 
