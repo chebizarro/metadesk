@@ -103,12 +103,25 @@ static char *bstr_to_cstr(BSTR bstr) {
     X(UIA_HyperlinkControlTypeId, MD_A11Y_ROLE_LINK) \
     X(UIA_DocumentControlTypeId, MD_A11Y_ROLE_DOCUMENT) \
     X(UIA_TableControlTypeId, MD_A11Y_ROLE_TABLE) \
-    X(UIA_HeaderControlTypeId, MD_A11Y_ROLE_HEADING) \
+    /* Header is the container of HeaderItems (a column-header row), not a
+     * heading; UIA expresses headings via the HeadingLevel property. */ \
+    X(UIA_HeaderControlTypeId, MD_A11Y_ROLE_PANEL) \
+    X(UIA_HeaderItemControlTypeId, MD_A11Y_ROLE_COLUMN_HEADER) \
     X(UIA_DataGridControlTypeId, MD_A11Y_ROLE_TABLE) \
     X(UIA_DataItemControlTypeId, MD_A11Y_ROLE_TABLE_CELL) \
     X(UIA_SplitButtonControlTypeId, MD_A11Y_ROLE_BUTTON) \
     X(UIA_SpinnerControlTypeId, MD_A11Y_ROLE_SPIN_BUTTON) \
-    X(UIA_ToolTipControlTypeId, MD_A11Y_ROLE_TOOL_TIP)
+    X(UIA_ToolTipControlTypeId, MD_A11Y_ROLE_TOOL_TIP) \
+    X(UIA_SeparatorControlTypeId, MD_A11Y_ROLE_SEPARATOR) \
+    /* Matches the AT-SPI "title bar" alias in a11y_vocab.h. */ \
+    X(UIA_TitleBarControlTypeId, MD_A11Y_ROLE_LABEL) \
+    X(UIA_CalendarControlTypeId, MD_A11Y_ROLE_CALENDAR) \
+    X(UIA_AppBarControlTypeId, MD_A11Y_ROLE_TOOL_BAR) \
+    X(UIA_SemanticZoomControlTypeId, MD_A11Y_ROLE_LIST) \
+    /* Deliberately UNKNOWN: Thumb is a scroll-bar drag handle and Custom has
+     * no fixed semantics. Listed so they are not logged as unmapped. */ \
+    X(UIA_ThumbControlTypeId, MD_A11Y_ROLE_UNKNOWN) \
+    X(UIA_CustomControlTypeId, MD_A11Y_ROLE_UNKNOWN)
 
 #define MD_UIA_ASSERT(native, role) static_assert(role >= 0 && role < MD_A11Y_ROLE_COUNT, "invalid UIA role");
 MD_UIA_ROLES(MD_UIA_ASSERT)
@@ -119,9 +132,25 @@ static const struct { CONTROLTYPEID native; enum MdA11yRole role; } uia_roles[] 
 #undef MD_UIA_ROW
 };
 #undef MD_UIA_ROLES
+/* Log each unmapped control type once (never per node per walk). UIA control
+ * types are a fixed set (UIA_*ControlTypeId, 50000..50040), so a 128-bit
+ * bitmap indexed from 50000 covers them; an out-of-range id (not produced by
+ * UIA) would be logged on every occurrence. */
+static void note_unmapped_control_type(CONTROLTYPEID ctid) {
+    static volatile LONG seen[4] = {0, 0, 0, 0}; /* 128 bits from 50000 */
+    long off = (long)ctid - 50000;
+    if (off >= 0 && off < 128) {
+        LONG bit = (LONG)1 << (off % 32);
+        LONG prev = InterlockedOr(&seen[off / 32], bit);
+        if (prev & bit) return;
+    }
+    MD_LOG_I("unmapped UIA control type %d -> unknown", (int)ctid);
+}
+
 static const char *control_type_to_role(CONTROLTYPEID ctid) {
     for (const auto &entry : uia_roles)
         if (entry.native == ctid) return md_a11y_role_name(entry.role);
+    note_unmapped_control_type(ctid);
     return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
 }
 
@@ -405,7 +434,9 @@ public:
         if (walker_) walker_->AddRef();
     }
 
-    virtual ~UIAChangeHandler() {
+    /* Not virtual: the class is final and Release() deletes via its own
+     * static type. COM interfaces carry no virtual destructor. */
+    ~UIAChangeHandler() {
         SAFE_RELEASE(walker_);
         SAFE_RELEASE(automation_);
     }

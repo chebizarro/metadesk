@@ -116,6 +116,44 @@ static void test_json_serialization(void) {
     printf("  PASS: JSON serialization\n");
 }
 
+/* md-yav: accessible names can contain CR/LF/TAB (seen live on Windows:
+ * taskbar clock "Clock 4:51 PM\r\n<LRM>11/16/2026", tray tooltips). The
+ * compact format is line-based, so a label must never split a node line. */
+static void test_compact_label_control_chars(void) {
+    MdA11yNode *root = make_node("1", "window", "Taskbar", 0, 0, 1920, 40);
+    MdA11yNode *clock = make_node("2", "button",
+                                  "Clock 4:51 PM\r\n\xE2\x80\x8E" "11/16", 0, 0, 80, 40);
+    node_add_state(clock, "enabled");
+    node_add_child(root, clock);
+    MdA11yNode *entry = make_node("3", "entry", "line1\nline2\tend", 0, 0, 80, 20);
+    node_add_child(root, entry);
+
+    char *compact = md_a11y_to_compact(root);
+    MD_CHECK(compact != NULL);
+    /* header + 3 node lines = exactly 4 newlines, no CR anywhere */
+    int newlines = 0;
+    for (const char *p = compact; p && *p; p++) if (*p == '\n') newlines++;
+    MD_CHECK(newlines == 4);
+    MD_CHECK(compact && strchr(compact, '\r') == NULL);
+    /* CRLF collapses to one space; UTF-8 (U+200E) passes through intact */
+    MD_CHECK(compact && strstr(compact, "BTN[2] Clock 4:51 PM \xE2\x80\x8E" "11/16 *enabled*") != NULL);
+    MD_CHECK(compact && strstr(compact, "TXT[3] 'line1 line2 end'") != NULL);
+
+    /* Targeted compact (all_roles) uses the same label path */
+    char *q = md_a11y_query_to_compact(clock, 0);
+    MD_CHECK(q && strchr(q, '\r') == NULL && strstr(q, "PM \xE2\x80\x8E") != NULL);
+
+    /* JSON keeps the raw label (cJSON escapes it) */
+    char *json = md_a11y_to_json(root);
+    MD_CHECK(json && strstr(json, "Clock 4:51 PM\\r\\n") != NULL);
+
+    free(q);
+    free(json);
+    free(compact);
+    md_a11y_node_free(root);
+    PASS("compact labels: control chars collapse to one space (no split lines)");
+}
+
 static void test_compact_serialization(void) {
     MdA11yNode *root = make_node("1", "window", "gedit - untitled",
                                   0, 0, 1920, 1080);
@@ -765,6 +803,7 @@ int main(void) {
     test_create_destroy();
     test_json_serialization();
     test_compact_serialization();
+    test_compact_label_control_chars();
     test_compact_interactable_filtering();
     test_compact_text_empty();
     test_delta_serialization();
