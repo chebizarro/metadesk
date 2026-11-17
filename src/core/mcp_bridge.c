@@ -13,6 +13,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
+#include <signal.h>
+#include <time.h>
 
 struct MdMcpBridge {
     MdSession          session;
@@ -70,7 +72,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     /* 1. Initialize session */
     md_session_init(&b->session);
     b->session.capabilities = MD_CAP_AGENT;
-    if (config->input) b->session.capabilities |= MD_CAP_INPUT;
+    if (md_input_is_ready(config->input)) b->session.capabilities |= MD_CAP_INPUT;
     b->session.state = MD_SESSION_NEGOTIATING;
 
     /* Generate session ID */
@@ -104,6 +106,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
 
     /* 4. Register tools */
     b->tool_ctx.agent = b->agent;
+    b->tool_ctx.input = config->input;
     b->tool_ctx.snapshot = b->snapshot;
     if (md_mcp_register_tools(b->server, &b->tool_ctx) != 0)
         goto fail;
@@ -184,6 +187,92 @@ int md_mcp_bridge_run(MdMcpBridge *bridge)
 
     /* No transport configured */
     return -1;
+}
+
+typedef struct {
+    MdMcpBridge *bridge;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool done;
+    bool desktop_lost;
+} McpLifecycle;
+
+static void *bridge_signal_wait(void *userdata)
+{
+    McpLifecycle *life = userdata;
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    int sig;
+    if (sigwait(&signals, &sig) == 0)
+        md_mcp_bridge_shutdown(life->bridge);
+    return NULL;
+}
+
+static void *bridge_watch_desktop(void *userdata)
+{
+    McpLifecycle *life = userdata;
+    pthread_mutex_lock(&life->mu);
+    while (!life->done) {
+        if (!md_a11y_is_connected(life->bridge->a11y)) {
+            life->desktop_lost = true;
+            pthread_mutex_unlock(&life->mu);
+            MD_LOG_E("accessibility backend disconnected");
+            md_mcp_bridge_shutdown(life->bridge);
+            return NULL;
+        }
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100 * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&life->cv, &life->mu, &deadline);
+    }
+    pthread_mutex_unlock(&life->mu);
+    return NULL;
+}
+
+int md_mcp_bridge_run_supervised(MdMcpBridge *bridge)
+{
+    if (!bridge) return -1;
+    McpLifecycle life = { .bridge = bridge };
+    if (pthread_mutex_init(&life.mu, NULL) != 0) return -1;
+    if (pthread_cond_init(&life.cv, NULL) != 0) {
+        pthread_mutex_destroy(&life.mu);
+        return -1;
+    }
+    int rc = -1;
+    pthread_t signal_thread, desktop_thread;
+    bool signal_started = pthread_create(&signal_thread, NULL, bridge_signal_wait, &life) == 0;
+    bool desktop_started = signal_started &&
+        pthread_create(&desktop_thread, NULL, bridge_watch_desktop, &life) == 0;
+    if (desktop_started) {
+        rc = md_mcp_bridge_run(bridge);
+    } else {
+        MD_LOG_E("failed to start lifecycle threads");
+        md_mcp_bridge_shutdown(bridge);
+    }
+    pthread_mutex_lock(&life.mu);
+    life.done = true;
+    pthread_cond_signal(&life.cv);
+    pthread_mutex_unlock(&life.mu);
+    if (desktop_started)
+        pthread_join(desktop_thread, NULL);
+    /* Also catch a disconnect coincident with transport EOF. */
+    if (life.desktop_lost || !md_a11y_is_connected(bridge->a11y))
+        rc = -1;
+    if (signal_started) {
+        /* Wake a still-waiting sigwait on normal EOF. Bridge stays alive
+         * until both lifecycle threads are joined. */
+        pthread_kill(signal_thread, SIGTERM);
+        pthread_join(signal_thread, NULL);
+    }
+    pthread_cond_destroy(&life.cv);
+    pthread_mutex_destroy(&life.mu);
+    return rc;
 }
 
 void md_mcp_bridge_shutdown(MdMcpBridge *bridge)

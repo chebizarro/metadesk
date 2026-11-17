@@ -173,14 +173,18 @@ static int agent_execute_locked(MdAgent *agent,
         }
     }
 
-    /* Inject the action */
-    if (agent->input) {
-        ret = md_input_execute_action(agent->input, &action);
-        if (ret < 0) {
-            MD_LOG_I("action injection failed");
-            md_action_cleanup(&action);
-            return -1;
-        }
+    /* Do not acknowledge an action that could not be injected. */
+    if (!md_input_is_ready(agent->input)) {
+        MD_LOG_E("input capability unavailable");
+        md_action_cleanup(&action);
+        return -1;
+    }
+
+    ret = md_input_execute_action(agent->input, &action);
+    if (ret < 0) {
+        MD_LOG_I("action injection failed");
+        md_action_cleanup(&action);
+        return -1;
     }
 
     md_action_cleanup(&action);

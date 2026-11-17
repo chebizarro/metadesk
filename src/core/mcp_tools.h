@@ -20,12 +20,13 @@ extern "C" {
  * execute actions. */
 typedef struct {
     MdA11ySnapshot *snapshot;   /* borrowed; shared MCP read snapshot */
+    MdInput   *input;           /* borrowed; real input readiness gates actions */
     MdAgent   *agent;           /* agent handler for action dispatch   */
     void      *_handler_ctxs;   /* internal: heap-allocated per-tool contexts,
                                    freed by md_mcp_tools_cleanup()       */
 } MdMcpToolCtx;
 
-/* Register all metadesk read and action tools with the MCP server.
+/* Register read tools, plus action tools only when input is ready.
  * The tool_ctx must remain valid for the lifetime of the server.
  * Returns 0 on success, -1 if any registration fails. */
 int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx);

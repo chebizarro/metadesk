@@ -354,16 +354,18 @@ static int test_injection_failure_propagates(void) {
 static int test_mcp_tool_requires_a11y_returns_error(void) {
     printf("  test_mcp_tool_requires_a11y_returns_error... ");
 
+    AgentMockInputData data = {0};
+    MdInput input = make_agent_mock_input(&data);
     MdAgentConfig cfg = {
         .a11y        = NULL,
-        .input       = NULL,
+        .input       = &input,
         .tree_format = MD_TREE_FORMAT_JSON,
         .settle_ms   = 1,
     };
     MdAgent *agent = md_agent_create(&cfg);
     MD_CHECK(agent != NULL);
 
-    MdMcpToolCtx tool_ctx = { .agent = agent };
+    MdMcpToolCtx tool_ctx = { .agent = agent, .input = &input };
     MdMcpServer *server = make_agent_mcp_server(&tool_ctx);
 
     const char *call = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":42,"
@@ -524,6 +526,37 @@ static int agent_fake_tree(MdA11yCtx *ctx, MdA11yNode **out) {
     return 0;
 }
 
+static int test_missing_input_never_acknowledges(void) {
+    printf("  test_missing_input_never_acknowledges... ");
+    const MdA11yBackend backend = { .get_tree = agent_fake_tree };
+    AgentMockInputData data = {0};
+    MdInput input = make_agent_mock_input(&data);
+    input.ready = false;
+    for (int i = 0; i < 2; i++) {
+        int walks = 0;
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = &walks };
+        MD_CHECK(pthread_mutex_init(&a11y.snapshot_mu, NULL) == 0);
+        MdAgentConfig cfg = {
+            .a11y = &a11y, .input = i ? &input : NULL,
+            .tree_format = MD_TREE_FORMAT_JSON, .settle_ms = 1,
+        };
+        MdAgent *agent = md_agent_create(&cfg);
+        MD_CHECK(agent != NULL);
+        const char action[] = "{\"v\":1,\"action\":\"type\",\"payload\":{\"text\":\"hello\"}}";
+        char *result = md_agent_handle_action_mcp(agent,
+            (const uint8_t *)action, sizeof(action) - 1);
+        MD_CHECK(result == NULL);
+        free(result);
+        MD_CHECK(md_agent_get_action_count(agent) == 0);
+        MD_CHECK(data.type_text_calls == 0);
+        MD_CHECK(walks == 0);
+        md_agent_destroy(agent);
+        pthread_mutex_destroy(&a11y.snapshot_mu);
+    }
+    printf("OK\n");
+    return 0;
+}
+
 static int test_format_aware_updates(void) {
     printf("  test_format_aware_updates... ");
     const MdA11yBackend backend = { .get_tree = agent_fake_tree };
@@ -547,8 +580,11 @@ static int test_format_aware_updates(void) {
         int count = 0;
         MdA11yDelta *initial = md_a11y_diff(&a11y, &count);
         md_a11y_delta_free(initial, count);
+        AgentMockInputData data = {0};
+        MdInput input = make_agent_mock_input(&data);
         MdAgentConfig cfg = {
             .a11y = &a11y,
+            .input = &input,
             .tree_format = compact ? MD_TREE_FORMAT_COMPACT : MD_TREE_FORMAT_JSON,
             .settle_ms = 1,
         };
@@ -612,6 +648,7 @@ int main(void) {
     failures += test_handle_invalid_payload();
     failures += test_default_settle();
     failures += test_handle_action_mcp();
+    failures += test_missing_input_never_acknowledges();
     failures += test_format_aware_updates();
 
     clear_agent_mcp_response();

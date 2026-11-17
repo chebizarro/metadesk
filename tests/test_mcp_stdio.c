@@ -74,7 +74,10 @@ static TestHarness *harness_create(void)
     h->stdio_ctx = md_mcp_stdio_create(h->server, h->agent_to_server[0],
                                         h->server_to_agent[1]);
 
-    /* Register tools */
+    /* This harness tests the full tool surface and no-agent errors, not
+     * deployment-time input availability. No input operation is dispatched. */
+    static MdInput ready_input = { .ready = true };
+    h->tool_ctx.input = &ready_input;
     md_mcp_register_tools(h->server, &h->tool_ctx);
 
     return h;
@@ -386,6 +389,53 @@ static void test_stdio_shared_nonblocking_input(void)
     PASS("dup'd input/output flags unchanged; initially idle nonblocking input survives");
 }
 
+static void test_stdio_shutdown_blocking_input(bool partial)
+{
+    int pair[2];
+    MD_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    int flags = fcntl(pair[0], F_GETFL);
+    MD_CHECK(flags >= 0 && !(flags & O_NONBLOCK));
+    MdMcpServerConfig config = { .server_name = "blocking-shutdown" };
+    MdMcpServer *server = md_mcp_server_create(&config);
+    MdMcpStdio *ctx = md_mcp_stdio_create(server, pair[0], pair[0]);
+    MD_CHECK(ctx != NULL);
+    NonblockingRun run = { .ctx = ctx, .mu = PTHREAD_MUTEX_INITIALIZER,
+                          .cv = PTHREAD_COND_INITIALIZER };
+    pthread_t tid;
+    MD_CHECK(pthread_create(&tid, NULL, nonblocking_run, &run) == 0);
+    const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+    MD_CHECK(write(pair[1], request, sizeof(request) - 1) == sizeof(request) - 1);
+    MD_CHECK(md_test_wait_readable(pair[1], 2000) == 1);
+    char response[2048] = {0};
+    MD_CHECK(read(pair[1], response, sizeof(response) - 1) > 0);
+    MD_CHECK(strstr(response, "\"result\"") != NULL);
+    if (partial) MD_CHECK(write(pair[1], "{", 1) == 1);
+    md_mcp_stdio_shutdown(ctx);
+    pthread_mutex_lock(&run.mu);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec++;
+    while (!run.returned) {
+        int rc = pthread_cond_timedwait(&run.cv, &run.mu, &deadline);
+        if (rc == ETIMEDOUT) break;
+        MD_CHECK(rc == 0);
+        if (rc != 0) break;
+    }
+    MD_CHECK(run.returned); /* writer is still open: shutdown, not EOF */
+    pthread_mutex_unlock(&run.mu);
+    /* Bound cleanup even if the liveness assertion failed. */
+    shutdown(pair[1], SHUT_WR);
+    MD_CHECK(pthread_join(tid, NULL) == 0);
+    MD_CHECK(run.rc == 0);
+    MD_CHECK(fcntl(pair[0], F_GETFL) == flags);
+    md_mcp_stdio_destroy(ctx);
+    md_mcp_server_destroy(server);
+    pthread_cond_destroy(&run.cv);
+    pthread_mutex_destroy(&run.mu);
+    close(pair[0]); close(pair[1]);
+    PASS("shutdown wakes blocking input, including an incomplete line, without EOF or flag changes");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
@@ -399,6 +449,8 @@ int main(void)
     test_stdio_broken_pipe();
     test_stdio_stalled_pipe();
     test_stdio_shared_nonblocking_input();
+    test_stdio_shutdown_blocking_input(false);
+    test_stdio_shutdown_blocking_input(true);
 
     printf("\nAll MCP stdio tests passed.\n");
     return md_test_report();

@@ -72,6 +72,13 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config);
  * Returns 0 on clean shutdown, -1 on error. */
 int md_mcp_bridge_run(MdMcpBridge *bridge);
 
+/* Host lifecycle: run with a dedicated SIGINT/SIGTERM sigwait thread and
+ * accessibility-liveness supervision. Returns -1 on desktop loss/error.
+ * Caller MUST block SIGINT/SIGTERM before creating any threads (including
+ * backend/bridge creation). All supervisor threads are joined before return;
+ * caller still owns bridge destruction and borrowed a11y/input contexts. */
+int md_mcp_bridge_run_supervised(MdMcpBridge *bridge);
+
 /* Signal the bridge to shut down (thread-safe). */
 void md_mcp_bridge_shutdown(MdMcpBridge *bridge);
 

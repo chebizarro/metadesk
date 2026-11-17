@@ -464,6 +464,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
+    fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
+    fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
     fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource only (default: compact); action results always JSON\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
@@ -550,10 +552,69 @@ static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) 
     return 0;
 }
 
+/* ── MCP lifecycle ───────────────────────────────────────────── */
+
+static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
+                        const char *bind_addr, bool no_input,
+                        MdMcpTreeFormat tree_format) {
+    int rc = 1;
+    MdA11yCtx *a11y = md_a11y_create();
+    MdInput *input = NULL;
+    MdMcpBridge *bridge = NULL;
+    if (!md_a11y_is_connected(a11y)) {
+        fprintf(stderr, "host[mcp]: accessibility backend unavailable\n");
+        goto cleanup;
+    }
+
+    if (!no_input) {
+        uint32_t width = 0, height = 0;
+        host_apply_fallback_dimensions(&width, &height,
+                                       "MCP mode has no capture pipeline");
+        MdInputConfig input_cfg = { .screen_width = width, .screen_height = height };
+        input = md_input_create(&input_cfg);
+        if (!md_input_is_ready(input))
+            fprintf(stderr, "host[mcp]: input unavailable; action tools disabled\n");
+    }
+    MdMcpBridgeConfig cfg = {
+        .a11y = a11y,
+        .input = input,
+        .tree_format = tree_format,
+        .settle_ms = 100,
+        .stdio_in_fd = stdio_mode ? STDIN_FILENO : -1,
+        .stdio_out_fd = stdio_mode ? STDOUT_FILENO : -1,
+        .http_bind_addr = bind_addr,
+        .http_port = http_mode ? (port ? port : MD_MCP_HTTP_DEFAULT_PORT) : 0,
+    };
+    bridge = md_mcp_bridge_create(&cfg);
+    if (!bridge) {
+        fprintf(stderr, "host[mcp]: failed to create MCP bridge\n");
+        goto cleanup;
+    }
+
+    fprintf(stderr, "host[mcp]: serving on %s\n", stdio_mode ? "stdio" : "HTTP");
+    rc = md_mcp_bridge_run_supervised(bridge) < 0 ? 1 : 0;
+
+cleanup:
+    md_mcp_bridge_destroy(bridge);
+    if (input) md_input_destroy(input);
+    if (a11y) md_a11y_destroy(a11y);
+    return rc;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    install_signal_handlers();
+    /* Every subsequently created thread inherits this mask. MCP consumes
+     * termination signals with sigwait, never an async-signal-unsafe handler. */
+    sigset_t term_signals;
+    sigemptyset(&term_signals);
+    sigaddset(&term_signals, SIGINT);
+    sigaddset(&term_signals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &term_signals, NULL) != 0) {
+        fprintf(stderr, "ERROR: cannot block termination signals\n");
+        return 1;
+    }
+    signal(SIGPIPE, SIG_IGN);
 
     /* Default options */
     uint16_t port = MD_STREAM_PORT;
@@ -570,6 +631,9 @@ int main(int argc, char **argv) {
     bool do_capture = true;
     bool mcp_stdio = false;
     bool mcp_http = false;
+    bool no_input = false;
+    bool signaling_option = false;
+    const char *mcp_http_bind = NULL;
     MdMcpTreeFormat mcp_tree_format = MD_MCP_TREE_FORMAT_DEFAULT;
     uint16_t mcp_http_port = 0;  /* 0 = default (7710) */
     uint32_t fips_ready_timeout_ms = 10000;
@@ -578,6 +642,11 @@ int main(int argc, char **argv) {
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--npub") == 0 || strcmp(argv[i], "--relay") == 0 ||
+            strcmp(argv[i], "--bunker") == 0 || strcmp(argv[i], "--dbus-signer") == 0 ||
+            strcmp(argv[i], "--socket-signer") == 0 || strcmp(argv[i], "--auto-signer") == 0 ||
+            strcmp(argv[i], "--fips-control") == 0 || strcmp(argv[i], "--fips-ready-timeout") == 0)
+            signaling_option = true;
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
@@ -610,6 +679,15 @@ int main(int argc, char **argv) {
             if (relay_count < 16)
                 relay_urls[relay_count++] = argv[++i];
         }
+        else if (strcmp(argv[i], "--no-input") == 0)
+            no_input = true;
+        else if (strcmp(argv[i], "--mcp-http-bind") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "Missing --mcp-http-bind address\n");
+                return 1;
+            }
+            mcp_http_bind = argv[++i];
+        }
         else if (strcmp(argv[i], "--mcp") == 0)
             mcp_stdio = true;
         else if (strncmp(argv[i], "--mcp-tree-format=", 18) == 0 ||
@@ -635,6 +713,22 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+
+    if ((mcp_stdio && mcp_http) || (mcp_http_bind && !mcp_http) ||
+        ((mcp_stdio || mcp_http) && signaling_option)) {
+        fprintf(stderr, "ERROR: MCP requires one transport; --mcp-http-bind requires HTTP; "
+                        "MCP cannot use video-session Nostr/FIPS/signer options\n");
+        return 1;
+    }
+
+    /* MCP does not use video session negotiation, Nostr or its session log.
+     * Enter before allocating them, and reserve stdout for JSON-RPC. */
+    if (mcp_stdio || mcp_http)
+        return host_run_mcp(mcp_stdio, mcp_http, mcp_http_port,
+                            mcp_http_bind, no_input, mcp_tree_format);
+
+    install_signal_handlers();
+    pthread_sigmask(SIG_UNBLOCK, &term_signals, NULL);
 
     printf("metadesk-host v0.1.0\n");
     printf("  port:      %u\n", port);
@@ -869,71 +963,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ── MCP agent interface ──────────────────────────────────── */
-    if (mcp_stdio || mcp_http) {
-        const char *mode = mcp_stdio ? "stdio" : "http";
-        printf("host: starting MCP server on %s\n", mode);
-
-        /* Initialize a11y + input for MCP mode */
-        MdA11yCtx *mcp_a11y = md_a11y_create();
-        if (md_a11y_is_connected(mcp_a11y)) {
-            printf("host[mcp]: accessibility tree connected\n");
-        } else {
-            fprintf(stderr, "host[mcp]: WARNING: a11y unavailable\n");
-            md_a11y_destroy(mcp_a11y);
-            mcp_a11y = NULL;
-        }
-
-        uint32_t mcp_screen_w = 0, mcp_screen_h = 0;
-        host_apply_fallback_dimensions(&mcp_screen_w, &mcp_screen_h,
-                                       "MCP mode has no capture pipeline");
-        MdInputConfig mcp_input_cfg = {
-            .screen_width = mcp_screen_w,
-            .screen_height = mcp_screen_h,
-        };
-        MdInput *mcp_input = md_input_create(&mcp_input_cfg);
-        if (mcp_input && md_input_is_ready(mcp_input))
-            printf("host[mcp]: input injection ready\n");
-        else
-            fprintf(stderr, "host[mcp]: WARNING: input unavailable\n");
-
-        MdMcpBridgeConfig mcp_cfg = {
-            .a11y = mcp_a11y,
-            .input = mcp_input,
-            .tree_format = mcp_tree_format,
-            .settle_ms = 100,
-            .stdio_in_fd = mcp_stdio ? STDIN_FILENO : -1,
-            .stdio_out_fd = mcp_stdio ? STDOUT_FILENO : -1,
-            .http_port = mcp_http
-                ? (mcp_http_port > 0 ? (uint16_t)mcp_http_port
-                                     : (uint16_t)MD_MCP_HTTP_DEFAULT_PORT)
-                : 0,
-        };
-
-        MdMcpBridge *mcp_bridge = md_mcp_bridge_create(&mcp_cfg);
-        if (!mcp_bridge) {
-            fprintf(stderr, "ERROR: failed to create MCP bridge\n");
-            return 1;
-        }
-
-        if (mcp_http) {
-            uint16_t actual_port = mcp_http_port > 0
-                                   ? mcp_http_port
-                                   : MD_MCP_HTTP_DEFAULT_PORT;
-            printf("host[mcp]: HTTP+SSE listening on port %u\n", actual_port);
-        }
-
-        int mcp_rc = md_mcp_bridge_run(mcp_bridge);
-
-        md_mcp_bridge_destroy(mcp_bridge);
-
-        if (signer) md_signer_destroy(signer);
-        if (mcp_a11y) md_a11y_destroy(mcp_a11y);
-        if (mcp_input) md_input_destroy(mcp_input);
-        printf("host: MCP session ended (rc=%d)\n", mcp_rc);
-        return mcp_rc < 0 ? 1 : 0;
-    }
-
     /* Create TCP server */
     MdStreamServer *srv = md_stream_server_create(bind_addr, port);
     if (!srv) {
@@ -1011,7 +1040,7 @@ int main(int argc, char **argv) {
         .screen_width  = display_width,
         .screen_height = display_height,
     };
-    MdInput *input = md_input_create(&input_cfg);
+    MdInput *input = no_input ? NULL : md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
         fprintf(stderr, "WARNING: input injection unavailable\n");
     } else {

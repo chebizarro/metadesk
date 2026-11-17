@@ -129,13 +129,25 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
             buf = new_buf;
         }
 
+        /* Blocking stdin must not strand a shutdown request. Do not change
+         * descriptor flags: dup'd stdin may share its open-file description
+         * with the launcher. This transport is the sole reader. */
+        struct pollfd pfd = { .fd = ctx->in_fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, 100);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            return -1;
+        }
+        if (ready == 0 || atomic_load(&ctx->shutdown)) continue;
+        if (pfd.revents & POLLNVAL) {
+            free(buf);
+            return -1;
+        }
+
         ssize_t n = read(ctx->in_fd, buf + buf_len, buf_cap - buf_len - 1);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* A launcher may supply nonblocking input. Wait for readiness,
-             * not EOF; the bounded wait also observes explicit shutdown. */
-            struct pollfd pfd = { .fd = ctx->in_fd, .events = POLLIN };
-            int rc = poll(&pfd, 1, 100);
-            if (rc < 0 && errno != EINTR) break;
+            /* Nonblocking launchers can race readiness; retry the poll. */
             continue;
         }
         if (n <= 0) {
