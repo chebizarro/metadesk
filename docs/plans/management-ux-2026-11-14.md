@@ -23,11 +23,12 @@ Corrected against the 2026-11-14 design review (`docs/reviews/management-ux-plan
 | P2.4 | Encrypted management store + replacement/conflict | Deterministic ordering, owner-separated cache/outbox, safety latch; no plaintext/secrets on disk | `src/core/managed_store.c/.h` | P1.2 | M |
 | P2.5 | Canonical host resolution + NIP-65/NIP-17 routing | NIP-05/19/65 linked; **metadesk-owned NIP-05 HTTPS fetch** (`nostr_nip05_resolve_from_json`; scrub `NIP05_ALLOW_INSECURE`/`NIP05_TIMEOUT_MS`); 10050 parse linked + unsigned builder (P1.2); pin-mismatch + unsafe-URL rejection; registry kind constants | `src/core/identity_resolver.*`, `relay_plan.*`; `meson.build` | P1.1 | M |
 | P2.6 | Harden signer/bridge concurrency, DM auth, teardown | Serialized signer, live key-pin check, bounded unwrap, named NIP-17/59 validation (§7); **NIP-42 AUTH→MdSigner bridge off the reader thread**; safe shutdown | `src/core/nostr.c/.h`, `signer.c/.h` | P1.1 | M |
-| P3.7 | Host approval policy + capability grants + **headless admin CLI** | `MdHostAccess` state machine, load states, deadlines, no-UI denial; `metadesk-host access upsert/remove <npub> <caps>` for headless/macOS hosts; pure-SM tests pass | `src/core/host_access.c/.h`, `src/host/main.c` | P2.4, P2.6, P3.8a | M |
+| P2.7 | **Signer accounts + user-assigned roles** (§7.6) | Account list over `MdSigner` backends (55L/5F/46); host + client role bindings; NIP-46 credentials in Secret Service/Keychain; role switch revokes generation; CLI binding for headless hosts | `src/core/accounts.c/.h` (new), `signer.c/.h`, `host/main.c`, `tests/test_accounts.c` | P2.6 | M |
+| P3.7 | Host approval policy + capability grants + **headless admin CLI** | `MdHostAccess` state machine, load states, deadlines, no-UI denial; `metadesk-host access upsert/remove <npub> <caps>` for headless/macOS hosts; pure-SM tests pass | `src/core/host_access.c/.h`, `src/host/main.c` | P2.4, P2.6, P2.7, P3.8a | M |
 | P3.8a | Session-v2 **types/parsers** | `request_id`/`stream_token`/deadlines/bind types in `session.c`; strict validation; bind payload sized to the 8 KiB limit (not `json_buf[4096]`) | `src/core/session.c/.h` | P2.5 | M |
 | P3.8b | Session-v2 **entrypoint adoption** + one-use binding (**atomic**) | CSPRNG tokens, candidate-stream gate; no video/tree/input before bind; capability gates incl. MCP dispatch path | `src/core/stream.c/.h`, `host/main.c`, `client/main.c`, `mcp_server.c` | P3.7, P3.8a | L |
 | P3.9 | Same-user host IPC + private client launch | **New** `SO_PEERCRED`/`getpeereid` peer-cred check (not "reuse"); socket-layout decision vs existing `metadesk-<name>.sock`; inherited FD; no creds in argv | `src/core/management_ipc.*`, `ipc_unix.c`, `client/main.c` | P3.7 | M |
-| P4.10 | Linux management shell + signer onboarding | Adaptive nav, Grotto identity panel, explicit relays; reuse grotto-panels `tests/fake-service.c` for GTK smoke; no GTK in host/core/client-only builds | `src/manager/*`, `meson_options.txt`, `meson.build` | P2.*, P3.9 | L |
+| P4.10 | Linux management shell + signer onboarding | Adaptive nav, **signer account list + host/client role picker** (§7.6), Grotto identity panel, explicit relays; reuse grotto-panels `tests/fake-service.c` for GTK smoke; no GTK in host/core/client-only builds | `src/manager/*`, `meson_options.txt`, `meson.build` | P2.*, P3.9 | L |
 | P4.11a | Host collections + connect flow (**ships on session v1**) | Hosts/favorites/tags, pin review, save/import/export, QR, client launch; keyboard-only + 360px + offline | `src/manager/md-page-{hosts,identity,relays}.c`, `md-client-launch.*` | P4.10, P2.* | M |
 | P4.11b | Approval inbox + scoped grants UI | Scoped inbox, grant display, notification withdraw on expiry/cancel | `src/manager/md-page-{host,access}.c`, `md-approval.*` | P4.10, P3.7, P3.8b, P3.9 | M |
 | P4.12 | Responsive connect/reconnect in SDL overlay | Async progress, explicit actions, input consumption, texture reset, grant display | `src/client/ui.cpp/.h`, `render.c/.h` | P3.8b | M |
@@ -1086,7 +1087,7 @@ Applied from `docs/reviews/management-ux-plan-critique-2026-11-14.md` (code-veri
 - **Cross-link** spin-offs to `md-3nv`, `md-d9y`, `md-aqf` with `bd dep` instead of duplicating.
 
 ### 7.3 Requirements newly surfaced (absent from the export)
-- **Host identity model (decide before P3.x):** host signaling key must equal the per-node FIPS key (§3.4) and every doc is keyed `(kind, author, d)` with fixed `d=metadesk-allowlist` — so a user cannot reuse one identity across machines without colliding on that coordinate. Decide: host identity = **per-machine** (companion is two-identity: user + this-machine) or = user identity (then FIPS provisioned with the user key, multi-host unsupported in v1). This changes `MdManagementConfig`, the Identity/This-Computer pages, and the cache layout.
+- **Host identity model** (→ **resolved in §7.6**, 2026-11-16): host signaling key must equal the per-node FIPS key (§3.4) and every doc is keyed `(kind, author, d)` with fixed `d=metadesk-allowlist` — so a user cannot reuse one identity across machines without colliding on that coordinate. Decide: host identity = **per-machine** (companion is two-identity: user + this-machine) or = user identity (then FIPS provisioned with the user key, multi-host unsupported in v1). This changes `MdManagementConfig`, the Identity/This-Computer pages, and the cache layout.
 - **Host process lifecycle/ownership:** nothing says who starts `metadesk-host`, nor behavior at logout/lock/reboot for unattended access. Decide a lifecycle (e.g. systemd user unit with `--managed`, autostart, restart-on-crash) and an IPC "host not running → start host" affordance, or declare it out of scope with a CLI path.
 - **Headless/macOS admin path:** removing auto-grant leaves headless and macOS (no GTK in v1) hosts unable to remember clients — `src/host/main.c` has no allowlist flags today. P3.7 adds `metadesk-host access upsert/remove` over the same IPC, or the plan must say headless hosting is unsupported until P4 (contradicting §3.1).
 - **NIP-42 AUTH on DM relays:** NIP-17 inboxes typically require AUTH for `#p` REQs; nostrc has `nostr_relay_set_auth_callback/auth(...)` (`nostr-relay.h:163–181`) but the sign callback is synchronous — bridging it to an async `MdSigner` off the reader thread is real design (add to P2.6 with a test).
@@ -1098,7 +1099,7 @@ Applied from `docs/reviews/management-ux-plan-critique-2026-11-14.md` (code-veri
 Address-book **import/export** and **QR scan/display** (Grotto has `sheet-qr-display.c`) fold into P4.11a; **clipboard**, **multi-monitor selection**, **quality settings (resolution/bitrate/fps)**, and an **in-overlay connection manager** are deferred (the overlay stays lightweight) — each to be filed as a separate later item, not silently dropped.
 
 ### 7.5 Open decisions (answers change design or order)
-1. Host identity model — per-machine vs user identity; is multi-host-per-user a v1 requirement?
+1. ~~Host identity model~~ — **resolved 2026-11-16 → §7.6** (user-assigned signer accounts per role).
 2. Host-process lifetime owner — systemd user service vs operator-run CLI; is unattended-after-logout required?
 3. Is headless (macOS/agent-mode) hosting required in the first release? If yes, the CLI admin surface is in P3.7.
 4. Are AUTH-required DM relays in scope for v1? If no, the first-run DM-relay picker filters them via NIP-11.
@@ -1107,5 +1108,29 @@ Address-book **import/export** and **QR scan/display** (Grotto has `sheet-qr-dis
 7. NIP-05 fetch ownership — metadesk HTTPS client + `resolve_from_json`, or a nostrc API change?
 8. One `NostrSimplePool` per concern (DM inbox / own docs / discovery) to sidestep the shared-filter limit and let P2.5/P2.6 start before P1.1, at the cost of duplicate connections under the 32-connection cap?
 9. `docs/designs/` vs `docs/plans/` as the canonical home for this deliverable.
+
+### 7.6 Decision: signer accounts with user-assigned roles (2026-11-16)
+
+**Direction (user):** metadesk supports a signer interface like Groundhog and GNostr and lets the user decide which key is used for what. This resolves §7.5 Q1 and **replaces** the single pinned identity in §3.4/§3.5 (`expected_signer_pubkey`, "pinned signer identity").
+
+**Prior art in nostrc (verified 2026-11-16):**
+- **Groundhog — the reference model.** `GhIdentityInfo` = npub + label + backend (`GROTTO`|`NIP46`) (`gnome/groundhog/src/identity/gh-identity.h:8–24`). The GTK-free `GhAccountController` selects by backend + npub, revokes the old generation on switch, and binds a `GhSigner` (`gh-account-controller.h:84–107, 145–160`; `.c:451–548, 953–1000`). The active pair is persisted as GSettings `current-backend` + `current-npub` (`data/org.nostr.Groundhog.gschema.xml:11–24`). NIP-46 client secret / remote pubkey / relays live in Secret Service (Linux) or Keychain (macOS) via `GhNip46CredentialStore`, keyed by user pubkey (`src/identity/gh-nip46-credentials.h:9–72`). Local keys stay in Grotto; removing an account deletes only remote credentials (`src/app/gh-account-ui.c:615–684`).
+- **GNostr — weaker variant.** A `known-accounts` npub list plus one global `GnostrSignerService` (`NONE`|`NIP55L`|`NIP46`); NIP-46 secrets are stored in GSettings, not libsecret (`apps/gnostr/src/ipc/gnostr-signer-service.h:60–117`; `src/ui/gnostr-login.c:1486–1521`). Not the pattern to copy for credential storage.
+- Neither app supports NIP-5F, and neither has per-purpose key choice (one active account). `nostr-gobject` only supplies the D-Bus proxy; there is no shared account library.
+
+**Design:**
+- **Account** = `(backend, pubkey, label)`. Backends: NIP-55L/Grotto, NIP-5F socket, NIP-46 (`bunker://`, `nostrconnect://`) — exactly what `MdSigner` already implements (`src/core/signer.h:127–163`), so metadesk is a superset of Groundhog's transports. Direct-key remains test/explicit-integration only (no native key vault — unchanged).
+- **Roles**, each bound by the user to one account:
+  - **client** — signs session requests; owns the address book, favorites, tags, and NIP-78 app data (the owner-separated cache is keyed by this account).
+  - **host** (per machine) — the identity `metadesk-host` signs as; owns `metadesk-allowlist` and receives session requests.
+
+  The same account may fill both roles. `MdManagement` holds up to two `MdSigner` instances, shared when both roles bind the same account; per-signer serialization (§3.4) is unchanged.
+- **Constraints become validation, not mandates.** When hosting over FIPS, the host-role account must equal the local FIPS node pubkey reported by `show_status` (§3.4): the picker suggests that account and blocks managed FIPS hosting on mismatch with a diagnostic. Direct-IP hosting accepts any account. Because FIPS node keys are per node, the host identity is effectively per machine, so `metadesk-allowlist` coordinates do not collide across machines (reusing one FIPS node key on two machines is unsupported).
+- **Persistence.** Role bindings are `(backend, pubkey)` pairs in local `management.json` (replacing `signer_backend` / `expected_signer_pubkey` in §3.6). NIP-46 credentials go in Secret Service / Keychain following `GhNip46CredentialStore`, keyed by account pubkey — never in NIP-78, config, argv, or plaintext. This **moves "Persistent NIP-46 pairing" (§6 Deferred) into scope.**
+- **Switching / removing.** Rebinding a role revokes that role's previous generation (Groundhog pattern), cancels its sessions and document operations, then loads the new owner's cache. Removing an account deletes only metadesk-held remote credentials, never signer-held keys.
+- **Headless hosts.** The same bindings are settable from the host CLI (e.g. `metadesk-host account bind host <backend> <pubkey>`), so headless/macOS hosts do not depend on the GTK companion (addresses part of §7.3 / §7.5 Q3).
+- **Reuse strategy.** Mirror Groundhog's model in metadesk's plain-C core (`src/core/accounts.c/.h`, cross-platform; GObject/GSettings stay out of core) and use Groundhog's account UI and credential store as the GTK reference. *Alternative considered:* extract Groundhog's GTK-free controller + credential store into a shared nostrc library — more reuse, but GObject-based (Linux-only) and cross-repo; revisit if a third app needs it.
+
+**Effects:** new work item **P2.7** (index); P3.7 consumes the host-role binding; P4.10 provides the account list and role picker; §4.2 gains `src/core/accounts.c/.h` and `tests/test_accounts.c`.
 
 

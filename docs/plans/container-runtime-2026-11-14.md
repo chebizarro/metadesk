@@ -861,6 +861,12 @@ Do not change `fips_addr.c` or duplicate `fips_control.c` readiness logic for co
 
 Applied from `docs/reviews/container-runtime-plan-critique-2026-11-14.md` (code-verified against metadesk; `capture_pipewire.c` not re-checked). These correct or extend §1–§6; where a correction contradicts body text, the correction wins. Leftover context_builder-session phrasing in the body ("the revised document should distinguish", "*Retain the existing section*", "the supplied material omits `a11y.h`", "this text-only pass", Phase-0 "update the plan") should be read as repo statements — the plan *is* the updated doc.
 
+### 7.0 Status update (2026-11-16)
+
+Work landed since the review shrinks W1:
+- **Resolved:** blocking a11y unsubscribe with in-flight drain, detached in bridge destroy (**md-6h0**; `md_a11y_unsubscribe_changes`, `a11y.h:163`, `mcp_bridge.c:218`); wakeable stdio loop (100 ms `poll` slices observing shutdown, `mcp_stdio.c:117–146`); bounded HTTP/transport writes and notification quiesce before drain (**md-ed7**); coalesced a11y change notifications (**md-ayo**). a11y backend liveness is now queryable via `md_a11y_is_connected()` (`a11y.h:219`, **md-eiy**) — the natural hook for desktop-loss detection (§7.4 Q4).
+- **Still open (W1):** no-input fake success (`agent.c:177` skips injection yet returns success); capability claimed from pointer presence (`mcp_bridge.c:73`) even when the host passes an unready input (`host/main.c:894–902`); host never calls `md_mcp_bridge_shutdown`, so SIGTERM is ignored in MCP mode; no Host/Origin/auth checks on HTTP; `CLIENT_READ_TIMEOUT_SEC 30` (`mcp_http.c:40`) vs the 5 s SIGTERM budget; `--mcp-http-bind` / `--no-input` CLI flags not yet added; MCP-branch leaks.
+
 ### 7.1 Corrections the code requires (highest priority)
 - **`--no-input` would fake success (§3.1 is wrong).** With `agent->input == NULL`, `agent.c:192–200` skips injection and still `action_count++`/`return 0`; `mcp_tools.c:286–298` reports that as success — so `metadesk_click/type/set_value/screenshot` would **report success while doing nothing**. **W1 must** make input-requiring actions return an MCP tool error (`is_error=true`) naming the missing capability, with a `test_mcp` case. (This is the 2026-07 fake-success pattern.)
 - **HTTP concurrency is already done** — `mcp_server.c:35` `dispatch_mu` serializes dispatch (`:357–365`); the agent has its own `mu`. Downgrade that W1 item to a concurrent-POST **regression test** in `test_mcp_http.c`.
