@@ -529,6 +529,22 @@ core_sources = files(
   'src/core/secrets.c',
 )
 
+# ── Signer accounts + OS credential storage (independent of signer discovery) ──
+core_sources += files(
+  'src/core/accounts.c',
+  'src/core/accounts_signer.c',
+  'src/core/credential_store.c',
+  'src/core/credential_store_secret_service.c',
+  'src/core/credential_store_keychain.c',
+)
+accounts_c_args = []
+if host_os == 'linux'
+  core_deps += dependency('libsecret-1', version : '>=0.20')
+  accounts_c_args += '-DMD_HAVE_LIBSECRET'
+elif host_os == 'darwin'
+  core_deps += dependency('appleframeworks', modules : ['Security', 'CoreFoundation'])
+endif
+
 # Append platform HAL backend sources
 core_sources += platform_hal_sources
 
@@ -537,7 +553,7 @@ mcp_c_args = ['-DMD_MCP_BRIDGE_VERSION="' + meson.project_version() + '"']
 libmetadesk = shared_library('metadesk', core_sources,
   include_directories : core_inc,
   dependencies : core_deps,
-  c_args : signer_c_args + mcp_c_args,
+  c_args : signer_c_args + mcp_c_args + accounts_c_args,
   install : true,
   version : meson.project_version(),
 )
@@ -548,8 +564,28 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
+# ── Signer account tests ────────────────────────────────────────────────────
+if host_os == 'linux' or host_os == 'darwin'
+  test_accounts = executable('test_accounts', 'tests/test_accounts.c',
+    dependencies : dep_metadesk, c_args : accounts_c_args)
+  test('accounts', test_accounts, timeout : 30)
+  accounts_python = import('python').find_installation('python3')
+  if host_os == 'darwin'
+    test('account_keychain', test_accounts, args : ['--keychain'], timeout : 30, is_parallel : false)
+  else
+    accounts_dbus = find_program('dbus-run-session', required : false)
+    accounts_keyring = find_program('gnome-keyring-daemon', required : false)
+    if accounts_dbus.found() and accounts_keyring.found()
+      test('account_secret_service', accounts_python,
+        args : [files('tests/test_account_keyring.py'), test_accounts], timeout : 45)
+    else
+      message('Private account Secret Service test unavailable: install dbus-run-session and gnome-keyring-daemon')
+    endif
+  endif
+endif
+
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c')
+host_sources = files('src/host/main.c', 'src/host/account_cli.c')
 host_includes = [core_inc]
 host_c_args = []
 
@@ -559,6 +595,11 @@ metadesk_host = executable('metadesk-host', host_sources,
   c_args : host_c_args,
   install : true,
 )
+
+if host_os == 'linux' or host_os == 'darwin'
+  test('account_cli', accounts_python,
+    args : [files('tests/test_account_cli.py'), metadesk_host], timeout : 30)
+endif
 
 # ── metadesk-client (human video client) ────────────────────────────────────
 if enable_client
