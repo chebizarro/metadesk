@@ -891,15 +891,37 @@ Work landed since the review shrinks W1:
 ### 7.3 Index/ownership corrections
 - **Runtime-bundle circularity:** W2 needs a bundle but W9 has md-kb7 *consuming* md-ah9's contract — nobody produces the first bundle. Decide: md-ah9 ships a throwaway local procedure (`meson install --destdir` + DT_NEEDED closure check) in `bundle-contract.md`, or W2 is blocked on md-kb7 tooling.
 - **W8 depends on P0** (propose cells), not W1–W4; **W9 path** is `reference/bundle-contract.md`; **W4 creates** `Dockerfile.video`+`sway-session.sh` (no Tier-B artifacts existed); **W5/W6 soft-depend** on W4 (buildable against a host xdpw / any nested wlroots); **K8s agent-only Pod** is its own item (W3b).
-- **Phase-0 exit criterion** "every open architectural question has a decision" is not yet met — bundle ownership, FIPS adapter, IPv6 behavior, and desktop-loss recovery remain open (§7.4).
+- **Phase-0 exit criterion** "every open architectural question has a decision" is not yet met. Bundle ownership, auth and bind are decided (§7.4 Q1–Q3, 2026-11-16). The FIPS tier, desktop-loss recovery, `--no-input` surface and K8s scope remain open (§7.4 Q4–Q7).
 
 ### 7.4 Open decisions (answers change design or order)
-1. Who builds the first runtime bundle (md-ah9 throwaway vs md-kb7 blocking)?
-2. In-process MCP HTTP auth — Host/Origin validation and/or file-mounted bearer token in W1, or proxy-only (leaves shared-netns peers and port-forward exposed)?
-3. Reference HTTP bind — `[::1]` default vs explicit `127.0.0.1` (works today via v4-map)?
+1. ~~Who builds the first runtime bundle?~~ **Resolved 2026-11-16: md-ah9 throwaway.** W2 ships `reference/bundle-contract.md` plus a clearly-labelled throwaway procedure (`meson install --destdir`, `-Dclient=false`, DT_NEEDED closure check against the image). md-kb7 inherits the *contract*, not the script. W2 is not blocked on md-kb7.
+2. ~~In-process MCP HTTP auth?~~ **Resolved 2026-11-16: Host/Origin checks + file-mounted bearer token (option C), plus NIP-98 as a second accepted credential.** See §7.7.
+3. ~~Reference HTTP bind?~~ **Resolved 2026-11-16: explicit `127.0.0.1`** in all reference artifacts via `--mcp-http-bind 127.0.0.1` (W1 adds the flag). The code default stays `[::1]`. W2/W3 still validate Docker-without-IPv6 and IPv4-dialing port-forwards on the pinned runtime versions.
 4. Desktop-loss policy — host exits on bus loss (restart-policy recovery) vs stay-up-unready + runbook?
 5. `--no-input` tool surface — unregister input tools from `tools/list`, or keep listed and return errors (plan's choice, needs §7.1)?
 6. Which tier does the FIPS reference serve (Tier B/C1 vs Tier A + proxy)?
 7. Is the agent-only Kubernetes Pod (W3b) in md-ah9 scope or deferred to md-5zi?
+
+### 7.7 MCP HTTP authentication design (resolves §7.4 Q2)
+
+**Always on (W1):** reject a non-loopback `Host` unless it matches a configured public URL, and reject any request carrying an `Origin` header (MCP agents don't send one; browsers always do on cross-origin fetches). This closes DNS rebinding independently of credentials.
+
+**Credentials.** The server accepts either of two schemes on every `POST /mcp` and on the SSE `GET /mcp`:
+
+| Scheme | Header | Who it suits | Authorizes |
+|---|---|---|---|
+| Bearer token | `Authorization: Bearer <token>` | Any MCP client today (static `headers` config) | Possession of a 0600 file (`--mcp-token-file`, a mounted secret) |
+| NIP-98 | `Authorization: Nostr <base64 kind-27235 event>` | Nostr-native agents, or any client behind a signing shim | An **npub**, checked against an allowlist |
+
+- **Configuration.** If neither credential is configured, loopback-only binds still serve requests, Host/Origin checks still apply, and the server logs a warning. That keeps local dev unchanged. A non-loopback `--mcp-http-bind` without a credential is refused at startup. All reference artifacts configure one.
+- **NIP-98 validation reuses nostrc `nips/nip98`.** `nostr_nip98_parse_auth_header` plus `nostr_nip98_validate_auth_event` already check kind 27235, the ±60 s window, `u`, `method` and the signature. Linking it follows the nip51 build-tree-object pattern in `meson.build`. metadesk adds four things nostrc does not do:
+  1. **Replay cache.** Reject a reused `event.id` within 2× the time window, using a small bounded set. This also satisfies the AGENTS.md dedupe-by-id rule.
+  2. **Payload binding.** `POST` requires a `payload` tag equal to the SHA-256 of the body (NIP-98 says SHOULD; we make it MUST), so a captured header can't carry a different body.
+  3. **URL matching.** nostrc does an exact `strcmp` on `u`, but the URL an agent signs is the one it dialed. Behind a proxy or `kubectl port-forward` that is not `http://127.0.0.1:7710/mcp`. Add a repeatable `--mcp-public-url` and accept `u` if it equals any configured URL or the loopback forms.
+  4. **Authorization.** The event pubkey must be in an allowlist. Sources: `--mcp-allow-npub` / `--mcp-allow-file` (a mounted file of npubs; works offline in containers), or the host account's NIP-51 `metadesk-allowlist` (kind 30000), which is the same list that gates video sessions (md-70v §7.6 host role). That list comes from an `authors`+`#d` REQ subscription kept live, not polled. The relay-backed path goes through a Nostr Protocol Review.
+- **Cost model.** NIP-98 requires one signature per POST, i.e. per tool call. That is cheap with a local or Grotto/NIP-55L key. With NIP-46 it costs a relay round-trip per call, so the reference docs recommend a local or delegated agent key. Session-bound credentials after the first NIP-98 check are deferred, because they would just be a bearer token again.
+- **Client reality.** No mainstream MCP client signs NIP-98 today, which is why the bearer token is the universal baseline. A small stdio↔HTTP signing shim, for example a `metadesk mcp-proxy` subcommand that uses an `MdSigner`, makes NIP-98 usable from any stdio MCP client. It is a candidate follow-on, not part of W1.
+- **Ties to Q6.** With NIP-98 the mesh-side proxy in option B can be a dumb TCP/HTTP forwarder that passes `Authorization` through. The agent's *npub*, not its network position, is what gets authorized. That is the seed of "MCP access governed by the same Nostr allowlist as video access". The proxy must forward the original `Host`, or the public URL must be configured.
+- **Tests (`test_mcp_http.c`):** missing or invalid credential → 401; `Origin` present → 403; foreign `Host` → 403; NIP-98 checks for wrong `u`, wrong method, stale timestamp, replayed id, body/payload mismatch and unknown npub each → 401; valid token and valid NIP-98 → 200. SSE GET follows the same rules. Also confirm a ~1 KB `Authorization` header fits the request read path (`READ_BUF_SIZE 4096`, `mcp_http.c:37`).
 
 
