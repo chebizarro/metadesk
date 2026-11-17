@@ -173,3 +173,15 @@ For controlled fixture reproduction use `reference/fixture.py`, `smoke_mcp.py`,
 and default `validate.py`; the results doc gives the isolated-session setup.
 Set a private `XDG_RUNTIME_DIR` **before** starting `dbus-run-session`/GetAddress.
 Never repoint or kill the real desktop bus. Health logs do not contain tree data.
+
+## Tier B isolated video experiment (capture only)
+
+`Dockerfile.video` and `reference/sway-session.sh` run a **private** headless Sway,
+PipeWire and wlr portal stack. No live desktop sockets are attached. See
+[video-validation.md](reference/video-validation.md) for the pinned rootless-Podman
+matrix, build/run commands, consent opt-in, token findings and cleanup procedure.
+The software-only pixman cell failed capture; the render-node/GLES2 cell delivered
+changing frames through metadesk's capture library. This is not full host/client,
+input (md-ah9.9), encoder, or unattended-policy (md-ah9.10) qualification.
+Use `--init` and the documented least-privilege run flags; capture is denied by
+default until the operator opts into sharing the isolated output.
