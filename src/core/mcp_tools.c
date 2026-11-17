@@ -286,6 +286,13 @@ static cJSON *tool_handler(const cJSON *arguments,
                                  "the MCP bridge was created without an agent");
     }
 
+    if (!md_input_is_ready(ctx->input)) {
+        *is_error = true;
+        *error_msg = strdup("Input capability unavailable");
+        free(action_json);
+        return make_text_content("Error: input capability unavailable");
+    }
+
     /* Full path: dispatch through agent pipeline and return delta */
     char *result_str = md_agent_handle_action_mcp(
         ctx->agent,
@@ -295,8 +302,8 @@ static cJSON *tool_handler(const cJSON *arguments,
 
     if (!result_str) {
         *is_error = true;
-        *error_msg = strdup("Agent action execution failed");
-        return make_text_content("Error: action execution failed");
+        *error_msg = strdup("Input capability unavailable or action execution failed");
+        return make_text_content("Error: input capability unavailable or action execution failed");
     }
 
     cJSON *result = make_text_content(result_str);
@@ -562,7 +569,10 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
     if (!hctxs) return -1;
     tool_ctx->_handler_ctxs = hctxs;
 
+    bool register_actions = md_input_is_ready(tool_ctx->input);
     for (size_t i = 0; i < TOOL_DEF_COUNT; i++) {
+        if (!tool_defs[i].read_kind && !register_actions)
+            continue;
         hctxs[i].ctx = tool_ctx;
         hctxs[i].action_type = tool_defs[i].action_type;
         hctxs[i].fields = tool_defs[i].fields;
@@ -583,8 +593,10 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
         if (!tool.input_schema || md_mcp_server_register_tool(server, &tool) != 0) {
             if (tool.input_schema)
                 cJSON_Delete(tool.input_schema);
-            for (size_t j = 0; j < i; j++)
-                md_mcp_server_unregister_tool(server, tool_defs[j].name);
+            for (size_t j = 0; j < i; j++) {
+                if (hctxs[j].ctx)
+                    md_mcp_server_unregister_tool(server, tool_defs[j].name);
+            }
             free(hctxs);
             tool_ctx->_handler_ctxs = NULL;
             return -1;

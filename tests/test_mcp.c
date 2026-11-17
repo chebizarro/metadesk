@@ -16,6 +16,9 @@
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include "md_test.h"
 
 
@@ -606,10 +609,107 @@ static void test_resources_with_session(void)
 
 /* ── Tool registration tests ──────────────────────────────────── */
 
+static int mock_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed)
+{
+    (void)keysym;
+    (void)pressed;
+    int *calls = ctx->backend_data;
+    (*calls)++;
+    return 0;
+}
+static const MdInputBackend mock_input_backend = { .key_event = mock_key_event };
+static int input_key_calls;
+static MdInput ready_input = {
+    .ready = true, .vtable = &mock_input_backend, .backend_data = &input_key_calls,
+};
+
+static void test_input_capability_gates_tools(void)
+{
+    static const MdA11yBackend backend = {0};
+    MdA11yCtx a11y = { .vtable = &backend };
+    MdInput unready = { .ready = false };
+    MdInput *inputs[] = { NULL, &unready, &ready_input };
+    for (int i = 0; i < 3; i++) {
+        MdMcpBridgeConfig cfg = {
+            .a11y = &a11y, .input = inputs[i],
+            .stdio_in_fd = -1, .stdio_out_fd = -1,
+        };
+        MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
+        MD_CHECK(bridge != NULL);
+        MdMcpServer *server = md_mcp_bridge_get_server(bridge);
+        md_mcp_server_set_write_fn(server, capture_write, NULL);
+        do_init(server);
+        clear_responses();
+        const char *list = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}";
+        md_mcp_server_handle_message(server, list, strlen(list));
+        cJSON *resp = last_response();
+        cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
+        MD_CHECK(cJSON_GetArraySize(tools) == (i == 2 ? 14 : 5));
+        if (i != 2) {
+            const char *names[] = { "metadesk_find", "metadesk_subtree", "metadesk_node",
+                                    "metadesk_focused", "metadesk_windows" };
+            for (int j = 0; j < 5; j++)
+                MD_CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(
+                    cJSON_GetArrayItem(tools, j), "name")), names[j]) == 0);
+        }
+        cJSON_Delete(resp);
+        clear_responses();
+        const char *info_req = "{\"jsonrpc\":\"2.0\",\"method\":\"resources/read\",\"id\":3,"
+                               "\"params\":{\"uri\":\"metadesk://session-info\"}}";
+        md_mcp_server_handle_message(server, info_req, strlen(info_req));
+        resp = last_response();
+        cJSON *contents = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "contents");
+        cJSON *info = cJSON_Parse(cJSON_GetStringValue(cJSON_GetObjectItem(
+            cJSON_GetArrayItem(contents, 0), "text")));
+        MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(info, "capabilities")) == (i == 2 ? 2 : 1));
+        cJSON_Delete(info);
+        cJSON_Delete(resp);
+        md_mcp_bridge_destroy(bridge);
+        clear_responses();
+    }
+    PASS("NULL/unready input omits action tools and input capability; ready input includes both");
+}
+
+static void test_input_loss_returns_tool_error(void)
+{
+    MdInput input = { .ready = true };
+    MdAgentConfig cfg = { .input = &input, .settle_ms = 1 };
+    MdAgent *agent = md_agent_create(&cfg);
+    MD_CHECK(agent != NULL);
+    MdMcpToolCtx ctx = { .agent = agent, .input = &input };
+    MdMcpServer *server = make_server();
+    MD_CHECK(md_mcp_register_tools(server, &ctx) == 0);
+    do_init(server);
+    input.ready = false; /* deterministic runtime loss after registration */
+    const char *calls[] = {
+        "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":2,\"params\":{\"name\":\"metadesk_type\",\"arguments\":{\"target_id\":\"entry1\",\"text\":\"hello\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":3,\"params\":{\"name\":\"metadesk_click\",\"arguments\":{\"target_id\":\"btn1\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":4,\"params\":{\"name\":\"metadesk_set_value\",\"arguments\":{\"target_id\":\"entry1\",\"text\":\"hello\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":5,\"params\":{\"name\":\"metadesk_screenshot\",\"arguments\":{}}}",
+    };
+    for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+        clear_responses();
+        md_mcp_server_handle_message(server, calls[i], strlen(calls[i]));
+        cJSON *resp = last_response();
+        cJSON *result = cJSON_GetObjectItem(resp, "result");
+        MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")));
+        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(
+            cJSON_GetObjectItem(result, "content"), 0), "text"));
+        MD_CHECK(text && strstr(text, "input capability unavailable"));
+        MD_CHECK(md_agent_get_action_count(agent) == 0);
+        cJSON_Delete(resp);
+    }
+    md_mcp_tools_cleanup(&ctx);
+    md_mcp_server_destroy(server);
+    md_agent_destroy(agent);
+    clear_responses();
+    PASS("runtime input loss returns isError naming input capability");
+}
+
 static void test_14_tools_register(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .input = &ready_input };
     MD_CHECK(md_mcp_register_tools(s, &tool_ctx) == 0);
 
     do_init(s);
@@ -659,7 +759,7 @@ static void test_14_tools_register(void)
 static void test_tool_call_click_no_agent(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .input = &ready_input };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -689,7 +789,7 @@ static void test_tool_call_click_no_agent(void)
 static void test_tool_call_missing_target(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .input = &ready_input };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -713,7 +813,7 @@ static void test_tool_call_missing_target(void)
 static void test_tool_call_key_combo(void)
 {
     MdMcpServer *s = make_server();
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .input = &ready_input };
     md_mcp_register_tools(s, &tool_ctx);
     do_init(s);
     clear_responses();
@@ -737,14 +837,16 @@ static void test_tool_call_key_combo(void)
     PASS("tool call key_combo (no agent) returns isError");
 }
 
-static void test_tool_registration_failure_rolls_back(int prefill)
+static void test_tool_registration_failure_rolls_back(int prefill, bool input_ready)
 {
     MdMcpServer *s = make_server();
-    char names[24][32];
+    char names[32][32];
 
     /* Exercise failure within both the action and read registrations. */
     for (int i = 0; i < prefill; i++) {
         snprintf(names[i], sizeof(names[i]), "prefill_tool_%02d", i);
+        /* Skipped action names must not be removed by read-tool rollback. */
+        if (!input_ready && i == 0) strcpy(names[i], "metadesk_click");
         cJSON *schema = cJSON_CreateObject();
         MdMcpTool tool = {
             .name = names[i],
@@ -754,7 +856,7 @@ static void test_tool_registration_failure_rolls_back(int prefill)
         MD_CHECK(md_mcp_server_register_tool(s, &tool) == 0);
     }
 
-    MdMcpToolCtx tool_ctx = { .agent = NULL };
+    MdMcpToolCtx tool_ctx = { .agent = NULL, .input = input_ready ? &ready_input : NULL };
     MD_CHECK(md_mcp_register_tools(s, &tool_ctx) == -1);
     MD_CHECK(tool_ctx._handler_ctxs == NULL);
 
@@ -768,8 +870,7 @@ static void test_tool_registration_failure_rolls_back(int prefill)
     MD_CHECK(cJSON_GetArraySize(tools) == prefill);
     for (int i = 0; i < cJSON_GetArraySize(tools); i++) {
         cJSON *t = cJSON_GetArrayItem(tools, i);
-        MD_CHECK(strncmp(cJSON_GetObjectItem(t, "name")->valuestring,
-                       "prefill_tool_", 13) == 0);
+        MD_CHECK(strcmp(cJSON_GetObjectItem(t, "name")->valuestring, names[i]) == 0);
     }
     cJSON_Delete(resp);
 
@@ -1191,6 +1292,7 @@ static void test_resource_tree_formats(void)
     for (int i = 0; i < 3; i++) {
         MdMcpBridgeConfig config = {
             .a11y = &a11y,
+            .input = &ready_input,
             .tree_format = (MdMcpTreeFormat)i,
             .settle_ms = 1,
             .stdio_in_fd = -1,
@@ -1245,7 +1347,9 @@ static void test_resource_tree_formats(void)
         cJSON_Delete(content);
         /* First action has no diff baseline, forcing the full-tree fallback. */
         MD_CHECK(a11y.last_snapshot == NULL);
+        int keys_before = input_key_calls;
         cJSON *update = query_json(server, "metadesk_key_combo", "{\"keys\":[\"ctrl\",\"s\"]}");
+        MD_CHECK(input_key_calls == keys_before + 4);
         MD_CHECK(cJSON_IsObject(update));
         MD_CHECK(cJSON_GetObjectItem(update, "v")->valueint == 1);
         MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(update, "root")));
@@ -1290,7 +1394,7 @@ static void test_shared_a11y_snapshot(void)
     MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
     query_a11y_init(&a11y);
     MdMcpBridgeConfig config = {
-        .a11y = &a11y, .settle_ms = 1, .notify_sync = true,
+        .a11y = &a11y, .input = &ready_input, .settle_ms = 1, .notify_sync = true,
         .stdio_in_fd = -1, .stdio_out_fd = -1,
     };
     MdMcpBridge *bridge = md_mcp_bridge_create(&config);
@@ -2131,10 +2235,233 @@ static void test_subscribe_refuses_second_owner(void)
     PASS("second subscriber is refused; identical re-subscribe is a no-op; loser bridge does not detach winner");
 }
 
+/* Optional live host-process gate (requires an accessible desktop):
+ * test_mcp --host-lifecycle /path/to/metadesk-host */
+static int64_t host_test_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static cJSON *host_test_response(int fd)
+{
+    char line[32768];
+    size_t used = 0;
+    int64_t deadline = host_test_now_ms() + 5000;
+    while (used + 1 < sizeof(line)) {
+        int64_t left = deadline - host_test_now_ms();
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if (left <= 0 || poll(&pfd, 1, (int)left) <= 0)
+            return NULL;
+        char ch;
+        if (read(fd, &ch, 1) != 1) return NULL;
+        if (ch == '\n') {
+            line[used] = '\0';
+            return cJSON_Parse(line);
+        }
+        line[used++] = ch;
+    }
+    return NULL;
+}
+
+static void host_test_send(int fd, const char *message)
+{
+    size_t len = strlen(message);
+    MD_CHECK(write(fd, message, len) == (ssize_t)len);
+    MD_CHECK(write(fd, "\n", 1) == 1);
+}
+
+static bool loss_fixture_connected(const MdA11yCtx *ctx)
+{
+    return atomic_load((atomic_bool *)ctx->backend_data);
+}
+
+static int loss_fixture_tree(MdA11yCtx *ctx, MdA11yNode **out)
+{
+    *out = query_node("desktop", "application", "fixture", 0);
+    atomic_store((atomic_bool *)ctx->backend_data, false);
+    return *out ? 0 : -1;
+}
+
+static void test_supervised_desktop_loss(void)
+{
+    int in[2], out[2], done[2];
+    MD_CHECK(pipe(in) == 0 && pipe(out) == 0 && pipe(done) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(in[1]); close(out[0]); close(done[0]);
+        sigset_t signals;
+        sigemptyset(&signals);
+        sigaddset(&signals, SIGTERM);
+        sigaddset(&signals, SIGINT);
+        if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0) _exit(2);
+        atomic_bool connected = true;
+        const MdA11yBackend backend = {
+            .is_connected = loss_fixture_connected, .get_tree = loss_fixture_tree,
+        };
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = &connected };
+        query_a11y_init(&a11y);
+        MdMcpBridgeConfig cfg = {
+            .a11y = &a11y, .stdio_in_fd = in[0], .stdio_out_fd = out[1],
+        };
+        MdMcpBridge *bridge = md_mcp_bridge_create(&cfg);
+        if (!bridge) _exit(2);
+        int rc = md_mcp_bridge_run_supervised(bridge);
+        md_mcp_bridge_destroy(bridge);
+        md_a11y_node_free(a11y.last_snapshot);
+        query_a11y_fini(&a11y);
+        /* Proves cleanup completed, not just that the process disappeared. */
+        if (write(done[1], "D", 1) != 1) _exit(2);
+        _exit(rc < 0 ? 1 : 0);
+    }
+    MD_CHECK(pid > 0);
+    close(in[0]); close(out[1]); close(done[1]);
+    if (pid > 0) {
+        host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{}}");
+        cJSON *response = host_test_response(out[0]);
+        MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(response, "result")));
+        cJSON_Delete(response);
+        host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+        host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"resources/read\",\"id\":2,\"params\":{\"uri\":\"metadesk://ui-tree\"}}");
+        struct pollfd pfd = { .fd = done[0], .events = POLLIN };
+        int ready = poll(&pfd, 1, 5000);
+        MD_CHECK(ready > 0);
+        if (ready <= 0) kill(pid, SIGKILL);
+        else {
+            char marker = 0;
+            MD_CHECK(read(done[0], &marker, 1) == 1 && marker == 'D');
+        }
+        int status = 0;
+        MD_CHECK(waitpid(pid, &status, 0) == pid);
+        MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    }
+    close(in[1]); close(out[0]); close(done[0]);
+    PASS("supervised desktop loss exits nonzero and completes cleanup with stdin still open");
+}
+
+static void test_host_cli_rejections(const char *host)
+{
+    const char *options[][6] = {
+        { "--mcp", "--mcp-http", NULL },
+        { "--mcp-http-bind", "127.0.0.1", NULL },
+        { "--mcp", "--mcp-http-bind", "127.0.0.1", NULL },
+        { "--mcp", "--npub", "npub1test", NULL },
+        { "--mcp", "--bunker", "bunker://test", NULL },
+        { "--mcp", "--socket-signer", NULL },
+        { "--mcp-http", "--dbus-signer", NULL },
+        { "--mcp", "--relay", "wss://example.invalid", NULL },
+        { "--mcp", "--auto-signer", NULL },
+        { "--mcp", "--mcp-http-bind", NULL },
+    };
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+        int out[2], err[2];
+        MD_CHECK(pipe(out) == 0 && pipe(err) == 0);
+        pid_t pid = fork();
+        if (pid == 0) {
+            dup2(out[1], STDOUT_FILENO); dup2(err[1], STDERR_FILENO);
+            close(out[0]); close(out[1]); close(err[0]); close(err[1]);
+            char *args[8] = { (char *)host };
+            for (int j = 0; options[i][j]; j++) args[j + 1] = (char *)options[i][j];
+            execv(host, args);
+            _exit(127);
+        }
+        MD_CHECK(pid > 0);
+        close(out[1]); close(err[1]);
+        if (pid > 0) {
+            struct pollfd pfd = { .fd = out[0], .events = POLLIN };
+            int ready = poll(&pfd, 1, 5000);
+            char ch;
+            bool empty = ready > 0 && read(out[0], &ch, 1) == 0;
+            MD_CHECK(empty);
+            if (!empty) kill(pid, SIGKILL);
+            int status = 0;
+            MD_CHECK(waitpid(pid, &status, 0) == pid);
+            MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+            MD_CHECK(read(err[0], &ch, 1) == 1);
+        }
+        close(out[0]); close(err[0]);
+    }
+    PASS("conflicting MCP CLI options fail before startup with stderr and no stdout");
+}
+
+static void test_live_host_lifecycle(const char *host)
+{
+    const int signals[] = { SIGTERM, SIGINT, 0, SIGTERM };
+    for (int i = 0; i < 4; i++) {
+        int in[2], out[2];
+        if (pipe(in) != 0) { MD_CHECK(false); return; }
+        if (pipe(out) != 0) { close(in[0]); close(in[1]); MD_CHECK(false); return; }
+        pid_t pid = fork();
+        if (pid == 0) {
+            dup2(in[0], STDIN_FILENO);
+            dup2(out[1], STDOUT_FILENO);
+            close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+            execl(host, host, "--mcp", "--no-input", (char *)NULL);
+            _exit(127);
+        }
+        close(in[0]); close(out[1]);
+        if (pid < 0) { close(in[1]); close(out[0]); MD_CHECK(false); return; }
+        host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{\"protocolVersion\":\"2025-03-26\"}}");
+        cJSON *response = host_test_response(out[0]);
+        MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(response, "result")));
+        bool initialized = response != NULL;
+        cJSON_Delete(response);
+        if (initialized) {
+            host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+            host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}");
+            response = host_test_response(out[0]);
+            cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(response, "result"), "tools");
+            MD_CHECK(cJSON_GetArraySize(tools) == 5);
+            cJSON_Delete(response);
+            host_test_send(in[1], "{\"jsonrpc\":\"2.0\",\"method\":\"resources/read\",\"id\":3,\"params\":{\"uri\":\"metadesk://session-info\"}}");
+            response = host_test_response(out[0]);
+            cJSON *contents = cJSON_GetObjectItem(cJSON_GetObjectItem(response, "result"), "contents");
+            MD_CHECK(cJSON_GetArraySize(contents) == 1);
+            cJSON_Delete(response);
+        }
+        if (i == 3) {
+            const char partial[] = "{\"jsonrpc\":";
+            MD_CHECK(write(in[1], partial, sizeof(partial) - 1) == sizeof(partial) - 1);
+        }
+        int64_t started = host_test_now_ms();
+        if (signals[i]) MD_CHECK(kill(pid, signals[i]) == 0);
+        else { close(in[1]); in[1] = -1; }
+        bool exited = false;
+        while (host_test_now_ms() - started < 5000) {
+            struct pollfd pfd = { .fd = out[0], .events = POLLIN };
+            int left = 5000 - (int)(host_test_now_ms() - started);
+            if (left <= 0 || poll(&pfd, 1, left) <= 0) break;
+            char discard[512];
+            if (read(out[0], discard, sizeof(discard)) == 0) { exited = true; break; }
+        }
+        MD_CHECK(exited);
+        if (!exited) kill(pid, SIGKILL);
+        int status = 0;
+        MD_CHECK(waitpid(pid, &status, 0) == pid);
+        MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        printf("  live host %s%s: %lld ms, status=%d\n",
+               signals[i] == SIGINT ? "SIGINT" : signals[i] ? "SIGTERM" : "EOF",
+               i == 3 ? " (partial stdin)" : "", (long long)(host_test_now_ms() - started), status);
+        if (in[1] >= 0) close(in[1]);
+        close(out[0]);
+    }
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && strcmp(argv[1], "--host-cli") == 0) {
+        test_host_cli_rejections(argv[2]);
+        return md_test_report();
+    }
+    if (argc == 3 && strcmp(argv[1], "--host-lifecycle") == 0) {
+        signal(SIGPIPE, SIG_IGN);
+        test_host_cli_rejections(argv[2]);
+        test_live_host_lifecycle(argv[2]);
+        return md_test_report();
+    }
     if (argc == 2 && strcmp(argv[1], "--a11y-queries") == 0) {
         test_a11y_read_tools();
         test_a11y_modal_and_label_queries();
@@ -2173,15 +2500,19 @@ int main(int argc, char **argv)
     test_unknown_method();
     test_parse_error();
     test_init_capabilities_reflect_registrations();
+    test_input_capability_gates_tools();
+    test_input_loss_returns_tool_error();
     test_14_tools_register();
     test_tool_call_click_no_agent();
     test_tool_call_missing_target();
     test_tool_call_key_combo();
-    test_tool_registration_failure_rolls_back(24);
-    test_tool_registration_failure_rolls_back(19);
+    test_tool_registration_failure_rolls_back(24, true);
+    test_tool_registration_failure_rolls_back(19, true);
+    test_tool_registration_failure_rolls_back(30, false);
     test_resources_with_session();
     test_bridge_null_a11y_fails_create();
     test_bridge_create_destroy_with_stub_a11y();
+    test_supervised_desktop_loss();
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();
