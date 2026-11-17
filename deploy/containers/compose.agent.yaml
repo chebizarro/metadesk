@@ -1,0 +1,53 @@
+# validated on Docker 29.1.3 / Compose 2.40.3, fixture cells.
+# Rootless Podman Compose unvalidated; see reference/validation.md.
+# Docker Compose reference. Rootless Podman uses explicit --userns=keep-id (README).
+services:
+  agent:
+    image: metadesk-agent:ah9-4
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BASE: ${MD_BASE:-ubuntu:24.04}
+    user: "1000:1000"
+    read_only: true
+    # Exercise the reference on an IPv4-only Docker bridge/netns.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true, apparmor:metadesk-agent-ah9-4]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
+      - /run/user/1000:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700
+    environment:
+      AT_SPI_BUS_ADDRESS: ${AT_SPI_BUS_ADDRESS:?discover the AT-SPI address}
+    volumes:
+      - type: bind
+        source: ${SESSION_BUS_SOCKET:-/run/user/1000/bus}
+        target: /run/user/1000/bus
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AT_SPI_DIR:?discovered filesystem socket directory}
+        target: ${AT_SPI_DIR:?discovered filesystem socket directory}
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets: [mcp-token]
+    command: [/opt/metadesk/bin/metadesk-host, --mcp-http, "7710", --mcp-http-bind, "127.0.0.1", --no-input, --mcp-token-file, /run/secrets/mcp-token]
+    # Docker engine restart backoff; health is readiness, not a restart trigger.
+    restart: on-failure
+    stop_grace_period: 5s
+    healthcheck:
+      test: [CMD, /opt/metadesk/reference/probe.py, --http]
+      interval: 30s
+      timeout: 10s
+      start_period: 35s
+      retries: 1
+    # No ports: loopback belongs to this private network namespace, not the host.
+    # No FIPS/netns holder here: md-ah9.5 owns the shared-netns topology.
+secrets:
+  mcp-token:
+    # Local Compose preserves source ownership/mode; provision 1000:1000, 0600.
+    file: ${MCP_TOKEN_FILE:?path to mode-0600 desktop-owned bearer secret}

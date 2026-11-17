@@ -1,0 +1,21 @@
+# validated on Docker 29.1.3, fixture cells; rootless Podman LSM cell unvalidated.
+# Docker-only profile, see validation.md.
+# Tier A grants broad access to the mounted user buses; not a D-Bus sandbox.
+# Load explicitly on the operator host, never modify docker-default.
+#include <tunables/global>
+profile metadesk-agent-ah9-4 flags=(attach_disconnected,mediate_deleted) {
+  file,
+  network unix,
+  network inet stream,
+  network inet6 stream,
+  dbus (send, receive) bus={session,accessibility} peer=(label=unconfined),
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (send, receive) peer=metadesk-agent-ah9-4,
+  ptrace (read, readby) peer=metadesk-agent-ah9-4,
+  deny mount,
+  deny /proc/sys/** w,
+  deny /proc/sysrq-trigger rwklx,
+  deny /proc/kcore rwklx,
+  deny /sys/** wklx,
+}
