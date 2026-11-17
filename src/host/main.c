@@ -615,6 +615,11 @@ cleanup:
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    /* Isolated metadata CLI: no capture, session, or Nostr startup. */
+    if (argc > 1 && strcmp(argv[1], "account") == 0) {
+        extern int md_host_account_cli(int argc, char **argv);
+        return md_host_account_cli(argc - 2, argv + 2);
+    }
     /* Every subsequently created thread inherits this mask. MCP consumes
      * termination signals with sigwait, never an async-signal-unsafe handler. */
     sigset_t term_signals;
