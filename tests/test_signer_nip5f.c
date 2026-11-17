@@ -135,6 +135,27 @@ static void test_lifecycle(void) {
     PASS();
 }
 
+static int malformed_public_key(void *ud, char **out) {
+    *out = strdup((const char *)ud);
+    return *out ? 0 : NIP5F_ERR_INTERNAL;
+}
+
+static void test_malformed_constructor_key(void) {
+    TEST("NIP-5F constructor rejects malformed identity pins");
+    const char *bad[] = { "", "too-short",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        MD_CHECK(nostr_nip5f_server_set_handlers(g_server,
+            malformed_public_key, NULL, NULL, NULL, NULL, (void *)bad[i]) == 0);
+        MdSigner *s = md_signer_create_nip5f(g_sock_path);
+        MD_CHECK(s == NULL);
+        md_signer_destroy(s);
+    }
+    MD_CHECK(nostr_nip5f_server_set_handlers(g_server,
+        NULL, NULL, NULL, NULL, NULL, NULL) == 0);
+    PASS();
+}
+
 /* ── Test: get_pubkey correct hex ────────────────────────────── */
 
 static void test_get_pubkey(void) {
@@ -398,6 +419,7 @@ int main(void) {
     }
 
     test_lifecycle();
+    test_malformed_constructor_key();
     test_get_pubkey();
     test_pubkey_caching();
     test_sign_event();

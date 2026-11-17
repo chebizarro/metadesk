@@ -358,8 +358,9 @@ static void test_unavailable_backends(void) {
  * type without relying on a relay, daemon, scheduling delay or sleep. */
 typedef struct {
     MdSigner *direct;
+    MdSigner *sign_as; /* optional alternate author for output-proof tests */
     char *pk;
-    atomic_int active, calls, destroyed;
+    atomic_int active, calls, destroyed, pubkey_calls, sign_calls;
     bool changed, switch_during_call, substitute, block, entered, release;
     unsigned waiting;
     pthread_mutex_t mu;
@@ -374,6 +375,7 @@ static void gated_leave(GatedSigner *g) { atomic_fetch_sub(&g->active, 1); }
 static int gated_pk(MdSigner *s, char **out) {
     GatedSigner *g = s->backend;
     gated_enter(g);
+    atomic_fetch_add(&g->pubkey_calls, 1);
     *out = strdup(g->changed ?
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" : g->pk);
     gated_leave(g);
@@ -398,7 +400,8 @@ static int gated_crypt(MdSigner *s, const char *peer, const char *text, char **o
 static int gated_sign(MdSigner *s, const char *json, char **out) {
     GatedSigner *g = s->backend;
     gated_enter(g);
-    int ret = md_signer_sign_event(g->direct, g->substitute ?
+    atomic_fetch_add(&g->sign_calls, 1);
+    int ret = md_signer_sign_event(g->sign_as ? g->sign_as : g->direct, g->substitute ?
         "{\"kind\":1,\"created_at\":1700000000,\"tags\":[],\"content\":\"substituted\"}" : json, out);
     gated_leave(g);
     return ret;
@@ -424,6 +427,7 @@ static MdSigner *gated_init(GatedSigner *g, MdSignerType type) {
     memset(g, 0, sizeof(*g));
     atomic_init(&g->active, 0); atomic_init(&g->calls, 0);
     atomic_init(&g->destroyed, 0);
+    atomic_init(&g->pubkey_calls, 0); atomic_init(&g->sign_calls, 0);
     pthread_mutex_init(&g->mu, NULL); pthread_cond_init(&g->cv, NULL);
     g->direct = md_signer_create_direct(
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -496,10 +500,18 @@ static void test_serialization_and_live_pin(void) {
             "{\"kind\":1,\"created_at\":1700000000,\"tags\":[],\"content\":\"test\"}", &out)
             == MD_SIGNER_ERR_INVALID);
         MD_CHECK(out == NULL); g.substitute = false;
-        /* Change during a backend operation: even successful output is refused. */
+        /* Switchable services catch drift during crypto. Fixed-session crypto
+         * trusts its established pin until an explicit live connection check. */
         g.switch_during_call = true;
-        MD_CHECK(md_signer_nip44_encrypt(s, "peer", "text", &out) == MD_SIGNER_ERR_KEY_CHANGED);
-        MD_CHECK(out == NULL); MD_CHECK(!md_signer_is_ready(s));
+        bool local = type == MD_SIGNER_NIP55L || type == MD_SIGNER_NIP5F;
+        MD_CHECK(md_signer_nip44_encrypt(s, "peer", "text", &out) ==
+                 (local ? MD_SIGNER_ERR_KEY_CHANGED : MD_SIGNER_OK));
+        if (local) MD_CHECK(out == NULL);
+        else {
+            MD_CHECK(out != NULL); free(out); out = NULL;
+            MD_CHECK(md_signer_check_connection(s) == MD_SIGNER_ERR_KEY_CHANGED);
+        }
+        MD_CHECK(!md_signer_is_ready(s));
         g.changed = false;
         int before = atomic_load(&g.calls);
         MD_CHECK(md_signer_probe(s) == MD_SIGNER_ERR_KEY_CHANGED);
@@ -507,6 +519,94 @@ static void test_serialization_and_live_pin(void) {
         md_signer_destroy(s); gated_fini(&g);
     }
     printf("  PASS: serialized mixed operations and live pin on all backend types\n");
+}
+
+static void test_backend_identity_policy(void) {
+    const char *json = "{\"kind\":1,\"created_at\":1700000000,\"tags\":[],\"content\":\"test\"}";
+    for (int type = MD_SIGNER_DIRECT_KEY; type <= MD_SIGNER_NIP5F; type++) {
+        GatedSigner g;
+        MdSigner *s = gated_init(&g, (MdSignerType)type);
+        bool local = type == MD_SIGNER_NIP55L || type == MD_SIGNER_NIP5F;
+        MD_CHECK(md_signer_probe(s) == MD_SIGNER_OK);
+        MD_CHECK(atomic_load(&g.pubkey_calls) == 1);
+        int before = atomic_load(&g.calls);
+        char *out = NULL;
+        for (int i = 0; i < 2; i++) {
+            MD_CHECK(md_signer_get_pubkey(s, &out) == MD_SIGNER_OK);
+            MD_CHECK(out && strcmp(out, g.pk) == 0); free(out); out = NULL;
+        }
+        MD_CHECK(atomic_load(&g.calls) == before); /* cached audit-entry lookup */
+        int keys = atomic_load(&g.pubkey_calls);
+        MD_CHECK(md_signer_sign_event(s, json, &out) == MD_SIGNER_OK);
+        MD_CHECK(out != NULL); free(out); out = NULL;
+        MD_CHECK(atomic_load(&g.calls) == before + (local ? 2 : 1));
+        MD_CHECK(atomic_load(&g.pubkey_calls) == keys + (local ? 1 : 0));
+        MD_CHECK(atomic_load(&g.sign_calls) == 1);
+        /* Every subsequent fixed-session operation is exactly one backend call. */
+        before = atomic_load(&g.calls); keys = atomic_load(&g.pubkey_calls);
+        MD_CHECK(md_signer_nip44_encrypt(s, "peer", "text", &out) == MD_SIGNER_OK);
+        MD_CHECK(out != NULL); free(out); out = NULL;
+        MD_CHECK(atomic_load(&g.calls) == before + (local ? 3 : 1));
+        MD_CHECK(atomic_load(&g.pubkey_calls) == keys + (local ? 2 : 0));
+        before = atomic_load(&g.calls); keys = atomic_load(&g.pubkey_calls);
+        MD_CHECK(md_signer_nip44_decrypt(s, "peer", "text", &out) == MD_SIGNER_OK);
+        MD_CHECK(out != NULL); free(out); out = NULL;
+        MD_CHECK(atomic_load(&g.calls) == before + (local ? 3 : 1));
+        MD_CHECK(atomic_load(&g.pubkey_calls) == keys + (local ? 2 : 0));
+        before = atomic_load(&g.calls);
+        MD_CHECK(md_signer_check_connection(s) == MD_SIGNER_OK);
+        MD_CHECK(atomic_load(&g.calls) == before + 1); /* explicitly live, even ready */
+        g.sign_as = md_signer_create_direct(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+        keys = atomic_load(&g.pubkey_calls);
+        MD_CHECK(md_signer_sign_event(s, json, &out) == MD_SIGNER_ERR_KEY_CHANGED);
+        MD_CHECK(out == NULL); MD_CHECK(!md_signer_is_ready(s));
+        MD_CHECK(atomic_load(&g.pubkey_calls) == keys + (local ? 1 : 0));
+        MD_CHECK(atomic_load(&g.sign_calls) == 2);
+        before = atomic_load(&g.calls);
+        MD_CHECK(md_signer_get_pubkey(s, &out) == MD_SIGNER_ERR_KEY_CHANGED);
+        MD_CHECK(out == NULL);
+        MD_CHECK(md_signer_sign_event(s, json, &out) == MD_SIGNER_ERR_KEY_CHANGED);
+        MD_CHECK(out == NULL); MD_CHECK(atomic_load(&g.calls) == before);
+        md_signer_destroy(g.sign_as); md_signer_destroy(s); gated_fini(&g);
+    }
+    /* Account selection may drift before a local signing call; no signing
+     * request should reach the service after that live precheck fails. */
+    for (int type = MD_SIGNER_NIP55L; type <= MD_SIGNER_NIP5F; type++) {
+        GatedSigner g;
+        MdSigner *s = gated_init(&g, (MdSignerType)type);
+        MD_CHECK(md_signer_probe(s) == MD_SIGNER_OK);
+        g.changed = true;
+        char *out = NULL;
+        MD_CHECK(md_signer_sign_event(s, json, &out) == MD_SIGNER_ERR_KEY_CHANGED);
+        MD_CHECK(out == NULL); MD_CHECK(atomic_load(&g.pubkey_calls) == 2);
+        MD_CHECK(atomic_load(&g.sign_calls) == 0);
+        md_signer_destroy(s); gated_fini(&g);
+    }
+    printf("  PASS: fixed-session RPC counts, cached pubkey, output proof and local live drift\n");
+}
+
+static void test_malformed_cached_pin(void) {
+    const char *bad[] = { "", "too-short",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        GatedSigner g;
+        MdSigner *s = gated_init(&g, MD_SIGNER_NIP46);
+        MD_CHECK(md_signer_probe(s) == MD_SIGNER_OK);
+        /* Simulate a pre-populated constructor cache at the shared boundary. */
+        free(s->pubkey_hex); s->pubkey_hex = strdup(bad[i]);
+        int before = atomic_load(&g.calls);
+        char *out = NULL;
+        MD_CHECK(md_signer_get_pubkey(s, &out) == MD_SIGNER_ERR_INVALID);
+        MD_CHECK(out == NULL); MD_CHECK(!md_signer_is_ready(s));
+        MD_CHECK(md_signer_probe(s) == MD_SIGNER_ERR_INVALID);
+        MD_CHECK(md_signer_nip44_encrypt(s, "peer", "text", &out) == MD_SIGNER_ERR_INVALID);
+        MD_CHECK(out == NULL);
+        MD_CHECK(md_signer_nip44_decrypt(s, "peer", "text", &out) == MD_SIGNER_ERR_INVALID);
+        MD_CHECK(out == NULL); MD_CHECK(atomic_load(&g.calls) == before);
+        md_signer_destroy(s); gated_fini(&g);
+    }
+    printf("  PASS: malformed cached pins fail closed without identity RPCs\n");
 }
 
 static void test_shutdown_and_inflight_lifetime(void) {
@@ -601,6 +701,8 @@ int main(void) {
     test_type_names();
     test_unavailable_backends();
     test_serialization_and_live_pin();
+    test_backend_identity_policy();
+    test_malformed_cached_pin();
     test_shutdown_and_inflight_lifetime();
     test_nonabortable_shutdown_and_local_cancel();
 

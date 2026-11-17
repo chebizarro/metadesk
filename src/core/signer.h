@@ -23,7 +23,9 @@
  * remote backends (NIP-46/55L/5F) never expose the key to metadesk.
  *
  * Thread safety: all backend operations on one instance are serialized,
- * including live identity checks before and after signing/encryption.
+ * including identity checks and signed-output validation. Direct-key and
+ * NIP-46 operations reuse a session pin; NIP-55L/5F check the live key before
+ * each operation and after encrypt/decrypt (whose output cannot prove author).
  * Signer operations may block (network I/O, D-Bus).
  * Callers must not call from latency-sensitive paths (capture callback).
  * The nostr.c bridge calls signing from its worker thread.
@@ -175,8 +177,9 @@ MdSigner *md_signer_auto_detect(void);
 
 /*
  * Get the user's public key (hex).
- * Always fetches the live backend key. The first key becomes an immutable
- * pin; a change permanently refuses further operations on this instance.
+ * Returns the immutable pin without I/O when initialized; otherwise fetches
+ * and pins the backend key. Use md_signer_check_connection() for a live check.
+ * Detected identity drift permanently refuses further operations.
  * out_pubkey_hex: receives malloc'd string. Caller frees.
  */
 int md_signer_get_pubkey(MdSigner *s, char **out_pubkey_hex);
@@ -247,8 +250,10 @@ bool md_signer_is_ready(const MdSigner *s);
 int md_signer_probe(MdSigner *s);
 
 /* Always query the live backend and compare with the immutable pin. May
- * block on remote IPC. Drift is latched: explicitly create a new instance
- * to bind a different (backend, pubkey) account. */
+ * block on remote IPC. Use for explicit liveness checks and before reusing
+ * a fixed-session pin after reconnect/rebinding; normal NIP-46 sign/crypto
+ * operations do not fetch the live key. Drift is latched: explicitly create
+ * a new instance to bind a different (backend, pubkey) account. */
 int md_signer_check_connection(MdSigner *s);
 
 /* Custom backends use the same serialization, pinning and lifetime rules.
