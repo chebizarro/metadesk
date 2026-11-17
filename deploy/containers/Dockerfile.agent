@@ -1,0 +1,28 @@
+# validated on Docker 29.1.3 (build/run), rootless Podman 4.9.3 (loaded/run), fixture cells.
+# Podman-native build unvalidated; see reference/validation.md.
+# Runtime only: produce runtime-bundle outside this image. Pin BASE for validation.
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+ARG MD_UID=1000
+ARG MD_GID=1000
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 libglib2.0-bin libgcc-s1 libstdc++6 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi \
+    && if getent group ubuntu >/dev/null; then groupdel ubuntu; fi \
+    && groupadd -g "$MD_GID" metadesk \
+    && useradd -u "$MD_UID" -g "$MD_GID" -m -d /home/metadesk metadesk \
+    && install -d -m 0700 -o "$MD_UID" -g "$MD_GID" /run/user/"$MD_UID"
+COPY runtime-bundle/opt/metadesk/ /opt/metadesk/
+COPY entrypoint.sh /opt/metadesk/entrypoint.sh
+COPY reference/probe.py reference/smoke_mcp.py /opt/metadesk/reference/
+RUN printf '/opt/metadesk/lib\n' > /etc/ld.so.conf.d/metadesk.conf \
+    && ldconfig && chmod 0755 /opt/metadesk/entrypoint.sh /opt/metadesk/reference/probe.py \
+    && ldd /opt/metadesk/bin/metadesk-host > /tmp/closure \
+    && ! grep -q 'not found' /tmp/closure && rm /tmp/closure
+ENV HOME=/home/metadesk MD_UID=${MD_UID} \
+    XDG_RUNTIME_DIR=/run/user/${MD_UID} \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${MD_UID}/bus
+USER ${MD_UID}:${MD_GID}
+ENTRYPOINT ["/opt/metadesk/entrypoint.sh"]
+CMD ["/opt/metadesk/bin/metadesk-host", "--mcp", "--no-input"]
