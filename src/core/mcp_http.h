@@ -29,6 +29,13 @@ typedef struct {
     MdMcpServer  *server;        /* MCP server to dispatch to         */
     const char   *bind_addr;     /* NULL for localhost only            */
     uint16_t      port;          /* 0 for default (7710)              */
+    /* Auth configuration is copied at create time; files are read once. */
+    const char   *token_file;    /* regular file, mode exactly 0600 */
+    const char *const *public_urls; /* exact signed URLs ending in /mcp */
+    size_t        public_url_count;
+    const char *const *allow_npubs;
+    size_t        allow_npub_count;
+    const char   *allow_file;    /* one npub per line; blank/# lines ignored */
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
     int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
     int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;

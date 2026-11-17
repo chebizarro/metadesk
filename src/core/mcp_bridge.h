@@ -58,6 +58,12 @@ typedef struct {
     int           stdio_out_fd;   /* stdio transport: write fd             */
     uint16_t      http_port;      /* HTTP+SSE transport (0 to skip)        */
     const char   *http_bind_addr; /* NULL for localhost only               */
+    const char   *http_token_file;
+    const char *const *http_public_urls;
+    size_t        http_public_url_count;
+    const char *const *http_allow_npubs;
+    size_t        http_allow_npub_count;
+    const char   *http_allow_file;
 } MdMcpBridgeConfig;
 
 /* Create the full MCP bridge: MdSession + MdAgent + MdMcpServer +
