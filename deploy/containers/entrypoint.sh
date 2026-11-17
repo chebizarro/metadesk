@@ -1,5 +1,5 @@
 #!/bin/sh
-# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture cells; see reference/validation.md.
+# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells; see reference/validation.md.
 set -eu
 # PID 1 must terminate even while preparing the desktop; exec host afterwards.
 waiter=

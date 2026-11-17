@@ -1,0 +1,12 @@
+# validated on rootless Podman 4.9.3 API + Docker Compose 2.40.3, live GNOME.
+# Layer over compose.agent.yaml; requires Compose !override / !reset support.
+# Rootless AppArmor disabled on the tested VM; not Docker LSM equivalence.
+services:
+  agent:
+    userns_mode: keep-id
+    security_opt: !override [no-new-privileges:true]
+    # Docker-only IPv6 control; no rootless IPv6-disabled claim.
+    sysctls: !reset {}
+    tmpfs: !override
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
+      - /run/user/1000:rw,nosuid,nodev,noexec,mode=0700,U
