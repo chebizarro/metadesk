@@ -7,6 +7,14 @@
 #ifdef __linux__
 #include "atspi.h"
 #include <atspi/atspi.h>
+#include <cjson/cJSON.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <glib-unix.h>
+#include <unistd.h>
+#include <errno.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -790,7 +798,298 @@ static void test_atspi_state_compaction(void) {
 }
 #endif
 
-int main(void) {
+#ifdef __linux__
+static int64_t fixture_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Bounded line reads also distinguish EOF from a readiness marker. */
+static bool fixture_line(int fd, char *line, size_t size) {
+    size_t used = 0;
+    int64_t deadline = fixture_now_ms() + 5000;
+    while (used + 1 < size) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int64_t left = deadline - fixture_now_ms();
+        if (left <= 0 || poll(&pfd, 1, (int)left) <= 0) return false;
+        char ch;
+        if (read(fd, &ch, 1) != 1) return false;
+        if (ch == '\n') { line[used] = 0; return true; }
+        line[used++] = ch;
+    }
+    return false;
+}
+
+typedef struct { MdA11yCtx *ctx; int fd; } LossObserver;
+static DBusHandlerResult fixture_disconnected(DBusConnection *bus,
+                                               DBusMessage *message, void *data) {
+    (void)bus;
+    LossObserver *observer = data;
+    if (dbus_message_is_signal(message, DBUS_INTERFACE_LOCAL, "Disconnected")) {
+        /* Installed after the backend's filter, so its atomic transition
+         * must already be visible. No sleeps or probing from the test. */
+        char result = md_a11y_is_connected(observer->ctx) ? 'F' : 'D';
+        if (write(observer->fd, &result, 1) != 1) _exit(2);
+    }
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+static void fixture_change(const MdA11yDelta *d, int count, void *data) {
+    (void)d; (void)count; (void)data;
+}
+
+typedef struct { GMainLoop *loop; int fd; bool passed; } CompetingLoop;
+
+static gpointer fixture_teardown_worker(gpointer data) {
+    CompetingLoop *fixture = data;
+    MdA11yCtx *ctx = md_a11y_create();
+    char result = ctx ? 'D' : 'F';
+    md_a11y_destroy(ctx);
+    if (write(fixture->fd, &result, 1) != 1) _exit(2);
+    return NULL;
+}
+
+static gboolean fixture_teardown_done(gint fd, GIOCondition condition, gpointer data) {
+    (void)condition;
+    CompetingLoop *fixture = data;
+    char result = 0;
+    fixture->passed = read(fd, &result, 1) == 1 && result == 'D';
+    g_main_loop_quit(fixture->loop);
+    return G_SOURCE_REMOVE;
+}
+
+static void fixture_competing_teardown(void) {
+    int done[2];
+    if (pipe(done) != 0) _exit(2);
+    GMainContext *context = g_main_context_default();
+    if (!g_main_context_acquire(context)) _exit(2);
+    CompetingLoop fixture = { .loop = g_main_loop_new(context, FALSE), .fd = done[1] };
+    GSource *source = g_unix_fd_source_new(done[0], G_IO_IN);
+    g_source_set_callback(source, G_SOURCE_FUNC(fixture_teardown_done), &fixture, NULL);
+    g_source_attach(source, context);
+    /* Keep ownership across init/destroy. The backend thread cannot acquire
+     * this context: our loop must handle its quit without losing it or
+     * accidentally quitting this independent loop. Parent bounds the test. */
+    GThread *worker = g_thread_new("competing-atspi-destroy", fixture_teardown_worker, &fixture);
+    g_main_loop_run(fixture.loop);
+    g_main_context_release(context);
+    g_thread_join(worker);
+    g_source_destroy(source);
+    g_source_unref(source);
+    g_main_loop_unref(fixture.loop);
+    close(done[0]); close(done[1]);
+    if (!fixture.passed) _exit(2);
+}
+
+static void fixture_backend_child(int fd, bool unsubscribe) {
+    if (!unsubscribe) fixture_competing_teardown();
+    MdA11yCtx *ctx = md_a11y_create();
+    if (!ctx || !md_a11y_is_connected(ctx)) _exit(2);
+    if (unsubscribe && (md_a11y_subscribe_changes(ctx, fixture_change, NULL) != 0 ||
+                        md_a11y_unsubscribe_changes(ctx) != 0)) _exit(2);
+    int observed[2];
+    if (pipe(observed) != 0) _exit(2);
+    LossObserver observer = { .ctx = ctx, .fd = observed[1] };
+    DBusConnection *bus = atspi_get_a11y_bus();
+    if (!dbus_connection_add_filter(bus, fixture_disconnected, &observer, NULL)) _exit(2);
+    if (write(fd, "R\n", 2) != 2) _exit(2);
+    struct pollfd pfd = { .fd = observed[0], .events = POLLIN };
+    char result = 0;
+    if (poll(&pfd, 1, 5000) <= 0 || read(observed[0], &result, 1) != 1 || result != 'D')
+        _exit(2);
+    /* destroy joins dispatch before observer's stack storage goes away. */
+    md_a11y_destroy(ctx);
+    close(observed[0]); close(observed[1]);
+    if (write(fd, "D\n", 2) != 2) _exit(2);
+    _exit(0);
+}
+
+/* Process-group collection needs waitpid(WNOHANG): a group has no single
+ * pollable fd. This deadline is cleanup only, never backend liveness. */
+static bool fixture_reap(pid_t pid, int *status, int timeout_ms) {
+    int64_t deadline = fixture_now_ms() + timeout_ms;
+    for (;;) {
+        pid_t got = waitpid(pid, status, WNOHANG);
+        if (got > 0) {
+            if (pid > 0) return true;
+            continue; /* process group: collect all adopted service children */
+        }
+        if (got < 0) return errno == ECHILD;
+        int64_t left = deadline - fixture_now_ms();
+        if (left <= 0) return false;
+        poll(NULL, 0, left < 10 ? (int)left : 10);
+    }
+}
+
+static void fixture_close_pair(int pair[2]) {
+    if (pair[0] >= 0) close(pair[0]);
+    if (pair[1] >= 0) close(pair[1]);
+}
+
+static bool fixture_registry_ready(const char *address) {
+    DBusError error = DBUS_ERROR_INIT;
+    DBusConnection *bus = dbus_connection_open_private(address, &error);
+    dbus_uint32_t result = 0;
+    bool ready = bus && dbus_bus_register(bus, &error) &&
+        dbus_bus_start_service_by_name(bus, "org.a11y.atspi.Registry", 0, &result, &error);
+    if (!ready) fprintf(stderr, "private registry startup failed: %s\n",
+                        error.message ? error.message : "unknown error");
+    dbus_error_free(&error);
+    if (bus) { dbus_connection_close(bus); dbus_connection_unref(bus); }
+    return ready;
+}
+
+static void test_private_bus_loss(const char *host) {
+    /* Activated private services are adopted and reaped by this test, not
+     * left as zombies with the VM's init process. */
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) { MD_CHECK(false); return; }
+    for (int mode = 0; mode < 3; mode++) {
+        pid_t bus_pid = -1, bus_group = -1, child = -1;
+        int bus_out[2] = {-1, -1}, in[2] = {-1, -1}, out[2] = {-1, -1};
+        char runtime[] = "/tmp/md-atspi-loss-XXXXXX";
+        if (!mkdtemp(runtime)) { MD_CHECK(false); return; }
+        char address[256], option[280], config[256], config_option[280];
+        snprintf(address, sizeof(address), "unix:path=%s/bus", runtime);
+        snprintf(option, sizeof(option), "--address=%s", address);
+        snprintf(config, sizeof(config), "%s/bus.conf", runtime);
+        snprintf(config_option, sizeof(config_option), "--config-file=%s", config);
+        FILE *fp = fopen(config, "w");
+        if (!fp) { MD_CHECK(false); rmdir(runtime); return; }
+        fprintf(fp, "<busconfig><type>accessibility</type><auth>EXTERNAL</auth>"
+                    "<listen>%s</listen>", address);
+        const gchar *const *dirs = g_get_system_data_dirs();
+        for (int i = 0; dirs[i]; i++) {
+            gchar *escaped = g_markup_escape_text(dirs[i], -1);
+            fprintf(fp, "<servicedir>%s/dbus-1/accessibility-services</servicedir>", escaped);
+            g_free(escaped);
+        }
+        fputs("<policy context=\"default\"><allow send_destination=\"*\"/>"
+              "<allow receive_sender=\"*\"/><allow own=\"*\"/></policy>"
+              "<limit name=\"service_start_timeout\">2000</limit></busconfig>", fp);
+        MD_CHECK(fclose(fp) == 0);
+        if (pipe(bus_out) || pipe(in) || pipe(out)) { MD_CHECK(false); goto cleanup; }
+        bus_pid = fork();
+        if (bus_pid == 0) {
+            setpgid(0, 0);
+            /* These are set BEFORE launching any bus or service. Never ask
+             * org.a11y.Bus for an address in the user's runtime directory. */
+            setenv("XDG_RUNTIME_DIR", runtime, 1);
+            setenv("AT_SPI_BUS_ADDRESS", address, 1);
+            setenv("DBUS_SESSION_BUS_ADDRESS", address, 1);
+            unsetenv("DISPLAY"); unsetenv("WAYLAND_DISPLAY");
+            dup2(bus_out[1], STDOUT_FILENO);
+            close(bus_out[0]); close(bus_out[1]);
+            close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+            execlp("dbus-daemon", "dbus-daemon", config_option, "--nofork",
+                   "--print-address", option, (char *)NULL);
+            _exit(127);
+        }
+        bus_group = bus_pid;
+        close(bus_out[1]); bus_out[1] = -1;
+        char line[32768];
+        bool started = bus_pid > 0 && fixture_line(bus_out[0], line, sizeof(line));
+        MD_CHECK(started);
+        close(bus_out[0]); bus_out[0] = -1;
+        if (!started) goto cleanup;
+        bool registry_ready = fixture_registry_ready(address);
+        MD_CHECK(registry_ready);
+        if (!registry_ready) goto cleanup;
+        child = fork();
+        if (child == 0) {
+            setenv("XDG_RUNTIME_DIR", runtime, 1);
+            setenv("AT_SPI_BUS_ADDRESS", address, 1);
+            setenv("DBUS_SESSION_BUS_ADDRESS", address, 1);
+            unsetenv("DISPLAY"); unsetenv("WAYLAND_DISPLAY");
+            close(in[1]); close(out[0]);
+            if (mode < 2) fixture_backend_child(out[1], mode == 1);
+            dup2(in[0], STDIN_FILENO); dup2(out[1], STDOUT_FILENO);
+            close(in[0]); close(out[1]);
+            execl(host, host, "--mcp", "--no-input", (char *)NULL);
+            _exit(127);
+        }
+        close(in[0]); in[0] = -1;
+        close(out[1]); out[1] = -1;
+        MD_CHECK(child > 0);
+        if (child > 0) {
+            if (mode == 2) {
+                const char init[] = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{}}\n";
+                MD_CHECK(write(in[1], init, sizeof(init)-1) == sizeof(init)-1);
+            }
+            bool ready = fixture_line(out[0], line, sizeof(line));
+            MD_CHECK(ready);
+            if (mode == 2 && ready) {
+                cJSON *reply = cJSON_Parse(line);
+                MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(reply, "result")));
+                cJSON_Delete(reply);
+                const char tree[] = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"resources/read\",\"id\":2,\"params\":{\"uri\":\"metadesk://ui-tree\"}}\n";
+                MD_CHECK(write(in[1], tree, sizeof(tree)-1) == sizeof(tree)-1);
+                MD_CHECK(fixture_line(out[0], line, sizeof(line)));
+                reply = cJSON_Parse(line);
+                MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(reply, "result")));
+                cJSON_Delete(reply);
+            } else if (ready) MD_CHECK(strcmp(line, "R") == 0);
+            int64_t before = fixture_now_ms();
+            /* Only the PID returned by this fixture's fork, never a PID
+             * looked up from a shared bus or process-name search. */
+            MD_CHECK(kill(bus_pid, SIGTERM) == 0);
+            int status;
+            bool bus_exited = fixture_reap(bus_pid, &status, 1000);
+            MD_CHECK(bus_exited);
+            if (bus_exited) bus_pid = -1;
+            if (mode < 2) {
+                MD_CHECK(fixture_line(out[0], line, sizeof(line)) && strcmp(line, "D") == 0);
+            }
+            /* EOF follows complete host/backend cleanup. */
+            struct pollfd pfd = { .fd = out[0], .events = POLLIN };
+            int64_t left = 5000 - (fixture_now_ms() - before);
+            char ch;
+            bool exited = left > 0 && poll(&pfd, 1, (int)left) > 0 && read(out[0], &ch, 1) == 0;
+            MD_CHECK(exited);
+            if (!exited) kill(child, SIGKILL);
+            bool collected = fixture_reap(child, &status, 1000);
+            MD_CHECK(collected);
+            if (collected) child = -1;
+            MD_CHECK(collected && WIFEXITED(status) && WEXITSTATUS(status) == (mode == 2 ? 1 : 0));
+            MD_CHECK(fixture_now_ms() - before < 5000);
+            printf("  private bus loss mode %d: %lld ms, status=%d\n", mode,
+                   (long long)(fixture_now_ms() - before), status);
+        }
+cleanup:
+        if (child > 0) {
+            kill(child, SIGKILL);
+            MD_CHECK(fixture_reap(child, NULL, 1000));
+        }
+        if (bus_pid > 0) kill(bus_pid, SIGKILL);
+        if (bus_group > 0) {
+            kill(-bus_group, SIGKILL);
+            MD_CHECK(fixture_reap(-bus_group, NULL, 1000));
+        }
+        fixture_close_pair(bus_out);
+        fixture_close_pair(in);
+        fixture_close_pair(out);
+        /* The private registry normally exits on disconnect. Remove only
+         * private fixture artifacts, never anything in /run/user/1000. */
+        char socket_path[256];
+        snprintf(socket_path, sizeof(socket_path), "%s/bus", runtime);
+        unlink(socket_path);
+        unlink(config);
+        MD_CHECK(rmdir(runtime) == 0);
+    }
+}
+#endif
+
+int main(int argc, char **argv) {
+#ifdef __linux__
+    if (argc == 3 && strcmp(argv[1], "--private-bus-loss") == 0) {
+        signal(SIGPIPE, SIG_IGN);
+        test_private_bus_loss(argv[2]);
+        return md_test_report();
+    }
+#else
+    (void)argc; (void)argv;
+#endif
     printf("test_a11y:\n");
     printf("  live backend tests: %s\n", live_a11y_tests_enabled() ? "enabled" : "disabled");
     test_liveness();
