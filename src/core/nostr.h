@@ -58,7 +58,7 @@ typedef struct MdNostr MdNostr;
  *
  * Authentication: provide EITHER signer OR sk_hex (not both).
  *   - signer:  MdSigner* from any backend (NIP-46/55L/5F/direct-key).
- *              MdNostr borrows the pointer — caller retains ownership.
+ *              MdNostr retains a reference; caller retains its own ownership.
  *   - sk_hex:  64-char hex secret key (legacy). MdNostr creates an
  *              internal direct-key signer and takes ownership of it.
  *
@@ -91,12 +91,37 @@ typedef void (*MdNostrPublishResultCallback)(const char *event_id,
                                              const char *reason,
                                              void *userdata);
 
+/* Bounded inbound DM pipeline. These limits cover serialized gift-wraps,
+ * queued wraps (one worker), and the recent wrap/rumor replay windows. */
+#define MD_NOSTR_DM_MAX_BYTES 131072
+#define MD_NOSTR_DM_QUEUE_CAPACITY 32
+#define MD_NOSTR_DM_DEDUP_CAPACITY 256
+
+typedef enum {
+    MD_NOSTR_DM_OK = 0,
+    MD_NOSTR_DM_INVALID_WRAP,
+    MD_NOSTR_DM_WRONG_RECIPIENT,
+    MD_NOSTR_DM_TOO_LARGE,
+    MD_NOSTR_DM_DECRYPT_FAILED,
+    MD_NOSTR_DM_INVALID_SEAL,
+    MD_NOSTR_DM_SENDER_MISMATCH,
+    MD_NOSTR_DM_INVALID_RUMOR,
+    MD_NOSTR_DM_DUPLICATE,
+    MD_NOSTR_DM_QUEUE_FULL,
+    MD_NOSTR_DM_STOPPED,
+    MD_NOSTR_DM_NO_MEMORY,
+} MdNostrDmResult;
+
+const char *md_nostr_dm_result_name(MdNostrDmResult result);
+
 /* Callback table registered at creation time */
 typedef struct {
     MdNostrDmCallback              on_dm;              /* incoming session DMs     */
     void                          *dm_userdata;
     MdNostrPublishResultCallback   on_publish_result;  /* relay OK/rejection       */
     void                          *publish_result_userdata;
+    /* Worker validation failures, never plaintext/key material. */
+    void (*on_dm_error)(MdNostrDmResult result, void *userdata);
 } MdNostrCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────
@@ -120,8 +145,33 @@ const char *md_nostr_get_npub(const MdNostr *n);
 /* Get the signer used by this Nostr bridge (borrowed reference). */
 MdSigner *md_nostr_get_signer(MdNostr *n);
 
-/* Destroy Nostr bridge: close subscriptions, disconnect relays, zero key material. */
+/* Stop external producers before destroy; no new calls may start afterward.
+ * Invalidates pending DM results and joins accepted operations before
+ * freeing callbacks/state. An already-admitted callback may finish.
+ * Never call destroy from a bridge callback (it joins the callback worker).
+ * A shared signer is retained, not shut down, by the bridge. */
 void md_nostr_destroy(MdNostr *n);
+
+/* Invalidate inbound/outbound admission immediately without freeing state.
+ * Pending DM results are discarded; destroy joins any non-abortable signer
+ * call. Does not shut down a signer shared with another bridge/role. */
+void md_nostr_stop(MdNostr *n);
+
+/* Bounded ingress used by relay middleware; copies the event on acceptance.
+ * Duplicate delivery is suppressed within bounded recent-ID windows, including
+ * rewrapping the same rumor. Queue-full is explicit backpressure, not a retry
+ * timer. Callers may use drain to await accepted work, not relay history. */
+MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *gift_wrap);
+void md_nostr_drain_dm(MdNostr *n);
+
+/* Deterministic lifecycle diagnostics for tests. Configure only while idle;
+ * hooks run outside bridge locks and must not re-enter bridge APIs. NULL is
+ * the production default. ADMITTED may block to hold an in-flight reader. */
+typedef enum {
+    MD_NOSTR_TEST_ADMITTED, MD_NOSTR_TEST_SERIALIZING, MD_NOSTR_TEST_DRAINING
+} MdNostrTestPoint;
+void md_nostr_set_test_hook(MdNostr *n,
+    void (*hook)(MdNostrTestPoint, void *), void *userdata);
 
 /* ── Session signaling (NIP-17 gift-wrapped DMs) ──────────────
  * Session messages are sent as NIP-17 gift-wrapped DMs:

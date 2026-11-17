@@ -32,6 +32,68 @@
 #define MD_LOG_TAG "signer"
 #include "platform.h"
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+struct MdSignerCancel { atomic_bool cancelled; };
+MdSignerCancel *md_signer_cancel_new(void) {
+    MdSignerCancel *c = malloc(sizeof(*c));
+    if (c) atomic_init(&c->cancelled, false);
+    return c;
+}
+void md_signer_cancel(MdSignerCancel *c) {
+    if (c) atomic_store(&c->cancelled, true);
+}
+void md_signer_cancel_free(MdSignerCancel *c) { free(c); }
+static bool call_cancelled(const MdSignerCancel *c) {
+    return c && atomic_load(&c->cancelled);
+}
+
+struct MdSignerSync {
+    pthread_mutex_t op_mu;
+    atomic_uint refs;
+    atomic_bool closed;
+    atomic_bool ready;
+    bool key_changed; /* op_mu */
+    void (*test_hook)(void *);
+    void *test_userdata;
+};
+
+void md_signer_set_test_hook(MdSigner *s, void (*hook)(void *), void *userdata) {
+    if (s) { s->sync->test_hook = hook; s->sync->test_userdata = userdata; }
+}
+
+static void signer_lock(MdSigner *s) {
+    if (s->sync->test_hook) s->sync->test_hook(s->sync->test_userdata);
+    pthread_mutex_lock(&s->sync->op_mu);
+}
+
+static MdSigner *signer_alloc(void) {
+    MdSigner *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->sync = calloc(1, sizeof(*s->sync));
+    if (!s->sync) { free(s); return NULL; }
+    if (pthread_mutex_init(&s->sync->op_mu, NULL) != 0) {
+        free(s->sync); free(s); return NULL;
+    }
+    atomic_init(&s->sync->refs, 1);
+    atomic_init(&s->sync->closed, false);
+    atomic_init(&s->sync->ready, false);
+    return s;
+}
+
+MdSigner *md_signer_create_custom(MdSignerType type, const MdSignerOps *ops,
+                                   void *backend) {
+    if (!ops || !ops->get_pubkey) return NULL;
+    MdSigner *s = signer_alloc();
+    if (s) { s->type = type; s->ops = ops; s->backend = backend; }
+    return s;
+}
+
+MdSigner *md_signer_ref(MdSigner *s) {
+    if (s) atomic_fetch_add(&s->sync->refs, 1);
+    return s;
+}
 
 /* ── Hex utilities ───────────────────────────────────────────── */
 
@@ -204,7 +266,7 @@ MdSigner *md_signer_create_direct(const char *sk_hex) {
         return NULL;
     }
 
-    MdSigner *s = calloc(1, sizeof(MdSigner));
+    MdSigner *s = signer_alloc();
     if (!s) {
         md_secure_zero(dk->sk_hex, sizeof(dk->sk_hex));
         free(dk->pk_hex);
@@ -218,6 +280,7 @@ MdSigner *md_signer_create_direct(const char *sk_hex) {
 
     /* Cache pubkey */
     s->pubkey_hex = strdup(dk->pk_hex);
+    atomic_store(&s->sync->ready, s->pubkey_hex != NULL);
 
     MD_LOG_I("direct-key backend ready (pk=%.*s...)", 8, dk->pk_hex);
     return s;
@@ -296,6 +359,11 @@ static int nip46_nip44_decrypt(MdSigner *s, const char *peer, const char *ct,
     return MD_SIGNER_OK;
 }
 
+static void nip46_cancel(MdSigner *s) {
+    Nip46State *st = s->backend;
+    nostr_nip46_client_cancel_all(st->session);
+}
+
 static void nip46_destroy(MdSigner *s) {
     if (!s || !s->backend) return;
     Nip46State *st = s->backend;
@@ -314,6 +382,7 @@ static const MdSignerOps nip46_ops = {
     .nip44_encrypt = nip46_nip44_encrypt,
     .nip44_decrypt = nip46_nip44_decrypt,
     .destroy       = nip46_destroy,
+    .cancel        = nip46_cancel,
 };
 
 MdSigner *md_signer_create_nip46(const char *bunker_uri,
@@ -377,7 +446,7 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     st->remote_pubkey_hex = strdup(parsed.remote_signer_pubkey_hex);
     nostr_nip46_uri_bunker_free(&parsed);
 
-    MdSigner *s = calloc(1, sizeof(MdSigner));
+    MdSigner *s = signer_alloc();
     if (!s) {
         /* Clean up backend state directly — can't use nip46_destroy(NULL) */
         if (st->session) {
@@ -395,7 +464,14 @@ MdSigner *md_signer_create_nip46(const char *bunker_uri,
     /* Fetch and cache pubkey */
     char *pk = NULL;
     if (nip46_get_pubkey(s, &pk) == MD_SIGNER_OK) {
+        uint8_t key[32];
+        if (hex_to_bin(pk, key, sizeof(key)) != 0) {
+            free(pk);
+            md_signer_destroy(s);
+            return NULL;
+        }
         s->pubkey_hex = pk;
+        atomic_store(&s->sync->ready, true);
         MD_LOG_I("NIP-46 backend ready (pk=%.*s...)", 8, pk);
     } else {
         MD_LOG_I("NIP-46 backend ready (pubkey pending)");
@@ -417,7 +493,7 @@ MdSigner *md_signer_create_nip46_from_session(
     st->session = session;
     st->remote_pubkey_hex = strdup(remote_pubkey_hex);
 
-    MdSigner *s = calloc(1, sizeof(MdSigner));
+    MdSigner *s = signer_alloc();
     if (!s) {
         free(st->remote_pubkey_hex);
         free(st);
@@ -563,13 +639,14 @@ MdSigner *md_signer_create_nip55l(void) {
         return NULL;
     }
 
-    MdSigner *s = calloc(1, sizeof(MdSigner));
+    MdSigner *s = signer_alloc();
     if (!s) { free(pk); return NULL; }
 
     s->type       = MD_SIGNER_NIP55L;
     s->ops        = &nip55l_ops;
     s->backend    = NULL;  /* stateless */
     s->pubkey_hex = pk;
+        atomic_store(&s->sync->ready, true);
 
     MD_LOG_I("NIP-55L D-Bus backend ready (pk=%.*s...)", 8, pk);
     return s;
@@ -704,8 +781,10 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
     /* Probe: get pubkey to verify signer is operational */
     char *pk = NULL;
     ret = nostr_nip5f_client_get_public_key(conn, &pk);
-    if (ret != 0 || !pk) {
-        MD_LOG_I("NIP-5F get_public_key failed");
+    uint8_t key[32];
+    if (ret != 0 || hex_to_bin(pk, key, sizeof(key)) != 0) {
+        MD_LOG_I("NIP-5F get_public_key failed or returned an invalid key");
+        free(pk);
         nostr_nip5f_client_close(conn);
         return NULL;
     }
@@ -719,7 +798,7 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
     st->conn = conn;
     st->socket_path = strdup(path);
 
-    MdSigner *s = calloc(1, sizeof(MdSigner));
+    MdSigner *s = signer_alloc();
     if (!s) {
         /* Clean up backend state directly — can't use nip5f_destroy(NULL) */
         if (st->conn)
@@ -734,6 +813,7 @@ MdSigner *md_signer_create_nip5f(const char *socket_path) {
     s->ops        = &nip5f_ops;
     s->backend    = st;
     s->pubkey_hex = pk;
+        atomic_store(&s->sync->ready, true);
 
     MD_LOG_I("NIP-5F backend ready (pk=%.*s..., socket=%s)", 8, pk, path);
     return s;
@@ -772,43 +852,160 @@ MdSigner *md_signer_auto_detect(void) {
  * Vtable dispatch layer
  * ══════════════════════════════════════════════════════════════ */
 
-int md_signer_get_pubkey(MdSigner *s, char **out_pubkey_hex) {
-    if (!s || !s->ops || !s->ops->get_pubkey || !out_pubkey_hex)
-        return MD_SIGNER_ERR_NOT_INIT;
+/* All identity-policy helpers run with op_mu held. */
+static int signer_state(MdSigner *s) {
+    if (atomic_load(&s->sync->closed)) return MD_SIGNER_ERR_CANCELLED;
+    if (s->sync->key_changed) return MD_SIGNER_ERR_KEY_CHANGED;
+    return MD_SIGNER_OK;
+}
 
-    /* Return cached value if available */
-    if (s->pubkey_hex) {
-        *out_pubkey_hex = strdup(s->pubkey_hex);
-        return *out_pubkey_hex ? MD_SIGNER_OK : MD_SIGNER_ERR_INTERNAL;
+static bool signer_identity_can_switch(const MdSigner *s) {
+    switch (s->type) {
+    case MD_SIGNER_DIRECT_KEY:
+    case MD_SIGNER_NIP46:
+        return false; /* key/session pin; explicit checks handle rebinding */
+    default:
+        return true; /* local services may switch accounts between calls */
     }
+}
 
-    int ret = s->ops->get_pubkey(s, out_pubkey_hex);
-    if (ret == MD_SIGNER_OK && *out_pubkey_hex) {
-        /* Cache for next time */
-        s->pubkey_hex = strdup(*out_pubkey_hex);
+/* Never replace an established pin on identity drift. */
+static int signer_check_key(MdSigner *s) {
+    int state = signer_state(s);
+    if (state != MD_SIGNER_OK) return state;
+    char *pk = NULL;
+    int ret = s->ops->get_pubkey(s, &pk);
+    if (ret == MD_SIGNER_OK) {
+        uint8_t bytes[32];
+        if (!pk || hex_to_bin(pk, bytes, sizeof(bytes)) != 0) {
+            ret = MD_SIGNER_ERR_INVALID;
+        } else if (s->pubkey_hex && strcmp(s->pubkey_hex, pk) != 0) {
+            s->sync->key_changed = true;
+            atomic_store(&s->sync->ready, false);
+            ret = MD_SIGNER_ERR_KEY_CHANGED;
+        } else if (!s->pubkey_hex) {
+            s->pubkey_hex = strdup(pk);
+            ret = s->pubkey_hex ? MD_SIGNER_OK : MD_SIGNER_ERR_INTERNAL;
+        }
     }
+    free(pk);
+    if (atomic_load(&s->sync->closed)) ret = MD_SIGNER_ERR_CANCELLED;
+    if (ret == MD_SIGNER_OK) atomic_store(&s->sync->ready, true);
     return ret;
 }
 
-int md_signer_sign_event(MdSigner *s, const char *event_json,
-                         char **out_signed_json) {
-    if (!s || !s->ops || !s->ops->sign_event)
-        return MD_SIGNER_ERR_NOT_INIT;
-    return s->ops->sign_event(s, event_json, out_signed_json);
+static int signer_ensure_key(MdSigner *s, bool live) {
+    int ret = signer_state(s);
+    if (ret != MD_SIGNER_OK) return ret;
+    if (!live && s->pubkey_hex) {
+        uint8_t key[32];
+        if (hex_to_bin(s->pubkey_hex, key, sizeof(key)) != 0) {
+            atomic_store(&s->sync->ready, false);
+            return MD_SIGNER_ERR_INVALID;
+        }
+        return MD_SIGNER_OK;
+    }
+    return signer_check_key(s);
 }
 
-int md_signer_nip44_encrypt(MdSigner *s, const char *peer_pubkey_hex,
-                            const char *plaintext, char **out_ciphertext) {
-    if (!s || !s->ops || !s->ops->nip44_encrypt)
+int md_signer_get_pubkey(MdSigner *s, char **out_pubkey_hex) {
+    if (out_pubkey_hex) *out_pubkey_hex = NULL;
+    if (!s || !s->ops || !s->ops->get_pubkey || !out_pubkey_hex)
         return MD_SIGNER_ERR_NOT_INIT;
-    return s->ops->nip44_encrypt(s, peer_pubkey_hex, plaintext, out_ciphertext);
+    md_signer_ref(s);
+    signer_lock(s);
+    int ret = signer_ensure_key(s, false);
+    if (ret == MD_SIGNER_OK) {
+        *out_pubkey_hex = strdup(s->pubkey_hex);
+        if (!*out_pubkey_hex) ret = MD_SIGNER_ERR_INTERNAL;
+    }
+    pthread_mutex_unlock(&s->sync->op_mu);
+    md_signer_destroy(s);
+    return ret;
 }
 
-int md_signer_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
-                            const char *ciphertext, char **out_plaintext) {
-    if (!s || !s->ops || !s->ops->nip44_decrypt)
-        return MD_SIGNER_ERR_NOT_INIT;
-    return s->ops->nip44_decrypt(s, peer_pubkey_hex, ciphertext, out_plaintext);
+/* One gate spans pin establishment, operation and output validation. Local
+ * services need a live precheck; only crypto output needs a live postcheck.
+ * Fixed-session backends avoid identity RPCs once pinned. Signed output proves
+ * its own author; crypto output relies on the fixed-session backend contract. */
+static int signer_call(MdSigner *s, const char *a, const char *b, char **out,
+                       int operation, const MdSignerCancel *cancel) {
+    if (out) *out = NULL;
+    if (!s || !s->ops || !s->ops->get_pubkey) return MD_SIGNER_ERR_NOT_INIT;
+    if (!out || !a || (operation != 0 && !b)) return MD_SIGNER_ERR_INVALID;
+    md_signer_ref(s);
+    signer_lock(s);
+    bool live = signer_identity_can_switch(s);
+    int ret = call_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED : signer_ensure_key(s, live);
+    if (call_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
+    if (ret == MD_SIGNER_OK) {
+        if (operation == 0 && s->ops->sign_event)
+            ret = s->ops->sign_event(s, a, out);
+        else if (operation == 1 && s->ops->nip44_encrypt)
+            ret = s->ops->nip44_encrypt(s, a, b, out);
+        else if (operation == 2 && s->ops->nip44_decrypt)
+            ret = s->ops->nip44_decrypt(s, a, b, out);
+        else ret = MD_SIGNER_ERR_NOT_INIT;
+        int check = call_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED :
+                    signer_ensure_key(s, live && operation != 0);
+        if (call_cancelled(cancel)) check = MD_SIGNER_ERR_CANCELLED;
+        if (check != MD_SIGNER_OK) ret = check;
+        if (ret == MD_SIGNER_OK && !*out) ret = MD_SIGNER_ERR_INVALID;
+        if (ret == MD_SIGNER_OK && operation == 0) {
+            NostrEvent *ev = nostr_event_new(), *requested = nostr_event_new();
+            char expected_id[65], signed_id[65];
+            if (!ev || !requested || nostr_event_deserialize(requested, a) != 0 ||
+                nostr_event_deserialize(ev, *out) != 0) {
+                ret = MD_SIGNER_ERR_INVALID;
+            } else {
+                if (!nostr_event_get_pubkey(requested) || !requested->pubkey[0])
+                    nostr_event_set_pubkey(requested, s->pubkey_hex);
+                if (nostr_event_compute_id(requested, expected_id) != NOSTR_EVENT_VALIDATION_OK ||
+                    nostr_event_validate(ev, signed_id) != NOSTR_EVENT_VALIDATION_OK) {
+                    ret = MD_SIGNER_ERR_INVALID;
+                } else if (strcmp(nostr_event_get_pubkey(ev), s->pubkey_hex) != 0) {
+                    /* A valid signature proves drift without another key RPC. */
+                    s->sync->key_changed = true;
+                    atomic_store(&s->sync->ready, false);
+                    ret = MD_SIGNER_ERR_KEY_CHANGED;
+                } else if (strcmp(expected_id, signed_id) != 0) {
+                    ret = MD_SIGNER_ERR_INVALID;
+                }
+            }
+            if (ev) nostr_event_free(ev);
+            if (requested) nostr_event_free(requested);
+        }
+    }
+    if (call_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
+    if (ret != MD_SIGNER_OK) { free(*out); *out = NULL; }
+    pthread_mutex_unlock(&s->sync->op_mu);
+    md_signer_destroy(s);
+    return ret;
+}
+
+int md_signer_sign_event(MdSigner *s, const char *event_json, char **out) {
+    return signer_call(s, event_json, NULL, out, 0, NULL);
+}
+
+int md_signer_nip44_encrypt(MdSigner *s, const char *peer, const char *pt, char **out) {
+    return signer_call(s, peer, pt, out, 1, NULL);
+}
+
+int md_signer_nip44_decrypt(MdSigner *s, const char *peer, const char *ct, char **out) {
+    return signer_call(s, peer, ct, out, 2, NULL);
+}
+
+int md_signer_sign_event_cancellable(MdSigner *s, const char *json, char **out,
+                                      const MdSignerCancel *cancel) {
+    return signer_call(s, json, NULL, out, 0, cancel);
+}
+int md_signer_nip44_encrypt_cancellable(MdSigner *s, const char *peer,
+    const char *text, char **out, const MdSignerCancel *cancel) {
+    return signer_call(s, peer, text, out, 1, cancel);
+}
+int md_signer_nip44_decrypt_cancellable(MdSigner *s, const char *peer,
+    const char *text, char **out, const MdSignerCancel *cancel) {
+    return signer_call(s, peer, text, out, 2, cancel);
 }
 
 MdSignerType md_signer_get_type(const MdSigner *s) {
@@ -826,34 +1023,50 @@ const char *md_signer_type_name(MdSignerType type) {
 }
 
 bool md_signer_is_ready(const MdSigner *s) {
-    /* Cheap predicate: only reports whether the pubkey is already cached.
-     * No I/O — remote signers must be probed with md_signer_probe(). */
-    return s && s->pubkey_hex != NULL;
+    /* Cached readiness only; check_connection performs explicit live I/O. */
+    return s && atomic_load(&s->sync->ready) && !atomic_load(&s->sync->closed);
 }
 
-int md_signer_probe(MdSigner *s) {
-    if (!s || !s->ops || !s->ops->get_pubkey)
-        return MD_SIGNER_ERR_INVALID;
-
-    if (s->pubkey_hex)
-        return MD_SIGNER_OK;
-
-    /* Route through md_signer_get_pubkey so a successful round-trip caches
-     * s->pubkey_hex (making md_signer_is_ready() true afterwards). Blocking
-     * for remote NIP-46/55L/5F backends. */
-    char *pk = NULL;
-    int ret = md_signer_get_pubkey(s, &pk);
-    free(pk);
+int md_signer_check_connection(MdSigner *s) {
+    if (!s || !s->ops || !s->ops->get_pubkey) return MD_SIGNER_ERR_INVALID;
+    md_signer_ref(s);
+    signer_lock(s);
+    int ret = signer_check_key(s);
+    pthread_mutex_unlock(&s->sync->op_mu);
+    md_signer_destroy(s);
     return ret;
 }
 
-void md_signer_destroy(MdSigner *s) {
+int md_signer_probe(MdSigner *s) {
+    if (!s || !s->ops || !s->ops->get_pubkey) return MD_SIGNER_ERR_INVALID;
+    md_signer_ref(s);
+    signer_lock(s);
+    int ret = signer_ensure_key(s, false);
+    pthread_mutex_unlock(&s->sync->op_mu);
+    md_signer_destroy(s);
+    return ret;
+}
+
+void md_signer_shutdown(MdSigner *s) {
     if (!s) return;
+    md_signer_ref(s);
+    /* Only one shutdown caller invokes the backend cancellation hook. */
+    if (!atomic_exchange(&s->sync->closed, true) && s->ops->cancel)
+        s->ops->cancel(s);
+    signer_lock(s);
+    pthread_mutex_unlock(&s->sync->op_mu);
+    md_signer_destroy(s);
+}
+
+void md_signer_destroy(MdSigner *s) {
+    if (!s || atomic_fetch_sub(&s->sync->refs, 1) != 1) return;
 
     if (s->ops && s->ops->destroy)
         s->ops->destroy(s);
 
     free(s->pubkey_hex);
+    pthread_mutex_destroy(&s->sync->op_mu);
+    free(s->sync);
 
     memset(s, 0, sizeof(MdSigner));
     free(s);

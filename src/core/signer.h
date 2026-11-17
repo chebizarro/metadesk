@@ -22,7 +22,11 @@
  * secret key is retrieved from 1Password Connect (secrets.c). The
  * remote backends (NIP-46/55L/5F) never expose the key to metadesk.
  *
- * Thread safety: signer operations may block (network I/O, D-Bus).
+ * Thread safety: all backend operations on one instance are serialized,
+ * including identity checks and signed-output validation. Direct-key and
+ * NIP-46 operations reuse a session pin; NIP-55L/5F check the live key before
+ * each operation and after encrypt/decrypt (whose output cannot prove author).
+ * Signer operations may block (network I/O, D-Bus).
  * Callers must not call from latency-sensitive paths (capture callback).
  * The nostr.c bridge calls signing from its worker thread.
  */
@@ -58,6 +62,8 @@ typedef enum {
     MD_SIGNER_ERR_CRYPTO     = -6,  /* cryptographic operation failed    */
     MD_SIGNER_ERR_INTERNAL   = -7,  /* internal/unexpected error         */
     MD_SIGNER_ERR_NO_KEY     = -8,  /* no key available in backend       */
+    MD_SIGNER_ERR_KEY_CHANGED = -9, /* live identity differs from pin    */
+    MD_SIGNER_ERR_CANCELLED  = -10, /* signer has been shut down         */
 } MdSignerError;
 
 /* ── Vtable (operation dispatch) ─────────────────────────────── */
@@ -108,6 +114,10 @@ typedef struct {
      */
     void (*destroy)(MdSigner *s);
 
+    /* Optional, thread-safe interruption of in-flight I/O. Must not free
+     * backend state; destroy runs only after all operation references drain. */
+    void (*cancel)(MdSigner *s);
+
 } MdSignerOps;
 
 /* ── Signer context ──────────────────────────────────────────── */
@@ -116,7 +126,8 @@ struct MdSigner {
     MdSignerType    type;
     const MdSignerOps *ops;
     void           *backend;    /* backend-specific opaque state */
-    char           *pubkey_hex; /* cached pubkey (lazy-populated) */
+    char           *pubkey_hex; /* immutable identity pin, once populated */
+    struct MdSignerSync *sync;   /* private serialization/lifetime state */
 };
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
@@ -166,7 +177,9 @@ MdSigner *md_signer_auto_detect(void);
 
 /*
  * Get the user's public key (hex).
- * Result is cached after the first call.
+ * Returns the immutable pin without I/O when initialized; otherwise fetches
+ * and pins the backend key. Use md_signer_check_connection() for a live check.
+ * Detected identity drift permanently refuses further operations.
  * out_pubkey_hex: receives malloc'd string. Caller frees.
  */
 int md_signer_get_pubkey(MdSigner *s, char **out_pubkey_hex);
@@ -191,6 +204,20 @@ int md_signer_nip44_encrypt(MdSigner *s, const char *peer_pubkey_hex,
 int md_signer_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
                             const char *ciphertext, char **out_plaintext);
 
+/* A bridge/role-local cancellation token never shuts down a shared signer.
+ * Cancellation discards eventual results of non-abortable calls. The owner
+ * keeps the token alive until all calls using it have returned. */
+typedef struct MdSignerCancel MdSignerCancel;
+MdSignerCancel *md_signer_cancel_new(void);
+void md_signer_cancel(MdSignerCancel *cancel);
+void md_signer_cancel_free(MdSignerCancel *cancel);
+int md_signer_sign_event_cancellable(MdSigner *s, const char *json, char **out,
+                                      const MdSignerCancel *cancel);
+int md_signer_nip44_encrypt_cancellable(MdSigner *s, const char *peer,
+    const char *plaintext, char **out, const MdSignerCancel *cancel);
+int md_signer_nip44_decrypt_cancellable(MdSigner *s, const char *peer,
+    const char *ciphertext, char **out, const MdSignerCancel *cancel);
+
 /* ── Testing / advanced constructors ──────────────────────────── */
 
 /*
@@ -214,20 +241,41 @@ MdSignerType md_signer_get_type(const MdSigner *s);
 /* Get a human-readable name for the signer backend. */
 const char *md_signer_type_name(MdSignerType type);
 
-/* Cheap, side-effect-free predicate: true iff the signer's pubkey is
- * already cached. For remote signers (NIP-46/55L/5F) this is false until
- * a successful md_signer_probe() (or any get_pubkey) has populated it.
- * Never performs I/O. */
+/* Cheap, side-effect-free predicate: a pin was established and this
+ * instance has not detected key drift or been shut down. Never performs
+ * I/O; this is not a liveness check. */
 bool md_signer_is_ready(const MdSigner *s);
 
-/* Actively probe the signer: fetch the pubkey, blocking on a remote
- * round-trip for NIP-46/55L/5F backends. On success the pubkey is cached
- * and md_signer_is_ready() then returns true. Returns MD_SIGNER_OK or a
- * negative MD_SIGNER_* error. Use this (not is_ready) to test whether a
- * remote signer service is actually reachable. */
+/* Initialize the cached pin if needed; already-ready instances do no I/O. */
 int md_signer_probe(MdSigner *s);
 
-/* Destroy signer, zeroing any key material. */
+/* Always query the live backend and compare with the immutable pin. May
+ * block on remote IPC. Use for explicit liveness checks and before reusing
+ * a fixed-session pin after reconnect/rebinding; normal NIP-46 sign/crypto
+ * operations do not fetch the live key. Drift is latched: explicitly create
+ * a new instance to bind a different (backend, pubkey) account. */
+int md_signer_check_connection(MdSigner *s);
+
+/* Custom backends use the same serialization, pinning and lifetime rules.
+ * Takes ownership of backend on success only. Ops must outlive the signer. */
+MdSigner *md_signer_create_custom(MdSignerType type, const MdSignerOps *ops,
+                                   void *backend);
+
+/* Retain/release an account backend across independent host/client roles.
+ * Every thread issuing operations must own a reference. No new calls may
+ * start after releasing that reference. In-flight calls retain themselves. */
+MdSigner *md_signer_ref(MdSigner *s);
+
+/* Test admission observer, invoked just before waiting on the signer gate.
+ * Configure only while idle; callback must not re-enter signer APIs. */
+void md_signer_set_test_hook(MdSigner *s, void (*hook)(void *), void *userdata);
+
+/* Permanently refuse new work, interrupt I/O if the backend supports cancel,
+ * and drain current operations. Do not call from a backend operation.
+ * Backends without cancel drain normally (no unsafe pthread cancellation). */
+void md_signer_shutdown(MdSigner *s);
+
+/* Release one reference, zeroing key material when the last call drains. */
 void md_signer_destroy(MdSigner *s);
 
 #ifdef __cplusplus

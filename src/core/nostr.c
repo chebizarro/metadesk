@@ -36,6 +36,9 @@
 
 /* Forward declaration — defined after DM helpers, used by auth handler */
 static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev);
+static NostrEvent *sign_event_cancellable(MdSigner *signer, NostrEvent *ev,
+                                          const MdSignerCancel *cancel);
+static int publish_signed_json(MdNostr *n, const char *json);
 
 /* Helper: parse JSON into a new NostrEvent (replaces old nostr_event_from_json) */
 static NostrEvent *event_from_json(const char *json) {
@@ -51,7 +54,7 @@ static NostrEvent *event_from_json(const char *json) {
 
 struct MdNostr {
     MdSigner          *signer;       /* signing backend                     */
-    bool               owns_signer;  /* true if we created it (from sk_hex) */
+    MdSignerCancel    *signer_cancel; /* bridge-local, never closes shared signer */
     char              *pk_hex;       /* our public key, hex                 */
     NostrSimplePool   *pool;         /* nostrc relay pool — persistent conns */
     NostrList         *allowlist;    /* cached NIP-51 allowlist             */
@@ -67,10 +70,56 @@ struct MdNostr {
     size_t             relay_count;
     char             **relay_urls;   /* owned copies of URL strings         */
 
-    /* Tracks pending DM-unwrap goroutines so md_nostr_destroy() can
-     * wait for them to finish before freeing signer/callbacks. */
-    GoWaitGroup        dm_wg;
+    pthread_mutex_t    work_mu;
+    pthread_cond_t     work_cv;
+    bool               closing;
+    unsigned           active_ops;
+    pthread_t          dm_thread;
+    bool               dm_started;
+    bool               dm_busy;
+    char              *dm_queue[MD_NOSTR_DM_QUEUE_CAPACITY];
+    size_t             dm_head, dm_count, dm_reserved;
+    char               wrap_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
+    char               rumor_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
+    size_t             wrap_next, rumor_next;
+    void (*test_hook)(MdNostrTestPoint, void *);
+    void *test_userdata;
 };
+
+void md_nostr_set_test_hook(MdNostr *n,
+    void (*hook)(MdNostrTestPoint, void *), void *userdata) {
+    if (!n) return;
+    n->test_hook = hook;
+    n->test_userdata = userdata;
+}
+
+static void test_point(MdNostr *n, MdNostrTestPoint point) {
+    if (n->test_hook) n->test_hook(point, n->test_userdata);
+}
+
+static bool operation_begin(MdNostr *n) {
+    if (!n) return false;
+    pthread_mutex_lock(&n->work_mu);
+    bool accepted = !n->closing;
+    if (accepted) n->active_ops++;
+    pthread_mutex_unlock(&n->work_mu);
+    if (accepted) test_point(n, MD_NOSTR_TEST_ADMITTED);
+    return accepted;
+}
+
+static bool is_stopped(MdNostr *n) {
+    pthread_mutex_lock(&n->work_mu);
+    bool stopped = n->closing;
+    pthread_mutex_unlock(&n->work_mu);
+    return stopped;
+}
+
+static void operation_end(MdNostr *n) {
+    pthread_mutex_lock(&n->work_mu);
+    n->active_ops--;
+    pthread_cond_broadcast(&n->work_cv);
+    pthread_mutex_unlock(&n->work_mu);
+}
 
 /* ── Parallel relay publishing ──────────────────────────────── */
 typedef struct {
@@ -95,7 +144,7 @@ static void *publish_one_thread(void *arg) {
  * Returns 0 only when at least one relay acknowledged the event with
  * OK=true; -1 when every relay rejected it or never answered. */
 static int publish_all(MdNostr *n, NostrEvent *ev) {
-    if (!n || !ev || n->relay_count == 0) return -1;
+    if (!n || !ev || n->relay_count == 0 || is_stopped(n)) return -1;
 
     GoWaitGroup wg;
     go_wait_group_init(&wg);
@@ -147,7 +196,7 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
 static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
                                   void *user_data) {
     MdNostr *n = user_data;
-    if (!n || !n->signer || !relay || !challenge)
+    if (!n || !n->signer || !relay || !challenge || is_stopped(n))
         return;
 
     const char *relay_url = nostr_relay_get_url_const(relay);
@@ -180,7 +229,7 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
     nostr_event_set_tags(ev, tags); /* takes ownership */
 
     /* Sign via signer abstraction (may block for remote signers) */
-    NostrEvent *signed_ev = sign_event_via_signer(n->signer, ev);
+    NostrEvent *signed_ev = sign_event_cancellable(n->signer, ev, n->signer_cancel);
     nostr_event_free(ev);
     if (!signed_ev) {
         MD_LOG_E("AUTH sign failed for %s", relay_url ? relay_url : "(unknown)");
@@ -202,7 +251,7 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
 static void md_nostr_ok_handler(const char *event_id, bool ok,
                                 const char *reason, void *user_data) {
     MdNostr *n = user_data;
-    if (!n) return;
+    if (!n || is_stopped(n)) return;
 
     if (!ok) {
         MD_LOG_W("relay REJECTED event %.16s%s — %s", event_id ? event_id : "(null)", event_id && strlen(event_id) > 16 ? "..." : "", reason ? reason : "(no reason)");
@@ -214,90 +263,214 @@ static void md_nostr_ok_handler(const char *event_id, bool ok,
     }
 }
 
-/* ── DM unwrap goroutine ──────────────────────────────────────
- * Offloads the 4-step NIP-17 gift-wrap decrypt chain from the pool
- * worker thread.  Each decrypt may involve IPC to a remote signer,
- * so running them on dedicated OS threads prevents head-of-line
- * blocking for other incoming events.
- *
- * Lifecycle safety: the caller increments dm_wg before spawning;
- * md_nostr_destroy() waits on dm_wg before freeing signer/cbs. */
-typedef struct {
-    char        *ephemeral_pk; /* owned copy of gift-wrap sender pubkey */
-    char        *gw_content;   /* owned copy of gift-wrap ciphertext   */
-    MdSigner    *signer;       /* borrowed — safe while dm_wg pending  */
-    void       (*on_dm)(const char *, const char *, void *);
-    void        *dm_userdata;
-    GoWaitGroup *dm_wg;        /* decrement when done                  */
-} DmUnwrapArg;
+/* One worker owns the replay windows; relay threads only enqueue bounded
+ * copies. No signer IPC or application callback runs under work_mu. */
+const char *md_nostr_dm_result_name(MdNostrDmResult result) {
+    static const char *names[] = {
+        "ok", "invalid-wrap", "wrong-recipient", "too-large", "decrypt-failed",
+        "invalid-seal", "sender-mismatch", "invalid-rumor", "duplicate",
+        "queue-full", "stopped", "no-memory"
+    };
+    return (unsigned)result < sizeof(names) / sizeof(names[0]) ? names[result] : "unknown";
+}
 
-static void *dm_unwrap_thread(void *arg) {
-    DmUnwrapArg *ua = arg;
+static bool recent_id(char ids[MD_NOSTR_DM_DEDUP_CAPACITY][65], const char *id) {
+    for (size_t i = 0; i < MD_NOSTR_DM_DEDUP_CAPACITY; i++)
+        if (strcmp(ids[i], id) == 0) return true;
+    return false;
+}
 
-    /* Step 1: Decrypt gift-wrap → seal JSON */
-    char *seal_json = NULL;
-    int ret = md_signer_nip44_decrypt(ua->signer, ua->ephemeral_pk,
-                                      ua->gw_content, &seal_json);
-    if (ret != 0 || !seal_json) goto done;
+static bool addressed_to(NostrEvent *ev, const char *pk) {
+    NostrTags *tags = nostr_event_get_tags(ev);
+    size_t recipients = 0;
+    for (size_t i = 0; tags && i < nostr_tags_size(tags); i++) {
+        NostrTag *tag = nostr_tags_get(tags, i);
+        if (nostr_tag_size(tag) < 1 || strcmp(nostr_tag_get(tag, 0), "p") != 0)
+            continue;
+        if (nostr_tag_size(tag) < 2 || strcmp(nostr_tag_get(tag, 1), pk) != 0)
+            return false; /* metadesk session control is one-to-one */
+        recipients++;
+    }
+    return recipients == 1;
+}
 
-    /* Step 2: Parse seal to get sender pubkey and encrypted content */
-    NostrEvent *seal = event_from_json(seal_json);
-    free(seal_json);
-    if (!seal) goto done;
-
-    const char *sender_pk = nostr_event_get_pubkey(seal);
-    const char *seal_content = nostr_event_get_content(seal);
-    if (!sender_pk || !seal_content) {
-        nostr_event_free(seal);
+static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap) {
+    MdNostrDmResult result = MD_NOSTR_DM_INVALID_WRAP;
+    NostrEvent *seal = NULL, *rumor = NULL;
+    char *seal_json = NULL, *rumor_json = NULL;
+    char wrap_id[65], rumor_id[65];
+    if (!nostr_nip17_validate_gift_wrap(wrap) ||
+        nostr_event_validate(wrap, wrap_id) != NOSTR_EVENT_VALIDATION_OK)
         goto done;
-    }
-
-    /* Step 3: Decrypt seal content → rumor JSON.
-     * sender_pk is borrowed from seal; keep an owned copy for the
-     * post-seal callback path before freeing seal below. */
-    char *sender_pk_copy = strdup(sender_pk);
-    if (!sender_pk_copy) {
-        nostr_event_free(seal);
+    result = MD_NOSTR_DM_WRONG_RECIPIENT;
+    if (!addressed_to(wrap, n->pk_hex)) goto done;
+    result = MD_NOSTR_DM_DUPLICATE;
+    if (recent_id(n->wrap_ids, wrap_id)) goto done;
+    result = MD_NOSTR_DM_DECRYPT_FAILED;
+    if (md_signer_nip44_decrypt_cancellable(n->signer, nostr_event_get_pubkey(wrap),
+                              nostr_event_get_content(wrap), &seal_json, n->signer_cancel) != 0)
         goto done;
-    }
-
-    char *rumor_json = NULL;
-    ret = md_signer_nip44_decrypt(ua->signer, sender_pk_copy,
-                                  seal_content, &rumor_json);
-    nostr_event_free(seal);
-    if (ret != 0 || !rumor_json) {
-        free(sender_pk_copy);
+    result = MD_NOSTR_DM_STOPPED;
+    if (is_stopped(n)) goto done;
+    result = MD_NOSTR_DM_TOO_LARGE;
+    if (strlen(seal_json) > MD_NOSTR_DM_MAX_BYTES) goto done;
+    seal = event_from_json(seal_json);
+    result = MD_NOSTR_DM_INVALID_SEAL;
+    if (!seal || !nostr_nip17_validate_seal(seal, NULL) ||
+        nostr_tags_size(nostr_event_get_tags(seal)) != 0) goto done;
+    result = MD_NOSTR_DM_DECRYPT_FAILED;
+    if (md_signer_nip44_decrypt_cancellable(n->signer, nostr_event_get_pubkey(seal),
+                              nostr_event_get_content(seal), &rumor_json, n->signer_cancel) != 0)
         goto done;
-    }
-
-    /* Step 4: Parse rumor to get DM content */
-    NostrEvent *rumor = event_from_json(rumor_json);
-    free(rumor_json);
-    if (!rumor) {
-        free(sender_pk_copy);
+    result = MD_NOSTR_DM_STOPPED;
+    if (is_stopped(n)) goto done;
+    result = MD_NOSTR_DM_TOO_LARGE;
+    if (strlen(rumor_json) > MD_NOSTR_DM_MAX_BYTES) goto done;
+    rumor = event_from_json(rumor_json);
+    result = MD_NOSTR_DM_INVALID_RUMOR;
+    if (!rumor || nostr_event_get_kind(rumor) != NOSTR_KIND_DIRECT_MESSAGE ||
+        (rumor->sig && rumor->sig[0]) || !nostr_event_get_content(rumor) ||
+        nostr_event_validate_id(rumor, rumor_id) != NOSTR_EVENT_VALIDATION_OK)
         goto done;
-    }
-
-    const char *dm_content = nostr_event_get_content(rumor);
-    if (dm_content) {
-        char *content_copy = strdup(dm_content);
-        nostr_event_free(rumor);
-
-        if (content_copy)
-            ua->on_dm(sender_pk_copy, content_copy, ua->dm_userdata);
-
-        free(content_copy);
-    } else {
-        nostr_event_free(rumor);
-    }
-    free(sender_pk_copy);
-
+    result = MD_NOSTR_DM_SENDER_MISMATCH;
+    if (!nostr_nip17_validate_seal(seal, rumor)) goto done;
+    result = MD_NOSTR_DM_WRONG_RECIPIENT;
+    if (!addressed_to(rumor, n->pk_hex)) goto done;
+    result = MD_NOSTR_DM_DUPLICATE;
+    if (recent_id(n->rumor_ids, rumor_id)) goto done;
+    /* Never use the randomized seal/wrap timestamps for freshness. */
+    memcpy(n->wrap_ids[n->wrap_next++ % MD_NOSTR_DM_DEDUP_CAPACITY], wrap_id, 65);
+    memcpy(n->rumor_ids[n->rumor_next++ % MD_NOSTR_DM_DEDUP_CAPACITY], rumor_id, 65);
+    result = MD_NOSTR_DM_STOPPED;
+    if (is_stopped(n)) goto done;
+    n->cbs.on_dm(nostr_event_get_pubkey(rumor), nostr_event_get_content(rumor),
+                 n->cbs.dm_userdata);
+    result = MD_NOSTR_DM_OK;
 done:
-    go_wait_group_done(ua->dm_wg);
-    free(ua->ephemeral_pk);
-    free(ua->gw_content);
-    free(ua);
+    free(seal_json); free(rumor_json);
+    if (seal) nostr_event_free(seal);
+    if (rumor) nostr_event_free(rumor);
+    return result;
+}
+
+static void *dm_worker(void *arg) {
+    MdNostr *n = arg;
+    pthread_mutex_lock(&n->work_mu);
+    for (;;) {
+        while (!n->closing && n->dm_count == 0)
+            pthread_cond_wait(&n->work_cv, &n->work_mu);
+        if (n->closing) {
+            while (n->dm_count) {
+                free(n->dm_queue[n->dm_head]);
+                n->dm_head = (n->dm_head + 1) % MD_NOSTR_DM_QUEUE_CAPACITY;
+                n->dm_count--;
+            }
+            pthread_cond_broadcast(&n->work_cv);
+            break;
+        }
+        char *json = n->dm_queue[n->dm_head];
+        n->dm_head = (n->dm_head + 1) % MD_NOSTR_DM_QUEUE_CAPACITY;
+        n->dm_count--;
+        n->dm_busy = true;
+        pthread_mutex_unlock(&n->work_mu);
+        NostrEvent *wrap = event_from_json(json);
+        free(json);
+        MdNostrDmResult result = wrap ? unwrap_dm(n, wrap) : MD_NOSTR_DM_INVALID_WRAP;
+        if (wrap) nostr_event_free(wrap);
+        if (result != MD_NOSTR_DM_OK && !is_stopped(n)) {
+            MD_LOG_W("DM rejected: %s", md_nostr_dm_result_name(result));
+            if (n->cbs.on_dm_error) n->cbs.on_dm_error(result, n->cbs.dm_userdata);
+        }
+        pthread_mutex_lock(&n->work_mu);
+        n->dm_busy = false;
+        pthread_cond_broadcast(&n->work_cv);
+    }
+    pthread_mutex_unlock(&n->work_mu);
     return NULL;
+}
+
+/* Bound JSON escaping and container overhead without allocating. The copy
+ * contains only NIP-01 fields; provider-specific extra data is not forwarded. */
+static bool json_string_fits(const char *s, size_t *budget) {
+    if (!s) return true;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        size_t cost = *p < 0x20 ? 6 : (*p == '"' || *p == '\\') ? 2 : 1;
+        if (*budget < cost) return false;
+        *budget -= cost;
+    }
+    return true;
+}
+static bool dm_event_fits(const NostrEvent *ev) {
+    size_t budget = MD_NOSTR_DM_MAX_BYTES - 512; /* keys, punctuation, integers */
+    if (!json_string_fits(ev->id, &budget) || !json_string_fits(ev->pubkey, &budget) ||
+        !json_string_fits(ev->sig, &budget) || !json_string_fits(ev->content, &budget))
+        return false;
+    for (size_t i = 0; i < nostr_tags_size(ev->tags); i++) {
+        if (budget < 3) return false;
+        budget -= 3; /* tag array and comma */
+        NostrTag *tag = nostr_tags_get(ev->tags, i);
+        for (size_t j = 0; j < nostr_tag_size(tag); j++) {
+            if (budget < 3) return false;
+            budget -= 3; /* quotes and comma */
+            if (!json_string_fits(nostr_tag_get(tag, j), &budget)) return false;
+        }
+    }
+    return true;
+}
+
+MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *wrap) {
+    if (!operation_begin(n)) return MD_NOSTR_DM_STOPPED;
+    MdNostrDmResult result = MD_NOSTR_DM_INVALID_WRAP;
+    char *json = NULL;
+    bool reserved = false;
+    if (!wrap || !n->cbs.on_dm) goto done;
+    pthread_mutex_lock(&n->work_mu);
+    if (n->closing) result = MD_NOSTR_DM_STOPPED;
+    else if (n->dm_count + n->dm_reserved >= MD_NOSTR_DM_QUEUE_CAPACITY)
+        result = MD_NOSTR_DM_QUEUE_FULL;
+    else { n->dm_reserved++; reserved = true; }
+    pthread_mutex_unlock(&n->work_mu);
+    if (!reserved) goto done;
+    result = MD_NOSTR_DM_TOO_LARGE;
+    if (!dm_event_fits(wrap)) goto done;
+    NostrEvent copy = *wrap;
+    copy.extra = NULL;
+    test_point(n, MD_NOSTR_TEST_SERIALIZING);
+    json = nostr_event_serialize(&copy);
+    result = MD_NOSTR_DM_NO_MEMORY;
+    if (!json) goto done;
+    result = MD_NOSTR_DM_TOO_LARGE;
+    if (strlen(json) > MD_NOSTR_DM_MAX_BYTES) goto done;
+    pthread_mutex_lock(&n->work_mu);
+    if (n->closing) result = MD_NOSTR_DM_STOPPED;
+    else {
+        n->dm_reserved--;
+        reserved = false;
+        n->dm_queue[(n->dm_head + n->dm_count++) % MD_NOSTR_DM_QUEUE_CAPACITY] = json;
+        json = NULL;
+        result = MD_NOSTR_DM_OK;
+        pthread_cond_broadcast(&n->work_cv);
+    }
+    pthread_mutex_unlock(&n->work_mu);
+done:
+    free(json);
+    if (reserved) {
+        pthread_mutex_lock(&n->work_mu);
+        n->dm_reserved--;
+        pthread_cond_broadcast(&n->work_cv);
+        pthread_mutex_unlock(&n->work_mu);
+    }
+    operation_end(n);
+    return result;
+}
+
+void md_nostr_drain_dm(MdNostr *n) {
+    if (!operation_begin(n)) return;
+    pthread_mutex_lock(&n->work_mu);
+    while (n->dm_count || n->dm_busy || n->dm_reserved)
+        pthread_cond_wait(&n->work_cv, &n->work_mu);
+    pthread_mutex_unlock(&n->work_mu);
+    operation_end(n);
 }
 
 /* ── Event middleware ─────────────────────────────────────────
@@ -314,38 +487,16 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming,
         return;
 
     MdNostr *n = user_data;
-    if (!n)
+    if (!n || is_stopped(n))
         return;
     NostrEvent *ev = incoming->event;
 
     int kind = nostr_event_get_kind(ev);
 
     if (kind == NOSTR_KIND_GIFT_WRAP && n->cbs.on_dm && n->signer) {
-        /* NIP-17 gift-wrap: offload the 4-step decrypt chain to a
-         * goroutine so the pool worker thread isn't blocked by
-         * potentially slow signer IPC (remote/daemon signers). */
-        const char *ephemeral_pk = nostr_event_get_pubkey(ev);
-        const char *gw_content = nostr_event_get_content(ev);
-        if (!ephemeral_pk || !gw_content) return;
-
-        DmUnwrapArg *ua = malloc(sizeof(DmUnwrapArg));
-        if (!ua) return;
-        ua->ephemeral_pk = strdup(ephemeral_pk);
-        ua->gw_content   = strdup(gw_content);
-        ua->signer       = n->signer;
-        ua->on_dm        = n->cbs.on_dm;
-        ua->dm_userdata  = n->cbs.dm_userdata;
-        ua->dm_wg        = &n->dm_wg;
-
-        if (!ua->ephemeral_pk || !ua->gw_content) {
-            free(ua->ephemeral_pk);
-            free(ua->gw_content);
-            free(ua);
-            return;
-        }
-
-        go_wait_group_add(&n->dm_wg, 1);
-        go(dm_unwrap_thread, ua);
+        MdNostrDmResult result = md_nostr_receive_dm(n, ev);
+        if (result != MD_NOSTR_DM_OK)
+            MD_LOG_W("DM ingress rejected: %s", md_nostr_dm_result_name(result));
     } else if (kind == NOSTR_KIND_CATEGORIZED_PEOPLE_LIST) {
         /* NIP-51 categorized people list — check if it's our allowlist.
          * The list is access control: only accept it from our own key
@@ -392,17 +543,18 @@ static int md_nostr_subscribe(MdNostr *n) {
     size_t added = 0;
 
     /* kind:1059 gift-wraps addressed to us.
-     * since = now - 300s: catch DMs from the last 5 minutes without
-     * replaying ancient gift-wraps. */
+     * NIP-59 randomizes timestamps up to two days into the past. Include
+     * that full window plus reconnect slack, and bound relay backfill. */
     if (n->cbs.on_dm) {
         NostrFilter *f = nostr_filter_builder_build(
-            nostr_filter_builder_since(
+            nostr_filter_builder_limit(nostr_filter_builder_since(
                 nostr_filter_builder_tag(
                     nostr_filter_builder_kinds(
                         nostr_filter_builder_new(),
                         NOSTR_KIND_GIFT_WRAP, -1),
                     "p", n->pk_hex),
-                (int64_t)time(NULL) - 300));
+                (int64_t)time(NULL) - (2 * 86400 + 300)),
+                MD_NOSTR_DM_DEDUP_CAPACITY));
         if (f) {
             nostr_filters_add(filters, f);
             nostr_filter_free(f);
@@ -433,7 +585,7 @@ static int md_nostr_subscribe(MdNostr *n) {
 
     if (added > 0)
         nostr_simple_pool_subscribe(n->pool, (const char **)n->relay_urls,
-                                    n->relay_count, *filters, true);
+                                    n->relay_count, *filters, false);
     nostr_filters_free(filters);
     return added > 0 ? 0 : -1;
 }
@@ -450,28 +602,28 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (!n) return NULL;
 
     pthread_mutex_init(&n->allowlist_mu, NULL);
-    go_wait_group_init(&n->dm_wg);
+    pthread_mutex_init(&n->work_mu, NULL);
+    pthread_cond_init(&n->work_cv, NULL);
+    n->signer_cancel = md_signer_cancel_new();
+    if (!n->signer_cancel) { md_nostr_destroy(n); return NULL; }
 
     /* Set up signer: use provided signer, or create direct-key from sk_hex */
     if (cfg->signer) {
-        n->signer = cfg->signer;
-        n->owns_signer = false;
+        n->signer = md_signer_ref(cfg->signer);
     } else {
         n->signer = md_signer_create_direct(cfg->sk_hex);
         if (!n->signer) {
             MD_LOG_E("failed to create signer from sk_hex");
-            free(n);
+            md_nostr_destroy(n);
             return NULL;
         }
-        n->owns_signer = true;
     }
 
     /* Get pubkey from signer */
     char *pk = NULL;
     if (md_signer_get_pubkey(n->signer, &pk) != MD_SIGNER_OK || !pk) {
         MD_LOG_E("failed to get pubkey from signer");
-        if (n->owns_signer) md_signer_destroy(n->signer);
-        free(n);
+        md_nostr_destroy(n);
         return NULL;
     }
     n->pk_hex = pk;
@@ -483,9 +635,15 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     /* Create relay pool — persistent WebSocket connections */
     n->pool = nostr_simple_pool_new();
     if (!n->pool) {
-        if (n->owns_signer) md_signer_destroy(n->signer);
-        free(n->pk_hex);
-        free(n);
+        md_nostr_destroy(n);
+        return NULL;
+    }
+
+    /* Reconnect catch-up must include NIP-59's randomized timestamp range,
+     * not a cursor derived from untrusted received timestamps. */
+    if (!nostr_simple_pool_set_recovery_window(n->pool, 2 * 86400 + 300)) {
+        MD_LOG_E("pool recovery-window configuration failed");
+        md_nostr_destroy(n);
         return NULL;
     }
 
@@ -536,6 +694,14 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         return NULL;
     }
 
+    if (n->cbs.on_dm) {
+        if (pthread_create(&n->dm_thread, NULL, dm_worker, n) != 0) {
+            md_nostr_destroy(n);
+            return NULL;
+        }
+        n->dm_started = true;
+    }
+
     /* Start pool worker threads */
     nostr_simple_pool_start(n->pool);
 
@@ -558,14 +724,28 @@ MdSigner *md_nostr_get_signer(MdNostr *n) {
     return n ? n->signer : NULL;
 }
 
+void md_nostr_stop(MdNostr *n) {
+    if (!n) return;
+    pthread_mutex_lock(&n->work_mu);
+    n->closing = true;
+    md_signer_cancel(n->signer_cancel);
+    pthread_cond_broadcast(&n->work_cv);
+    pthread_mutex_unlock(&n->work_mu);
+}
+
 void md_nostr_destroy(MdNostr *n) {
     if (!n) return;
+    md_nostr_stop(n);
 
-    /* Stop pool — closes all subscriptions, disconnects relays */
-    if (n->pool) {
-        nostr_simple_pool_stop(n->pool);
-        nostr_simple_pool_free(n->pool);
-    }
+    /* Stop relay producers before draining consumers. Keep the pool,
+     * allowlist and callbacks alive while accepted work still uses them. */
+    if (n->pool) nostr_simple_pool_stop(n->pool);
+    test_point(n, MD_NOSTR_TEST_DRAINING);
+    if (n->dm_started) pthread_join(n->dm_thread, NULL);
+    pthread_mutex_lock(&n->work_mu);
+    while (n->active_ops) pthread_cond_wait(&n->work_cv, &n->work_mu);
+    pthread_mutex_unlock(&n->work_mu);
+    if (n->pool) nostr_simple_pool_free(n->pool);
     if (n->allowlist)
         nostr_nip51_list_free(n->allowlist);
 
@@ -579,13 +759,10 @@ void md_nostr_destroy(MdNostr *n) {
 
     pthread_mutex_destroy(&n->allowlist_mu);
 
-    /* Wait for any pending DM-unwrap goroutines before freeing signer */
-    go_wait_group_wait(&n->dm_wg);
-    go_wait_group_destroy(&n->dm_wg);
-
-    /* Only destroy signer if we created it (from sk_hex fallback) */
-    if (n->owns_signer && n->signer)
-        md_signer_destroy(n->signer);
+    pthread_cond_destroy(&n->work_cv);
+    pthread_mutex_destroy(&n->work_mu);
+    md_signer_destroy(n->signer);
+    md_signer_cancel_free(n->signer_cancel);
 
     free(n->pk_hex);
     free(n);
@@ -627,6 +804,11 @@ char *md_nostr_get_pubkey(const char *sk_hex) {
  * the signer protocol. For direct-key, it stays in-process.
  */
 static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev) {
+    return sign_event_cancellable(signer, ev, NULL);
+}
+
+static NostrEvent *sign_event_cancellable(MdSigner *signer, NostrEvent *ev,
+                                          const MdSignerCancel *cancel) {
     if (!signer || !ev) return NULL;
 
     /* Serialize unsigned event to JSON */
@@ -635,7 +817,7 @@ static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev) {
 
     /* Sign through the signer abstraction */
     char *signed_json = NULL;
-    int ret = md_signer_sign_event(signer, unsigned_json, &signed_json);
+    int ret = md_signer_sign_event_cancellable(signer, unsigned_json, &signed_json, cancel);
     free(unsigned_json);
 
     if (ret != MD_SIGNER_OK || !signed_json)
@@ -692,17 +874,25 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
                                                  content, 0);
     if (!rumor) return -1;
 
+    char rumor_id[65];
+    if (nostr_event_compute_id(rumor, rumor_id) != NOSTR_EVENT_VALIDATION_OK) {
+        nostr_event_free(rumor);
+        return -1;
+    }
+    rumor->id = strdup(rumor_id);
+    if (!rumor->id) { nostr_event_free(rumor); return -1; }
     char *rumor_json = nostr_event_serialize(rumor);
     nostr_event_free(rumor);
     if (!rumor_json) return -1;
 
     /* Step 2: NIP-44 encrypt rumor → seal content (via signer) */
     char *encrypted_rumor = NULL;
-    int ret = md_signer_nip44_encrypt(n->signer, recipient_pubkey_hex,
-                                      rumor_json, &encrypted_rumor);
+    int ret = md_signer_nip44_encrypt_cancellable(n->signer, recipient_pubkey_hex,
+                                      rumor_json, &encrypted_rumor, n->signer_cancel);
     free(rumor_json);
     if (ret != MD_SIGNER_OK || !encrypted_rumor)
         return -1;
+    if (is_stopped(n)) { free(encrypted_rumor); return -1; }
 
     /* Step 3: Seal (kind:13) signed via the signer abstraction. This step
      * stays local: nostrc's create_seal needs the raw secret key, which
@@ -716,9 +906,10 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
     nostr_event_set_created_at(seal, (int64_t)time(NULL));
     free(encrypted_rumor);
 
-    NostrEvent *signed_seal = sign_event_via_signer(n->signer, seal);
+    NostrEvent *signed_seal = sign_event_cancellable(n->signer, seal, n->signer_cancel);
     nostr_event_free(seal);
     if (!signed_seal) return -1;
+    if (is_stopped(n)) { nostr_event_free(signed_seal); return -1; }
 
     /* Step 4: Gift-wrap (kind:1059) via nostrc — adds the recipient p tag
      * and a randomized timestamp per NIP-59, signed by an ephemeral key
@@ -737,12 +928,20 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
 
 int md_nostr_send_session_request(MdNostr *n, const char *host_pubkey_hex,
                                   const char *json_payload) {
-    return md_nostr_send_dm(n, host_pubkey_hex, json_payload);
+    if (!operation_begin(n)) return -1;
+    int ret = md_nostr_send_dm(n, host_pubkey_hex, json_payload);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    return ret;
 }
 
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload) {
-    return md_nostr_send_dm(n, client_pubkey_hex, json_payload);
+    if (!operation_begin(n)) return -1;
+    int ret = md_nostr_send_dm(n, client_pubkey_hex, json_payload);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    return ret;
 }
 
 /* ── Access control (NIP-51 allowlists) ─────────────────────── */
@@ -754,7 +953,7 @@ static void warn_allowlist_startup_window(const MdNostr *n) {
     MD_LOG_W("WARNING: allowlist checked before first NIP-51 refresh (%s); startup window remains open until relay data arrives", n->allowlist_refresh_requested ? "waiting for relay data" : "refresh not requested");
 }
 
-bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
+static bool is_allowed(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex)
         return false;
 
@@ -776,7 +975,7 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex) {
     return allowed;
 }
 
-bool md_nostr_has_allowlist(const MdNostr *n) {
+static bool has_allowlist(const MdNostr *n) {
     if (!n)
         return false;
 
@@ -788,14 +987,16 @@ bool md_nostr_has_allowlist(const MdNostr *n) {
     return has;
 }
 
-int md_nostr_refresh_allowlist(MdNostr *n) {
+static int refresh_allowlist(MdNostr *n) {
     if (!n || !n->pool || !n->pk_hex) return -1;
 
     /* The kind:30000 filter is part of the single merged subscription
      * created in md_nostr_create() — a second subscribe call would free
      * the filter set the live DM subscription borrows. Nothing to do
      * here but record the request; events arrive asynchronously. */
+    pthread_mutex_lock(&n->allowlist_mu);
     n->allowlist_refresh_requested = true;
+    pthread_mutex_unlock(&n->allowlist_mu);
     return 0;
 }
 
@@ -833,7 +1034,7 @@ static NostrEvent *build_allowlist_event(const MdNostr *n) {
     return list_event;
 }
 
-int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps) {
+static int allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps) {
     if (!n || !n->signer || !pubkey_hex)
         return -1;
 
@@ -859,7 +1060,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
     if (!list_event) return -1;
 
     /* Sign via signer abstraction (may block — outside the mutex) */
-    NostrEvent *signed_event = sign_event_via_signer(n->signer, list_event);
+    NostrEvent *signed_event = sign_event_cancellable(n->signer, list_event, n->signer_cancel);
     nostr_event_free(list_event);
     if (!signed_event) return -1;
 
@@ -872,7 +1073,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps)
     return ret;
 }
 
-int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
+static int allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex)
         return -1;
 
@@ -914,7 +1115,7 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
 
     if (!list_event) return -1;
 
-    NostrEvent *signed_event = sign_event_via_signer(n->signer, list_event);
+    NostrEvent *signed_event = sign_event_cancellable(n->signer, list_event, n->signer_cancel);
     nostr_event_free(list_event);
     if (!signed_event) return -1;
 
@@ -927,7 +1128,7 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex) {
     return ret;
 }
 
-int md_nostr_allowlist_count(const MdNostr *n) {
+static int allowlist_count(const MdNostr *n) {
     if (!n) return 0;
     pthread_mutex_lock((pthread_mutex_t *)&n->allowlist_mu);
     int count = n->allowlist ? (int)n->allowlist->count : 0;
@@ -935,7 +1136,7 @@ int md_nostr_allowlist_count(const MdNostr *n) {
     return count;
 }
 
-int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
+static int allowlist_get_entry(const MdNostr *n, int index,
                                  MdAllowlistEntry *out) {
     if (!n || !out || index < 0)
         return -1;
@@ -958,10 +1159,64 @@ int md_nostr_allowlist_get_entry(const MdNostr *n, int index,
     return ret;
 }
 
+bool md_nostr_is_allowed(MdNostr *n, const char *pk) {
+    if (!operation_begin(n)) return false;
+    bool ret = is_allowed(n, pk);
+    operation_end(n);
+    return ret;
+}
+bool md_nostr_has_allowlist(const MdNostr *n) {
+    if (!operation_begin((MdNostr *)n)) return false;
+    bool ret = has_allowlist(n);
+    operation_end((MdNostr *)n);
+    return ret;
+}
+int md_nostr_refresh_allowlist(MdNostr *n) {
+    if (!operation_begin(n)) return -1;
+    int ret = refresh_allowlist(n);
+    operation_end(n);
+    return ret;
+}
+int md_nostr_allowlist_count(const MdNostr *n) {
+    if (!operation_begin((MdNostr *)n)) return 0;
+    int ret = allowlist_count(n);
+    operation_end((MdNostr *)n);
+    return ret;
+}
+int md_nostr_allowlist_get_entry(const MdNostr *n, int index, MdAllowlistEntry *out) {
+    if (!operation_begin((MdNostr *)n)) return -1;
+    int ret = allowlist_get_entry(n, index, out);
+    operation_end((MdNostr *)n);
+    return ret;
+}
+
+int md_nostr_publish_signed_json(MdNostr *n, const char *json) {
+    if (!operation_begin(n)) return -1;
+    int ret = publish_signed_json(n, json);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    return ret;
+}
 
 /* ── Generic event publishing ────────────────────────────────── */
 
-int md_nostr_publish_signed_json(MdNostr *n, const char *signed_event_json) {
+int md_nostr_allowlist_add(MdNostr *n, const char *pk, const char *caps) {
+    if (!operation_begin(n)) return -1;
+    int ret = allowlist_add(n, pk, caps);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    return ret;
+}
+
+int md_nostr_allowlist_remove(MdNostr *n, const char *pk) {
+    if (!operation_begin(n)) return -1;
+    int ret = allowlist_remove(n, pk);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    return ret;
+}
+
+static int publish_signed_json(MdNostr *n, const char *signed_event_json) {
     if (!n || !signed_event_json || n->relay_count == 0)
         return -1;
 
