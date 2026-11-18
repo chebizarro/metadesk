@@ -6,6 +6,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
 #include <time.h>
 
 static double now(void) {
@@ -14,15 +16,18 @@ static double now(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-int main(void) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    MdCaptureConfig cfg = {.target_fps = 15, .show_cursor = true};
-    MdCaptureCtx *ctx = md_capture_create(&cfg);
-    if (!ctx) return 2;
+static uint64_t last_timestamp;
+
+static void *stop_capture(void *ctx) {
+    md_capture_stop(ctx);
+    return NULL;
+}
+
+static int probe(MdCaptureCtx *ctx) {
     double start = now();
     int rc = md_capture_start(ctx);
     printf("start_rc=%d elapsed=%.3f\n", rc, now() - start);
-    if (rc) { md_capture_destroy(ctx); return 3; }
+    if (rc) { printf("frames=0 start_failed=1\n"); return 3; }
     /* Two distinct rendered backgrounds: verify pixels, not just callbacks.
      * No input injection, no encoder, no network, no mock capture backend. */
     const char *commands[] = {
@@ -33,11 +38,11 @@ int main(void) {
     const unsigned rgb[2][3] = {{0x20, 0x40, 0x60}, {0xa0, 0x80, 0x20}};
     for (unsigned change = 0; change < 10; change++) {
         unsigned phase = change % 2, before = matches[phase];
-        if (system(commands[phase]) != 0) { md_capture_destroy(ctx); return 4; }
+        if (system(commands[phase]) != 0) { return 4; }
         double deadline = now() + 3, redraw = now() + .25;
         while (now() < deadline && matches[phase] == before) {
             if (now() >= redraw) {
-                if (system(commands[phase]) != 0) { md_capture_destroy(ctx); return 4; }
+                if (system(commands[phase]) != 0) { return 4; }
                 redraw = now() + .25;
             }
             MdFrame f = {0};
@@ -50,6 +55,13 @@ int main(void) {
                 continue;
             }
             frames++;
+            if (!f.timestamp_ns || f.timestamp_ns <= last_timestamp ||
+                f.timestamp_ns > (uint64_t)(now() * 1e9)) {
+                fprintf(stderr, "invalid/nonprogressing monotonic timestamp\n");
+                md_capture_release_frame(ctx, &f);
+                return 8;
+            }
+            last_timestamp = f.timestamp_ns;
             size_t offset = (size_t)(f.height / 2) * f.stride + (f.width / 2) * 4;
             if (f.width != 1920 || f.height != 1080 || f.buf_type != MD_BUF_CPU ||
                 !f.data || offset + 4 > f.data_size) {
@@ -58,7 +70,6 @@ int main(void) {
                         f.width, f.height, f.stride, f.buf_type, f.format,
                         f.data != NULL, f.data_size, f.seq);
                 md_capture_release_frame(ctx, &f);
-                md_capture_destroy(ctx);
                 return 5;
             }
             const unsigned char *p = f.data + offset;
@@ -76,19 +87,88 @@ int main(void) {
     /* A static, undamaged output can legitimately stop delivering new frames.
      * Measure that boundary separately from the changing-pixel success test. */
     if (matches[0] == 5 && matches[1] == 5) {
-        unsigned idle_frames = 0, idle_timeouts = 0;
+        unsigned idle_frames = 0, idle_timeouts = 0, idle_errors = 0;
+        char before[1024], after[1024];
+        size_t token_len = md_capture_restore_token_load(before, sizeof(before));
         double idle_start = now();
-        for (unsigned i = 0; i < 3; i++) {
+        for (unsigned i = 0; i < 5; i++) {
             MdFrame f = {0};
-            if (md_capture_get_frame(ctx, &f)) idle_timeouts++;
+            int result = md_capture_get_frame(ctx, &f);
+            if (result == MD_CAPTURE_IDLE) idle_timeouts++;
+            else if (result == MD_CAPTURE_ERROR) idle_errors++;
             else { idle_frames++; md_capture_release_frame(ctx, &f); }
         }
-        printf("static_frames=%u static_timeouts=%u elapsed=%.3f\n",
-               idle_frames, idle_timeouts, now() - idle_start);
+        bool retained = token_len && md_capture_restore_token_load(after, sizeof(after)) == token_len &&
+                        strcmp(before, after) == 0;
+        printf("static_frames=%u static_idle=%u static_errors=%u authorization_retained=%d elapsed=%.3f\n",
+               idle_frames, idle_timeouts, idle_errors, retained, now() - idle_start);
+        if (idle_errors || !retained) return 9;
     }
-    md_capture_stop(ctx);
-    md_capture_destroy(ctx);
+    if (matches[0] < 5 || matches[1] < 5) {
+        printf("frames=%u timeouts=%u matching_pixels=%u,%u elapsed=%.3f\n",
+               frames, timeouts, matches[0], matches[1], now() - start);
+        return 6;
+    }
+    if (getenv("MD_CAPTURE_BREAK_PIPEWIRE")) {
+        /* Only this container's PID namespace; never a host/live service. */
+        if (system("python3 -c 'import pathlib,os,signal; [os.kill(int(p.name),signal.SIGTERM) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and (p/\"comm\").exists() and (p/\"comm\").read_text().strip()==\"pipewire\"]'") != 0) return 10;
+        MdFrame f = {0};
+        int broken = md_capture_get_frame(ctx, &f);
+        if (broken == 0) md_capture_release_frame(ctx, &f);
+        printf("broken_result=%d\n", broken);
+        if (broken != MD_CAPTURE_ERROR) return 10;
+        char token[1024];
+        if (!md_capture_restore_token_load(token, sizeof(token))) return 10;
+    } else {
+        /* Acquire a real mapping, stop concurrently, prove the held pixels
+         * remain readable until release, then prove no stale frame survives. */
+        MdFrame held = {0};
+        int held_result;
+        double deadline = now() + 3;
+        do {
+            if (system(commands[0]) != 0) return 4;
+            held_result = md_capture_get_frame(ctx, &held);
+        } while (held_result != 0 && now() < deadline);
+        if (held_result != 0 || !held.data) return 11;
+        uint8_t pixel = held.data[0];
+        pthread_t stopper;
+        if (pthread_create(&stopper, NULL, stop_capture, ctx) != 0) {
+            md_capture_release_frame(ctx, &held);
+            return 11;
+        }
+        /* get_frame observes stopping without taking another buffer. */
+        MdFrame next = {0};
+        int stopped = md_capture_get_frame(ctx, &next);
+        if (stopped == 0) md_capture_release_frame(ctx, &next);
+        bool intact = held.data[0] == pixel;
+        md_capture_release_frame(ctx, &held);
+        pthread_join(stopper, NULL);
+        int after_stop = md_capture_get_frame(ctx, &next);
+        printf("held_buffer_intact=%d after_stop=%d\n", intact, after_stop);
+        if (!intact || after_stop != MD_CAPTURE_ERROR) return 11;
+    }
     printf("frames=%u timeouts=%u matching_pixels=%u,%u elapsed=%.3f\n",
            frames, timeouts, matches[0], matches[1], now() - start);
     return matches[0] >= 5 && matches[1] >= 5 ? 0 : 6;
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    MdCaptureConfig cfg = {.target_fps = 15, .show_cursor = true, .unattended = true};
+    const char *timeout = getenv("MD_CAPTURE_CONSENT_TIMEOUT_MS");
+    if (timeout) cfg.consent_timeout_ms = (uint32_t)strtoul(timeout, NULL, 10);
+    MdCaptureCtx *ctx = md_capture_create(&cfg);
+    if (!ctx) return 2;
+    const char *repeat = getenv("MD_CAPTURE_REOPENS");
+    unsigned count = repeat ? (unsigned)strtoul(repeat, NULL, 10) : 1;
+    if (!count || count > 20) { md_capture_destroy(ctx); return 2; }
+    int rc = 0;
+    for (unsigned i = 0; i < count; i++) {
+        printf("reopen=%u\n", i);
+        rc = probe(ctx);
+        md_capture_stop(ctx);
+        if (rc) break;
+    }
+    md_capture_destroy(ctx);
+    return rc;
 }

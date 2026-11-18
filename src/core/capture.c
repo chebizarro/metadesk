@@ -11,6 +11,165 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint32_t md_capture_consent_timeout_ms(const MdCaptureConfig *cfg) {
+    uint32_t timeout = cfg && cfg->consent_timeout_ms ? cfg->consent_timeout_ms :
+                       (cfg && cfg->unattended ? 10000 : 180000);
+    if (cfg && cfg->unattended && timeout > 10000) timeout = 10000;
+    return timeout > 180000 ? 180000 : timeout;
+}
+
+bool md_capture_stall_may_forget(const MdCaptureConfig *cfg) {
+    return cfg && cfg->forget_authorization_on_stall && !cfg->unattended;
+}
+
+MdCaptureRecovery md_capture_watchdog_step(MdCaptureWatchdog *w,
+    int result, bool has_client, uint32_t now, uint32_t stall, uint32_t max_restarts) {
+    if (!w) return MD_CAPTURE_RECOVERY_NONE;
+    if (!has_client || result == 0) {
+        memset(w, 0, sizeof(*w));
+        return MD_CAPTURE_RECOVERY_NONE;
+    }
+    if (result == MD_CAPTURE_IDLE) {
+        w->armed = false;
+        return MD_CAPTURE_RECOVERY_NONE;
+    }
+    if (w->gave_up) return MD_CAPTURE_RECOVERY_NONE;
+    if (!w->armed) {
+        w->deadline_ms = now + stall;
+        w->armed = true;
+        return MD_CAPTURE_RECOVERY_NONE;
+    }
+    if ((int32_t)(now - w->deadline_ms) < 0) return MD_CAPTURE_RECOVERY_NONE;
+    if (w->restarts >= max_restarts) {
+        w->gave_up = true;
+        return MD_CAPTURE_RECOVERY_EXHAUSTED;
+    }
+    w->restarts++;
+    w->deadline_ms = now + stall;
+    return MD_CAPTURE_RECOVERY_RESTART;
+}
+
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdatomic.h>
+
+/* Only the metadesk leaf is chmod'd; XDG_STATE_HOME may hold other apps. */
+static int token_dir_open(void) {
+    char path[PATH_MAX];
+    const char *base = getenv("XDG_STATE_HOME");
+    int len;
+    if (base && base[0]) {
+        if (base[0] != '/') return -1;
+        len = snprintf(path, sizeof(path), "%s/metadesk", base);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || home[0] != '/') return -1;
+        len = snprintf(path, sizeof(path), "%s/.local/state/metadesk", home);
+    }
+    if (len < 0 || (size_t)len >= sizeof(path)) return -1;
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        int rc = mkdir(path, 0700);
+        *p = '/';
+        if (rc < 0 && errno != EEXIST) return -1;
+    }
+    if (mkdir(path, 0700) < 0 && errno != EEXIST) return -1;
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_uid != geteuid() || fchmod(fd, 0700) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+size_t md_capture_restore_token_load(char *buf, size_t size) {
+    if (!buf || size < 2) return 0;
+    buf[0] = '\0';
+    int dir = token_dir_open();
+    if (dir < 0) return 0;
+    int fd = openat(dir, "screencast.token", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    close(dir);
+    if (fd < 0) return 0;
+    struct stat st;
+    size_t len = 0;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        /* A concurrent atomic rename can unlink the already-open old inode. */
+        st.st_nlink > 1 || st.st_size <= 0 || (uint64_t)st.st_size >= size ||
+        fchmod(fd, 0600) < 0) goto done;
+    while (len < (size_t)st.st_size) {
+        ssize_t n = read(fd, buf + len, (size_t)st.st_size - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { len = 0; goto done; }
+        len += (size_t)n;
+    }
+    if (memchr(buf, '\0', len)) { len = 0; goto done; }
+    while (len && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' ')) len--;
+done:
+    close(fd);
+    buf[len] = '\0';
+    return len;
+}
+
+int md_capture_restore_token_save(const char *token) {
+    if (!token || !token[0] || strlen(token) >= 1024) return -1;
+    int dir = token_dir_open();
+    if (dir < 0) return -1;
+    static atomic_uint serial;
+    char tmp[96];
+    int fd = -1, rc = -1;
+    for (unsigned i = 0; i < 128; i++) {
+        snprintf(tmp, sizeof(tmp), ".screencast.token.%ld.%u", (long)getpid(),
+                 atomic_fetch_add(&serial, 1));
+        fd = openat(dir, tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0 || errno != EEXIST) break;
+    }
+    if (fd < 0) { close(dir); return -1; }
+    size_t len = strlen(token), off = 0;
+    if (fchmod(fd, 0600) < 0) goto done;
+    while (off < len) {
+        ssize_t n = write(fd, token + off, len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto done;
+        off += (size_t)n;
+    }
+    if (fsync(fd) < 0) goto done;
+    if (close(fd) < 0) { fd = -1; goto done; }
+    fd = -1;
+    if (renameat(dir, tmp, dir, "screencast.token") < 0) goto done;
+    rc = fsync(dir);
+done:
+    if (fd >= 0) close(fd);
+    if (rc < 0) unlinkat(dir, tmp, 0);
+    close(dir);
+    return rc;
+}
+
+int md_capture_restore_token_forget(void) {
+    int dir = token_dir_open();
+    if (dir < 0) return -1;
+    int rc = unlinkat(dir, "screencast.token", 0);
+    if (rc == 0) rc = fsync(dir);
+    else if (errno == ENOENT) rc = 0;
+    close(dir);
+    return rc;
+}
+#else
+size_t md_capture_restore_token_load(char *buf, size_t size) {
+    if (buf && size) buf[0] = '\0';
+    return 0;
+}
+int md_capture_restore_token_save(const char *token) { (void)token; return -1; }
+int md_capture_restore_token_forget(void) { return -1; }
+#endif
+
 /* ── Public convenience API ──────────────────────────────────── */
 
 MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg) {
@@ -44,8 +203,16 @@ int md_capture_start(MdCaptureCtx *ctx) {
 }
 
 int md_capture_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
-    if (!ctx || !ctx->vtable || !ctx->vtable->get_frame) return -1;
-    return ctx->vtable->get_frame(ctx, out);
+    if (!ctx || !out || !ctx->vtable || !ctx->vtable->get_frame) return MD_CAPTURE_ERROR;
+    int result = ctx->vtable->get_frame(ctx, out);
+    if (result == 0 && out->buf_type == MD_BUF_CPU && !out->data) {
+        /* Enforce the HAL contract even if a backend violates its mapping
+         * precondition. Return its borrowed storage before reporting failure. */
+        md_capture_release_frame(ctx, out);
+        memset(out, 0, sizeof(*out));
+        return MD_CAPTURE_ERROR;
+    }
+    return result;
 }
 
 void md_capture_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local rootless-Podman video experiment; no host-session connections or src edits.
+"""Local rootless-Podman video experiment; no host-session connections.
 
 Run after building Dockerfile.video and compiling capture-probe.c externally.
 Evidence contains private backend state: do not commit it; delete after review.
@@ -25,7 +25,8 @@ summary = {}
 # Never mount the invoking user's runtime, home, session bus, or accessibility bus.
 cells = [('pixman', False, 'allow-isolated-output')]
 if a.render_node:
-    cells += [('render', True, 'allow-isolated-output'), ('deny', True, 'deny')]
+    cells += [('render', True, 'allow-isolated-output'), ('deny', True, 'deny'),
+              ('timeout', True, 'deny')]
 for cell, render, consent in cells:
     root = a.evidence / cell
     root.mkdir(mode=0o700)
@@ -54,14 +55,28 @@ if [ "$rc" = 0 ]; then
         printf 'invalid-md-ah9-8-token' > "$token"
         /opt/capture-probe > malformed.log 2>&1
         printf '%s\n' "$?" > malformed.rc
+        test "$(cat "$token")" = 'invalid-md-ah9-8-token'
+        printf '%s\n' "$?" > malformed_retained.rc
         rm -f "$token"
         /opt/capture-probe > cleared.log 2>&1
         printf '%s\n' "$?" > cleared.rc
+        MD_CAPTURE_REOPENS=6 /opt/capture-probe > reopens.log 2>&1
+        printf '%s\n' "$?" > reopens.rc
+        MD_CAPTURE_BREAK_PIPEWIRE=1 /opt/capture-probe > broken.log 2>&1
+        printf '%s\n' "$?" > broken.rc
     fi
 fi
 exit "$rc"
 '''
-    name = 'md-ah9-8-' + cell + '-validation'
+    if cell == 'timeout':
+        # Private-session chooser stalls longer than the consumer's 500ms budget.
+        command = '''
+set -eu
+MD_CAPTURE_CONSENT_TIMEOUT_MS=500 /opt/capture-probe > /evidence/fresh.log 2>&1 && rc=0 || rc=$?
+printf '%s\\n' "$rc" > /evidence/fresh.rc
+exit "$rc"
+'''
+    name = 'ah9-10-' + cell + '-validation'
     # Outside every container bind mount; only this Podman invocation writes it.
     cidfile = a.evidence / (cell + '.cid')
     args = ['podman', 'run', '--init', '--name', name, '--cidfile', str(cidfile),
@@ -75,6 +90,8 @@ exit "$rc"
             '-v', f'{root}/home:/home/metadesk:rw',
             '-v', f'{root}:/evidence:rw', '-v', f'{probe}:/opt/capture-probe:ro',
             '-e', f'MD_VIDEO_CONSENT={consent}']
+    if cell == 'timeout':
+        args += ['-e', 'MD_VIDEO_CHOOSER_WAIT_TEST=1']
     if render:
         args += ['--device', str(a.render_node), '-e', 'WLR_RENDERER=gles2',
                  '-e', 'WLR_RENDERER_ALLOW_SOFTWARE=1',
@@ -87,7 +104,7 @@ exit "$rc"
     try:
         with (root / 'container.log').open('w') as out:
             try:
-                result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=100)
+                result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=180)
                 code = result.returncode
             except subprocess.TimeoutExpired:
                 code = 124
@@ -96,7 +113,7 @@ exit "$rc"
             inspection = subprocess.check_output(['podman', 'inspect', cid], text=True)
             (root / 'inspect.json').write_text(inspection)
         summary[cell] = {'container_exit': code}
-        for run in ['fresh', 'reuse', 'stale', 'malformed', 'cleared']:
+        for run in ['fresh', 'reuse', 'stale', 'malformed', 'malformed_retained', 'cleared', 'reopens', 'broken']:
             rc = root / (run + '.rc')
             if rc.exists():
                 summary[cell][run] = int(rc.read_text())
@@ -108,13 +125,14 @@ exit "$rc"
             subprocess.run(['podman', 'rm', '-f', cid], check=True,
                            stdout=subprocess.DEVNULL)
 (a.evidence / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-expected = {'pixman': {'container_exit': 6, 'fresh': 6}}
+expected = {'pixman': {'container_exit': 3, 'fresh': 3}}
 negative = [('pixman', 'fresh')]
 if a.render_node:
     expected.update(render={'container_exit': 0, 'fresh': 0, 'reuse': 0, 'stale': 0,
-                            'malformed': 6, 'cleared': 0},
-                    deny={'container_exit': 6, 'fresh': 6})
-    negative += [('render', 'malformed'), ('deny', 'fresh')]
+                            'malformed': 3, 'malformed_retained': 0, 'cleared': 0, 'reopens': 0, 'broken': 0},
+                    deny={'container_exit': 3, 'fresh': 3},
+                    timeout={'container_exit': 3, 'fresh': 3})
+    negative += [('render', 'malformed'), ('deny', 'fresh'), ('timeout', 'fresh')]
 failures = [f'{cell}.{key}: expected {value}, got {summary.get(cell, {}).get(key)}'
             for cell, outcomes in expected.items() for key, value in outcomes.items()
             if summary.get(cell, {}).get(key) != value]
@@ -122,6 +140,11 @@ for cell, run in negative:
     log = a.evidence / cell / (run + '.log')
     if not log.exists() or not re.search(r'^frames=0 ', log.read_text(), re.MULTILINE):
         failures.append(f'{cell}.{run}: no zero-frame receipt')
+if a.render_node:
+    log = a.evidence / 'timeout' / 'fresh.log'
+    timing = re.search(r'start_rc=-1 elapsed=([0-9.]+)', log.read_text()) if log.exists() else None
+    if not timing or not 0.4 <= float(timing[1]) < 2:
+        failures.append('consent timeout did not fail within 0.4..2 seconds')
 if not a.render_node:
     failures.append('no positive render-node capture cell requested')
 (a.evidence / 'gate-failures.json').write_text(json.dumps(failures, indent=2) + '\n')

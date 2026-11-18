@@ -1,5 +1,10 @@
 <!-- validated on rootless Podman 4.9.3 / Ubuntu 24.04 aarch64, isolated Sway capture; 2026-11-17. -->
-# md-ah9.8 — Tier B isolated-video experiment
+# Tier B isolated-video evidence — md-ah9.8 and md-ah9.10
+
+The original md-ah9.8 sections below are **historical evidence for f19f6ab**.
+The final md-ah9.10 section records the new implementation and its qualification;
+old statements about fallback, timestamps and unchanged production code are not
+claims about the current branch.
 
 ## Verdict and boundaries
 
@@ -195,7 +200,7 @@ resources shared with other builds. The validated producer/consumer commands:
   "$PWD" /home/bizarro/nostrc "$PWD/deploy/containers/runtime-bundle"
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Isrc \
   deploy/containers/reference/capture-probe.c -Lbuild-container -lmetadesk \
-  -o capture-probe
+  -pthread -o capture-probe
 podman build --jobs=2 -t localhost/metadesk-video:md-ah9-8 \
   -f deploy/containers/Dockerfile.video deploy/containers
 python3 deploy/containers/reference/validate-video.py \
@@ -290,3 +295,264 @@ capture conclusions above were checked against actual source or VM results.
 Delivery is a **local-only branch commit**; no push, rebase, merge, publishing,
 input implementation or sibling-source edit. md-ah9.8's reporting experiment is
 complete; md-ah9.9/md-ah9.10 and the two filed capture bugs remain separate.
+
+## md-ah9.10 — portal policy and restore-token lifecycle
+
+2026-11-17 local / 2026-11-18 UTC receipts. Base **323292d9d5b1717371a2061cb12c29c2d69e7207**;
+all production changes are confined to capture.c/.h, capture_pipewire.c and the
+contiguous host watchdog/CLI/config blocks. The reference probe/driver/launcher
+are qualification tooling, not new supported capture executables.
+
+### Operator policy and API
+
+- Linux capture now **requires portal authorization**, including interactive
+  mode. Denial, method error, malformed response, missing bus and timeout return
+  `md_capture_start=-1`; none trigger a direct PipeWire fallback.
+- `--capture-unattended` caps the **whole portal negotiation** at 10 seconds.
+  `--capture-consent-timeout-ms MS` selects a shorter budget (1..180000 ms;
+  unattended still caps at 10000). Interactive default is 180000 ms total.
+  Authentication, Hello, AddMatch and method/Response waits share the deadline;
+  there is no bus auto-launch/discovery or blocking flush. A single explicit
+  local `unix:` session-bus address is required.
+- `--capture-forget-on-stall` explicitly permits local token removal after
+  exhausted **broken-stream** retries. It defaults off and is ignored in
+  unattended mode. Explicit operator revocation remains available separately.
+- `MD_CAPTURE_IDLE` (1) means connected PAUSED/STREAMING without a new damaged
+  frame. `MD_CAPTURE_ERROR` (-1) means broken/stopped capture or a failed startup
+  transition. Idle disarms the watchdog fault timer but does not erase retry
+  history. A valid frame or client disconnect resets recovery. Core errors and
+  an unexpected event-loop exit wake consumers as errors.
+- Unattended host startup exits nonzero if capture authorization/start fails.
+  This does **not** authorize a private output by itself: the operator must still
+  choose the isolated xdpw `allow-isolated-output` policy. Unknown valid UUIDs
+  still reacquire through that policy, not through retained authorization.
+- Failure/expiry closes the request/session and the private D-Bus connection.
+  Successful teardown waits up to 1 second for Session.Close acknowledgment;
+  failed-start cleanup cannot extend its consent deadline. The pinned portal
+  [completes Close after backend close](https://github.com/flatpak/xdg-desktop-portal/blob/1.18.4/src/session.c#L158-L212).
+  This is a protocol boundary, not a sleep before reopening.
+
+Example options for a host already launched **inside the private video session**:
+
+```sh
+metadesk-host --capture-unattended --capture-consent-timeout-ms 1500
+```
+
+### Token and frame contracts
+
+The opaque file remains `$XDG_STATE_HOME/metadesk/screencast.token`, with HOME
+fallback to `.local/state`, but never a shared `/tmp` fallback. The store creates
+missing parents, enforces an owned non-symlink 0700 leaf and 0600 regular token,
+rejects symlinks/oversized/truncated/NUL-containing reads, and tightens readable
+legacy permissions. Invalid UTF-8 is rejected before building a D-Bus string;
+its local file is retained. Error logs do not echo portal error detail/token bytes.
+
+Replacement uses exclusive same-directory temp creation, complete checked writes,
+file fsync, close, renameat and directory fsync. Pre-rename failure removes only
+the temporary file and leaves old authorization intact. Tests exercise a forced
+partial write with RLIMIT_FSIZE and concurrent readers during 100 replacements;
+readers must see a complete old or new token. An already-open old inode with
+`nlink=0` after concurrent rename remains readable. No power-loss/crash-recovery
+qualification is claimed.
+
+Delivered PipeWire frames now carry strictly progressing CLOCK_MONOTONIC
+**receipt timestamps**, not a claim of compositor acquisition PTS. The probe
+checks nonzero, increasing, nonfuture timestamps, including same-context reopen.
+CPU descriptors are checked for supported type, non-NULL mapping, offset,
+accessible extent, geometry and stride before publication. A second HAL guard
+releases/rejects any NULL CPU frame returned by a backend. Pending borrowed
+pointers are cleared on stop; stop blocks new acquisitions and waits for an
+outstanding consumer release before destroying storage.
+
+The pinned xdpw 0.7.1 intentionally
+[sets data flags to zero](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.7.1/src/screencast/pipewire_screencast.c#L312-L358),
+including valid readable MemFd mappings. A review suggestion to require READABLE
+unconditionally was tested and **rejected by real evidence**: it rejected all
+otherwise valid frames. Zero flags remain compatible; explicit non-readable
+flags and negative stride are rejected. Buffer dataType negotiation now uses a
+flags choice, matching the producer's mask representation.
+
+### Findings preserved from implementation runs
+
+- The original backend, built from 323292d capture_pipewire.c with only metadata
+  logging and preloaded into the private reference, reproduced **zero timestamps**
+  on otherwise correct RGBX frames. Its fresh/reuse/stale/cleared matrix passed
+  once; that repeat did not reproduce the old intermittent NULL frame.
+- Instrumented hardened runs **did** reproduce invalid backend allocations:
+  `type=4294967295`, flags=0, mapped=0, maxsize=0, chunk size=8294400,
+  offset=0, stride=7680. PipeWire simultaneously logged `invalid memory type 4`.
+  The guard returned no NULL CPU frame; the changing-frame gate correctly failed.
+  A single passing run after the flags-choice correction did not establish a fix:
+  another delivered-image run still failed its cleared-token cell (probe 6).
+- The pinned [PipeWire invalid-type branch](https://github.com/PipeWire/pipewire/blob/1.0.5/src/modules/module-client-node/client-node.c#L799-L835)
+  replaces an unsupported descriptor with SPA_ID_INVALID/NULL. This identifies
+  the invalid descriptor before HAL publication; it is not evidence that the
+  probe freed a valid mapping. Metadesk's confirmed violation was treating every
+  non-DMA descriptor as a valid CPU frame. The deeper allocation/reuse trigger
+  is not proven merely by adding a guard or observing subsequent passing runs.
+- Source review found that dropping the D-Bus connection/issuing no-reply Close
+  allowed teardown to remain asynchronous with the next consumer. Bounded
+  Session.Close acknowledgment was added and is exercised below. It must not be
+  described as a proven cure for every upstream allocation race.
+- ASan caught a 50-byte libdbus container-builder leak on the new invalid-UTF-8
+  path. Abandoning the open container before message unref fixed it; final gates
+  use leak detection without suppressions.
+
+### Pre-rebase delivered-image matrix and gates
+
+Pre-rebase implementation commit: **f808e52**, replayed as **142bb28** on local
+master **636904f** (including the md-ah9.9, md-66n and md-ah9.4 merges). The
+pre-rebase private reference image was
+**59945722e8b38c385332ff882ffd490b1ffcfdba032b47d44061f6332f3fc8d6**,
+1,139,735,545 bytes; local only and removed after qualification. Sway, wlroots,
+xdpw, portal, PipeWire and WirePlumber versions match the pinned table above.
+The actual renderer was again **virgl (ANGLE / Apple M4 Max)** with only
+`/dev/dri/renderD128`; this is not a software-only or DRI-free result.
+
+Two complete fresh-container/private-service matrices on that final image each
+returned **aggregate 0**, with no invalid-descriptor log or NULL CPU delivery:
+
+| Cell, per matrix | Result |
+|---|---|
+| Pixman, no render device | Start -1; zero frames, probe 3; expected negative |
+| Render-node fresh state | 10 correct changing-pixel frames; 5+5 matches; probe 0 |
+| Saved-token reuse | 10 matching frames; probe 0 |
+| Unknown valid UUID | 10 matching frames under explicit operator chooser policy; probe 0 |
+| Malformed UUID | Start -1 in 0.006 / 0.005 s; zero frames, probe 3; malformed file retained |
+| Cleared token after malformed attempt | 10 matching frames; probe 0 |
+| One context, six start/stop cycles | 60 matching frames; probe 0; timestamps progress across restarts |
+| Undamaged static output, after each successful cycle | Five IDLE results over approximately 5.1 s, zero ERRORs, token retained |
+| Outstanding consumer mapping during concurrent stop | Mapping intact until release; get_frame after stop returns ERROR; ten checks per matrix |
+| Kill only the private container's PipeWire after valid capture | 10 prior matching frames, then ERROR (-1); token retained; probe 0 |
+| Default deny chooser | Start -1 in 0.008 s in both runs; zero frames, probe 3 |
+| Stalled chooser, explicit 500 ms budget | Start -1 in **0.503 / 0.504 s**; zero frames, probe 3 |
+
+That is **220 validated changing-pixel frames**, 12 same-context start/stop cycles
+(10 true reopens after the initial starts), 20 outstanding-buffer teardown checks
+and 110 static-idle results across the two
+matrices. This remains local pinned-backend qualification, not proof that all
+upstream allocation races or compositor combinations are eliminated. Earlier
+failed matrices above remain failures; subsequent passes do not erase them.
+
+**Additional real-backend ASan matrix: aggregate 1 (not a pass).** Using the same
+private runtime image with the ASan-built library and ASan-built probe mounted
+privately, fresh/reuse/stale each passed, six same-context cycles passed, and
+private PipeWire loss returned ERROR with authorization retained. There were
+100 correct timestamped changing frames and no ASan/LSan diagnostic. However,
+cleared-token reopen returned start=0 in 0.017 s, then rejected eight descriptors
+with the same SPA_ID_INVALID/NULL/maxsize=0 metadata and delivered **zero frames**
+(probe 6). Denial, malformed-token retention, pixman and bounded chooser negatives
+passed; the stalled chooser returned -1 in 0.501 s. This failure occurred **after**
+bounded Session.Close was added: neither flags negotiation nor Close ordering is
+claimed to have cured the deeper backend allocation failure.
+
+**md-atg remains OPEN.** Its NULL-frame escape and stale-pointer hazards are
+hardened in f808e52, but reliable cleared-state reopen/the deeper allocation
+trigger is still unresolved. No duplicate follow-up bead was created; md-atg
+retains that work and the detailed metadata. md-ah9.10 and md-l0s meet their
+policy/token and timestamp acceptance respectively.
+
+Quality gates for `-Dclient=false`, all compiled with at most two jobs per build:
+
+- macOS full configured `meson test`: **25 passed**, 0 failed.
+- Linux full configured suite, nonexistent desktop bus/runtime/display:
+  **26 passed**, 0 failed, 0 skipped, 0 timeout.
+- Linux capture tests with Meson `-Db_sanitize=address -Db_lundef=false`,
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`: **1/1 passed**, no ASan/LSan report.
+  New tests cover actual Linux backend denial, malformed response and stream
+  variants, a hung Start, silent bus authentication, corrupt UTF-8 retention,
+  retry-cap/idle/timer-wrap logic, NULL CPU rejection/release and token lifecycle.
+  Portal fixtures launch their own daemon and service; they assert which actual
+  methods were reached, rather than treating any failure as test success.
+- A Linux strace run of the capture tests also returned 0 and observed:
+  exclusive 0600 temp open → fchmod0600 → complete write → file fsync → close →
+  renameat to screencast.token → directory fsync. This is syscall execution
+  evidence in addition to concurrent-reader and partial-write tests, not a claim
+  of power-loss testing.
+- Probe C `-Wall -Wextra -Werror -pthread`, shell syntax, Python AST and
+  `git diff --check`: passed.
+
+The full metadesk host/client transport and encoder were **not** run in this
+matrix. The actual host watchdog state machine is shared with and tested by
+`tests/test_capture.c`; the reference exercises its backend IDLE/ERROR inputs,
+not a connected full-host watchdog session. No generic GNOME unattended claim,
+input implementation, FIPS or accessibility qualification is added here.
+
+One substantive Oracle review used actual worktree attachments after stale
+selection transport returned the old baseline. The ownership, bounded setup,
+parser, UTF-8, retry-history and loop-exit findings were addressed; no second
+substantive review was run. Jev used three find-lines judgments (9 requests,
+79,430 input tokens, $0.003336) to narrow the plan, host and historical-report
+reads; those judgments were not treated as runtime evidence.
+
+### Rebase and renewed qualification
+
+The branch was rebased onto local master 636904f, whose code integration tip is
+1d23cf7. Git applied the host changes without textual conflict; direct source
+checks verified both input flags in usage/argument parsing, the new input_options
+parameter and caller in host_run_mcp, and the separate capture-policy block.
+No input or Meson implementation was edited by this task. A combined-options
+`metadesk-host --help` check passed after rebuilding.
+
+The interrupted run's uncommitted evidence was preserved in a task-only stash,
+restored after rebase, and that stash was dropped. No unrelated stash was touched.
+A fresh macOS Meson configuration was required to discover the new option.
+The VM clock lagged copied source timestamps by roughly 25 minutes; only this
+private checkout's future file mtimes were normalized to the guest clock. The
+VM clock and live services were not changed.
+
+Renewed gates on the rebased source:
+
+- macOS, client=false, wayland_input=false: **25/25 passed**.
+- Linux, client=false, **wayland_input=true**: **26/26 passed**, zero skips,
+  failures or timeouts. The input tests include the merged private Wayland fixture;
+  live-input/live-a11y environment flags were unset, and desktop bus/runtime/display
+  addresses were unavailable.
+- Linux ASan capture gate with wayland_input=true: **1/1 passed** (1.56 s),
+  detect_leaks=1, halt_on_error=1, no suppressions or sanitizer diagnostics.
+
+Rebuilt rebased image: **5478a00fec7d749fca98d67047d307115485783bff31076feb5967b330c87ac9**,
+1,140,807,672 bytes, from 142bb28 with wayland_input=true. Both renewed real-backend
+matrices correctly returned **aggregate 1**, not green:
+
+| Rebased cell | Native probe/library | ASan probe/library |
+|---|---|---|
+| Fresh / reuse / unknown valid UUID | 10 matching timestamped frames each | 10 each |
+| Malformed token | Start -1, 0 frames, file retained | Same |
+| Cleared token | 10 matching frames | **0 frames; probe 6**, 8 invalid descriptors rejected |
+| Six-cycle test | **Fails first start; probe 6**, 0 frames, 13 invalid descriptors rejected | 60 frames; all six start/stop cycles pass |
+| Static undamaged output in successful cells | IDLE, no ERROR, token retained | Same |
+| Concurrent stop with borrowed mapping, successful cells | Mapping intact until release; post-stop ERROR | Same |
+| Kill only private PipeWire after positive capture | ERROR, token retained | Same |
+| Pixman / deny chooser | Start -1; zero frames, expected negatives | Same |
+| Stalled chooser, 500 ms budget | Start -1 in **0.504 s** | Start -1 in **0.504 s** |
+
+There were **150 validated changing-pixel frames** in these renewed matrices
+(50 native, 100 ASan). No NULL CPU frame escaped, no timestamp regression was
+observed, and no ASan/LSan diagnostic occurred. The rejected mapping metadata and
+PipeWire `invalid memory type 4` error match the pre-rebase failure. This is
+continuing evidence for md-atg, **not** a successful reliable-reopen qualification
+and not evidence that the unrelated master merges caused the defect. No retries
+were used to hide the failed aggregate gates.
+
+Final bead decisions: **md-ah9.10 CLOSED**, **md-l0s CLOSED**, **md-atg OPEN** with
+partial safety/lifetime hardening and unresolved backend allocation/reuse work.
+No new bead was filed because md-atg already owns the remaining investigation.
+
+### Final cleanup and handoff
+
+Committed the implementation and evidence locally, then removed the task's rebased
+image and its pulled base by exact image IDs (all earlier task images had already
+been removed). Driver CID cleanup left no containers, including external build
+containers. Removed `/home/bizarro/wt-ah9-10` in full: both Linux builds, staged
+bundle, native/ASan probes, baselines, private runtime/home/token state and all raw
+evidence. Also removed the exact stale socket-test directory left by the earlier
+timeout, the macOS build-ah9-10 directory, and task-owned temporary macOS logs.
+No global prune, unrelated image/container deletion, shared nostrc build edit,
+or live GNOME display/portal/PipeWire/bus access or restart was performed.
+
+Final rootless Podman accounting: **0 containers, 0 images, 0 volumes; 0 B**.
+Final VM free space: approximately **8.2 GiB**, **8,760,590,336 bytes**. All checked
+free-space values stayed above the 3 GiB stop threshold; shared-VM space changes
+are not attributed solely to this task. Task-only stashes were dropped, and the
+feature worktree/branch are retained for review. No push or merge was performed.
