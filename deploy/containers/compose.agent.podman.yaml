@@ -1,4 +1,5 @@
 # validated on rootless Podman 4.9.3 API + Docker Compose 2.40.3, live GNOME.
+# Accessibility-loss restart/backoff qualified with CLI + user systemd, not this API policy; see reference/validation.md.
 # Layer over compose.agent.yaml; requires Compose !override / !reset support.
 # Rootless AppArmor disabled on the tested VM; not Docker LSM equivalence.
 services:

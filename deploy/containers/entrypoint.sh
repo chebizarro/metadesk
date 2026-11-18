@@ -1,12 +1,13 @@
 #!/bin/sh
-# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells; see reference/validation.md.
+# validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME + accessibility-loss restart recovery cells; see reference/validation.md.
 set -eu
 # PID 1 must terminate even while preparing the desktop; exec host afterwards.
 waiter=
+address_file=
 trap '[ -z "$waiter" ] || kill "$waiter" 2>/dev/null || :; exit 143' TERM INT
+trap '[ -z "$address_file" ] || rm -f "$address_file"' EXIT
 fail() { echo "metadesk preparation: $*" >&2; exit 1; }
 [ "$(id -u)" = "${MD_UID:?MD_UID required}" ] && [ "$(id -u)" != 0 ] || fail 'wrong desktop identity'
-: "${AT_SPI_BUS_ADDRESS:?discover and mount the filesystem AT-SPI bus}"
 # HTTP references always require the mounted secret, even on loopback.
 http=false
 for arg in "$@"; do [ "$arg" != --mcp-http ] || http=true; done
@@ -19,12 +20,16 @@ fi
 # Missing mounts/incorrect identities are configuration errors, not startup delays.
 [ -S "$XDG_RUNTIME_DIR/bus" ] || fail 'missing session bus socket'
 [ "$(stat -c %u "$XDG_RUNTIME_DIR/bus")" = "$MD_UID" ] || fail 'wrong session bus owner'
-atspi_path=${AT_SPI_BUS_ADDRESS#unix:path=}
-atspi_path=${atspi_path%%,*}
-[ -S "$atspi_path" ] || fail 'missing filesystem AT-SPI socket'
+# Rediscover on every start/retry: the live socket basename can change.
+# Mount its parent directory, not one socket inode. Never trust a stale env value.
 # Bound the entire wait, including D-Bus calls, not just the retry count.
-timeout 30 sh -c 'until /opt/metadesk/reference/probe.py; do sleep 1; done' &
+address_file=$(mktemp)
+timeout 30 sh -c 'until /opt/metadesk/reference/probe.py --print-address > "$1"; do sleep 1; done' sh "$address_file" &
 waiter=$!
 wait "$waiter" || fail 'desktop not ready within 30 seconds'
 waiter=
+AT_SPI_BUS_ADDRESS=$(cat "$address_file")
+export AT_SPI_BUS_ADDRESS
+rm -f "$address_file"
+address_file=
 exec "$@"
