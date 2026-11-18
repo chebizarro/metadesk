@@ -668,6 +668,9 @@ host_sources = files('src/host/main.c', 'src/host/account_cli.c')
 host_includes = [core_inc]
 host_c_args = []
 
+# Headless host access administration (md-pss).
+host_sources += files('src/host/access_cli.c')
+
 metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
   dependencies : [dep_metadesk],
@@ -678,6 +681,26 @@ metadesk_host = executable('metadesk-host', host_sources,
 if host_os == 'linux' or host_os == 'darwin'
   test('account_cli', accounts_python,
     args : [files('tests/test_account_cli.py'), metadesk_host], timeout : 30)
+endif
+
+# Headless access CLI private relay/real signer contracts (md-pss).
+if host_os == 'linux' or host_os == 'darwin'
+  access_signer_fixture = executable('access_signer_fixture',
+    'tests/access_signer_fixture.c', dependencies : [dep_metadesk])
+  test('access_cli arguments', accounts_python,
+    args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture, '--syntax-only'],
+    timeout : 30)
+  if get_option('signer_nip5f')
+    test('access_cli private relay', accounts_python,
+      args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
+      timeout : 120)
+  endif
+endif
+
+# Opt-in Linux full-process session fixture; never installed (md-pss).
+if enable_nip46 and host_os == 'linux'
+  access_bunker_fixture = executable('access_bunker_fixture',
+    'tests/access_bunker_fixture.c', dependencies : [dep_metadesk])
 endif
 
 # ── metadesk-client (human video client) ────────────────────────────────────
@@ -707,6 +730,13 @@ if host_os == 'linux' or host_os == 'darwin'
   endif
   test('account startup roles + private relay restore', accounts_python,
     args : startup_args, timeout : 120)
+endif
+
+# Opt-in private-keyring + disposable-netns end-to-end access/session gate (md-pss).
+if enable_nip46 and enable_client and host_os == 'linux'
+  test('access session e2e', accounts_python,
+    args : [files('tests/access_session_e2e.py'), metadesk_host, metadesk_client, access_bunker_fixture],
+    timeout : 200)
 endif
 
 # ── Tests ───────────────────────────────────────────────────────────────────

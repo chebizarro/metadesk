@@ -45,6 +45,9 @@ it externally and retry. Duplicate Secret Service items fail closed; remove the
 remote account and re-import its pairing to recover. Removal deletes only
 Metadesk's remote credentials, not the remote signer's signing key.
 
+For headless host admission policy and a fresh host/client walkthrough, see
+[Session access CLI](access.md). `access` always restores the saved host role.
+
 ## Core ownership and persistence
 
 `MdAccounts` is a single-owner control-plane object. Its metadata pointers are
@@ -87,9 +90,9 @@ Precedence, in order:
    stores, unavailable backends, direct keys without an explicit integration,
    malformed metadata and wrong-owner replies fail closed. There is no fallback
    to another account, an environment-detected signer or an ephemeral key.
-3. With **no selected role**, retain legacy behavior: host direct-IP mode needs
-   no signer; client `--npub` uses an ephemeral signer; direct-IP client needs no
-   signer. Auto-detection (including its environment inputs) runs only with
+3. With **no selected role**, client `--npub` uses an ephemeral signer and the
+   direct-IP client needs no signer. Hosts cannot admit unauthenticated TCP;
+   bind a host role and publish its access list before negotiating a session. Auto-detection (including its environment inputs) runs only with
    `--auto-signer`. `--npub` selects a peer, not a signer override; `--relay`
    changes signaling relays, not the account or saved bunker's private relays.
    MCP startup remains independent of video/signing accounts.
@@ -114,13 +117,13 @@ Revocation watchers must be removed before their callback data is destroyed.
 
 ## Security limits
 
-Signer/role verification is not proof of end-to-end desktop authorization.
-Inherited host stream/session binding and allowlist-readiness defects are tracked
-as **md-mrw** and **md-q6m**; do not expose the host to untrusted networks until
-those are resolved. Protocol review also tracks AUTH transport (**md-xcy**),
-allowlist replacement ordering (**md-5w9**) and failed-publication/local-ACL
-consistency (**md-30w**). The private restore fixture does not qualify relay AUTH,
-CLOSED/rejection/reconnect handling or the full desktop session boundary.
+Signer/role verification alone is not proof of end-to-end desktop authorization.
+The host additionally requires loaded allowlist membership and the one-use
+[stream binding](stream-binding.md) proof. [Access administration](access.md)
+uses staged, acknowledgement-gated list publication. Per-client capability
+restrictions and dynamic active-stream revocation are not yet implemented.
+The private restore fixture does not qualify relay AUTH, CLOSED/rejection/
+reconnect handling or the full desktop session boundary.
 
 ## Tests
 

@@ -17,6 +17,7 @@ int test_publish(MdNostr *n, const char *peer, const char *json) {
     return 0;
 }
 int md_host_account_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
+int md_host_access_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
 int test_send_tree(MdAgent *a, MdStream *s, uint32_t *seq) {
     (void)a; (void)s; (void)seq; tree_calls++; return 0;
 }
