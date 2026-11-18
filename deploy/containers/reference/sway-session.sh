@@ -37,6 +37,13 @@ case "${MD_VIDEO_CONSENT:-deny}" in
 chooser_cmd=/bin/false' ;;
     *) echo 'MD_VIDEO_CONSENT must be deny or allow-isolated-output' >&2; exit 2 ;;
 esac
+# Qualification-only stalled chooser, never a grant of authorization.
+if [ "${MD_VIDEO_CHOOSER_WAIT_TEST:-0}" = 1 ]; then
+    printf '#!/bin/sh\nsleep 30\n' > "$XDG_RUNTIME_DIR/chooser-wait"
+    chmod 700 "$XDG_RUNTIME_DIR/chooser-wait"
+    chooser="chooser_type=simple
+chooser_cmd=$XDG_RUNTIME_DIR/chooser-wait"
+fi
 printf '[screencast]\n%s\noutput_name=HEADLESS-1\nmax_fps=15\n' "$chooser" \
     > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config"
 sway -d -c "$XDG_CONFIG_HOME/sway.conf" > "$XDG_RUNTIME_DIR/sway.log" 2>&1 &

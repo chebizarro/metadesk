@@ -78,7 +78,23 @@ typedef struct {
     uint32_t        node_id;     /* stream node ID from portal    */
     int             token_seq;   /* counter for unique tokens     */
     char            sender[128]; /* munged bus unique name         */
+    uint64_t        deadline_ns; /* one budget for the entire negotiation */
+    char            owner[128]; /* unique sender of the portal method reply */
+    bool            opened;
 } PortalScreencast;
+
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static int portal_remaining_ms(PortalScreencast *p, int limit) {
+    uint64_t now = monotonic_ns();
+    if (now >= p->deadline_ns) return 0;
+    uint64_t ms = (p->deadline_ns - now) / 1000000;
+    return ms < (uint64_t)limit ? (int)ms : limit;
+}
 
 /* Munge a D-Bus unique name (":1.234" → "1_234") for request paths */
 static void munge_sender(const char *name, char *out, size_t out_sz) {
@@ -132,7 +148,8 @@ static const char *dict_lookup_string(DBusMessageIter *dict_iter,
         if (strcmp(k, key) == 0) {
             dbus_message_iter_next(&entry);
             dbus_message_iter_recurse(&entry, &variant);
-            if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
+            int type = dbus_message_iter_get_arg_type(&variant);
+            if (type == DBUS_TYPE_STRING || type == DBUS_TYPE_OBJECT_PATH) {
                 const char *v;
                 dbus_message_iter_get_basic(&variant, &v);
                 return v;
@@ -171,44 +188,24 @@ static uint32_t portal_wait_response(PortalScreencast *p,
                                      const char *request_path,
                                      int timeout_ms,
                                      DBusMessage **out_msg) {
-    char rule[1024];
-    snprintf(rule, sizeof(rule),
-             "type='signal',sender='" PORTAL_BUS_NAME "',"
-             "interface='" PORTAL_REQUEST "',"
-             "member='Response',path='%s'", request_path);
-
-    DBusError err;
-    dbus_error_init(&err);
-    dbus_bus_add_match(p->bus, rule, &err);
-    if (dbus_error_is_set(&err)) {
-        MD_LOG_I("add_match failed: %s", err.message);
-        dbus_error_free(&err);
-        return UINT32_MAX;
-    }
-
     uint32_t result = UINT32_MAX;
-    int polls = timeout_ms / 100;
-    if (polls < 1) polls = 1;
+    uint64_t deadline = monotonic_ns() + (uint64_t)timeout_ms * 1000000;
+    if (deadline > p->deadline_ns) deadline = p->deadline_ns;
 
-    for (int i = 0; i < polls; i++) {
-        dbus_connection_read_write(p->bus, 100);
+    while (monotonic_ns() < deadline) {
+        int remaining = (int)((deadline - monotonic_ns()) / 1000000);
+        if (remaining <= 0) break;
+        if (!dbus_connection_read_write(p->bus, remaining > 100 ? 100 : remaining)) break;
         DBusMessage *msg;
-        while ((msg = dbus_connection_pop_message(p->bus)) != NULL) {
-            /* The portal answers a malformed call with a method error
-             * instead of a Response signal; surface it rather than
-             * silently waiting out the timeout. */
-            if (dbus_message_get_type(msg) == DBUS_MESSAGE_TYPE_ERROR) {
-                const char *detail = NULL;
-                dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &detail,
-                                      DBUS_TYPE_INVALID);
-                MD_LOG_I("portal call failed: %s%s%s",
-                         dbus_message_get_error_name(msg),
-                         detail ? ": " : "", detail ? detail : "");
-                dbus_message_unref(msg);
-                goto done;
-            }
+        while (monotonic_ns() < deadline &&
+               (msg = dbus_connection_pop_message(p->bus)) != NULL) {
             if (dbus_message_is_signal(msg, PORTAL_REQUEST, "Response")
-                && strcmp(dbus_message_get_path(msg), request_path) == 0) {
+                && dbus_message_has_sender(msg, p->owner)
+                && dbus_message_has_path(msg, request_path)) {
+                if (!dbus_message_has_signature(msg, "ua{sv}")) {
+                    dbus_message_unref(msg);
+                    goto done;
+                }
                 /* Parse response code (first arg) */
                 DBusMessageIter args;
                 dbus_message_iter_init(msg, &args);
@@ -227,8 +224,45 @@ static uint32_t portal_wait_response(PortalScreencast *p,
     MD_LOG_I("timeout waiting for Response on %s", request_path);
 
 done:
-    dbus_bus_remove_match(p->bus, rule, NULL);
+    if (result == UINT32_MAX) {
+        DBusMessage *close = dbus_message_new_method_call(PORTAL_BUS_NAME,
+            request_path, PORTAL_REQUEST, "Close");
+        if (close) {
+            dbus_message_set_no_reply(close, TRUE);
+            dbus_connection_send(p->bus, close, NULL);
+            dbus_message_unref(close);
+        }
+    }
     return result;
+}
+
+/* All method waits, including Hello/authentication and AddMatch, consume the
+ * same absolute startup budget. No unbounded flush or bus registration. */
+static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
+    int remaining = portal_remaining_ms(p, 180000);
+    if (!msg || remaining <= 0) return NULL;
+    DBusError err;
+    dbus_error_init(&err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->bus, msg, remaining, &err);
+    if (dbus_error_is_set(&err)) {
+        MD_LOG_I("portal method failed: %s", err.name);
+        dbus_error_free(&err);
+    }
+    return reply;
+}
+
+static bool portal_request(PortalScreencast *p, DBusMessage *msg, const char *path) {
+    DBusMessage *reply = portal_call(p, msg);
+    if (!reply) return false;
+    const char *actual = NULL;
+    const char *sender = dbus_message_get_sender(reply);
+    bool ok = dbus_message_has_signature(reply, "o") && sender && sender[0] == ':' &&
+        strlen(sender) < sizeof(p->owner) && (!p->owner[0] || !strcmp(sender, p->owner)) &&
+        dbus_message_get_args(reply, NULL, DBUS_TYPE_OBJECT_PATH, &actual, DBUS_TYPE_INVALID) &&
+        strcmp(path, actual) == 0;
+    if (ok) snprintf(p->owner, sizeof(p->owner), "%s", sender);
+    dbus_message_unref(reply);
+    return ok;
 }
 
 static void portal_screencast_close(PortalScreencast *portal);
@@ -245,59 +279,55 @@ static void portal_screencast_close(PortalScreencast *portal);
  * A restore_token returned by a persistent Start lets later runs re-open the
  * same screencast without showing the consent dialog again. Persist it under
  * XDG_STATE_HOME so capture survives host restarts after one approval. */
-static void portal_token_path(char *out, size_t n) {
-    const char *base = getenv("XDG_STATE_HOME");
-    if (base && base[0]) {
-        snprintf(out, n, "%s/metadesk", base);
-    } else {
-        const char *home = getenv("HOME");
-        snprintf(out, n, "%s/.local/state/metadesk", home ? home : "/tmp");
-    }
-}
-
-static size_t portal_load_token(char *buf, size_t n) {
-    if (n == 0) return 0;
-    char dir[512];
-    portal_token_path(dir, sizeof(dir));
-    char path[640];
-    snprintf(path, sizeof(path), "%s/screencast.token", dir);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    size_t len = fread(buf, 1, n - 1, f);
-    fclose(f);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
-                       buf[len - 1] == ' '))
-        len--;
-    buf[len] = '\0';
-    return len;
-}
-
-static void portal_save_token(const char *tok) {
-    if (!tok || !tok[0]) return;
-    char dir[512];
-    portal_token_path(dir, sizeof(dir));
-    mkdir(dir, 0700); /* best effort; parent (~/.local/state) usually exists */
-    char path[640];
-    snprintf(path, sizeof(path), "%s/screencast.token", dir);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fputs(tok, f);
-    fclose(f);
-}
-
-static int portal_screencast_open(PortalScreencast *portal) {
+static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfig *cfg) {
+    char restore_token[1024] = {0};
     memset(portal, 0, sizeof(*portal));
     portal->pw_fd = -1;
+    portal->deadline_ns = monotonic_ns() + (uint64_t)md_capture_consent_timeout_ms(cfg) * 1000000;
 
-    /* Connect to session bus */
+    /* Connect to a private session-bus connection: no shared message draining. */
     DBusError err;
     dbus_error_init(&err);
-    portal->bus = dbus_bus_get(DBUS_BUS_SESSION, &err);
+    const char *address = getenv("DBUS_SESSION_BUS_ADDRESS");
+    /* Do not auto-launch a session or discover/connect to a different desktop.
+     * Consent requires an explicitly available local session bus. */
+    if (!address || strncmp(address, "unix:", 5) != 0 || strchr(address, ';')) return -1;
+    portal->bus = dbus_connection_open_private(address, &err);
     if (!portal->bus) {
         MD_LOG_I("cannot connect to session bus: %s", err.message);
         dbus_error_free(&err);
         return -1;
     }
+
+    dbus_connection_set_exit_on_disconnect(portal->bus, FALSE);
+    /* libdbus's blocking method helper does not bound authentication. Drive
+     * it explicitly before Hello so a silent peer cannot hold consent open. */
+    while (!dbus_connection_get_is_authenticated(portal->bus)) {
+        int remaining = portal_remaining_ms(portal, 100);
+        if (remaining <= 0 || !dbus_connection_read_write(portal->bus, remaining)) goto fail;
+    }
+    DBusMessage *setup = dbus_message_new_method_call(DBUS_SERVICE_DBUS,
+        DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "Hello");
+    DBusMessage *reply = portal_call(portal, setup);
+    if (setup) dbus_message_unref(setup);
+    if (!reply) goto fail;
+    const char *name = NULL;
+    bool registered = dbus_message_has_signature(reply, "s") &&
+        dbus_message_get_args(reply, NULL, DBUS_TYPE_STRING, &name, DBUS_TYPE_INVALID) &&
+        dbus_validate_bus_name(name, NULL) && dbus_bus_set_unique_name(portal->bus, name);
+    dbus_message_unref(reply);
+    if (!registered) goto fail;
+
+    /* Subscribe before any portal method; ordered AddMatch has a bounded reply. */
+    setup = dbus_message_new_method_call(DBUS_SERVICE_DBUS,
+        DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "AddMatch");
+    if (!setup) goto fail;
+    const char *rule = "type='signal',sender='" PORTAL_BUS_NAME "',interface='" PORTAL_REQUEST "',member='Response'";
+    dbus_message_append_args(setup, DBUS_TYPE_STRING, &rule, DBUS_TYPE_INVALID);
+    reply = portal_call(portal, setup);
+    dbus_message_unref(setup);
+    if (!reply) goto fail;
+    dbus_message_unref(reply);
 
     /* Munge our unique name for request object paths */
     const char *unique = dbus_bus_get_unique_name(portal->bus);
@@ -308,6 +338,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
     {
         char req_path[512];
         char *token = portal_make_token(portal, req_path, sizeof(req_path));
+        if (!token) goto fail;
 
         DBusMessage *msg = dbus_message_new_method_call(
             PORTAL_BUS_NAME, PORTAL_OBJ_PATH,
@@ -321,11 +352,10 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dict_append_sv_string(&dict, "session_handle_token", "metadesk_session");
         dbus_message_iter_close_container(&args, &dict);
 
-        /* Fire and forget — we wait for the signal */
-        dbus_connection_send(portal->bus, msg, NULL);
-        dbus_connection_flush(portal->bus);
+        bool accepted = portal_request(portal, msg, req_path);
         dbus_message_unref(msg);
         free(token);
+        if (!accepted) goto fail;
 
         DBusMessage *resp = NULL;
         uint32_t rc = portal_wait_response(portal, req_path, 5000, &resp);
@@ -341,13 +371,14 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_iter_next(&resp_args); /* skip response code */
 
         const char *sh = dict_lookup_string(&resp_args, "session_handle");
-        if (!sh) {
+        if (!sh || !dbus_validate_path(sh, NULL)) {
             MD_LOG_I("no session_handle in CreateSession response");
             dbus_message_unref(resp);
             goto fail;
         }
         portal->session_handle = strdup(sh);
         dbus_message_unref(resp);
+        if (!portal->session_handle) goto fail;
 
         MD_LOG_I("session created: %s", portal->session_handle);
     }
@@ -356,6 +387,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
     {
         char req_path[512];
         char *token = portal_make_token(portal, req_path, sizeof(req_path));
+        if (!token) goto fail;
 
         DBusMessage *msg = dbus_message_new_method_call(
             PORTAL_BUS_NAME, PORTAL_OBJ_PATH,
@@ -376,14 +408,21 @@ static int portal_screencast_open(PortalScreencast *portal) {
          * with a method error and never emit a Response.) */
         dict_append_sv_uint32(&dict, "persist_mode", 2);
         char rtoken[1024];
-        if (portal_load_token(rtoken, sizeof(rtoken)) > 0)
-            dict_append_sv_string(&dict, "restore_token", rtoken);
+        size_t token_len = md_capture_restore_token_load(rtoken, sizeof(rtoken));
+        if (token_len && !dbus_validate_utf8(rtoken, NULL)) {
+            MD_LOG_I("restore token is not valid UTF-8; refusing capture");
+            dbus_message_iter_abandon_container(&args, &dict);
+            dbus_message_unref(msg);
+            free(token);
+            goto fail;
+        }
+        if (token_len) dict_append_sv_string(&dict, "restore_token", rtoken);
         dbus_message_iter_close_container(&args, &dict);
 
-        dbus_connection_send(portal->bus, msg, NULL);
-        dbus_connection_flush(portal->bus);
+        bool accepted = portal_request(portal, msg, req_path);
         dbus_message_unref(msg);
         free(token);
+        if (!accepted) goto fail;
 
         uint32_t rc = portal_wait_response(portal, req_path, 5000, NULL);
         if (rc != 0) {
@@ -397,6 +436,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
     {
         char req_path[512];
         char *token = portal_make_token(portal, req_path, sizeof(req_path));
+        if (!token) goto fail;
 
         DBusMessage *msg = dbus_message_new_method_call(
             PORTAL_BUS_NAME, PORTAL_OBJ_PATH,
@@ -413,15 +453,15 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dict_append_sv_string(&dict, "handle_token", token);
         dbus_message_iter_close_container(&args, &dict);
 
-        dbus_connection_send(portal->bus, msg, NULL);
-        dbus_connection_flush(portal->bus);
+        bool accepted = portal_request(portal, msg, req_path);
         dbus_message_unref(msg);
         free(token);
+        if (!accepted) goto fail;
 
-        /* Generous timeout — the user needs time to find and approve the
-         * "Share your screen" consent dialog. */
+        /* Interactive callers may wait longer; unattended has one capped
+         * budget across CreateSession, SelectSources, Start and remote open. */
         DBusMessage *resp = NULL;
-        uint32_t rc = portal_wait_response(portal, req_path, 180000, &resp);
+        uint32_t rc = portal_wait_response(portal, req_path, md_capture_consent_timeout_ms(cfg), &resp);
         if (rc != 0 || !resp) {
             MD_LOG_I("Start failed or user cancelled (rc=%u)", rc);
             if (resp) dbus_message_unref(resp);
@@ -451,6 +491,14 @@ static int portal_screencast_open(PortalScreencast *portal) {
                 dbus_message_iter_next(&entry);
                 dbus_message_iter_recurse(&entry, &variant);
 
+                if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
+                    dbus_message_unref(resp);
+                    goto fail;
+                }
+                char *signature = dbus_message_iter_get_signature(&variant);
+                bool valid = signature && strcmp(signature, "a(ua{sv})") == 0;
+                dbus_free(signature);
+                if (!valid) { dbus_message_unref(resp); goto fail; }
                 /* variant contains a(ua{sv}) */
                 DBusMessageIter streams_arr, stream_struct;
                 dbus_message_iter_recurse(&variant, &streams_arr);
@@ -458,7 +506,7 @@ static int portal_screencast_open(PortalScreencast *portal) {
                 if (dbus_message_iter_get_arg_type(&streams_arr) == DBUS_TYPE_STRUCT) {
                     dbus_message_iter_recurse(&streams_arr, &stream_struct);
                     dbus_message_iter_get_basic(&stream_struct, &portal->node_id);
-                    found_streams = true;
+                    found_streams = portal->node_id != 0 && portal->node_id != PW_ID_ANY;
                     MD_LOG_I("stream node_id=%u", portal->node_id);
                 }
             } else if (strcmp(key, "restore_token") == 0) {
@@ -467,8 +515,11 @@ static int portal_screencast_open(PortalScreencast *portal) {
                 if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
                     const char *rt = NULL;
                     dbus_message_iter_get_basic(&variant, &rt);
-                    portal_save_token(rt);
-                    MD_LOG_I("screencast consent persisted (restore_token saved)");
+                    if (!rt || strlen(rt) >= sizeof(restore_token)) {
+                        dbus_message_unref(resp);
+                        goto fail;
+                    }
+                    snprintf(restore_token, sizeof(restore_token), "%s", rt);
                 }
             }
             dbus_message_iter_next(&results_arr);
@@ -495,32 +546,44 @@ static int portal_screencast_open(PortalScreencast *portal) {
         dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
         dbus_message_iter_close_container(&args, &dict);
 
+        int remaining = portal_remaining_ms(portal, 5000);
+        if (remaining <= 0) { dbus_message_unref(msg); goto fail; }
         DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-            portal->bus, msg, 5000, &err);
+            portal->bus, msg, remaining, &err);
         dbus_message_unref(msg);
 
         if (!reply || dbus_error_is_set(&err)) {
-            MD_LOG_I("OpenPipeWireRemote failed: %s", err.message);
+            MD_LOG_I("OpenPipeWireRemote failed");
             dbus_error_free(&err);
             goto fail;
         }
 
         /* Reply contains a Unix FD */
         int fd = -1;
-        if (!dbus_message_get_args(reply, &err,
+        if (!dbus_message_has_sender(reply, portal->owner) ||
+            !dbus_message_has_signature(reply, "h") ||
+            !dbus_message_get_args(reply, &err,
                                   DBUS_TYPE_UNIX_FD, &fd,
                                   DBUS_TYPE_INVALID)) {
-            MD_LOG_I("cannot extract fd: %s", err.message);
+            MD_LOG_I("invalid OpenPipeWireRemote fd reply");
             dbus_error_free(&err);
             dbus_message_unref(reply);
             goto fail;
         }
-        dbus_message_unref(reply);
-
+        /* dbus_message_get_args duplicates UNIX_FD; this copy is ours. */
         portal->pw_fd = fd;
+        dbus_message_unref(reply);
+        if (portal->pw_fd < 0) goto fail;
         MD_LOG_I("PipeWire fd=%d, node_id=%u", portal->pw_fd, portal->node_id);
     }
 
+    portal->opened = true;
+    if (restore_token[0]) {
+        if (md_capture_restore_token_save(restore_token) == 0)
+            MD_LOG_I("screencast consent persisted");
+        else
+            MD_LOG_I("cannot persist screencast consent securely");
+    }
     return 0;
 
 fail:
@@ -533,9 +596,31 @@ static void portal_screencast_close(PortalScreencast *portal) {
         close(portal->pw_fd);
         portal->pw_fd = -1;
     }
+    if (portal->bus && portal->session_handle) {
+        DBusMessage *msg = dbus_message_new_method_call(PORTAL_BUS_NAME,
+            portal->session_handle, "org.freedesktop.portal.Session", "Close");
+        if (msg) {
+            /* The portal acknowledges Close only after backend teardown.
+             * Without that boundary a new capture can race old allocations.
+             * Failed startup cleanup may not extend the consent deadline. */
+            int budget = portal->opened ? 1000 : portal_remaining_ms(portal, 1000);
+            if (budget > 0 && dbus_connection_get_is_authenticated(portal->bus)) {
+                DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+                    portal->bus, msg, budget, NULL);
+                if (reply) dbus_message_unref(reply);
+                else MD_LOG_I("portal session Close was not acknowledged");
+            } else {
+                dbus_message_set_no_reply(msg, TRUE);
+                dbus_connection_send(portal->bus, msg, NULL);
+                dbus_connection_read_write(portal->bus, 0);
+            }
+            dbus_message_unref(msg);
+        }
+    }
     free(portal->session_handle);
     portal->session_handle = NULL;
     if (portal->bus) {
+        dbus_connection_close(portal->bus);
         dbus_connection_unref(portal->bus);
         portal->bus = NULL;
     }
@@ -550,6 +635,7 @@ typedef struct {
     struct pw_core         *core;
     struct pw_stream       *stream;
     struct spa_hook         stream_listener;
+    struct spa_hook         core_listener;
 
     /* Thread running pw_main_loop */
     pthread_t               thread;
@@ -564,6 +650,11 @@ typedef struct {
     pthread_cond_t          frame_cond;
     MdFrame                 pending_frame;
     bool                    frame_ready;
+    bool                    connected;
+    bool                    broken;
+    bool                    stopping;
+    uint64_t                started_ns;
+    uint64_t                last_timestamp_ns;
     struct pw_buffer       *held_pw_buf; /* currently held by consumer */
 
     /* DMA-BUF preference */
@@ -614,7 +705,7 @@ static void on_param_changed(void *userdata, uint32_t id,
     const struct spa_pod *params[1];
     params[0] = spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_Int(data_type));
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
 
     pw_stream_update_params(pw->stream, params, 1);
 }
@@ -645,14 +736,43 @@ static void on_process(void *userdata) {
     if (!d->chunk || d->chunk->size == 0)
         goto requeue;
 
+    /* MAP_BUFFERS does not guarantee every producer buffer is readable.
+     * Reject invalid mappings/chunks while PW still owns the dequeued buffer;
+     * never advertise a CPU frame whose backing pointer is NULL. */
+    uint32_t stride = d->chunk->stride > 0 ? (uint32_t)d->chunk->stride : pw->stride;
+    uint64_t needed = ctx->height ? (uint64_t)(ctx->height - 1) * stride + (uint64_t)ctx->width * 4 : 0;
+    if (!ctx->width || !ctx->height || stride < (uint64_t)ctx->width * 4 ||
+        /* xdpw/PW 1.0.5 supplies flags=0 even for readable MAP_BUFFERS.
+         * Reject an explicit write-only descriptor, not that legacy default. */
+        d->chunk->stride < 0 || (d->flags && !(d->flags & SPA_DATA_FLAG_READABLE)) ||
+        d->chunk->offset > d->maxsize || d->chunk->size > d->maxsize - d->chunk->offset ||
+        needed > d->chunk->size ||
+        (d->type == SPA_DATA_DmaBuf && (!pw->prefer_dmabuf || d->fd < 0)) ||
+        (d->type != SPA_DATA_DmaBuf &&
+         ((d->type != SPA_DATA_MemFd && d->type != SPA_DATA_MemPtr) || !d->data))) {
+        MD_LOG_I("reject buffer: type=%u flags=%u mapped=%d max=%u offset=%u size=%u stride=%d",
+                 d->type, d->flags, d->data != NULL, d->maxsize,
+                 d->chunk->offset, d->chunk->size, d->chunk->stride);
+        pthread_mutex_lock(&pw->frame_lock);
+        pw->broken = true;
+        pthread_cond_signal(&pw->frame_cond);
+        pthread_mutex_unlock(&pw->frame_lock);
+        goto requeue;
+    }
+    /* pw_buffer.time is zero on xdpw 0.7.1. Use CLOCK_MONOTONIC receipt
+     * time in ns, not that unspecified producer value. Ownership is unchanged. */
+    uint64_t timestamp = monotonic_ns();
+    if (timestamp <= pw->last_timestamp_ns) timestamp = pw->last_timestamp_ns + 1;
+    pw->last_timestamp_ns = timestamp;
+
     /* Build MdFrame */
     MdFrame frame = {
         .width        = ctx->width,
         .height       = ctx->height,
-        .stride       = pw->stride,
+        .stride       = stride,
         .format       = spa_to_capture_fmt(pw->spa_format),
         .seq          = atomic_fetch_add_explicit(&pw->seq, 1, memory_order_relaxed),
-        .timestamp_ns = pw_buf->time,
+        .timestamp_ns = timestamp,
     };
 
     if (d->type == SPA_DATA_DmaBuf) {
@@ -664,7 +784,7 @@ static void on_process(void *userdata) {
     } else {
         frame.buf_type   = MD_BUF_CPU;
         frame.dmabuf_fd  = -1;
-        frame.data       = d->data;
+        frame.data       = (uint8_t *)d->data + d->chunk->offset;
         frame.gpu_handle = NULL;
         frame.data_size  = d->chunk->size;
     }
@@ -676,6 +796,10 @@ static void on_process(void *userdata) {
      * this newer buffer instead so release_frame() can safely return the
      * consumer-owned buffer later. */
     pthread_mutex_lock(&pw->frame_lock);
+    if (pw->stopping) {
+        pthread_mutex_unlock(&pw->frame_lock);
+        goto requeue;
+    }
     if (pw->held_pw_buf) {
         if (pw->frame_ready) {
             pw_stream_queue_buffer(pw->stream, pw->held_pw_buf);
@@ -687,6 +811,8 @@ static void on_process(void *userdata) {
         }
     }
 
+    pw->broken = false;
+    pw->connected = true;
     pw->pending_frame = frame;
     pw->held_pw_buf   = pw_buf;
     pw->frame_ready   = true;
@@ -705,23 +831,32 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
     (void)old;
     (void)error;
 
-    switch (state) {
-    case PW_STREAM_STATE_STREAMING:
-        ctx->active = true;
-        break;
-    case PW_STREAM_STATE_PAUSED:
-    case PW_STREAM_STATE_ERROR:
-    case PW_STREAM_STATE_UNCONNECTED:
-        ctx->active = false;
-        /* Wake any blocked get_frame */
-        pthread_mutex_lock(&pw->frame_lock);
-        pthread_cond_signal(&pw->frame_cond);
-        pthread_mutex_unlock(&pw->frame_lock);
-        break;
-    default:
-        break;
-    }
+    pthread_mutex_lock(&pw->frame_lock);
+    ctx->active = state == PW_STREAM_STATE_STREAMING;
+    if (state == PW_STREAM_STATE_STREAMING || state == PW_STREAM_STATE_PAUSED)
+        pw->connected = true;
+    pw->broken = state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED;
+    pthread_cond_signal(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
 }
+
+static void on_core_error(void *userdata, uint32_t id, int seq, int res, const char *message) {
+    PipewireState *pw = userdata;
+    (void)seq; (void)message;
+    if (id != PW_ID_CORE) return;
+    MD_LOG_I("PipeWire core error: %d", res);
+    pthread_mutex_lock(&pw->frame_lock);
+    pw->broken = true;
+    pw->connected = false;
+    pthread_cond_broadcast(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
+    pw_main_loop_quit(pw->loop);
+}
+
+static const struct pw_core_events core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .error = on_core_error,
+};
 
 static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
@@ -735,6 +870,11 @@ static const struct pw_stream_events stream_events = {
 static void *pw_thread_func(void *arg) {
     PipewireState *pw = arg;
     pw_main_loop_run(pw->loop);
+    pthread_mutex_lock(&pw->frame_lock);
+    pw->broken = true;
+    pw->connected = false;
+    pthread_cond_broadcast(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
     return NULL;
 }
 
@@ -742,7 +882,9 @@ static void *pw_thread_func(void *arg) {
 
 static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     /* Initialize PipeWire (idempotent, safe to call multiple times) */
+    (void)cfg;
     pw_init(NULL, NULL);
+    if (!dbus_threads_init_default()) return -1;
 
     PipewireState *pw = calloc(1, sizeof(PipewireState));
     if (!pw) return -1;
@@ -750,6 +892,7 @@ static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     pw->ctx = ctx;
     pw->prefer_dmabuf = false; /* SHM default; backends may expose knob later */
     pw->portal.pw_fd = -1;
+    pw->broken = true;
     pthread_mutex_init(&pw->frame_lock, NULL);
     pthread_cond_init(&pw->frame_cond, NULL);
 
@@ -772,6 +915,16 @@ fail:
 }
 
 static void pw_cleanup_start_resources(PipewireState *pw) {
+    /* Called only after joining the loop, or before it starts. The pending
+     * pointer belongs to this stream and cannot survive stream destruction. */
+    pthread_mutex_lock(&pw->frame_lock);
+    pw->held_pw_buf = NULL;
+    pw->frame_ready = false;
+    memset(&pw->pending_frame, 0, sizeof(pw->pending_frame));
+    pw->ctx->width = pw->ctx->height = 0;
+    pw->connected = false;
+    pw->broken = true;
+    pthread_mutex_unlock(&pw->frame_lock);
     if (pw->stream) {
         pw_stream_disconnect(pw->stream);
         pw_stream_destroy(pw->stream);
@@ -791,13 +944,16 @@ static int pw_start(MdCaptureCtx *ctx) {
     PipewireState *pw = ctx->backend_data;
     if (!pw) return -1;
 
-    /* Connect to PipeWire via xdg-desktop-portal ScreenCast flow.
-     * This shows a user consent dialog and returns a PipeWire fd + node_id.
-     * Falls back to direct PW_ID_ANY connection if portal is unavailable
-     * (e.g. running under X11 without a portal, or in a test harness). */
+    /* Portal authorization is mandatory. A denial/error is never permission
+     * to bypass the portal with a direct connection. */
+    if (pw->thread_started || pw->stream) return -1;
+    pw->started_ns = monotonic_ns();
+    pw->connected = false;
+    pw->broken = false;
+    pw->stopping = false;
     uint32_t stream_node_id = PW_ID_ANY;
 
-    if (portal_screencast_open(&pw->portal) == 0) {
+    if (portal_screencast_open(&pw->portal, &ctx->config) == 0) {
         /* Portal succeeded — connect using the portal's PipeWire fd */
         pw->portal_active = true;
         pw->core = pw_context_connect_fd(pw->pw_ctx,
@@ -806,14 +962,16 @@ static int pw_start(MdCaptureCtx *ctx) {
         stream_node_id = pw->portal.node_id;
         MD_LOG_I("connected via portal (node=%u)", stream_node_id);
     } else {
-        /* Fallback: direct connection (works on X11 / test environments) */
-        MD_LOG_I("portal unavailable, falling back to direct connect");
-        pw->core = pw_context_connect(pw->pw_ctx, NULL, 0);
+        MD_LOG_I("portal authorization failed; refusing capture");
+        pw_cleanup_start_resources(pw);
+        return -1;
     }
     if (!pw->core) {
         pw_cleanup_start_resources(pw);
         return -1;
     }
+
+    pw_core_add_listener(pw->core, &pw->core_listener, &core_events, pw);
 
     /* Create capture stream */
     struct pw_properties *props = pw_properties_new(
@@ -884,12 +1042,9 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
 
     pthread_mutex_lock(&pw->frame_lock);
 
-    /* Wait for a frame from the PipeWire thread, but bound the wait: a
-     * screencast can sit in STREAMING (ctx->active) yet never deliver a
-     * buffer (GNOME/PipeWire can leave the stream "running" but idle).
-     * Returning -1 after ~1s lets the host's capture watchdog restart
-     * capture instead of this call blocking forever. */
-    for (int waited = 0; !pw->frame_ready && ctx->active && waited < 10; waited++) {
+    /* Damage-driven capture can legitimately remain idle indefinitely.
+     * A connected paused/streaming stream is not broken merely for silence. */
+    for (int waited = 0; !pw->frame_ready && !pw->broken && !pw->stopping && waited < 10; waited++) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 100000000L; /* 100ms timeout */
@@ -900,9 +1055,11 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
         pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &ts);
     }
 
-    if (!pw->frame_ready) {
+    if (pw->stopping || !pw->frame_ready) {
+        bool broken = pw->stopping || pw->broken || (!pw->connected &&
+            monotonic_ns() - pw->started_ns > 5000000000ULL);
         pthread_mutex_unlock(&pw->frame_lock);
-        return -1; /* capture stopped */
+        return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
 
     *out = pw->pending_frame;
@@ -920,6 +1077,7 @@ static void pw_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {
     if (pw->held_pw_buf) {
         pw_stream_queue_buffer(pw->stream, pw->held_pw_buf);
         pw->held_pw_buf = NULL;
+        pthread_cond_broadcast(&pw->frame_cond);
     }
     pthread_mutex_unlock(&pw->frame_lock);
 }
@@ -930,6 +1088,8 @@ static void pw_stop(MdCaptureCtx *ctx) {
 
     pthread_mutex_lock(&pw->frame_lock);
     ctx->active = false;
+    pw->stopping = true;
+    pw->broken = true;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
 
@@ -940,6 +1100,14 @@ static void pw_stop(MdCaptureCtx *ctx) {
         pthread_join(pw->thread, NULL);
         pw->thread_started = false;
     }
+
+    /* A concurrent consumer may still be encoding a borrowed mapping. Stop
+     * prevents new acquisitions, then waits for that owner to release before
+     * destroying the stream. A pending (unacquired) frame has no such owner. */
+    pthread_mutex_lock(&pw->frame_lock);
+    while (pw->held_pw_buf && !pw->frame_ready)
+        pthread_cond_wait(&pw->frame_cond, &pw->frame_lock);
+    pthread_mutex_unlock(&pw->frame_lock);
 
     /* Tear down the per-start resources (stream, core, portal) so a later
      * pw_start() can cleanly re-open them — used by the host's stall-recovery
@@ -952,12 +1120,8 @@ static void pw_stop(MdCaptureCtx *ctx) {
  * the consent dialog again (used after repeated capture failures). */
 static void pw_forget_authorization(MdCaptureCtx *ctx) {
     (void)ctx;
-    char dir[512];
-    portal_token_path(dir, sizeof(dir));
-    char path[640];
-    snprintf(path, sizeof(path), "%s/screencast.token", dir);
-    if (unlink(path) == 0)
-        MD_LOG_I("cleared screencast restore_token (%s)", path);
+    if (md_capture_restore_token_forget() == 0)
+        MD_LOG_I("cleared screencast restore_token");
 }
 
 static void pw_destroy(MdCaptureCtx *ctx) {

@@ -163,9 +163,8 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
 }
 
 #define HOST_CAPTURE_SIZE_WAIT_MS 2000
-/* Capture stall watchdog: if a client is connected but no frame arrives for
- * this long, restart the capture backend; after this many failed restarts,
- * drop the saved screencast authorization so the next start re-prompts. */
+/* Restart only broken capture, not healthy damage-driven idle streams.
+ * Authorization removal is separately opt-in and forbidden unattended. */
 #define HOST_CAPTURE_STALL_MS      4000
 #define HOST_CAPTURE_MAX_RESTARTS  2
 
@@ -224,67 +223,41 @@ static void *capture_thread_func(void *arg) {
     HostCtx       *ctx = ct->host;
     MdCaptureCtx  *cap = ct->capture;
 
-    /* Loop on g_running, NOT on md_capture_is_active(): a backend reports its
-     * dimensions at format-negotiation time but may reach its streaming state
-     * much later, and a *restored* PipeWire screencast (reused restore_token)
-     * can deliver buffers without ever flipping our 'active' flag to
-     * STREAMING. Gating on 'active' dropped the thread before the first frame
-     * and left the stream permanently at frames=0. get_frame() returns a
-     * frame whenever one is ready and -1 otherwise, so a short sleep on -1
-     * keeps the thread alive and idle until buffers flow. */
-    uint32_t stall_deadline   = 0;      /* 0 = disarmed; else ms to restart   */
-    uint32_t restart_count    = 0;
-    bool     recovery_gave_up = false;
+    /* A restored or damage-driven stream can be paused but healthy. Keep
+     * pulling frames; only MD_CAPTURE_ERROR arms the recovery watchdog. */
+    MdCaptureWatchdog watchdog = {0};
 
     while (g_running) {
         pthread_mutex_lock(&ctx->client_mu);
         bool has_client = (ctx->client != NULL);
         pthread_mutex_unlock(&ctx->client_mu);
-        uint32_t now = md_stream_now_ms();
-
         MdFrame frame;
-        if (md_capture_get_frame(cap, &frame) != 0) {
-            /* No frame. Watchdog: if a client is waiting but the (often
-             * restored) screencast has produced nothing for a while, restart
-             * capture; after repeated failures drop the saved restore_token
-             * so the next host start re-prompts for consent. */
-            if (has_client && !recovery_gave_up) {
-                if (stall_deadline == 0) {
-                    stall_deadline = now + HOST_CAPTURE_STALL_MS;
-                } else if (now >= stall_deadline) {
-                    restart_count++;
-                    md_capture_stop(cap);
-                    if (restart_count > HOST_CAPTURE_MAX_RESTARTS) {
-                        md_capture_forget_authorization(cap);
-                        recovery_gave_up = true;
-                        fprintf(stderr,
-                            "host: capture unrecoverable after %u restarts; "
-                            "cleared screencast authorization — restart the host "
-                            "and re-approve the screen-share prompt\n",
-                            HOST_CAPTURE_MAX_RESTARTS);
-                    } else {
-                        fprintf(stderr,
-                            "host: no capture frames for %dms with a client "
-                            "connected — restarting capture (attempt %u)\n",
-                            HOST_CAPTURE_STALL_MS, restart_count);
-                        if (md_capture_start(cap) != 0)
-                            fprintf(stderr, "host: capture restart failed\n");
-                        stall_deadline = now + HOST_CAPTURE_STALL_MS;
-                    }
+        int capture_result = md_capture_get_frame(cap, &frame);
+        MdCaptureRecovery recovery = md_capture_watchdog_step(&watchdog,
+            capture_result, has_client, md_stream_now_ms(),
+            HOST_CAPTURE_STALL_MS, HOST_CAPTURE_MAX_RESTARTS);
+        if (capture_result != 0) {
+            if (recovery != MD_CAPTURE_RECOVERY_NONE) {
+                md_capture_stop(cap);
+                if (recovery == MD_CAPTURE_RECOVERY_EXHAUSTED) {
+                    bool forget = md_capture_stall_may_forget(&cap->config);
+                    if (forget) md_capture_forget_authorization(cap);
+                    fprintf(stderr,
+                        "host: capture unrecoverable after %u restarts; "
+                        "screencast authorization %s — operator action required\n",
+                        watchdog.restarts, forget ? "cleared" : "retained");
+                } else {
+                    fprintf(stderr,
+                        "host: capture broken for %dms with a client "
+                        "connected — restarting capture (attempt %u)\n",
+                        HOST_CAPTURE_STALL_MS, watchdog.restarts);
+                    if (md_capture_start(cap) != 0)
+                        fprintf(stderr, "host: capture restart failed\n");
                 }
-            } else if (!has_client) {
-                stall_deadline = 0;
-                restart_count = 0;
-                recovery_gave_up = false;
             }
-            usleep(10000);  /* 10 ms; no frame yet (warming up / paused) */
+            if (capture_result != MD_CAPTURE_IDLE) usleep(10000);
             continue;
         }
-
-        /* Healthy frame: slide the watchdog forward (or disarm if idle). */
-        stall_deadline   = has_client ? (now + HOST_CAPTURE_STALL_MS) : 0;
-        restart_count    = 0;
-        recovery_gave_up = false;
 
         if (!ctx->encoder || !has_client) {
             md_capture_release_frame(cap, &frame);
@@ -452,6 +425,9 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
     fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
     fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
+    fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
+    fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
+    fprintf(stderr, "  --capture-forget-on-stall  Opt in to token removal after broken capture\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
     fprintf(stderr, "  --fips-ready-timeout MS  Peer readiness timeout (default: 10000)\n");
@@ -650,6 +626,10 @@ int main(int argc, char **argv) {
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
     bool do_capture = true;
+    /* Capture policy options: keep this block independent of input selection. */
+    bool capture_unattended = false;
+    bool capture_forget_on_stall = false;
+    uint32_t capture_consent_timeout_ms = 0;
     bool mcp_stdio = false;
     bool mcp_http = false;
     const char *mcp_token_file = NULL, *mcp_allow_file = NULL;
@@ -684,6 +664,24 @@ int main(int argc, char **argv) {
             use_nvenc = false;
         else if (strcmp(argv[i], "--no-capture") == 0)
             do_capture = false;
+        /* Capture policy: portal-required on Linux, never direct fallback. */
+        else if (strcmp(argv[i], "--capture-unattended") == 0)
+            capture_unattended = true;
+        else if (strcmp(argv[i], "--capture-forget-on-stall") == 0)
+            capture_forget_on_stall = true;
+        else if (strcmp(argv[i], "--capture-consent-timeout-ms") == 0) {
+            if (++i >= argc || !argv[i][0]) {
+                fprintf(stderr, "ERROR: capture consent timeout requires 1..180000 ms\n");
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long ms = strtoul(argv[i], &end, 10);
+            if (*end || ms < 1 || ms > 180000) {
+                fprintf(stderr, "ERROR: capture consent timeout requires 1..180000 ms\n");
+                return 1;
+            }
+            capture_consent_timeout_ms = (uint32_t)ms;
+        }
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             fips_npub = argv[++i];
         else if (strcmp(argv[i], "--fips-control") == 0 && i + 1 < argc)
@@ -1058,6 +1056,9 @@ int main(int argc, char **argv) {
         MdCaptureConfig cap_cfg = {
             .target_fps  = fps,
             .show_cursor = true,
+            .unattended = capture_unattended,
+            .forget_authorization_on_stall = capture_forget_on_stall,
+            .consent_timeout_ms = capture_consent_timeout_ms,
         };
         capture = md_capture_create(&cap_cfg);
         if (!capture) {
@@ -1076,6 +1077,11 @@ int main(int argc, char **argv) {
                                            "capture dimensions not negotiated");
             printf("host: capture started\n");
         }
+    }
+
+    if (do_capture && capture_unattended && !capture) {
+        fprintf(stderr, "ERROR: unattended capture authorization/start failed\n");
+        return 1;
     }
 
     if (!host_dimensions_are_valid(display_width, display_height)) {
