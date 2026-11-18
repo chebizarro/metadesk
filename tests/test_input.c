@@ -2,9 +2,9 @@
  * metadesk — tests/test_input.c
  * Input injection tests.
  *
- * Note: Full uinput tests require /dev/uinput access (root or input group).
- * These tests validate the API surface and action dispatch logic.
- * Run with elevated permissions to test actual device creation.
+ * Default runs use mock/wire-level peers, never desktop input devices.
+ * MD_INPUT_LIVE_TESTS=1 explicitly opts into platform device creation; use
+ * that only on a disposable desktop. Permissions alone are not consent.
  */
 #include "input.h"
 #include "action.h"
@@ -106,12 +106,15 @@ static MdInput make_mock_input(MockInputData *data,
 
 static int test_create_destroy(void) {
     printf("  test_create_destroy... ");
+    if (!getenv("MD_INPUT_LIVE_TESTS") || strcmp(getenv("MD_INPUT_LIVE_TESTS"), "1")) {
+        puts("SKIP (requires explicit disposable-desktop opt-in)");
+        return 0;
+    }
 
     MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
     MdInput *inp = md_input_create(&cfg);
 
-    /* Creation should succeed even if /dev/uinput is unavailable
-     * (it just won't be "ready") */
+    /* Explicit live test: the platform backend must initialize. */
     MD_CHECK(inp != NULL);
 
     if (md_input_is_ready(inp)) {
@@ -128,6 +131,10 @@ static int test_create_destroy(void) {
 
 static int test_create_defaults(void) {
     printf("  test_create_defaults... ");
+    if (!getenv("MD_INPUT_LIVE_TESTS") || strcmp(getenv("MD_INPUT_LIVE_TESTS"), "1")) {
+        puts("SKIP (requires explicit disposable-desktop opt-in)");
+        return 0;
+    }
 
     MdInput *inp = md_input_create(NULL);
     MD_CHECK(inp != NULL);
@@ -393,9 +400,9 @@ static int test_mouse_scroll(void) {
 static int test_type_key_combo_edges(void) {
     printf("  test_type_key_combo_edges... ");
 
-    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
-    MdInput *inp = md_input_create(&cfg);
-    MD_CHECK(inp != NULL);
+    MockInputData data = {0};
+    MdInput mock = make_mock_input(&data, &mock_backend);
+    MdInput *inp = &mock;
 
     /* NULL text */
     MD_CHECK(md_input_type_text(inp, NULL) == -1);
@@ -414,8 +421,6 @@ static int test_type_key_combo_edges(void) {
     /* Unknown key name should fail */
     const char *bad_keys[] = {"nonexistent_key"};
     MD_CHECK(md_input_key_combo(inp, bad_keys, 1) == -1);
-
-    md_input_destroy(inp);
     printf("OK\n");
     return 0;
 }
@@ -514,16 +519,128 @@ static int test_lifecycle_edges(void) {
     return 0;
 }
 
+static int test_explicit_backend_selection(void) {
+    MdInputConfig cfg = { .screen_width = 640, .screen_height = 480,
+                          .backend = "not-a-backend" };
+    MD_CHECK(md_input_create(&cfg) == NULL);
+    cfg.backend = "wayland";
+    /* Even an enabled Wayland backend cannot use ambient display/socket FDs. */
+    MD_CHECK(md_input_create(&cfg) == NULL);
+    cfg.wayland_display = "wayland-0";
+    MD_CHECK(md_input_create(&cfg) == NULL);
+    cfg.wayland_display = "/nonexistent/metadesk-private-wayland";
+    MD_CHECK(md_input_create(&cfg) == NULL);
+    return 0;
+}
+
+#ifdef MD_HAVE_WAYLAND_INPUT
+#include "input_wayland_server.h"
+#include <pthread.h>
+static void *wayland_concurrent_moves(void *data) {
+    MdInput *inp = data;
+    for (int i = 0; i < 16; i++) {
+        MD_CHECK(md_input_is_ready(inp));
+        MD_CHECK(md_input_mouse_move(inp, i, i) == 0);
+    }
+    return NULL;
+}
+static int test_wayland_protocol(void) {
+    InputTestServer *s = input_test_server_start(7);
+    MD_CHECK(s != NULL);
+    if (!s) return 1;
+    MdInputConfig cfg = { .screen_width = 640, .screen_height = 480,
+        .backend = "wayland", .wayland_display = input_test_server_path(s) };
+    MdInput *inp = md_input_create(&cfg);
+    MD_CHECK(md_input_is_ready(inp));
+    if (!inp) { input_test_server_stop(s); return 1; }
+    MD_CHECK(md_input_mouse_move(inp, -10, 999) == 0);
+    InputTestEvents e = input_test_server_events(s);
+    MD_CHECK(e.x == 0 && e.y == 479 && e.width == 640 && e.height == 480);
+    for (int b = 0; b < 3; b++) MD_CHECK(md_input_click(inp, 123, 234, b) == 0);
+    MD_CHECK(inp->vtable->mouse_button(inp, 3, 1) == -1);
+    MD_CHECK(md_input_scroll(inp, -2, 3) == 0);
+    MD_CHECK(md_input_type_text(inp, "aA!\t\n") == 0);
+    e = input_test_server_events(s);
+    MD_CHECK(e.keymap_valid && e.keymaps == 1);
+    MD_CHECK(e.moves == 4 && e.frames >= 11);
+    MD_CHECK(e.x == 123 && e.y == 234);
+    for (int b = 0; b < 3; b++) MD_CHECK(e.button_down[b] == 1 && e.button_up[b] == 1);
+    MD_CHECK(e.scroll_x == -2 && e.scroll_y == -3);
+    MD_CHECK(e.key_down == 5 && e.key_up == 5 && e.saw_shift);
+    MD_CHECK(strcmp(e.text, "aA!\t\r") == 0);
+    MD_CHECK(strcmp(e.release_text, "aA!\t\r") == 0);
+    MD_CHECK(md_input_type_text(inp, "prefix\r") == -1);
+    MD_CHECK(md_input_type_text(inp, "prefix\xc3\xa9") == -1);
+    MD_CHECK(inp->vtable->key_event(inp, 0x1002603, 1) == -1);
+    MD_CHECK(input_test_server_events(s).key_down == e.key_down);
+    const char *combo[] = {"ctrl", "s"};
+    MD_CHECK(md_input_key_combo(inp, combo, 2) == 0);
+    MD_CHECK(input_test_server_events(s).saw_ctrl);
+    pthread_t threads[2];
+    unsigned started = 0;
+    for (unsigned i = 0; i < 2; i++) {
+        int rc = pthread_create(&threads[started], NULL, wayland_concurrent_moves, inp);
+        MD_CHECK(rc == 0);
+        if (!rc) started++;
+    }
+    for (unsigned i = 0; i < started; i++) MD_CHECK(pthread_join(threads[i], NULL) == 0);
+    MD_CHECK(input_test_server_events(s).moves == 36);
+    /* Deliberately leave a modifier and button down; destroy must release both. */
+    MD_CHECK(inp->vtable->key_event(inp, md_input_keysym_from_name("shift"), 1) == 0);
+    MD_CHECK(inp->vtable->mouse_button(inp, 0, 1) == 0);
+    MD_CHECK(md_input_type_text(inp, "no") == -1);
+    md_input_destroy(inp);
+    e = input_test_server_events(s);
+    MD_CHECK(e.key_down == e.key_up);
+    MD_CHECK(e.button_down[0] == e.button_up[0]);
+    /* Production constructor normalization without touching a desktop backend. */
+    cfg.screen_width = 0;
+    cfg.screen_height = 1;
+    inp = md_input_create(&cfg);
+    MD_CHECK(md_input_is_ready(inp));
+    if (inp) {
+        MD_CHECK(inp->config.screen_width == MD_INPUT_FALLBACK_SCREEN_WIDTH);
+        MD_CHECK(inp->config.screen_height == MD_INPUT_FALLBACK_SCREEN_HEIGHT);
+        md_input_destroy(inp);
+    }
+    input_test_server_stop(s);
+    cfg.screen_width = 640;
+    cfg.screen_height = 480;
+
+    const unsigned failures[] = {0, 3, 5, 6, 7 | 8, 7 | 16, 7 | 32};
+    for (unsigned i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        s = input_test_server_start(failures[i]);
+        MD_CHECK(s != NULL);
+        if (!s) return 1;
+        cfg.wayland_display = input_test_server_path(s);
+        inp = md_input_create(&cfg);
+        if (failures[i] & 16) {
+            MD_CHECK(md_input_is_ready(inp));
+            MD_CHECK(md_input_mouse_move(inp, 1, 2) == -1);
+            MD_CHECK(!md_input_is_ready(inp));
+            MD_CHECK(md_input_type_text(inp, "x") == -1);
+        } else MD_CHECK(inp == NULL);
+        md_input_destroy(inp);
+        input_test_server_stop(s);
+    }
+    return 0;
+}
+#endif
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
-    printf("test_input: uinput injection tests\n");
+    printf("test_input: input HAL tests (desktop devices opt-in only)\n");
 
     if (access("/dev/uinput", W_OK) != 0) {
         printf("  NOTE: /dev/uinput not writable — device tests will be limited\n");
     }
 
     int failures = 0;
+    failures += test_explicit_backend_selection();
+#ifdef MD_HAVE_WAYLAND_INPUT
+    failures += test_wayland_protocol();
+#endif
     failures += test_create_destroy();
     failures += test_create_defaults();
     failures += test_action_dispatch();

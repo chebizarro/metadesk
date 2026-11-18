@@ -325,6 +325,37 @@ else
   error('Unsupported platform: ' + host_os)
 endif
 
+# ── Optional wlroots virtual input (independent of signer discovery) ─────────
+wayland_test_sources = []
+wayland_test_deps = []
+if get_option('wayland_input')
+  if host_os != 'linux'
+    error('wayland_input is supported only on Linux')
+  endif
+  dep_wayland_client = dependency('wayland-client', version : '>=1.20')
+  dep_xkbcommon = dependency('xkbcommon', version : '>=1.0')
+  wayland_scanner = find_program('wayland-scanner')
+  foreach protocol : ['wlr-virtual-pointer-unstable-v1', 'virtual-keyboard-unstable-v1']
+    xml = files('protocols' / (protocol + '.xml'))
+    client_header = custom_target(protocol + '-client-header', input : xml,
+      output : protocol + '-client-protocol.h',
+      command : [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+    protocol_code = custom_target(protocol + '-code', input : xml,
+      output : protocol + '-protocol.c',
+      command : [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+    server_header = custom_target(protocol + '-server-header', input : xml,
+      output : protocol + '-server-protocol.h',
+      command : [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+    platform_hal_sources += [client_header, protocol_code]
+    wayland_test_sources += [server_header, protocol_code]
+  endforeach
+  platform_hal_sources += files('src/core/input_wayland.c')
+  platform_hal_deps += [dep_wayland_client, dep_xkbcommon]
+  wayland_test_sources += files('tests/input_wayland_server.c')
+  wayland_test_deps += dependency('wayland-server', version : '>=1.20')
+  add_project_arguments('-DMD_HAVE_WAYLAND_INPUT', language : ['c', 'cpp'])
+endif
+
 # ── Client-only deps ────────────────────────────────────────────────────────
 if enable_client
   dep_sdl2 = dependency('sdl2', version : '>=2.28')
@@ -712,8 +743,8 @@ test_stream = executable('test_stream',
 test('TCP stream transport', test_stream)
 
 test_input = executable('test_input',
-  files('tests/test_input.c'),
-  dependencies : [dep_metadesk],
+  files('tests/test_input.c') + wayland_test_sources,
+  dependencies : [dep_metadesk] + wayland_test_deps,
 )
 test('input injection', test_input)
 

@@ -4,7 +4,7 @@
  * See spec §2.3.3 — platform backends selected at compile time.
  *
  * Backends:
- *   Linux:   uinput virtual devices  (input_uinput.c)
+ *   Linux:   uinput virtual devices, or opt-in Wayland virtual input
  *   macOS:   CGEvent / Quartz        (input_cgevent.m)
  *   Windows: SendInput               (input_sendinput.cpp)
  *
@@ -36,6 +36,12 @@ typedef struct MdInputCtx MdInputCtx;
 typedef struct {
     uint32_t screen_width;   /* absolute mouse coordinate range */
     uint32_t screen_height;
+    /* NULL/"auto": existing platform backend. Linux also accepts "uinput"
+     * and explicit "wayland" (requires -Dwayland_input=true). No fallback. */
+    const char *backend;
+    /* Wayland requires an absolute socket path. Ambient WAYLAND_DISPLAY and
+     * WAYLAND_SOCKET are deliberately ignored. Strings are borrowed. */
+    const char *wayland_display;
 } MdInputConfig;
 
 /* ── Mouse button identifiers ────────────────────────────────── */
@@ -56,6 +62,8 @@ typedef struct MdInputBackend {
     int   (*key_event)(MdInputCtx *ctx, uint32_t keysym, int pressed);
     int   (*type_text)(MdInputCtx *ctx, const char *utf8);
     void  (*destroy)(MdInputCtx *ctx);
+    /* Optional synchronized readiness accessor for stateful backends. */
+    bool  (*is_ready)(const MdInputCtx *ctx);
 } MdInputBackend;
 
 /* ── Input context ───────────────────────────────────────────── */
@@ -72,6 +80,9 @@ struct MdInputCtx {
 /* Create the platform-appropriate input backend.
  * Each platform's backend source file implements this function. */
 const MdInputBackend *md_input_backend_create(void);
+#ifdef MD_HAVE_WAYLAND_INPUT
+const MdInputBackend *md_input_wayland_backend(void);
+#endif
 
 /* ── Public convenience API ──────────────────────────────────── */
 
@@ -95,6 +106,7 @@ int md_input_mouse_move(MdInput *inp, int x, int y);
 int md_input_click(MdInput *inp, int x, int y, int button);
 int md_input_dbl_click(MdInput *inp, int x, int y);
 int md_input_right_click(MdInput *inp, int x, int y);
+/* Wheel detents: positive X is right, positive Y is up (evdev convention). */
 int md_input_scroll(MdInput *inp, int dx, int dy);
 
 /* ── Keyboard injection ──────────────────────────────────────── */
@@ -107,7 +119,9 @@ int md_input_scroll(MdInput *inp, int dx, int dy);
  * Keys are pressed in order, then released in reverse. */
 int md_input_key_combo(MdInput *inp, const char **keys, int key_count);
 
-/* Type a UTF-8 string. */
+/* Type a UTF-8 string if supported by the backend. Wayland synthesizes a
+ * fixed US keymap: printable ASCII, tab and newline only, at most 4096 bytes;
+ * unsupported text, held keys or latched/locked modifiers fail before input. */
 int md_input_type_text(MdInput *inp, const char *text);
 
 /* ── Action dispatch ─────────────────────────────────────────── */

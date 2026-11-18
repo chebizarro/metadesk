@@ -152,7 +152,21 @@ static void input_apply_fallback_dimensions(MdInputConfig *cfg,
 }
 
 MdInput *md_input_create(const MdInputConfig *cfg) {
-    const MdInputBackend *vtable = md_input_backend_create();
+    const char *name = cfg ? cfg->backend : NULL;
+    const MdInputBackend *vtable = NULL;
+    if (!name || strcmp(name, "auto") == 0) {
+        vtable = md_input_backend_create();
+#ifdef __linux__
+    } else if (strcmp(name, "uinput") == 0) {
+        vtable = md_input_backend_create();
+#endif
+#ifdef MD_HAVE_WAYLAND_INPUT
+    } else if (strcmp(name, "wayland") == 0) {
+        vtable = md_input_wayland_backend();
+#endif
+    } else {
+        MD_LOG_E("input backend '%s' unavailable (no fallback)", name);
+    }
     if (!vtable) return NULL;
 
     MdInput *inp = calloc(1, sizeof(MdInput));
@@ -325,7 +339,10 @@ int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
 bool md_input_is_ready(const MdInput *inp) {
-    return inp ? inp->ready : false;
+    if (!inp) return false;
+    if (inp->vtable && inp->vtable->is_ready)
+        return inp->vtable->is_ready(inp);
+    return inp->ready;
 }
 
 void md_input_destroy(MdInput *inp) {
