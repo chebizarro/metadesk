@@ -181,7 +181,48 @@ dep_websockets = cc.find_library('websockets', required : true, dirs : _sys_lib_
 dep_ssl = cc.find_library('ssl', required : true, dirs : _sys_lib_dirs)
 dep_crypto = cc.find_library('crypto', required : true, dirs : _sys_lib_dirs)
 dep_nsync = cc.find_library('nsync', required : true, dirs : _sys_lib_dirs)
-dep_nostr_json = cc.find_library('nostr_json', required : true, dirs : _sys_lib_dirs)
+# Current nostrc names the artifact nostr-json and its pkg-config module
+# libnostr-json. Prefer the selected build tree, just as for libnostr above;
+# installed underscore-named dylibs may still require removed Homebrew ABIs.
+_json_build_lib = ''
+if _nostrc_build != ''
+  foreach name : ['libnostr-json.dylib', 'libnostr-json.so', 'libnostr-json.a']
+    candidate = _nostrc_build / 'libjson' / name
+    if _json_build_lib == '' and fs.exists(candidate)
+      _json_build_lib = candidate
+    endif
+  endforeach
+endif
+if _json_build_lib != ''
+  dep_nostr_json = declare_dependency(
+    dependencies : dependency('jansson'),
+    link_args : [_json_build_lib, '-Wl,-rpath,' + _nostrc_build / 'libjson'],
+  )
+  message('nostr-json: using build-tree library: ' + _json_build_lib)
+else
+  dep_nostr_json = dependency('libnostr-json', required : false, method : 'pkg-config')
+  if not dep_nostr_json.found()
+    dep_nostr_json = dependency('nostr-json', required : false, method : 'pkg-config')
+  endif
+  if not dep_nostr_json.found()
+    _json_lib = cc.find_library('nostr-json', required : false, dirs : _sys_lib_dirs)
+    if _json_lib.found()
+      dep_nostr_json = declare_dependency(
+        dependencies : [_json_lib, dependency('jansson')],
+      )
+    elif host_os == 'darwin'
+      error('Current nostr-json not found. Install libnostr-json pkg-config metadata/library, ' +
+            'or build the nostrc nostr_json target and set -Dnostrc_build_dir=<path>. ' +
+            'Legacy libnostr_json.dylib is not used: it can depend on removed Homebrew ABIs.')
+    else
+      _json_legacy = cc.find_library('nostr_json', required : true, dirs : _sys_lib_dirs)
+      warning('Using legacy nostr_json; upgrade nostrc to the canonical nostr-json library.')
+      dep_nostr_json = declare_dependency(
+        dependencies : [_json_legacy, dependency('jansson')],
+      )
+    endif
+  endif
+endif
 
 # NIP-11 relay information document (requires libcurl for HTTP fetch)
 dep_curl = dependency('libcurl', version : '>=7.80', required : true)

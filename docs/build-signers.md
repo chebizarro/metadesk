@@ -19,8 +19,8 @@ nostrc's key-store fallback from consulting the user's store.
 
 ## Dependency discovery
 
-Meson tries installed libraries first (including the Homebrew prefix on macOS),
-then libraries under `nostrc_build_dir/nips/<component>`. Adapter libraries contain
+For signer adapters, Meson tries installed libraries first (including the Homebrew
+prefix on macOS), then libraries under `nostrc_build_dir/nips/<component>`. Adapter libraries contain
 multiple objects, so the fallback links their archive rather than guessing one
 object file. A link check rejects installed backend archives missing the entry
 points Metadesk uses and tries their build-tree counterpart. Source include paths,
@@ -38,7 +38,37 @@ For Linux, `gnostr-secret` can also come from
 naming the nostrc target to build. Build missing targets with
 `cmake --build /path/to/nostrc/_build --target <target> --parallel 2`.
 
-## libwebsockets upgrades and md-k1k
+### Common JSON library
+
+JSON follows the core libnostr build-tree preference, not the signer adapter
+installed-first order. Meson selects, in order:
+
+1. `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a}`, when present. The link
+   dependency includes Jansson and an rpath to that directory, so the current
+   shared library loads without `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH`.
+2. Installed `libnostr-json` pkg-config metadata (the current nostrc module name),
+   then the `nostr-json` module alias, then the `nostr-json` library directly.
+3. On Linux, the old `nostr_json` library with a deprecation warning.
+
+macOS deliberately rejects legacy-only discovery with an actionable configure
+error. The old `/opt/homebrew/lib/libnostr_json.dylib` can retain dependencies on
+removed Homebrew SONAMEs; rebuilding the canonical library does not replace it.
+Build only the missing target if necessary:
+
+```sh
+cmake --build /path/to/nostrc/_build --target nostr_json --parallel 2
+```
+
+No compatibility symlinks, loader overrides, generated-manifest edits, or local
+pkg-config shims are needed. Removing the stale underscore-named Homebrew library
+is recommended after checking its other consumers; Metadesk does not remove or
+modify it.
+
+## libwebsockets upgrades and md-k1k (historical diagnosis)
+
+The following records the earlier md-dpl investigation, before the shared nostrc
+build was rebuilt on 2026-11-17. The current md-66n qualification below uses that
+fresh shared build, not the private diagnostic build.
 
 The macOS shared nostrc tree was configured with libwebsockets **4.5.8**:
 `LWS_VERSION:INTERNAL=4.5.8-unknown` in its CMake cache and the 4.5.8 include
@@ -102,8 +132,8 @@ cmake --build /Users/bizarro/Documents/Projects/nostrc/_build --parallel 2 --tar
   nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
 ```
 
-**A second, separate blocker remains (md-66n):** the common Metadesk JSON-library
-discovery still selects `/opt/homebrew/lib/libnostr_json.dylib`. That legacy
+**Second blocker found during md-dpl (now fixed by md-66n):** the old common
+Metadesk JSON-library discovery selected `/opt/homebrew/lib/libnostr_json.dylib`. That legacy
 installed library needs the now-absent `libwebsockets.21.dylib`, so an unmodified
 macOS test run aborts in dyld even after rebuilding private `libnostr.a`. Current
 nostrc builds `libjson/libnostr-json.2.dylib` with canonical `libnostr-json.pc`
@@ -112,7 +142,49 @@ underscore-named install; core JSON discovery must select the new library.
 This is outside the signer-only build-edit scope. Extra `c_link_args` do not
 solve it: the stale library remains a load dependency.
 
-## Qualification (2026-11-17)
+## Current md-66n / md-dpl qualification (2026-11-17)
+
+From Metadesk master `323292d` plus the md-66n discovery fix, all configurations
+configure, build, and pass normal `meson test --print-errorlogs` without loader
+overrides, pkg-config shims, ABI aliases, or generated-manifest changes:
+
+| Enabled options | macOS | Linux aarch64 VM |
+| --- | --- | --- |
+| none (defaults) | 25/25 | 26/26 |
+| NIP-46 only | 26/26 | 27/27 |
+| NIP-55L only | 26/26 | 27/27 |
+| NIP-5F only | 26/26 | 27/27 |
+| all three | 28/28 | 29/29 |
+
+There were zero failures or skips. The all-enabled `nostr NIP-44` test also
+passed 100/100 serial repetitions on each platform (`--no-rebuild --repeat=100
+--num-processes=1`). Counts differ from the earlier md-dpl snapshot
+because master has additional tests; Linux also has the private AT-SPI bus-loss
+test. All builds used `-j2`, default client settings, and explicit
+`nostrc_root` / `nostrc_build_dir`. Tests used only the isolation variables shown
+at the top of this document; neither platform had loader or pkg-config overrides.
+
+macOS used `/Users/bizarro/Documents/Projects/nostrc/_build`, freshly rebuilt
+against libwebsockets 5.1.0 and OpenSSL 4 before this task. Linux used
+`bizarro@192.168.64.3:~/wt-66n` and `/home/bizarro/nostrc/_build`. No shared nostrc
+targets needed building, and no shared dependency tree or Homebrew files were
+modified. No packages were installed.
+
+`otool -L` on the NIP-46 library shows `@rpath/libnostr-json.2.dylib`, and its
+`LC_RPATH` includes the selected nostrc build's `libjson` directory. That JSON
+dylib depends on `libwebsockets.23.dylib`, not the removed `.21` SONAME. The
+macOS default still has no dynamic JSON dependency. A separate negative setup
+using a private symlink view of the build tree with `libjson` omitted fails with
+the intended legacy-library diagnostic; the original shared tree stays untouched.
+Installed canonical pkg-config/direct-library fallbacks were not runtime-tested
+because neither platform needed them for this matrix.
+
+Nostr Protocol Review of this build/docs-only diff found no protocol-behavior
+changes: no polling, timer closes, relay frame handling, filters, or subscription
+lifecycles were introduced or modified. This is not a live relay/signing or
+interactive-desktop qualification.
+
+## Historical md-dpl qualification (before md-66n, 2026-11-17)
 
 All ten platform/configuration combinations configured, built, and linked without
 pkg-config shims. The normal test gate is **not fully green**:
@@ -154,4 +226,5 @@ NOSTRC_TEST_ISOLATION=1 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent \
 
 Result: **100/100**, zero failures. The shared-tree cache warning was separately
 verified against the untouched shared build; the current header/library probe
-passed. md-dpl remains open pending md-66n and an unmodified macOS test gate.
+passed. At that point md-dpl remained open pending md-66n and an unmodified macOS
+test gate; see the current qualification below.
