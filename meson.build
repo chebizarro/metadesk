@@ -503,7 +503,10 @@ endforeach
 # Installed archives can lag behind the source headers. Check the entry points
 # used by Metadesk with the full transitive link set before accepting them.
 _signer_apis = {
-  'nip46' : ['nostr_nip46_core', ['nostr_nip46_client_sign_event']],
+  'nip04' : ['nip04', ['nostr_nip04_legacy_decrypt_enabled']],
+  'nip46' : ['nostr_nip46_core', ['nostr_nip46_client_sign_event',
+    'nostr_nip46_bunker_set_request_handler', 'nostr_nip46_bunker_set_transport_key',
+    'nostr_nip46_bunker_request_complete']],
   'nip55l' : ['nostr_nip55l_core', ['nostr_nip55l_sign_event_json']],
   'nip5f' : ['nostr_nip5f_core', ['nostr_nip5f_client_sign_event', 'nostr_nip5f_server_start']],
 }
@@ -684,11 +687,26 @@ if enable_client
     'src/client/render.c',
     'src/client/ui.cpp',
   )
-  executable('metadesk-client', client_sources,
+  metadesk_client = executable('metadesk-client', client_sources,
     include_directories : [core_inc],
     dependencies : [dep_metadesk, dep_sdl2, dep_imgui],
     install : true,
   )
+endif
+
+if host_os == 'linux' or host_os == 'darwin'
+  test_account_startup = executable('test_account_startup',
+    'tests/test_account_startup.c', dependencies : dep_metadesk,
+    c_args : signer_c_args)
+  startup_args = [files('tests/account_startup_fixture.py'), test_account_startup, metadesk_host]
+  if enable_client
+    startup_args += [metadesk_client]
+  endif
+  if enable_nip5f
+    startup_args += ['--nip5f']
+  endif
+  test('account startup roles + private relay restore', accounts_python,
+    args : startup_args, timeout : 120)
 endif
 
 # ── Tests ───────────────────────────────────────────────────────────────────

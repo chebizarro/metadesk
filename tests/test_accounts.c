@@ -139,6 +139,7 @@ static void test_credentials(void) {
     MD_CHECK(md_credential_store_remove(store, "bad") == MD_CREDENTIAL_INVALID);
     md_nip46_credentials_free(c); md_credential_store_destroy(store);
 }
+static void revoked_count(void *data) { (*(unsigned *)data)++; }
 static void test_roles_and_persistence(void) {
     char *dir = tempdir(); MdAccounts *a = NULL, *other = NULL;
     MdCredentialStore *store = md_credential_store_memory();
@@ -161,6 +162,12 @@ static void test_roles_and_persistence(void) {
     MD_CHECK(md_accounts_check_fips_host(a, pk1) == 0);
     MD_CHECK(md_accounts_check_fips_host(a, pk2) == MD_ACCOUNTS_FIPS_KEY_MISMATCH);
     MD_CHECK(md_accounts_check_fips_host(a, "bad") == MD_ACCOUNTS_INVALID);
+    MD_CHECK(md_account_binding_role(host) == MD_ACCOUNT_HOST);
+    MD_CHECK(md_account_binding_role(client) == MD_ACCOUNT_CLIENT);
+    unsigned revoked = 0, client_revoked = 0;
+    MdAccountWatch *watch = md_account_binding_watch(host, revoked_count, &revoked);
+    MdAccountWatch *client_watch = md_account_binding_watch(client, revoked_count, &client_revoked);
+    MD_CHECK(watch && client_watch);
     uint64_t generation = md_account_binding_generation(host);
     MD_CHECK(md_accounts_bind_role(a, MD_ACCOUNT_HOST, MD_SIGNER_DIRECT_KEY, pk1, NULL) == 0);
     MdAccountBinding *same = md_accounts_acquire_role(a, MD_ACCOUNT_HOST);
@@ -169,6 +176,12 @@ static void test_roles_and_persistence(void) {
     MD_CHECK(md_account_binding_is_current(host));
     MD_CHECK(md_accounts_bind_role(a, MD_ACCOUNT_HOST, MD_SIGNER_DIRECT_KEY, pk2, s2) == 0);
     MD_CHECK(!md_account_binding_is_current(host) && md_account_binding_is_current(client));
+    MD_CHECK(revoked == 1 && client_revoked == 0);
+    unsigned late = 0;
+    MdAccountWatch *late_watch = md_account_binding_watch(host, revoked_count, &late);
+    MD_CHECK(late_watch && late == 1);
+    md_account_binding_unwatch(late_watch);
+    md_account_binding_unwatch(watch);
     char *out = NULL;
     MD_CHECK(md_account_binding_encrypt(host, pk2, "old", &out) == MD_SIGNER_ERR_CANCELLED && !out);
     MD_CHECK(md_account_binding_encrypt(client, pk2, "still alive", &out) == 0 && out);
@@ -181,7 +194,16 @@ static void test_roles_and_persistence(void) {
     MD_CHECK(!strstr(text, sk1) && !strstr(text, sk2) && !strstr(text, "client_secret"));
     md_accounts_destroy(a); a = NULL;
     MD_CHECK(!md_account_binding_is_current(client));
+    MD_CHECK(client_revoked == 1);
+    md_account_binding_unwatch(client_watch);
     md_account_binding_release(host); md_account_binding_release(client);
+    MD_CHECK(md_accounts_open_snapshot(dir, store, &a) == 0);
+    MD_CHECK(md_accounts_open(dir, store, &other) == 0);
+    md_accounts_destroy(other); other = NULL;
+    MD_CHECK(md_accounts_save(a) == MD_ACCOUNTS_UNSUPPORTED);
+    MdAccountBinding *restored = NULL;
+    MD_CHECK(md_accounts_restore_role(a, MD_ACCOUNT_HOST, &restored) == MD_ACCOUNTS_NOT_READY && !restored);
+    md_accounts_destroy(a);
     MD_CHECK(md_accounts_open(dir, store, &a) == 0);
     MD_CHECK(md_accounts_count(a) == 2);
     MD_CHECK(!strcmp(md_accounts_role(a, MD_ACCOUNT_HOST)->pubkey, pk2));

@@ -5,6 +5,28 @@
 #include <nostr/nip46/nip46_client.h>
 #endif
 
+void md_account_startup_clear(MdAccountStartup *s) {
+    if (!s) return;
+    md_accounts_destroy(s->accounts);
+    md_account_binding_release(s->binding);
+    md_credential_store_destroy(s->store);
+    memset(s, 0, sizeof(*s));
+}
+int md_account_startup_open(MdAccountRole role, MdAccountStartup *s) {
+    if (!s) return MD_ACCOUNTS_INVALID;
+    memset(s, 0, sizeof(*s));
+    s->store = md_credential_store_default();
+    int rc = md_accounts_open_snapshot(NULL, s->store, &s->accounts);
+#ifdef _WIN32
+    /* Saved accounts are unsupported here; preserve explicit/direct-IP use. */
+    if (rc == MD_ACCOUNTS_UNSUPPORTED) rc = MD_ACCOUNTS_NOT_FOUND;
+#endif
+    if (!rc) rc = md_accounts_restore_role(s->accounts, role, &s->binding);
+    if (rc == MD_ACCOUNTS_NOT_FOUND) { md_account_startup_clear(s); return 0; }
+    if (rc) md_account_startup_clear(s);
+    return rc;
+}
+
 int md_accounts_connect_signer(MdSignerType type, const char *pubkey,
     MdCredentialStore *store, MdSigner **out) {
     if (!out) return MD_ACCOUNTS_INVALID;

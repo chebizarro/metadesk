@@ -16,6 +16,9 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 static void test_keypair_generation(void) {
     char *sk = NULL, *pk = NULL;
@@ -483,7 +486,7 @@ static void dm_test_hook(MdNostrTestPoint point, void *ud) {
     pthread_mutex_unlock(&st->mu);
 }
 
-static MdNostr *dm_bridge(DmState *st) {
+static MdNostr *dm_bridge_owned(DmState *st, MdAccounts *accounts) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL); pthread_cond_init(&st->cv, NULL);
     atomic_init(&st->decrypts, 0); atomic_init(&st->destroyed, 0);
@@ -491,15 +494,27 @@ static MdNostr *dm_bridge(DmState *st) {
     st->direct = md_signer_create_direct(dm_recipient_sk);
     MdSigner *s = md_signer_create_custom(MD_SIGNER_NIP46, &dm_test_ops, st);
     const char *relays[] = { "ws://127.0.0.1:1" };
-    MdNostrConfig cfg = { .signer = s, .relay_urls = relays, .relay_count = 1 };
+    MdAccountBinding *owner = NULL;
+    if (accounts) {
+        char *pk = NULL;
+        MD_CHECK(md_signer_get_pubkey(s, &pk) == 0);
+        MD_CHECK(md_accounts_add(accounts, MD_SIGNER_NIP46, pk, "shared fixture") == 0);
+        MD_CHECK(md_accounts_bind_role(accounts, MD_ACCOUNT_HOST, MD_SIGNER_NIP46, pk, s) == 0);
+        MD_CHECK(md_accounts_bind_role(accounts, MD_ACCOUNT_CLIENT, MD_SIGNER_NIP46, pk, NULL) == 0);
+        owner = md_accounts_acquire_role(accounts, MD_ACCOUNT_HOST);
+        free(pk);
+    }
+    MdNostrConfig cfg = { .signer = s, .owner = owner, .relay_urls = relays, .relay_count = 1 };
     MdNostrCallbacks cbs = { .on_dm = dm_received, .on_dm_error = dm_rejected,
                              .dm_userdata = st };
     st->bridge = md_nostr_create(&cfg, &cbs);
+    md_account_binding_release(owner);
     MD_CHECK(st->bridge != NULL);
     md_nostr_set_test_hook(st->bridge, dm_test_hook, st);
     md_signer_destroy(s); /* bridge must retain its own reference */
     return st->bridge;
 }
+static MdNostr *dm_bridge(DmState *st) { return dm_bridge_owned(st, NULL); }
 static void dm_state_fini(DmState *st) {
     MD_CHECK(atomic_load(&st->destroyed) == 1);
     md_signer_destroy(st->direct);
@@ -638,8 +653,17 @@ static void *hold_shared_signer(void *arg) {
     return NULL;
 }
 static void test_dm_cancel_behind_shared_signer(void) {
+#ifndef _WIN32
+    char temporary[] = "/tmp/md-role-revoke-XXXXXX";
+    char *created = mkdtemp(temporary);
+    MD_CHECK(created != NULL);
+    if (!created) return;
+    char *directory = realpath(created, NULL);
+    MdAccounts *accounts = NULL;
+    MD_CHECK(md_accounts_open(directory, NULL, &accounts) == 0);
+    if (!accounts) { rmdir(created); free(directory); return; }
     DmState st;
-    MdNostr *n = dm_bridge(&st);
+    MdNostr *n = dm_bridge_owned(&st, accounts);
     MdSigner *shared = md_signer_ref(md_nostr_get_signer(n));
     md_signer_set_test_hook(shared, dm_signer_wait_hook, &st);
     st.block = true;
@@ -655,7 +679,9 @@ static void test_dm_cancel_behind_shared_signer(void) {
     pthread_mutex_lock(&st.mu);
     while (st.signer_waiting < 2) pthread_cond_wait(&st.cv, &st.mu);
     pthread_mutex_unlock(&st.mu);
-    md_nostr_stop(n);
+    /* Revoking host must cancel its bridge-local token, even while queued
+     * behind the independently live client role's shared signer operation. */
+    MD_CHECK(md_accounts_unbind_role(accounts, MD_ACCOUNT_HOST) == 0);
     MD_CHECK(pthread_create(&destroyer, NULL, destroy_dm_bridge, n) == 0);
     pthread_mutex_lock(&st.mu);
     while (!st.draining) pthread_cond_wait(&st.cv, &st.mu);
@@ -666,8 +692,18 @@ static void test_dm_cancel_behind_shared_signer(void) {
     MD_CHECK(atomic_load(&st.decrypts) == 0);
     MD_CHECK(st.delivered == 0 && st.rejected == 0);
     MD_CHECK(md_signer_check_connection(shared) == MD_SIGNER_OK);
-    md_signer_destroy(shared); dm_state_fini(&st);
-    printf("  PASS: stopped DM waiting behind another role never enters signer backend\n");
+    MdAccountBinding *client = md_accounts_acquire_role(accounts, MD_ACCOUNT_CLIENT);
+    MD_CHECK(md_account_binding_is_current(client));
+    char *out = NULL, *pk = md_nostr_get_pubkey(dm_sender_sk);
+    MD_CHECK(md_account_binding_encrypt(client, pk, "client survives host revocation", &out) == 0);
+    free(out); free(pk); md_account_binding_release(client);
+    md_signer_destroy(shared); md_accounts_destroy(accounts); dm_state_fini(&st);
+    char lock[4096]; snprintf(lock, sizeof(lock), "%s/.management.lock", directory);
+    unlink(lock); rmdir(directory); free(directory);
+    printf("  PASS: role-revoked DM waiting behind the other role never enters signer backend\n");
+#else
+    puts("  SKIP: account persistence unsupported on Windows");
+#endif
 }
 
 typedef struct { MdNostr *n; int operation, result; } AllowlistRead;
@@ -700,7 +736,7 @@ static void test_allowlist_read_teardown(void) {
         st.released = true; pthread_cond_broadcast(&st.cv);
         pthread_mutex_unlock(&st.mu);
         pthread_join(reader, NULL); pthread_join(destroyer, NULL);
-        MD_CHECK(read.result == (operation == 4 ? -1 : 0));
+        MD_CHECK(read.result == (operation >= 3 ? -1 : 0));
         dm_state_fini(&st);
     }
     printf("  PASS: every in-flight allowlist reader participates in teardown drain\n");
