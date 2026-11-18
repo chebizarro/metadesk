@@ -5,6 +5,7 @@ Run after building Dockerfile.video and compiling capture-probe.c externally.
 Evidence contains private backend state: do not commit it; delete after review.
 """
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -15,12 +16,30 @@ p.add_argument('image')
 p.add_argument('probe', type=Path)
 p.add_argument('evidence', type=Path, help='new, private task-owned directory')
 p.add_argument('--render-node', type=Path, help='optional explicit render node; never a card node')
+p.add_argument('--library', type=Path, help='explicit matching native/ASan libmetadesk.so.0.1.0')
+p.add_argument('--asan-runtime', type=Path, help='explicit matching libasan.so.8 for an ASan probe/library')
+p.add_argument('--prefix', default='atg', help='task-owned container name prefix')
+p.add_argument('--skip-idle', action='store_true', help='burst diagnostic: skip static idle checks, never pixel/lifetime checks')
+p.add_argument('--reopens', type=int, default=6, help='same-context start/stop cycles')
+p.add_argument('--pipewire-debug', help='optional upstream PipeWire log level/topic rules')
+p.add_argument('--trace-buffers', action='store_true', help='log private PipeWire buffer metadata')
 a = p.parse_args()
+if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', a.prefix) or not 1 <= a.reopens <= 100:
+    p.error('invalid prefix or reopen count')
 if a.render_node and not str(a.render_node).startswith('/dev/dri/renderD'):
     p.error('only an explicit /dev/dri/renderD* node is accepted')
+if a.asan_runtime and not a.library:
+    p.error('--asan-runtime requires an explicit matching --library')
 a.evidence = a.evidence.resolve()
 a.evidence.mkdir(mode=0o700, parents=False)
 probe = a.probe.resolve(strict=True)
+inputs = {'image_tag': a.image, 'image': subprocess.check_output(['podman', 'image', 'inspect', a.image,
+                                          '--format', '{{.Id}}'], text=True).strip(),
+          'reopens': a.reopens, 'skip_idle': a.skip_idle, 'trace_buffers': a.trace_buffers, 'pipewire_debug': a.pipewire_debug}
+for key, path in [('probe', probe), ('library', a.library), ('asan_runtime', a.asan_runtime)]:
+    if path:
+        inputs[key + '_sha256'] = hashlib.sha256(path.resolve(strict=True).read_bytes()).hexdigest()
+(a.evidence / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
 summary = {}
 # Never mount the invoking user's runtime, home, session bus, or accessibility bus.
 cells = [('pixman', False, 'allow-isolated-output')]
@@ -60,7 +79,7 @@ if [ "$rc" = 0 ]; then
         rm -f "$token"
         /opt/capture-probe > cleared.log 2>&1
         printf '%s\n' "$?" > cleared.rc
-        MD_CAPTURE_REOPENS=6 /opt/capture-probe > reopens.log 2>&1
+        MD_CAPTURE_REOPENS="$MD_VIDEO_REOPENS" /opt/capture-probe > reopens.log 2>&1
         printf '%s\n' "$?" > reopens.rc
         MD_CAPTURE_BREAK_PIPEWIRE=1 /opt/capture-probe > broken.log 2>&1
         printf '%s\n' "$?" > broken.rc
@@ -76,7 +95,7 @@ MD_CAPTURE_CONSENT_TIMEOUT_MS=500 /opt/capture-probe > /evidence/fresh.log 2>&1 
 printf '%s\\n' "$rc" > /evidence/fresh.rc
 exit "$rc"
 '''
-    name = 'ah9-10-' + cell + '-validation'
+    name = a.prefix + '-' + cell + '-validation'
     # Outside every container bind mount; only this Podman invocation writes it.
     cidfile = a.evidence / (cell + '.cid')
     args = ['podman', 'run', '--init', '--name', name, '--cidfile', str(cidfile),
@@ -89,7 +108,19 @@ exit "$rc"
             '-v', f'{root}/run:/run/metadesk:rw',
             '-v', f'{root}/home:/home/metadesk:rw',
             '-v', f'{root}:/evidence:rw', '-v', f'{probe}:/opt/capture-probe:ro',
-            '-e', f'MD_VIDEO_CONSENT={consent}']
+            '-e', f'MD_VIDEO_CONSENT={consent}',
+            '-e', f'MD_VIDEO_REOPENS={a.reopens}',
+            '-e', f'MD_CAPTURE_TRACE_BUFFERS={int(a.trace_buffers)}']
+    if a.skip_idle:
+        args += ['-e', 'MD_CAPTURE_SKIP_IDLE=1']
+    if a.library:
+        args += ['-v', f'{a.library.resolve(strict=True)}:/opt/metadesk/lib/libmetadesk.so.0:ro']
+    if a.asan_runtime:
+        args += ['-v', f'{a.asan_runtime.resolve(strict=True)}:/opt/metadesk/lib/libasan.so.8:ro',
+                 '-e', 'LD_LIBRARY_PATH=/opt/metadesk/lib',
+                 '-e', 'ASAN_OPTIONS=detect_leaks=1:halt_on_error=1']
+    if a.pipewire_debug is not None:
+        args += ['-e', f'PIPEWIRE_DEBUG={a.pipewire_debug}']
     if cell == 'timeout':
         args += ['-e', 'MD_VIDEO_CHOOSER_WAIT_TEST=1']
     if render:
@@ -97,14 +128,14 @@ exit "$rc"
                  '-e', 'WLR_RENDERER_ALLOW_SOFTWARE=1',
                  '-e', f'WLR_RENDER_DRM_DEVICE={a.render_node}',
                  '-e', 'LIBGL_ALWAYS_SOFTWARE=1']
-    args += [a.image, 'sh', '-c', command]
+    args += [inputs['image'], 'sh', '-c', command]
     # Names are task-owned; refuse collisions rather than deleting others' work.
     if subprocess.run(['podman', 'container', 'exists', name]).returncode == 0:
         raise SystemExit(f'container already exists: {name}')
     try:
         with (root / 'container.log').open('w') as out:
             try:
-                result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=180)
+                result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=180 + a.reopens * 10)
                 code = result.returncode
             except subprocess.TimeoutExpired:
                 code = 124
@@ -141,6 +172,19 @@ for cell, run in negative:
     if not log.exists() or not re.search(r'^frames=0 ', log.read_text(), re.MULTILINE):
         failures.append(f'{cell}.{run}: no zero-frame receipt')
 if a.render_node:
+    for run in ['fresh', 'reuse', 'stale', 'cleared', 'reopens', 'broken']:
+        log = a.evidence / 'render' / (run + '.log')
+        content = log.read_text() if log.exists() else ''
+        cycles = a.reopens if run == 'reopens' else 1
+        receipts = re.findall(r'^frames=\d+ timeouts=\d+ matching_pixels=5,5 ', content, re.MULTILINE)
+        if len(receipts) != cycles:
+            failures.append(f'render.{run}: expected {cycles} changing-pixel receipts, got {len(receipts)}')
+        if run != 'broken':
+            held = re.findall(r'^held_buffer_intact=1 after_stop=-1 stop_waiting=1$', content, re.MULTILINE)
+            if len(held) != cycles:
+                failures.append(f'render.{run}: expected {cycles} outstanding-borrow stop receipts, got {len(held)}')
+        if 'reject buffer:' in content or 'ERROR: AddressSanitizer' in content or 'ERROR: LeakSanitizer' in content:
+            failures.append(f'render.{run}: rejected descriptor or sanitizer diagnostic')
     log = a.evidence / 'timeout' / 'fresh.log'
     timing = re.search(r'start_rc=-1 elapsed=([0-9.]+)', log.read_text()) if log.exists() else None
     if not timing or not 0.4 <= float(timing[1]) < 2:

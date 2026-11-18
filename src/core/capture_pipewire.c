@@ -659,6 +659,8 @@ typedef struct {
 
     /* DMA-BUF preference */
     bool                    prefer_dmabuf;
+    bool                    trace_buffers;
+    uint32_t                generation;
 
     /* Sequence counter */
     atomic_uint_least32_t   seq;
@@ -672,6 +674,41 @@ typedef struct {
 } PipewireState;
 
 /* ── PipeWire stream events ──────────────────────────────────── */
+
+/* Private diagnostics only: addresses/FDs describe this process, not ownership
+ * transferable to a caller. Enable with MD_CAPTURE_TRACE_BUFFERS=1. */
+static void trace_buffer(PipewireState *pw, const char *event, struct pw_buffer *buffer) {
+    if (!pw->trace_buffers) return;
+    struct spa_buffer *b = buffer ? buffer->buffer : NULL;
+    MD_LOG_I("buffer %s gen=%u pw=%p spa=%p planes=%u", event, pw->generation,
+             (void *)buffer, (void *)b, b ? b->n_datas : 0);
+    for (uint32_t i = 0; b && i < b->n_datas; i++) {
+        struct spa_data *d = &b->datas[i];
+        MD_LOG_I(" plane=%u type=%u flags=%u fd=%ld data=%p mapoffset=%u max=%u chunk=%p offset=%u size=%u stride=%d",
+                 i, d->type, d->flags, (long)d->fd, d->data, d->mapoffset,
+                 d->maxsize, (void *)d->chunk, d->chunk ? d->chunk->offset : 0,
+                 d->chunk ? d->chunk->size : 0, d->chunk ? d->chunk->stride : 0);
+        if (strcmp(event, "add") == 0 && d->fd >= 0) {
+            char path[64], target[256];
+            snprintf(path, sizeof(path), "/proc/self/fd/%ld", (long)d->fd);
+            ssize_t len = readlink(path, target, sizeof(target) - 1);
+            if (len >= 0) {
+                target[len] = '\0';
+                struct stat st;
+                if (fstat((int)d->fd, &st) == 0)
+                    MD_LOG_I(" backing=%s file_size=%lld", target, (long long)st.st_size);
+            }
+        }
+    }
+}
+
+static void on_add_buffer(void *userdata, struct pw_buffer *buffer) {
+    trace_buffer(userdata, "add", buffer);
+}
+
+static void on_remove_buffer(void *userdata, struct pw_buffer *buffer) {
+    trace_buffer(userdata, "remove", buffer);
+}
 
 static void on_param_changed(void *userdata, uint32_t id,
                              const struct spa_pod *param) {
@@ -707,7 +744,10 @@ static void on_param_changed(void *userdata, uint32_t id,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
 
-    pw_stream_update_params(pw->stream, params, 1);
+    int rc = pw_stream_update_params(pw->stream, params, 1);
+    if (pw->trace_buffers)
+        MD_LOG_I("buffer params gen=%u format=%u size=%ux%u dataType=%u map_buffers=1 rc=%d",
+                 pw->generation, info.format, info.size.width, info.size.height, data_type, rc);
 }
 
 /* Map SPA video format to our capture pixel format. */
@@ -728,6 +768,7 @@ static void on_process(void *userdata) {
     struct pw_buffer *pw_buf = pw_stream_dequeue_buffer(pw->stream);
     if (!pw_buf) return;
 
+    trace_buffer(pw, "dequeue", pw_buf);
     struct spa_buffer *spa_buf = pw_buf->buffer;
     if (!spa_buf || spa_buf->n_datas == 0)
         goto requeue;
@@ -828,8 +869,10 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
                              enum pw_stream_state state, const char *error) {
     PipewireState *pw = userdata;
     MdCaptureCtx  *ctx = pw->ctx;
-    (void)old;
-    (void)error;
+    if (pw->trace_buffers)
+        MD_LOG_I("stream state gen=%u %s -> %s error=%s", pw->generation,
+                 pw_stream_state_as_string(old), pw_stream_state_as_string(state),
+                 error ? error : "none");
 
     pthread_mutex_lock(&pw->frame_lock);
     ctx->active = state == PW_STREAM_STATE_STREAMING;
@@ -862,6 +905,8 @@ static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .param_changed = on_param_changed,
     .process       = on_process,
+    .add_buffer    = on_add_buffer,
+    .remove_buffer = on_remove_buffer,
     .state_changed = on_state_changed,
 };
 
@@ -890,6 +935,8 @@ static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     if (!pw) return -1;
 
     pw->ctx = ctx;
+    const char *trace = getenv("MD_CAPTURE_TRACE_BUFFERS");
+    pw->trace_buffers = trace && strcmp(trace, "1") == 0;
     pw->prefer_dmabuf = false; /* SHM default; backends may expose knob later */
     pw->portal.pw_fd = -1;
     pw->broken = true;
@@ -915,6 +962,9 @@ fail:
 }
 
 static void pw_cleanup_start_resources(PipewireState *pw) {
+    if (pw->trace_buffers)
+        MD_LOG_I("capture cleanup gen=%u stream=%p core=%p", pw->generation,
+                 (void *)pw->stream, (void *)pw->core);
     /* Called only after joining the loop, or before it starts. The pending
      * pointer belongs to this stream and cannot survive stream destruction. */
     pthread_mutex_lock(&pw->frame_lock);
@@ -947,6 +997,8 @@ static int pw_start(MdCaptureCtx *ctx) {
     /* Portal authorization is mandatory. A denial/error is never permission
      * to bypass the portal with a direct connection. */
     if (pw->thread_started || pw->stream) return -1;
+    pw->generation++;
+    if (pw->trace_buffers) MD_LOG_I("capture start gen=%u", pw->generation);
     pw->started_ns = monotonic_ns();
     pw->connected = false;
     pw->broken = false;
@@ -1062,6 +1114,7 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
         return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
 
+    trace_buffer(pw, "acquire", pw->held_pw_buf);
     *out = pw->pending_frame;
     pw->frame_ready = false;
     pthread_mutex_unlock(&pw->frame_lock);
@@ -1075,6 +1128,7 @@ static void pw_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {
 
     pthread_mutex_lock(&pw->frame_lock);
     if (pw->held_pw_buf) {
+        trace_buffer(pw, "release", pw->held_pw_buf);
         pw_stream_queue_buffer(pw->stream, pw->held_pw_buf);
         pw->held_pw_buf = NULL;
         pthread_cond_broadcast(&pw->frame_cond);
@@ -1114,6 +1168,7 @@ static void pw_stop(MdCaptureCtx *ctx) {
      * restart. The loop and context are kept and reused. The pw loop thread
      * has been joined above, so touching these objects here is safe. */
     pw_cleanup_start_resources(pw);
+    if (pw->trace_buffers) MD_LOG_I("capture stopped gen=%u", pw->generation);
 }
 
 /* Delete the persisted screencast restore_token so the next pw_start() shows

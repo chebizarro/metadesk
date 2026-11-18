@@ -556,3 +556,240 @@ Final VM free space: approximately **8.2 GiB**, **8,760,590,336 bytes**. All che
 free-space values stayed above the 3 GiB stop threshold; shared-VM space changes
 are not attributed solely to this task. Task-only stashes were dropped, and the
 feature worktree/branch are retained for review. No push or merge was performed.
+
+## md-atg: allocation-publication investigation (2026-11-18)
+
+Baseline: master **c571b5df580fc68b83637c103cfc9eb19837c564**, private checkout
+`/home/bizarro/wt-atg`. Same pinned Sway 1.9 / wlroots 0.17.1 / xdpw 0.7.1 /
+portal 1.18.4 / PipeWire 1.0.5 backend as above, with only renderD128. The runtime
+image built from the unmodified Dockerfile.video was
+**9ac1d1e646d1e20e2322462370de9786408c7be262f6b92208d292018532e299**,
+621,661,951 bytes. All names/images/evidence use an `atg` prefix. No live GNOME
+runtime directory, display, bus, portal or PipeWire connection was accessed.
+
+**This is not a reliability fix or a passing after-fix matrix.** Changes in the
+assigned capture code are opt-in diagnostics, not allocation workarounds. The
+confirmed violation is in the PipeWire backend's allocation-publication path:
+the daemon exports the producer's still-unallocated skeleton to the consumer
+before applying the producer's allocation reply. Fixing that ordering is outside
+the assigned files; md-atg must remain open until corrected and requalified.
+
+### Instrumentation and corrected library override
+
+`MD_CAPTURE_TRACE_BUFFERS=1` records a per-context start generation, stream state,
+negotiated format/size/dataType mask and update result, and add/dequeue/acquire/
+release/remove metadata. Each plane includes type, flags, FD, mapping pointer,
+map offset, capacity, chunk offset/size/stride; add also identifies the FD's
+backing file and size. Tracing is disabled by default and never owns, maps or
+closes a producer FD. The probe additionally reports private `/proc/self/fd` and
+SHM/memfd mapping counts before create, after each stop, and after destroy.
+
+The validator now supports task-prefixed names, 1..100 cycles, explicit library
+and ASan runtime mounts, separate upstream log-topic selection, input hashes,
+and per-cycle changing-pixel receipt checks. Any rejected descriptor makes the
+positive matrix fail even if later frames recover. `--skip-idle` is explicitly a
+**burst diagnostic**, not static-idle qualification; pixel, timestamp, held-frame
+and stop/release checks remain enabled.
+
+The throwaway bundle **dereferences** its library symlinks. Therefore an override
+must mount **libmetadesk.so.0**, the actual SONAME loaded by the probe/host, not
+libmetadesk.so.0.1.0. The first run mistakenly overlaid only the latter and thus
+exercised the image's pristine baseline library; it is identified separately
+below. All subsequent overrides target the loaded SONAME. The baseline tracing
+library SHA-256 was
+`fb92ca3914dd175d84490f22b20ea004fd9f52df54220ffce4cdc63018f23c0a`.
+
+### Before/diagnostic matrix — no behavior fix
+
+| Run | Logging / idle mode | Reopen result | Aggregate |
+|---|---|---|---|
+| Pristine native image | Global upstream DEBUG; normal static checks | 20/20 starts pass; 250 matched changing-pixel frames across all positive cells | 0 |
+| Native tracing library, correctly overlaid | Default upstream logging; normal static checks | 3 pass, fourth start fails; zero frames and 22 rejected descriptors | **1** |
+| Native tracing library | Link/client-node topic DEBUG; burst | 100/100 starts pass; 1,050 matched frames across positive cells | 0 |
+| Native + in-memory SPA server logger | No debug-output I/O before fault; burst | 5 pass, sixth start fails; 16 rejected descriptors | **1** |
+| Native + in-memory SPA/core logger | All core DEBUG enabled into ring; burst | 100/100 starts pass; 1,050 matched frames | 0 |
+| Native + selective in-memory SPA/core logger | Link/port topics only; burst | First start passes, second fails; causal ledger below | **1** |
+| Native + selective ring with sync/resource topics added | Burst; added tracing masks failure again | 100/100 starts pass; 1,050 matched frames | 0 |
+| ASan probe + ASan library | Default upstream logging; normal static checks | 6 pass, seventh start fails; zero frames, 13 rejected descriptors; no ASan/LSan report | **1** |
+
+Fresh, saved-token reuse, unknown valid UUID, cleared-token, malformed-token
+retention, private-PipeWire-loss and all expected-negative cells passed in each
+of these matrices; the allocation failures above were in the repeated-start cell.
+The pixman/no-device and deny cells failed closed with zero frames as expected;
+the 500 ms stalled-chooser cell also failed closed. Higher-verbosity passes do
+not erase default-logging failures and are not evidence of a cure. There is no
+established token-specific trigger.
+
+### Causal ledger and owner
+
+Consumer-side add callbacks in the fourth-start failure already show both data
+planes as `SPA_ID_INVALID` (4294967295), FD -1, NULL mapping and maxsize 0. The
+first shared chunk already contains size 8,294,400 and stride 7,680; the second
+chunk fills later. STREAMING and continuing nonempty chunks do not repair the
+consumer's private descriptor copy. All bad frames remain contained by the
+existing guard; none was published as a CPU frame.
+
+A VM-only `LD_PRELOAD` diagnostic substituted an in-memory SPA logger for the
+**private daemon only**. It also routed selected core link/port log topics into
+the ring, dumping on the first invalid-type error and recording subsequent
+allocation replies. It changed no buffer values, flags, calls or waits. Other
+container processes passed through unchanged. The high-volume all-core variant
+masked the failure; selective logging reproduced it. This experimental tracer
+is not part of the runtime product. Its selective source is retained privately at
+`~/Library/Caches/metadesk-md-atg-20261118/atg-pw-ring-selective.c` on the macOS
+workstation, SHA-256
+`daf8bacf08548f7665eb111271ead3ca11ac70f27a03252e3be3dceb14d105d6`.
+It is available for source audit without retaining authorization state.
+
+In the selective failure, one link (output node 37 port 0 to input node 39 port
+0) and one server-local array were correlated throughout. Relative to its output
+allocation dispatch:
+
+| Event | Relative time | Same-link observation |
+|---|---:|---|
+| Producer allocation request | 0 us | Two skeletons; `SPA_NODE_BUFFERS_FLAG_ALLOC=1` |
+| Output marked complete/paused | +142 us | Link resumes allocation before allocation reply is applied |
+| Consumer export | +146 us | Same array, non-ALLOC input `use_buffers` |
+| Conversion error | +148 us | Type **4** rejected and converted to SPA_ID_INVALID |
+| Producer allocation reply applied | +816 us | Two concrete **SPA_DATA_MemFd=2** descriptors, valid FDs, 8,294,400-byte capacities |
+| Link activation | Later | Consumer still has the earlier invalid copies |
+
+These are traced-run timestamps, not a latency benchmark: dumping the ring after
+an already-detected invalid export can delay processing of the later reply.
+The premature export itself occurs before any fault-dump I/O.
+
+There is no second overlapping link in this failed allocation. The earlier
+successful allocation has the expected request → reply application → consumer
+export ordering. The first independent ring run reproduced premature export on
+another start; the selective trace additionally captures the late reply. This
+establishes the allocation-publication violation, not merely temporal proximity
+between logs from different processes. O, I and C were all in the **same TLS
+ring**, hence the same daemon thread; the array was newly allocated for that
+link, with no intervening clear/replacement. C's entry at client-node.c:1054
+precedes per-plane logs at :1095, which occur **after** copying descriptor fields
+into the output buffer at :1089. Both entry and post-copy logs are later than I.
+Protocol sequence IDs were not recorded, so these receipts do not identify
+which synchronization completion was wrong.
+
+Pinned source explains the signature:
+
+- [xdpw v0.7.1 producer allocation](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.7.1/src/screencast/pipewire_screencast.c)
+  receives a type **mask**, allocates SHM synchronously in add_buffer, then sets
+  concrete type MemFd, FD and capacity. No allocation failure was logged.
+- [PipeWire 1.0.5 client-node export/import](https://github.com/PipeWire/pipewire/blob/1.0.5/src/modules/module-client-node/client-node.c)
+  rejects unsupported non-ALLOC types and makes the consumer copy invalid.
+  Here **4 is the unconverted mask `1 << SPA_DATA_MemFd`**, not DMA-BUF type 3.
+  A later allocation reply updates the server/producer descriptors, not the
+  already-exported consumer copy.
+- [PipeWire 1.0.5 link allocation](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/impl-link.c)
+  allocates producer skeletons, waits via asynchronous synchronization, then
+  reuses that array on the input. The observed completion precedes the reply.
+  The exact synchronization defect still needs a corrective upstream patch.
+
+Successful buffers are type 2 with mapped CPU memory; negotiated consumer mask
+6 intersects xdpw mask 4 correctly. No DMA-BUF/modifier path was negotiated. The
+100-cycle resource-enabled native burst returns to **10 FDs and zero SHM/memfd
+mappings after every stop**, then to **3 FDs and zero mappings after destroy**,
+matching the pre-create baseline. The ASan matrix used library SHA-256
+`6a7d7a15d2785229a99ed615940dcc4e25ac16cf05e3676913a3359aee85ab2d`
+and probe `d9190934a6810e7fff2ecc602adbaaae6b7560bc8d70bff183239f8769bbdefb`.
+Add/remove and borrowed release precede teardown
+in successful cycles. Those early probe versions record concurrent-stop attempts,
+not proof that stop had reached its blocking boundary. Review strengthened the
+probe to require ERROR while a mapping is held **and** atomic confirmation that
+stop has not completed before release; the final validator requires that receipt
+for every positive non-broken cycle. It also pins every cell to the originally
+resolved image ID, retaining the supplied tag only as descriptive metadata. These observations argue against a consumer mapping/FD
+lifetime leak; they do not claim general concurrency correctness for all backends.
+
+### Reproduction and gates
+
+After the unchanged throwaway bundle/image build described above, compile the
+probe against the matching build. For a normal, correctly overlaid matrix:
+
+```sh
+python3 deploy/containers/reference/validate-video.py \
+  localhost/atg-video:baseline ./capture-probe ./atg-evidence \
+  --prefix atg-check --render-node /dev/dri/renderD128 --reopens 20 \
+  --library "$PWD/build-container/libmetadesk.so.0.1.0" --trace-buffers
+```
+
+For burst diagnostics, add `--skip-idle --reopens 100`. Upstream verbosity can be
+selected independently with `--pipewire-debug '2,pw.link:4,mod.client-node:4'`;
+logging can mask this race. For ASan, compile the probe with `-fsanitize=address
+-fno-omit-frame-pointer`, link the ASan build, and supply both
+`--library "$PWD/build-asan/libmetadesk.so.0.1.0"` and
+`--asan-runtime /usr/lib/aarch64-linux-gnu/libasan.so.8`. No sanitizer suppression
+or automatic matrix retry is used. Private input hashes, summaries and receipts
+are recorded in the evidence directory; raw tokens/state/logs must not be committed.
+
+Final configured gates on the instrumentation changes: macOS **25/25**; Linux
+with `client=false,wayland_input=true` **26/26**; ASan capture convenience API
+**1/1**, `detect_leaks=1:halt_on_error=1`, no sanitizer report. Probe compilation
+uses `-Wall -Wextra -Werror`. The real-backend reliability gate remains **failed**,
+not skipped, despite the unit gates passing.
+
+Jev was used for seven find-lines judgments (13 requests, 90,522 input tokens,
+$0.003803): it narrowed capture negotiation/teardown and historical-evidence reads.
+Its absent/partial validator/probe judgments were insufficient for extending the
+harness, so those short files were read directly. No judgment was treated as
+runtime proof.
+
+### Reviewed harness requalification
+
+After strengthening the held-frame check and pinning image execution, two new
+normal-idle matrices used the final library and probe builds, default upstream
+logging, opt-in buffer tracing, and **20 start/stop cycles each**:
+
+| Final scoped-delivery cell | Native | ASan |
+|---|---|---|
+| Fresh / saved-token reuse | Pass | Pass |
+| Unknown valid UUID | Pass | **Zero frames, probe 6; eight invalid descriptors** |
+| Malformed UUID / retention / cleared token | Expected reject / retained / pass | Same |
+| Repeated-start cell | **20/20 pass** | **20/20 pass** |
+| Private PipeWire loss | ERROR, authorization retained | Same |
+| Pixman / denied / stalled chooser | All expected negatives pass | Same |
+| Aggregate | **0** | **1 — allocation reliability still fails** |
+
+These final matrices validate **250 / 240 matched changing-pixel frames**
+(native / ASan), respectively, from **257 / 247 observed frames**. There are
+**24 / 23** strengthened outstanding-borrow stop receipts: ERROR observed while
+held, stop not completed, pixels intact, then release and post-stop ERROR.
+No ASan/LSan diagnostic or NULL CPU frame escape occurred. All 20-cycle resource
+receipts return to 10 FDs/zero SHM mappings after stop and 3/zero after destroy.
+Valid plane FDs resolve to unlinked `/dev/shm/xdpw-shm-*` files of 8,294,400 bytes;
+`SPA_DATA_MemFd` is the transport type, not a claim that xdpw used memfd_create.
+
+Final native library/probe SHA-256:
+`a52c50ae362930ea2950b34a5ec6038d725249d0766656ce2912cf61e7f2376c` /
+`24e2b913cf9b89fdf06b550ebc2da414ea9b0506ac18571a9e813486d2c20a72`.
+Final ASan library/probe:
+`6a7d7a15d2785229a99ed615940dcc4e25ac16cf05e3676913a3359aee85ab2d` /
+`fb41b1c4ee8c6cc8097de7f6b8a6984dc4fe5d884d2ad41d1f044ce1276d053a`.
+Image ID, inputs, summaries, causal server log, tracer source and unit-gate
+summaries are retained in the mode-0700 private macOS cache directory above;
+files are mode 0600. No restore-token/home/runtime directory is retained there.
+
+One substantive Oracle review was completed using actual-file attachments after
+stale selected-context transport omitted the diagnostic patch. Its held-frame
+and mutable-tag findings were fixed and the matrices rerun; no second substantive
+review was performed. macOS was rerun and remains 25/25; Linux remains 26/26 and
+ASan capture 1/1. C probe strict compilation, Python AST and diff checks pass.
+
+**Remaining work:** correct and qualify the backend synchronization/publication
+path. No production behavior fix is included and no after-fix success is claimed.
+A scope-expansion decision was requested before changing PipeWire/runtime
+packaging. Existing **md-atg remains unresolved**; no duplicate bead was created.
+
+### md-atg cleanup and handoff
+
+Removed the task image by its exact recorded ID (including its unreferenced build
+layers), and removed `/home/bizarro/wt-atg` with all builds, probes, tracer binaries,
+bundle and private runtime/home/token/evidence directories. CID cleanup left zero
+containers; no task volumes remain. The shared `ubuntu:24.04` base/tag was left
+untouched. Final checked VM free space is **7.4 GiB**; all checked values stayed
+above the 3 GiB stop threshold. No global prune, sibling code edit, live service
+restart, push or merge was performed. The repository's pre-commit hook exported
+shared Beads metadata to the main checkout's `.beads/issues.jsonl`; that
+project-managed export was not staged in the task commit or reverted. The local
+branch/worktree and small private macOS evidence cache are retained for review.
