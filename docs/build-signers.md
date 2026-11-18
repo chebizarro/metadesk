@@ -43,9 +43,11 @@ naming the nostrc target to build. Build missing targets with
 JSON follows the core libnostr build-tree preference, not the signer adapter
 installed-first order. Meson selects, in order:
 
-1. `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a}`, when present. The link
-   dependency includes Jansson and an rpath to that directory, so the current
-   shared library loads without `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH`.
+1. `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a}`, when present. The typed
+   library dependency includes Jansson and lets Meson manage the build rpath, so
+   the current shared library loads without `DYLD_LIBRARY_PATH` or
+   `LD_LIBRARY_PATH`. Meson removes this build-tree rpath during installation;
+   no raw rpath linker flags or install rpath are added.
 2. Installed `libnostr-json` pkg-config metadata (the current nostrc module name),
    then the `nostr-json` module alias, then the `nostr-json` library directly.
 3. On Linux, the old `nostr_json` library with a deprecation warning.
@@ -178,6 +180,40 @@ using a private symlink view of the build tree with `libjson` omitted fails with
 the intended legacy-library diagnostic; the original shared tree stays untouched.
 Installed canonical pkg-config/direct-library fallbacks were not runtime-tested
 because neither platform needed them for this matrix.
+
+### Install rpath regression gate
+
+The build-tree JSON dependency uses `cc.find_library()`, not raw library/rpath
+`link_args`. Meson therefore tracks the JSON directory as a removable build
+rpath, including when the dependency propagates to `metadesk-host` and the client.
+The default empty install rpath is preserved. This keeps the installed producer
+ELFs compatible with the [Tier A bundle contract](../deploy/containers/reference/bundle-contract.md);
+it does not replace the producer's dependency-closure or in-image checks.
+
+On Linux, stage using the bundle prefix/libdir and inspect the installed files
+**before** any producer `patchelf --remove-rpath` step:
+
+```sh
+meson setup build --prefix=/opt/metadesk --libdir=lib \
+  -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build
+meson compile -C build -j2
+meson install -C build --destdir "$PWD/build/stage"
+readelf -d build/stage/opt/metadesk/bin/metadesk-host
+readelf -d build/stage/opt/metadesk/bin/metadesk-client
+readelf -d build/stage/opt/metadesk/lib/libmetadesk.so.0.1.0
+# No installed ELF may have an RPATH or RUNPATH dynamic tag.
+```
+
+The pre-merge rpath correction revalidated default and all-signers builds and
+normal tests: macOS **25/25**, **28/28**; Linux **26/26**, **29/29**, no failures or
+skips. Both Linux configurations were installed with the prefix/libdir above.
+`readelf -d` confirmed **no RPATH/RUNPATH** on all three installed producer ELFs
+(host, client, libmetadesk), without running `patchelf`. Their build-tree host
+executables still had `$ORIGIN/:/home/bizarro/nostrc/_build/libjson` RUNPATH, and
+`ldd` on the all-signers build resolved canonical build-tree JSON. Both macOS
+configurations also staged successfully: installed host/client/libmetadesk had
+no `LC_RPATH`, while the build libraries retained the JSON lookup path. No full
+container closure or in-image test was rerun for this dependency-only correction.
 
 Nostr Protocol Review of this build/docs-only diff found no protocol-behavior
 changes: no polling, timer closes, relay frame handling, filters, or subscription

@@ -194,9 +194,13 @@ if _nostrc_build != ''
   endforeach
 endif
 if _json_build_lib != ''
+  # A typed library dependency lets Meson manage the build rpath and remove
+  # it at install time. Raw -Wl,-rpath link_args would survive installation.
   dep_nostr_json = declare_dependency(
-    dependencies : dependency('jansson'),
-    link_args : [_json_build_lib, '-Wl,-rpath,' + _nostrc_build / 'libjson'],
+    dependencies : [
+      cc.find_library('nostr-json', dirs : [_nostrc_build / 'libjson'], required : true),
+      dependency('jansson'),
+    ],
   )
   message('nostr-json: using build-tree library: ' + _json_build_lib)
 else
