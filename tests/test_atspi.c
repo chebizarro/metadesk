@@ -843,9 +843,20 @@ typedef struct { GMainLoop *loop; int fd; bool passed; } CompetingLoop;
 
 static gpointer fixture_teardown_worker(gpointer data) {
     CompetingLoop *fixture = data;
-    MdA11yCtx *ctx = md_a11y_create();
-    char result = ctx ? 'D' : 'F';
-    md_a11y_destroy(ctx);
+    GMainContext *thread_context = g_main_context_new();
+    g_main_context_push_thread_default(thread_context);
+    char result = 'D';
+    /* Exercise lifecycle against an actively dispatching owner, not just
+     * the owned backend thread. Repetition exposes a stale libatspi source
+     * racing connection teardown; a larger timeout cannot fix that race. */
+    for (int i = 0; i < 32; i++) {
+        MdA11yCtx *ctx = md_a11y_create();
+        if (!ctx || !md_a11y_is_connected(ctx)) result = 'F';
+        md_a11y_destroy(ctx);
+        if (result == 'F') break;
+    }
+    g_main_context_pop_thread_default(thread_context);
+    g_main_context_unref(thread_context);
     if (write(fixture->fd, &result, 1) != 1) _exit(2);
     return NULL;
 }
@@ -882,8 +893,33 @@ static void fixture_competing_teardown(void) {
     if (!fixture.passed) _exit(2);
 }
 
+/* No external default-context dispatcher: a private thread-default context
+ * makes invoke_full queue work even when the global context is unowned.
+ * Also release a competing owner without iterating it; the backend must
+ * provide its own dispatcher for lifecycle handoff. Parent bounds both. */
+static void fixture_context_handoff(void) {
+    int done[2];
+    if (pipe(done) != 0) _exit(2);
+    CompetingLoop fixture = { .fd = done[1] };
+    /* First exercise the entirely unowned default context on this thread. */
+    fixture_teardown_worker(&fixture);
+    char result = 0;
+    if (read(done[0], &result, 1) != 1 || result != 'D') _exit(2);
+
+    GMainContext *context = g_main_context_default();
+    if (!g_main_context_acquire(context)) _exit(2);
+    GThread *worker = g_thread_new("atspi-context-handoff", fixture_teardown_worker, &fixture);
+    g_main_context_release(context);
+    g_thread_join(worker);
+    if (read(done[0], &result, 1) != 1 || result != 'D') _exit(2);
+    close(done[0]); close(done[1]);
+}
+
 static void fixture_backend_child(int fd, bool unsubscribe) {
-    if (!unsubscribe) fixture_competing_teardown();
+    if (!unsubscribe) {
+        fixture_context_handoff();
+        fixture_competing_teardown();
+    }
     MdA11yCtx *ctx = md_a11y_create();
     if (!ctx || !md_a11y_is_connected(ctx)) _exit(2);
     if (unsubscribe && (md_a11y_subscribe_changes(ctx, fixture_change, NULL) != 0 ||
