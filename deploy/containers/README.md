@@ -1,8 +1,8 @@
-<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells; see reference/validation.md. -->
+<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME + accessibility-loss restart recovery cells; see reference/validation.md. -->
 # Tier A: attached-desktop MCP observation
 
 Local reference, not release packaging. Ubuntu 24.04/aarch64 evidence and
-**remaining pending cells**: [validation](reference/validation.md).
+qualification limits: [validation](reference/validation.md).
 No FIPS/mesh, Kubernetes, video, devices, or registry publication.
 
 ## Prepare the operator-managed desktop
@@ -17,14 +17,15 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 # Query the actual session; do not assume the common AT-SPI path exists.
 gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
   --method org.a11y.Bus.GetAddress
-export AT_SPI_BUS_ADDRESS='unix:path=<discovered-socket-path>[,guid=<guid>]'
 export AT_SPI_DIR='<directory-containing-that-socket>'
+# Mount the whole directory. Entrypoint re-queries GetAddress on every start;
+# do not pin AT_SPI_BUS_ADDRESS in the container environment.
 export SESSION_BUS_SOCKET=/run/user/1000/bus
 ```
 
 Require filesystem Unix sockets owned by the desktop user, and at least one
-registered accessible app. Abstract/TCP/proxy addresses fail preparation; no
-host-network fallback. The AT-SPI directory is mounted at its **same absolute
+registered accessible app. Abstract/TCP/proxy, address lists and percent-encoded
+paths fail preparation; no host-network fallback. The AT-SPI directory is mounted at its **same absolute
 path**, so socket replacement within it is visible. Session socket replacement
 needs **container recreation**, not just readiness polling or assumed remounts.
 
@@ -54,7 +55,7 @@ On AppArmor-enabled Ubuntu, load the explicit reference profile before starting:
 ```sh
 sudo apparmor_parser -r reference/metadesk-agent.apparmor
 # sudo normally clears variables; preserve only the required non-secret values.
-sudo --preserve-env=AT_SPI_BUS_ADDRESS,AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
+sudo --preserve-env=AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
   docker compose -f compose.agent.yaml up -d --no-build --wait --wait-timeout 45
 ```
 
@@ -73,10 +74,10 @@ exec -T agent` for a local MCP client/diagnostic, or an explicitly authorized
 same-netns client. Remote access/proxy/holder topology belongs to md-ah9.5.
 
 ```sh
-sudo --preserve-env=AT_SPI_BUS_ADDRESS,AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
+sudo --preserve-env=AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
   docker compose -f compose.agent.yaml exec -T agent \
   python3 /opt/metadesk/reference/smoke_mcp.py --http --expect 'Known app label'
-sudo --preserve-env=AT_SPI_BUS_ADDRESS,AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
+sudo --preserve-env=AT_SPI_DIR,SESSION_BUS_SOCKET,MCP_TOKEN_FILE,MD_BASE \
   docker compose -f compose.agent.yaml down --volumes
 sudo apparmor_parser -R reference/metadesk-agent.apparmor
 ```
@@ -84,8 +85,10 @@ sudo apparmor_parser -R reference/metadesk-agent.apparmor
 Keep the required environment exported for every Compose command. `/healthz`
 checks transport alongside registry readiness; probes **never GET /mcp** or
 perform MCP initialization. Docker `on-failure` supplies engine restart backoff;
-health is readiness only and does not cause restarts. Known bus-loss detection
-prevents logout recovery today (md-ah9.15). Do not test it by logging out a user.
+health is readiness only and does not cause restarts. The host exits nonzero on
+AT-SPI loss (md-ah9.15); each restart discovers the current socket via the
+mounted session bus. Live accessibility-bus restart recovery is qualified below; a full session-bus replacement still requires
+recreation. Do not test by logging out a user.
 
 ## Rootless Podman CLI
 
@@ -101,7 +104,7 @@ podman run --rm -i --userns=keep-id --read-only --read-only-tmpfs=false \
   --tmpfs /run/user/1000:rw,nosuid,nodev,noexec,mode=0700,U \
   --mount type=bind,source="$SESSION_BUS_SOCKET",target=/run/user/1000/bus,readonly \
   --mount type=bind,source="$AT_SPI_DIR",target="$AT_SPI_DIR",readonly \
-  -e AT_SPI_BUS_ADDRESS="$AT_SPI_BUS_ADDRESS" metadesk-agent:ah9-4
+  metadesk-agent:ah9-4
 ```
 
 This starts stdio (JSON-RPC lines; **no TTY**). Startup can consume up to 30 s;
@@ -122,9 +125,10 @@ prefix the above HTTP `podman run --rm` command (omit `-i`) with
 --property=RestartSec=5s --property=StartLimitIntervalSec=300s
 --property=StartLimitBurst=5`. Do not also set Podman's native restart policy.
 Stop with `systemctl --user stop metadesk-agent`; after a rate limit, inspect the
-failure and explicitly restart. Fixed backoff was exercised at 2 s in validation;
-the conservative 5 s operational setting is unvalidated. Recreate when session
-socket identity/path changes. No claim of automatic logout/relogin recovery.
+failure and explicitly restart. The 5 s setting is qualified for live
+accessibility-bus restart recovery; see the recovery matrix. Recreate when the
+session socket identity/path changes.
+A full logout/relogin (session-bus replacement) is not automatic recovery.
 
 ## Rootless Podman Compose (tested compatibility API)
 

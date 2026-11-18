@@ -1,4 +1,4 @@
-# validated on Docker 29.1.3 / Compose 2.40.3, fixture + live GNOME cells.
+# validated on Docker 29.1.3 / Compose 2.40.3, fixture + live GNOME + accessibility-loss restart recovery; see reference/validation.md.
 # Rootless Podman 4.9.3 API + Compose 2.40.3: use compose.agent.podman.yaml.
 # Docker Compose reference; see README and reference/validation.md.
 services:
@@ -19,8 +19,7 @@ services:
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,mode=1777
       - /run/user/1000:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700
-    environment:
-      AT_SPI_BUS_ADDRESS: ${AT_SPI_BUS_ADDRESS:?discover the AT-SPI address}
+    # Entrypoint discovers AT-SPI through the session bus on every restart.
     volumes:
       - type: bind
         source: ${SESSION_BUS_SOCKET:-/run/user/1000/bus}

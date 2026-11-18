@@ -1,7 +1,126 @@
-<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME cells below; other cells unvalidated. -->
+<!-- validated on Docker 29.1.3 / rootless Podman 4.9.3, fixture + live GNOME + accessibility-loss restart recovery below; other cells unvalidated. -->
 # md-ah9.4 / md-ah9.16 / md-5zi Tier A container results — 2026-11-17
 
-## Live GNOME requalification — md-ah9.16
+## Desktop accessibility-loss restart recovery — md-ah9.4
+
+This completes the last open Tier A cell on source master `323292d`, with
+**deploy-only** changes. Scope is the explicitly authorized live accessibility
+bus loss, **not logout or replacement of the session bus**. A changed session
+socket inode still requires container recreation. Earlier pending md-ah9.15
+statements below are historical and superseded by this section.
+
+### Fix and recovery matrix
+
+The entrypoint no longer requires/pins `AT_SPI_BUS_ADDRESS` from `up` time.
+On every start and preparation retry, `probe.py` calls `org.a11y.Bus.GetAddress`
+on the mounted session bus, validates both filesystem sockets and their desktop
+UID ownership, then requires registered applications. The entrypoint exports
+that validated address to the host. The entire preparation remains bounded at
+30 s; PID 1 still handles TERM. Health probes independently rediscover the bus,
+since container-exec environments do not inherit PID 1's exported address.
+Compose mounts the **whole AT-SPI directory** at its original absolute path.
+
+One controlled SIGTERM of launcher, accessibility.conf daemon and registry was
+used for the measured cell in each runtime. Docker had one additional initial
+restart: a test assertion incorrectly required the socket *basename* to change;
+it was corrected to require the full address to change. Total: **two Docker,
+one Podman**. The session bus, shell and desktop session were never terminated.
+Old calculators were terminated and relaunched on `wayland-0` to re-register.
+No sibling containers, images, build trees or live input were touched.
+
+Times start immediately before SIGTERM of those three AT-SPI processes. Host
+exit uses a Linux pidfd for container PID 1 (not the later runtime die event).
+Recovery ends at successful authenticated MCP initialize/tools/list/tree read,
+asserting Calculator window, buttons **0/7/+/=**, two display text nodes and
+absence of input/capture tools. Missing bearer still returns 401.
+
+| Recovery cell | Docker 29.1.3 / Compose 2.40.3 | Rootless Podman 4.9.3 / user systemd |
+|---|---|---|
+| Host exits nonzero after desktop loss | **PASS: 0.680 s**, exit 1 | **PASS: 0.641 s**, exit 1 |
+| Automatic restart owner / backoff | Compose `on-failure`, one engine restart; die → start **0.259 s** (engine initial 100 ms backoff plus runtime overhead) | Single systemd owner, `Restart=on-failure`, `RestartSec=5s`, burst 5/300 s; one restart; systemd failure → next start **5.093 s**, container died → start **5.266 s** |
+| GetAddress returns new bus | **0.721 s** after loss | **0.671 s** after loss |
+| New-address authenticated widget tree | **PASS: 3.324 s** after loss | **PASS: 6.626 s** after loss |
+| New full address in recovered PID 1 environment; dynamic HTTP health | PASS | PASS, even with deliberately stale `/stale/old-bus` container env |
+
+Observed socket path stayed `/run/user/1000/at-spi/bus_0`; the socket was
+replaced and GUID changed on each restart. **Live basename-change recovery is
+not claimed**: `bus` → `bus_0` discovery is covered by focused unit tests using
+real Unix sockets and mocked GetAddress replies. No path was hardcoded to make
+this cell pass. New full addresses (GUIDs):
+
+- Docker: `1290ea87c2e39c0275512adc6afd38b7` →
+  `7758dddea2d84264f38b5dec6afd38ee`.
+- Podman: `7758dddea2d84264f38b5dec6afd38ee` →
+  `7681f49ef99e5cb711fb70b56afd3911`.
+
+The Docker cell used the supplied Compose manifest (only a task-specific
+container-name override), read-only root, no caps/devices/published ports,
+explicit AppArmor profile and Docker-only IPv6 sysctl. Podman used the README's
+keep-ID/read-only CLI wrapped in transient user systemd, **not** native Podman
+restart or a claim about Compose backoff. Rootless AppArmor remains disabled.
+The updated rootless Compose compatibility-API healthy/tree cell also passed;
+its restart behaviour is not the systemd recovery result above.
+
+### Build and regression receipts
+
+Same Ubuntu 24.04 aarch64 VM/dependencies and pinned base as md-ah9.16 below.
+Bundle built with `throwaway-bundle.sh`, `-j2`, in `~/wt-ah9-4r`.
+Docker built image `sha256:5d8fc733d268e709b5e12068eb3ea7eb0890e34ccf5bbb29de44d4246bc13110`;
+save → rootless load image
+`7777acd3eaba5d76bfb4406103fd75aa9b0d2f34f8b673495fb99bc9c56fdf2d`.
+No Podman-native build claim. In-image closure check passed. After the review
+hardening (address syntax only), images were rebuilt and both live validation
+suites rerun without further bus disruption: Docker
+`sha256:2b130254b733502546a87975049b531998919d9660afbee1fc84fb023ee0a5cd`,
+rootless loaded
+`c2a051ca6725dbd06ec1ac7a212d00daf3fc082987f1ee238ee191084cfc8de5`.
+Recovery timings above belong to the first image pair, not a second disruptive
+qualification on the hardened pair.
+
+- `meson test -C build-container --print-errorlogs`: **26 OK / 0 fail / 0 skip**.
+- Python reference unit tests: **12 passed** on macOS and the VM, including
+  dynamic discovery, stale env, socket owner/type, invalid replies and empty tree.
+  Review identified address-list ambiguity: validation now rejects `;` and `%`
+  so D-Bus cannot parse a different endpoint from the literal socket checked by
+  stat. Regression uses real sockets with separator/escape characters in names.
+  The review was completed with that straightforward fix applied.
+- `validate.py docker --live` and `validate.py podman --live`: HTTP + stdio real
+  Calculator widgets, identity/session/secret/no-desktop negatives, closure,
+  no-input/capture/device/7700 checks and graceful termination passed.
+- Preparation TERM now omits only the container's AT-SPI directory mount;
+  no test alias is written into the live runtime directory. Exit 143 in
+  **0.113 s Docker / 0.101 s Podman** in the first full updated-driver run.
+
+### Final desktop and cleanup
+
+- GetAddress succeeds on `/run/user/1000/bus` and returns
+  `unix:path=/run/user/1000/at-spi/bus_0,guid=7681f49ef99e5cb711fb70b56afd3911`.
+  Launcher/daemon/registry PIDs: **700705 / 700720 / 700785**.
+- Exactly **one** calculator process and **one** registered accessible app:
+  **gnome-calculator PID 743316**. D-Bus GetConnectionUnixProcessID agrees;
+  its **Calculator** window has AT-SPI **VISIBLE** state. It was relaunched from
+  `/home/bizarro` at cleanup so it does not retain the deleted task cwd.
+  Shell/session bus stayed up; shell is still absent from the restarted registry.
+- Docker before purge: **0 images / 0 containers / 0 volumes / 0 build cache**.
+  Purged all seven newly installed packages: docker.io, docker-compose-v2,
+  containerd, runc, bridge-utils, pigz, ubuntu-fan. Installed-package additions
+  remaining **0**, baseline installed packages lost **0**. Docker binary, group,
+  data/runtime directories, bridge and task-added Docker firewall/AppArmor
+  state removed; pre-existing non-Docker firewall rules preserved.
+- Removed only the two task-loaded rootless images; task containers/networks
+  and transient systemd/API/event processes are gone. No Podman-native build
+  cache or task volumes were created. Sibling input/video images and their
+  Ubuntu base were preserved; no global Podman prune was run.
+- `~/wt-ah9-4r` (bundle, build, token, logs, helper) removed. Final available
+  root disk: **7,763,099,648 bytes (7.23 GiB)**. Lowest observed free disk was
+  **6.2 GiB**, safely above the 3 GiB stop floor; concurrent sibling disk usage
+  explains why the final value is lower than the initial 9.1 GiB.
+- No new beads. md-ah9.4 is complete for the authorized accessibility-loss
+  cell; full session-bus replacement, native Podman Compose backoff and hosted
+  CI remain outside this qualification, not implied passes. Local commit only;
+  no push or merge.
+
+## Live GNOME requalification — md-ah9.16 (historical)
 
 This section supersedes **only the missing-socket live row** in the historical
 fixture matrix below. Evidence is local Ubuntu 24.04 aarch64 VM execution, not
@@ -68,7 +187,7 @@ widgets, including additional buttons `mod`, `÷`, `×`, `Undo`, and `Main Menu`
 | Compose healthy → authenticated widget tree → stop exit 0, <5 s | PASS, **1.00 s** | PASS, **1.08 s**, compatibility API + override |
 | Wrong identity / missing session socket / missing secret / direct no-desktop host | PASS, nonzero diagnostics | PASS, nonzero diagnostics |
 | DT_NEEDED closure | PASS, 144 resolved entries | PASS, 144 resolved entries |
-| Desktop logout → recovery | **pending md-ah9.15, not attempted** | **pending md-ah9.15, not attempted** |
+| Desktop accessibility loss → recovery | **PASS; see md-ah9.4 recovery matrix above** | **PASS; see md-ah9.4 recovery matrix above** |
 
 Docker's namespace IPv6-disabled sysctl was also checked. Its listener appears
 in `/proc/net/tcp6` as **IPv4-mapped 127.0.0.1**, not a wildcard/IPv6 bind; actual
@@ -208,7 +327,7 @@ incorporating these named cells into the wider md-5zi matrix.
 | SIGTERM HTTP PID 1 / stdio host / preparation PID 1 (<5 s) | PASS: 1.020 / 0.114 / 0.105 s | PASS: 1.080 / 0.118 / 0.088 s |
 | Restart policy/backoff after startup failure (not logout recovery) | PASS, native increasing backoff | PASS, user systemd fixed 2 s + rate limit |
 | Actual advertised GNOME registry tree | BLOCKED: missing socket | BLOCKED: missing socket |
-| Desktop logout → exit → restart → recovery | **pending md-ah9.15** | **pending md-ah9.15** |
+| Desktop accessibility loss → exit → restart → recovery | **PASS; see recovery matrix above** | **PASS; see recovery matrix above** |
 | Docker Compose HTTP/secret/readiness/shutdown | PASS, healthy; exit 0 in 0.925 s | Podman Compose unvalidated; explicit CLI used |
 | DT_NEEDED in runtime image | PASS, 144 resolved entries | PASS, 144 resolved entries |
 
@@ -343,6 +462,7 @@ Cleanup verified on the VM:
 
 At fixture qualification time, **md-ah9.16** tracked live GNOME requalification
 after operator socket restoration. That live row is now superseded by the
-md-ah9.16 results above. Backend logout/recovery remains **md-ah9.15**. No new
+md-ah9.16 results above. Accessibility-loss recovery is now qualified by
+**md-ah9.4** above; actual session-bus replacement requires recreation. No new
 product-code defect bead was needed. Changes are for local review only:
 **no push or merge**.

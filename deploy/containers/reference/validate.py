@@ -38,8 +38,7 @@ if args.runtime == "podman":
 else:
     common += ["/run/user/1000:rw,nosuid,nodev,noexec,mode=0700,uid=1000,gid=1000", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1", "--security-opt", "apparmor=metadesk-agent-ah9-4"]
 buses = ["--mount", f"type=bind,source={session_path},target=/run/user/1000/bus,readonly",
-         "--mount", f"type=bind,source={atspi_dir},target={atspi_dir},readonly",
-         "-e", "AT_SPI_BUS_ADDRESS=" + atspi]
+         "--mount", f"type=bind,source={atspi_dir},target={atspi_dir},readonly"]
 secret = ["--mount", f"type=bind,source={root / 'mcp-token'},target=/run/secrets/mcp-token,readonly"]
 host = ["/opt/metadesk/bin/metadesk-host", "--mcp-http", "7710", "--mcp-http-bind", "127.0.0.1", "--no-input", "--mcp-token-file", "/run/secrets/mcp-token"]
 names = []
@@ -111,7 +110,7 @@ try:
     live_guard()
     for label, options, command, expected, message in [
         ("wrong identity", common + buses + ["--user", "1001:1001"], host, 1, "wrong desktop identity"),
-        ("missing bus socket", common + ["-e", "AT_SPI_BUS_ADDRESS=" + atspi], ["/opt/metadesk/bin/metadesk-host", "--mcp", "--no-input"], 1, "missing session bus socket"),
+        ("missing bus socket", common, ["/opt/metadesk/bin/metadesk-host", "--mcp", "--no-input"], 1, "missing session bus socket"),
         ("missing secret", common + buses, host, 1, "missing /run/secrets/mcp-token"),
         ("no desktop direct host", [], ["/opt/metadesk/bin/metadesk-host", "--mcp", "--no-input"], 1, "accessibility backend unavailable"),
     ]:
@@ -178,23 +177,19 @@ print('only TCP listener=7710; 7700 absent; zero caps; no devices/PipeWire socke
     live_guard()
     print(run(["run", "--rm", "-i", *common, *buses, "--entrypoint", "python3", image,
                *smoke[1:], "--", "/opt/metadesk/entrypoint.sh", "/opt/metadesk/bin/metadesk-host", "--mcp", "--no-input"]))
-    if not args.live:
-        waiting = name + "-wait"
-        names.append(waiting)
-        alias = Path(atspi_dir) / "wait-socket"
-        alias.symlink_to(Path(atspi.split("=", 1)[1].split(",")[0]).name)
-        try:
-            run(["run", "-d", "--name", waiting, *common, *buses, "-e", "AT_SPI_BUS_ADDRESS=unix:path=" + str(alias), image])
-            event(waiting, "discovered AT-SPI socket differs")
-            start = time.monotonic()
-            run(["kill", "--signal", "TERM", waiting])
-            code = run(["wait", waiting], timeout=5)
-            elapsed = time.monotonic() - start
-            assert code == "143" and elapsed < 5, (code, elapsed)
-            print(f"preparation PID1 SIGTERM: exit={code} elapsed={elapsed:.3f}s")
-        finally:
-            alias.unlink()
-    print("logout/restart recovery: PENDING md-ah9.15; no user desktop disruption")
+    waiting = name + "-wait"
+    names.append(waiting)
+    # Session discovery succeeds, but its AT-SPI directory is not mounted.
+    # Exercise PID 1 during preparation without mutating a desktop socket.
+    run(["run", "-d", "--name", waiting, *common, *buses[:2], image])
+    event(waiting, "No such file or directory")
+    start = time.monotonic()
+    run(["kill", "--signal", "TERM", waiting])
+    code = run(["wait", waiting], timeout=5)
+    elapsed = time.monotonic() - start
+    assert code == "143" and elapsed < 5, (code, elapsed)
+    print(f"preparation PID1 SIGTERM: exit={code} elapsed={elapsed:.3f}s")
+    print("desktop-loss recovery: separate operator-authorized cell; see validation.md")
 finally:
     for name in names:
         subprocess.run(rt + ["rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
