@@ -863,6 +863,11 @@ test('signer abstraction', test_signer)
 test_host_binding = executable('test_host_binding',
   files('tests/test_host_binding.c'), dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
+if host_os == 'linux' or host_os == 'darwin'
+  test('capability grants private relay', accounts_python,
+    args : [files('tests/test_capability_grants.py'), test_host_binding, access_signer_fixture],
+    timeout : 180, is_parallel : false)
+endif
 
 test_session = executable('test_session',
   files('tests/test_session.c'),

@@ -255,8 +255,85 @@ static void test_expiry_and_strict_json(void) {
     MD_CHECK(md_session_consume_binding(&s, (uint8_t *)proof, len, 1) < 0);
     free(trailing); free(proof);
 }
-int main(void) {
+/* Real private-relay policy -> negotiated token -> production stream gates.
+ * Desktop boundaries above are instrumented; no GUI backend is started. */
+static void test_relay_grant(const char *url, uint32_t expected) {
+    const char *urls[] = {url};
+    MdNostrConfig cfg = {
+        .sk_hex = "0000000000000000000000000000000000000000000000000000000000000001",
+        .relay_urls = urls, .relay_count = 1,
+    };
+    const char *client = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    MdNostr *n = md_nostr_create(&cfg, NULL);
+    MD_CHECK(n);
+    MdAllowlistEntry *entries = NULL;
+    size_t count = 0;
+    MD_CHECK(md_nostr_allowlist_snapshot(n, &entries, &count) == 0);
+    free(entries);
+    uint32_t granted = md_nostr_granted_capabilities(n, client, UINT32_MAX);
+    MD_CHECK(granted == expected);
+    MD_CHECK(md_nostr_granted_capabilities(n, client, MD_CAP_INPUT) ==
+             (expected & MD_CAP_INPUT));
+    MD_CHECK(md_nostr_granted_capabilities(n, client, 0) == 0);
+    MdSession negotiation; md_session_init(&negotiation);
+    HostCtx request = context(&negotiation);
+    snprintf(request.pending_client_pk, sizeof(request.pending_client_pk), "%s", client);
+    request.pending_req.capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT;
+    request.pending_req.tree_format = MD_TREE_FORMAT_COMPACT;
+    MD_CHECK(host_accept_request(&request, n, "negotiated-id", false) == (expected ? 0 : -1));
+    MD_CHECK(negotiation.state == (expected ? MD_SESSION_NEGOTIATING : MD_SESSION_IDLE));
+    MD_CHECK(negotiation.capabilities == expected && !negotiation.stream_token[0]);
+    for (unsigned action = 0; granted == MD_CAP_VIDEO && action < 2; action++) {
+        MdSession s; md_session_init(&s);
+        HostCtx ctx = request; ctx.session = &s;
+        MD_CHECK(host_accept_request(&ctx, n, "negotiated-id", false) == 0);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        MdSessionAccept acc;
+        MD_CHECK(md_session_prepare_binding(&s, &acc,
+            (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000) == 0);
+        Pair p = pair(); send_proof(p, &acc);
+        MD_CHECK(host_bind_candidate(&ctx, p.host) == 0);
+        ack(p, MD_CAP_VIDEO); ctx.client = p.host;
+        unsigned trees = tree_calls; host_send_initial_tree(&ctx);
+        MD_CHECK(tree_calls == trees);
+        uint8_t input[MD_INPUT_EVENT_HDR_LEN];
+        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 1, 2, NULL, 0));
+        MdPacketHeader hdr = { .type = action ? MD_PKT_ACTION : MD_PKT_INPUT,
+                               .payload_len = sizeof(input) };
+        unsigned moves = input_calls, actions = action_calls;
+        handle_client_packet(&ctx, &hdr, input);
+        MD_CHECK(input_calls == moves && action_calls == actions);
+        closed(p); destroy_pair(p);
+    }
+    if (granted == MD_CAP_VIDEO) {
+        /* An acknowledged live edit on this same bridge must affect the next
+         * production acceptance, without minting a reservation. */
+        MD_CHECK(md_nostr_allowlist_add(n, client, "none") == 0);
+        md_session_init(&negotiation);
+        MD_CHECK(host_accept_request(&request, n, "next-session", false) < 0);
+        MD_CHECK(negotiation.state == MD_SESSION_IDLE && !negotiation.stream_token[0]);
+    } else if (!granted) {
+        /* Editing another principal must not turn malformed/truncated scope
+         * records into valid grants, either locally or after a fresh REQ. */
+        MD_CHECK(md_nostr_allowlist_add(n,
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798", "video") == 0);
+        MD_CHECK(md_nostr_granted_capabilities(n, client, UINT32_MAX) == 0);
+        md_nostr_destroy(n);
+        n = md_nostr_create(&cfg, NULL); MD_CHECK(n);
+        MD_CHECK(md_nostr_allowlist_snapshot(n, &entries, &count) == 0);
+        free(entries);
+        md_session_init(&negotiation);
+        MD_CHECK(host_accept_request(&request, n, "reloaded-session", false) < 0);
+        MD_CHECK(negotiation.state == MD_SESSION_IDLE && !negotiation.stream_token[0]);
+    }
+    md_nostr_destroy(n);
+}
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 4 && !strcmp(argv[1], "--grant-fixture")) {
+        test_relay_grant(argv[2], (uint32_t)strtoul(argv[3], NULL, 10));
+        return md_test_report();
+    }
     test_candidate_and_second_client(); test_unbound_dispatch(); test_bad_proofs();
     test_denied_capabilities(); test_late_publication(); test_expiry_and_strict_json();
     return md_test_report();

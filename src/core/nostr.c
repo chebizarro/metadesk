@@ -39,6 +39,8 @@ static NostrEvent *sign_event_via_signer(MdSigner *signer, NostrEvent *ev);
 static NostrEvent *sign_event_cancellable(MdSigner *signer, NostrEvent *ev,
                                           const MdSignerCancel *cancel);
 static int publish_signed_json(MdNostr *n, const char *json);
+static bool list_append_copy(NostrList *list, const char *tag,
+                             const char *value, const char *extra);
 
 /* Helper: parse JSON into a new NostrEvent (replaces old nostr_event_from_json) */
 static NostrEvent *event_from_json(const char *json) {
@@ -343,7 +345,8 @@ static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
     free(current);
     pthread_mutex_lock(&n->work_mu);
     fresh = fresh && !n->closing && generation == rs->auth_generation;
-    if (fresh && wire) snprintf(rs->auth_id, sizeof(rs->auth_id), "%s", nostr_event_get_id(signed_ev));
+    if (fresh && wire)
+        fresh = nostr_event_compute_id(signed_ev, rs->auth_id) == NOSTR_EVENT_VALIDATION_OK;
     pthread_mutex_unlock(&n->work_mu);
     if (fresh && wire) {
         GoChannel *done = nostr_relay_write(relay, wire);
@@ -688,6 +691,21 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
         }
 
         NostrList *list = nostr_nip51_parse_list(ev, NULL);
+        /* NIP-51's generic parser ignores application tags. Retain grant
+         * records separately from p's opaque relay-hint field. A malformed
+         * arity remains invalid even after an unrelated edit republishes it. */
+        NostrTags *tags = nostr_event_get_tags(ev);
+        for (size_t i = 0; list && tags && i < nostr_tags_size(tags); i++) {
+            NostrTag *tag = nostr_tags_get(tags, i);
+            const char *name = tag ? nostr_tag_get(tag, 0) : NULL;
+            if (!name || strcmp(name, "metadesk-caps")) continue;
+            const char *pk = nostr_tag_get(tag, 1);
+            const char *grant = nostr_tag_size(tag) == 3 ? nostr_tag_get(tag, 2) : "";
+            if (!list_append_copy(list, name, pk ? pk : "", grant ? grant : "")) {
+                nostr_nip51_list_free(list);
+                list = NULL;
+            }
+        }
         if (list && list->identifier &&
             strcmp(list->identifier, "metadesk-allowlist") == 0) {
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_PROCESSING);
@@ -1199,6 +1217,54 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 
 /* ── Access control (NIP-51 allowlists) ─────────────────────── */
 
+/* Exact canonical spellings make unknown/duplicate/out-of-order tokens fail
+ * closed; the wire version is deliberately outside the CLI vocabulary. */
+static const char *const cap_names[] = {
+    "none", "video", "agent", "video,agent", "input", "video,input",
+    "agent,input", "video,agent,input"
+};
+
+int md_nostr_parse_caps(const char *text, uint32_t *out) {
+    if (!out) return -1;
+    *out = 0;
+    if (text) for (uint32_t i = 0; i < sizeof(cap_names) / sizeof(cap_names[0]); i++) {
+        if (!strcmp(text, cap_names[i])) { *out = i; return 0; }
+    }
+    return -1;
+}
+
+/* Caller holds allowlist_mu. Membership and scope are read atomically from
+ * the same winning event. Never infer policy from a p tag's extra field. */
+static uint32_t entry_grant(const NostrList *list, const char *pk) {
+    if (!pk || strlen(pk) != 64 || strspn(pk, "0123456789abcdef") != 64) return 0;
+    unsigned members = 0, grants = 0;
+    uint32_t caps = 0;
+    if (list && pk) for (size_t i = 0; i < list->count; i++) {
+        NostrListEntry *e = list->entries[i];
+        if (!e || !e->tag_name || !e->value || strcmp(e->value, pk)) continue;
+        if (!strcmp(e->tag_name, "p")) members++;
+        if (!strcmp(e->tag_name, "metadesk-caps")) {
+            grants++;
+            if (!e->extra || strncmp(e->extra, "v1:", 3) ||
+                md_nostr_parse_caps(e->extra + 3, &caps)) return 0;
+        }
+    }
+    return members == 1 && grants == 1 ? caps : 0;
+}
+
+uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pk, uint32_t requested) {
+    if (!pk || strlen(pk) != 64 || strspn(pk, "0123456789abcdef") != 64 ||
+        !owns_host(n) || !operation_begin(n)) return 0;
+    pthread_mutex_lock(&n->allowlist_mu);
+    uint32_t grant = n->acl_state == MD_NOSTR_ACL_OPEN
+        ? MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT
+        : n->acl_state == MD_NOSTR_ACL_LOADED ? entry_grant(n->allowlist, pk) : 0;
+    pthread_mutex_unlock(&n->allowlist_mu);
+    if (is_stopped(n)) grant = 0;
+    operation_end(n);
+    return requested & grant;
+}
+
 
 static bool is_allowed(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex)
@@ -1252,7 +1318,8 @@ static NostrEvent *build_allowlist_event(const MdNostr *n, const NostrList *list
 
     /* Serialize allowlist entries as NIP-51 tags:
      *   ["d", "metadesk-allowlist"]  — addressable d-tag
-     *   ["p", "<pubkey>", "<caps>"]  — one per allowlist entry */
+     *   ["p", "<pubkey>"] — membership (extra is only a relay hint)
+     *   ["metadesk-caps", "<pubkey>", "v1:video,agent,input"] — policy */
     NostrTags *tags = nostr_tags_new(0);
     if (!tags) { nostr_event_free(list_event); return NULL; }
 
@@ -1300,6 +1367,10 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     if (!n || !n->signer || !pk || strlen(pk) != 64 ||
         strspn(pk, "0123456789abcdef") != 64) return -1;
 
+    uint32_t parsed = MD_CAP_VIDEO;
+    if (add && caps && md_nostr_parse_caps(caps, &parsed)) return -1;
+    char wire[64];
+    snprintf(wire, sizeof(wire), "v1:%s", cap_names[parsed]);
     int ret = -1;
     NostrList *candidate = NULL;
     NostrEvent *ev = NULL, *signed_ev = NULL;
@@ -1313,13 +1384,20 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
         pthread_mutex_unlock(&n->allowlist_mu);
         return -1;
     }
-    bool found = false;
+    unsigned members = 0, scopes = 0;
+    bool same = false;
     if (n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
         NostrListEntry *e = n->allowlist->entries[i];
-        if (e && e->tag_name && e->value && !strcmp(e->tag_name, "p") &&
-            !strcmp(e->value, pk)) found = true;
+        if (!e || !e->tag_name || !e->value || strcmp(e->value, pk)) continue;
+        if (!strcmp(e->tag_name, "p")) members++;
+        if (!strcmp(e->tag_name, "metadesk-caps")) {
+            scopes++;
+            same = e->extra && !strcmp(e->extra, wire);
+        }
     }
-    if (found == add) { /* Membership operations are idempotent. */
+    if ((!add && !members && !scopes) || (add && members &&
+        (!caps || (members == 1 && scopes == 1 && same)))) {
+        /* Omitted caps preserves existing policy; explicit caps is an upsert. */
         pthread_mutex_unlock(&n->allowlist_mu);
         return 0;
     }
@@ -1332,12 +1410,14 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     if (built && n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
         NostrListEntry *e = n->allowlist->entries[i];
         if (!e || !e->tag_name || !e->value) continue;
-        if (!add && !strcmp(e->tag_name, "p") && !strcmp(e->value, pk)) continue;
+        if ((!strcmp(e->tag_name, "p") || !strcmp(e->tag_name, "metadesk-caps")) &&
+            !strcmp(e->value, pk)) continue;
         if (!list_append_copy(candidate, e->tag_name, e->value, e->extra)) {
             built = false; break;
         }
     }
-    if (built && add) built = list_append_copy(candidate, "p", pk, caps);
+    if (built && add) built = list_append_copy(candidate, "p", pk, NULL) &&
+                             list_append_copy(candidate, "metadesk-caps", pk, wire);
     uint64_t version = n->acl_version;
     int64_t created = (int64_t)time(NULL);
     /* Successive local edits within a second must actually replace the base,
@@ -1353,8 +1433,8 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
 
     signed_ev = sign_event_cancellable(n->signer, ev, n->signer_cancel);
     nostr_event_free(ev);
-    if (signed_ev) {
-        const char *id = nostr_event_get_id(signed_ev);
+    char id[65];
+    if (signed_ev && nostr_event_compute_id(signed_ev, id) == NOSTR_EVENT_VALIDATION_OK) {
         pthread_mutex_lock(&n->allowlist_mu);
         bool current = version == n->acl_version && n->acl_state == MD_NOSTR_ACL_LOADED;
         size_t slot = n->acl_unconfirmed_count;
@@ -1380,8 +1460,8 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
             } else ret = -1;
             pthread_mutex_unlock(&n->allowlist_mu);
         }
-        nostr_event_free(signed_ev);
     }
+    nostr_event_free(signed_ev);
     nostr_nip51_list_free(candidate);
     pthread_mutex_lock(&n->allowlist_mu);
     n->acl_editing = false;
@@ -1399,7 +1479,11 @@ static int allowlist_remove(MdNostr *n, const char *pk) {
 static int allowlist_count(const MdNostr *n) {
     if (!n) return 0;
     pthread_mutex_lock((pthread_mutex_t *)&n->allowlist_mu);
-    int count = n->allowlist ? (int)n->allowlist->count : 0;
+    int count = 0;
+    if (n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *e = n->allowlist->entries[i];
+        if (e && e->tag_name && !strcmp(e->tag_name, "p")) count++;
+    }
     pthread_mutex_unlock((pthread_mutex_t *)&n->allowlist_mu);
     return count;
 }
@@ -1411,16 +1495,18 @@ static int allowlist_get_entry(const MdNostr *n, int index,
 
     pthread_mutex_lock((pthread_mutex_t *)&n->allowlist_mu);
     int ret = -1;
-    if (n->allowlist && (size_t)index < n->allowlist->count) {
-        NostrListEntry *entry = n->allowlist->entries[index];
-        if (entry) {
+    if (n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *entry = n->allowlist->entries[i];
+        if (!entry || !entry->tag_name || strcmp(entry->tag_name, "p")) continue;
+        if (index-- == 0) {
             /* Copy into caller storage — interior pointers into the list
              * would dangle as soon as a refresh replaces it. */
             snprintf(out->pubkey_hex, sizeof(out->pubkey_hex), "%s",
                      entry->value ? entry->value : "");
             snprintf(out->caps, sizeof(out->caps), "%s",
-                     entry->extra ? entry->extra : "");
+                     cap_names[entry_grant(n->allowlist, entry->value)]);
             ret = 0;
+            break;
         }
     }
     pthread_mutex_unlock((pthread_mutex_t *)&n->allowlist_mu);
@@ -1446,7 +1532,8 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
                 NostrListEntry *e = n->allowlist->entries[i];
                 if (!e || !e->tag_name || strcmp(e->tag_name, "p") || !e->value) continue;
                 snprintf(copy[used].pubkey_hex, sizeof(copy[used].pubkey_hex), "%s", e->value);
-                snprintf(copy[used].caps, sizeof(copy[used].caps), "%s", e->extra ? e->extra : "");
+                snprintf(copy[used].caps, sizeof(copy[used].caps), "%s",
+                         cap_names[entry_grant(n->allowlist, e->value)]);
                 ++used;
             }
             ret = 0;

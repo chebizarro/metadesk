@@ -115,8 +115,8 @@ def control(servers, command):
             assert s.auths == command["count"]
         elif op == "mode":
             s.mode = command["value"]
-        elif op == "published":
-            s.wait(lambda: s.publishes >= command["count"])
+        elif op == "held":
+            s.wait(lambda: bool(s.held))
         elif op == "echo":
             assert s.held
             s.emit("EVENT", s.held[-1][1])

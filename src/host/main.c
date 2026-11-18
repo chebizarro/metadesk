@@ -632,6 +632,19 @@ cleanup:
 
 /* ── Main ────────────────────────────────────────────────────── */
 
+/* Acceptance is the policy boundary, not the earlier membership prefilter.
+ * Read the latest winning grant immediately before recording negotiation. */
+static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
+                               const char *session_id, bool no_input) {
+    uint32_t granted = md_nostr_granted_capabilities(nostr,
+        ctx->pending_client_pk, ctx->pending_req.capabilities);
+    if (no_input) granted &= ~MD_CAP_INPUT;
+    if (!granted) return -1;
+    if (md_session_request(ctx->session, ctx->pending_client_pk,
+            ctx->pending_req.capabilities, ctx->pending_req.tree_format)) return -1;
+    return md_session_accept(ctx->session, session_id, granted);
+}
+
 int main(int argc, char **argv) {
     /* Isolated metadata CLI: no capture, session, or Nostr startup. */
     if (argc > 1 && strcmp(argv[1], "account") == 0) {
@@ -1047,17 +1060,12 @@ int main(int argc, char **argv) {
                              rnd[10],rnd[11],rnd[12],rnd[13],rnd[14],rnd[15]);
                 }
 
-                /* Determine granted capabilities */
-                uint32_t granted = ctx.pending_req.capabilities &
-                                   (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
-
-                if (no_input) granted &= ~MD_CAP_INPUT;
-                /* Record the negotiated grant now. Reserve/publish its token
-                 * only after the listener and desktop backends are ready. */
-                md_session_request(&session, ctx.pending_client_pk,
-                                   ctx.pending_req.capabilities,
-                                   ctx.pending_req.tree_format);
-                md_session_accept(&session, session_id, granted);
+                /* Record the current per-client grant now; reserve/publish
+                 * its token only after listener/backends are ready. */
+                if (host_accept_request(&ctx, nostr, session_id, no_input)) {
+                    fprintf(stderr, "ERROR: current client policy grants no requested capabilities\n");
+                    goto signaling_failed;
+                }
 
             } else if (g_running) {
                 if (fips_npub || account.binding) {
