@@ -41,11 +41,16 @@ typedef struct {
     int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;
                                   * positive: bound per-client buffering,
                                   * 0: leave the kernel default unchanged */
+    bool          ephemeral_port; /* test/diagnostic: bind :0, ignoring port;
+                                   * false preserves port/default semantics */
 } MdMcpHttpConfig;
 
-/* Create an HTTP+SSE transport.
- * Does NOT start listening — call md_mcp_http_run(). */
+/* Create an HTTP+SSE transport and bind/listen on its socket.
+ * Call md_mcp_http_run() to accept and dispatch connections. */
 MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config);
+
+/* Bound port, including the kernel-selected ephemeral port; 0 for NULL. */
+uint16_t md_mcp_http_port(const MdMcpHttp *http);
 
 /* Run the HTTP server (blocking).
  * Returns 0 on clean shutdown, -1 on error. */
