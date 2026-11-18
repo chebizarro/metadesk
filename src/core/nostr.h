@@ -55,6 +55,13 @@ extern "C" {
  */
 typedef struct MdNostr MdNostr;
 
+typedef enum {
+    MD_NOSTR_ACL_UNKNOWN = 0, /* history pending: deny */
+    MD_NOSTR_ACL_LOADED,      /* history complete; empty means deny all */
+    MD_NOSTR_ACL_FAILED,      /* no usable history: deny */
+    MD_NOSTR_ACL_OPEN,        /* explicitly selected by configuration */
+} MdNostrAclState;
+
 /* Configuration for the Nostr bridge.
  *
  * Authentication: provide EITHER signer OR sk_hex (not both).
@@ -73,6 +80,7 @@ typedef struct {
     /* Optional checked owner. Retained until destroy; signer must be NULL or
      * the binding's signer. Revocation stops this bridge, never the signer. */
     MdAccountBinding *owner;
+    bool allowlist_open; /* explicit opt-out of ACL enforcement; default false */
 } MdNostrConfig;
 
 /* ── Event callbacks ──────────────────────────────────────────
@@ -179,7 +187,9 @@ void md_nostr_drain_dm(MdNostr *n);
  * the production default. ADMITTED may block to hold an in-flight reader. */
 typedef enum {
     MD_NOSTR_TEST_ADMITTED, MD_NOSTR_TEST_SERIALIZING, MD_NOSTR_TEST_DRAINING,
-    MD_NOSTR_TEST_ALLOWLIST_RECEIVED
+    MD_NOSTR_TEST_ALLOWLIST_RECEIVED, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY,
+    MD_NOSTR_TEST_ALLOWLIST_SIGNED, MD_NOSTR_TEST_AUTH_RESULT,
+    MD_NOSTR_TEST_ALLOWLIST_PROCESSING
 } MdNostrTestPoint;
 void md_nostr_set_test_hook(MdNostr *n,
     void (*hook)(MdNostrTestPoint, void *), void *userdata);
@@ -208,18 +218,23 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 /* Check if pubkey_hex is on the cached allowlist. */
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
 
-/* Check if an allowlist has been loaded (with at least one entry).
- * md_nostr_refresh_allowlist() subscribes asynchronously; before the first
- * matching relay event arrives this returns false and the host remains in the
- * documented startup open window. A warning is logged if checked then.
- * When false after refresh, the host has no access control configured (open mode).
- * When true, only clients on the list should be accepted. */
+/* History readiness is independent of membership. UNKNOWN/FAILED deny, and
+ * LOADED with zero entries denies all. OPEN is only selected by config.
+ * Always enforce md_nostr_is_allowed(), never gate it on has_allowlist(). */
+MdNostrAclState md_nostr_allowlist_state(MdNostr *n);
+
+/* True when history has loaded (including an empty list); not an auth check. */
 bool md_nostr_has_allowlist(const MdNostr *n);
 
 /* Subscribe to allowlist updates from relays (limit:1 for latest). */
 int md_nostr_refresh_allowlist(MdNostr *n);
 
-/* Add pubkey_hex to allowlist with capabilities, publish updated list. */
+/* Stage an idempotent membership edit, sign and wait for at least one OK=true,
+ * then commit only if the base ACL version is unchanged. Pending history waits
+ * for EOSE/failure or stop/revocation. Returns -1 on failed history, signer/
+ * publish failure, a busy edit, or concurrent replacement.
+ * A conflict can already have reached a relay; refresh/reconcile before retry.
+ * Duplicate add is a no-op (does not change existing capabilities). */
 int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps);
 
 /* Remove pubkey_hex from allowlist, publish updated list. */

@@ -52,6 +52,21 @@ static NostrEvent *event_from_json(const char *json) {
     return ev;
 }
 
+typedef struct {
+    MdNostr *bridge;
+    size_t index;
+    bool history_done, history_ok; /* allowlist_mu */
+    NostrRelayConnectionState connection_state;
+    char *challenge;              /* work_mu, one queued challenge per relay */
+    uint64_t auth_generation;
+    char auth_id[65];
+} MdRelayState;
+
+/* Failed/conflicting local publications must not become grants via an echo.
+ * Bound retained unconfirmed ids; refuse further edits rather than evict a
+ * guard. Successful edits release their slot. */
+#define MD_ACL_UNCONFIRMED_MAX 256
+
 struct MdNostr {
     MdAccountBinding  *owner;
     MdAccountWatch    *owner_watch;
@@ -60,9 +75,15 @@ struct MdNostr {
     char              *pk_hex;       /* our public key, hex                 */
     NostrSimplePool   *pool;         /* nostrc relay pool — persistent conns */
     NostrList         *allowlist;    /* cached NIP-51 allowlist             */
-    pthread_mutex_t    allowlist_mu; /* guards allowlist + refresh flags    */
-    bool               allowlist_refresh_requested;
-    bool               allowlist_refresh_loaded;
+    pthread_mutex_t    allowlist_mu;
+    pthread_cond_t     allowlist_cv;
+    MdNostrAclState    acl_state;
+    bool               acl_open, acl_editing;
+    uint64_t           acl_version;
+    int64_t            acl_created_at;
+    char               acl_id[65];
+    char               acl_unconfirmed[MD_ACL_UNCONFIRMED_MAX][65];
+    size_t             acl_unconfirmed_count;
     MdNostrCallbacks   cbs;          /* event callbacks                     */
 
     /* Cached relay snapshot — avoids direct access to pool struct internals.
@@ -70,6 +91,9 @@ struct MdNostr {
      * Replace with nostrc accessor APIs when available. */
     NostrRelay       **relays;       /* borrowed relay pointers (not owned) */
     size_t             relay_count;
+    MdRelayState      *relay_states;
+    pthread_t          auth_thread;
+    bool               auth_started;
     char             **relay_urls;   /* owned copies of URL strings         */
 
     pthread_mutex_t    work_mu;
@@ -91,12 +115,18 @@ struct MdNostr {
 void md_nostr_set_test_hook(MdNostr *n,
     void (*hook)(MdNostrTestPoint, void *), void *userdata) {
     if (!n) return;
+    pthread_mutex_lock(&n->work_mu);
     n->test_hook = hook;
     n->test_userdata = userdata;
+    pthread_mutex_unlock(&n->work_mu);
 }
 
 static void test_point(MdNostr *n, MdNostrTestPoint point) {
-    if (n->test_hook) n->test_hook(point, n->test_userdata);
+    pthread_mutex_lock(&n->work_mu);
+    void (*hook)(MdNostrTestPoint, void *) = n->test_hook;
+    void *userdata = n->test_userdata;
+    pthread_mutex_unlock(&n->work_mu);
+    if (hook) hook(point, userdata);
 }
 
 static bool operation_begin(MdNostr *n) {
@@ -195,18 +225,73 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
     return 0;
 }
 
+/* Recompute readiness only at protocol/connection boundaries. A relay that
+ * fails is terminal but supplies no trustworthy empty history. At least one
+ * successful EOSE and no pending relays are required to authorize. */
+static void update_acl_readiness(MdNostr *n) {
+    if (n->acl_open) { n->acl_state = MD_NOSTR_ACL_OPEN; return; }
+    bool pending = false, ok = false;
+    for (size_t i = 0; i < n->relay_count; i++) {
+        pending |= !n->relay_states[i].history_done;
+        ok |= n->relay_states[i].history_ok;
+    }
+    n->acl_state = pending ? MD_NOSTR_ACL_UNKNOWN :
+        ok ? MD_NOSTR_ACL_LOADED : MD_NOSTR_ACL_FAILED;
+    pthread_cond_broadcast(&n->allowlist_cv);
+}
+
+static void md_nostr_subscription_handler(NostrRelay *relay, const char *state,
+                                         const char *reason, void *data) {
+    MdNostr *n = data;
+    if (is_stopped(n)) return;
+    pthread_mutex_lock(&n->allowlist_mu);
+    for (size_t i = 0; i < n->relay_count; i++) if (n->relays[i] == relay) {
+        n->relay_states[i].history_done = true;
+        n->relay_states[i].history_ok = !strcmp(state, "EOSE");
+    }
+    update_acl_readiness(n);
+    pthread_mutex_unlock(&n->allowlist_mu);
+    if (!strcmp(state, "CLOSED"))
+        MD_LOG_W("subscription CLOSED on %s: %s", nostr_relay_get_url_const(relay),
+                 reason ? reason : "(no reason)");
+    test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
+}
+
+static void md_nostr_relay_state_handler(NostrRelay *relay,
+    NostrRelayConnectionState old_state, NostrRelayConnectionState state, void *data) {
+    (void)old_state; (void)state;
+    MdRelayState *rs = data;
+    MdNostr *n = rs->bridge;
+    if (is_stopped(n)) return;
+    pthread_mutex_lock(&n->allowlist_mu);
+    /* Read the current state, not a possibly superseded notification. */
+    NostrRelayConnectionState current = nostr_relay_get_connection_state(relay);
+    if (current == rs->connection_state) {
+        pthread_mutex_unlock(&n->allowlist_mu);
+        return;
+    }
+    rs->connection_state = current;
+    rs->history_done = current == NOSTR_RELAY_STATE_DISCONNECTED ||
+                       current == NOSTR_RELAY_STATE_BACKOFF;
+    rs->history_ok = false;
+    update_acl_readiness(n);
+    pthread_mutex_unlock(&n->allowlist_mu);
+    test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
+}
+
 /* ── NIP-42 AUTH callback ──────────────────────────────────────
  * Fires on the relay worker thread when a relay sends an AUTH
  * challenge.  We respond by building a kind:22242 event with the
  * relay URL and challenge string, signing it via the signer
- * abstraction, and publishing it back to the relay.
+ * abstraction, and writing an AUTH envelope back to the relay.
+ * Reader callbacks only enqueue work; signing happens on auth_worker.
  *
  * This is required for relays that gate subscriptions or event
  * storage behind authentication.
  */
-static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
-                                  void *user_data) {
-    MdNostr *n = user_data;
+static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
+                      uint64_t generation) {
+    NostrRelay *relay = n->relays[rs->index];
     if (!n || !n->signer || !relay || !challenge || is_stopped(n))
         return;
 
@@ -247,10 +332,79 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
         return;
     }
 
-    /* Send the signed auth event back to the relay */
-    nostr_relay_publish(relay, signed_ev);
+    /* nostr_relay_auth() currently calls publish(EVENT), and its signing
+     * callback has no userdata. Use nostrc's AUTH envelope serializer/write
+     * API instead, never hand-roll frames or sign on the reader thread. */
+    NostrAuthEnvelope auth = { .base.type = NOSTR_ENVELOPE_AUTH, .event = signed_ev };
+    char *wire = nostr_envelope_serialize((NostrEnvelope *)&auth);
+    uint64_t current_generation = 0;
+    char *current = nostr_relay_get_auth_challenge(relay, &current_generation);
+    bool fresh = current && generation == current_generation && !strcmp(challenge, current);
+    free(current);
+    pthread_mutex_lock(&n->work_mu);
+    fresh = fresh && !n->closing && generation == rs->auth_generation;
+    if (fresh && wire) snprintf(rs->auth_id, sizeof(rs->auth_id), "%s", nostr_event_get_id(signed_ev));
+    pthread_mutex_unlock(&n->work_mu);
+    if (fresh && wire) {
+        GoChannel *done = nostr_relay_write(relay, wire);
+        Error *error = NULL;
+        if (done) {
+            go_channel_receive(done, (void **)&error);
+            go_channel_unref(done);
+        }
+        if (!done || error) {
+            MD_LOG_W("AUTH transport failed on %s: %s", relay_url,
+                     error ? error->message : "no write result");
+            if (error) free_error(error);
+        }
+        /* Only md_nostr_ok_handler may report relay authentication success. */
+    }
+    free(wire);
     nostr_event_free(signed_ev);
-    MD_LOG_I("AUTH response sent to %s", relay_url ? relay_url : "(unknown)");
+}
+
+static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge, void *data) {
+    MdRelayState *rs = data;
+    MdNostr *n = rs->bridge;
+    if (!challenge || strlen(challenge) > 4096 || is_stopped(n)) return;
+    uint64_t generation = 0;
+    char *current = nostr_relay_get_auth_challenge(relay, &generation);
+    bool fresh = current && !strcmp(current, challenge);
+    free(current);
+    if (!fresh) return;
+    char *copy = strdup(challenge);
+    if (!copy) return;
+    pthread_mutex_lock(&n->work_mu);
+    if (!n->closing && generation != rs->auth_generation) {
+        free(rs->challenge);
+        rs->challenge = copy;
+        copy = NULL;
+        rs->auth_generation = generation;
+        rs->auth_id[0] = '\0';
+        pthread_cond_broadcast(&n->work_cv);
+    }
+    pthread_mutex_unlock(&n->work_mu);
+    free(copy);
+}
+
+static void *auth_worker(void *data) {
+    MdNostr *n = data;
+    pthread_mutex_lock(&n->work_mu);
+    while (!n->closing) {
+        MdRelayState *rs = NULL;
+        for (size_t i = 0; i < n->relay_count; i++)
+            if (n->relay_states[i].challenge) { rs = &n->relay_states[i]; break; }
+        if (!rs) { pthread_cond_wait(&n->work_cv, &n->work_mu); continue; }
+        char *challenge = rs->challenge;
+        uint64_t generation = rs->auth_generation;
+        rs->challenge = NULL;
+        pthread_mutex_unlock(&n->work_mu);
+        send_auth(n, rs, challenge, generation);
+        free(challenge);
+        pthread_mutex_lock(&n->work_mu);
+    }
+    pthread_mutex_unlock(&n->work_mu);
+    return NULL;
 }
 
 /* ── Relay OK callback ─────────────────────────────────────────
@@ -261,8 +415,18 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge,
  */
 static void md_nostr_ok_handler(const char *event_id, bool ok,
                                 const char *reason, void *user_data) {
-    MdNostr *n = user_data;
+    MdRelayState *rs = user_data;
+    MdNostr *n = rs->bridge;
     if (!n || is_stopped(n)) return;
+    pthread_mutex_lock(&n->work_mu);
+    bool auth_result = event_id && rs->auth_id[0] && !strcmp(event_id, rs->auth_id);
+    if (auth_result) rs->auth_id[0] = '\0';
+    pthread_mutex_unlock(&n->work_mu);
+    if (auth_result) {
+        if (ok) MD_LOG_I("AUTH accepted by %s", n->relay_urls[rs->index]);
+        else MD_LOG_W("AUTH rejected by %s: %s", n->relay_urls[rs->index], reason ? reason : "");
+        test_point(n, MD_NOSTR_TEST_AUTH_RESULT);
+    }
 
     if (!ok) {
         MD_LOG_W("relay REJECTED event %.16s%s — %s", event_id ? event_id : "(null)", event_id && strlen(event_id) > 16 ? "..." : "", reason ? reason : "(no reason)");
@@ -526,15 +690,24 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
         NostrList *list = nostr_nip51_parse_list(ev, NULL);
         if (list && list->identifier &&
             strcmp(list->identifier, "metadesk-allowlist") == 0) {
-            /* Replace cached allowlist (pool worker thread vs callers) */
+            test_point(n, MD_NOSTR_TEST_ALLOWLIST_PROCESSING);
             pthread_mutex_lock(&n->allowlist_mu);
-            if (n->allowlist)
+            bool pending = false;
+            for (size_t i = 0; i < n->acl_unconfirmed_count; i++)
+                if (!strcmp(n->acl_unconfirmed[i], canon)) pending = true;
+            int64_t created = nostr_event_get_created_at(ev);
+            bool newer = !n->acl_id[0] || created > n->acl_created_at ||
+                (created == n->acl_created_at && strcmp(canon, n->acl_id) < 0);
+            if (newer && !pending) {
                 nostr_nip51_list_free(n->allowlist);
-            n->allowlist = list;
-            n->allowlist_refresh_loaded = true;
-            size_t count = list->count;
+                n->allowlist = list;
+                list = NULL;
+                n->acl_created_at = created;
+                memcpy(n->acl_id, canon, sizeof(n->acl_id));
+                n->acl_version++;
+            }
             pthread_mutex_unlock(&n->allowlist_mu);
-            MD_LOG_I("refreshed allowlist (%zu entries)", count);
+            nostr_nip51_list_free(list);
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_RECEIVED);
         } else {
             nostr_nip51_list_free(list);
@@ -626,8 +799,11 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (!n) return NULL;
 
     pthread_mutex_init(&n->allowlist_mu, NULL);
+    pthread_cond_init(&n->allowlist_cv, NULL);
     pthread_mutex_init(&n->work_mu, NULL);
     pthread_cond_init(&n->work_cv, NULL);
+    n->acl_open = cfg->allowlist_open;
+    n->acl_state = cfg->allowlist_open ? MD_NOSTR_ACL_OPEN : MD_NOSTR_ACL_UNKNOWN;
     n->signer_cancel = md_signer_cancel_new();
     if (!n->signer_cancel) { md_nostr_destroy(n); return NULL; }
 
@@ -677,6 +853,9 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         return NULL;
     }
 
+    nostr_simple_pool_set_auto_unsub_on_eose(n->pool, false);
+    nostr_simple_pool_set_subscription_callback(n->pool, md_nostr_subscription_handler, n);
+
     /* Register event middleware for incoming event routing.
      * The _ex variant carries our MdNostr as user_data. */
     nostr_simple_pool_set_event_middleware_ex(n->pool,
@@ -707,14 +886,30 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         }
         pthread_mutex_unlock(&n->pool->pool_mutex);
 
+        n->relay_states = calloc(n->relay_count, sizeof(*n->relay_states));
+        if (!n->relay_states) { md_nostr_destroy(n); return NULL; }
         /* Register per-relay callbacks.  Both have a user_data parameter
          * (unlike event_middleware), so we pass MdNostr directly. */
+        /* All callback data exists before the first callback can run. */
         for (size_t i = 0; i < n->relay_count; i++) {
-            nostr_relay_set_ok_callback(n->relays[i],
-                                        md_nostr_ok_handler, n);
-            nostr_relay_set_auth_callback(n->relays[i],
-                                          md_nostr_auth_handler, n);
+            n->relay_states[i].bridge = n;
+            n->relay_states[i].index = i;
         }
+        pthread_mutex_lock(&n->allowlist_mu);
+        for (size_t i = 0; i < n->relay_count; i++) {
+            nostr_relay_set_state_callback(n->relays[i], md_nostr_relay_state_handler,
+                                          &n->relay_states[i]);
+            NostrRelayConnectionState state = nostr_relay_get_connection_state(n->relays[i]);
+            n->relay_states[i].connection_state = state;
+            n->relay_states[i].history_done = state == NOSTR_RELAY_STATE_DISCONNECTED ||
+                                            state == NOSTR_RELAY_STATE_BACKOFF;
+            nostr_relay_set_ok_callback(n->relays[i],
+                                        md_nostr_ok_handler, &n->relay_states[i]);
+            nostr_relay_set_auth_callback(n->relays[i],
+                                          md_nostr_auth_handler, &n->relay_states[i]);
+        }
+        update_acl_readiness(n);
+        pthread_mutex_unlock(&n->allowlist_mu);
     }
 
     if (n->relay_count == 0) {
@@ -732,6 +927,18 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         n->dm_started = true;
     }
 
+    if (pthread_create(&n->auth_thread, NULL, auth_worker, n) != 0) {
+        md_nostr_destroy(n);
+        return NULL;
+    }
+    n->auth_started = true;
+    /* Cover a challenge received during ensure_relay(), before callbacks. */
+    for (size_t i = 0; i < n->relay_count; i++) {
+        char *challenge = nostr_relay_get_auth_challenge(n->relays[i], NULL);
+        if (challenge) md_nostr_auth_handler(n->relays[i], challenge, &n->relay_states[i]);
+        free(challenge);
+    }
+
     /* Start pool worker threads */
     nostr_simple_pool_start(n->pool);
 
@@ -739,7 +946,11 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
      * pool's shared filter set on each subscribe call, while live
      * subscriptions borrow it — so a second independent subscribe would
      * leave the first subscription matching against freed memory. */
-    md_nostr_subscribe(n);
+    if (md_nostr_subscribe(n) != 0) {
+        pthread_mutex_lock(&n->allowlist_mu);
+        if (!n->acl_open) n->acl_state = MD_NOSTR_ACL_FAILED;
+        pthread_mutex_unlock(&n->allowlist_mu);
+    }
 
     MD_LOG_I("bridge ready (signer=%s, pk=%.*s..., relays=%zu)", md_signer_type_name(md_signer_get_type(n->signer)), 8, n->pk_hex, n->relay_count);
 
@@ -761,6 +972,9 @@ void md_nostr_stop(MdNostr *n) {
     md_signer_cancel(n->signer_cancel);
     pthread_cond_broadcast(&n->work_cv);
     pthread_mutex_unlock(&n->work_mu);
+    pthread_mutex_lock(&n->allowlist_mu);
+    pthread_cond_broadcast(&n->allowlist_cv);
+    pthread_mutex_unlock(&n->allowlist_mu);
 }
 
 void md_nostr_destroy(MdNostr *n) {
@@ -772,6 +986,7 @@ void md_nostr_destroy(MdNostr *n) {
      * allowlist and callbacks alive while accepted work still uses them. */
     if (n->pool) nostr_simple_pool_stop(n->pool);
     test_point(n, MD_NOSTR_TEST_DRAINING);
+    if (n->auth_started) pthread_join(n->auth_thread, NULL);
     if (n->dm_started) pthread_join(n->dm_thread, NULL);
     pthread_mutex_lock(&n->work_mu);
     while (n->active_ops) pthread_cond_wait(&n->work_cv, &n->work_mu);
@@ -787,7 +1002,12 @@ void md_nostr_destroy(MdNostr *n) {
         free(n->relay_urls);
     }
     free(n->relays);
+    if (n->relay_states) {
+        for (size_t i = 0; i < n->relay_count; i++) free(n->relay_states[i].challenge);
+        free(n->relay_states);
+    }
 
+    pthread_cond_destroy(&n->allowlist_cv);
     pthread_mutex_destroy(&n->allowlist_mu);
 
     pthread_cond_destroy(&n->work_cv);
@@ -979,22 +1199,14 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 
 /* ── Access control (NIP-51 allowlists) ─────────────────────── */
 
-static void warn_allowlist_startup_window(const MdNostr *n) {
-    if (!n || n->allowlist_refresh_loaded || n->allowlist)
-        return;
-
-    MD_LOG_W("WARNING: allowlist checked before first NIP-51 refresh (%s); startup window remains open until relay data arrives", n->allowlist_refresh_requested ? "waiting for relay data" : "refresh not requested");
-}
 
 static bool is_allowed(MdNostr *n, const char *pubkey_hex) {
     if (!n || !pubkey_hex)
         return false;
 
-    warn_allowlist_startup_window(n);
-
     pthread_mutex_lock(&n->allowlist_mu);
-    bool allowed = false;
-    if (n->allowlist) {
+    bool allowed = n->acl_state == MD_NOSTR_ACL_OPEN;
+    if (n->acl_state == MD_NOSTR_ACL_LOADED && n->allowlist) {
         for (size_t i = 0; i < n->allowlist->count; i++) {
             NostrListEntry *entry = n->allowlist->entries[i];
             if (entry && entry->tag_name && strcmp(entry->tag_name, "p") == 0
@@ -1012,10 +1224,8 @@ static bool has_allowlist(const MdNostr *n) {
     if (!n)
         return false;
 
-    warn_allowlist_startup_window(n);
-
     pthread_mutex_lock((pthread_mutex_t *)&n->allowlist_mu);
-    bool has = n->allowlist && n->allowlist->count > 0;
+    bool has = n->acl_state == MD_NOSTR_ACL_LOADED;
     pthread_mutex_unlock((pthread_mutex_t *)&n->allowlist_mu);
     return has;
 }
@@ -1023,25 +1233,22 @@ static bool has_allowlist(const MdNostr *n) {
 static int refresh_allowlist(MdNostr *n) {
     if (!n || !n->pool || !n->pk_hex) return -1;
 
-    /* The kind:30000 filter is part of the single merged subscription
-     * created in md_nostr_create() — a second subscribe call would free
-     * the filter set the live DM subscription borrows. Nothing to do
-     * here but record the request; events arrive asynchronously. */
-    pthread_mutex_lock(&n->allowlist_mu);
-    n->allowlist_refresh_requested = true;
-    pthread_mutex_unlock(&n->allowlist_mu);
+    /* Already subscribed at create; do not replace borrowed pool filters.
+     * EOSE/CLOSED callbacks, not a refresh call or timer, drive readiness. */
     return 0;
 }
 
-/* Build the signed-ready (unsigned) kind:30000 allowlist event from the
- * current cached list. Caller holds allowlist_mu. */
-static NostrEvent *build_allowlist_event(const MdNostr *n) {
+/* Build an unsigned kind:30000 event from the staged candidate.
+ * Caller holds allowlist_mu while copying the authoritative base. */
+static NostrEvent *build_allowlist_event(const MdNostr *n, const NostrList *list,
+                                        int64_t created) {
     NostrEvent *list_event = nostr_event_new();
     if (!list_event) return NULL;
 
     nostr_event_set_kind(list_event, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
     nostr_event_set_pubkey(list_event, n->pk_hex);
-    nostr_event_set_created_at(list_event, (int64_t)time(NULL));
+    nostr_event_set_created_at(list_event, created);
+    nostr_event_set_content(list_event, "");
 
     /* Serialize allowlist entries as NIP-51 tags:
      *   ["d", "metadesk-allowlist"]  — addressable d-tag
@@ -1050,16 +1257,25 @@ static NostrEvent *build_allowlist_event(const MdNostr *n) {
     if (!tags) { nostr_event_free(list_event); return NULL; }
 
     NostrTag *d_tag = nostr_tag_new("d", "metadesk-allowlist", NULL);
-    if (d_tag) nostr_tags_append(tags, d_tag);
+    if (!d_tag) { nostr_tags_free(tags); nostr_event_free(list_event); return NULL; }
+    nostr_tags_append(tags, d_tag);
+    if (nostr_tags_size(tags) != 1) {
+        nostr_tag_free(d_tag); nostr_tags_free(tags); nostr_event_free(list_event); return NULL;
+    }
 
-    if (n->allowlist) {
-        for (size_t i = 0; i < n->allowlist->count; i++) {
-            NostrListEntry *e = n->allowlist->entries[i];
+    if (list) {
+        for (size_t i = 0; i < list->count; i++) {
+            NostrListEntry *e = list->entries[i];
             if (!e || !e->tag_name || !e->value) continue;
             NostrTag *t = e->extra
                 ? nostr_tag_new(e->tag_name, e->value, e->extra, NULL)
                 : nostr_tag_new(e->tag_name, e->value, NULL);
-            if (t) nostr_tags_append(tags, t);
+            if (!t) { nostr_tags_free(tags); nostr_event_free(list_event); return NULL; }
+            size_t before = nostr_tags_size(tags);
+            nostr_tags_append(tags, t);
+            if (nostr_tags_size(tags) != before + 1) {
+                nostr_tag_free(t); nostr_tags_free(tags); nostr_event_free(list_event); return NULL;
+            }
         }
     }
 
@@ -1067,98 +1283,117 @@ static NostrEvent *build_allowlist_event(const MdNostr *n) {
     return list_event;
 }
 
-static int allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps) {
-    if (!n || !n->signer || !pubkey_hex)
-        return -1;
+static bool list_append_copy(NostrList *list, const char *tag,
+                             const char *value, const char *extra) {
+    NostrListEntry *entry = nostr_nip51_entry_new(tag, value, extra, false);
+    if (!entry) return false;
+    size_t before = list->count;
+    nostr_nip51_list_add_entry(list, entry);
+    if (list->count == before) {
+        nostr_nip51_entry_free(entry);
+        return false;
+    }
+    return true;
+}
 
-    NostrEvent *list_event = NULL;
-    size_t count = 0;
+static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add) {
+    if (!n || !n->signer || !pk || strlen(pk) != 64 ||
+        strspn(pk, "0123456789abcdef") != 64) return -1;
 
+    int ret = -1;
+    NostrList *candidate = NULL;
+    NostrEvent *ev = NULL, *signed_ev = NULL;
     pthread_mutex_lock(&n->allowlist_mu);
-    if (!n->allowlist)
-        n->allowlist = nostr_nip51_list_new();
-    if (n->allowlist) {
-        n->allowlist_refresh_loaded = true;
-
-        NostrListEntry *entry = nostr_nip51_entry_new("p", pubkey_hex, caps, false);
-        if (entry) {
-            nostr_nip51_list_add_entry(n->allowlist, entry);
-            nostr_nip51_list_set_identifier(n->allowlist, "metadesk-allowlist");
-            list_event = build_allowlist_event(n);
-            count = n->allowlist->count;
+    /* Existing callers may edit immediately after create. Wait for an actual
+     * history/failure boundary, never build from a partially received list. */
+    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && !is_stopped(n))
+        pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    if (is_stopped(n) || n->acl_state != MD_NOSTR_ACL_LOADED || n->acl_editing ||
+        n->acl_unconfirmed_count == MD_ACL_UNCONFIRMED_MAX) {
+        pthread_mutex_unlock(&n->allowlist_mu);
+        return -1;
+    }
+    bool found = false;
+    if (n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *e = n->allowlist->entries[i];
+        if (e && e->tag_name && e->value && !strcmp(e->tag_name, "p") &&
+            !strcmp(e->value, pk)) found = true;
+    }
+    if (found == add) { /* Membership operations are idempotent. */
+        pthread_mutex_unlock(&n->allowlist_mu);
+        return 0;
+    }
+    candidate = nostr_nip51_list_new();
+    bool built = candidate != NULL;
+    if (built) {
+        nostr_nip51_list_set_identifier(candidate, "metadesk-allowlist");
+        built = candidate->identifier != NULL;
+    }
+    if (built && n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+        NostrListEntry *e = n->allowlist->entries[i];
+        if (!e || !e->tag_name || !e->value) continue;
+        if (!add && !strcmp(e->tag_name, "p") && !strcmp(e->value, pk)) continue;
+        if (!list_append_copy(candidate, e->tag_name, e->value, e->extra)) {
+            built = false; break;
         }
     }
+    if (built && add) built = list_append_copy(candidate, "p", pk, caps);
+    uint64_t version = n->acl_version;
+    int64_t created = (int64_t)time(NULL);
+    /* Successive local edits within a second must actually replace the base,
+     * independent of the random lexical order of their signed ids. */
+    if (n->acl_id[0] && created <= n->acl_created_at) {
+        if (n->acl_created_at == INT64_MAX) built = false;
+        else created = n->acl_created_at + 1;
+    }
+    if (built) ev = build_allowlist_event(n, candidate, created);
+    if (ev) n->acl_editing = true;
     pthread_mutex_unlock(&n->allowlist_mu);
+    if (!ev) { nostr_nip51_list_free(candidate); return -1; }
 
-    if (!list_event) return -1;
-
-    /* Sign via signer abstraction (may block — outside the mutex) */
-    NostrEvent *signed_event = sign_event_cancellable(n->signer, list_event, n->signer_cancel);
-    nostr_event_free(list_event);
-    if (!signed_event) return -1;
-
-    int ret = publish_all(n, signed_event);
-    nostr_event_free(signed_event);
-
-    if (ret == 0)
-        MD_LOG_I("published allowlist (%zu entries)", count);
-
+    signed_ev = sign_event_cancellable(n->signer, ev, n->signer_cancel);
+    nostr_event_free(ev);
+    if (signed_ev) {
+        const char *id = nostr_event_get_id(signed_ev);
+        pthread_mutex_lock(&n->allowlist_mu);
+        bool current = version == n->acl_version && n->acl_state == MD_NOSTR_ACL_LOADED;
+        size_t slot = n->acl_unconfirmed_count;
+        if (current) {
+            memcpy(n->acl_unconfirmed[slot], id, 65);
+            n->acl_unconfirmed_count++;
+        }
+        pthread_mutex_unlock(&n->allowlist_mu);
+        if (current) {
+            test_point(n, MD_NOSTR_TEST_ALLOWLIST_SIGNED);
+            ret = publish_all(n, signed_ev);
+            pthread_mutex_lock(&n->allowlist_mu);
+            if (ret == 0 && version == n->acl_version &&
+                n->acl_state == MD_NOSTR_ACL_LOADED && !is_stopped(n)) {
+                nostr_nip51_list_free(n->allowlist);
+                n->allowlist = candidate;
+                candidate = NULL;
+                n->acl_created_at = nostr_event_get_created_at(signed_ev);
+                memcpy(n->acl_id, id, 65);
+                n->acl_version++;
+                /* Only this edit can append while acl_editing is true. */
+                n->acl_unconfirmed_count--;
+            } else ret = -1;
+            pthread_mutex_unlock(&n->allowlist_mu);
+        }
+        nostr_event_free(signed_ev);
+    }
+    nostr_nip51_list_free(candidate);
+    pthread_mutex_lock(&n->allowlist_mu);
+    n->acl_editing = false;
+    pthread_mutex_unlock(&n->allowlist_mu);
     return ret;
 }
 
-static int allowlist_remove(MdNostr *n, const char *pubkey_hex) {
-    if (!n || !pubkey_hex)
-        return -1;
-
-    NostrEvent *list_event = NULL;
-    size_t count = 0;
-
-    pthread_mutex_lock(&n->allowlist_mu);
-    if (n->allowlist) {
-        /* Rebuild the list through the public API, dropping the matching
-         * entry — nip51 exposes no remove, and mutating its entry array
-         * in place depends on struct layout nostrc does not promise. */
-        NostrList *kept = nostr_nip51_list_new();
-        bool found = false;
-        if (kept) {
-            for (size_t i = 0; i < n->allowlist->count; i++) {
-                NostrListEntry *e = n->allowlist->entries[i];
-                if (!e || !e->tag_name || !e->value) continue;
-                if (!found && strcmp(e->tag_name, "p") == 0 &&
-                    strcmp(e->value, pubkey_hex) == 0) {
-                    found = true;
-                    continue;
-                }
-                NostrListEntry *copy =
-                    nostr_nip51_entry_new(e->tag_name, e->value, e->extra, false);
-                if (copy) nostr_nip51_list_add_entry(kept, copy);
-            }
-        }
-        if (found && kept) {
-            nostr_nip51_list_set_identifier(kept, "metadesk-allowlist");
-            nostr_nip51_list_free(n->allowlist);
-            n->allowlist = kept;
-            kept = NULL;
-            list_event = build_allowlist_event(n);
-            count = n->allowlist->count;
-        }
-        if (kept) nostr_nip51_list_free(kept);
-    }
-    pthread_mutex_unlock(&n->allowlist_mu);
-
-    if (!list_event) return -1;
-
-    NostrEvent *signed_event = sign_event_cancellable(n->signer, list_event, n->signer_cancel);
-    nostr_event_free(list_event);
-    if (!signed_event) return -1;
-
-    int ret = publish_all(n, signed_event);
-    nostr_event_free(signed_event);
-
-    if (ret == 0)
-        MD_LOG_I("published updated allowlist (%zu entries)", count);
-
-    return ret;
+static int allowlist_add(MdNostr *n, const char *pk, const char *caps) {
+    return allowlist_edit(n, pk, caps, true);
+}
+static int allowlist_remove(MdNostr *n, const char *pk) {
+    return allowlist_edit(n, pk, NULL, false);
 }
 
 static int allowlist_count(const MdNostr *n) {
@@ -1190,6 +1425,16 @@ static int allowlist_get_entry(const MdNostr *n, int index,
     }
     pthread_mutex_unlock((pthread_mutex_t *)&n->allowlist_mu);
     return ret;
+}
+
+MdNostrAclState md_nostr_allowlist_state(MdNostr *n) {
+    if (!owns_host(n) || !operation_begin(n)) return MD_NOSTR_ACL_FAILED;
+    pthread_mutex_lock(&n->allowlist_mu);
+    MdNostrAclState state = n->acl_state;
+    pthread_mutex_unlock(&n->allowlist_mu);
+    if (is_stopped(n)) state = MD_NOSTR_ACL_FAILED;
+    operation_end(n);
+    return state;
 }
 
 bool md_nostr_is_allowed(MdNostr *n, const char *pk) {

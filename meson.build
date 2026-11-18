@@ -747,6 +747,10 @@ test_nostr = executable('test_nostr',
   dependencies : [dep_metadesk],
 )
 test('nostr NIP-44', test_nostr)
+test('nostr ACL and AUTH private relays', find_program('python3'),
+  args : [files('tests/nostr_acl_fixture.py'), test_nostr],
+  env : {'PYTHONDONTWRITEBYTECODE' : '1'}, timeout : 120,
+)
 
 test_encode = executable('test_encode',
   files('tests/test_encode.c'),
