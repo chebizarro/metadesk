@@ -1,0 +1,113 @@
+# Rootless Podman reference: namespace and keep-ID mapping owned by netns.
+# Not a Docker-qualified manifest (Docker cannot join a sibling user namespace).
+# See reference/mesh-validation.md for exact versions, setup and evidence.
+name: ah9-5
+x-sandbox: &sandbox
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: on-failure
+  stop_grace_period: 5s
+
+services:
+  netns:
+    <<: *sandbox
+    container_name: ah9-5-netns
+    image: ${MD_BASE:?pinned Ubuntu digest}
+    userns_mode: keep-id
+    user: "1000:1000"
+    command: [sleep, infinity]
+    networks:
+      default:
+        ipv4_address: 10.89.95.2
+    # No host ports. Only the holder owns the underlay namespace.
+
+  mesh:
+    <<: *sandbox
+    image: ${FIPS_IMAGE:?locally built pinned fipsd image}
+    container_name: ah9-5-mesh
+    depends_on: [netns]
+    network_mode: service:netns
+    userns_mode: container:ah9-5-netns
+    user: "0:777"
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    tmpfs: ["/run/fips:rw,nosuid,nodev,noexec,mode=0750,U"]
+    volumes:
+      - type: bind
+        source: ${FIPS_CONFIG:?private daemon YAML with persistent identity and UDP peers}
+        target: /etc/fips/fips.yaml
+        read_only: true
+        bind: {create_host_path: false}
+
+  agent:
+    <<: *sandbox
+    image: ${MD_AGENT_IMAGE:?Tier A runtime image}
+    container_name: ah9-5-agent
+    depends_on: [netns]
+    network_mode: service:netns
+    userns_mode: container:ah9-5-netns
+    user: "1000:1000"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
+      - /run/user/1000:rw,nosuid,nodev,noexec,mode=0700,U
+    volumes:
+      - type: bind
+        source: ${SESSION_BUS_SOCKET:-/run/user/1000/bus}
+        target: /run/user/1000/bus
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${AT_SPI_DIR:?discovered AT-SPI directory}
+        target: ${AT_SPI_DIR:?discovered AT-SPI directory}
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${MCP_TOKEN_FILE:?desktop-owned mode-0600 bearer file}
+        target: /run/secrets/mcp-token
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${MCP_ALLOW_FILE:?authorized npubs only - no secret keys}
+        target: /run/secrets/mcp-allow
+        read_only: true
+        bind: {create_host_path: false}
+    command:
+      - /opt/metadesk/bin/metadesk-host
+      - --mcp-http
+      - "7710"
+      - --mcp-http-bind
+      - "127.0.0.1"
+      - --no-input
+      - --mcp-token-file
+      - /run/secrets/mcp-token
+      - --mcp-public-url
+      - http://[${MD_MESH_IP:?stable FIPS IPv6}]:7711/mcp
+      - --mcp-allow-file
+      - /run/secrets/mcp-allow
+    # Deliberately no FIPS control directory or daemon keys.
+
+  proxy:
+    <<: *sandbox
+    image: ${FIPS_IMAGE:?locally built pinned fipsd image}
+    container_name: ah9-5-proxy
+    depends_on: [mesh, agent]
+    network_mode: service:netns
+    userns_mode: container:ah9-5-netns
+    user: "1000:1000"
+    environment:
+      MD_MESH_IP: ${MD_MESH_IP:?stable FIPS IPv6}
+    volumes:
+      - type: bind
+        source: ./mesh-proxy.cfg
+        target: /etc/haproxy/mesh.cfg
+        read_only: true
+    command: [haproxy, -W, -db, -f, /etc/haproxy/mesh.cfg]
+    # If mesh has not assigned its address yet, bind fails and restart retries.
+    # Never recreate the holder alone: stop/recreate its namespace consumers too.
+networks:
+  default:
+    name: ah9-5-underlay
+    ipam:
+      config:
+        - subnet: 10.89.95.0/24

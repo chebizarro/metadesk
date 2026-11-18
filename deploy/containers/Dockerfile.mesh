@@ -1,0 +1,36 @@
+# Build context: a git archive of the exact nostrc revision below.
+# See reference/mesh-validation.md. This image is not an upstream FIPS release.
+ARG BASE
+FROM ${BASE} AS build
+ARG FIPSD_REV=5d09cab9183a09a0b0b88d89c20495b55beb2a50
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config ca-certificates \
+    libglib2.0-dev libsodium-dev libyaml-dev libjansson-dev libsecp256k1-dev \
+    libssl-dev libwebsockets-dev libcurl4-openssl-dev libnsync-dev \
+    libnftables-dev libncurses-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /build -G Ninja \
+    $(sh fipsd/packaging/common/cmake-args.sh) \
+    -DCMAKE_BUILD_TYPE=Release -DGO_WARNINGS_AS_ERRORS=OFF \
+    -DFIPSD_GIT_REV=${FIPSD_REV} \
+    && cmake --build /build --target fipsd fipsctl -j2
+
+FROM ${BASE}
+ARG FIPSD_REV=5d09cab9183a09a0b0b88d89c20495b55beb2a50
+LABEL org.opencontainers.image.source="https://github.com/chebizarro/nostrc" \
+      org.opencontainers.image.revision=${FIPSD_REV}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0t64 libsodium23 libyaml-0-2 libjansson4 libsecp256k1-1 \
+    libssl3t64 libwebsockets19t64 libcurl4t64 libnsync1 libnftables1 \
+    libncurses6 libtinfo6 haproxy iproute2 python3 \
+    && rm -rf /var/lib/apt/lists/* && groupadd --system fips
+RUN groupmod -g 777 fips
+COPY --from=build /build/fipsd/fipsd /usr/local/bin/fipsd
+COPY --from=build /build/fipsd/fipsctl /usr/local/bin/fipsctl
+COPY --from=build /build/libjson/libnostr-json.so* /opt/fips/lib/
+ENV LD_LIBRARY_PATH=/opt/fips/lib FIPSD_WORKERS=2
+RUN ldd /usr/local/bin/fipsd > /tmp/closure \
+    && ! grep -q 'not found' /tmp/closure && rm /tmp/closure \
+    && fipsd -V
+CMD ["/usr/local/bin/fipsd", "--config", "/etc/fips/fips.yaml"]
