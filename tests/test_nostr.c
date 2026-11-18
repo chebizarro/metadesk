@@ -16,6 +16,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <stdarg.h>
+#include <errno.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -742,7 +744,382 @@ static void test_allowlist_read_teardown(void) {
     printf("  PASS: every in-flight allowlist reader participates in teardown drain\n");
 }
 
-int main(void) {
+/* The controller owns two real loopback websocket relays. CONTROL replies
+ * and hook condition variables are protocol barriers, never delivery sleeps. */
+static char acl_reply[131072];
+static void acl_control(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    printf("CONTROL "); vprintf(fmt, ap); printf("\n"); fflush(stdout);
+    va_end(ap);
+    MD_CHECK(fgets(acl_reply, sizeof(acl_reply), stdin) != NULL);
+}
+
+typedef struct {
+    MdNostr *bridge;
+    MdSigner *direct;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    unsigned received, boundaries, signed_count, auth_results, processing, admitted;
+    unsigned sign_entered, draining;
+    bool hold_signed, release_signed, hold_processing, release_processing;
+    bool hold_backend_sign, release_backend_sign;
+    atomic_bool fail_sign;
+    atomic_int signs;
+    MdNostrAclState state;
+} AclTest;
+
+static void acl_hook(MdNostrTestPoint point, void *data) {
+    AclTest *s = data;
+    if (point == MD_NOSTR_TEST_ADMITTED) {
+        pthread_mutex_lock(&s->mu);
+        s->admitted++; pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        return;
+    }
+    if (point != MD_NOSTR_TEST_DRAINING &&
+        point != MD_NOSTR_TEST_ALLOWLIST_PROCESSING &&
+        point != MD_NOSTR_TEST_ALLOWLIST_RECEIVED &&
+        point != MD_NOSTR_TEST_ALLOWLIST_BOUNDARY &&
+        point != MD_NOSTR_TEST_ALLOWLIST_SIGNED &&
+        point != MD_NOSTR_TEST_AUTH_RESULT) return;
+    MdNostrAclState state = md_nostr_allowlist_state(s->bridge);
+    pthread_mutex_lock(&s->mu);
+    s->state = state;
+    if (point == MD_NOSTR_TEST_DRAINING) s->draining++;
+    if (point == MD_NOSTR_TEST_ALLOWLIST_PROCESSING) s->processing++;
+    if (point == MD_NOSTR_TEST_ALLOWLIST_RECEIVED) s->received++;
+    if (point == MD_NOSTR_TEST_ALLOWLIST_BOUNDARY) s->boundaries++;
+    if (point == MD_NOSTR_TEST_AUTH_RESULT) s->auth_results++;
+    if (point == MD_NOSTR_TEST_ALLOWLIST_SIGNED) s->signed_count++;
+    pthread_cond_broadcast(&s->cv);
+    while (point == MD_NOSTR_TEST_ALLOWLIST_PROCESSING && s->hold_processing && !s->release_processing)
+        pthread_cond_wait(&s->cv, &s->mu);
+    while (point == MD_NOSTR_TEST_ALLOWLIST_SIGNED && s->hold_signed && !s->release_signed)
+        pthread_cond_wait(&s->cv, &s->mu);
+    pthread_mutex_unlock(&s->mu);
+}
+static void acl_wait(AclTest *s, unsigned *counter, unsigned count) {
+    struct timespec until;
+    timespec_get(&until, TIME_UTC); until.tv_sec += 15;
+    pthread_mutex_lock(&s->mu);
+    while (*counter < count) {
+        int error = pthread_cond_timedwait(&s->cv, &s->mu, &until);
+        MD_CHECK(error == 0);
+        if (error) exit(1);
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+static unsigned acl_counter(AclTest *s, unsigned *counter) {
+    pthread_mutex_lock(&s->mu);
+    unsigned value = *counter;
+    pthread_mutex_unlock(&s->mu);
+    return value;
+}
+static void acl_wait_state(AclTest *s, MdNostrAclState state) {
+    struct timespec until;
+    timespec_get(&until, TIME_UTC); until.tv_sec += 15;
+    pthread_mutex_lock(&s->mu);
+    while (s->state != state) {
+        int error = pthread_cond_timedwait(&s->cv, &s->mu, &until);
+        MD_CHECK(error == 0);
+        if (error) exit(1);
+    }
+    pthread_mutex_unlock(&s->mu);
+    MD_CHECK(md_nostr_allowlist_state(s->bridge) == state);
+}
+static int acl_sign(MdSigner *signer, const char *json, char **out) {
+    AclTest *s = signer->backend;
+    atomic_fetch_add(&s->signs, 1);
+    pthread_mutex_lock(&s->mu);
+    s->sign_entered++; pthread_cond_broadcast(&s->cv);
+    while (s->hold_backend_sign && !s->release_backend_sign)
+        pthread_cond_wait(&s->cv, &s->mu);
+    pthread_mutex_unlock(&s->mu);
+    if (atomic_load(&s->fail_sign)) return MD_SIGNER_ERR_DENIED;
+    return md_signer_sign_event(s->direct, json, out);
+}
+static int acl_pk(MdSigner *signer, char **out) {
+    return md_signer_get_pubkey(((AclTest *)signer->backend)->direct, out);
+}
+static const MdSignerOps acl_ops = { .get_pubkey = acl_pk, .sign_event = acl_sign };
+static void acl_unused_dm(const char *pk, const char *content, void *data) {
+    (void)pk; (void)content; (void)data;
+    MD_CHECK(false); /* The AUTH fixture must not leak protected DMs. */
+}
+static void acl_bridge_start(AclTest *s, const char **urls, int count, bool open, bool dm) {
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_init(&s->mu, NULL); pthread_cond_init(&s->cv, NULL);
+    atomic_init(&s->fail_sign, false); atomic_init(&s->signs, 0);
+    s->direct = md_signer_create_direct(dm_recipient_sk);
+    MdSigner *signer = md_signer_create_custom(MD_SIGNER_NIP46, &acl_ops, s);
+    MdNostrConfig cfg = { .signer = signer, .relay_urls = urls, .relay_count = count,
+                          .allowlist_open = open };
+    MdNostrCallbacks callbacks = { .on_dm = dm ? acl_unused_dm : NULL };
+    s->bridge = md_nostr_create(&cfg, &callbacks);
+    MD_CHECK(s->bridge != NULL);
+    s->state = md_nostr_allowlist_state(s->bridge);
+    md_nostr_set_test_hook(s->bridge, acl_hook, s);
+    md_signer_destroy(signer);
+}
+static void acl_bridge(AclTest *s, const char **urls, int count, bool open, bool dm) {
+    acl_bridge_start(s, urls, count, open, dm);
+    for (int i = 0; i < count; i++) acl_control("{\"op\":\"req\",\"relay\":%d}", i);
+}
+static void acl_finish(AclTest *s) {
+    md_nostr_destroy(s->bridge);
+    md_signer_destroy(s->direct);
+    pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->mu);
+}
+static char *acl_event(AclTest *s, int64_t created, const char *member) {
+    NostrEvent *ev = nostr_event_new();
+    nostr_event_set_kind(ev, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
+    nostr_event_set_created_at(ev, created);
+    nostr_event_set_content(ev, "");
+    nostr_event_set_pubkey(ev, md_nostr_get_npub(s->bridge));
+    NostrTags *tags = nostr_tags_new(1, nostr_tag_new("d", "metadesk-allowlist", NULL));
+    if (member) nostr_tags_append(tags, nostr_tag_new("p", member, "video", NULL));
+    nostr_event_set_tags(ev, tags);
+    char *json = nostr_event_serialize(ev), *signed_json = NULL;
+    MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
+    free(json); nostr_event_free(ev);
+    return signed_json;
+}
+static void acl_deliver(AclTest *s, int relay, const char *event) {
+    unsigned count = acl_counter(s, &s->received);
+    acl_control("{\"op\":\"event\",\"relay\":%d,\"event\":%s}", relay, event);
+    acl_wait(s, &s->received, count + 1);
+}
+static void acl_eose(AclTest *s, int relay) {
+    unsigned count = acl_counter(s, &s->boundaries);
+    acl_control("{\"op\":\"eose\",\"relay\":%d}", relay);
+    acl_wait(s, &s->boundaries, count + 1);
+}
+static void acl_reset(void) {
+    acl_control("{\"op\":\"reset\"}");
+    acl_control("{\"op\":\"reset\",\"relay\":1}");
+}
+
+static void test_acl_history(const char **urls, const char *a, const char *b) {
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 2, false, false);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    int64_t t = time(NULL) - 100;
+    char *old = acl_event(&s, t, a), *newer = acl_event(&s, t + 1, b);
+    acl_deliver(&s, 0, newer);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, b)); /* EVENT alone is not ready. */
+    acl_eose(&s, 0);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    acl_deliver(&s, 1, old); acl_eose(&s, 1);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, b));
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    acl_deliver(&s, 0, newer); /* duplicate */
+    acl_deliver(&s, 1, old);   /* reconnect/other relay replay */
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 1);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+
+    char *one = acl_event(&s, t + 2, a), *two = acl_event(&s, t + 2, b);
+    NostrEvent *e1 = nostr_event_new(), *e2 = nostr_event_new();
+    MD_CHECK(nostr_event_deserialize(e1, one) == 0 && nostr_event_deserialize(e2, two) == 0);
+    bool first_low = strcmp(nostr_event_get_id(e1), nostr_event_get_id(e2)) < 0;
+    const char *low = first_low ? one : two, *high = first_low ? two : one;
+    acl_deliver(&s, 0, high); acl_deliver(&s, 1, low); acl_deliver(&s, 0, high);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, first_low ? a : b));
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, first_low ? b : a));
+    char *empty = acl_event(&s, t + 3, NULL);
+    acl_deliver(&s, 1, empty);
+    MD_CHECK(md_nostr_has_allowlist(s.bridge));
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 0);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    free(old); free(newer); free(one); free(two); free(empty);
+    nostr_event_free(e1); nostr_event_free(e2); acl_finish(&s);
+
+    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    MD_CHECK(md_nostr_has_allowlist(s.bridge)); /* No event also means empty. */
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    unsigned boundary = acl_counter(&s, &s.boundaries);
+    acl_control("{\"op\":\"closed\"}"); acl_wait(&s, &s.boundaries, boundary + 1);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
+    acl_reset(); acl_bridge(&s, urls, 1, true, false);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_OPEN);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
+    /* Relay 1's websocket handshake is deliberately still pending when
+     * bridge callbacks are registered and relay 0 reaches EOSE. */
+    acl_reset(); acl_control("{\"op\":\"hold_connection\",\"relay\":1}");
+    acl_bridge_start(&s, urls, 2, false, false);
+    acl_control("{\"op\":\"req\"}");
+    char *grant = acl_event(&s, t, a);
+    acl_deliver(&s, 0, grant); free(grant); acl_eose(&s, 0);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    acl_control("{\"op\":\"release_connection\",\"relay\":1}");
+    acl_control("{\"op\":\"req\",\"relay\":1}");
+    pthread_mutex_lock(&s.mu); s.hold_processing = true;
+    unsigned processing = s.processing; pthread_mutex_unlock(&s.mu);
+    char *revocation = acl_event(&s, t + 1, NULL);
+    acl_control("{\"op\":\"event_eose\",\"relay\":1,\"event\":%s}", revocation);
+    free(revocation);
+    acl_wait(&s, &s.processing, processing + 1);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    pthread_mutex_lock(&s.mu); s.release_processing = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
+    printf("  PASS: private history, empty/unknown/open, ordering/ties, delayed handshake and EVENT/EOSE fence\n");
+}
+
+typedef struct { MdNostr *n; const char *pk; bool remove; int result; } AclEdit;
+static void *acl_edit_thread(void *data) {
+    AclEdit *edit = data;
+    edit->result = edit->remove ? md_nostr_allowlist_remove(edit->n, edit->pk) :
+        md_nostr_allowlist_add(edit->n, edit->pk, "video");
+    return NULL;
+}
+static void *acl_destroy_thread(void *data) {
+    md_nostr_destroy(((AclTest *)data)->bridge);
+    return NULL;
+}
+static void acl_mode(const char *mode) {
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"mode\",\"relay\":%d,\"value\":\"%s\"}", i, mode);
+}
+static void test_acl_edits(const char **urls, const char *a, const char *b) {
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 2, false, false); acl_eose(&s, 0); acl_eose(&s, 1);
+    atomic_store(&s.fail_sign, true);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == -1);
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 0);
+    atomic_store(&s.fail_sign, false); acl_mode("reject");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == -1);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    /* One accepting relay is sufficient even when the other rejects. */
+    acl_control("{\"op\":\"mode\",\"value\":\"accept\"}");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == 0);
+    int signs = atomic_load(&s.signs);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "input") == 0);
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, b) == 0);
+    MD_CHECK(atomic_load(&s.signs) == signs);
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 1);
+    MdAllowlistEntry entry;
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, &entry) == 0);
+    MD_CHECK(!strcmp(entry.caps, "video"));
+    atomic_store(&s.fail_sign, true);
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, a) == -1);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a));
+    atomic_store(&s.fail_sign, false);
+
+    acl_mode("hold");
+    AclEdit edit = { s.bridge, b, false, -2 };
+    pthread_t worker;
+    MD_CHECK(pthread_create(&worker, NULL, acl_edit_thread, &edit) == 0);
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"published\",\"relay\":%d,\"count\":3}", i);
+    unsigned received = acl_counter(&s, &s.received);
+    acl_control("{\"op\":\"echo\"}"); acl_wait(&s, &s.received, received + 1);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, b)); /* Echo before OK cannot commit. */
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 1);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, b, "video") == -1); /* busy */
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"ack\",\"relay\":%d,\"ok\":true}", i);
+    pthread_join(worker, NULL); MD_CHECK(edit.result == 0);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, b));
+    acl_mode("reject");
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, b) == -1);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, b));
+    acl_mode("accept");
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, b) == 0);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, b));
+
+    pthread_mutex_lock(&s.mu);
+    s.hold_signed = true;
+    unsigned signed_before = s.signed_count;
+    pthread_mutex_unlock(&s.mu);
+    edit.result = -2;
+    MD_CHECK(pthread_create(&worker, NULL, acl_edit_thread, &edit) == 0);
+    acl_wait(&s, &s.signed_count, signed_before + 1);
+    char *replacement = acl_event(&s, time(NULL) + 100, NULL);
+    acl_deliver(&s, 1, replacement); free(replacement);
+    pthread_mutex_lock(&s.mu); s.release_signed = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    pthread_join(worker, NULL);
+    MD_CHECK(edit.result == -1); /* OK cannot overwrite the concurrent version. */
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 0);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a) && !md_nostr_is_allowed(s.bridge, b));
+    acl_finish(&s);
+
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    edit = (AclEdit){ s.bridge, a, false, -2 };
+    unsigned admitted = acl_counter(&s, &s.admitted);
+    MD_CHECK(pthread_create(&worker, NULL, acl_edit_thread, &edit) == 0);
+    acl_wait(&s, &s.admitted, admitted + 1);
+    MD_CHECK(atomic_load(&s.signs) == 0);
+    md_nostr_stop(s.bridge);
+    pthread_join(worker, NULL); MD_CHECK(edit.result == -1);
+    acl_finish(&s);
+    printf("  PASS: staged edits, signer/all-relay failure, echo, duplicate add, replacement conflict and history-wait cancellation\n");
+}
+
+static void test_auth_wire(const char **urls, const char *a) {
+    AclTest s;
+    acl_reset(); acl_control("{\"op\":\"reset\",\"auth\":true}");
+    acl_bridge(&s, urls, 1, false, true);
+    acl_control("{\"op\":\"auth\",\"count\":1}");
+    NostrEvent *ev = nostr_event_new();
+    MD_CHECK(nostr_event_deserialize(ev, acl_reply) == 0);
+    MD_CHECK(nostr_event_validate(ev, NULL) == NOSTR_EVENT_VALIDATION_OK);
+    MD_CHECK(nostr_event_get_kind(ev) == NOSTR_KIND_CLIENT_AUTHENTICATION);
+    MD_CHECK(!strcmp(nostr_event_get_pubkey(ev), md_nostr_get_npub(s.bridge)));
+    MD_CHECK(strstr(acl_reply, "challenge-one") && strstr(acl_reply, urls[0]));
+    nostr_event_free(ev);
+    acl_control("{\"op\":\"protected\",\"count\":0}");
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    unsigned results = acl_counter(&s, &s.auth_results);
+    acl_control("{\"op\":\"auth_result\",\"ok\":false}");
+    acl_wait(&s, &s.auth_results, results + 1);
+    acl_control("{\"op\":\"protected\",\"count\":0}");
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-two\"}");
+    acl_control("{\"op\":\"auth\",\"count\":2}");
+    MD_CHECK(strstr(acl_reply, "challenge-two"));
+    results = acl_counter(&s, &s.auth_results);
+    acl_control("{\"op\":\"auth_result\",\"ok\":true}");
+    acl_wait(&s, &s.auth_results, results + 1);
+    acl_wait_state(&s, MD_NOSTR_ACL_LOADED); /* private protected REQ eventually EOSE */
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); /* authenticated != authorized */
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-three\"}");
+    acl_control("{\"op\":\"auth\",\"count\":3}");
+    results = acl_counter(&s, &s.auth_results);
+    acl_control("{\"op\":\"auth_result\",\"ok\":true}");
+    acl_wait(&s, &s.auth_results, results + 1);
+    /* A slow signer must not block the relay reader or escape destroy. */
+    pthread_mutex_lock(&s.mu); s.hold_backend_sign = true;
+    unsigned entered = s.sign_entered; pthread_mutex_unlock(&s.mu);
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-cancel\"}");
+    acl_wait(&s, &s.sign_entered, entered + 1);
+    pthread_t destroyer;
+    MD_CHECK(pthread_create(&destroyer, NULL, acl_destroy_thread, &s) == 0);
+    acl_wait(&s, &s.draining, 1);
+    pthread_mutex_lock(&s.mu); s.release_backend_sign = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    pthread_join(destroyer, NULL); s.bridge = NULL;
+    acl_control("{\"op\":\"auth_count\",\"count\":3}");
+    acl_finish(&s);
+    printf("  PASS: private AUTH wire, real signatures, rejection, re-auth, protected REQ gating and blocked-signer teardown\n");
+    printf("  NOTE: protected REQ recovery still uses nostrc pool reconciliation (md-1be); md-xcy remains open\n");
+}
+
+static int acl_fixture_tests(const char **urls) {
+    char *a = md_nostr_get_pubkey(dm_sender_sk);
+    char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    test_acl_history(urls, a, b);
+    test_acl_edits(urls, a, b);
+    test_auth_wire(urls, a);
+    free(a); free(b);
+    return md_test_report();
+}
+
+int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--acl-fixture"))
+        return acl_fixture_tests((const char **)&argv[2]);
     printf("test_nostr (nostrc bridge):\n");
     test_keypair_generation();
     test_null_args();

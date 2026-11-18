@@ -135,8 +135,7 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
         /* Enforce allowlist: if an allowlist is configured, reject
          * clients that are not on it. If no allowlist is configured
          * (open mode), accept all clients. */
-        if (ctx->nostr && md_nostr_has_allowlist(ctx->nostr)
-            && !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
+        if (!ctx->nostr || !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
             fprintf(stderr, "host: REJECTED session request from "
                     "non-allowlisted pubkey %.*s...\n",
                     8, sender_pubkey_hex);

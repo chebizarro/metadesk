@@ -91,6 +91,9 @@ class Peer(socketserver.StreamRequestHandler):
                 body = json.dumps({"supported_nips": [1, 4, 11, 46], "name": "private-md70v3"}).encode()
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
                 return
+            gate = getattr(self.server, "handshake_gate", None)
+            if gate is not None and not gate.wait(timeout=15):
+                raise RuntimeError("fixture websocket handshake gate never released")
             accept = base64.b64encode(hashlib.sha1((headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
             self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
             self.wfile.flush()
