@@ -45,6 +45,8 @@
 struct MdStream {
     int          fd;
     bool         connected;
+    bool         session_bound;
+    uint32_t     granted_caps;
     uint32_t     send_seq;       /* monotonic sequence for sent packets    */
 
     /* TLS (NULL when plaintext) */
@@ -371,7 +373,13 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
     }
 
     srv->fd = fd;
-    srv->port = port;
+    socklen_t bound_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &bound_len) != 0) {
+        close(fd);
+        free(srv);
+        return NULL;
+    }
+    srv->port = ntohs(addr.sin6_port);
 
     /* Set up TLS context if requested */
     if (tls && tls->enabled) {
@@ -434,6 +442,10 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
     }
 
     return stream_from_fd(client_fd, ssl);
+}
+
+uint16_t md_stream_server_port(const MdStreamServer *srv) {
+    return srv ? srv->port : 0;
 }
 
 void md_stream_server_destroy(MdStreamServer *srv) {
@@ -674,6 +686,68 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
     s->bytes_recv += (size_t)MD_PACKET_HEADER_SIZE + hdr->payload_len;
     s->packets_recv++;
     return 0;
+}
+
+static uint64_t stream_now_ms64(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+void md_stream_close(MdStream *s) {
+    if (!s) return;
+    s->session_bound = false;
+    s->granted_caps = 0;
+    s->connected = false;
+    if (s->fd >= 0) shutdown(s->fd, SHUT_RDWR);
+}
+
+bool md_stream_has_capability(const MdStream *s, uint32_t caps) {
+    return s && s->connected && s->session_bound &&
+        (s->granted_caps & caps) == caps;
+}
+
+int md_stream_accept_binding(MdStream *s, MdSession *session) {
+    if (!s || !s->connected || s->session_bound || !session ||
+        session->state != MD_SESSION_NEGOTIATING || !session->stream_token[0])
+        goto reject;
+    uint64_t deadline = stream_now_ms64() + MD_SESSION_BIND_TIMEOUT_MS;
+    uint8_t header[MD_PACKET_HEADER_SIZE];
+    MdPacketHeader hdr;
+    /* Never allocate the general 16 MiB packet budget for an unproven peer. */
+    if (read_exact(s, header, sizeof(header), MD_SESSION_BIND_TIMEOUT_MS) != 0 ||
+        md_packet_header_read(&hdr, header, sizeof(header)) < 0 ||
+        hdr.type != MD_PKT_SESSION_INFO || hdr.payload_len == 0 ||
+        hdr.payload_len > MD_SESSION_JSON_MAX)
+        goto reject;
+    uint64_t now = stream_now_ms64();
+    if (now >= deadline) goto reject;
+    uint8_t payload[MD_SESSION_JSON_MAX];
+    if (read_exact(s, payload, hdr.payload_len, (uint32_t)(deadline - now)) != 0)
+        goto reject;
+    now = stream_now_ms64();
+    int ret = now >= deadline ? -1 :
+        md_session_consume_binding(session, payload, hdr.payload_len, now);
+    OPENSSL_cleanse(payload, hdr.payload_len);
+    if (ret != 0) goto reject;
+    /* No token in the ACK, and no client-supplied grants are echoed. */
+    MdSessionAccept ack = {
+        .granted = session->capabilities,
+        .tree_format = session->tree_format,
+    };
+    memcpy(ack.session_id, session->session_id, sizeof(ack.session_id));
+    char *json = md_session_accept_to_json(&ack);
+    if (!json) goto reject;
+    ret = md_stream_send(s, MD_PKT_SESSION_INFO, 0,
+                         (const uint8_t *)json, (uint32_t)strlen(json));
+    free(json);
+    if (ret != 0) goto reject;
+    s->granted_caps = session->capabilities;
+    s->session_bound = true;
+    return 0;
+reject:
+    md_stream_close(s);
+    return -1;
 }
 
 /* ── Ping/Pong ───────────────────────────────────────────────── */

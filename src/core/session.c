@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cjson/cJSON.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
 
 void md_session_init(MdSession *s) {
     if (!s) return;
@@ -57,6 +59,8 @@ int md_session_disconnect(MdSession *s) {
     if (!s || s->state == MD_SESSION_IDLE)
         return -1;
 
+    OPENSSL_cleanse(s->stream_token, sizeof(s->stream_token));
+    s->stream_deadline_ms = 0;
     s->state = MD_SESSION_DISCONNECTING;
     return 0;
 }
@@ -89,6 +93,84 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms) {
         return false; /* clock rollback or same timestamp */
 
     return (now_ms - s->last_pong_ms) > ((uint64_t)s->keepalive_ms * MD_SESSION_KEEPALIVE_TIMEOUT_MULT);
+}
+
+/* ── One-use stream binding ─────────────────────────────────── */
+
+int md_session_prepare_binding(MdSession *s, MdSessionAccept *acc, uint64_t now_ms) {
+    if (!s || !acc || s->state != MD_SESSION_NEGOTIATING ||
+        !s->session_id[0] || s->stream_token[0] ||
+        now_ms > UINT64_MAX - MD_SESSION_TOKEN_LIFETIME_MS)
+        return -1;
+    uint8_t random[32];
+    if (RAND_bytes(random, sizeof(random)) != 1)
+        return -1; /* Never authorize with predictable fallback entropy. */
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        s->stream_token[i * 2] = hex[random[i] >> 4];
+        s->stream_token[i * 2 + 1] = hex[random[i] & 15];
+    }
+    OPENSSL_cleanse(random, sizeof(random));
+    s->stream_token[64] = '\0';
+    s->stream_deadline_ms = now_ms + MD_SESSION_TOKEN_LIFETIME_MS;
+    memset(acc, 0, sizeof(*acc));
+    memcpy(acc->session_id, s->session_id, sizeof(acc->session_id));
+    memcpy(acc->stream_token, s->stream_token, sizeof(acc->stream_token));
+    acc->granted = s->capabilities;
+    acc->tree_format = s->tree_format;
+    return 0;
+}
+
+char *md_session_bind_to_json(const MdSessionAccept *acc) {
+    if (!acc || !acc->session_id[0] || strlen(acc->stream_token) != 64)
+        return NULL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    char *json = NULL;
+    if (cJSON_AddStringToObject(root, "type", "session_bind") &&
+        cJSON_AddNumberToObject(root, "v", 1) &&
+        cJSON_AddStringToObject(root, "session_id", acc->session_id) &&
+        cJSON_AddStringToObject(root, "stream_token", acc->stream_token))
+        json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return json;
+}
+
+int md_session_consume_binding(MdSession *s, const uint8_t *payload, size_t len,
+                               uint64_t now_ms) {
+    if (!s || s->state != MD_SESSION_NEGOTIATING || !s->stream_token[0] ||
+        !payload || len == 0 || len > MD_SESSION_JSON_MAX ||
+        memchr(payload, '\0', len))
+        return -1;
+    if (now_ms >= s->stream_deadline_ms) {
+        OPENSSL_cleanse(s->stream_token, sizeof(s->stream_token));
+        return -1;
+    }
+    char json[MD_SESSION_JSON_MAX + 1];
+    memcpy(json, payload, len);
+    json[len] = '\0';
+    cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+    OPENSSL_cleanse(json, len);
+    if (!root) return -1;
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
+    cJSON *sid = cJSON_GetObjectItemCaseSensitive(root, "session_id");
+    cJSON *token = cJSON_GetObjectItemCaseSensitive(root, "stream_token");
+    /* Exactly four fields rejects duplicate/ambiguous keys and client claims
+     * about capabilities. Only the reservation supplies the grant. */
+    bool valid = cJSON_IsObject(root) && cJSON_GetArraySize(root) == 4 &&
+        cJSON_IsString(type) && strcmp(type->valuestring, "session_bind") == 0 &&
+        cJSON_IsNumber(v) && v->valuedouble == 1 &&
+        cJSON_IsString(sid) && strcmp(sid->valuestring, s->session_id) == 0 &&
+        cJSON_IsString(token) && strlen(token->valuestring) == 64 &&
+        CRYPTO_memcmp(token->valuestring, s->stream_token, 64) == 0;
+    if (cJSON_IsString(token))
+        OPENSSL_cleanse(token->valuestring, strlen(token->valuestring));
+    cJSON_Delete(root);
+    if (!valid) return -1;
+    OPENSSL_cleanse(s->stream_token, sizeof(s->stream_token));
+    s->stream_deadline_ms = 0;
+    return md_session_activate(s);
 }
 
 /* ── Capability helpers ──────────────────────────────────────── */
@@ -261,6 +343,10 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
         !cJSON_AddStringToObject(root, "session_id", acc->session_id))
         goto fail;
 
+    if (acc->stream_token[0] &&
+        !cJSON_AddStringToObject(root, "stream_token", acc->stream_token))
+        goto fail;
+
     /* granted array */
     granted_arr = cJSON_CreateArray();
     if (!granted_arr)
@@ -317,6 +403,15 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
     if (cJSON_IsString(sid)) {
         strncpy(out->session_id, sid->valuestring, sizeof(out->session_id) - 1);
         out->session_id[sizeof(out->session_id) - 1] = '\0';
+    }
+
+    cJSON *token = cJSON_GetObjectItemCaseSensitive(root, "stream_token");
+    if (token) {
+        if (!cJSON_IsString(token) || strlen(token->valuestring) != 64) {
+            cJSON_Delete(root);
+            return -1;
+        }
+        memcpy(out->stream_token, token->valuestring, 65);
     }
 
     /* granted */

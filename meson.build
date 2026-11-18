@@ -826,6 +826,10 @@ test_signer = executable('test_signer',
 )
 test('signer abstraction', test_signer)
 
+test_host_binding = executable('test_host_binding',
+  files('tests/test_host_binding.c'), dependencies : [dep_metadesk])
+test('host_binding', test_host_binding, timeout : 30)
+
 test_session = executable('test_session',
   files('tests/test_session.c'),
   dependencies : [dep_metadesk],
