@@ -78,7 +78,7 @@ def inside(host, client, bunker, root):
         cmd = [host, "access", "--config-dir", str(configs["host"]), "--relay", url]
         checked([*cmd, "add", CLIENT_NPUB], env)
         listed = checked([*cmd, "list"], env)
-        assert listed.stdout.strip() == CLIENT_PK, listed.stdout
+        assert listed.stdout.strip() == CLIENT_PK + "\tvideo", listed.stdout
         # The caller placed this entire process tree in a disposable netns.
         # No interface, route or address in the VM's main namespace is changed.
         checked(["ip", "-6", "addr", "add", addresses["host"] + "/128", "dev", "lo", "nodad"], env)

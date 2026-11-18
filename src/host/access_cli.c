@@ -9,12 +9,12 @@ static int usage(void) {
     fprintf(stderr,
         "Usage: metadesk-host access [--config-dir ABSOLUTE_DIRECTORY] [--relay URL ...] COMMAND\n"
         "  list\n"
-        "  add <npub>\n"
+        "  add <npub> [caps]\n"
         "  remove <npub>\n"
         "Uses the saved host role; no signer override or open mode.\n"
-        "Membership permits requested video, agent and input capabilities.\n"
-        "Per-client capability restrictions are not implemented; caps arguments are rejected.\n"
-        "list prints public keys in lowercase hex, one per line.\n"
+        "caps: none or a comma-separated subset in video,agent,input order (no spaces).\n"
+        "Explicit caps replaces the grant; omitted caps preserves existing, defaults new to video.\n"
+        "list prints lowercase hex public keys and effective caps, tab-separated.\n"
         "Waits for relay history and, on edits, a positive publish acknowledgement.\n");
     return 2;
 }
@@ -36,8 +36,12 @@ int md_host_access_cli(int argc, char **argv) {
     const char *cmd = remaining ? argv[arg] : "";
     bool list = !strcmp(cmd, "list"), add = !strcmp(cmd, "add");
     char pk[65] = {0};
+    const char *caps = add && remaining == 3 ? argv[arg + 2] : NULL;
+    uint32_t parsed;
     if ((list && remaining != 1) ||
-        (!list && ((!add && strcmp(cmd, "remove")) || remaining != 2)) ||
+        (!list && ((!add && strcmp(cmd, "remove")) ||
+                   (add ? remaining != 2 && remaining != 3 : remaining != 2))) ||
+        (caps && md_nostr_parse_caps(caps, &parsed)) ||
         (!list && md_fips_npub_to_pubkey_hex(argv[arg + 1], pk, sizeof(pk)))) {
         free(relays);
         return usage();
@@ -70,11 +74,12 @@ int md_host_access_cli(int argc, char **argv) {
         MdAllowlistEntry *entries = NULL;
         size_t count = 0;
         rc = md_nostr_allowlist_snapshot(nostr, &entries, &count);
-        if (!rc) for (size_t i = 0; i < count; ++i) puts(entries[i].pubkey_hex);
+        if (!rc) for (size_t i = 0; i < count; ++i)
+            printf("%s\t%s\n", entries[i].pubkey_hex, entries[i].caps);
         free(entries);
         if (!rc && fflush(stdout)) rc = -1;
     } else {
-        rc = add ? md_nostr_allowlist_add(nostr, pk, NULL)
+        rc = add ? md_nostr_allowlist_add(nostr, pk, caps)
                  : md_nostr_allowlist_remove(nostr, pk);
     }
     if (rc) fprintf(stderr, "access: operation failed (history unavailable, signer/publish failure, or concurrent replacement); reread list before retrying\n");

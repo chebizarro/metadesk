@@ -83,7 +83,8 @@ def run_contracts(host, crypto, root, env, relay):
         return p
     access("list", ok=False)
     for args in [[], ["add"], ["remove"], ["add", "npub1bad"], ["add", CLIENT_PK],
-                 ["add", CLIENT_NPUB, "video"], ["list", "extra"], ["--open", "list"]]:
+                 ["add", CLIENT_NPUB, "video,bad"], ["add", CLIENT_NPUB, "input,video"],
+                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["--open", "list"]]:
         p = access(*args, ok=False)
         assert p.returncode == 2, p.stderr
     account("add", "nip5f", HOST_PK, "private host")
@@ -113,21 +114,34 @@ def run_contracts(host, crypto, root, env, relay):
         relay.publish_release.set()
     stdout, stderr = p.communicate(timeout=20)
     assert p.returncode == 0, (stdout, stderr)
-    expected = {HOST_PK, CLIENT_PK}
+    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo"}
     assert set(access("list").stdout.splitlines()) == expected
     count = relay.oks
     access("add", CLIENT_NPUB)
     assert relay.oks == count, "idempotent add republished"
+    access("add", CLIENT_NPUB, "video,agent,input")
+    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo,agent,input"}
+    assert set(access("list").stdout.splitlines()) == expected
+    access("add", CLIENT_NPUB)  # Omission must not silently narrow/regrant.
+    assert set(access("list").stdout.splitlines()) == expected
     relay.reject = True
+    access("add", CLIENT_NPUB, "none", ok=False)
+    assert set(access("list").stdout.splitlines()) == expected
     access("remove", CLIENT_NPUB, ok=False)
     relay.reject = False
     assert set(access("list").stdout.splitlines()) == expected
+    access("add", CLIENT_NPUB, "none")
+    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tnone"}
+    assert set(access("list").stdout.splitlines()) == expected
+    count = relay.oks
+    access("add", CLIENT_NPUB, "none")
+    assert relay.oks == count, "idempotent revoke republished"
     relay.closed = True
     access("list", ok=False)
     access("add", CLIENT_NPUB, ok=False)
     relay.closed = False
     access("remove", CLIENT_NPUB)
-    assert access("list").stdout.strip() == HOST_PK
+    assert access("list").stdout.strip() == HOST_PK + "\tvideo"
     count = relay.oks
     access("remove", CLIENT_NPUB)
     assert relay.oks == count
@@ -161,7 +175,8 @@ def main():
         if syntax_only:
             base = [host, "access", "--config-dir", str(root / "syntax")]
             for args in [[], ["add"], ["remove"], ["add", "npub1bad"], ["add", CLIENT_PK],
-                         ["add", CLIENT_NPUB, "video"], ["list", "extra"], ["--open", "list"]]:
+                         ["add", CLIENT_NPUB, "video,bad"], ["add", CLIENT_NPUB, "input,video"],
+                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["--open", "list"]]:
                 p = subprocess.run([*base, *args], env=env, capture_output=True, text=True, timeout=10)
                 assert p.returncode == 2, (args, p.stdout, p.stderr)
             p = subprocess.run([*base, "list"], env=env, capture_output=True, text=True, timeout=10)

@@ -922,7 +922,10 @@ static void test_acl_history(const char **urls, const char *a, const char *b) {
     char *one = acl_event(&s, t + 2, a), *two = acl_event(&s, t + 2, b);
     NostrEvent *e1 = nostr_event_new(), *e2 = nostr_event_new();
     MD_CHECK(nostr_event_deserialize(e1, one) == 0 && nostr_event_deserialize(e2, two) == 0);
-    bool first_low = strcmp(nostr_event_get_id(e1), nostr_event_get_id(e2)) < 0;
+    char id1[65], id2[65];
+    MD_CHECK(nostr_event_compute_id(e1, id1) == NOSTR_EVENT_VALIDATION_OK);
+    MD_CHECK(nostr_event_compute_id(e2, id2) == NOSTR_EVENT_VALIDATION_OK);
+    bool first_low = strcmp(id1, id2) < 0;
     const char *low = first_low ? one : two, *high = first_low ? two : one;
     acl_deliver(&s, 0, high); acl_deliver(&s, 1, low); acl_deliver(&s, 0, high);
     MD_CHECK(md_nostr_is_allowed(s.bridge, first_low ? a : b));
@@ -998,13 +1001,26 @@ static void test_acl_edits(const char **urls, const char *a, const char *b) {
     acl_control("{\"op\":\"mode\",\"value\":\"accept\"}");
     MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == 0);
     int signs = atomic_load(&s.signs);
-    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "input") == 0);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == 0);
     MD_CHECK(md_nostr_allowlist_remove(s.bridge, b) == 0);
     MD_CHECK(atomic_load(&s.signs) == signs);
     MD_CHECK(md_nostr_allowlist_count(s.bridge) == 1);
     MdAllowlistEntry entry;
     MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, &entry) == 0);
     MD_CHECK(!strcmp(entry.caps, "video"));
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == MD_CAP_VIDEO);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, MD_CAP_INPUT) == 0);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video,agent,input") == 0);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) ==
+             (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT));
+    acl_mode("reject");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "none") == -1);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, MD_CAP_INPUT) == MD_CAP_INPUT);
+    acl_mode("accept");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "none") == 0);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a)); /* Membership isn't a grant. */
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == 0);
     atomic_store(&s.fail_sign, true);
     MD_CHECK(md_nostr_allowlist_remove(s.bridge, a) == -1);
     MD_CHECK(md_nostr_is_allowed(s.bridge, a));
@@ -1014,7 +1030,7 @@ static void test_acl_edits(const char **urls, const char *a, const char *b) {
     AclEdit edit = { s.bridge, b, false, -2 };
     pthread_t worker;
     MD_CHECK(pthread_create(&worker, NULL, acl_edit_thread, &edit) == 0);
-    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"published\",\"relay\":%d,\"count\":3}", i);
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"held\",\"relay\":%d}", i);
     unsigned received = acl_counter(&s, &s.received);
     acl_control("{\"op\":\"echo\"}"); acl_wait(&s, &s.received, received + 1);
     MD_CHECK(!md_nostr_is_allowed(s.bridge, b)); /* Echo before OK cannot commit. */
@@ -1122,6 +1138,11 @@ int main(int argc, char **argv) {
         return acl_fixture_tests((const char **)&argv[2]);
     printf("test_nostr (nostrc bridge):\n");
     test_keypair_generation();
+    uint32_t caps = UINT32_MAX;
+    MD_CHECK(md_nostr_parse_caps("video,agent,input", &caps) == 0 && caps == 7);
+    MD_CHECK(md_nostr_parse_caps("none", &caps) == 0 && caps == 0);
+    MD_CHECK(md_nostr_parse_caps("video,bad", &caps) == -1 && caps == 0);
+    MD_CHECK(md_nostr_granted_capabilities(NULL, "", UINT32_MAX) == 0);
     test_null_args();
     test_allowlist_default_deny();
     test_nip44_roundtrip();

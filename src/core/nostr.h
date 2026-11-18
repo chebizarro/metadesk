@@ -22,6 +22,7 @@
 
 #include "signer.h"
 #include "accounts.h"
+#include "session.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -215,12 +216,22 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
  * This is a replaceable event — only the latest version matters.
  */
 
-/* Check if pubkey_hex is on the cached allowlist. */
+/* Membership only, NOT capability authorization. */
 bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
+
+/* Atomic requested & entry grant from the loaded policy. Missing/legacy/
+ * malformed/duplicate scopes deny; UNKNOWN/FAILED deny. Explicit OPEN permits
+ * known bits only. Recheck at session acceptance; zero means refuse. */
+uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pubkey_hex,
+                                      uint32_t requested);
+
+/* Strict CLI vocabulary: none or a canonical subset of video,agent,input.
+ * Returns -1 for unknown/duplicate/out-of-order/empty tokens; clears *out. */
+int md_nostr_parse_caps(const char *text, uint32_t *out);
 
 /* History readiness is independent of membership. UNKNOWN/FAILED deny, and
  * LOADED with zero entries denies all. OPEN is only selected by config.
- * Always enforce md_nostr_is_allowed(), never gate it on has_allowlist(). */
+ * Authorize with md_nostr_granted_capabilities(), never has_allowlist(). */
 MdNostrAclState md_nostr_allowlist_state(MdNostr *n);
 
 /* True when history has loaded (including an empty list); not an auth check. */
@@ -234,7 +245,9 @@ int md_nostr_refresh_allowlist(MdNostr *n);
  * for EOSE/failure or stop/revocation. Returns -1 on failed history, signer/
  * publish failure, a busy edit, or concurrent replacement.
  * A conflict can already have reached a relay; refresh/reconcile before retry.
- * Duplicate add is a no-op (does not change existing capabilities). */
+ * NULL caps preserves an existing member or adds a new video-only member.
+ * Explicit canonical caps upserts membership and a v1 grant (none revokes all).
+ * Removal drops every matching membership and grant. Identical edits no-op. */
 int md_nostr_allowlist_add(MdNostr *n, const char *pubkey_hex, const char *caps);
 
 /* Remove pubkey_hex from allowlist, publish updated list. */
@@ -243,7 +256,7 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex);
 /* Allowlist entry snapshot (copied out under the allowlist lock) */
 typedef struct {
     char pubkey_hex[65];  /* NUL-terminated npub hex (64 chars)  */
-    char caps[64];        /* capability string ("" if none)      */
+    char caps[64];        /* effective canonical caps, or "none" */
 } MdAllowlistEntry;
 
 /* Wait for EOSE/CLOSED/connection failure (or stop/revocation), then copy a

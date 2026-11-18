@@ -5,6 +5,10 @@ an implementation of the full P3.8/session-v2 management protocol. Binary
 framing remains version 1. Both host and client must be upgraded together.
 
 1. The host records the authenticated Nostr request and its authoritative grant.
+   At acceptance it rechecks the current per-client allowlist policy and computes
+   `requested & entry_grant` (also applying local `--no-input`). Zero is refused.
+   Legacy/malformed grants default to zero; see [grant format v1](access.md).
+   This is a snapshot for the next stream, not dynamic active-stream revocation.
    Once listener/capture/backend startup is complete, it reserves a CSPRNG
    256-bit token for 30 seconds on the monotonic clock and publishes acceptance.
    Startup cannot spend the client's bind/ACK budget. Entropy failure denies
