@@ -21,6 +21,7 @@
 #define MD_NOSTR_H
 
 #include "signer.h"
+#include "accounts.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -69,6 +70,9 @@ typedef struct {
     const char  *sk_hex;          /* 64-char hex secret key (fallback) */
     const char **relay_urls;      /* NULL-terminated array of relay URLs */
     int          relay_count;
+    /* Optional checked owner. Retained until destroy; signer must be NULL or
+     * the binding's signer. Revocation stops this bridge, never the signer. */
+    MdAccountBinding *owner;
 } MdNostrConfig;
 
 /* ── Event callbacks ──────────────────────────────────────────
@@ -77,6 +81,10 @@ typedef struct {
  */
 
 /* Called when a session-related DM (NIP-17 gift-wrap) is received and decrypted */
+/* Runs synchronously on the control thread revoking the role, after bridge
+ * admission/cancellable operations stop. Must not destroy the bridge here. */
+typedef void (*MdNostrOwnerRevokedCallback)(void *userdata);
+
 typedef void (*MdNostrDmCallback)(const char *sender_pubkey_hex,
                                   const char *content,
                                   void *userdata);
@@ -122,6 +130,8 @@ typedef struct {
     void                          *publish_result_userdata;
     /* Worker validation failures, never plaintext/key material. */
     void (*on_dm_error)(MdNostrDmResult result, void *userdata);
+    MdNostrOwnerRevokedCallback on_owner_revoked;
+    void *owner_userdata;
 } MdNostrCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────
@@ -168,7 +178,8 @@ void md_nostr_drain_dm(MdNostr *n);
  * hooks run outside bridge locks and must not re-enter bridge APIs. NULL is
  * the production default. ADMITTED may block to hold an in-flight reader. */
 typedef enum {
-    MD_NOSTR_TEST_ADMITTED, MD_NOSTR_TEST_SERIALIZING, MD_NOSTR_TEST_DRAINING
+    MD_NOSTR_TEST_ADMITTED, MD_NOSTR_TEST_SERIALIZING, MD_NOSTR_TEST_DRAINING,
+    MD_NOSTR_TEST_ALLOWLIST_RECEIVED
 } MdNostrTestPoint;
 void md_nostr_set_test_hook(MdNostr *n,
     void (*hook)(MdNostrTestPoint, void *), void *userdata);

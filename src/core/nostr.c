@@ -53,6 +53,8 @@ static NostrEvent *event_from_json(const char *json) {
 }
 
 struct MdNostr {
+    MdAccountBinding  *owner;
+    MdAccountWatch    *owner_watch;
     MdSigner          *signer;       /* signing backend                     */
     MdSignerCancel    *signer_cancel; /* bridge-local, never closes shared signer */
     char              *pk_hex;       /* our public key, hex                 */
@@ -100,7 +102,7 @@ static void test_point(MdNostr *n, MdNostrTestPoint point) {
 static bool operation_begin(MdNostr *n) {
     if (!n) return false;
     pthread_mutex_lock(&n->work_mu);
-    bool accepted = !n->closing;
+    bool accepted = !n->closing && (!n->owner || md_account_binding_is_current(n->owner));
     if (accepted) n->active_ops++;
     pthread_mutex_unlock(&n->work_mu);
     if (accepted) test_point(n, MD_NOSTR_TEST_ADMITTED);
@@ -109,9 +111,18 @@ static bool operation_begin(MdNostr *n) {
 
 static bool is_stopped(MdNostr *n) {
     pthread_mutex_lock(&n->work_mu);
-    bool stopped = n->closing;
+    bool stopped = n->closing || (n->owner && !md_account_binding_is_current(n->owner));
     pthread_mutex_unlock(&n->work_mu);
     return stopped;
+}
+
+static bool owns_host(MdNostr *n) {
+    return n && (!n->owner || md_account_binding_role(n->owner) == MD_ACCOUNT_HOST);
+}
+static void owner_revoked(void *data) {
+    MdNostr *n = data;
+    md_nostr_stop(n);
+    if (n->cbs.on_owner_revoked) n->cbs.on_owner_revoked(n->cbs.owner_userdata);
 }
 
 static void operation_end(MdNostr *n) {
@@ -481,8 +492,8 @@ void md_nostr_drain_dm(MdNostr *n) {
  * This runs on the pool's worker thread — callbacks must be
  * thread-safe or dispatch to the main thread.
  */
-static void md_nostr_event_handler(NostrIncomingEvent *incoming,
-                                   void *user_data) {
+static void handle_incoming_event(NostrIncomingEvent *incoming,
+                                  void *user_data) {
     if (!incoming || !incoming->event)
         return;
 
@@ -498,6 +509,7 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming,
         if (result != MD_NOSTR_DM_OK)
             MD_LOG_W("DM ingress rejected: %s", md_nostr_dm_result_name(result));
     } else if (kind == NOSTR_KIND_CATEGORIZED_PEOPLE_LIST) {
+        if (!owns_host(n)) return;
         /* NIP-51 categorized people list — check if it's our allowlist.
          * The list is access control: only accept it from our own key
          * with a valid signature. The REQ filter is enforced by the
@@ -523,10 +535,19 @@ static void md_nostr_event_handler(NostrIncomingEvent *incoming,
             size_t count = list->count;
             pthread_mutex_unlock(&n->allowlist_mu);
             MD_LOG_I("refreshed allowlist (%zu entries)", count);
+            test_point(n, MD_NOSTR_TEST_ALLOWLIST_RECEIVED);
         } else {
             nostr_nip51_list_free(list);
         }
     }
+}
+
+/* Pool middleware owns the event even on rejection/stopped paths. DM ingress
+ * serializes its bounded copy; NIP-51 parsing copies entries, not the event. */
+static void md_nostr_event_handler(NostrIncomingEvent *incoming, void *user_data) {
+    if (!incoming) return;
+    handle_incoming_event(incoming, user_data);
+    nostr_event_free(incoming->event);
 }
 
 /* ── Lifecycle ────────────────────────────────────────────── */
@@ -565,7 +586,7 @@ static int md_nostr_subscribe(MdNostr *n) {
     /* kind:30000, authors:[our_pk], #d:["metadesk-allowlist"].
      * limit:1 — addressable event (NIP-33), only the latest exists;
      * the subscription stays open for live replacements. */
-    {
+    if (owns_host(n)) {
         NostrFilter *f = nostr_filter_builder_build(
             nostr_filter_builder_limit(
                 nostr_filter_builder_tag(
@@ -595,7 +616,10 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         return NULL;
 
     /* Must have either signer or sk_hex */
-    if (!cfg->signer && !cfg->sk_hex)
+    if (!cfg->signer && !cfg->sk_hex && !cfg->owner)
+        return NULL;
+    if (cfg->owner && (!md_account_binding_is_current(cfg->owner) ||
+        (cfg->signer && cfg->signer != md_account_binding_signer(cfg->owner))))
         return NULL;
 
     MdNostr *n = calloc(1, sizeof(MdNostr));
@@ -608,8 +632,9 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (!n->signer_cancel) { md_nostr_destroy(n); return NULL; }
 
     /* Set up signer: use provided signer, or create direct-key from sk_hex */
-    if (cfg->signer) {
-        n->signer = md_signer_ref(cfg->signer);
+    n->owner = md_account_binding_ref(cfg->owner);
+    if (cfg->owner || cfg->signer) {
+        n->signer = md_signer_ref(cfg->owner ? md_account_binding_signer(cfg->owner) : cfg->signer);
     } else {
         n->signer = md_signer_create_direct(cfg->sk_hex);
         if (!n->signer) {
@@ -631,6 +656,11 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     /* Store callbacks */
     if (cbs)
         n->cbs = *cbs;
+
+    if (n->owner) {
+        n->owner_watch = md_account_binding_watch(n->owner, owner_revoked, n);
+        if (!n->owner_watch || is_stopped(n)) { md_nostr_destroy(n); return NULL; }
+    }
 
     /* Create relay pool — persistent WebSocket connections */
     n->pool = nostr_simple_pool_new();
@@ -735,6 +765,7 @@ void md_nostr_stop(MdNostr *n) {
 
 void md_nostr_destroy(MdNostr *n) {
     if (!n) return;
+    md_account_binding_unwatch(n->owner_watch);
     md_nostr_stop(n);
 
     /* Stop relay producers before draining consumers. Keep the pool,
@@ -762,6 +793,7 @@ void md_nostr_destroy(MdNostr *n) {
     pthread_cond_destroy(&n->work_cv);
     pthread_mutex_destroy(&n->work_mu);
     md_signer_destroy(n->signer);
+    md_account_binding_release(n->owner);
     md_signer_cancel_free(n->signer_cancel);
 
     free(n->pk_hex);
@@ -928,7 +960,8 @@ static int md_nostr_send_dm(MdNostr *n, const char *recipient_pubkey_hex,
 
 int md_nostr_send_session_request(MdNostr *n, const char *host_pubkey_hex,
                                   const char *json_payload) {
-    if (!operation_begin(n)) return -1;
+    if (!n || (n->owner && md_account_binding_role(n->owner) != MD_ACCOUNT_CLIENT) ||
+        !operation_begin(n)) return -1;
     int ret = md_nostr_send_dm(n, host_pubkey_hex, json_payload);
     if (is_stopped(n)) ret = -1;
     operation_end(n);
@@ -937,7 +970,7 @@ int md_nostr_send_session_request(MdNostr *n, const char *host_pubkey_hex,
 
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload) {
-    if (!operation_begin(n)) return -1;
+    if (!owns_host(n) || !operation_begin(n)) return -1;
     int ret = md_nostr_send_dm(n, client_pubkey_hex, json_payload);
     if (is_stopped(n)) ret = -1;
     operation_end(n);
@@ -1160,32 +1193,40 @@ static int allowlist_get_entry(const MdNostr *n, int index,
 }
 
 bool md_nostr_is_allowed(MdNostr *n, const char *pk) {
-    if (!operation_begin(n)) return false;
+    if (!owns_host(n) || !operation_begin(n)) return false;
     bool ret = is_allowed(n, pk);
+    if (is_stopped(n)) ret = false;
     operation_end(n);
     return ret;
 }
 bool md_nostr_has_allowlist(const MdNostr *n) {
-    if (!operation_begin((MdNostr *)n)) return false;
+    if (!owns_host((MdNostr *)n) || !operation_begin((MdNostr *)n)) return false;
     bool ret = has_allowlist(n);
+    if (is_stopped((MdNostr *)n)) ret = false;
     operation_end((MdNostr *)n);
     return ret;
 }
 int md_nostr_refresh_allowlist(MdNostr *n) {
-    if (!operation_begin(n)) return -1;
+    if (!owns_host(n) || !operation_begin(n)) return -1;
     int ret = refresh_allowlist(n);
+    if (is_stopped(n)) ret = -1;
     operation_end(n);
     return ret;
 }
 int md_nostr_allowlist_count(const MdNostr *n) {
-    if (!operation_begin((MdNostr *)n)) return 0;
+    if (!owns_host((MdNostr *)n) || !operation_begin((MdNostr *)n)) return 0;
     int ret = allowlist_count(n);
+    if (is_stopped((MdNostr *)n)) ret = 0;
     operation_end((MdNostr *)n);
     return ret;
 }
 int md_nostr_allowlist_get_entry(const MdNostr *n, int index, MdAllowlistEntry *out) {
-    if (!operation_begin((MdNostr *)n)) return -1;
+    if (!owns_host((MdNostr *)n) || !operation_begin((MdNostr *)n)) return -1;
     int ret = allowlist_get_entry(n, index, out);
+    if (is_stopped((MdNostr *)n)) {
+        if (out) memset(out, 0, sizeof(*out));
+        ret = -1;
+    }
     operation_end((MdNostr *)n);
     return ret;
 }
@@ -1201,7 +1242,7 @@ int md_nostr_publish_signed_json(MdNostr *n, const char *json) {
 /* ── Generic event publishing ────────────────────────────────── */
 
 int md_nostr_allowlist_add(MdNostr *n, const char *pk, const char *caps) {
-    if (!operation_begin(n)) return -1;
+    if (!owns_host(n) || !operation_begin(n)) return -1;
     int ret = allowlist_add(n, pk, caps);
     if (is_stopped(n)) ret = -1;
     operation_end(n);
@@ -1209,7 +1250,7 @@ int md_nostr_allowlist_add(MdNostr *n, const char *pk, const char *caps) {
 }
 
 int md_nostr_allowlist_remove(MdNostr *n, const char *pk) {
-    if (!operation_begin(n)) return -1;
+    if (!owns_host(n) || !operation_begin(n)) return -1;
     int ret = allowlist_remove(n, pk);
     if (is_stopped(n)) ret = -1;
     operation_end(n);
@@ -1227,6 +1268,15 @@ static int publish_signed_json(MdNostr *n, const char *signed_event_json) {
         return -1;
     }
 
+    if (n->owner) {
+        const char *author = nostr_event_get_pubkey(ev);
+        char canonical[65];
+        if (!author || strcmp(author, n->pk_hex) ||
+            nostr_event_validate(ev, canonical) != NOSTR_EVENT_VALIDATION_OK) {
+            nostr_event_free(ev);
+            return -1;
+        }
+    }
     int ret = publish_all(n, ev);
     nostr_event_free(ev);
 

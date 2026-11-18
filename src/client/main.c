@@ -72,6 +72,8 @@ typedef struct {
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* set by on_dm callback           */
     GoChannel      *session_ch;       /* signaled on session accepted    */
+    MdAccountWatch *owner_watch;      /* also guards direct-IP sessions  */
+    MdAccountBinding *owner;          /* borrowed from startup until drain */
 
     /* Connection recovery UI state */
     int            reconnecting;      /* unexpected disconnect recovery  */
@@ -100,10 +102,20 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
 
 /* ── Nostr callbacks for --npub session negotiation ──────────── */
 
+static bool client_owner_current(const ClientCtx *ctx) {
+    return g_running && (!ctx->owner || md_account_binding_is_current(ctx->owner));
+}
+
+static void client_owner_revoked(void *data) {
+    ClientCtx *ctx = data;
+    g_running = 0;
+    if (ctx->session_ch) go_channel_close(ctx->session_ch);
+}
+
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
                           void *userdata) {
     ClientCtx *ctx = userdata;
-    if (!ctx || !content || !sender_pubkey_hex) return;
+    if (!ctx || !content || !sender_pubkey_hex || !client_owner_current(ctx)) return;
 
     /* Verify the DM came from the expected host */
     if (ctx->expected_host_pk[0] != '\0' &&
@@ -199,14 +211,19 @@ static int check_fips_daemon(const char *socket_path, uint32_t timeout_ms) {
 }
 
 static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
-    if (ctx && ctx->session_ch) {
-        go_channel_close(ctx->session_ch);
-        go_channel_unref(ctx->session_ch);
-        ctx->session_ch = NULL;
+    /* Drain callbacks/revocation before releasing their channel. */
+    if (ctx) {
+        md_account_binding_unwatch(ctx->owner_watch);
+        ctx->owner_watch = NULL;
     }
     if (nostr && *nostr) {
         md_nostr_destroy(*nostr);
         *nostr = NULL;
+    }
+    if (ctx && ctx->session_ch) {
+        go_channel_close(ctx->session_ch);
+        go_channel_unref(ctx->session_ch);
+        ctx->session_ch = NULL;
     }
 }
 
@@ -222,7 +239,7 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
                                   const char *host_pubkey_hex,
                                   uint32_t timeout_ms,
                                   MdSessionRequest *out_req) {
-    if (!nostr || !ctx || !host_pubkey_hex || !out_req)
+    if (!nostr || !ctx || !host_pubkey_hex || !out_req || !client_owner_current(ctx))
         return -1;
 
     reset_session_accept_state(ctx);
@@ -255,6 +272,10 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
     };
     go_select_timeout(cases, 1, (uint64_t)timeout_ms * 2);
 
+    if (!client_owner_current(ctx)) {
+        fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
+        return -1;
+    }
     if (!ctx->session_accepted) {
         fprintf(stderr, "ERROR: timed out waiting for session accept\n");
         return -1;
@@ -266,7 +287,7 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
 }
 
 static int send_session_info(MdStream *stream, const ClientCtx *ctx) {
-    if (!stream || !ctx)
+    if (!stream || !ctx || !client_owner_current(ctx))
         return -1;
 
     MdSessionAccept acc = { .tree_format = ctx->accepted_tree_format };
@@ -277,6 +298,7 @@ static int send_session_info(MdStream *stream, const ClientCtx *ctx) {
     if (!info_json)
         return -1;
 
+    if (!client_owner_current(ctx)) { free(info_json); return -1; }
     int ret = md_stream_send(stream, MD_PKT_SESSION_INFO, 0,
                              (const uint8_t *)info_json,
                              (uint32_t)strlen(info_json));
@@ -292,6 +314,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
                                        ClientCtx *ctx,
                                        MdSession *session) {
     MdStream *stream = NULL;
+    if (!client_owner_current(ctx)) return NULL;
 
     if (npub) {
         printf("client: checking FIPS daemon health...\n");
@@ -315,7 +338,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
 
         MdSessionRequest req;
         if (negotiate_npub_session(nostr, ctx, host_pubkey_hex,
-                                   timeout_ms, &req) != 0)
+                                   timeout_ms, &req) != 0 || !client_owner_current(ctx))
             return NULL;
 
         printf("client: connecting via FIPS to %.*s...\n", 12, npub);
@@ -325,7 +348,8 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
             return NULL;
         }
 
-        if (send_session_info(stream, ctx) != 0) {
+        if (!client_owner_current(ctx) || send_session_info(stream, ctx) != 0 ||
+            !client_owner_current(ctx)) {
             fprintf(stderr, "ERROR: failed to send session info\n");
             md_stream_destroy(stream);
             return NULL;
@@ -344,6 +368,10 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
             fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
     }
 
+    if (!client_owner_current(ctx)) {
+        md_stream_destroy(stream);
+        return NULL;
+    }
     return stream;
 }
 
@@ -552,6 +580,7 @@ int main(int argc, char **argv) {
     const char *fips_control_socket = NULL;
     bool use_dbus_signer = false;
     bool auto_signer = false;
+    bool use_socket_signer = false;
     uint16_t port = MD_STREAM_PORT;
     bool do_display = true;
     uint32_t timeout_ms = 5000;
@@ -575,6 +604,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dbus-signer") == 0)
             use_dbus_signer = true;
         else if (strcmp(argv[i], "--socket-signer") == 0) {
+            use_socket_signer = true;
             socket_path = (i + 1 < argc && argv[i + 1][0] != '-')
                 ? argv[++i] : NULL;
         }
@@ -610,14 +640,23 @@ int main(int argc, char **argv) {
 
     /* ── Signer initialization ─────────────────────────────── */
     MdSigner *signer = NULL;
-    if (bunker_uri) {
+    MdAccountStartup account = {0};
+    bool explicit_signer = bunker_uri || use_dbus_signer || use_socket_signer || auto_signer;
+    if (!explicit_signer) {
+        int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &account);
+        if (rc) {
+            fprintf(stderr, "ERROR: client account restore: %s\n", md_accounts_error_string(rc));
+            return 1;
+        }
+        signer = md_signer_ref(md_account_binding_signer(account.binding));
+    } else if (bunker_uri) {
         printf("client: connecting to NIP-46 bunker...\n");
         signer = md_signer_create_nip46(bunker_uri, 30000);
     } else if (use_dbus_signer) {
         printf("client: connecting to NIP-55L D-Bus signer...\n");
         signer = md_signer_create_nip55l();
-    } else if (socket_path || auto_signer) {
-        if (socket_path) {
+    } else if (use_socket_signer || auto_signer) {
+        if (use_socket_signer) {
             printf("client: connecting to NIP-5F socket signer...\n");
             signer = md_signer_create_nip5f(socket_path);
         }
@@ -629,7 +668,7 @@ int main(int argc, char **argv) {
     if (signer) {
         printf("client: signer ready (%s)\n",
                md_signer_type_name(md_signer_get_type(signer)));
-    } else if (bunker_uri || use_dbus_signer) {
+    } else if (explicit_signer) {
         fprintf(stderr, "ERROR: requested signer backend not available\n");
         return 1;
     }
@@ -639,7 +678,16 @@ int main(int argc, char **argv) {
     md_session_init(&session);
 
     /* Client context (needed before connect for nostr callbacks) */
-    ClientCtx ctx = { 0 };
+    ClientCtx ctx = { .owner = account.binding };
+    if (account.binding) {
+        ctx.owner_watch = md_account_binding_watch(account.binding, client_owner_revoked, &ctx);
+        if (!ctx.owner_watch) {
+            fprintf(stderr, "ERROR: cannot watch client role generation\n");
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
+            return 1;
+        }
+    }
 
     /* Connect to host */
     MdStream *stream = NULL;
@@ -682,9 +730,20 @@ int main(int argc, char **argv) {
 
         MdNostrConfig nostr_cfg = {
             .signer = signer,
+            .owner = account.binding,
             .relay_urls = relay_urls,
             .relay_count = relay_count,
         };
+
+        if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
+            fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
+            cleanup_npub_nostr(&nostr, &ctx);
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
+            return 1;
+        }
+        /* Pin expected peer before callbacks can run. */
+        strncpy(ctx.expected_host_pk, host_pubkey_hex, sizeof(ctx.expected_host_pk) - 1);
 
         /* Create channel before nostr_create — callbacks fire on worker threads */
         ctx.session_ch = go_channel_create(1);
@@ -692,30 +751,28 @@ int main(int argc, char **argv) {
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (!nostr) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
-            go_channel_close(ctx.session_ch);
-            go_channel_unref(ctx.session_ch);
-            ctx.session_ch = NULL;
-            if (signer) md_signer_destroy(signer);
-            return 1;
-        }
-
-        if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
-            fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
             cleanup_npub_nostr(&nostr, &ctx);
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
             return 1;
         }
 
-        /* Store expected host pubkey hex for callback verification */
-        strncpy(ctx.expected_host_pk, host_pubkey_hex, sizeof(ctx.expected_host_pk) - 1);
-        ctx.expected_host_pk[sizeof(ctx.expected_host_pk) - 1] = '\0';
+
     }
 
+    if (!g_running) {
+        cleanup_npub_nostr(&nostr, &ctx);
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
+        return 1;
+    }
     stream = connect_client_stream(host, npub, fips_control_socket,
                                    port, timeout_ms, nostr,
                                    host_pubkey_hex, &ctx, &session);
     if (!stream) {
         cleanup_npub_nostr(&nostr, &ctx);
-        if (signer) md_signer_destroy(signer);
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
         return 1;
     }
     printf("client: connected\n");
@@ -726,7 +783,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: failed to create H.264 decoder\n");
         md_stream_destroy(stream);
         cleanup_npub_nostr(&nostr, &ctx);
-        if (signer) md_signer_destroy(signer);
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
         return 1;
     }
 
@@ -963,8 +1021,8 @@ int main(int argc, char **argv) {
     md_stream_destroy(stream);
 
     cleanup_npub_nostr(&nostr, &ctx);
-    if (signer)
-        md_signer_destroy(signer);
+    md_signer_destroy(signer);
+    md_account_startup_clear(&account);
     free(ctx.ui_tree_json);
     if (ctx.overlay)
         md_overlay_destroy(ctx.overlay);

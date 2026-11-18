@@ -110,6 +110,13 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
 
 /* ── Nostr callbacks for session negotiation ──────────────── */
 
+static void host_owner_revoked(void *data) {
+    HostCtx *ctx = data;
+    g_running = 0;
+    if (ctx->session_req_ch) go_channel_close(ctx->session_req_ch);
+}
+
+
 static void host_on_dm(const char *sender_pubkey_hex, const char *content,
                        void *userdata) {
     HostCtx *ctx = userdata;
@@ -622,6 +629,7 @@ int main(int argc, char **argv) {
     const char *fips_control_socket = NULL;
     bool use_dbus_signer = false;
     bool auto_signer = false;
+    bool use_socket_signer = false;
     uint32_t fps = 60;
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
@@ -693,6 +701,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dbus-signer") == 0)
             use_dbus_signer = true;
         else if (strcmp(argv[i], "--socket-signer") == 0) {
+            use_socket_signer = true;
             socket_path = (i + 1 < argc && argv[i + 1][0] != '-')
                 ? argv[++i] : NULL;
         }
@@ -814,14 +823,23 @@ int main(int argc, char **argv) {
 
     /* ── Signer initialization ────────────────────────────────── */
     MdSigner *signer = NULL;
-    if (bunker_uri) {
+    MdAccountStartup account = {0};
+    bool explicit_signer = bunker_uri || use_dbus_signer || use_socket_signer || auto_signer;
+    if (!explicit_signer) {
+        int rc = md_account_startup_open(MD_ACCOUNT_HOST, &account);
+        if (rc) {
+            fprintf(stderr, "ERROR: host account restore: %s\n", md_accounts_error_string(rc));
+            return 1;
+        }
+        signer = md_signer_ref(md_account_binding_signer(account.binding));
+    } else if (bunker_uri) {
         printf("host: connecting to NIP-46 bunker...\n");
         signer = md_signer_create_nip46(bunker_uri, 30000);
     } else if (use_dbus_signer) {
         printf("host: connecting to NIP-55L D-Bus signer...\n");
         signer = md_signer_create_nip55l();
-    } else if (socket_path || auto_signer) {
-        if (socket_path) {
+    } else if (use_socket_signer || auto_signer) {
+        if (use_socket_signer) {
             printf("host: connecting to NIP-5F socket signer...\n");
             signer = md_signer_create_nip5f(socket_path);
         }
@@ -834,13 +852,13 @@ int main(int argc, char **argv) {
     if (signer) {
         printf("host: signer ready (%s)\n",
                md_signer_type_name(md_signer_get_type(signer)));
-    } else if (bunker_uri || use_dbus_signer) {
+    } else if (explicit_signer) {
         fprintf(stderr, "ERROR: requested signer backend not available\n");
         return 1;
     }
     if (fips_npub && !signer) {
         fprintf(stderr, "ERROR: host --npub requires a signer for Nostr session authorization\n");
-        fprintf(stderr, "  Use --auto-signer, --socket-signer, --dbus-signer, or --bunker.\n");
+        fprintf(stderr, "  Bind a host account or use --auto-signer, --socket-signer, --dbus-signer, or --bunker.\n");
         return 1;
     }
 
@@ -849,7 +867,8 @@ int main(int argc, char **argv) {
         if (md_fips_npub_to_pubkey_hex(fips_npub, expected_client_pk,
                                        sizeof(expected_client_pk)) != 0) {
             fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
-            if (signer) md_signer_destroy(signer);
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
             return 1;
         }
 
@@ -858,7 +877,36 @@ int main(int argc, char **argv) {
 
         printf("host: checking FIPS daemon health...\n");
         if (host_check_fips_daemon(fips_control_socket, 5000) != 0) {
-            if (signer) md_signer_destroy(signer);
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
+            return 1;
+        }
+        /* Compare our checked host identity, not the expected peer, with the
+         * actual daemon's show_status identity. Missing identity fails closed. */
+        MdFipsControlResponse status;
+        md_fips_control_response_init(&status);
+        MdFipsControlResult result = md_fips_control_request(fips_control_socket,
+            "show_status", NULL, 5000, &status);
+        cJSON *node = status.data ? cJSON_GetObjectItemCaseSensitive(status.data, "npub") : NULL;
+        char node_pk[65] = {0};
+        int rc = MD_ACCOUNTS_INVALID;
+        if (result == MD_FIPS_CONTROL_OK && cJSON_IsString(node) &&
+            !md_fips_npub_to_pubkey_hex(node->valuestring, node_pk, sizeof(node_pk))) {
+            if (account.binding) rc = md_accounts_check_fips_host(account.accounts, node_pk);
+            else {
+                char *host_pk = NULL;
+                rc = md_signer_check_connection(signer);
+                if (!rc) rc = md_signer_get_pubkey(signer, &host_pk);
+                if (!rc && (!host_pk || strcmp(host_pk, node_pk))) rc = MD_ACCOUNTS_FIPS_KEY_MISMATCH;
+                free(host_pk);
+            }
+        }
+        md_fips_control_response_free(&status);
+        if (rc) {
+            fprintf(stderr, "ERROR: FIPS host identity check refused: %s (requires show_status npub matching host signer)\n",
+                    md_accounts_error_string(rc));
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
             return 1;
         }
     }
@@ -896,9 +944,14 @@ int main(int argc, char **argv) {
         MdNostrCallbacks nostr_cbs = { 0 };
         nostr_cbs.on_dm = host_on_dm;
         nostr_cbs.dm_userdata = &ctx;
+        nostr_cbs.on_owner_revoked = host_owner_revoked;
+        nostr_cbs.owner_userdata = &ctx;
+        /* Callbacks may fire during create. */
+        ctx.session_req_ch = go_channel_create(1);
 
         MdNostrConfig nostr_cfg = {
             .signer = signer,
+            .owner = account.binding,
             .relay_urls = relay_urls,
             .relay_count = relay_count,
         };
@@ -917,7 +970,6 @@ int main(int argc, char **argv) {
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
             /* Wait for a session request DM (event-driven with timeout) */
-            ctx.session_req_ch = go_channel_create(1);
             {
                 void *dummy = NULL;
                 GoSelectCase cases[] = {
@@ -926,7 +978,8 @@ int main(int argc, char **argv) {
                 go_select_timeout(cases, 1, 60000); /* 60s timeout */
             }
 
-            if (ctx.session_requested) {
+            if (ctx.session_requested && g_running &&
+                (!account.binding || md_account_binding_is_current(account.binding))) {
                 if (fips_npub) {
                     printf("host: waiting for FIPS peer readiness for %.*s...\n",
                            12, fips_npub);
@@ -940,14 +993,7 @@ int main(int argc, char **argv) {
                         else
                             fprintf(stderr, "ERROR: FIPS route not ready (%s): %s\n",
                                     md_fips_peer_readiness_string(rstate), ready.detail);
-                        if (ctx.session_req_ch) {
-                            go_channel_close(ctx.session_req_ch);
-                            go_channel_unref(ctx.session_req_ch);
-                            ctx.session_req_ch = NULL;
-                        }
-                        md_nostr_destroy(nostr);
-                        if (session_log) md_session_log_destroy(session_log);
-                        return 1;
+                        goto signaling_failed;
                     }
                     printf("host: FIPS peer ready: %s\n", ready.detail);
                 }
@@ -992,9 +1038,14 @@ int main(int argc, char **argv) {
 
                 char *acc_json = md_session_accept_to_json(&acc);
                 if (acc_json) {
-                    md_nostr_send_session_accept(nostr, ctx.pending_client_pk,
-                                                acc_json);
+                    int sent = md_nostr_send_session_accept(nostr, ctx.pending_client_pk,
+                                                           acc_json);
                     free(acc_json);
+                    if (sent || !g_running ||
+                        (account.binding && !md_account_binding_is_current(account.binding))) {
+                        fprintf(stderr, "ERROR: session acceptance failed or host role revoked\n");
+                        goto signaling_failed;
+                    }
                     printf("host: sent session accept to %.*s... (session=%s)\n",
                            8, ctx.pending_client_pk, session_id);
 
@@ -1003,6 +1054,9 @@ int main(int argc, char **argv) {
                         md_session_log_event(session_log, MD_SESSION_LOG_ACCEPT,
                                              session_id, ctx.pending_client_pk,
                                              "session accepted");
+                } else {
+                    fprintf(stderr, "ERROR: cannot serialize session acceptance\n");
+                    goto signaling_failed;
                 }
 
                 /* Update session state */
@@ -1011,30 +1065,36 @@ int main(int argc, char **argv) {
                                    ctx.pending_req.tree_format);
                 md_session_accept(&session, session_id, granted);
             } else if (g_running) {
-                if (fips_npub) {
-                    fprintf(stderr, "ERROR: timed out waiting for authorized --npub session request; refusing direct TCP fallback\n");
-                    if (ctx.session_req_ch) {
-                        go_channel_close(ctx.session_req_ch);
-                        go_channel_unref(ctx.session_req_ch);
-                        ctx.session_req_ch = NULL;
-                    }
-                    md_nostr_destroy(nostr);
-                    if (session_log) md_session_log_destroy(session_log);
-                    return 1;
+                if (fips_npub || account.binding) {
+                    fprintf(stderr, "ERROR: timed out waiting for authorized host-role session request; refusing direct TCP fallback\n");
+                    goto signaling_failed;
                 }
                 printf("host: no session request received, accepting direct TCP\n");
             }
         } else {
-            if (fips_npub) {
-                fprintf(stderr, "ERROR: nostr bridge creation failed; --npub cannot fall back to direct TCP\n");
-                if (session_log) md_session_log_destroy(session_log);
-                if (signer) md_signer_destroy(signer);
-                return 1;
+            if (fips_npub || account.binding) {
+                fprintf(stderr, "ERROR: nostr bridge creation failed; authorized hosting cannot fall back to direct TCP\n");
+                goto signaling_failed;
             }
             fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
         }
     }
 
+    if (!g_running) goto signaling_failed;
+    goto signaling_ready;
+signaling_failed:
+    md_nostr_destroy(nostr);
+    if (ctx.session_req_ch) {
+        go_channel_close(ctx.session_req_ch);
+        go_channel_unref(ctx.session_req_ch);
+    }
+    md_session_log_destroy(session_log);
+    md_signer_destroy(signer);
+    md_account_startup_clear(&account);
+    pthread_mutex_destroy(&ctx.client_mu);
+    return 1;
+signaling_ready:
+    ;
     /* Create TCP server */
     MdStreamServer *srv = md_stream_server_create(bind_addr, port);
     if (!srv) {
@@ -1355,15 +1415,14 @@ int main(int argc, char **argv) {
 
     md_stream_server_destroy(srv);
 
-    if (session_log)
-        md_session_log_destroy(session_log);
-
-    if (nostr) {
+    md_nostr_destroy(nostr);
+    if (ctx.session_req_ch) {
         go_channel_close(ctx.session_req_ch);
         go_channel_unref(ctx.session_req_ch);
-        md_nostr_destroy(nostr);
-    } else if (signer)
-        md_signer_destroy(signer);
+    }
+    md_session_log_destroy(session_log);
+    md_signer_destroy(signer);
+    md_account_startup_clear(&account);
 
     pthread_mutex_destroy(&ctx.client_mu);
 

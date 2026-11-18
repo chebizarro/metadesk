@@ -68,17 +68,70 @@ back. OS credential deletion and metadata saving are not a cross-store atomic
 transaction: if saving after removal fails, repair storage and rerun removal.
 Windows persistence is explicitly unsupported (no insecure fallback).
 
-Loaded role selections are **not live bindings**. Startup/live-session adoption
-is deliberately deferred. A future integration must supply checked signers,
-acquire role leases, cancel owner-specific work on switching, and call
-`md_accounts_check_fips_host` with the actual node pubkey from `show_status`
-before FIPS hosting. Direct-IP hosting does not require that key equality.
-The CLI does not change current session startup or existing signer flags.
+## Live startup and precedence
+
+Host startup restores the saved **host** role; client startup restores the saved
+**client** role. Restoration checks the live signer against the saved account
+before acquiring a role lease. The host lease owns allowlist reads/updates and
+session acceptance; the client lease owns outbound session requests. A bridge
+cannot use a client lease for host operations (or a host lease for requests).
+
+Precedence, in order:
+
+1. Any explicit signer option bypasses saved accounts and the OS credential
+   store: `--bunker`, then `--dbus-signer`, then `--socket-signer` (default local
+   endpoint when no path is supplied), with `--auto-signer` as the socket/auto
+   branch's fallback. This preserves the existing ordering if flags are mixed.
+   An explicitly requested backend that fails is fatal, not an ephemeral fallback.
+2. Otherwise, restore the application's saved role. Missing credentials, locked
+   stores, unavailable backends, direct keys without an explicit integration,
+   malformed metadata and wrong-owner replies fail closed. There is no fallback
+   to another account, an environment-detected signer or an ephemeral key.
+3. With **no selected role**, retain legacy behavior: host direct-IP mode needs
+   no signer; client `--npub` uses an ephemeral signer; direct-IP client needs no
+   signer. Auto-detection (including its environment inputs) runs only with
+   `--auto-signer`. `--npub` selects a peer, not a signer override; `--relay`
+   changes signaling relays, not the account or saved bunker's private relays.
+   MCP startup remains independent of video/signing accounts.
+
+FIPS hosting (`--npub`) additionally decodes the **actual daemon's** `show_status`
+`npub` and compares it to the checked host identity. A missing/malformed node
+identity or a different key is fatal, including with explicit signer overrides.
+The expected client key is not the local node key. Direct-IP hosting omits this
+FIPS equality check. Saved-role hosting never downgrades to unauthenticated TCP
+when signaling fails or no authorized request arrives.
+
+Runtime controllers load a read-only metadata snapshot under the advisory lock,
+then release that lock so host, client and CLI can coexist. CLI edits affect the
+**next startup**, not an already-running process; there is no file polling.
+In-process role switches/removal revoke the old generation synchronously: bridge
+admission closes, bridge-local signer cancellation fires, cached allowlist reads
+fail closed, and the owning application's negotiation/session loop is stopped.
+The client drops its document/tree state on normal shutdown. Non-abortable signer
+results are discarded; a signer shared by the other role stays usable. A new
+identity requires a fresh bridge/session, never reuse of an old owner's cache.
+Revocation watchers must be removed before their callback data is destroyed.
+
+## Security limits
+
+Signer/role verification is not proof of end-to-end desktop authorization.
+Inherited host stream/session binding and allowlist-readiness defects are tracked
+as **md-mrw** and **md-q6m**; do not expose the host to untrusted networks until
+those are resolved. Protocol review also tracks AUTH transport (**md-xcy**),
+allowlist replacement ordering (**md-5w9**) and failed-publication/local-ACL
+consistency (**md-30w**). The private restore fixture does not qualify relay AUTH,
+CLOSED/rejection/reconnect handling or the full desktop session boundary.
 
 ## Tests
 
 `meson test -C build accounts account_cli` runs the core/memory store and CLI
-contracts. macOS also runs `account_keychain` against a private throwaway
+contracts. `account startup roles + private relay restore` runs owner-separated
+bridge cancellation and process startup/override contracts in a temporary HOME.
+With `-Dsigner_nip46=true` it also starts a private loopback WebSocket relay and
+real nostrc bunker/client transports, restores saved pairing material from an
+in-memory credential store, validates a signed event and refuses a wrong-owner
+restore. The fixture uses only deterministic throwaway keys, observes REQ/EOSE
+and OK, and removes all files/connections; it never reads an OS keyring. macOS also runs `account_keychain` against a private throwaway
 Keychain (restoring the original search list). Linux registers
 `account_secret_service` when `dbus-run-session` and `gnome-keyring-daemon` are
 installed; otherwise Meson explicitly reports the unavailable fixture. It uses

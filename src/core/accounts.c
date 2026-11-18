@@ -1,5 +1,6 @@
 #include "accounts.h"
 #include <stdatomic.h>
+#include <pthread.h>
 #ifndef _WIN32
 #include <cjson/cJSON.h>
 #include <sys/file.h>
@@ -14,10 +15,19 @@
 
 #define MAX_ACCOUNTS 128
 #define METADATA_FILE "management.json"
+struct MdAccountWatch {
+    MdAccountBinding *binding;
+    void (*revoked)(void *);
+    void *data;
+    struct MdAccountWatch *next;
+};
 struct MdAccountBinding {
     atomic_uint refs;
     atomic_bool revoked;
     uint64_t generation;
+    MdAccountRole role;
+    pthread_mutex_t watch_mu;
+    MdAccountWatch *watches;
     MdSigner *signer;
     MdSignerCancel *cancel;
 };
@@ -30,6 +40,7 @@ struct MdAccounts {
     MdAccountBinding *bindings[MD_ACCOUNT_ROLE_COUNT];
     uint64_t generation;
     MdCredentialStore *store;
+    bool snapshot;
 };
 static bool key_valid(const char *s) {
     return s && strlen(s) == 64 && strspn(s, "0123456789abcdef") == 64;
@@ -87,13 +98,17 @@ MdAccountBinding *md_account_binding_ref(MdAccountBinding *b) {
 }
 void md_account_binding_release(MdAccountBinding *b) {
     if (!b || atomic_fetch_sub(&b->refs, 1) != 1) return;
+    pthread_mutex_destroy(&b->watch_mu);
     md_signer_cancel_free(b->cancel); md_signer_destroy(b->signer); free(b);
 }
 static void revoke_role(MdAccounts *a, MdAccountRole role) {
     MdAccountBinding *b = a->bindings[role];
     a->bindings[role] = NULL;
     if (b) {
+        pthread_mutex_lock(&b->watch_mu);
         atomic_store(&b->revoked, true); md_signer_cancel(b->cancel);
+        for (MdAccountWatch *w = b->watches; w; w = w->next) w->revoked(w->data);
+        pthread_mutex_unlock(&b->watch_mu);
         md_account_binding_release(b);
     }
 }
@@ -154,6 +169,8 @@ int md_accounts_bind_role(MdAccounts *a, MdAccountRole role, MdSignerType t, con
     if (!r->signer) r->signer = md_signer_ref(s);
     b->signer = md_signer_ref(r->signer);
     atomic_init(&b->refs, 1); atomic_init(&b->revoked, false);
+    pthread_mutex_init(&b->watch_mu, NULL);
+    b->role = role;
     b->generation = ++a->generation;
     revoke_role(a, role); a->roles[role] = i; a->bindings[role] = b;
     release_idle_signers(a); return 0;
@@ -167,6 +184,28 @@ MdAccountBinding *md_accounts_acquire_role(MdAccounts *a, MdAccountRole role) {
 }
 bool md_account_binding_is_current(const MdAccountBinding *b) { return b && !atomic_load(&b->revoked); }
 uint64_t md_account_binding_generation(const MdAccountBinding *b) { return b ? b->generation : 0; }
+MdAccountRole md_account_binding_role(const MdAccountBinding *b) { return b ? b->role : MD_ACCOUNT_ROLE_COUNT; }
+MdAccountWatch *md_account_binding_watch(MdAccountBinding *b, void (*revoked)(void *), void *data) {
+    if (!b || !revoked) return NULL;
+    MdAccountWatch *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->binding = md_account_binding_ref(b); w->revoked = revoked; w->data = data;
+    pthread_mutex_lock(&b->watch_mu);
+    w->next = b->watches; b->watches = w;
+    if (atomic_load(&b->revoked)) revoked(data);
+    pthread_mutex_unlock(&b->watch_mu);
+    return w;
+}
+void md_account_binding_unwatch(MdAccountWatch *w) {
+    if (!w) return;
+    MdAccountBinding *b = w->binding;
+    pthread_mutex_lock(&b->watch_mu);
+    MdAccountWatch **p = &b->watches;
+    while (*p && *p != w) p = &(*p)->next;
+    if (*p) *p = w->next;
+    pthread_mutex_unlock(&b->watch_mu);
+    free(w); md_account_binding_release(b);
+}
 MdSigner *md_account_binding_signer(const MdAccountBinding *b) { return b ? b->signer : NULL; }
 const MdSignerCancel *md_account_binding_cancel(const MdAccountBinding *b) { return b ? b->cancel : NULL; }
 static int finish(MdAccountBinding *b, int rc, char **out) {
@@ -321,6 +360,30 @@ int md_accounts_open(const char *dir, MdCredentialStore *store, MdAccounts **out
     *out = NULL; return MD_ACCOUNTS_UNSUPPORTED;
 }
 #endif
+int md_accounts_open_snapshot(const char *dir, MdCredentialStore *store, MdAccounts **out) {
+    int rc = md_accounts_open(dir, store, out);
+    if (rc) return rc;
+    (*out)->snapshot = true;
+#ifndef _WIN32
+    close((*out)->lockfd); (*out)->lockfd = -1;
+#endif
+    return 0;
+}
+int md_accounts_restore_role(MdAccounts *a, MdAccountRole role, MdAccountBinding **out) {
+    if (!a || !out || !role_valid(role)) return MD_ACCOUNTS_INVALID;
+    *out = NULL;
+    const MdAccount *info = md_accounts_role(a, role);
+    if (!info) return MD_ACCOUNTS_NOT_FOUND;
+    MdSigner *s = NULL;
+    int rc = md_accounts_bind_role(a, role, info->backend, info->pubkey, NULL);
+    if (rc == MD_ACCOUNTS_NOT_READY) {
+        rc = md_accounts_connect_signer(info->backend, info->pubkey, a->store, &s);
+        if (!rc) rc = md_accounts_bind_role(a, role, info->backend, info->pubkey, s);
+        md_signer_destroy(s);
+    }
+    if (!rc) *out = md_accounts_acquire_role(a, role);
+    return rc;
+}
 void md_accounts_destroy(MdAccounts *a) {
     if (!a) return;
     for (int r = 0; r < MD_ACCOUNT_ROLE_COUNT; ++r) revoke_role(a, r);
@@ -341,6 +404,7 @@ static cJSON *pair(const MdAccount *info) {
 }
 int md_accounts_save(MdAccounts *a) {
     if (!a) return MD_ACCOUNTS_INVALID;
+    if (a->snapshot) return MD_ACCOUNTS_UNSUPPORTED;
     cJSON *j = cJSON_CreateObject(), *list = cJSON_CreateArray(), *roles = cJSON_CreateObject();
     if (!j || !list || !roles) { cJSON_Delete(j); cJSON_Delete(list); cJSON_Delete(roles); return MD_ACCOUNTS_IO; }
     bool ok = cJSON_AddNumberToObject(j, "version", 1) != NULL;

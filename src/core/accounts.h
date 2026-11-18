@@ -23,6 +23,7 @@ typedef struct {
 } MdAccount;
 typedef struct MdAccounts MdAccounts;
 typedef struct MdAccountBinding MdAccountBinding;
+typedef struct MdAccountWatch MdAccountWatch;
 /* Control-plane objects are single-owner, not concurrently mutable. Leases
  * below are thread-safe and may outlive the controller. A retained advisory
  * lock rejects concurrent writers to the same directory (no lost CLI updates).
@@ -33,6 +34,9 @@ typedef struct MdAccountBinding MdAccountBinding;
  * plaintext fallback. Metadata getters borrow until the next mutation. */
 int md_accounts_open(const char *directory, MdCredentialStore *store, MdAccounts **out);
 void md_accounts_destroy(MdAccounts *);
+/* Runtime snapshot: load atomically under the writer lock, then release it so
+ * host and client can coexist. save is refused; CLI edits apply on restart. */
+int md_accounts_open_snapshot(const char *directory, MdCredentialStore *, MdAccounts **out);
 size_t md_accounts_count(const MdAccounts *);
 const MdAccount *md_accounts_at(const MdAccounts *, size_t index);
 int md_accounts_add(MdAccounts *, MdSignerType, const char *pubkey, const char *label);
@@ -62,6 +66,12 @@ MdAccountBinding *md_account_binding_ref(MdAccountBinding *);
 void md_account_binding_release(MdAccountBinding *);
 bool md_account_binding_is_current(const MdAccountBinding *);
 uint64_t md_account_binding_generation(const MdAccountBinding *);
+MdAccountRole md_account_binding_role(const MdAccountBinding *);
+/* Synchronous revocation notification. unwatch waits for a running callback.
+ * Callbacks must not watch/unwatch or mutate this controller. The watch retains
+ * its binding. An already-revoked binding calls back before watch returns. */
+MdAccountWatch *md_account_binding_watch(MdAccountBinding *, void (*revoked)(void *), void *);
+void md_account_binding_unwatch(MdAccountWatch *);
 /* Borrowed signer/token valid until this binding is released. Use cancellable
  * operations and check is_current before committing asynchronous side effects.
  * Revocation discards non-abortable results; it does not kill a shared signer. */
@@ -75,6 +85,18 @@ int md_account_binding_decrypt(MdAccountBinding *, const char *peer, const char 
  * Direct keys must be supplied by an explicit integration via bind_role. */
 int md_accounts_connect_signer(MdSignerType, const char *pubkey,
     MdCredentialStore *, MdSigner **out);
+/* Restore and verify the saved selection; NOT_FOUND means no selected role.
+ * Any other failure must not fall back to another identity. */
+int md_accounts_restore_role(MdAccounts *, MdAccountRole, MdAccountBinding **out);
+typedef struct {
+    MdAccounts *accounts;
+    MdCredentialStore *store;
+    MdAccountBinding *binding;
+} MdAccountStartup;
+/* Default snapshot + OS store (no prompt or plaintext fallback). No selection
+ * succeeds with binding=NULL. Explicit signer flags should bypass this. */
+int md_account_startup_open(MdAccountRole, MdAccountStartup *);
+void md_account_startup_clear(MdAccountStartup *);
 const char *md_accounts_backend_name(MdSignerType);
 int md_accounts_parse_backend(const char *, MdSignerType *out);
 const char *md_accounts_error_string(int error);
