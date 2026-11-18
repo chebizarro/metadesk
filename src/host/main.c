@@ -454,6 +454,7 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "  %s access --help  Manage saved host-role session access\n", argv0);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --port PORT      Listen port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
@@ -636,6 +637,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "account") == 0) {
         extern int md_host_account_cli(int argc, char **argv);
         return md_host_account_cli(argc - 2, argv + 2);
+    }
+    if (argc > 1 && strcmp(argv[1], "access") == 0) {
+        extern int md_host_access_cli(int argc, char **argv);
+        return md_host_access_cli(argc - 2, argv + 2);
     }
     /* Every subsequently created thread inherits this mask. MCP consumes
      * termination signals with sigwait, never an async-signal-unsafe handler. */

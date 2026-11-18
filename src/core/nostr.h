@@ -246,6 +246,12 @@ typedef struct {
     char caps[64];        /* capability string ("" if none)      */
 } MdAllowlistEntry;
 
+/* Wait for EOSE/CLOSED/connection failure (or stop/revocation), then copy a
+ * coherent membership snapshot. Returns -1 unless history loaded successfully.
+ * Empty history succeeds with *entries=NULL and *count=0. Caller frees entries.
+ * No deadline is interpreted as successful history completion. */
+int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *count);
+
 /* Return number of entries on the current allowlist (0 if none). */
 int md_nostr_allowlist_count(const MdNostr *n);
 

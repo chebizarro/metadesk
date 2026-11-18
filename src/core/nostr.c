@@ -1427,6 +1427,39 @@ static int allowlist_get_entry(const MdNostr *n, int index,
     return ret;
 }
 
+int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *count) {
+    if (!entries || !count) return -1;
+    *entries = NULL;
+    *count = 0;
+    if (!owns_host(n) || !operation_begin(n)) return -1;
+    int ret = -1;
+    MdAllowlistEntry *copy = NULL;
+    size_t used = 0;
+    pthread_mutex_lock(&n->allowlist_mu);
+    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && !is_stopped(n))
+        pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    if (n->acl_state == MD_NOSTR_ACL_LOADED && !is_stopped(n)) {
+        size_t capacity = n->allowlist ? n->allowlist->count : 0;
+        copy = capacity ? calloc(capacity, sizeof(*copy)) : NULL;
+        if (!capacity || copy) {
+            for (size_t i = 0; i < capacity; ++i) {
+                NostrListEntry *e = n->allowlist->entries[i];
+                if (!e || !e->tag_name || strcmp(e->tag_name, "p") || !e->value) continue;
+                snprintf(copy[used].pubkey_hex, sizeof(copy[used].pubkey_hex), "%s", e->value);
+                snprintf(copy[used].caps, sizeof(copy[used].caps), "%s", e->extra ? e->extra : "");
+                ++used;
+            }
+            ret = 0;
+        }
+    }
+    pthread_mutex_unlock(&n->allowlist_mu);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
+    if (ret) free(copy);
+    else { *entries = copy; *count = used; }
+    return ret;
+}
+
 MdNostrAclState md_nostr_allowlist_state(MdNostr *n) {
     if (!owns_host(n) || !operation_begin(n)) return MD_NOSTR_ACL_FAILED;
     pthread_mutex_lock(&n->allowlist_mu);
