@@ -321,8 +321,8 @@ static gboolean atspi_context_op(gpointer data) {
 
 /* libatspi's sources borrow its connection. Joining our event thread does
  * not exclude another default-context dispatcher from prepare/dispatch while
- * atspi_exit() frees that connection. Serialize lifecycle and listener work
- * with the context, including initialization.
+ * atspi_exit() frees that connection. Serialize lifecycle, listener work and
+ * tree walks with the context, including initialization.
  * The owned event thread must exist for every call: invoke_full can queue
  * even on an unowned context (a different thread-default context), or an
  * existing owner can release the context without dispatching the operation.
@@ -535,14 +535,32 @@ static int atspi_get_tree_unlocked(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return 0;
 }
 
+typedef struct { MdA11yCtx *ctx; MdA11yNode **out_root; int result; } AtspiTreeOp;
+
+static gboolean atspi_get_tree_on_context(gpointer data) {
+    AtspiTreeOp *op = data;
+    AtspiState *st = op->ctx->backend_data;
+    g_mutex_lock(&st->lock);
+    op->result = atspi_get_tree_unlocked(op->ctx, op->out_root);
+    g_mutex_unlock(&st->lock);
+    return G_SOURCE_REMOVE;
+}
+
+/* libatspi is single-threaded. Its async requests arm their notify only
+ * after dbus_connection_send_with_reply() returns (get_application's
+ * GetApplicationBusAddress from atspi_get_desktop, for example), and its
+ * synchronous calls dispatch the connection from the calling thread. Walking
+ * on a caller thread while another thread dispatches the default context lets
+ * a reply complete before the notify is armed; libdbus then never runs it,
+ * stranding libatspi's DBusPendingCall reference and reply (md-x16). Walk on
+ * the context so no dispatch can interleave with libatspi's calls. */
 static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     AtspiState *st = ctx ? ctx->backend_data : NULL;
     if (!st) return -1;
 
-    g_mutex_lock(&st->lock);
-    int ret = atspi_get_tree_unlocked(ctx, out_root);
-    g_mutex_unlock(&st->lock);
-    return ret;
+    AtspiTreeOp op = { .ctx = ctx, .out_root = out_root, .result = -1 };
+    atspi_invoke_sync(atspi_get_tree_on_context, &op);
+    return op.result;
 }
 
 static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
