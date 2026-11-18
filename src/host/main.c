@@ -470,6 +470,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
     fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
+    fprintf(stderr, "  --input-backend auto|uinput|wayland  Explicit input backend (default: auto)\n");
+    fprintf(stderr, "  --input-wayland-display PATH  Absolute private Wayland socket; no ambient display\n");
     fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource only (default: compact); action results always JSON\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
 }
@@ -560,6 +562,7 @@ static int host_check_fips_daemon(const char *socket_path, uint32_t timeout_ms) 
 
 static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
                         const char *bind_addr, bool no_input,
+                        const MdInputConfig *input_options,
                         MdMcpTreeFormat tree_format,
                         const MdMcpBridgeConfig *http_auth) {
     int rc = 1;
@@ -575,7 +578,9 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
         uint32_t width = 0, height = 0;
         host_apply_fallback_dimensions(&width, &height,
                                        "MCP mode has no capture pipeline");
-        MdInputConfig input_cfg = { .screen_width = width, .screen_height = height };
+        MdInputConfig input_cfg = *input_options;
+        input_cfg.screen_width = width;
+        input_cfg.screen_height = height;
         input = md_input_create(&input_cfg);
         if (!md_input_is_ready(input))
             fprintf(stderr, "host[mcp]: input unavailable; action tools disabled\n");
@@ -651,6 +656,7 @@ int main(int argc, char **argv) {
     const char *mcp_public_urls[32], *mcp_allow_npubs[32];
     size_t mcp_public_url_count = 0, mcp_allow_npub_count = 0;
     bool no_input = false;
+    MdInputConfig input_options = {0};
     bool signaling_option = false;
     const char *mcp_http_bind = NULL;
     MdMcpTreeFormat mcp_tree_format = MD_MCP_TREE_FORMAT_DEFAULT;
@@ -697,6 +703,17 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
             if (relay_count < 16)
                 relay_urls[relay_count++] = argv[++i];
+        }
+        /* Wayland input options: kept together, independent of capture flags. */
+        else if (strcmp(argv[i], "--input-backend") == 0 ||
+                 strcmp(argv[i], "--input-wayland-display") == 0) {
+            bool backend = strcmp(argv[i], "--input-backend") == 0;
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "Missing input option value\n");
+                return 1;
+            }
+            if (backend) input_options.backend = argv[++i];
+            else input_options.wayland_display = argv[++i];
         }
         else if (strcmp(argv[i], "--no-input") == 0)
             no_input = true;
@@ -751,6 +768,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    if ((input_options.backend && strcmp(input_options.backend, "auto") &&
+         strcmp(input_options.backend, "uinput") && strcmp(input_options.backend, "wayland")) ||
+        (input_options.backend && !strcmp(input_options.backend, "wayland") &&
+         (!input_options.wayland_display || input_options.wayland_display[0] != '/')) ||
+        (input_options.wayland_display &&
+         (!input_options.backend || strcmp(input_options.backend, "wayland")))) {
+        fprintf(stderr, "Invalid input selection: wayland requires an absolute --input-wayland-display path\n");
+        return 1;
+    }
+
     if ((mcp_stdio && mcp_http) || (mcp_http_bind && !mcp_http) ||
         ((mcp_stdio || mcp_http) && signaling_option)) {
         fprintf(stderr, "ERROR: MCP requires one transport; --mcp-http-bind requires HTTP; "
@@ -770,7 +797,7 @@ int main(int argc, char **argv) {
             .http_allow_file = mcp_allow_file,
         };
         return host_run_mcp(mcp_stdio, mcp_http, mcp_http_port,
-                            mcp_http_bind, no_input, mcp_tree_format,
+                            mcp_http_bind, no_input, &input_options, mcp_tree_format,
                             &http_auth);
     }
 
@@ -1083,10 +1110,9 @@ int main(int argc, char **argv) {
            enc_width, enc_height);
 
     /* Initialize input injection (persistent) */
-    MdInputConfig input_cfg = {
-        .screen_width  = display_width,
-        .screen_height = display_height,
-    };
+    MdInputConfig input_cfg = input_options;
+    input_cfg.screen_width = display_width;
+    input_cfg.screen_height = display_height;
     MdInput *input = no_input ? NULL : md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
         fprintf(stderr, "WARNING: input injection unavailable\n");

@@ -1,0 +1,13 @@
+# Build context: own throwaway VM directory containing the compiled probe and
+# validate-input.py. No host runtime sockets/devices are mounted into this image.
+FROM docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sway=1.9-1build2 libwlroots12t64=0.17.1-2.1build1 wev python3 \
+    libwayland-client0 libxkbcommon0 xkb-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && userdel ubuntu && useradd -u 1000 -m tester
+COPY ah9-9-input-probe /usr/local/bin/ah9-9-input-probe
+COPY validate-input.py /usr/local/bin/validate-input.py
+USER 1000:1000
+ENV WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman
+ENTRYPOINT ["python3", "/usr/local/bin/validate-input.py"]
