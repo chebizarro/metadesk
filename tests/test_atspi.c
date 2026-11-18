@@ -15,6 +15,7 @@
 #include <glib-unix.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dlfcn.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -821,6 +822,29 @@ static bool fixture_line(int fd, char *line, size_t size) {
     return false;
 }
 
+/* md-x16: libatspi arms async notifies after dbus_connection_send_with_reply()
+ * returns, so it must only run on the thread dispatching the default context.
+ * Otherwise a reply can complete first, libdbus never calls the notify, and
+ * libatspi's pending-call reference leaks. libatspi's calls bind to this
+ * executable's definition; record calls that come from any other thread. */
+static atomic_int fixture_notify_calls, fixture_notify_off_context;
+
+dbus_bool_t dbus_pending_call_set_notify(DBusPendingCall *pending,
+                                         DBusPendingCallNotifyFunction function,
+                                         void *user_data,
+                                         DBusFreeFunction free_user_data) {
+    static dbus_bool_t (*real)(DBusPendingCall *, DBusPendingCallNotifyFunction,
+                               void *, DBusFreeFunction);
+    if (!real) {
+        *(void **)&real = dlsym(RTLD_NEXT, "dbus_pending_call_set_notify");
+        if (!real) abort();
+    }
+    atomic_fetch_add(&fixture_notify_calls, 1);
+    if (!g_main_context_is_owner(g_main_context_default()))
+        atomic_fetch_add(&fixture_notify_off_context, 1);
+    return real(pending, function, user_data, free_user_data);
+}
+
 typedef struct { MdA11yCtx *ctx; int fd; } LossObserver;
 static DBusHandlerResult fixture_disconnected(DBusConnection *bus,
                                                DBusMessage *message, void *data) {
@@ -920,10 +944,25 @@ static void fixture_backend_child(int fd, bool unsubscribe) {
         fixture_context_handoff();
         fixture_competing_teardown();
     }
+    atomic_store(&fixture_notify_calls, 0);
+    atomic_store(&fixture_notify_off_context, 0);
     MdA11yCtx *ctx = md_a11y_create();
     if (!ctx || !md_a11y_is_connected(ctx)) _exit(2);
     if (unsubscribe && (md_a11y_subscribe_changes(ctx, fixture_change, NULL) != 0 ||
                         md_a11y_unsubscribe_changes(ctx) != 0)) _exit(2);
+    /* The first desktop reference (here, or the listener registration above)
+     * starts libatspi's async GetApplicationBusAddress while the backend
+     * thread dispatches; every libatspi call must run on that context. */
+    MdA11yNode *tree = md_a11y_walk(ctx);
+    if (!tree) _exit(2);
+    md_a11y_node_free(tree);
+    if (atomic_load(&fixture_notify_calls) == 0 ||
+        atomic_load(&fixture_notify_off_context) != 0) {
+        fprintf(stderr, "AT-SPI notify armed off the dispatch context: %d of %d\n",
+                atomic_load(&fixture_notify_off_context),
+                atomic_load(&fixture_notify_calls));
+        _exit(2);
+    }
     int observed[2];
     if (pipe(observed) != 0) _exit(2);
     LossObserver observer = { .ctx = ctx, .fd = observed[1] };
@@ -976,11 +1015,11 @@ static bool fixture_registry_ready(const char *address) {
     return ready;
 }
 
-static void test_private_bus_loss(const char *host) {
+static void test_private_bus_loss(const char *host, bool host_only) {
     /* Activated private services are adopted and reaped by this test, not
      * left as zombies with the VM's init process. */
     if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) { MD_CHECK(false); return; }
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = host_only ? 2 : 0; mode < 3; mode++) {
         pid_t bus_pid = -1, bus_group = -1, child = -1;
         int bus_out[2] = {-1, -1}, in[2] = {-1, -1}, out[2] = {-1, -1};
         char runtime[] = "/tmp/md-atspi-loss-XXXXXX";
@@ -1118,9 +1157,12 @@ cleanup:
 
 int main(int argc, char **argv) {
 #ifdef __linux__
-    if (argc == 3 && strcmp(argv[1], "--private-bus-loss") == 0) {
+    if ((argc == 3 || (argc == 4 && strcmp(argv[3], "--host-only") == 0)) &&
+        strcmp(argv[1], "--private-bus-loss") == 0) {
+        /* Select mode 2 for large host/LSan batches without weakening the
+         * default three-mode lifecycle regression. */
         signal(SIGPIPE, SIG_IGN);
-        test_private_bus_loss(argv[2]);
+        test_private_bus_loss(argv[2], argc == 4);
         return md_test_report();
     }
 #else
