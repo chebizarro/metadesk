@@ -20,6 +20,7 @@ extern "C" {
 #ifdef _WIN32
 
 #include <UIAutomation.h>
+#include <wtsapi32.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -42,11 +43,29 @@ struct UIAState {
     IUIAutomation      *automation;
     IUIAutomationTreeWalker *walker;
     MdA11yCtx          *ctx;         /* back-pointer for change hints */
-    int                 connected;
+    volatile LONG       connected;  /* Interlocked only; predicate never calls COM */
     int                 com_initialized;
     uint64_t            next_id;
     CRITICAL_SECTION    lock;
     int                 lock_initialized;
+    SRWLOCK             calls_lock;
+    CONDITION_VARIABLE  calls_drained;
+    unsigned            active_calls; /* includes callers waiting for tree lock */
+    bool                closing;
+
+    /* Resolve WTS at runtime to keep the backend self-contained in existing
+     * Windows link targets (which do not link wtsapi32). Fail closed if absent. */
+    HMODULE             wts_module;
+    decltype(&WTSQuerySessionInformationW) wts_query;
+    decltype(&WTSFreeMemory) wts_free;
+    decltype(&WTSRegisterSessionNotification) wts_register;
+    decltype(&WTSUnRegisterSessionNotification) wts_unregister;
+    DWORD               session_id;
+    HANDLE              session_thread;
+    HANDLE              session_stop;
+    HANDLE              session_ready;
+    HWND                session_window;
+    int                 session_registered;
 
     HANDLE              event_thread;
     HANDLE              stop_event;
@@ -55,6 +74,151 @@ struct UIAState {
     int                 subscribed;      /* handlers registered; the callback
                                           * itself lives on the MdA11yCtx */
 };
+
+/* Loss is terminal for this context: unlocking/reconnecting requires a new
+ * backend, not resurrection of COM proxies from the old desktop. */
+static bool uia_connected(UIAState *st) {
+    return st && InterlockedCompareExchange(&st->connected, 0, 0) != 0;
+}
+
+#ifdef MD_UIA_TESTING
+static HANDLE uia_test_loss_event = nullptr;
+#endif
+
+static void uia_lost(UIAState *st) {
+    InterlockedExchange(&st->connected, 0);
+#ifdef MD_UIA_TESTING
+    if (uia_test_loss_event) SetEvent(uia_test_loss_event);
+#endif
+}
+
+static void uia_session_change(UIAState *st, WPARAM reason, DWORD session) {
+    if (session == st->session_id &&
+        (reason == WTS_SESSION_LOCK || reason == WTS_CONSOLE_DISCONNECT ||
+         reason == WTS_REMOTE_DISCONNECT || reason == WTS_SESSION_LOGOFF ||
+         reason == WTS_SESSION_TERMINATE))
+        uia_lost(st);
+}
+
+static LRESULT CALLBACK uia_session_proc(HWND window, UINT msg,
+                                         WPARAM wp, LPARAM lp) {
+    auto *st = reinterpret_cast<UIAState *>(GetWindowLongPtr(window, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        st = static_cast<UIAState *>(reinterpret_cast<CREATESTRUCT *>(lp)->lpCreateParams);
+        SetWindowLongPtr(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(st));
+    }
+    if (st && msg == WM_WTSSESSION_CHANGE)
+        uia_session_change(st, wp, static_cast<DWORD>(lp));
+    if (st && msg == WM_ENDSESSION && wp)
+        uia_lost(st);
+    return DefWindowProc(window, msg, wp, lp);
+}
+
+/* Session 0 can allocate UIA and even obtain a root, but has no interactive
+ * desktop. Register before checking state so startup cannot miss a loss.
+ * OpenInputDesktop also rejects a locked/inaccessible secure desktop; compare
+ * names to avoid claiming readiness on a different desktop. No COM here. */
+static bool uia_desktop_available(UIAState *st) {
+    if (!st->session_id) return false;
+    LPWSTR buffer = nullptr;
+    DWORD bytes = 0;
+    bool active = st->wts_query(WTS_CURRENT_SERVER_HANDLE,
+        st->session_id, WTSConnectState, &buffer, &bytes) &&
+        bytes >= sizeof(WTS_CONNECTSTATE_CLASS) &&
+        *reinterpret_cast<WTS_CONNECTSTATE_CLASS *>(buffer) == WTSActive;
+    if (buffer) st->wts_free(buffer);
+    if (!active) return false;
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!input) return false;
+    wchar_t input_name[256], thread_name[256];
+    DWORD needed = 0;
+    bool same = GetUserObjectInformationW(input, UOI_NAME, input_name,
+                    sizeof(input_name), &needed) &&
+        GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),
+                    UOI_NAME, thread_name, sizeof(thread_name), &needed) &&
+        wcscmp(input_name, thread_name) == 0;
+    CloseDesktop(input);
+    return same;
+}
+
+static DWORD WINAPI uia_session_thread_proc(LPVOID data) {
+    auto *st = static_cast<UIAState *>(data);
+    /* A per-thread class name allows independent backend contexts. This thread
+     * owns a hidden top-level window, never COM/UIA (UIA calls must not run on
+     * a window-owning thread). */
+    wchar_t class_name[64];
+    swprintf(class_name, 64, L"MetadeskUIASession%lu", GetCurrentThreadId());
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = uia_session_proc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = class_name;
+    ATOM atom = RegisterClassW(&wc);
+    HWND window = atom ? CreateWindowExW(0, class_name, L"", 0,
+        0, 0, 0, 0, nullptr, nullptr, wc.hInstance, st) : nullptr;
+    bool registered = window &&
+        st->wts_register(window, NOTIFY_FOR_THIS_SESSION);
+    st->session_window = window;
+    st->session_registered = registered;
+    if (!registered || !uia_desktop_available(st)) uia_lost(st);
+    SetEvent(st->session_ready);
+    if (registered) {
+        for (;;) {
+            DWORD wait = MsgWaitForMultipleObjects(1, &st->session_stop,
+                                                   FALSE, INFINITE, QS_ALLINPUT);
+            if (wait == WAIT_OBJECT_0) break;
+            if (wait != WAIT_OBJECT_0 + 1) { uia_lost(st); break; }
+            MSG msg;
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+        st->wts_unregister(window);
+    }
+    if (window) DestroyWindow(window);
+    if (atom) UnregisterClassW(class_name, wc.hInstance);
+    return 0;
+}
+
+static void uia_stop_session_thread(UIAState *st) {
+    if (st->session_thread) {
+        SetEvent(st->session_stop);
+        WaitForSingleObject(st->session_thread, INFINITE);
+        CloseHandle(st->session_thread);
+    }
+    if (st->session_stop) CloseHandle(st->session_stop);
+    if (st->session_ready) CloseHandle(st->session_ready);
+    if (st->wts_module) FreeLibrary(st->wts_module);
+}
+
+#ifdef MD_UIA_TESTING
+/* Only the standalone harness defines this seam; never present in production. */
+static HRESULT (*uia_test_root)(IUIAutomation *, IUIAutomationElement **) = nullptr;
+static HANDLE uia_test_destroy_waiting = nullptr;
+static HANDLE uia_test_call_admitted = nullptr;
+#endif
+
+static HRESULT uia_root(UIAState *st, IUIAutomation *automation,
+                         IUIAutomationElement **root) {
+    HRESULT hr;
+#ifdef MD_UIA_TESTING
+    if (uia_test_root) hr = uia_test_root(automation, root);
+    else
+#endif
+        hr = automation->GetRootElement(root);
+    if (SUCCEEDED(hr) && *root) {
+        int process_id = 0;
+        hr = (*root)->get_CurrentProcessId(&process_id);
+    }
+    /* Only a desktop-root failure is global. A child disappearing during a
+     * walk is normal and must not terminate the host. */
+    if (hr == RPC_E_DISCONNECTED || hr == static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE) ||
+        hr == CO_E_OBJNOTCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE))
+        uia_lost(st);
+    if (SUCCEEDED(hr) && !*root) { uia_lost(st); hr = E_FAIL; }
+    if (FAILED(hr)) SAFE_RELEASE(*root);
+    return hr;
+}
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -299,8 +463,9 @@ static int uia_init(MdA11yCtx *ctx) {
     int com_initialized = 0;
     if (SUCCEEDED(hr)) {
         com_initialized = 1;
-    } else if (hr != RPC_E_CHANGED_MODE) {
-        MD_LOG_I("CoInitializeEx failed: 0x%08lx", hr);
+    } else {
+        /* Do not publish STA-owned proxies to the bridge's worker threads. */
+        MD_LOG_I("CoInitializeEx(MTA) failed: 0x%08lx", hr);
         return -1;
     }
 
@@ -313,6 +478,8 @@ static int uia_init(MdA11yCtx *ctx) {
     st->ctx = ctx;
     InitializeCriticalSection(&st->lock);
     st->lock_initialized = 1;
+    InitializeSRWLock(&st->calls_lock);
+    InitializeConditionVariable(&st->calls_drained);
 
     hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr,
                           CLSCTX_INPROC_SERVER,
@@ -337,7 +504,43 @@ static int uia_init(MdA11yCtx *ctx) {
         return -1;
     }
 
-    st->connected = 1;
+    InterlockedExchange(&st->connected, 1);
+    IUIAutomationElement *root = nullptr;
+    if (FAILED(uia_root(st, st->automation, &root))) uia_lost(st);
+    SAFE_RELEASE(root);
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &st->session_id))
+        uia_lost(st);
+    st->wts_module = LoadLibraryW(L"wtsapi32.dll");
+    if (st->wts_module) {
+        /* memcpy avoids MSVC /W4's incompatible function-pointer cast warning.
+         * FARPROC and these Win32 function pointers have identical size. */
+#define MD_WTS_PROC(member, name) do { \
+        FARPROC proc = GetProcAddress(st->wts_module, name); \
+        static_assert(sizeof(st->member) == sizeof(proc), "Win32 function pointer size"); \
+        memcpy(&st->member, &proc, sizeof(proc)); \
+    } while (0)
+        MD_WTS_PROC(wts_query, "WTSQuerySessionInformationW");
+        MD_WTS_PROC(wts_free, "WTSFreeMemory");
+        MD_WTS_PROC(wts_register, "WTSRegisterSessionNotification");
+        MD_WTS_PROC(wts_unregister, "WTSUnRegisterSessionNotification");
+#undef MD_WTS_PROC
+    }
+    st->session_stop = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    st->session_ready = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (st->session_stop && st->session_ready && st->wts_query && st->wts_free &&
+        st->wts_register && st->wts_unregister)
+        st->session_thread = CreateThread(nullptr, 0, uia_session_thread_proc, st, 0, nullptr);
+    if (st->session_thread)
+        WaitForSingleObject(st->session_ready, INFINITE);
+    if (!st->session_thread || !st->session_registered) {
+        uia_stop_session_thread(st);
+        SAFE_RELEASE(st->walker);
+        SAFE_RELEASE(st->automation);
+        DeleteCriticalSection(&st->lock);
+        if (st->com_initialized) CoUninitialize();
+        free(st);
+        return -1;
+    }
     ctx->backend_data = st;
     return 0;
 }
@@ -345,7 +548,7 @@ static int uia_init(MdA11yCtx *ctx) {
 static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
                                       IUIAutomationTreeWalker *walker,
                                       MdA11yNode **out_root) {
-    if (!st || !automation || !walker || !st->connected || !out_root)
+    if (!st || !automation || !walker || !uia_connected(st) || !out_root)
         return -1;
 
     *out_root = nullptr;
@@ -353,7 +556,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
 
     /* Get the root element (desktop) */
     IUIAutomationElement *rootElem = nullptr;
-    HRESULT hr = automation->GetRootElement(&rootElem);
+    HRESULT hr = uia_root(st, automation, &rootElem);
     if (FAILED(hr) || !rootElem) return -1;
 
     /* Create root node */
@@ -417,9 +620,31 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
     if (!st || !st->lock_initialized) return -1;
 
-    EnterCriticalSection(&st->lock);
-    int ret = uia_get_tree_with_unlocked(st, st->automation, st->walker, out_root);
-    LeaveCriticalSection(&st->lock);
+    AcquireSRWLockExclusive(&st->calls_lock);
+    if (st->closing) {
+        ReleaseSRWLockExclusive(&st->calls_lock);
+        return -1;
+    }
+    st->active_calls++;
+#ifdef MD_UIA_TESTING
+    if (uia_test_call_admitted) ReleaseSemaphore(uia_test_call_admitted, 1, nullptr);
+#endif
+    ReleaseSRWLockExclusive(&st->calls_lock);
+
+    /* Bridge callers may be plain worker threads. Join the MTA for the whole
+     * call rather than using a proxy on an uninitialized or STA thread. */
+    HRESULT apartment_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int ret = -1;
+    if (SUCCEEDED(apartment_hr)) {
+        EnterCriticalSection(&st->lock);
+        ret = uia_get_tree_with_unlocked(st, st->automation, st->walker, out_root);
+        LeaveCriticalSection(&st->lock);
+        CoUninitialize();
+    }
+
+    AcquireSRWLockExclusive(&st->calls_lock);
+    if (--st->active_calls == 0) WakeAllConditionVariable(&st->calls_drained);
+    ReleaseSRWLockExclusive(&st->calls_lock);
     return ret;
 }
 
@@ -430,6 +655,7 @@ public:
     UIAChangeHandler(UIAState *st, IUIAutomation *automation,
                      IUIAutomationTreeWalker *walker)
         : refs_(1), st_(st), automation_(automation), walker_(walker) {
+        InitializeCriticalSection(&callback_lock_);
         if (automation_) automation_->AddRef();
         if (walker_) walker_->AddRef();
     }
@@ -437,8 +663,17 @@ public:
     /* Not virtual: the class is final and Release() deletes via its own
      * static type. COM interfaces carry no virtual destructor. */
     ~UIAChangeHandler() {
+        DeleteCriticalSection(&callback_lock_);
         SAFE_RELEASE(walker_);
         SAFE_RELEASE(automation_);
+    }
+
+    /* COM may retain this handler and call it after unregistration. Detach
+     * while holding a handler-owned lock, draining any dispatch using st_. */
+    void detach() {
+        EnterCriticalSection(&callback_lock_);
+        st_ = nullptr;
+        LeaveCriticalSection(&callback_lock_);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -496,12 +731,13 @@ public:
 
 private:
     void emit_change() {
-        if (!st_ || !st_->ctx || !st_->lock_initialized)
-            return;
-
-        md_a11y_change_dispatch(st_->ctx);
+        EnterCriticalSection(&callback_lock_);
+        if (st_ && st_->ctx && uia_connected(st_))
+            md_a11y_change_dispatch(st_->ctx);
+        LeaveCriticalSection(&callback_lock_);
     }
 
+    CRITICAL_SECTION callback_lock_;
     volatile LONG refs_;
     UIAState *st_;
     IUIAutomation *automation_;
@@ -534,7 +770,7 @@ static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
     if (SUCCEEDED(hr) && automation)
         hr = automation->get_ContentViewWalker(&walker);
     if (SUCCEEDED(hr) && automation)
-        hr = automation->GetRootElement(&root);
+        hr = uia_root(st, automation, &root);
     if (SUCCEEDED(hr) && !root)
         hr = E_FAIL;
     if (SUCCEEDED(hr) && automation && walker)
@@ -586,6 +822,7 @@ static DWORD WINAPI uia_event_thread_proc(LPVOID data) {
     st->subscribed = 0;
     LeaveCriticalSection(&st->lock);
 
+    if (handler) handler->detach();
     if (structure_registered) {
         auto *structure_handler =
             static_cast<IUIAutomationStructureChangedEventHandler *>(handler);
@@ -611,7 +848,7 @@ static void uia_teardown_subscription(UIAState *st);
 static int uia_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                  void *userdata) {
     auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
-    if (!st || !st->connected || !st->lock_initialized || !cb)
+    if (!st || !uia_connected(st) || !st->lock_initialized || !cb)
         return -1;
     (void)userdata; /* callback + userdata are stored on ctx by a11y.c */
 
@@ -714,16 +951,28 @@ static void uia_destroy(MdA11yCtx *ctx) {
     auto *st = ctx ? (UIAState *)ctx->backend_data : nullptr;
     if (!st) return;
 
-    if (st->lock_initialized) {
-        EnterCriticalSection(&st->lock);
-        st->connected = 0;
-        LeaveCriticalSection(&st->lock);
-    }
-
+    uia_lost(st);
+    AcquireSRWLockExclusive(&st->calls_lock);
+    st->closing = true;
+#ifdef MD_UIA_TESTING
+    if (uia_test_destroy_waiting) SetEvent(uia_test_destroy_waiting);
+#endif
+    /* A critical section is not FIFO: merely acquiring the tree lock here
+     * could overtake and free a caller already queued on it. Drain all admitted
+     * calls, including lock waiters, before deleting any backend state. */
+    while (st->active_calls)
+        SleepConditionVariableSRW(&st->calls_drained, &st->calls_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&st->calls_lock);
     uia_teardown_subscription(st);
+    uia_stop_session_thread(st);
 
+    /* The owner stops starting new calls before destroy (the supervised
+     * bridge joins its watcher). Admitted tree calls have drained above; never
+     * join an event thread with the tree lock held. */
+    EnterCriticalSection(&st->lock);
     SAFE_RELEASE(st->walker);
     SAFE_RELEASE(st->automation);
+    LeaveCriticalSection(&st->lock);
 
     if (st->lock_initialized)
         DeleteCriticalSection(&st->lock);
@@ -738,8 +987,8 @@ static void uia_destroy(MdA11yCtx *ctx) {
 /* ── Singleton vtable ────────────────────────────────────────── */
 
 static bool uia_is_connected(const MdA11yCtx *ctx) {
-    const auto *st = static_cast<const UIAState *>(ctx->backend_data);
-    return st && st->automation != nullptr;
+    auto *st = ctx ? static_cast<UIAState *>(ctx->backend_data) : nullptr;
+    return uia_connected(st);
 }
 
 /* Positional: must match the MdA11yBackend member order in a11y.h. */
