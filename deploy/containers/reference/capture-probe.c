@@ -3,11 +3,13 @@
  * Link against the SAME libmetadesk.so shipped to the image. No fake backend.
  */
 #include "core/capture.h"
+#include <dirent.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 static double now(void) {
@@ -18,8 +20,39 @@ static double now(void) {
 
 static uint64_t last_timestamp;
 
-static void *stop_capture(void *ctx) {
-    md_capture_stop(ctx);
+static void resources(const char *stage) {
+    const char *trace = getenv("MD_CAPTURE_TRACE_BUFFERS");
+    if (!trace || strcmp(trace, "1") != 0) return;
+    unsigned fds = 0, mappings = 0;
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            char *end;
+            long fd = strtol(entry->d_name, &end, 10);
+            if (*entry->d_name && !*end && fd != dirfd(dir)) fds++;
+        }
+        closedir(dir);
+    }
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char line[2048];
+        while (fgets(line, sizeof(line), maps))
+            if (strstr(line, "xdpw-shm-") || strstr(line, "memfd:")) mappings++;
+        fclose(maps);
+    }
+    printf("resources=%s fds=%u shm_mappings=%u\n", stage, fds, mappings);
+}
+
+typedef struct {
+    MdCaptureCtx *ctx;
+    atomic_bool completed;
+} StopTask;
+
+static void *stop_capture(void *arg) {
+    StopTask *task = arg;
+    md_capture_stop(task->ctx);
+    atomic_store_explicit(&task->completed, true, memory_order_release);
     return NULL;
 }
 
@@ -86,7 +119,7 @@ static int probe(MdCaptureCtx *ctx) {
     }
     /* A static, undamaged output can legitimately stop delivering new frames.
      * Measure that boundary separately from the changing-pixel success test. */
-    if (matches[0] == 5 && matches[1] == 5) {
+    if (matches[0] == 5 && matches[1] == 5 && !getenv("MD_CAPTURE_SKIP_IDLE")) {
         unsigned idle_frames = 0, idle_timeouts = 0, idle_errors = 0;
         char before[1024], after[1024];
         size_t token_len = md_capture_restore_token_load(before, sizeof(before));
@@ -132,7 +165,9 @@ static int probe(MdCaptureCtx *ctx) {
         if (held_result != 0 || !held.data) return 11;
         uint8_t pixel = held.data[0];
         pthread_t stopper;
-        if (pthread_create(&stopper, NULL, stop_capture, ctx) != 0) {
+        StopTask task = {.ctx = ctx};
+        atomic_init(&task.completed, false);
+        if (pthread_create(&stopper, NULL, stop_capture, &task) != 0) {
             md_capture_release_frame(ctx, &held);
             return 11;
         }
@@ -140,12 +175,14 @@ static int probe(MdCaptureCtx *ctx) {
         MdFrame next = {0};
         int stopped = md_capture_get_frame(ctx, &next);
         if (stopped == 0) md_capture_release_frame(ctx, &next);
-        bool intact = held.data[0] == pixel;
+        bool waiting = stopped == MD_CAPTURE_ERROR &&
+                       !atomic_load_explicit(&task.completed, memory_order_acquire);
+        bool intact = waiting && held.data[0] == pixel;
         md_capture_release_frame(ctx, &held);
         pthread_join(stopper, NULL);
         int after_stop = md_capture_get_frame(ctx, &next);
-        printf("held_buffer_intact=%d after_stop=%d\n", intact, after_stop);
-        if (!intact || after_stop != MD_CAPTURE_ERROR) return 11;
+        printf("held_buffer_intact=%d after_stop=%d stop_waiting=%d\n", intact, after_stop, waiting);
+        if (!waiting || !intact || after_stop != MD_CAPTURE_ERROR) return 11;
     }
     printf("frames=%u timeouts=%u matching_pixels=%u,%u elapsed=%.3f\n",
            frames, timeouts, matches[0], matches[1], now() - start);
@@ -157,18 +194,22 @@ int main(void) {
     MdCaptureConfig cfg = {.target_fps = 15, .show_cursor = true, .unattended = true};
     const char *timeout = getenv("MD_CAPTURE_CONSENT_TIMEOUT_MS");
     if (timeout) cfg.consent_timeout_ms = (uint32_t)strtoul(timeout, NULL, 10);
+    resources("before-create");
     MdCaptureCtx *ctx = md_capture_create(&cfg);
     if (!ctx) return 2;
     const char *repeat = getenv("MD_CAPTURE_REOPENS");
     unsigned count = repeat ? (unsigned)strtoul(repeat, NULL, 10) : 1;
-    if (!count || count > 20) { md_capture_destroy(ctx); return 2; }
+    if (!count || count > 100) { md_capture_destroy(ctx); return 2; }
+    printf("static_check_skipped=%d\n", getenv("MD_CAPTURE_SKIP_IDLE") != NULL);
     int rc = 0;
     for (unsigned i = 0; i < count; i++) {
         printf("reopen=%u\n", i);
         rc = probe(ctx);
         md_capture_stop(ctx);
+        resources("after-stop");
         if (rc) break;
     }
     md_capture_destroy(ctx);
+    resources("after-destroy");
     return rc;
 }
