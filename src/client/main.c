@@ -16,6 +16,7 @@
 #include "fips_addr.h"
 #include "fips_control.h"
 #include "session.h"
+#include <openssl/crypto.h>
 #include "packet.h"
 #include "stream.h"
 #include "decode.h"
@@ -68,6 +69,7 @@ typedef struct {
     /* Nostr session negotiation state */
     char          expected_host_pk[128]; /* pubkey hex of host we're connecting to */
     char          accepted_session_id[64]; /* from session_accept DM     */
+    char          stream_token[65];       /* ephemeral DM-only proof    */
     uint32_t      granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* set by on_dm callback           */
@@ -127,7 +129,9 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
 
     /* Try to parse as session_accept */
     MdSessionAccept acc;
-    if (md_session_accept_from_json(content, &acc) == 0) {
+    if (!ctx->session_accepted &&
+        md_session_accept_from_json(content, &acc) == 0 && acc.stream_token[0]) {
+        memcpy(ctx->stream_token, acc.stream_token, sizeof(ctx->stream_token));
         strncpy(ctx->accepted_session_id, acc.session_id,
                 sizeof(ctx->accepted_session_id) - 1);
         ctx->granted_caps = acc.granted;
@@ -136,6 +140,7 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         if (ctx->session_ch)
             go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
     }
+    OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
 }
 
 /* ── Usage ───────────────────────────────────────────────────── */
@@ -230,6 +235,7 @@ static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
 static void reset_session_accept_state(ClientCtx *ctx) {
     if (!ctx) return;
     ctx->accepted_session_id[0] = '\0';
+    OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
     ctx->granted_caps = 0;
     ctx->accepted_tree_format = MD_TREE_FORMAT_COMPACT;
     ctx->session_accepted = 0;
@@ -286,7 +292,7 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
     return 0;
 }
 
-static int send_session_info(MdStream *stream, const ClientCtx *ctx) {
+static int send_session_info(MdStream *stream, ClientCtx *ctx) {
     if (!stream || !ctx || !client_owner_current(ctx))
         return -1;
 
@@ -294,16 +300,43 @@ static int send_session_info(MdStream *stream, const ClientCtx *ctx) {
     strncpy(acc.session_id, ctx->accepted_session_id, sizeof(acc.session_id) - 1);
     acc.granted = ctx->granted_caps;
 
-    char *info_json = md_session_accept_to_json(&acc);
+    memcpy(acc.stream_token, ctx->stream_token, sizeof(acc.stream_token));
+    char *info_json = md_session_bind_to_json(&acc);
+    OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
     if (!info_json)
         return -1;
 
-    if (!client_owner_current(ctx)) { free(info_json); return -1; }
+    if (!client_owner_current(ctx)) {
+        OPENSSL_cleanse(info_json, strlen(info_json)); free(info_json); return -1;
+    }
     int ret = md_stream_send(stream, MD_PKT_SESSION_INFO, 0,
                              (const uint8_t *)info_json,
                              (uint32_t)strlen(info_json));
+    OPENSSL_cleanse(info_json, strlen(info_json));
     free(info_json);
-    return ret;
+    OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
+    if (ret != 0) return -1;
+
+    /* Do not declare this client active on a successful send alone. */
+    MdPacketHeader hdr;
+    uint8_t *payload = NULL;
+    ret = md_stream_recv(stream, &hdr, &payload, MD_SESSION_BIND_TIMEOUT_MS);
+    if (ret != 0) return -1;
+    bool valid = hdr.type == MD_PKT_SESSION_INFO && hdr.payload_len > 0 &&
+        hdr.payload_len <= MD_SESSION_JSON_MAX &&
+        !memchr(payload, '\0', hdr.payload_len);
+    if (valid) {
+        char json[MD_SESSION_JSON_MAX + 1];
+        memcpy(json, payload, hdr.payload_len);
+        json[hdr.payload_len] = '\0';
+        MdSessionAccept ack;
+        valid = md_session_accept_from_json(json, &ack) == 0 &&
+            strcmp(ack.session_id, ctx->accepted_session_id) == 0 &&
+            ack.granted == ctx->granted_caps &&
+            ack.tree_format == ctx->accepted_tree_format && !ack.stream_token[0];
+    }
+    free(payload);
+    return valid && client_owner_current(ctx) ? 0 : -1;
 }
 
 static MdStream *connect_client_stream(const char *host, const char *npub,

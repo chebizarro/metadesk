@@ -29,7 +29,8 @@ typedef enum {
     MD_PKT_INPUT         = 0x06,  /* raw human mouse/keyboard (client→host) */
     MD_PKT_PING          = 0x10,
     MD_PKT_PONG          = 0x11,
-    MD_PKT_SESSION_INFO  = 0x20,
+    MD_PKT_SESSION_INFO  = 0x20, /* first packet: session_bind proof (<=8 KiB);
+                                 * host ACK: secret-free session_accept */
 } MdPacketType;
 
 /* 16-byte packet header (little-endian) */

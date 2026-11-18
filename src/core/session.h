@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,9 @@ typedef struct {
     uint32_t       keepalive_ms;   /* keepalive interval            */
     uint64_t       last_ping_ms;   /* timestamp of last ping sent   */
     uint64_t       last_pong_ms;   /* timestamp of last pong recv   */
+    /* Host-only, ephemeral one-use stream reservation. Never log/persist. */
+    char           stream_token[65];
+    uint64_t       stream_deadline_ms;
 } MdSession;
 
 /* Initialise session to IDLE state */
@@ -107,6 +111,7 @@ typedef struct {
     char         session_id[64];   /* UUID assigned by host      */
     uint32_t     granted;          /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;      /* confirmed tree format       */
+    char         stream_token[65]; /* DM-only 256-bit binding secret */
 } MdSessionAccept;
 
 /* Serialize a session request to a newly-allocated JSON string. Caller frees. */
@@ -120,6 +125,21 @@ char *md_session_accept_to_json(const MdSessionAccept *acc);
 
 /* Parse a session accept from JSON. Returns 0 on success, -1 on error. */
 int md_session_accept_from_json(const char *json, MdSessionAccept *out);
+
+/* Transitional binding extension to v1 signaling (not full session-v2).
+ * SESSION_INFO must carry session_bind as the first stream packet.
+ * The token is delivered only in the authenticated acceptance DM. */
+#define MD_SESSION_JSON_MAX 8192
+#define MD_SESSION_TOKEN_LIFETIME_MS 30000
+#define MD_SESSION_BIND_TIMEOUT_MS 5000
+
+/* Reserve a CSPRNG token for a negotiating host session and fill its DM. */
+int md_session_prepare_binding(MdSession *s, MdSessionAccept *acc, uint64_t now_ms);
+char *md_session_bind_to_json(const MdSessionAccept *acc);
+/* Validate bounded wire JSON, consume once and activate. Caller serializes
+ * access to the reservation. Failure never activates or grants capabilities. */
+int md_session_consume_binding(MdSession *s, const uint8_t *payload, size_t len,
+                               uint64_t now_ms);
 
 /* Helper: convert capability bitfield to/from JSON array of strings. */
 uint32_t md_caps_from_strings(const char **strs, int count);

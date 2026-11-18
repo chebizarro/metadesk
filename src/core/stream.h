@@ -18,6 +18,7 @@
 #define MD_STREAM_H
 
 #include "packet.h"
+#include "session.h"
 #include "fips_addr.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -81,6 +82,9 @@ MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port);
  * Returns a connected MdStream, or NULL on timeout/error. */
 MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms);
 
+/* Actual listening port, including an ephemeral port requested with 0. */
+uint16_t md_stream_server_port(const MdStreamServer *srv);
+
 /* Destroy server socket. Does NOT close accepted streams. */
 void md_stream_server_destroy(MdStreamServer *srv);
 
@@ -113,6 +117,15 @@ int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,
  * Returns 0 on success, -1 on error, 1 on timeout. */
 int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
                    uint8_t **payload_out, uint32_t timeout_ms);
+
+/* Host candidate gate. First packet must be a bounded SESSION_INFO bind.
+ * Consumes the session reservation once, sends a secret-free authoritative
+ * acceptance ACK, then attaches the grant to this stream. On failure closes
+ * the transport (caller still destroys the object). Single host-thread use. */
+int md_stream_accept_binding(MdStream *s, MdSession *session);
+bool md_stream_has_capability(const MdStream *s, uint32_t capabilities);
+/* Reject a connection without destroying it; caller retains lifetime ownership. */
+void md_stream_close(MdStream *s);
 
 /* Send a ping packet. Records send timestamp for RTT measurement. */
 int md_stream_send_ping(MdStream *s);

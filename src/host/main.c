@@ -40,6 +40,8 @@
 #include <poll.h>
 #include <pthread.h>
 #include <go.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -95,7 +97,7 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
 
     pthread_mutex_lock(&ctx->client_mu);
     MdStream *client = ctx->client;
-    if (!client || !md_stream_is_connected(client)) {
+    if (!md_stream_has_capability(client, MD_CAP_VIDEO)) {
         pthread_mutex_unlock(&ctx->client_mu);
         return;
     }
@@ -314,10 +316,60 @@ static void *capture_thread_func(void *arg) {
     return NULL;
 }
 
+/* Publish only after listener/backend startup, so no valid proof is stranded
+ * in the listen backlog while the client's bounded ACK wait expires. */
+static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
+    if (!g_running || (owner && !md_account_binding_is_current(owner))) return -1;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    MdSessionAccept acc;
+    if (md_session_prepare_binding(ctx->session, &acc,
+        (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000) != 0)
+        return -1;
+    char *json = md_session_accept_to_json(&acc);
+    OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
+    if (!json) return -1;
+    int ret = md_nostr_send_session_accept(ctx->nostr, ctx->pending_client_pk, json);
+    OPENSSL_cleanse(json, strlen(json));
+    free(json);
+    if (ret || !g_running || (owner && !md_account_binding_is_current(owner)))
+        return -1;
+    if (ctx->session_log)
+        md_session_log_event(ctx->session_log, MD_SESSION_LOG_ACCEPT,
+                             ctx->session->session_id, ctx->pending_client_pk,
+                             "session accepted");
+    return 0;
+}
+
+/* Candidate ownership stays on the host thread. It is never published here;
+ * capture sees it only after the bind has consumed the reservation and ACKed. */
+static int host_bind_candidate(HostCtx *ctx, MdStream *candidate) {
+    if (ctx->client) {
+        md_stream_close(candidate);
+        return -1;
+    }
+    return md_stream_accept_binding(candidate, ctx->session);
+}
+
+static void host_send_initial_tree(HostCtx *ctx) {
+    if (ctx->agent && md_stream_has_capability(ctx->client, MD_CAP_AGENT))
+        md_agent_send_tree(ctx->agent, ctx->client, &ctx->pkt_seq);
+}
+
 /* ── Handle incoming packets from client ─────────────────────── */
 
 static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
                                  const uint8_t *payload) {
+    /* Only the published, proven stream can dispatch. Rebinding is always a
+     * protocol violation, even on the stream that consumed the token. */
+    uint32_t needed = 0;
+    if (hdr->type == MD_PKT_INPUT) needed = MD_CAP_INPUT;
+    if (hdr->type == MD_PKT_ACTION) needed = MD_CAP_AGENT | MD_CAP_INPUT;
+    if (hdr->type == MD_PKT_SESSION_INFO ||
+        !md_stream_has_capability(ctx->client, needed)) {
+        md_stream_close(ctx->client);
+        return;
+    }
     switch (hdr->type) {
     case MD_PKT_PING:
         /* Reply with pong */
@@ -390,28 +442,6 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         default:
             break;
         }
-        break;
-    }
-
-    case MD_PKT_SESSION_INFO: {
-        fprintf(stderr, "host: received session info\n");
-        /* Parse session info and ack with granted capabilities */
-        if (payload && hdr->payload_len > 0) {
-            MdSessionAccept acc;
-            char json_buf[4096];
-            size_t len = hdr->payload_len < sizeof(json_buf) - 1
-                         ? hdr->payload_len : sizeof(json_buf) - 1;
-            memcpy(json_buf, payload, len);
-            json_buf[len] = '\0';
-            if (md_session_accept_from_json(json_buf, &acc) == 0) {
-                fprintf(stderr, "host: session_id=%s\n", acc.session_id);
-                if (ctx->session)
-                    md_session_activate(ctx->session);
-            }
-        }
-        /* Echo back as ack */
-        md_stream_send(ctx->client, MD_PKT_SESSION_INFO, ctx->pkt_seq++,
-                       payload, hdr->payload_len);
         break;
     }
 
@@ -1002,22 +1032,10 @@ int main(int argc, char **argv) {
                 char session_id[64];
                 {
                     uint8_t rnd[16];
-    #if defined(__APPLE__) || defined(__FreeBSD__)
-                    arc4random_buf(rnd, sizeof(rnd));
-    #elif defined(__linux__)
-                    /* getrandom(2) — available since Linux 3.17 */
-                    extern long getrandom(void *buf, size_t buflen, unsigned int flags);
-                    if (getrandom(rnd, sizeof(rnd), 0) != sizeof(rnd)) {
-                        /* Fallback to /dev/urandom */
-                        FILE *f = fopen("/dev/urandom", "rb");
-                        if (f) { fread(rnd, 1, sizeof(rnd), f); fclose(f); }
-                        else memset(rnd, 0, sizeof(rnd));
+                    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+                        fprintf(stderr, "ERROR: session entropy unavailable\n");
+                        goto signaling_failed;
                     }
-    #else
-                    FILE *f = fopen("/dev/urandom", "rb");
-                    if (f) { fread(rnd, 1, sizeof(rnd), f); fclose(f); }
-                    else memset(rnd, 0, sizeof(rnd));
-    #endif
                     snprintf(session_id, sizeof(session_id),
                              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
                              rnd[0],rnd[1],rnd[2],rnd[3], rnd[4],rnd[5],
@@ -1029,58 +1047,34 @@ int main(int argc, char **argv) {
                 uint32_t granted = ctx.pending_req.capabilities &
                                    (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
 
-                /* Send session accept DM — confirm the tree format we'll use */
-                MdSessionAccept acc = {
-                    .granted = granted,
-                    .tree_format = ctx.pending_req.tree_format,
-                };
-                strncpy(acc.session_id, session_id, sizeof(acc.session_id) - 1);
-
-                char *acc_json = md_session_accept_to_json(&acc);
-                if (acc_json) {
-                    int sent = md_nostr_send_session_accept(nostr, ctx.pending_client_pk,
-                                                           acc_json);
-                    free(acc_json);
-                    if (sent || !g_running ||
-                        (account.binding && !md_account_binding_is_current(account.binding))) {
-                        fprintf(stderr, "ERROR: session acceptance failed or host role revoked\n");
-                        goto signaling_failed;
-                    }
-                    printf("host: sent session accept to %.*s... (session=%s)\n",
-                           8, ctx.pending_client_pk, session_id);
-
-                    /* Log session accept */
-                    if (session_log)
-                        md_session_log_event(session_log, MD_SESSION_LOG_ACCEPT,
-                                             session_id, ctx.pending_client_pk,
-                                             "session accepted");
-                } else {
-                    fprintf(stderr, "ERROR: cannot serialize session acceptance\n");
-                    goto signaling_failed;
-                }
-
-                /* Update session state */
+                if (no_input) granted &= ~MD_CAP_INPUT;
+                /* Record the negotiated grant now. Reserve/publish its token
+                 * only after the listener and desktop backends are ready. */
                 md_session_request(&session, ctx.pending_client_pk,
                                    ctx.pending_req.capabilities,
                                    ctx.pending_req.tree_format);
                 md_session_accept(&session, session_id, granted);
+
             } else if (g_running) {
                 if (fips_npub || account.binding) {
                     fprintf(stderr, "ERROR: timed out waiting for authorized host-role session request; refusing direct TCP fallback\n");
                     goto signaling_failed;
                 }
-                printf("host: no session request received, accepting direct TCP\n");
+                fprintf(stderr, "ERROR: no negotiated session request\n");
             }
         } else {
             if (fips_npub || account.binding) {
                 fprintf(stderr, "ERROR: nostr bridge creation failed; authorized hosting cannot fall back to direct TCP\n");
                 goto signaling_failed;
             }
-            fprintf(stderr, "WARNING: nostr bridge creation failed, direct TCP only\n");
+            fprintf(stderr, "ERROR: nostr bridge creation failed\n");
         }
     }
 
-    if (!g_running) goto signaling_failed;
+    if (!g_running || session.state != MD_SESSION_NEGOTIATING) {
+        fprintf(stderr, "ERROR: negotiated stream authorization required; direct TCP disabled\n");
+        goto signaling_failed;
+    }
     goto signaling_ready;
 signaling_failed:
     md_nostr_destroy(nostr);
@@ -1223,6 +1217,14 @@ signaling_ready:
         }
     }
 
+    /* No remote client can start its bind/ACK wait before this point. */
+    int exit_status = 0;
+    if (host_publish_session_accept(&ctx, account.binding) != 0) {
+        fprintf(stderr, "ERROR: session acceptance failed or host role revoked\n");
+        exit_status = 1;
+        g_running = 0; /* Use the normal backend cleanup below. */
+    }
+
     /* ══════════════════════════════════════════════════════════════
      * Client accept + stream loop
      *
@@ -1251,10 +1253,18 @@ signaling_ready:
                                  session.peer_npub[0] ? session.peer_npub : NULL,
                                  "TCP client connected");
 
-        /* Reset per-connection state */
+        /* A candidate never reaches capture/tree/dispatch. Failed and reused
+         * proofs close only that candidate, without replacing the active one. */
+        if (host_bind_candidate(&ctx, client) != 0) {
+            fprintf(stderr, "host: rejected unproven client #%u\n", client_num);
+            md_stream_destroy(client);
+            continue;
+        }
+
+        /* Reset and publish only after the authoritative bind ACK. Serialize
+         * all host sends with capture so headers/payloads cannot interleave. */
         pthread_mutex_lock(&ctx.client_mu);
         ctx.client     = client;
-        pthread_mutex_unlock(&ctx.client_mu);
         ctx.pkt_seq    = 0;
         ctx.frames_sent = 0;
         ctx.total_encode_us = 0;
@@ -1267,10 +1277,9 @@ signaling_ready:
             md_encoder_force_keyframe(encoder);
 
         /* Send initial UI tree to new client */
-        if (agent && a11y) {
-            md_agent_send_tree(agent, client, &ctx.pkt_seq);
-            printf("host: sent initial UI tree to client #%u\n", client_num);
-        }
+        host_send_initial_tree(&ctx);
+
+        pthread_mutex_unlock(&ctx.client_mu);
 
         /* ── Streaming loop ─────────────────────────────────────── */
         printf("host: streaming to client #%u (Ctrl+C to stop)\n", client_num);
@@ -1288,13 +1297,21 @@ signaling_ready:
         uint32_t last_br = bitrate;
 
         while (g_running && md_stream_is_connected(client)) {
+            /* Never leave a second connection waiting to inherit this grant. */
+            MdStream *extra = md_stream_server_accept(srv, 1);
+            if (extra) {
+                host_bind_candidate(&ctx, extra);
+                md_stream_destroy(extra);
+            }
             /* Check for incoming packets from client (non-blocking) */
             MdPacketHeader hdr;
             uint8_t *payload = NULL;
             int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
 
             if (ret == 0) {
+                pthread_mutex_lock(&ctx.client_mu);
                 handle_client_packet(&ctx, &hdr, payload);
+                pthread_mutex_unlock(&ctx.client_mu);
                 free(payload);
             } else if (ret < 0) {
                 /* Connection lost */
@@ -1306,7 +1323,9 @@ signaling_ready:
 
             /* Send periodic ping for RTT measurement */
             if (now - last_ping_ms >= 1000) {
+                pthread_mutex_lock(&ctx.client_mu);
                 md_stream_send_ping(client);
+                pthread_mutex_unlock(&ctx.client_mu);
                 last_ping_ms = now;
 
                 /* Feed RTT to bitrate controller */
@@ -1427,5 +1446,5 @@ signaling_ready:
     pthread_mutex_destroy(&ctx.client_mu);
 
     printf("host: done. served %u client(s)\n", client_num);
-    return 0;
+    return exit_status;
 }
