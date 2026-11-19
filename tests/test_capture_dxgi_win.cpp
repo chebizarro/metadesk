@@ -27,8 +27,67 @@
  * pointer already is and change only that window's own cursor (SetCursor on
  * its thread), so each change is a pointer-only update. The windows never
  * take focus, send input or touch other windows.
+ *
+ * md-4dsa: while the VM console display changes power state, Desktop
+ * Duplication stalls: AcquireNextFrame overruns its timeout by hundreds of
+ * milliseconds and the staging Map can stall too. The test windows keep
+ * re-waking the display, which the console powers off again about a second
+ * later, so wall-clock cells only count samples during which the display
+ * held one state (display watch below) and the test process kept being
+ * scheduled (scheduling watch: on a busy host the VM's virtual CPUs stall).
+ *
+ * md-m5x4: GetMonitorInfoW is replaced, in this translation unit only, by a
+ * fake that DPI-virtualizes a synthetic mixed-DPI layout for threads that
+ * are not per-monitor aware, as Windows does, and forwards real monitors.
+ * The VM has one output at 100%, so mixed DPI is covered synthetically only.
  */
+#include <windows.h>
+#include "../src/core/win_dpi.h"
+
+/* Physical desktop rectangles and DPI of the synthetic monitors. */
+struct SyntheticMonitor {
+    RECT physical;
+    UINT dpi;
+};
+static const SyntheticMonitor synthetic_monitors[] = {
+    { { 0, 0, 1920, 1080 }, 96 },         /* primary, 100% */
+    { { 1920, -540, 5760, 1620 }, 144 },  /* 3840x2160 at 150%, right */
+    { { -2560, 0, 0, 1440 }, 120 },       /* 2560x1440 at 125%, left */
+};
+static const int synthetic_monitor_count = 3;
+
+static HMONITOR synthetic_monitor(int i) { return (HMONITOR)(INT_PTR)(0x5D000 + i); }
+
+static bool thread_per_monitor_aware() {
+    auto get = (MdGetDpiContextFn)md_win_dpi_proc(L"user32.dll", "GetThreadDpiAwarenessContext");
+    auto awareness = (MdDpiContextAwarenessFn)md_win_dpi_proc(
+        L"user32.dll", "GetAwarenessFromDpiAwarenessContext");
+    return get && awareness && awareness(get()) == 2; /* DPI_AWARENESS_PER_MONITOR_AWARE */
+}
+
+/* What a thread that is not per-monitor aware sees: the rectangle in
+ * 96-DPI logical units. */
+static RECT virtualized(const SyntheticMonitor &m) {
+    const RECT &p = m.physical;
+    const auto s = [&](LONG v) { return (LONG)((LONGLONG)v * 96 / (LONGLONG)m.dpi); };
+    return { s(p.left), s(p.top), s(p.right), s(p.bottom) };
+}
+
+static BOOL WINAPI dpi_monitor_info(HMONITOR monitor, LPMONITORINFO mi) {
+    for (int i = 0; i < synthetic_monitor_count; i++) {
+        if (monitor != synthetic_monitor(i)) continue;
+        if (!mi || mi->cbSize < sizeof(MONITORINFO)) return FALSE;
+        const SyntheticMonitor &m = synthetic_monitors[i];
+        mi->rcMonitor = mi->rcWork = thread_per_monitor_aware() ? m.physical : virtualized(m);
+        mi->dwFlags = i == 0 ? MONITORINFOF_PRIMARY : 0;
+        return TRUE;
+    }
+    return GetMonitorInfoW(monitor, mi);
+}
+
+#define GetMonitorInfoW dpi_monitor_info
 #include "../src/core/capture_dxgi.cpp"
+#undef GetMonitorInfoW
 
 #include <climits>
 #include <cstdio>
@@ -303,6 +362,73 @@ static void all_outputs_unit_tests() {
     puts("PASS pointer across outputs: owner-only hide, newer visible report wins, offsets");
 }
 
+/* md-m5x4: output rectangles are physical on a mixed-DPI desktop even on a
+ * thread that is not per-monitor aware, so "all" composes each output's
+ * physical-size image into a region of exactly that size and the published
+ * rectangle is the physical bounding rectangle SendInput targets. */
+static void dpi_unit_tests() {
+    typedef HANDLE(WINAPI * SetThreadContext)(HANDLE);
+    auto set_thread = (SetThreadContext)md_win_dpi_proc(L"user32.dll", "SetThreadDpiAwarenessContext");
+    CHECK(set_thread); /* Windows 10 1607+ */
+    const HANDLE before = set_thread(MD_DPI_CONTEXT_UNAWARE);
+    CHECK(before && !thread_per_monitor_aware());
+
+    /* The fake virtualizes, as Windows does, so a query outside the
+     * backend's per-monitor scope would be caught. */
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    CHECK(dpi_monitor_info(synthetic_monitor(1), &mi));
+    CHECK(mi.rcMonitor.left == 1280 && mi.rcMonitor.top == -360 && mi.rcMonitor.right == 3840);
+
+    MdCaptureCtx ctx = {};
+    DxgiState st = {};
+    st.count = 3;
+    st.all = true;
+    for (int i = 0; i < 3; i++) {
+        const SyntheticMonitor &m = synthetic_monitors[i];
+        DXGI_OUTPUT_DESC d = {};
+        d.Monitor = synthetic_monitor(i);
+        d.DesktopCoordinates = virtualized(m); /* what DXGI reports to this thread */
+        d.AttachedToDesktop = TRUE;
+        st.out[i].rect = output_physical_rect(d);
+        CHECK(!thread_per_monitor_aware()); /* the scope restored the context */
+        CHECK(EqualRect(&st.out[i].rect, &m.physical));
+        /* Desktop Duplication images are physical: the mode is the
+         * rectangle's size, so the image fills its region exactly. */
+        output_configure(&st.out[i], (uint32_t)(m.physical.right - m.physical.left),
+                         (uint32_t)(m.physical.bottom - m.physical.top), DXGI_MODE_ROTATION_IDENTITY);
+    }
+    /* A monitor the fake does not know (none) falls back to DXGI's own. */
+    {
+        DXGI_OUTPUT_DESC d = {};
+        d.DesktopCoordinates = { 7, 8, 9, 10 };
+        const RECT r = output_physical_rect(d);
+        CHECK(r.left == 7 && r.bottom == 10);
+    }
+    CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+    /* Bounding rectangle (-2560,-540) to (5760,1620). */
+    CHECK(ctx.width == 8320 && ctx.height == 2160);
+    CHECK(ctx.output_rect.x == -2560 && ctx.output_rect.y == -540 &&
+          ctx.output_rect.width == 8320 && ctx.output_rect.height == 2160);
+    CHECK(st.out[0].frame_x == 2560 && st.out[0].frame_y == 540);
+    CHECK(st.out[1].frame_x == 4480 && st.out[1].frame_y == 0 && st.out[1].width == 3840);
+    CHECK(st.out[2].frame_x == 0 && st.out[2].frame_y == 540 && st.out[2].width == 2560);
+    /* Adjacent outputs abut without overlap: the 150% output starts where
+     * the primary's region ends, in frame and desktop pixels alike. */
+    CHECK(st.out[0].frame_x + st.out[0].width == st.out[1].frame_x);
+    CHECK(st.out[2].frame_x + st.out[2].width == st.out[0].frame_x);
+    /* A UIA point on the 150% output (physical, from a per-monitor aware
+     * process) is its frame pixel: frame = global - output_rect origin. */
+    const LONG gx = 1920 + 1000, gy = -540 + 700;
+    CHECK(gx - ctx.output_rect.x == (LONG)st.out[1].frame_x + 1000 &&
+          gy - ctx.output_rect.y == (LONG)st.out[1].frame_y + 700);
+    free(st.canvas);
+
+    set_thread(before);
+    puts("PASS mixed DPI (synthetic): physical output rects from a DPI-unaware thread, "
+         "'all' regions abut, UIA physical points map to frame pixels");
+}
+
 static void unit_tests() {
     const Bgr bg = { 10, 100, 200 };
 
@@ -489,6 +615,7 @@ static void unit_tests() {
 
     rotation_unit_tests();
     all_outputs_unit_tests();
+    dpi_unit_tests();
 }
 
 /* ── Test windows ────────────────────────────────────────────── */
@@ -617,6 +744,153 @@ static void window_stop(TestWindow *tw) {
     CloseHandle(tw->thread);
     CloseHandle(tw->ready);
     CloseHandle(tw->display_on);
+}
+
+/* ── Display watch (md-4dsa) ─────────────────────────────────── */
+
+/* Observes the console display's power state for the whole interactive run,
+ * on its own thread with a hidden window; the test windows do the waking.
+ * A wall-clock bound on get_frame only means something while the display
+ * holds one state. During a power change (the VM console turns the display
+ * off about a second after every wake), measured on the VM with
+ * AcquireNextFrame traced against these notifications: 10188 calls, every
+ * one more than 50 ms past its timeout overlapped a change (AcquireNextFrame
+ * blocking up to 630 ms on a 250 ms timeout, Map stalling 195 ms), and no
+ * call without a change was more than 24 ms past it. */
+static const UINT WM_DISPLAY_BARRIER = WM_APP + 2;
+static volatile LONG display_changes = 0; /* GUID_CONSOLE_DISPLAY_STATE notifications */
+static HANDLE display_is_on;              /* manual reset: set while the display is on */
+static HWND display_watch_window;
+
+static LRESULT CALLBACK display_watch_proc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_POWERBROADCAST && wp == PBT_POWERSETTINGCHANGE) {
+        auto *setting = reinterpret_cast<POWERBROADCAST_SETTING *>(lp);
+        DWORD state = 0;
+        if (setting->DataLength >= sizeof(state)) memcpy(&state, setting->Data, sizeof(state));
+        if (IsEqualGUID(setting->PowerSetting, console_display_state)) {
+            if (state == 1) SetEvent(display_is_on);
+            else ResetEvent(display_is_on);
+            InterlockedIncrement(&display_changes);
+        }
+        return TRUE;
+    }
+    if (msg == WM_DISPLAY_BARRIER) {
+        SetEvent((HANDLE)lp);
+        return 0;
+    }
+    return DefWindowProcW(window, msg, wp, lp);
+}
+
+static DWORD WINAPI display_watch_thread(LPVOID ready) {
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = display_watch_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"MetadeskDxgiDisplayWatch";
+    CHECK(RegisterClassW(&wc));
+    /* Never shown; top-level, since power notifications go to top-level
+     * windows. Registration delivers the current state immediately. */
+    display_watch_window = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
+                                           nullptr, nullptr, wc.hInstance, nullptr);
+    CHECK(display_watch_window);
+    CHECK(RegisterPowerSettingNotification(display_watch_window, &console_display_state,
+                                           DEVICE_NOTIFY_WINDOW_HANDLE));
+    SetEvent((HANDLE)ready);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+    return 0;
+}
+
+/* Scheduling watch: a normal-priority thread that sleeps 1 ms at a time
+ * and records the longest gap between its wake-ups. A gap of 50 ms or more
+ * means the process (on the VM, its virtual CPU) was not scheduled, so no
+ * bound on get_frame's duration can hold, whatever the backend does. The
+ * backend cannot cause such a gap: it blocks in DXGI and never spins. */
+static volatile LONG sched_max_gap_us = 0;
+static HANDLE sched_tick; /* auto reset: set on every heartbeat wake-up */
+
+static DWORD WINAPI sched_watch_thread(LPVOID) {
+    double last = now_ms();
+    for (;;) {
+        Sleep(1);
+        const double t = now_ms();
+        const LONG gap = (LONG)((t - last) * 1000.0);
+        last = t;
+        LONG seen = sched_max_gap_us;
+        while (gap > seen) {
+            const LONG prior = InterlockedCompareExchange(&sched_max_gap_us, gap, seen);
+            if (prior == seen) break;
+            seen = prior;
+        }
+        SetEvent(sched_tick);
+    }
+}
+
+/* The longest scheduling gap since the last call, in ms, once the heartbeat
+ * has woken after this call: a gap still open now is counted too. */
+static double sched_gap_settled() {
+    ResetEvent(sched_tick);
+    CHECK(WaitForSingleObject(sched_tick, 10000) == WAIT_OBJECT_0);
+    return InterlockedExchange(&sched_max_gap_us, 0) / 1000.0;
+}
+
+static void display_watch_start() {
+    display_is_on = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    HANDLE ready = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    CHECK(display_is_on && ready);
+    HANDLE thread = CreateThread(nullptr, 0, display_watch_thread, ready, 0, nullptr);
+    CHECK(thread && WaitForSingleObject(ready, 10000) == WAIT_OBJECT_0);
+    CloseHandle(thread); /* lives until the process exits */
+    CloseHandle(ready);
+    sched_tick = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    CHECK(sched_tick);
+    thread = CreateThread(nullptr, 0, sched_watch_thread, nullptr, 0, nullptr);
+    CHECK(thread);
+    CloseHandle(thread);
+}
+
+/* Display power changes so far, once the watch has handled every
+ * notification already queued to it: a posted message is retrieved after
+ * the messages sent or posted to that thread before it, so the event is an
+ * ordering barrier, not a delay. */
+static LONG display_changes_settled() {
+    static HANDLE handled = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    CHECK(handled && PostMessageW(display_watch_window, WM_DISPLAY_BARRIER, 0, (LPARAM)handled));
+    CHECK(WaitForSingleObject(handled, 10000) == WAIT_OBJECT_0);
+    return display_changes;
+}
+
+/* get_frame for a cell that bounds its duration: retried until one call
+ * ran while the display held one state (and, with need_on, was on, so
+ * duplication can deliver) and the process kept being scheduled. Every
+ * call's result goes to `handle`, timed or not. Returns the timed call's
+ * result and duration, and the longest scheduling gap during it. */
+template <typename Handle>
+static int steady_get_frame(const MdCaptureBackend *be, MdCaptureCtx *ctx, MdFrame *f,
+                            uint32_t timeout, bool need_on, double *took, double *gap,
+                            int *discarded, Handle handle) {
+    for (int attempt = 0; attempt < 40; attempt++) {
+        if (need_on && WaitForSingleObject(display_is_on, 10000) != WAIT_OBJECT_0) {
+            fprintf(stderr, "FAIL console display did not report on within 10 s\n");
+            ExitProcess(1);
+        }
+        const LONG before = display_changes_settled();
+        const bool on = WaitForSingleObject(display_is_on, 0) == WAIT_OBJECT_0;
+        sched_gap_settled();
+        const double t0 = now_ms();
+        const int rc = be->get_frame(ctx, f, timeout);
+        *took = now_ms() - t0;
+        *gap = sched_gap_settled();
+        handle(rc);
+        const bool steady = display_changes_settled() == before && (on || !need_on);
+        if (steady && *gap < 50) return rc;
+        ++*discarded;
+        printf("  timeout %u: %s after %.1f ms %s; not timed\n", timeout,
+               rc == 0 ? "frame" : rc == MD_CAPTURE_IDLE ? "IDLE" : "ERROR", *took,
+               steady ? "while the process was not scheduled" : "across a display power change");
+        if (steady) printf("    scheduling gap %.1f ms\n", *gap);
+    }
+    fprintf(stderr, "FAIL no steady get_frame call (display power state, scheduling) in 40\n");
+    ExitProcess(1);
 }
 
 /* ── Frame helpers ───────────────────────────────────────────── */
@@ -1155,6 +1429,9 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const bool interactive = argc > 1 && strcmp(argv[1], "--interactive") == 0;
+    /* As the host does (md-m5x4): GetCursorPos, window and output
+     * rectangles then agree with DXGI's physical pixels on any DPI. */
+    CHECK(md_win_dpi_process_init() != MD_DPI_PROCESS_NOT_PER_MONITOR);
     unit_tests();
 
     const MdCaptureBackend *be = md_capture_backend_create();
@@ -1174,6 +1451,7 @@ int main(int argc, char **argv) {
     }
     CHECK(rc == 0 && ctx.backend_data);
     be->destroy(&ctx);
+    display_watch_start();
     output_cells(be);
 
     ctx = make_ctx(be, true, nullptr);
@@ -1192,15 +1470,19 @@ int main(int argc, char **argv) {
     uint32_t last_seq = UINT32_MAX;
 
     /* Undamaged: whatever the desktop was doing, an answer within the
-     * timeout that is never ERROR. */
-    t0 = now_ms();
-    rc = be->get_frame(&ctx, &f, 300);
-    double took = now_ms() - t0;
-    CHECK((rc == 0 || rc == MD_CAPTURE_IDLE) && took < 400);
-    if (rc == 0) {
-        check_frame(&ctx, st, f, &last_ts, &last_seq);
-        be->release_frame(&ctx, &f);
-    }
+     * timeout that is never ERROR. The display may be off; it must not
+     * change state during the timed call (md-4dsa). */
+    const auto take = [&](int r) {
+        CHECK(r == 0 || r == MD_CAPTURE_IDLE);
+        if (r == 0) {
+            check_frame(&ctx, st, f, &last_ts, &last_seq);
+            be->release_frame(&ctx, &f);
+        }
+    };
+    int discarded = 0;
+    double took = 0, gap = 0;
+    rc = steady_get_frame(be, &ctx, &f, 300, false, &took, &gap, &discarded, take);
+    CHECK(took < 400);
     printf("PASS without test damage: %s after %.0f ms (timeout 300)\n",
            rc == 0 ? "frame" : "IDLE", took);
 
@@ -1217,30 +1499,33 @@ int main(int argc, char **argv) {
     CHECK(!st->out[0].mapped);
     puts("PASS damaged desktop delivers a frame (BGRA, CPU, stride, QPC ns, seq)");
 
-    /* A healthy stream answers 0 or IDLE within the timeout, never ERROR. */
+    /* A healthy stream answers 0 or IDLE within the timeout, never ERROR,
+     * timed while the display stays on (md-4dsa). MD_DXGI_HEALTHY_REPEAT
+     * repeats the cell for qualification runs. */
+    char repeat_env[16] = "";
+    GetEnvironmentVariableA("MD_DXGI_HEALTHY_REPEAT", repeat_env, sizeof(repeat_env));
+    const int repeats = atoi(repeat_env) > 0 ? atoi(repeat_env) : 1;
     int frames = 0, idles = 0;
     double worst_over = 0;
-    for (uint32_t timeout : { 0u, 0u, 100u, 250u, 250u, 500u }) {
-        t0 = now_ms();
-        rc = be->get_frame(&ctx, &f, timeout);
-        double over = now_ms() - t0 - timeout;
-        worst_over = over > worst_over ? over : worst_over;
-        CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
-        if (over >= 100)
-            fprintf(stderr, "timeout %u: %s after %.1f ms\n", timeout,
-                    rc == 0 ? "frame" : "IDLE", over + timeout);
-        CHECK(over < 100); /* GetTickCount64 granularity plus slack */
-        if (rc == 0) {
-            frames++;
-            check_frame(&ctx, st, f, &last_ts, &last_seq);
-            be->release_frame(&ctx, &f);
-        } else {
-            idles++;
+    discarded = 0;
+    for (int pass = 0; pass < repeats; pass++) {
+        for (uint32_t timeout : { 0u, 0u, 100u, 250u, 250u, 500u }) {
+            rc = steady_get_frame(be, &ctx, &f, timeout, true, &took, &gap, &discarded, take);
+            const double over = took - timeout;
+            worst_over = over > worst_over ? over : worst_over;
+            if (over >= 100)
+                fprintf(stderr, "timeout %u: %s after %.1f ms with the display steady on "
+                        "(longest scheduling gap %.1f ms)\n",
+                        timeout, rc == 0 ? "frame" : "IDLE", took, gap);
+            CHECK(over < 100); /* GetTickCount64 granularity, staging copy, slack */
+            (rc == 0 ? frames : idles)++;
         }
     }
     CHECK(frames > 0);
-    printf("PASS healthy stream: %d frames, %d IDLE, worst overrun %.1f ms past timeout\n",
-           frames, idles, worst_over);
+    printf("PASS healthy stream: %d frames, %d IDLE, worst overrun %.1f ms past timeout "
+           "(%d pass(es); %d call(s) across a display power change or a scheduling gap "
+           "not timed)\n",
+           frames, idles, worst_over, repeats, discarded);
 
     /* Duplication loss: ERROR promptly, then the HAL's stop + start recovers
      * and the first frame after re-duplicating is delivered. */

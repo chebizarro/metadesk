@@ -17,8 +17,18 @@
  * machine does not have. Every recorded move is decoded the way Windows
  * decodes MOUSEEVENTF_VIRTUALDESK (pixel = left + n * width / 65536) and
  * must land on the exact intended desktop pixel.
+ *
+ * md-m5x4: the fake DPI-virtualizes, as Windows does: a thread that is not
+ * per-monitor aware sees the layout in logical units at a 150% system DPI.
+ * The test thread is made DPI unaware first, so every move above also
+ * checks that the backend reads the virtual desktop per-monitor aware
+ * (win_dpi.h). A mixed-DPI cell then aims agent (UIA) and MCP clicks at
+ * outputs of different scales, once on that unaware thread and once in a
+ * per-monitor aware process, as the host runs. The VM has one 100% output,
+ * so this coverage is synthetic only.
  */
 #include <windows.h>
+#include "../src/core/win_dpi.h"
 
 #include <vector>
 
@@ -35,15 +45,25 @@ static UINT WINAPI recorded_send_input(UINT count, LPINPUT inputs, int size) {
 
 /* Synthetic physical desktop: the virtual desktop's bounding rectangle. */
 static struct { int vx, vy, vw, vh; } layout;
+static const int system_dpi = 144; /* 150%: what a DPI-unaware thread is scaled by */
+
+static bool thread_per_monitor_aware() {
+    auto get = (MdGetDpiContextFn)md_win_dpi_proc(L"user32.dll", "GetThreadDpiAwarenessContext");
+    auto awareness = (MdDpiContextAwarenessFn)md_win_dpi_proc(
+        L"user32.dll", "GetAwarenessFromDpiAwarenessContext");
+    return get && awareness && awareness(get()) == 2; /* DPI_AWARENESS_PER_MONITOR_AWARE */
+}
 
 static int WINAPI synthetic_metrics(int index) {
+    int v = 0;
     switch (index) {
-    case SM_XVIRTUALSCREEN:  return layout.vx;
-    case SM_YVIRTUALSCREEN:  return layout.vy;
-    case SM_CXVIRTUALSCREEN: return layout.vw;
-    case SM_CYVIRTUALSCREEN: return layout.vh;
+    case SM_XVIRTUALSCREEN:  v = layout.vx; break;
+    case SM_YVIRTUALSCREEN:  v = layout.vy; break;
+    case SM_CXVIRTUALSCREEN: v = layout.vw; break;
+    case SM_CYVIRTUALSCREEN: v = layout.vh; break;
     default:                 return 0;
     }
+    return thread_per_monitor_aware() ? v : (int)((long long)v * 96 / system_dpi);
 }
 
 #define SendInput recorded_send_input
@@ -230,6 +250,76 @@ static void test_targets() {
          "no display");
 }
 
+/* Where an agent click (global UIA coordinates) lands: md_input_execute_action
+ * sends move, down, up. */
+static bool click_lands(MdInputCtx *ctx, int gx, int gy, LONG *x, LONG *y) {
+    MdAction click = {};
+    click.type = MD_ACTION_CLICK;
+    click.region[0] = gx;
+    click.region[1] = gy;
+    reset();
+    if (md_input_execute_action(ctx, &click) != 0) return false;
+    CHECK(sent.size() == 3);
+    sent.resize(1);
+    const POINT p = landed();
+    *x = p.x;
+    *y = p.y;
+    return true;
+}
+
+static bool clicks_exactly(MdInputCtx *ctx, int gx, int gy) {
+    LONG x = 0, y = 0;
+    CHECK(click_lands(ctx, gx, gy, &x, &y));
+    if (x == gx && y == gy) return true;
+    fprintf(stderr, "  click (%d,%d) landed on (%ld,%ld)\n", gx, gy, x, y);
+    return false;
+}
+
+/* md-m5x4: mixed DPI, all in physical pixels. Primary 1920x1080 at (0,0)
+ * (100%), a 3840x2160 output at (1920,-540) (150%) and a 2560x1440 one at
+ * (-2560,0) (125%): the virtual desktop is (-2560,-540) 8320x2160. UIA
+ * rectangles from a per-monitor aware process are physical, as are DXGI's
+ * output rectangles, so agent clicks round-trip through the frame onto the
+ * exact pixel. */
+static void test_mixed_dpi(const char *mode) {
+    set_layout(-2560, -540, 8320, 2160);
+
+    /* The 150% output, captured 1:1: element centres, corners. */
+    MdInputCtx ctx = make_ctx(3840, 2160, 1920, -540, 3840, 2160);
+    CHECK(clicks_exactly(&ctx, 2920, 160) && clicks_exactly(&ctx, 1920, -540) &&
+          clicks_exactly(&ctx, 5759, 1619) && clicks_exactly(&ctx, 3001, 777));
+    /* A point on the 100% primary is not on the captured output. */
+    LONG x = 0, y = 0;
+    CHECK(!click_lands(&ctx, 1000, 500, &x, &y) && sends == 0);
+    sendinput_backend.destroy(&ctx);
+
+    /* The same output streamed at 1920x1080: a click lands inside the
+     * footprint of the frame pixel it falls in (2x2 desktop pixels). */
+    ctx = make_ctx(1920, 1080, 1920, -540, 3840, 2160);
+    for (const POINT &g : { POINT{ 2920, 160 }, POINT{ 2921, 161 }, POINT{ 5759, 1619 } }) {
+        CHECK(click_lands(&ctx, (int)g.x, (int)g.y, &x, &y));
+        CHECK(x <= g.x && g.x - x < 2 && y <= g.y && g.y - y < 2);
+    }
+    sendinput_backend.destroy(&ctx);
+
+    /* DXGI "all": the frame is the outputs' physical bounding rectangle,
+     * so every output's pixels are reached exactly. */
+    ctx = make_ctx(8320, 2160, -2560, -540, 8320, 2160);
+    CHECK(clicks_exactly(&ctx, -1000, 700) && clicks_exactly(&ctx, 100, 100) &&
+          clicks_exactly(&ctx, 5000, 1500) && clicks_exactly(&ctx, -2560, 1439));
+    sendinput_backend.destroy(&ctx);
+
+    /* MCP without output bounds: global UIA points go straight to the
+     * physical virtual desktop. */
+    ctx = make_ctx(1920, 1080);
+    CHECK(moves_to(&ctx, 5000, 1500, 5000, 1500) && moves_to(&ctx, -2000, 100, -2000, 100));
+    CHECK(moves_to(&ctx, 1920, -540, 1920, -540));
+    sendinput_backend.destroy(&ctx);
+    printf("PASS mixed DPI (synthetic, %s): agent clicks on 100/125/150%% outputs land on "
+           "the exact physical pixel (1:1 and 'all'), within a frame pixel when scaled; "
+           "MCP global points exact\n", mode);
+}
+
 static void test_mouse(MdInputCtx *ctx) {
     set_layout(0, 0, 1920, 1080);
     reset();
@@ -353,6 +443,17 @@ static void test_text(MdInputCtx *ctx) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    /* An unaware thread, as in a process nobody made DPI aware (over SSH
+     * Windows starts this one per-monitor v1 aware): the fake virtualizes
+     * unless the backend scopes its query per-monitor aware. */
+    typedef HANDLE(WINAPI * SetThreadContext)(HANDLE);
+    auto set_thread = (SetThreadContext)md_win_dpi_proc(L"user32.dll", "SetThreadDpiAwarenessContext");
+    CHECK(set_thread); /* Windows 10 1607+ */
+    const HANDLE initial = set_thread(MD_DPI_CONTEXT_UNAWARE);
+    CHECK(initial && !thread_per_monitor_aware());
+    set_layout(0, -540, 5760, 2160);
+    CHECK(synthetic_metrics(SM_CXVIRTUALSCREEN) == 3840 &&
+          synthetic_metrics(SM_YVIRTUALSCREEN) == -360);
     const MdInputBackend *be = md_input_backend_create();
     CHECK(be == &sendinput_backend && !be->is_ready);
 
@@ -368,6 +469,20 @@ int main() {
     test_scroll(&ctx);
     test_keys(&ctx);
     test_text(&ctx);
+    test_mixed_dpi("DPI-unaware thread");
+    {
+        /* The scope restores an unaware thread as it found it. */
+        { MdPhysicalPixels physical; CHECK(thread_per_monitor_aware()); }
+        CHECK(!thread_per_monitor_aware());
+    }
+
+    /* The host's configuration: per-monitor (v2 in the console; v1 when
+     * Windows preset it) from the start of main, on every thread. */
+    set_thread(initial);
+    const int process = md_win_dpi_process_init();
+    CHECK(process != MD_DPI_PROCESS_NOT_PER_MONITOR && thread_per_monitor_aware());
+    test_mixed_dpi(process == MD_DPI_PROCESS_PER_MONITOR_V2 ? "per-monitor v2 process"
+                                                            : "per-monitor v1 process");
 
     be->destroy(&ctx);
     CHECK(!ctx.backend_data);

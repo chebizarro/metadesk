@@ -11,6 +11,17 @@
  *   5. Compute deltas by comparing current vs previous snapshot
  *   6. (Phase 2) Event handlers for live changes
  *
+ * Coordinates (md-m5x4): BoundingRectangle is in physical screen pixels only
+ * for a DPI-aware client. A client that is not DPI aware gets wrong,
+ * DPI-virtualized rectangles on displays scaled above 100% (Microsoft, "UI
+ * Automation and Screen Scaling"). Agent and MCP clicks feed these
+ * rectangles to SendInput against the physical output and virtual-desktop
+ * rectangles (capture_dxgi.cpp, input_sendinput.cpp). The documented fix is
+ * a DPI-aware process: the host is per-monitor aware from the start of
+ * main() (win_dpi.h). Tree walks also run inside an MdPhysicalPixels scope,
+ * for processes that did not set it (tools, tests) and in case conversion
+ * follows the thread's DPI context.
+ *
  * Requires Windows 7+.
  * UIA control types are mapped to platform-neutral role strings.
  */
@@ -29,6 +40,7 @@ extern "C" {
 #include <cstdio>
 #include <new>
 #include "log.h"
+#include "win_dpi.h"
 #define MD_LOG_TAG "a11y_uia"
 
 #ifndef SAFE_RELEASE
@@ -1028,6 +1040,7 @@ static int uia_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     HRESULT apartment_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     int ret = -1;
     if (SUCCEEDED(apartment_hr)) {
+        MdPhysicalPixels physical; /* BoundingRectangle in physical pixels */
         EnterCriticalSection(&st->lock);
         ret = uia_get_tree_with_unlocked(st, st->automation, st->walker, out_root);
         LeaveCriticalSection(&st->lock);

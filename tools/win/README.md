@@ -108,6 +108,7 @@ Reference numbers on the Win11 ARM64 VM (console session, medians):
 ```sh
 bash tools/win/build-media-harness.sh
 ./build-win-media/test_sendinput_win.exe
+./build-win-media/test_win_dpi_win.exe
 ./build-win-media/test_capture_dxgi_win.exe                 # session 0 cell
 ./build-win-media/test_capture_dxgi_win.exe --interactive   # console only
 ```
@@ -140,6 +141,58 @@ The DXGI backend publishes that rectangle in physical pixels:
 (`win_dpi.h`). The virtual desktop is read the same way, because
 `DXGI_OUTPUT_DESC.DesktopCoordinates` and `SM_*VIRTUALSCREEN` are
 DPI-virtualized for a process that is not DPI aware.
+
+### Per-monitor DPI awareness (md-m5x4)
+
+Agent and MCP clicks use UI Automation `BoundingRectangle` coordinates,
+which are physical only for a DPI-aware client. The host therefore calls
+`md_win_dpi_process_init()` (`win_dpi.h`) as the first statement of
+`main()`, before any window, UIA, DXGI or input call. That makes the process
+per-monitor v2 aware (`SetProcessDpiAwarenessContext`, Windows 10 1703+;
+per-monitor v1 through shcore on 8.1 to 1607), and every thread inherits
+it. If a manifest or Windows already set the awareness, the call is
+refused and the awareness in effect is reported. Over SSH, Windows starts
+processes per-monitor v1 aware. DXGI `init` logs when the process is not
+per-monitor aware.
+
+The API call is used instead of an application manifest because the meson
+Windows build is still blocked. A manifest needs `windows.compile_resources`,
+and MinGW and MSVC embed it differently (MSVC also embeds its own default
+manifest). None of that can be built or verified yet, while the call is
+exercised by the standalone harnesses today. If a manifest is added later,
+the call becomes a no-op.
+
+With the process per-monitor aware, every coordinate source is physical
+virtual-desktop pixels:
+
+- UIA node rectangles. Walks also run inside an `MdPhysicalPixels` scope.
+- The DXGI output rectangle and the "all" frame bounds. Regions are
+  mode-sized, so physical rectangles make them abut exactly.
+- `SendInput`'s virtual desktop.
+- `md_input_execute_action`'s global-to-frame conversion, which inverts
+  `md_input_map_to_output`.
+
+The backend scopes also keep tools and tests that never called the init
+correct.
+
+The VM has one 100% output, so mixed DPI is covered synthetically:
+
+- `test_sendinput_win` fakes `GetSystemMetrics` so it DPI-virtualizes
+  (logical units at 150%) for threads that are not per-monitor aware, and
+  runs every move on a forced-unaware thread. A mixed 100/125/150% layout
+  checks that agent clicks land on the exact physical pixel, both 1:1 and
+  in "all". A scaled stream lands within one frame pixel's footprint. MCP
+  global points are exact. The cell runs on an unaware thread, then in a
+  per-monitor process.
+- `test_capture_dxgi_win` fakes `GetMonitorInfoW` for synthetic monitors
+  the same way. It checks physical output rectangles from an unaware
+  thread, scope restoration and the composed "all" layout.
+- `test_win_dpi_win.c` compiles `win_dpi.h` as C with `src/host/main.c`'s
+  include block. In the console it checks unaware to per-monitor v2, a
+  repeated call and thread inheritance. In session 0 it checks that the
+  preset v1 awareness is reported.
+
+A real scaled or mixed-DPI display is not covered.
 
 `test_capture_dxgi_win.exe` checks the capture HAL contract. Both modes start
 with synthetic cells that need no desktop:
@@ -176,6 +229,35 @@ itself, plus `ES_DISPLAY_REQUIRED` while it lives) and waits for
 the display off again about a second later anyway. Duplication then stalls
 and reports the pointer hidden, so the windows wake the display again each
 time it reports off.
+
+During each of those power changes, Desktop Duplication can block well past
+its timeout (md-4dsa). This was traced on the VM by logging AcquireNextFrame
+entry and exit against `GUID_CONSOLE_DISPLAY_STATE` notifications. Over
+10,188 calls:
+
+- Every call more than 50 ms past its timeout overlapped a power change.
+  AcquireNextFrame blocked 627 ms on a 250 ms timeout, and a staging `Map`
+  stalled 195 ms.
+- No call without a change was more than 24 ms past its timeout.
+
+So the wall-clock cells ("without test damage" and "healthy stream") keep
+their 100 ms bound, but only time calls during which the display held one
+state. A watch thread counts the notifications. Before and after each call
+the test posts a barrier message to that thread and waits for it, so every
+notification sent before the barrier has been counted.
+
+On a heavily loaded Mac host (load average 30-60 from parallel builds), a
+rare call also overran with the display steady. So a second watch thread
+wakes every millisecond and records the longest gap between its wake-ups.
+Its gap is read only after it has woken once more following the call. A gap
+of 50 ms or more means the test process, which on the VM is its virtual
+CPU, was not scheduled, and no duration bound can hold. The backend cannot
+cause that, because it blocks in DXGI rather than spinning.
+
+A call that spans a display change or such a gap is reported and repeated,
+up to 40 times. Every overrun prints the longest scheduling gap. There are
+no sleeps and no whole-test retries. `MD_DXGI_HEALTHY_REPEAT=N` repeats the
+healthy cell for qualification.
 
 The pointer cells never move the user's pointer. They show a static window
 around wherever the pointer already is and change only that window's cursor,
@@ -284,3 +366,6 @@ and the three Windows test translation units with MSVC ARM64
 `/std:c++17 /W4 /WX /EHsc /permissive-`. Use real dependency headers or the
 VM's type-only pthread/cJSON stubs for this compile-only check. Do not define
 `WIN32_LEAN_AND_MEAN` for the UIA files (it breaks UIAutomationCore headers).
+Compile `tests/test_win_dpi_win.c` as C (`/std:c11 /W4 /WX /Tc`) and link
+it with `user32.lib`: it stands in for `src/host/main.c`'s use of
+`win_dpi.h` until the product builds on Windows.

@@ -674,7 +674,22 @@ static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
     return md_session_accept(ctx->session, session_id, granted);
 }
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "win_dpi.h"
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* md-m5x4: per-monitor DPI aware before any window, UIA, DXGI or input
+     * call, so UIA rectangles, capture and SendInput share physical pixels. */
+    md_win_dpi_process_init();
+#endif
     /* Isolated metadata CLI: no capture, session, or Nostr startup. */
     if (argc > 1 && strcmp(argv[1], "account") == 0) {
         extern int md_host_account_cli(int argc, char **argv);
