@@ -1002,7 +1002,8 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     if (!h) return NULL;
 
     h->mcp_server = config->server;
-    h->port = config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT;
+    h->port = config->ephemeral_port ? 0
+        : (config->port > 0 ? config->port : MD_MCP_HTTP_DEFAULT_PORT);
     atomic_init(&h->shutdown, false);
     if (!auth_init(h, config)) {
         MD_LOG_E("invalid MCP HTTP authentication configuration");
@@ -1083,7 +1084,10 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         return NULL;
     }
 
-    if (listen(h->listen_fd, 8) < 0) {
+    socklen_t addr_len = sizeof(addr);
+    if ((config->ephemeral_port &&
+         getsockname(h->listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) ||
+        listen(h->listen_fd, 8) < 0) {
         close(h->listen_fd);
         go_wait_group_destroy(&h->handler_wg);
         pthread_mutex_destroy(&h->sse_mu);
@@ -1094,7 +1098,14 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         return NULL;
     }
 
+    if (config->ephemeral_port)
+        h->port = ntohs(addr.sin6_port);
     return h;
+}
+
+uint16_t md_mcp_http_port(const MdMcpHttp *http)
+{
+    return http ? http->port : 0;
 }
 
 int md_mcp_http_run(MdMcpHttp *http)

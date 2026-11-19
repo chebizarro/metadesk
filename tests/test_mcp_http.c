@@ -31,8 +31,12 @@
 #include "md_test.h"
 
 
-/* Separate range from test_stream (17700..17711), which runs in parallel. */
-static uint16_t g_test_port = 18710;
+/* Creation failures are prerequisites, not permission to run a case against
+ * an unrelated listener or cascade through uninitialized response buffers. */
+#define REQUIRE_HTTP(http, mcp) do { \
+    MD_CHECK((http) != NULL); \
+    if (!(http)) { md_mcp_server_destroy(mcp); return; } \
+} while (0)
 
 /* ── Helper: create a minimal MCP server ─────────────────────── */
 
@@ -92,6 +96,16 @@ static int tcp_connect_opts(uint16_t port, int rcvbuf)
 static int tcp_connect(uint16_t port)
 {
     return tcp_connect_opts(port, 0);
+}
+
+static void shutdown_http(MdMcpHttp *http)
+{
+    md_mcp_http_shutdown(http);
+    /* Wake the accept loop's one-second select after setting shutdown. This
+     * is a test-owned connection, not a change to production shutdown policy. */
+    int fd = tcp_connect(md_mcp_http_port(http));
+    MD_CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
 }
 
 /* ── Helper: send HTTP request, read response ────────────────── */
@@ -184,6 +198,7 @@ static void test_create_null(void)
 {
     MD_CHECK(md_mcp_http_create(NULL) == NULL);
     MD_CHECK(md_mcp_http_sse_client_count(NULL) == 0);
+    MD_CHECK(md_mcp_http_port(NULL) == 0);
 
     MdMcpHttpConfig cfg = { .server = NULL };
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
@@ -199,7 +214,7 @@ static void test_create_invalid_bind_addr(void)
     MdMcpHttpConfig cfg = {
         .server = mcp,
         .bind_addr = "not-an-ip-address",
-        .port = g_test_port++,
+        .ephemeral_port = true,
     };
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
 
@@ -214,14 +229,31 @@ static void test_create_destroy(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    MD_CHECK(md_mcp_http_port(http) != 0);
+    MdMcpHttp *other = md_mcp_http_create(&cfg);
+    MD_CHECK(other != NULL);
+    if (!other) {
+        md_mcp_http_destroy(http);
+        md_mcp_server_destroy(mcp);
+        return;
+    }
+    MD_CHECK(md_mcp_http_port(other) != 0);
+    MD_CHECK(md_mcp_http_port(other) != md_mcp_http_port(http));
+    /* A live listener owns its port for the entire case: no reserve/close
+     * race. Explicit ports still fail rather than silently relocating. */
+    cfg.ephemeral_port = false;
+    cfg.port = md_mcp_http_port(http);
+    MdMcpHttp *conflict = md_mcp_http_create(&cfg);
+    MD_CHECK(conflict == NULL);
+    md_mcp_http_destroy(conflict);
+    md_mcp_http_destroy(other);
 
     /* The transport exposes its notification sink as a plain
      * MdMcpWriteFn taking the MdMcpHttp* as userdata. */
@@ -263,14 +295,14 @@ static void test_post_initialize(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
     wire_server_to_http(mcp, http);
 
     /* Start server in background */
@@ -300,7 +332,7 @@ static void test_post_initialize(void)
     MD_CHECK(strstr(response, "\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\"") != NULL);
 
     /* Shutdown */
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -314,14 +346,14 @@ static void test_invalid_content_length_rejected(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -349,7 +381,7 @@ static void test_invalid_content_length_rejected(void)
     MD_CHECK(n > 0);
     MD_CHECK(strstr(response, "400") != NULL);
 
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -363,14 +395,14 @@ static void test_post_requires_json_content_type(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -402,7 +434,7 @@ static void test_post_requires_json_content_type(void)
     MD_CHECK(n > 0);
     MD_CHECK(strstr(response, "415") != NULL);
 
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -418,14 +450,14 @@ static void test_get_404(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -438,7 +470,7 @@ static void test_get_404(void)
     MD_CHECK(strstr(response, "404") != NULL);
     MD_CHECK(strstr(response, "Access-Control-Allow-Origin") == NULL);
 
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -452,14 +484,14 @@ static void test_sse_multiline_data(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -490,7 +522,7 @@ static void test_sse_multiline_data(void)
     MD_CHECK(strstr(event, "data: line1\nline2") == NULL);
 
     close(fd);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -504,15 +536,15 @@ static void test_sse_max_clients_config(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
         .max_clients = 1,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -557,7 +589,7 @@ static void test_sse_max_clients_config(void)
 
     close(fd1);
     close(fd2);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
 
     md_mcp_http_destroy(http);
@@ -617,13 +649,13 @@ static void test_sse_stalled_client(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
     md_test_mcp_handshake(mcp);
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
-        .server = mcp, .port = port, .max_clients = 5,
+        .server = mcp, .ephemeral_port = true, .max_clients = 5,
         .sse_write_timeout_ms = 1000, .sse_sndbuf = 8192,
     };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
     wire_server_to_http(mcp, http);
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t server_tid, reader_tid;
@@ -743,7 +775,7 @@ static void test_sse_stalled_client(void)
     free(json);
     for (int i = 0; i < 4; i++) close(stalled[i]);
     close(healthy);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
     MD_CHECK(pthread_join(server_tid, NULL) == 0);
     md_mcp_http_destroy(http);
@@ -773,10 +805,10 @@ static void test_stalled_post_destroy(void)
         .uri = "test://large", .name = "large", .read_handler = large_resource,
     };
     MD_CHECK(md_mcp_server_register_resource(mcp, &resource) == 0);
-    uint16_t port = g_test_port++;
-    MdMcpHttpConfig cfg = { .server = mcp, .port = port, .sse_write_timeout_ms = 200 };
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .sse_write_timeout_ms = 200 };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     MD_CHECK(pthread_create(&tid, NULL, server_thread, &sa) == 0);
@@ -798,7 +830,7 @@ static void test_stalled_post_destroy(void)
         if (strstr(headers, "\r\n\r\n")) break;
     }
     MD_CHECK(strstr(headers, "200 OK") != NULL);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     MD_CHECK(pthread_join(tid, NULL) == 0);
     MD_CHECK(sa.result == 0);
     /* Completion is the assertion; Meson's suite timeout guards liveness. */
@@ -815,21 +847,20 @@ static void test_shutdown(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
 
     /* Shutdown should cause run to return */
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
     MD_CHECK(sa.result == 0); /* clean shutdown */
 
@@ -844,14 +875,14 @@ static void test_shutdown_closes_sse_clients(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
 
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
@@ -862,7 +893,7 @@ static void test_shutdown_closes_sse_clients(void)
     MD_CHECK(fd >= 0);
     MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
     MD_CHECK(sa.result == 0);
 
@@ -892,14 +923,13 @@ static void test_sse_no_clients(void)
     MdMcpServer *mcp = make_mcp_server();
     MD_CHECK(mcp != NULL);
 
-    uint16_t port = g_test_port++;
     MdMcpHttpConfig cfg = {
         .server = mcp,
-        .port   = port,
+        .ephemeral_port = true,
     };
 
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
 
     /* SSE send with no clients should succeed (no-op) */
     int ret = md_mcp_http_send_sse(http, "test", "data", 4);
@@ -1009,7 +1039,7 @@ static int auth_status(uint16_t port, const char *method, const char *path,
 static void test_auth_configuration(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    MdMcpHttpConfig cfg = { .server = mcp, .port = g_test_port++, .bind_addr = "0.0.0.0" };
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .bind_addr = "0.0.0.0" };
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
     cfg.bind_addr = "::";
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
@@ -1036,6 +1066,11 @@ static void test_auth_configuration(void)
     cfg.bind_addr = "0.0.0.0";
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     MD_CHECK(http != NULL);
+    if (!http) {
+        unlink(token_path);
+        md_mcp_server_destroy(mcp);
+        return;
+    }
     md_mcp_http_destroy(http);
     cfg.bind_addr = NULL;
     cfg.token_file = "/nonexistent/md-token";
@@ -1065,10 +1100,10 @@ static void test_auth_configuration(void)
     fclose(file);
     cfg.bind_addr = "0.0.0.0";
     http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
-    md_mcp_http_destroy(http);
     free(npub);
     unlink(token_path); unlink(allow_path);
+    REQUIRE_HTTP(http, mcp);
+    md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
     PASS("auth startup credentials, permissions, URL validation and allow-file");
 }
@@ -1084,14 +1119,14 @@ static void test_http_auth(void)
     char *npub = test_npub();
     const char *npubs[] = {npub};
     const char *urls[] = {"https://agent.example/mcp", "http://proxy.example:8000/mcp"};
-    uint16_t port = g_test_port++;
-    MdMcpHttpConfig cfg = { .server = mcp, .port = port, .token_file = token_path,
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .token_file = token_path,
         .allow_npubs = npubs, .allow_npub_count = 1,
         .public_urls = urls, .public_url_count = 2 };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
     /* Config is owned by the server, not borrowed from its caller/files. */
     unlink(token_path); free(npub);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
@@ -1162,7 +1197,7 @@ static void test_http_auth(void)
         MD_CHECK(auth_status(port, "GET", "/healthz", "localhost", NULL, NULL) == 200);
     MD_CHECK(md_mcp_http_sse_client_count(http) == clients);
     MD_CHECK(auth_status(port, "GET", "/healthz", "evil.example", NULL, NULL) == 403);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
@@ -1172,10 +1207,10 @@ static void test_http_auth(void)
 static void test_unauthenticated_guards_and_read_budget(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    uint16_t port = g_test_port++;
-    MdMcpHttpConfig cfg = { .server = mcp, .port = port };
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    MD_CHECK(http != NULL);
+    REQUIRE_HTTP(http, mcp);
+    uint16_t port = md_mcp_http_port(http);
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     pthread_create(&tid, NULL, server_thread, &sa);
@@ -1196,7 +1231,7 @@ static void test_unauthenticated_guards_and_read_budget(void)
     MD_CHECK(n > 0 && strstr(response, "400 Bad Request") != NULL);
     MD_CHECK(md_now_ms() - start < 3000);
     close(fd);
-    md_mcp_http_shutdown(http);
+    shutdown_http(http);
     pthread_join(tid, NULL);
     md_mcp_http_destroy(http);
     MD_CHECK(md_now_ms() - start < 5000);
@@ -1230,6 +1265,6 @@ int main(void)
     test_shutdown();
     test_shutdown_closes_sse_clients();
 
-    printf("\nAll HTTP transport tests passed.\n");
+    printf("\nHTTP transport tests finished.\n");
     return md_test_report();
 }
