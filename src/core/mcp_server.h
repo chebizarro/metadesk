@@ -150,12 +150,26 @@ int md_mcp_server_handle_message_as(MdMcpServer *server,
  * thread dispatching it; 0 (no caller) otherwise. */
 uint32_t md_mcp_server_caller_caps(MdMcpServer *server);
 
+/* True when callers holding grants a and b see the same tools/list (each
+ * registered tool's required_caps is satisfied by both or by neither). */
+bool md_mcp_server_same_tools(const MdMcpServer *server, uint32_t a, uint32_t b);
+
 /* ── Notifications ───────────────────────────────────────────── */
 
 /* Send a resource-updated notification to the client.
  * Only sent if the client has subscribed to this URI. */
 int md_mcp_server_notify_resource_updated(MdMcpServer *server,
                                           const char *uri);
+
+/* Advertise capabilities.tools.listChanged in initialize (md-ht7). Set by a
+ * transport, before serving, when it will send
+ * notifications/tools/list_changed as a caller's grant changes. */
+void md_mcp_server_set_tools_list_changed(MdMcpServer *server, bool enabled);
+
+/* The notifications/tools/list_changed message (static; no allocation), for
+ * a transport to deliver to exactly the callers whose tool set changed (it is
+ * never broadcast via write_fn). NULL before initialized or once quiesced. */
+const char *md_mcp_server_tools_list_changed(MdMcpServer *server);
 
 /* Permanently reject new notifications; does not drain an already copied
  * sink. Drain callback producers before destroying their transport. */

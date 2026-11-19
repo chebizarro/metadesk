@@ -6,7 +6,8 @@
  * on loopback, without the accessibility/input backends a real desktop host
  * needs. Tools, gated like the real ones (md-5km): "echo" and "notify"
  * (broadcasts one SSE notification) need agent; "act" stands in for an
- * action tool and needs agent+input.
+ * action tool and needs agent+input. The allowlist change feed is wired
+ * as in the host (md-ht7), so grant changes reach the SSE streams.
  *
  * Usage: mcp_proxy_host_fixture RELAY_URL [--allow-npub NPUB]
  * Prints "PORT <n>" on stdout once listening; exits when stdin closes.
@@ -54,11 +55,14 @@ static cJSON *echo_tool(const cJSON *args, bool *is_error, char **msg, void *ud)
 
 /* The proxy reports "notification stream open" when the GET's 200 headers
  * arrive; the server marks the client ready right after writing them. This
- * bounded wait covers that sub-millisecond hand-off for the test only. */
+ * bounded wait for {"text": "<n>"} (default 1) ready streams covers that
+ * sub-millisecond hand-off for the test only. */
 static cJSON *notify_tool(const cJSON *args, bool *is_error, char **msg, void *ud) {
-    (void)args; (void)ud;
+    (void)ud;
+    const cJSON *text = cJSON_GetObjectItemCaseSensitive(args, "text");
+    int want = cJSON_IsString(text) ? atoi(text->valuestring) : 1;
     int64_t deadline = now_ms() + 5000;
-    while (md_mcp_http_sse_client_count(g_http) < 1 && now_ms() < deadline)
+    while (md_mcp_http_sse_client_count(g_http) < (want > 0 ? want : 1) && now_ms() < deadline)
         sched_yield();
     static const char note[] =
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","
@@ -113,6 +117,7 @@ int main(int argc, char **argv) {
         .server = server, .ephemeral_port = true,
         .allow_npubs = npubs, .allow_npub_count = argc == 4 ? 1 : 0,
         .nip98_grant = host_mcp_acl_grant, .nip98_grant_userdata = acl,
+        .nip98_grant_watch = host_mcp_acl_watch,
     };
     if (!server || md_mcp_server_register_tool(server, &echo) ||
         md_mcp_server_register_tool(server, &notify) ||

@@ -66,12 +66,15 @@ a grant, and malformed or duplicate records deny.
   under the newest-replaceable rule, and a same-second tie goes to the lower
   event id. Reconnection and backoff are the existing bridge's (the nostrc pool);
   readiness drops to deny while history is being re-delivered.
-- **Open SSE streams** admitted by this source are rechecked before every
-  broadcast. A revoked stream gets no further notifications and is closed.
+- **Open SSE streams** admitted by this source are rechecked on every
+  accepted list version and before every broadcast. A stream whose grant lost
+  `agent` is closed at once, with no further notifications; one whose visible
+  tool set changed gets `notifications/tools/list_changed` (see below).
 - **Host role changes** (revocation of the binding) stop the bridge, after which
   this source denies.
 - Readiness and every accepted list version are logged to stderr, for example
   `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent (1 also input)`.
+  The line is written after the SSE streams have been notified for that version.
 
 ## Per-principal tool capabilities (md-5km)
 
@@ -113,10 +116,46 @@ cached per connection or per MCP session. Granting `input` makes the actions
 appear on the next `tools/list` and succeed on the next call. Removing it
 refuses the very next call. An `input`-only or `video`-only grant is not
 admitted (401). Open SSE streams carry notifications only, never tool
-results. They are rechecked before every broadcast and dropped once the grant
-no longer includes `agent`. Metadesk does not send
-`notifications/tools/list_changed`, so a client that cached an earlier
-`tools/list` learns of a narrower grant from the `isError` on its next call.
+results. A stream is closed once its grant no longer includes `agent`.
+
+### `notifications/tools/list_changed` (md-ht7)
+
+With `--mcp-allow-host-list`, `initialize` advertises
+`capabilities.tools.listChanged: true`, and a live principal with an open SSE
+stream (`GET /mcp`) is told when its grant changes what it can see:
+
+- **Trigger: events only.** The allowlist's watcher thread wakes on each
+  accepted list version (and each readiness transition) via
+  `md_nostr_allowlist_wait_change()`, the same wait that logs the version
+  lines. It calls into the HTTP transport, which re-reads the grant of every
+  stream the live list admitted. There is no timer and no poll.
+- **Targeted.** Each stream records the grant its tool set was last checked
+  against (initially the one it was admitted with). A stream gets exactly one
+  `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` when the set
+  of tools visible under the new grant differs from that recorded set, and
+  nothing otherwise. Narrowing `agent,input` → `agent` and widening
+  `agent` → `agent,input` both notify. A change that leaves the tool set alone
+  sends nothing: another principal's entry, `video` added or removed, a
+  re-published identical list, or `input` changes on a host with no action
+  tools registered (`--no-input`). Static-npub, bearer and credential-less
+  streams never get one: their tool set does not depend on the list.
+- **Revocation** (grant loses `agent`, the list becomes unavailable, or the
+  host role changes) closes the stream on the change itself.
+- **No gaps.** A stream that becomes ready just after a change is re-checked
+  as it becomes ready. The record is updated under the SSE lock, so a change
+  notifies once however many wake-ups observe it.
+- **Bounded and teardown-safe.** Delivery uses the same single write budget
+  (`MD_MCP_SSE_WRITE_TIMEOUT_MS`) as broadcasts. A stream that cannot be
+  notified (a stall, a write error, an allocation failure) is closed, never
+  silently skipped, so its client reconnects and lists again. Nothing is sent after shutdown starts or after the MCP server is
+  quiesced. The transport unregisters from the watcher first thing in
+  destroy, and unregistering waits for an in-flight call to return.
+
+The notification only says "list again": clients re-run `tools/list`, and
+every `tools/call` is still gated on the grant at that moment. A grant change
+between a client's last `tools/list` and its opening the SSE stream is not
+reported, so clients should list after the stream opens. Without the live
+list (static, bearer or open callers only), `listChanged` is not advertised.
 
 **Why static and bearer principals keep all capabilities.** They are
 deploy-time operator credentials: a 0600 token file, CLI flags, or a file the
@@ -229,6 +268,13 @@ restore), and needs no new install target or packaging.
     refuses the next call. `input`/`video` without `agent` get 401. Static
     npub, bearer and credential-less loopback callers keep all tools. A live
     SSE stream is dropped once its grant loses `agent`;
+  - `tools/list_changed` (md-ht7), with two live principals and a bearer
+    stream and a stand-in change feed: exactly one notification per tool-set
+    change (narrowing and widening), only to that principal's stream; none
+    for a repeated event, a `video`-only change, the other principal or the
+    bearer stream; revocation closes the stream on the change; nothing after
+    quiesce; `listChanged` advertised only while a feed is registered, and
+    destroy unregisters;
   - the live authorizer fails closed before it is ready;
   - grants and revocations apply on the next request;
   - invalid events never reach the authorizer;
@@ -248,6 +294,14 @@ restore), and needs no new install target or packaging.
   - an `agent`-only grant lists no action tool (`act` stands in for one) and
     gets `isError` naming `input` on call. Publishing `v1:agent,input` enables
     it on the next request, and publishing `v1:agent` again refuses it;
+  - `tools/list_changed` (md-ht7): `initialize` advertises `listChanged`.
+    Revoking `agent` closes the open stream at once. With a second live
+    principal streaming, widening to `v1:agent,input` and narrowing back each
+    send exactly one `list_changed` on the agent's stream and nothing on the
+    other's. `v1:video,agent` → `v1:agent` and adding `video` send nothing.
+    Revoking the second principal closes only its stream. The barrier is the
+    host's version line (logged after notifying), then one `notify` broadcast
+    that must arrive before anything else on every quiet stream;
   - a static `--allow-npub` principal keeps the full tool surface, even though
     its live grant is `video`-only;
   - prompt exit on EOF;
@@ -267,7 +321,9 @@ md-ah9.3 and md-ah9.14 close notes. The relay-backed path adds:
 
 - no polling or refresh timer, and no timeout-driven close;
 - no publish (MCP never edits the list);
-- no new frame handling: EOSE, CLOSED, AUTH and OK stay in the unchanged core.
+- no new frame handling: EOSE, CLOSED, AUTH and OK stay in the unchanged core;
+- md-ht7: no new subscription or filter. `tools/list_changed` is driven by the
+  same accepted-version wake-up, and repeat wake-ups are idempotent.
 
 Readiness and updates come from EOSE/CLOSED/connection boundaries and accepted
 events, delivered through a condition variable. The filter is tightly scoped:

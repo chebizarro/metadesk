@@ -9,7 +9,10 @@
  * {kinds:[30000], authors:[host], #d:[metadesk-allowlist], limit:1} that is
  * kept open for live replacements. No gift-wrap DM subscription, session log,
  * capture, polling or refresh timer is added. Authorization is a lock-guarded
- * lookup in the newest replaceable event the bridge has accepted.
+ * lookup in the newest replaceable event the bridge has accepted. Each
+ * accepted replacement (and each readiness transition) also wakes one watcher
+ * thread, which tells the MCP transport to re-read its live streams' grants
+ * (md-ht7: tools/list_changed to exactly the streams whose tool set changed).
  */
 #include "host_mcp.h"
 #include "accounts.h"
@@ -24,9 +27,20 @@
 struct HostMcpAcl {
     MdAccountStartup account;
     MdNostr *nostr;
-    pthread_t ready_thread;
-    bool ready_started;
+    pthread_t watch_thread;
+    bool watch_started;
+    /* One change listener (the MCP transport). watch_mu is held while it
+     * runs, so unregistering waits out an in-flight call. */
+    pthread_mutex_t watch_mu;
+    void (*watch_fn)(void *);
+    void *watch_ud;
 };
+
+static void acl_notify(HostMcpAcl *acl) {
+    pthread_mutex_lock(&acl->watch_mu);
+    if (acl->watch_fn) acl->watch_fn(acl->watch_ud);
+    pthread_mutex_unlock(&acl->watch_mu);
+}
 
 static void acl_owner_revoked(void *userdata) {
     (void)userdata;
@@ -34,16 +48,18 @@ static void acl_owner_revoked(void *userdata) {
     fprintf(stderr, "host[mcp]: host role changed; host-allowlist NIP-98 grants now deny\n");
 }
 
-/* Report readiness transitions and each accepted list replacement for
- * operators (and as the e2e test's barrier). Waits on the bridge's condition
- * variable, woken by EOSE/CLOSED/connection boundaries and accepted newer
- * events; it is not a readiness gate (host_mcp_acl_grant() already denies unless
- * LOADED) and never a timer. */
-static void *acl_ready_logger(void *arg) {
+/* On each readiness transition and accepted list replacement: notify the
+ * change listener, then report it for operators. Logging second makes the
+ * log line a barrier (the e2e test's) for the listener's notifications.
+ * Waits on the bridge's condition variable, woken by EOSE/CLOSED/connection
+ * boundaries and accepted newer events; it is not a readiness gate
+ * (host_mcp_acl_grant() already denies unless LOADED) and never a timer. */
+static void *acl_watch_thread(void *arg) {
     HostMcpAcl *acl = arg;
     MdNostrAclState state = MD_NOSTR_ACL_UNKNOWN, logged = MD_NOSTR_ACL_UNKNOWN;
     uint64_t version = 0;
     while (md_nostr_allowlist_wait_change(acl->nostr, &state, &version) == 0) {
+        acl_notify(acl);
         if (state == MD_NOSTR_ACL_LOADED) {
             MdAllowlistEntry *entries = NULL;
             size_t count = 0, agents = 0, inputs = 0;
@@ -69,12 +85,15 @@ static void *acl_ready_logger(void *arg) {
         }
         logged = state;
     }
+    /* Stopped, or the host role changed: every grant now denies. */
+    acl_notify(acl);
     return NULL;
 }
 
 HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count) {
     HostMcpAcl *acl = calloc(1, sizeof(*acl));
     if (!acl) return NULL;
+    pthread_mutex_init(&acl->watch_mu, NULL);
     int rc = md_account_startup_open(MD_ACCOUNT_HOST, &acl->account);
     if (rc || !acl->account.binding) {
         fprintf(stderr, "host[mcp]: --mcp-allow-host-list needs a saved host role: %s\n",
@@ -95,7 +114,12 @@ HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count) {
         host_mcp_acl_stop(acl);
         return NULL;
     }
-    acl->ready_started = pthread_create(&acl->ready_thread, NULL, acl_ready_logger, acl) == 0;
+    acl->watch_started = pthread_create(&acl->watch_thread, NULL, acl_watch_thread, acl) == 0;
+    if (!acl->watch_started) {
+        fprintf(stderr, "host[mcp]: could not start the host allowlist watcher\n");
+        host_mcp_acl_stop(acl);
+        return NULL;
+    }
     fprintf(stderr, "host[mcp]: NIP-98 also authorized by host allowlist "
                     "(agent grant; action tools need input) for %.*s... on %d relay(s)\n", 12, md_nostr_get_npub(acl->nostr), relay_count);
     return acl;
@@ -109,11 +133,25 @@ uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *userdata) {
         : 0;
 }
 
+int host_mcp_acl_watch(void *userdata, void (*on_change)(void *), void *on_change_ud) {
+    HostMcpAcl *acl = userdata;
+    if (!acl) return -1;
+    pthread_mutex_lock(&acl->watch_mu); /* waits for an in-flight on_change */
+    int rc = on_change && acl->watch_fn ? -1 : 0;
+    if (!rc) {
+        acl->watch_fn = on_change;
+        acl->watch_ud = on_change ? on_change_ud : NULL;
+    }
+    pthread_mutex_unlock(&acl->watch_mu);
+    return rc;
+}
+
 void host_mcp_acl_stop(HostMcpAcl *acl) {
     if (!acl) return;
-    md_nostr_stop(acl->nostr); /* wakes the logger's history wait */
-    if (acl->ready_started) pthread_join(acl->ready_thread, NULL);
+    md_nostr_stop(acl->nostr); /* wakes the watcher's change wait */
+    if (acl->watch_started) pthread_join(acl->watch_thread, NULL);
     md_nostr_destroy(acl->nostr);
     md_account_startup_clear(&acl->account);
+    pthread_mutex_destroy(&acl->watch_mu);
     free(acl);
 }

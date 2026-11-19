@@ -11,7 +11,11 @@ and SSE notifications); unlisted and video-only npubs get 401; revocation
 and re-grant take effect on the running host without a restart. md-5km:
 agent without input lists no action tool and gets isError naming input on
 call; adding/removing input applies to the next request; a static
---allow-npub principal keeps the full tool surface.
+--allow-npub principal keeps the full tool surface. md-ht7: initialize
+advertises tools.listChanged; widening or narrowing a live principal's tool
+set sends exactly one notifications/tools/list_changed on its stream only (an
+unrelated live principal's stream gets nothing); a grant change that leaves
+the tool set alone sends nothing; revoking agent closes the stream at once.
 """
 import json
 import os
@@ -26,6 +30,8 @@ sys.dont_write_bytecode = True
 from account_startup_fixture import Relay, Peer, PrivateUnixServer, matches
 from test_access_cli import Signer, HOST_PK, CLIENT_PK, HOST_NPUB
 
+PEER_PK = "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13"  # sk 4
+LIST_CHANGED = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
 ALLOWLIST_FILTER = {"kinds": [30000], "authors": [HOST_PK],
                     "#d": ["metadesk-allowlist"], "limit": 1}
 
@@ -104,9 +110,12 @@ def publish(relay, event):
                     peer.send(["EVENT", sid, event])
 
 
-def grants(client_caps):
-    return [["p", CLIENT_PK], ["metadesk-caps", CLIENT_PK, client_caps],
+def grants(client_caps, peer_caps=None):
+    tags = [["p", CLIENT_PK], ["metadesk-caps", CLIENT_PK, client_caps],
             ["p", HOST_PK], ["metadesk-caps", HOST_PK, "v1:video"]]
+    if peer_caps:
+        tags += [["p", PEER_PK], ["metadesk-caps", PEER_PK, peer_caps]]
+    return tags
 
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -143,6 +152,27 @@ def expect_refused(proc, rid, tool):
 def expect_acted(proc, rid):
     result = call_result(proc, rid, "act")
     assert not result.get("isError") and result["content"][0]["text"] == "acted", result
+
+
+def expect_list_changed(proc):
+    msg = json.loads(proc.line())
+    assert msg == LIST_CHANGED, msg
+
+
+def barrier(agent, rid, quiet=()):
+    """Event-ordered "nothing else was sent": the host logs a list change only
+    after notifying for it, and the fixture's notify then broadcasts one frame
+    behind anything already queued on every stream. So agent's next two lines
+    are exactly that frame and the call's response, and each quiet stream's
+    next line is that frame: any list_changed would come first."""
+    call(agent, rid, "notify", {"text": str(1 + len(quiet))})
+    got = [json.loads(agent.line()), json.loads(agent.line())]
+    note = [m for m in got if m.get("method") == "notifications/message"]
+    resp = [m for m in got if m.get("id") == rid]
+    assert len(note) == 1 and len(resp) == 1, got
+    for proc in quiet:
+        msg = json.loads(proc.line())
+        assert msg.get("method") == "notifications/message", (proc.name, msg)
 
 
 def expect_401(proc, rid):
@@ -183,7 +213,7 @@ def main():
                                       capture_output=True, text=True, timeout=20)
                 assert done.returncode == 0, (args, done.stdout, done.stderr)
             keys = {}
-            for name, sk in (("client", 2), ("video", 1), ("stranger", 3)):
+            for name, sk in (("client", 2), ("video", 1), ("stranger", 3), ("peer", 4)):
                 path = root / f"{name}.key"
                 path.write_text(f"{sk:064x}\n")
                 path.chmod(0o600)
@@ -224,6 +254,7 @@ def main():
             agent.send(INIT)
             reply = json.loads(agent.line())
             assert reply["id"] == 1 and reply["result"]["serverInfo"]["name"] == "mcp-proxy-fixture", reply
+            assert reply["result"]["capabilities"]["tools"] == {"listChanged": True}, reply
             agent.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             agent.expect_err("notification stream open")
             call(agent, 2, "echo", {"text": "hi é"})
@@ -262,8 +293,12 @@ def main():
             print("PASS: unlisted and video-only npubs refused with HTTP 401")
 
             # 4. Live revocation and re-grant on the running host, no restart.
+            # Revoking agent closes the open SSE stream on the change itself,
+            # with no broadcast needed (md-ht7); the proxy's reconnect then
+            # gets 401 until the re-grant.
             publish(relay, sign(crypto, env, grants("v1:video"), now + 1))
             hostp.expect_err("host allowlist updated (v2): 2 member(s), 0 with agent")
+            agent.expect_err("notification stream ended (HTTP 200)")
             call(agent, 5, "echo", {"text": "after revoke"})
             expect_401(agent, 5)
             publish(relay, sign(crypto, env, grants("v1:video,agent"), now + 2))
@@ -272,19 +307,56 @@ def main():
             reply = json.loads(agent.line())
             assert reply["id"] == 6 and reply["result"]["content"][0]["text"] == "regranted", reply
             expect_refused(agent, 7, "act")
-            print("PASS: revocation and re-grant apply live on the running host")
+            agent.expect_err("notification stream open")
+            print("PASS: revocation closes the SSE stream at once; re-grant applies live")
 
-            # 4b. Granting input enables actions on the next request; removing
-            # it disables them again, with no restart or reconnect (md-5km).
-            publish(relay, sign(crypto, env, grants("v1:agent,input"), now + 3))
-            hostp.expect_err("host allowlist updated (v4): 2 member(s), 1 with agent (1 also input)")
+            # 4b. An unrelated live principal ("peer") with its own stream.
+            # video,agent -> agent leaves the agent's tool set alone: nothing.
+            publish(relay, sign(crypto, env, grants("v1:agent", "v1:agent"), now + 3))
+            hostp.expect_err("host allowlist updated (v4): 3 member(s), 2 with agent (0 also input)")
+            barrier(agent, 30)
+            peer = Proc([host, "mcp-proxy", "--key-file", keys["peer"], url], env, "peer")
+            procs.append(peer)
+            peer.expect_err("signing as e493dbf1c10d")
+            peer.send(INIT)
+            assert json.loads(peer.line())["result"]["capabilities"]["tools"] == {"listChanged": True}
+            peer.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            peer.expect_err("notification stream open")
+            barrier(agent, 31, [peer])
+            print("PASS: a grant change that keeps the tool set sends no list_changed")
+
+            # 4c. Widening agent -> agent,input: exactly one list_changed, to
+            # the agent's stream only; actions apply on the next request.
+            publish(relay, sign(crypto, env, grants("v1:agent,input", "v1:agent"), now + 4))
+            hostp.expect_err("host allowlist updated (v5): 3 member(s), 2 with agent (1 also input)")
+            expect_list_changed(agent)
+            barrier(agent, 32, [peer])
             assert tool_names(agent, 8) == ["act", "echo", "notify"]
             expect_acted(agent, 9)
-            publish(relay, sign(crypto, env, grants("v1:agent"), now + 4))
-            hostp.expect_err("host allowlist updated (v5): 2 member(s), 1 with agent (0 also input)")
+            # Video is not an MCP grant: still the same tool set, nothing sent.
+            publish(relay, sign(crypto, env, grants("v1:video,agent,input", "v1:agent"), now + 5))
+            hostp.expect_err("host allowlist updated (v6): 3 member(s), 2 with agent (1 also input)")
+            barrier(agent, 33, [peer])
+            print("PASS: widening sends exactly one list_changed, only to that principal")
+
+            # 4d. Narrowing agent,input -> agent: exactly one list_changed;
+            # the next request is refused (md-5km).
+            publish(relay, sign(crypto, env, grants("v1:agent", "v1:agent"), now + 6))
+            hostp.expect_err("host allowlist updated (v7): 3 member(s), 2 with agent (0 also input)")
+            expect_list_changed(agent)
+            barrier(agent, 34, [peer])
             expect_refused(agent, 10, "act")
             assert tool_names(agent, 11) == ["echo", "notify"]
-            print("PASS: input grant/removal gates action tools on the next request")
+            print("PASS: narrowing sends exactly one list_changed, only to that principal")
+
+            # 4e. Revoking the peer closes only the peer's stream.
+            publish(relay, sign(crypto, env, grants("v1:agent", "v1:video"), now + 7))
+            hostp.expect_err("host allowlist updated (v8): 3 member(s), 1 with agent (0 also input)")
+            peer.expect_err("notification stream ended (HTTP 200)")
+            barrier(agent, 35)
+            rc, _ = peer.close()
+            assert rc == 0, peer.log
+            print("PASS: revoking agent closes just that principal's stream")
 
             rc, elapsed = agent.close()
             assert rc == 0 and elapsed < 5, (rc, elapsed, agent.log)
