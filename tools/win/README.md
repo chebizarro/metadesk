@@ -103,7 +103,7 @@ Reference numbers on the Win11 ARM64 VM (console session, medians):
 | Desktop, 281 nodes | 570-790 ms | 2.8-3.0x | 2.7-2.9x |
 | Desktop plus the 5000-item fixture | 1420 ms | | 660 ms (2.1x) |
 
-## DXGI capture and SendInput (md-7yc)
+## DXGI capture and SendInput (md-7yc, md-346)
 
 ```sh
 bash tools/win/build-media-harness.sh
@@ -121,22 +121,59 @@ rejected injections. It never injects input, so it is safe in any session.
 Never aim real SendInput at the console: it moves the user's pointer and types
 into the user's applications.
 
-`test_capture_dxgi_win.exe` checks the capture HAL contract. In session 0,
-`init` fails cleanly (`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`). With
-`--interactive` it covers:
+`test_capture_dxgi_win.exe` checks the capture HAL contract. Both modes start
+with synthetic cells that need no desktop:
 
+- monochrome, color and masked-color pointer blending
+- clipping at every frame edge
+- rejection of malformed shapes
+- save-under restore after a move or hide
+- which pointer updates count as damage
+- output selector parsing
+
+In session 0 no output is attached to the desktop, so `init` fails cleanly,
+both by default and with an explicit selection. With `--interactive` it also
+covers:
+
+- output selection: the default is the primary, every output can be picked
+  by index, by device name and by bare name, and unknown selections fail
+  `init` and log the attached outputs
 - ERROR before start and after stop, returned promptly
 - IDLE versus frames within the timeout
 - frame fields and QPC-nanosecond timestamps
 - an unreleased frame reclaimed by the next call
 - access loss, then recovery through stop + start
+- real pointer shapes (monochrome, color, masked color) checked in the
+  delivered pixels, hotspot placement, hiding, pointer-only updates as frames
+  with `show_cursor`, and IDLE without it
 
 Desktop Duplication delivers no frames while the console display is powered
 off, which is the VM console's usual state. It also delivers none on a static
 desktop. The test therefore shows a 64x64 non-activating window that repaints
-on a timer. That window turns the display on (`SC_MONITORPOWER` sent to
-itself, plus `ES_DISPLAY_REQUIRED` while it lives). It then waits for
-`GUID_CONSOLE_DISPLAY_STATE` to report the display on.
+on a timer. Each test window turns the display on (`SC_MONITORPOWER` sent to
+itself, plus `ES_DISPLAY_REQUIRED` while it lives) and waits for
+`GUID_CONSOLE_DISPLAY_STATE` to report the display on. The VM console turns
+the display off again about a second later anyway. Duplication then stalls
+and reports the pointer hidden, so the windows wake the display again each
+time it reports off.
+
+The pointer cells never move the user's pointer. They show a static window
+around wherever the pointer already is and change only that window's cursor,
+using `SetCursor` on the window's own thread. Each change is therefore a
+pointer-only update. What was observed on the VM (Basic Display adapter):
+
+- Color shapes are hardware pointers. DXGI reports them, and the backend
+  composites them. `PointerPosition` is the shape's top-left, so position
+  plus hotspot is the pointer location. Color shape data is premultiplied: a
+  50% red pixel arrives as BGRA `0,0,128,128`.
+- Monochrome and masked-color shapes are software cursors. DWM draws them into
+  the desktop image itself and DXGI reports no pointer, so the backend draws
+  nothing. Such cursors are captured even with `show_cursor` off.
+- The desktop is never quiet for long. There is a full redraw after each
+  display wake, the taskbar updates, and the scheduled task's console caret
+  blinks about every 530 ms. The `show_cursor`-off cell therefore waits
+  150 ms after each shape change. It counts an attempt only when the call
+  returns IDLE and the backend consumed the pointer update in the meantime.
 
 ## Real lock/disconnect qualification
 

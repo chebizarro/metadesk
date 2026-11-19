@@ -494,6 +494,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
     fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
     fprintf(stderr, "  --capture-forget-on-stall  Opt in to token removal after broken capture\n");
+    fprintf(stderr, "  --capture-output SEL  Windows: output index or device name (default: primary)\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
     fprintf(stderr, "  --fips-ready-timeout MS  Peer readiness timeout (default: 10000)\n");
@@ -730,6 +731,7 @@ int main(int argc, char **argv) {
     bool capture_unattended = false;
     bool capture_forget_on_stall = false;
     uint32_t capture_consent_timeout_ms = 0;
+    const char *capture_output = NULL;
     bool mcp_stdio = false;
     bool mcp_http = false;
     const char *mcp_token_file = NULL, *mcp_allow_file = NULL;
@@ -782,6 +784,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
             capture_consent_timeout_ms = (uint32_t)ms;
+        }
+        else if (strcmp(argv[i], "--capture-output") == 0) {
+            if (++i >= argc || !argv[i][0]) {
+                fprintf(stderr, "ERROR: --capture-output requires an output index or device name\n");
+                return 1;
+            }
+#ifdef _WIN32
+            capture_output = argv[i];
+#else
+            fprintf(stderr, "ERROR: --capture-output is only supported by the Windows (DXGI) capture backend\n");
+            return 1;
+#endif
         }
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             fips_npub = argv[++i];
@@ -1194,6 +1208,7 @@ signaling_ready:
             .unattended = capture_unattended,
             .forget_authorization_on_stall = capture_forget_on_stall,
             .consent_timeout_ms = capture_consent_timeout_ms,
+            .output = capture_output,
         };
         capture = md_capture_create(&cap_cfg);
         if (!capture) {
