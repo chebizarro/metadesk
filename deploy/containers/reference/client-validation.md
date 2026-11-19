@@ -334,3 +334,12 @@ build trees, throwaway keys and `~/wt-rk4` were removed, and the driver removed
 its containers and network. VM free disk was 7.4 GB at start, 6.3 GB lowest and
 7.3 GB at the end. GNOME was never touched; host-side SDL probes forced
 `dummy`/`offscreen` or pointed `XDG_RUNTIME_DIR` away from the session.
+
+md-cdz/md-rnc re-run: the `cdz-*` images and the derived probe images
+(`probe-noegl`, `probe-nogles`, `wip-gui-gl`) were removed by exact tag, and
+dangling layers were pruned. The bundle and build trees, throwaway keys, probe
+display container and `~/wt-cdz` were removed. The driver removed its
+containers and network. Only the shared Ubuntu base image remained. VM free
+disk was 9.0 GB at start, 5.5 GB lowest and 8.9 GB at the end; the VM is
+shared with other agents. GNOME was never touched: every SDL probe ran inside
+a container against the private Sway socket.
