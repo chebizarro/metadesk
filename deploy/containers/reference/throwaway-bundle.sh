@@ -4,18 +4,22 @@
 # THROWAWAY LOCAL PRODUCER: md-kb7 inherits bundle-contract.md, NOT this script.
 # Run on matching Ubuntu 24.04/architecture; never runs inside the runtime image.
 set -eu
-[ "$#" = 3 ] || { echo "usage: $0 SOURCE NOSTRC_ROOT OUTPUT (new directory)" >&2; exit 2; }
+# Extra Meson options follow OUTPUT and override the defaults, e.g. the md-ah9.11
+# client bundle: -Dclient=true -Dsigner_nip5f=true -Dsigner_nip46=true
+# (see client-validation.md).
+[ "$#" -ge 3 ] || { echo "usage: $0 SOURCE NOSTRC_ROOT OUTPUT (new directory) [MESON_OPTION...]" >&2; exit 2; }
 src=$(realpath "$1")
 nostrc=$(realpath "$2")
 [ ! -e "$3" ] || { echo 'output must not exist' >&2; exit 2; }
 mkdir -p "$3"
 out=$(realpath "$3")
+shift 3
 build="$src/build-container"
 [ ! -e "$build" ] || { echo 'build-container must not exist' >&2; exit 2; }
 . /etc/os-release
 [ "$ID:$VERSION_ID" = ubuntu:24.04 ] || { echo 'requires Ubuntu 24.04' >&2; exit 2; }
 meson setup "$build" "$src" -Dclient=false -Dnostrc_root="$nostrc" \
-    -Dnostrc_build_dir="$nostrc/_build" --prefix=/opt/metadesk --libdir=lib
+    -Dnostrc_build_dir="$nostrc/_build" --prefix=/opt/metadesk --libdir=lib "$@"
 meson compile -C "$build" -j2
 meson install -C "$build" --destdir "$build/destdir"
 cp -a "$build/destdir/opt" "$out/"
@@ -32,7 +36,8 @@ import sys
 root = Path(sys.argv[1]) / 'opt/metadesk'
 lib = root / 'lib'
 env = dict(os.environ, LD_LIBRARY_PATH=str(lib))
-elfs = [root / 'bin/metadesk-host', *lib.glob('*.so*')]
+bins = [p for p in (root / 'bin/metadesk-host', root / 'bin/metadesk-client') if p.exists()]
+elfs = [*bins, *lib.glob('*.so*')]
 base = re.compile(r'^(ld-linux-.*|lib(c|m|pthread|dl|rt|resolv|util|anl|nss_.*)\.so\..*|libgcc_s\.so\..*|libstdc\+\+\.so\..*)$')
 for elf in elfs:
     output = subprocess.check_output(['ldd', str(elf)], env=env, text=True)
@@ -45,7 +50,7 @@ for elf in elfs:
             if not target.exists():
                 shutil.copy2(match[1], target)
 # Dereference all private symlinks, then remove producer/build-tree RPATHs.
-for path in [root / 'bin/metadesk-host', *lib.glob('*.so*')]:
+for path in [*bins, *lib.glob('*.so*')]:
     if path.is_symlink():
         data = path.read_bytes()
         path.unlink()

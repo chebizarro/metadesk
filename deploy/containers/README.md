@@ -189,3 +189,26 @@ changing frames through metadesk's capture library. This is not full host/client
 input (md-ah9.9), encoder, or unattended-policy (md-ah9.10) qualification.
 Use `--init` and the documented least-privilege run flags; capture is denied by
 default until the operator opts into sharing the isolated output.
+
+## Tier A FIPS mesh reference (rootless Podman)
+
+`compose.mesh.yaml` joins the mesh, agent and proxy to the namespace holder
+`ah9-5-netns`, which **`mesh-netns.sh` creates with Podman**; Compose never
+owns it. Run `mesh-netns.sh up`, then plain `docker-compose … up -d`. Both are
+idempotent. Podman < 5.4 makes Compose see any holder on a Compose network as
+diverged; Compose then stops it under its consumers (md-ba4). Never stop or
+restart the holder under its consumers. See
+[mesh-validation.md](reference/mesh-validation.md).
+
+## Container client (decode-only and GUI)
+
+`Dockerfile.client` builds two targets from a client bundle
+(`throwaway-bundle.sh … -Dclient=true -Dsigner_nip5f=true -Dsigner_nip46=true`):
+- `decode`: `--no-display`, with no display stack;
+- `gui`: adds the pinned Wayland/EGL/GL runtime SDL loads. Grant a display only
+  by mounting one private Wayland socket, and set `SDL_VIDEODRIVER=wayland`.
+  Otherwise SDL may render to an invisible offscreen surface (md-33e).
+
+Sessions need Nostr negotiation; direct IP fails closed. See
+[client-validation.md](reference/client-validation.md) for the qualified Tier B
+host pairing, private relay/bunker fixture and driver.

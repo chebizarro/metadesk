@@ -172,8 +172,8 @@ only in the remote test client; neither proxy nor agent receives it.
 
 ## Start and test
 
-Copy `compose.mesh.yaml` and `mesh-proxy.cfg` together into the task directory.
-Set these variables in a private env file (paths are absolute):
+Copy `compose.mesh.yaml`, `mesh-proxy.cfg` and `mesh-netns.sh` together into
+the task directory. Set these variables in a private env file (paths are absolute):
 
 ```dotenv
 MD_BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
@@ -189,23 +189,29 @@ MD_MESH_IP=REPLACE_WITH_HOST_FIPS_IPV6
 Use the discovered AT-SPI parent directory, not one socket inode. All desktop
 mounts stay read-only; never recursively relabel the live user runtime dir.
 
-Start a task-owned Podman API socket, then the holder before its consumers:
+Start a task-owned Podman API socket. Create the holder with Podman, then
+reconcile its consumers with plain Compose (md-ba4; see below):
 
 ```sh
 podman system service --time=0 unix:$HOME/wt-ah9-5/podman.sock
 # In another shell; standalone Compose executable placed in the task directory:
 export DOCKER_HOST=unix://$HOME/wt-ah9-5/podman.sock
-./docker-compose --env-file mesh.env -f compose.mesh.yaml up -d --no-recreate netns
-./docker-compose --env-file mesh.env -f compose.mesh.yaml up -d --no-recreate
+set -a; . ./mesh.env; set +a          # MD_BASE (and optional MD_NETNS_*) for the holder
+./mesh-netns.sh up                    # idempotent; refuses a diverged or orphaned holder
+./docker-compose --env-file mesh.env -f compose.mesh.yaml up -d   # idempotent
 ```
 
-**Runtime caveat (md-ba4):** on the measured API/client combination, a plain
-second `up -d` attempted to recreate the unchanged holder and Podman refused
-because of dependent containers, leaving a temporary renamed replacement.
-The qualified commands use `--no-recreate`. To change configuration, remove
-all namespace consumers **before** replacing the holder, then start afresh.
-Do not use `--force-recreate` on the holder alone. This reconciliation path
-is not qualified. `restart mesh` / `restart agent` are qualified separately.
+`mesh-netns.sh up` creates the `ah9-5-underlay` network (`10.89.95.0/24`) and
+the holder `ah9-5-netns` (`10.89.95.2`). The holder is capability-free and
+keep-ID UID/GID 1000, with a read-only root, no-new-privileges, `--init` and
+no restart policy. The holder and network carry an `io.metadesk.netns` ownership
+label, and the holder also carries a spec hash. Re-running `up` verifies an
+identical, running, owned holder with the expected live address and no restart
+policy. Anything else (a diverged, stopped, drifted or unmanaged same-name
+resource) exits 1 without changing state. Teardown order is
+`docker-compose … down`, then `mesh-netns.sh down`. Podman refuses the latter
+while any consumer still exists, and the script never removes unlabelled
+resources.
 
 The manifest deliberately uses Podman's `userns_mode: container:ah9-5-netns`
 and tmpfs `U` ownership. Docker cannot use this manifest unchanged. The
@@ -297,7 +303,91 @@ completion is involved; these are endpoint operations and measured success.
   installed, so no Docker purge was necessary. The temporary standalone
   Compose download/checksum were also removed locally.
 
-Remaining work: **md-uzf** (external packaged config example) and **md-ba4**
-(Compose/API reconciliation). Neither was worked around by pretending an
-underlay connection was a mesh or by granting extra agent privileges.
-No `src/` or existing Tier A files were modified.
+Remaining work: **md-uzf** (external packaged config example). The md-ba4
+Compose/API reconciliation follow-up is qualified below. Neither was worked
+around by pretending an underlay connection was a mesh or by granting extra
+agent privileges. No `src/` or existing Tier A files were modified.
+
+## Compose reconciliation — md-ba4
+
+Validated 2026-11-18, same VM, rootless Podman **4.9.3** API and standalone
+Docker Compose **5.5.1**, whose SHA-256 matched the pin above. The run used two
+real `fipsd 0.1.0` daemons built at `5d09cab` (image
+`ef763f82a403…`, rebuilt from the same Dockerfile) and HAProxy 2.8.30.
+Names were `sed s/ah9-5/cont-ba4/` (VM prefix rule) on the committed files, on
+underlay `10.89.98.0/24`.
+
+**Root cause.** A plain second `up -d` recreated the holder because Podman's
+compat API (< 5.4) reports a container's `NetworkSettings.Networks[].NetworkID`
+as the network **name** (`cont-ba4-underlay`), while `/networks/{name}` returns
+the real ID (`d1b1b953…`). Compose 5.5.1's reconciler (`hasNetworkMismatch`)
+compares the two and always sees the holder, the only service attached through
+`networks:`, as diverged. The config-hash and image-digest labels matched. An
+`external:` network resolves to the same real ID, so no Compose setting avoids
+this. Upstream fixed it in Podman `805e78c2aaa7`, first released in **v5.4.0**.
+
+The failure is worse than the md-ah9.5 note. Compose creates `<id>_…-netns`,
+**stops the original holder**, then Podman refuses its removal (dependents).
+The consumers keep running in a namespace whose `eth0` is gone (`lo` only), so
+the mesh loses its underlay silently. Podman also allows `podman stop` on a
+holder with dependents. It refuses `podman rm [-f]` before stopping anything.
+
+**Fix.** The holder is no longer a Compose service. `mesh-netns.sh` owns it with
+Podman. The Compose consumers use `network_mode: container:ah9-5-netns` plus the
+unchanged `userns_mode`. No service sits on a Compose network, so the network
+check never applies and plain `up -d` is a no-op. A Podman pod was not used:
+Podman 4.9.3 `pod create` has no `--cap-drop`/`--read-only` for its infra
+container, while a plain container keeps the qualified holder sandbox.
+
+The agent was replaced by `reference/compose.mesh.standin.yaml`, a loopback HTTP
+stand-in with the same namespaces, user and sandbox, so lifecycle runs never
+mount the live desktop bus. The Tier A MCP/desktop cells above are unchanged.
+Each receipt requires:
+- both daemons to show a connected peer;
+- one GET from the remote peer's namespace to `http://[MESH_IP]:7711/` over
+  `fips0` → HAProxy → stand-in (bounded 10 s attempts within 90 s);
+- an established FIPS session after the GET;
+- agent/proxy/mesh in the holder's network namespace.
+
+Inode numbers are recycled by the kernel, so holder stability is shown by an
+unchanged container ID and no restart.
+
+| Cell | Result |
+|---|---|
+| `config -q` with holder file and override | PASS |
+| `up -d` with holder absent | PASS (fail closed): exit 1, `no container with name or ID "…-netns"`; 0 containers created |
+| `mesh-netns.sh up` ×2 | PASS: created, then `up to date`; CapEff empty, read-only, init, no restart policy |
+| Plain `up -d` ×3 and `--dry-run` | PASS: only `Running`; identical IDs; 0 `<id>_` temporaries; receipt OK |
+| Proxy-only config change, plain `up -d` | PASS: only proxy recreated; holder and other IDs unchanged |
+| `up -d --force-recreate` ×2 (consumers) | PASS: all consumers new, holder unchanged; mesh back in 26.0 / 26.2 s (two failed 10 s GETs while FIPS sessions recovered) |
+| `restart mesh` / `restart agent` | PASS: 30.5 s / 1.2 s whole cell |
+| `mesh-netns.sh down` with consumers | PASS (refused): Podman `has dependent containers`; holder still running, mesh OK |
+| Holder spec drift (IP) / underlay subnet drift | PASS (refused): exit 1, nothing changed |
+| Holder stopped under consumers | Detected: proxy left with `lo fips0`; `mesh-netns.sh up` exits 1. Plain Compose `up -d` still reports `Running` (it cannot see this) |
+| Recovery: compose `down` → holder back → `up -d` | PASS: mesh back in 23.6 s |
+| Teardown | PASS: holder removed in 0.31 s; repeat `down` idempotent; 0 containers/networks left |
+
+**Review hardening** (re-run with the same rename and podman stand-in
+consumers; the Compose file was unchanged):
+- `up` now **refuses** to start a stopped holder. The earlier pass restarted
+  one that had no dependents; recovery is now `down` and `up`, which relies on
+  Podman's dependency-checked removal rather than a userspace inventory.
+- `up` checks the live address and restart policy.
+- `up` and `down` both refuse an unlabelled same-name network.
+- Name overrides were dropped, because Compose hardcodes the names.
+
+Re-run PASS: create/idempotent; IP drift refused; `down` with a consumer
+refused (holder still running); stopped holder refused; `down` then `up` gave
+the consumer a working `lo eth0`; teardown left 0 containers/networks; repeat
+`down` returned 0.
+
+The recreation times are FIPS session recovery after a daemon restart, not
+Compose behaviour, and they match md-ah9.5's note. **Supported commands:**
+`mesh-netns.sh up` then plain `up -d` (repeatable; consumer edits and
+`--force-recreate` are safe). Never `podman stop`/`restart` the holder under
+its consumers. To change or recover the holder, run `compose down`, then `mesh-netns.sh down`
+and `up`, then `up -d`. If Compose and the network look healthy but the mesh is
+dark, `mesh-netns.sh up` reports a stopped or drifted holder.
+Requalifying a Compose-owned holder on Podman ≥ 5.4 is **md-czf**. Cleanup:
+task containers, networks and the mesh image layers (by the exact IDs from the
+build log) were removed. A sibling agent's `hal-video` image was untouched.
