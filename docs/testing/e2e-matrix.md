@@ -3,8 +3,8 @@
 Owner: **md-5zi** (full matrix execution and failing-cell bugs). Container
 receipts incorporated by **md-ah9.12** against master `c571b5d`; no new runtime
 tests were run for that documentation task. Container client cells were added by
-**md-ah9.11** against master `8eebb6c`. This is the owning matrix, not a new E2E
-harness.
+**md-ah9.11** against master `8eebb6c`; md-rk4/md-33e re-ran those cells against
+`66c1886` plus their fix. This is the owning matrix, not a new E2E harness.
 
 ## Status and counting
 
@@ -21,8 +21,8 @@ checks, not full E2E passes. Counts exclude the checklist and summary tables.
 | Scope | PASS | FAIL | not yet run | pending | N/A | Total |
 |---|---:|---:|---:|---:|---:|---:|
 | General host/client pairings | 0 | 0 | 32 | 0 | 0 | 32 |
-| Containers | 91 | 5 | 4 | 5 | 1 | 106 |
-| Total | 91 | 5 | 36 | 5 | 1 | 138 |
+| Containers | 93 | 4 | 4 | 5 | 1 | 107 |
+| Total | 93 | 4 | 36 | 5 | 1 | 139 |
 
 ## General roles × platforms × transports
 
@@ -259,7 +259,8 @@ the source; final Linux gates ran without devices or host session/runtime mounts
 
 Source: [client-validation.md](../../deploy/containers/reference/client-validation.md).
 Validated **2026-11-18**: rootless **Podman 4.9.3**, Ubuntu 24.04 aarch64,
-metadesk **8eebb6c**. The host is the Tier B Sway/xdpw container (render node,
+metadesk **8eebb6c**; re-run by md-rk4/md-33e on `66c1886` plus the fix (44/44
+checks, no `stdbuf`). The host is the Tier B Sway/xdpw container (render node,
 GLES2, isolated 1920×1080 output, x264). A loopback host has no frame source
 without capturing the live desktop. Negotiation is real NIP-17 over a private
 relay, with a v1 `video` grant, throwaway NIP-46 bunkers and one-use stream
@@ -269,13 +270,14 @@ receipt. Headless and display-authorization results are separate rows.
 
 | Client check | Rootless Podman 4.9.3 |
 |---|---|
+| Readiness/progress lines without a TTY (no `stdbuf`) | PASS: host `nostr bridge ready` logged while running; client stats/summary live; **md-rk4** |
 | Non-allowlisted client refused before any stream | PASS: host `REJECTED … non-allowlisted`; client exit 1; no TCP client |
 | Decode-only (`--no-display`): negotiate, bind, decode | PASS: 1920×1080 x264; 102 decoded, 0 displayed; SIGTERM exit 0 in 0.17 s |
 | Decode-only sandbox: no display server/devices/caps | PASS: CapEff 0; no `/dev/dri`; no display env/socket; no EGL/GLES in image |
 | Legacy direct-IP client (no session proof) | PASS (fails closed): host `rejected unproven client #2`; no stream |
-| GUI, granted private Wayland socket | PASS: 100 displayed; visible `xdg_shell` view `metadesk-client` 1920×1055 on the private output |
-| GUI, no display granted (default env) | FAIL: SDL silently uses its `offscreen` EGL driver and reports displayed frames, exit 0; **md-33e** |
-| GUI, no display granted, `SDL_VIDEODRIVER=wayland` | PASS (refused): `SDL_Init failed`; continues decode-only, exit 0; fail-open note in **md-33e** |
+| GUI, granted private Wayland socket | PASS: logs `SDL video driver 'wayland'`, renderer `opengl`, frame 1920×1080; 100 displayed; visible `xdg_shell` view `metadesk-client` 1920×1055 on the private output |
+| GUI, no display granted (default env) | PASS (refused): `SDL video driver 'offscreen' has no visible output`, exit 1 before signer/relay/session work; **md-33e** fixed |
+| GUI, no display granted, `SDL_VIDEODRIVER=wayland` | PASS (refused): `SDL_Init failed: wayland not available`, exit 1 before signer/relay/session work; no decode-only fallback (**md-33e**) |
 | Repeat negotiation on a history-retaining relay | FAIL: stale `session_accept` replayed; host rejects the stale proof; **md-6ns** |
 | NIP-5F signer for a live host session | FAIL: decrypted seal JSON not unescaped, `DM rejected: invalid-seal`; **md-ebm** |
 

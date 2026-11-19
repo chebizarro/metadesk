@@ -26,6 +26,15 @@ typedef struct MdRenderer MdRenderer;
  * Returns NULL on failure (SDL2 not available, etc.). */
 MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *title);
 
+/* Initialize SDL video and require a driver with visible output. Headless
+ * drivers (offscreen, dummy, evdev) are refused rather than used silently.
+ * Logs the selected driver to stderr. Idempotent; md_renderer_create() calls
+ * it. Returns 0 on success, -1 (reason on stderr) if no display is usable. */
+int md_renderer_open_display(void);
+
+/* Shut SDL down after every renderer is destroyed. */
+void md_renderer_close_display(void);
+
 /* Present a decoded RGBA frame in one call (upload + draw + present).
  * Kept for simple callers; the client composite path uses the split
  * update/begin/end functions below so the overlay shares the same frame. */
