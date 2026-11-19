@@ -333,6 +333,45 @@ static void test_output_rect(void)
     PASS("output_rect");
 }
 
+/* md-n9p2: the size cap shrinks to fit, keeps aspect, never upscales. */
+static void test_fit_size(void)
+{
+    uint32_t w = 0, h = 0;
+    /* Retina MacBook backing pixels down to its point size. */
+    MD_CHECK(md_capture_fit_size(3024, 1964, 1512, 982, &w, &h) == 0);
+    MD_CHECK(w == 1512 && h == 982);
+    /* One side bounded; the other is unbounded (0) and rounds. */
+    MD_CHECK(md_capture_fit_size(3024, 1964, 1920, 0, &w, &h) == 0);
+    MD_CHECK(w == 1920 && h == 1247);               /* 1246.98 */
+    MD_CHECK(md_capture_fit_size(3024, 1964, 0, 1080, &w, &h) == 0);
+    MD_CHECK(w == 1663 && h == 1080);               /* 1662.9 */
+    /* Both bounded: the tighter one binds (here the height). */
+    MD_CHECK(md_capture_fit_size(3024, 1964, 1920, 1080, &w, &h) == 0);
+    MD_CHECK(w == 1663 && h == 1080);
+    MD_CHECK(md_capture_fit_size(1080, 1920, 1920, 1080, &w, &h) == 0);
+    MD_CHECK(w == 608 && h == 1080);                /* portrait, 607.5 up */
+    MD_CHECK(md_capture_fit_size(2560, 1440, 1280, 1080, &w, &h) == 0);
+    MD_CHECK(w == 1280 && h == 720);                /* width binds */
+    /* Already within the cap, or uncapped: native, never scaled up. */
+    MD_CHECK(md_capture_fit_size(1920, 1080, 1920, 1080, &w, &h) == 0);
+    MD_CHECK(w == 1920 && h == 1080);
+    MD_CHECK(md_capture_fit_size(1920, 1080, 2560, 1440, &w, &h) == 0);
+    MD_CHECK(w == 1920 && h == 1080);
+    MD_CHECK(md_capture_fit_size(1920, 1080, 0, 0, &w, &h) == 0);
+    MD_CHECK(w == 1920 && h == 1080);
+    /* A degenerate side never rounds to 0; 64-bit products don't wrap. */
+    MD_CHECK(md_capture_fit_size(100000, 1, 100, 0, &w, &h) == 0);
+    MD_CHECK(w == 100 && h == 1);
+    MD_CHECK(md_capture_fit_size(UINT32_MAX, UINT32_MAX, 4096, 4096, &w, &h) == 0);
+    MD_CHECK(w == 4096 && h == 4096);
+    /* Invalid input. */
+    MD_CHECK(md_capture_fit_size(0, 1080, 1920, 0, &w, &h) == -1);
+    MD_CHECK(md_capture_fit_size(1920, 0, 1920, 0, &w, &h) == -1);
+    MD_CHECK(md_capture_fit_size(1920, 1080, 1280, 0, NULL, &h) == -1);
+    MD_CHECK(md_capture_fit_size(1920, 1080, 1280, 0, &w, NULL) == -1);
+    PASS("fit_size");
+}
+
 /* md-6c4f: frame timestamps live on md_capture_clock_ns()'s clock. */
 #ifdef __APPLE__
 static bool within_ns(uint64_t a, uint64_t b, uint64_t tol)
@@ -469,12 +508,15 @@ static void test_config_passthrough(void)
     MdCaptureConfig cfg = {
         .target_fps  = 30,
         .show_cursor = false,
+        .max_width   = 1512,
+        .max_height  = 982,
     };
 
     MdCaptureCtx *ctx = create_mock_ctx(&cfg);
     MD_CHECK(ctx != NULL);
     MD_CHECK(ctx->config.target_fps == 30);
     MD_CHECK(ctx->config.show_cursor == false);
+    MD_CHECK(ctx->config.max_width == 1512 && ctx->config.max_height == 982);
 
     md_capture_destroy(ctx);
     PASS("config passthrough");
@@ -919,6 +961,17 @@ static void test_portal_required(void)
     else unsetenv("DBUS_SESSION_BUS_ADDRESS");
     PASS("real PipeWire backend fails closed without portal (repeated start/stop)");
 }
+
+/* md-n9p2: PipeWire cannot scale its stream, so it refuses a size cap up
+ * front instead of silently capturing at full size. */
+static void test_pipewire_rejects_size_cap(void)
+{
+    MdCaptureConfig cfg = {.unattended = true, .max_width = 1280};
+    MD_CHECK(md_capture_create(&cfg) == NULL);
+    cfg = (MdCaptureConfig){.unattended = true, .max_height = 720};
+    MD_CHECK(md_capture_create(&cfg) == NULL);
+    PASS("real PipeWire backend rejects a capture size cap");
+}
 #endif
 
 /* ── Main ────────────────────────────────────────────────────── */
@@ -934,6 +987,7 @@ int main(void)
     test_get_size_before_init();
     test_display_choose();
     test_output_rect();
+    test_fit_size();
     test_frame_clock();
     test_wait_size_dispatch();
     test_get_frame_and_release();
@@ -950,6 +1004,7 @@ int main(void)
     test_portal_required();
     test_stalled_bus();
     test_portal_responses();
+    test_pipewire_rejects_size_cap();
 #endif
 
     printf("\nAll capture tests passed.\n");

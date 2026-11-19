@@ -480,6 +480,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --capture-forget-on-stall  Opt in to token removal after broken capture\n");
     fprintf(stderr, "  --capture-output SEL  Display to capture (default: primary): index; Windows\n"
                     "                   device name (\\\\.\\DISPLAY2); macOS id:CGDirectDisplayID or name\n");
+    fprintf(stderr, "  --capture-max-size WxH  macOS: scale frames down to fit WxH (aspect kept;\n"
+                    "                   0 = unbounded, e.g. 1920x0), e.g. the display's point size\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
     fprintf(stderr, "  --fips-ready-timeout MS  Peer readiness timeout (default: 10000)\n");
@@ -733,6 +735,7 @@ int main(int argc, char **argv) {
     bool capture_forget_on_stall = false;
     uint32_t capture_consent_timeout_ms = 0;
     const char *capture_output = NULL;
+    uint32_t capture_max_w = 0, capture_max_h = 0;
     bool mcp_stdio = false;
     bool mcp_http = false;
     const char *mcp_token_file = NULL, *mcp_allow_file = NULL;
@@ -796,6 +799,41 @@ int main(int argc, char **argv) {
 #else
             fprintf(stderr, "ERROR: --capture-output is not supported on Linux: "
                             "PipeWire capture picks the source in the ScreenCast portal dialog\n");
+            return 1;
+#endif
+        }
+        else if (strcmp(argv[i], "--capture-max-size") == 0) {
+            /* Each side 0 (unbounded) or 64..16384, not both 0. */
+            char *end = NULL;
+            unsigned long mw = 0, mh = 0;
+            bool ok = ++i < argc && argv[i][0] >= '0' && argv[i][0] <= '9';
+            if (ok) {
+                mw = strtoul(argv[i], &end, 10);
+                ok = (*end == 'x' || *end == 'X') && end[1] >= '0' && end[1] <= '9';
+            }
+            if (ok) {
+                mh = strtoul(end + 1, &end, 10);
+                ok = !*end && (mw || mh) &&
+                     (!mw || (mw >= MD_INPUT_MIN_SCREEN_DIMENSION && mw <= 16384)) &&
+                     (!mh || (mh >= MD_INPUT_MIN_SCREEN_DIMENSION && mh <= 16384));
+            }
+            if (!ok) {
+                fprintf(stderr, "ERROR: --capture-max-size requires WxH, each 0 (unbounded) "
+                                "or %u..16384, not both 0\n", MD_INPUT_MIN_SCREEN_DIMENSION);
+                return 1;
+            }
+#if defined(__APPLE__)
+            capture_max_w = (uint32_t)mw;
+            capture_max_h = (uint32_t)mh;
+#else
+#  ifdef _WIN32
+            const char *platform = "Windows (DXGI)";
+#  else
+            const char *platform = "Linux (PipeWire)";
+#  endif
+            fprintf(stderr, "ERROR: --capture-max-size is not supported on %s: frames are "
+                            "captured at the display's pixels (only macOS scales in capture)\n",
+                    platform);
             return 1;
 #endif
         }
@@ -1211,6 +1249,8 @@ signaling_ready:
             .forget_authorization_on_stall = capture_forget_on_stall,
             .consent_timeout_ms = capture_consent_timeout_ms,
             .output = capture_output,
+            .max_width = capture_max_w,
+            .max_height = capture_max_h,
         };
         capture = md_capture_create(&cap_cfg);
         if (!capture) {

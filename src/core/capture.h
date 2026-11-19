@@ -85,6 +85,14 @@ typedef struct {
      * available displays. Linux/PipeWire picks its source in the portal and
      * ignores it. Borrowed for the ctx lifetime. */
     const char *output;
+    /* Upper bound on the delivered frame size, e.g. for bandwidth-limited
+     * sessions; 0 leaves that dimension unbounded (both 0 = native pixels).
+     * The native frame is scaled down to md_capture_fit_size() of it: aspect
+     * kept, never scaled up. The output rect is unchanged, so input mapping
+     * (md_input_map_to_output) follows the smaller frame with no change.
+     * Only macOS (ScreenCaptureKit, scaled in hardware) supports it; DXGI
+     * and PipeWire fail init when it is set. */
+    uint32_t max_width, max_height;
 } MdCaptureConfig;
 
 /* Bounds of the captured output in the platform's global desktop space
@@ -94,8 +102,13 @@ typedef struct {
  * macOS: CoreGraphics global display points, origin at the main display's
  * top-left, while frames are backing pixels, so on Retina the frame is
  * scale x this rect and frame->desktop mapping divides by that scale;
- * md_input_map_to_output derives it from the two sizes).
- * width == 0 means the backend has not published it. */
+ * md_input_map_to_output derives it from the two sizes; a max_width/
+ * max_height cap only shrinks the frame relative to this rect).
+ * width == 0 means the backend has not published it.
+ * Backends set it in init/start and may republish it (with ctx->width/
+ * height) while handing out a frame from get_frame, e.g. ScreenCaptureKit
+ * when the captured display moves or changes mode without a restart; all of
+ * these run on the capture (get_frame) thread, so read it there. */
 typedef struct {
     int32_t  x, y;
     uint32_t width, height;
@@ -202,11 +215,19 @@ bool md_capture_is_active(const MdCaptureCtx *ctx);
 int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
                          uint32_t *width, uint32_t *height);
 
+/* The size a w x h frame is delivered at under a max_w x max_h cap (0 =
+ * unbounded): unchanged if it fits, else scaled down, aspect kept, so the
+ * binding dimension equals its cap and the other is rounded (at least 1).
+ * Pure; returns -1 for a zero source size or NULL outputs. */
+int md_capture_fit_size(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
+                        uint32_t *out_w, uint32_t *out_h);
+
 /* Non-blocking md_capture_wait_size(ctx, 0, ...). */
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);
 
 /* Desktop bounds of the selected output after a successful start, so input
- * can address the same display. Returns -1 if the backend did not publish
+ * can address the same display; current as of the last frame get_frame
+ * returned (see MdCaptureRect). Returns -1 if the backend did not publish
  * them (Linux/PipeWire) or the arguments are invalid. */
 int md_capture_get_output_rect(const MdCaptureCtx *ctx, MdCaptureRect *rect);
 

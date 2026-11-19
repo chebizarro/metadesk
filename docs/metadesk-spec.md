@@ -154,6 +154,22 @@ MdCaptureBackend *md_capture_backend_create(void);
 
 An unknown or ambiguous selection fails capture and logs every available display with its index, id/name, size and desktop origin. After a successful start, `md_capture_get_output_rect()` reports the selected display's global desktop bounds. The host copies them into `MdInputConfig.output_*`, and `md_input_map_to_output()` maps the client's frame-relative pointer coordinates into that display. Without this mapping, clicks would land on the display at the desktop origin. Agent actions (`md_input_execute_action`) carry global accessibility coordinates instead. They are converted back to frame space, and a target that is not on the captured display is refused.
 
+**Size cap** (`MdCaptureConfig.max_width`/`max_height`, host `--capture-max-size WxH`). This is for bandwidth-limited sessions. Frames are captured at the display's native pixels by default: backing pixels on macOS Retina, physical pixels on Windows. A cap scales the frame down to fit inside `WxH`:
+
+- Aspect is kept (`md_capture_fit_size`): the binding side equals its cap and the other side is rounded.
+- A frame is never scaled up.
+- `0` leaves a side unbounded, so `1920x0` caps only the width.
+
+A cap at the display's point size (`1512x982` on a 14" MacBook Pro) captures at point resolution. A cap is used instead of a scale divisor because it bounds encode cost the same way on any display density and leaves displays already within the cap untouched.
+
+The output rectangle does not change. `md_input_map_to_output` already scales between the frame size (`screen_*`) and the rectangle (`output_*`), so input and agent actions need no change.
+
+| Platform | Size cap |
+|---|---|
+| macOS (ScreenCaptureKit) | Supported. Scaled in hardware through `SCStreamConfiguration` width/height, and re-applied when the display changes mode |
+| Windows (DXGI) | Not supported. Frames are the mapped staging copy of the desktop image, so a GPU scaling pass would be needed. The host rejects the flag and init fails |
+| Linux (PipeWire) | Not supported. The compositor sets the monitor stream's size. The host rejects the flag and init fails |
+
 #### 2.3.2 Accessibility Tree HAL
 
 ```c
@@ -684,6 +700,14 @@ profile            = high
 ### 9.3 Mid-Stream Size Changes
 
 The captured size can change during a session. Causes include a display mode change or rotation, a watchdog capture restart, DXGI access-loss re-duplication, a display rearrangement or attach/detach, or a new `--capture-output all` layout. The wire protocol does not carry a frame size. The H.264 bitstream is the only source of the size:
+
+- **Capture** (macOS): ScreenCaptureKit keeps its stream running when the captured display moves or changes mode. Each SCK frame carries the display's onscreen rect and pixel/point scale, and the backend follows those per-frame attachments:
+  - When they change, the backend re-reads `CGDisplayBounds`.
+  - If the pixel size changed, it reconfigures the stream (`updateConfiguration`, honouring the size cap). Old-size frames are dropped until the new size arrives, because SCK letterboxes them into the new aspect.
+  - The new rectangle and size are published from `get_frame`, on the capture thread, together with the frame they describe.
+  - A failed reconfiguration reports the stream broken, and the watchdog restarts it.
+
+  `CGDisplayRegisterReconfigurationCallback` is not used: it only fires on a thread that processes events, and the host runs no run loop.
 
 - **Host** (`src/host/capture_sync.c`): the capture thread reconciles every frame it receives. It compares the frame's size and the capture's published output rectangle (`md_capture_get_output_rect`) with what was last applied. Any difference does two things:
   - The input context is retargeted with `md_input_set_bounds`. This happens under `client_mu`, the lock that packet dispatch and agent actions run under.

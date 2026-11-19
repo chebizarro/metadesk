@@ -933,6 +933,13 @@ static void *pw_thread_func(void *arg) {
 /* ── Backend vtable implementation ───────────────────────────── */
 
 static int pw_backend_init(MdCaptureCtx *ctx) {
+    /* The compositor picks the monitor stream's size; a cap would need a
+     * scaler before the encoder (md-n9p2 follow-up). */
+    if (ctx->config.max_width || ctx->config.max_height) {
+        MD_LOG_E("a capture size cap (max %ux%u) is not supported by PipeWire capture",
+                 ctx->config.max_width, ctx->config.max_height);
+        return -1;
+    }
     /* Initialize PipeWire (idempotent, safe to call multiple times) */
     pw_init(NULL, NULL);
     if (!dbus_threads_init_default()) return -1;
