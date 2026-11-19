@@ -21,6 +21,7 @@ extern "C" {
 #ifdef _WIN32
 
 #include <UIAutomation.h>
+#include <commctrl.h>   /* item-count messages only; no comctl32 link */
 #include <wtsapi32.h>
 
 #include <cstdlib>
@@ -37,6 +38,17 @@ extern "C" {
 /* Maximum tree depth */
 #define MD_UIA_MAX_DEPTH     32
 #define MD_UIA_MAX_CHILDREN  256
+
+/* A Win32 item container holding more than this many items makes its
+ * top-level window walk by bounded navigation instead of one subtree fetch
+ * (see "Tree walking" below). At 4x the child cap, the overfetch a subtree
+ * fetch would pay (~0.3 ms/item through the in-process Win32 proxies) is
+ * about what bounded navigation (~1.5 ms/node) costs for a typical window. */
+#define MD_UIA_WIDE_ITEMS        (4 * MD_UIA_MAX_CHILDREN)
+/* Per-control bound on the item-count query to a foreign window. */
+#define MD_UIA_WIDE_PROBE_MS     100
+/* Wide windows remembered per walk; any beyond this use the subtree fetch. */
+#define MD_UIA_MAX_WIDE_WINDOWS  16
 
 /* ── Backend-private state ───────────────────────────────────── */
 
@@ -368,16 +380,29 @@ static void extract_states(IUIAutomationElement *elem, MdA11yNode *node) {
  * per node, so one bad app degrades to per-level cost instead of vanishing or
  * ending enumeration.
  *
- * Tradeoff: UIA cannot bound a subtree cache fetch by depth or width (the
- * transaction timeout is per provider call, not per request), so nodes past
- * MD_UIA_MAX_DEPTH / MD_UIA_MAX_CHILDREN are fetched and then dropped. Output
- * is still capped exactly as before, but a window holding a very wide
- * non-virtualised list costs more than the capped uncached walk did (5000
- * Win32 list-box items: ~1.2-1.6 s vs ~0.6-0.8 s on the reference VM).
- * Bounded BuildCache navigation avoids that but is only ~1.5-2x faster than
- * uncached; see md-cw8 notes and its follow-up bead. */
+ * Width bound (md-0by): UIA cannot bound a subtree cache fetch by depth or
+ * width (the transaction timeout is per provider call, not per request), so
+ * nodes past MD_UIA_MAX_DEPTH / MD_UIA_MAX_CHILDREN are fetched and then
+ * dropped. That overfetch is expensive where the provider is one of the
+ * in-process Win32 proxies (list box, list view, tree view, combo box): each
+ * item costs cross-process window messages, so a 5000-item list box made the
+ * cached walk ~2x slower than the capped uncached one. Native providers serve
+ * a subtree request inside their own process, where overfetch is cheap.
+ *
+ * So before walking, uia_scan_wide() checks the visible Win32 descendants of
+ * every top-level window for those control classes and asks each for its
+ * item count (window messages only, no COM). Top-level windows holding a
+ * container with more than MD_UIA_WIDE_ITEMS items are walked by bounded
+ * navigation instead: First/NextSiblingElementBuildCache with an element
+ * request, never past either cap, which is exactly the uncached walk's
+ * semantics at two round trips per node. When some window is wide, every
+ * top-level window is navigated with the element request first (to read its
+ * HWND) and then, if not wide, refreshed with the subtree request: one more
+ * round trip per window, paid only while a wide list is on screen. When none
+ * is, enumeration is the single subtree-fetching navigation as before. */
 
-/* Everything walk_node() and extract_states() read. */
+/* Everything walk_node() and extract_states() read. Element-only requests
+ * also carry UIA_NativeWindowHandlePropertyId for the wide-window check. */
 static const PROPERTYID uia_walk_props[] = {
     UIA_RuntimeIdPropertyId,
     UIA_ControlTypePropertyId,
@@ -390,9 +415,12 @@ static const PROPERTYID uia_walk_props[] = {
 };
 
 struct UIAWalk {
+    IUIAutomationTreeWalker   *walker;   /* borrowed: ContentViewWalker */
     IUIAutomationCacheRequest *subtree;  /* props + Subtree */
     IUIAutomationCacheRequest *level;    /* props + Element|Children */
-    IUIAutomationCacheRequest *element;  /* props + Element */
+    IUIAutomationCacheRequest *element;  /* props + HWND + Element */
+    HWND wide[MD_UIA_MAX_WIDE_WINDOWS];  /* top-level windows to bound */
+    int  wide_count;
 };
 
 /* What a cached element carries beyond its own properties. */
@@ -400,6 +428,8 @@ enum UIACached {
     UIA_CACHED_ELEMENT,   /* no children cached */
     UIA_CACHED_CHILDREN,  /* its children (with properties) are cached */
     UIA_CACHED_SUBTREE,   /* every descendant's children are cached too */
+    UIA_CACHED_BOUNDED,   /* no children cached: navigate to them, each
+                           * arriving with its own properties */
 };
 
 static void uia_walk_end(UIAWalk *w) {
@@ -410,6 +440,7 @@ static void uia_walk_end(UIAWalk *w) {
 
 static HRESULT uia_cache_request(IUIAutomation *automation,
                                  IUIAutomationCondition *view, TreeScope scope,
+                                 PROPERTYID extra,
                                  IUIAutomationCacheRequest **out) {
     IUIAutomationCacheRequest *req = nullptr;
     HRESULT hr = automation->CreateCacheRequest(&req);
@@ -418,6 +449,7 @@ static HRESULT uia_cache_request(IUIAutomation *automation,
     if (SUCCEEDED(hr)) hr = req->put_TreeScope(scope);
     for (PROPERTYID id : uia_walk_props)
         if (SUCCEEDED(hr)) hr = req->AddProperty(id);
+    if (SUCCEEDED(hr) && extra) hr = req->AddProperty(extra);
     if (FAILED(hr)) SAFE_RELEASE(req);
     *out = req;
     return hr;
@@ -425,21 +457,120 @@ static HRESULT uia_cache_request(IUIAutomation *automation,
 
 /* Cache requests are client-side objects: building them makes no
  * cross-process call. */
-static HRESULT uia_walk_begin(IUIAutomation *automation, UIAWalk *w) {
+static HRESULT uia_walk_begin(IUIAutomation *automation,
+                              IUIAutomationTreeWalker *walker, UIAWalk *w) {
     *w = {};
+    w->walker = walker;
     IUIAutomationCondition *view = nullptr;
     HRESULT hr = automation->get_ContentViewCondition(&view);
     if (SUCCEEDED(hr) && !view) hr = E_FAIL;
     if (SUCCEEDED(hr))
-        hr = uia_cache_request(automation, view, TreeScope_Subtree, &w->subtree);
+        hr = uia_cache_request(automation, view, TreeScope_Subtree, 0, &w->subtree);
     if (SUCCEEDED(hr))
         hr = uia_cache_request(automation, view,
-            static_cast<TreeScope>(TreeScope_Element | TreeScope_Children), &w->level);
+            static_cast<TreeScope>(TreeScope_Element | TreeScope_Children), 0, &w->level);
     if (SUCCEEDED(hr))
-        hr = uia_cache_request(automation, view, TreeScope_Element, &w->element);
+        hr = uia_cache_request(automation, view, TreeScope_Element,
+                               UIA_NativeWindowHandlePropertyId, &w->element);
     SAFE_RELEASE(view);
     if (FAILED(hr)) uia_walk_end(w);
     return hr;
+}
+
+/* ── Wide Win32 item containers (md-0by) ─────────────────────── */
+
+#ifdef MD_UIA_TESTING
+/* Only the standalone harness defines this seam: a nonzero value replaces
+ * MD_UIA_WIDE_ITEMS so the default fixture exercises the bounded path. */
+static LRESULT uia_test_wide_items = 0;
+#endif
+
+static LRESULT uia_wide_items() {
+#ifdef MD_UIA_TESTING
+    if (uia_test_wide_items) return uia_test_wide_items;
+#endif
+    return MD_UIA_WIDE_ITEMS;
+}
+
+/* The item-count message for a Win32 control whose UIA proxy exposes one
+ * element per item, or 0. Matches exact class names (and their WinForms
+ * wrappers, "WindowsForms10.<class>.app...") so that no private message is
+ * ever sent to an unrelated window class. */
+static UINT uia_item_count_msg(HWND h) {
+    wchar_t cls[128];
+    if (GetClassNameW(h, cls, 128) <= 0) return 0;
+    static const wchar_t winforms[] = L"WindowsForms10.";
+    const size_t prefix = sizeof(winforms) / sizeof(winforms[0]) - 1;
+    const wchar_t *base = cls;
+    if (_wcsnicmp(cls, winforms, prefix) == 0) {
+        base = cls + prefix;
+        if (wchar_t *dot = wcschr(cls + prefix, L'.')) *dot = L'\0';
+    }
+    if (_wcsicmp(base, L"ListBox") == 0 || _wcsicmp(base, L"ComboLBox") == 0)
+        return LB_GETCOUNT;
+    if (_wcsicmp(base, L"ComboBox") == 0) return CB_GETCOUNT;
+    if (_wcsicmp(base, WC_LISTVIEWW) == 0) return LVM_GETITEMCOUNT;
+    if (_wcsicmp(base, WC_TREEVIEWW) == 0) return TVM_GETCOUNT;
+    return 0;
+}
+
+/* A hung or unreachable (UIPI) control counts as narrow: the walk then
+ * behaves as it did before md-0by. */
+static bool uia_hwnd_wide(HWND h) {
+    UINT msg = IsWindowVisible(h) ? uia_item_count_msg(h) : 0;
+    DWORD_PTR count = 0;
+    return msg && SendMessageTimeoutW(h, msg, 0, 0, SMTO_ABORTIFHUNG,
+                                      MD_UIA_WIDE_PROBE_MS, &count) &&
+        static_cast<LRESULT>(count) > uia_wide_items();
+}
+
+static BOOL CALLBACK uia_scan_descendant(HWND h, LPARAM data) {
+    auto *wide = reinterpret_cast<bool *>(data);
+    *wide = uia_hwnd_wide(h);
+    return !*wide;
+}
+
+/* Whether top-level window `h` is, or contains, a wide item container. */
+static bool uia_window_wide(HWND h) {
+    bool wide = uia_hwnd_wide(h);
+    if (!wide)
+        EnumChildWindows(h, uia_scan_descendant, reinterpret_cast<LPARAM>(&wide));
+    return wide;
+}
+
+struct UIAWideScan {
+    UIAWalk *w;
+    HWND parent;  /* nullptr: the desktop's top-level windows */
+};
+
+static BOOL CALLBACK uia_scan_top(HWND h, LPARAM data) {
+    auto *scan = reinterpret_cast<UIAWideScan *>(data);
+    /* EnumChildWindows visits all descendants; keep direct children. */
+    if (scan->parent && GetAncestor(h, GA_PARENT) != scan->parent) return TRUE;
+    if (IsWindowVisible(h) && uia_window_wide(h))
+        scan->w->wide[scan->w->wide_count++] = h;
+    return scan->w->wide_count < MD_UIA_MAX_WIDE_WINDOWS;
+}
+
+/* Fill w->wide with the windows under `parent` (nullptr: the desktop) that
+ * must be walked by bounded navigation. In-process window-manager calls plus
+ * one bounded message per matching control; no UIA round trip. */
+static void uia_scan_wide(UIAWalk *w, HWND parent) {
+    w->wide_count = 0;
+    UIAWideScan scan = { w, parent };
+    if (parent)
+        EnumChildWindows(parent, uia_scan_top, reinterpret_cast<LPARAM>(&scan));
+    else
+        EnumWindows(uia_scan_top, reinterpret_cast<LPARAM>(&scan));
+}
+
+static bool uia_is_wide(const UIAWalk *w, IUIAutomationElement *elem) {
+    UIA_HWND h = nullptr;
+    if (!w->wide_count || FAILED(elem->get_CachedNativeWindowHandle(&h)) || !h)
+        return false;
+    for (int i = 0; i < w->wide_count; i++)
+        if (w->wide[i] == static_cast<HWND>(h)) return true;
+    return false;
 }
 
 /* Format a UIA RuntimeId (VT_I4 SAFEARRAY) as "u:2a.101b0.4". */
@@ -462,9 +593,82 @@ static void set_runtime_id(MdA11yNode *node, SAFEARRAY *rid) {
     }
 }
 
+#ifdef MD_UIA_TESTING
+/* Only the standalone harness defines this seam: fetches using these requests
+ * fail, forcing walk_top_level_step's fallback tiers. */
+static const IUIAutomationCacheRequest *uia_test_rejected[2] = { nullptr, nullptr };
+#endif
+
+static bool uia_fetch_rejected(const IUIAutomationCacheRequest *req) {
+#ifdef MD_UIA_TESTING
+    return req && (req == uia_test_rejected[0] || req == uia_test_rejected[1]);
+#else
+    (void)req;
+    return false;
+#endif
+}
+
+/* Replace *elem with a copy carrying `req`'s cache. On failure *elem is
+ * untouched and false is returned. */
+static bool uia_refresh(IUIAutomationCacheRequest *req, IUIAutomationElement **elem) {
+    IUIAutomationElement *refreshed = nullptr;
+    if (uia_fetch_rejected(req) ||
+        FAILED((*elem)->BuildUpdatedCache(req, &refreshed)) || !refreshed) {
+        SAFE_RELEASE(refreshed);
+        return false;
+    }
+    (*elem)->Release();
+    *elem = refreshed;
+    return true;
+}
+
 static MdA11yNode *walk_node(UIAState *st, const UIAWalk *w,
                              IUIAutomationElement *elem, int depth,
                              UIACached cached);
+
+/* Trim a child array allocated at the cap to what was emitted. */
+static void walk_children_trim(MdA11yNode *node) {
+    if (node->child_count == 0) {
+        free(node->children);
+        node->children = nullptr;
+    } else if (node->child_count < MD_UIA_MAX_CHILDREN) {
+        auto *exact = (MdA11yNode **)realloc(node->children,
+            (size_t)node->child_count * sizeof(MdA11yNode *));
+        if (exact) node->children = exact;
+    }
+}
+
+/* UIA_CACHED_BOUNDED: reach elem's children by navigation, each arriving
+ * with its own properties, and never navigate past the child cap. A failed
+ * first-child step leaves elem a leaf; a failed sibling step ends the list,
+ * as in the uncached walk. Returns false only on allocation failure. */
+static bool walk_children_bounded(UIAState *st, const UIAWalk *w,
+                                  IUIAutomationElement *elem, int depth,
+                                  MdA11yNode *node) {
+    IUIAutomationElement *child = nullptr;
+    HRESULT hr = w->walker->GetFirstChildElementBuildCache(elem, w->element, &child);
+    if (FAILED(hr) || !child) {
+        SAFE_RELEASE(child);
+        return true;
+    }
+    node->children = (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
+    if (!node->children) {
+        child->Release();
+        return false;
+    }
+    while (child) {
+        MdA11yNode *child_node = walk_node(st, w, child, depth + 1, UIA_CACHED_BOUNDED);
+        if (child_node) node->children[node->child_count++] = child_node;
+        if (node->child_count == MD_UIA_MAX_CHILDREN) break;
+        IUIAutomationElement *next = nullptr;
+        hr = w->walker->GetNextSiblingElementBuildCache(child, w->element, &next);
+        child->Release();
+        child = SUCCEEDED(hr) ? next : nullptr;
+    }
+    SAFE_RELEASE(child);
+    walk_children_trim(node);
+    return true;
+}
 
 /* Attach elem's cached children. In UIA_CACHED_CHILDREN mode each child is
  * refreshed with the per-level request (one round trip per node) so that its
@@ -495,16 +699,9 @@ static bool walk_children(UIAState *st, const UIAWalk *w,
         if (FAILED(kids->GetElement(i, &child)) || !child) continue;
         UIACached child_cached = UIA_CACHED_SUBTREE;
         if (cached != UIA_CACHED_SUBTREE) {
-            IUIAutomationElement *refreshed = nullptr;
-            child_cached = UIA_CACHED_ELEMENT;
             /* Children of a node at the depth cap are never emitted. */
-            if (depth + 1 < MD_UIA_MAX_DEPTH &&
-                SUCCEEDED(child->BuildUpdatedCache(w->level, &refreshed)) &&
-                refreshed) {
-                child->Release();
-                child = refreshed;
-                child_cached = UIA_CACHED_CHILDREN;
-            }
+            child_cached = depth + 1 < MD_UIA_MAX_DEPTH && uia_refresh(w->level, &child)
+                ? UIA_CACHED_CHILDREN : UIA_CACHED_ELEMENT;
         }
         MdA11yNode *child_node = walk_node(st, w, child, depth + 1, child_cached);
         child->Release();
@@ -565,7 +762,9 @@ static MdA11yNode *walk_node(UIAState *st, const UIAWalk *w,
     }
 
     if (depth < MD_UIA_MAX_DEPTH && cached != UIA_CACHED_ELEMENT &&
-        !walk_children(st, w, elem, depth, cached, node)) {
+        !(cached == UIA_CACHED_BOUNDED
+              ? walk_children_bounded(st, w, elem, depth, node)
+              : walk_children(st, w, elem, depth, cached, node))) {
         md_a11y_node_free(node);
         return nullptr;
     }
@@ -573,39 +772,31 @@ static MdA11yNode *walk_node(UIAState *st, const UIAWalk *w,
     return node;
 }
 
-#ifdef MD_UIA_TESTING
-/* Only the standalone harness defines this seam: fetches using these requests
- * fail, forcing walk_top_level_step's fallback tiers. */
-static const IUIAutomationCacheRequest *uia_test_rejected[2] = { nullptr, nullptr };
-#endif
-
-static bool uia_fetch_rejected(const IUIAutomationCacheRequest *req) {
-#ifdef MD_UIA_TESTING
-    return req && (req == uia_test_rejected[0] || req == uia_test_rejected[1]);
-#else
-    (void)req;
-    return false;
-#endif
-}
-
-/* Navigate to a top-level sibling (or first child when `first`) of `from`,
- * prefetching its whole subtree in the same round trip. If that fails, the
- * fetch rather than the navigation may be at fault: navigate again with only
- * the element's properties, then try a per-level refresh (leaving the window
- * a leaf if even that fails). Only a failed element-only navigation ends
- * enumeration, as a failed uncached GetNextSiblingElement did. */
-static HRESULT walk_top_level_step(IUIAutomationTreeWalker *walker,
-                                   const UIAWalk *w, IUIAutomationElement *from,
+/* Navigate to a top-level sibling (or first child when `first`) of `from`.
+ * With no wide window on screen, the navigation prefetches the whole subtree
+ * in the same round trip. If that fails, the fetch rather than the
+ * navigation may be at fault: navigate again with only the element's
+ * properties, then try a per-level refresh (leaving the window a leaf if
+ * even that fails). With a wide window on screen, every window is navigated
+ * element-only first: a wide one is walked by bounded navigation, any other
+ * is refreshed with the subtree request, then the per-level one. Only a
+ * failed element-only navigation ends enumeration, as a failed uncached
+ * GetNextSiblingElement did. */
+static HRESULT walk_top_level_step(const UIAWalk *w, IUIAutomationElement *from,
                                    bool first, IUIAutomationElement **out,
                                    UIACached *cached) {
+    IUIAutomationTreeWalker *walker = w->walker;
     *out = nullptr;
-    *cached = UIA_CACHED_SUBTREE;
-    HRESULT hr = uia_fetch_rejected(w->subtree) ? E_FAIL : first
-        ? walker->GetFirstChildElementBuildCache(from, w->subtree, out)
-        : walker->GetNextSiblingElementBuildCache(from, w->subtree, out);
-    if (SUCCEEDED(hr)) return hr;
+    HRESULT hr;
+    if (!w->wide_count) {
+        *cached = UIA_CACHED_SUBTREE;
+        hr = uia_fetch_rejected(w->subtree) ? E_FAIL : first
+            ? walker->GetFirstChildElementBuildCache(from, w->subtree, out)
+            : walker->GetNextSiblingElementBuildCache(from, w->subtree, out);
+        if (SUCCEEDED(hr)) return hr;
+        SAFE_RELEASE(*out);
+    }
 
-    SAFE_RELEASE(*out);
     *cached = UIA_CACHED_ELEMENT;
     hr = first
         ? walker->GetFirstChildElementBuildCache(from, w->element, out)
@@ -614,13 +805,18 @@ static HRESULT walk_top_level_step(IUIAutomationTreeWalker *walker,
         SAFE_RELEASE(*out);
         return hr;
     }
-    IUIAutomationElement *refreshed = nullptr;
-    if (*out && !uia_fetch_rejected(w->level) &&
-        SUCCEEDED((*out)->BuildUpdatedCache(w->level, &refreshed)) && refreshed) {
-        (*out)->Release();
-        *out = refreshed;
-        *cached = UIA_CACHED_CHILDREN;
+    if (!*out) return hr;
+    if (w->wide_count) {
+        if (uia_is_wide(w, *out)) {
+            *cached = UIA_CACHED_BOUNDED;
+            return hr;
+        }
+        if (uia_refresh(w->subtree, out)) {
+            *cached = UIA_CACHED_SUBTREE;
+            return hr;
+        }
     }
+    if (uia_refresh(w->level, out)) *cached = UIA_CACHED_CHILDREN;
     return hr;
 }
 
@@ -714,13 +910,14 @@ static int uia_init(MdA11yCtx *ctx) {
 }
 
 /* Attach the walker children of `parent` (the desktop root in production) to
- * `node` as depth-`depth` nodes. Returns false only on allocation failure. */
-static bool walk_top_level(UIAState *st, IUIAutomationTreeWalker *walker,
-                           const UIAWalk *w, IUIAutomationElement *parent,
-                           int depth, MdA11yNode *node) {
+ * `node` as depth-`depth` nodes. `parent_hwnd` is parent's window, or
+ * nullptr for the desktop. Returns false only on allocation failure. */
+static bool walk_top_level(UIAState *st, UIAWalk *w, IUIAutomationElement *parent,
+                           HWND parent_hwnd, int depth, MdA11yNode *node) {
+    uia_scan_wide(w, parent_hwnd);
     IUIAutomationElement *child = nullptr;
     UIACached cached = UIA_CACHED_SUBTREE;
-    HRESULT hr = walk_top_level_step(walker, w, parent, true, &child, &cached);
+    HRESULT hr = walk_top_level_step(w, parent, true, &child, &cached);
     if (FAILED(hr) || !child) {
         SAFE_RELEASE(child);
         return true;
@@ -744,7 +941,7 @@ static bool walk_top_level(UIAState *st, IUIAutomationTreeWalker *walker,
          * to drop it. */
         if (childCount == MD_UIA_MAX_CHILDREN) break;
         IUIAutomationElement *next = nullptr;
-        hr = walk_top_level_step(walker, w, child, false, &next, &cached);
+        hr = walk_top_level_step(w, child, false, &next, &cached);
         child->Release();
         child = (SUCCEEDED(hr)) ? next : nullptr;
     }
@@ -781,7 +978,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     if (FAILED(hr) || !rootElem) return -1;
 
     UIAWalk w;
-    if (FAILED(uia_walk_begin(automation, &w))) {
+    if (FAILED(uia_walk_begin(automation, walker, &w))) {
         rootElem->Release();
         return -1;
     }
@@ -799,7 +996,7 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     root->label = _strdup("Desktop");
 
     /* Walk top-level children (application windows) */
-    bool ok = walk_top_level(st, walker, &w, rootElem, 1, root);
+    bool ok = walk_top_level(st, &w, rootElem, nullptr, 1, root);
     rootElem->Release();
     uia_walk_end(&w);
     if (!ok) {

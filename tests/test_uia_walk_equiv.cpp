@@ -17,8 +17,13 @@
  * The fixture is a Win32 window owned by a helper thread: buttons (one
  * disabled), a checkbox, an edit, a label, a 300-item list box (exercises the
  * MD_UIA_MAX_CHILDREN cap) and a chain of nested windows deeper than
- * MD_UIA_MAX_DEPTH (exercises the depth cap). Both the subtree-cache path and
- * the per-level fallback path are compared against the reference.
+ * MD_UIA_MAX_DEPTH (exercises the depth cap). The subtree-cache path, the
+ * per-level fallback path and the bounded-navigation path used for windows
+ * holding wide Win32 lists (md-0by) are all compared against the reference.
+ *
+ * Width measurements (md-0by): build with -DFIXTURE_LIST_ITEMS=5000 for a
+ * wide list box, and/or -DFIXTURE_VLIST_ITEMS=100000 to add a virtual
+ * (LVS_OWNERDATA) list view. Both then take the production bounded path.
  */
 #define MD_UIA_TESTING 1
 #include "../src/core/a11y_uia.cpp"
@@ -26,6 +31,13 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+#ifndef FIXTURE_VLIST_ITEMS /* >0 adds a virtual list view with this many items */
+#define FIXTURE_VLIST_ITEMS 0
+#endif
+#ifndef FIXTURE_TIMING_RUNS /* lower it for very wide fixtures */
+#define FIXTURE_TIMING_RUNS 5
+#endif
 
 #define CHECK(expr) do { if (!(expr)) { \
     fprintf(stderr, "FAIL %s:%d: %s (winerr=%lu)\n", __FILE__, __LINE__, #expr, GetLastError()); \
@@ -295,6 +307,12 @@ struct Fixture {
 
 static LRESULT CALLBACK fixture_proc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (msg == WM_NOTIFY && reinterpret_cast<NMHDR *>(lp)->code == LVN_GETDISPINFOW) {
+        auto *info = reinterpret_cast<NMLVDISPINFOW *>(lp);
+        if (info->item.mask & LVIF_TEXT)
+            swprintf(info->item.pszText, info->item.cchTextMax, L"v%d", info->item.iItem);
+        return 0;
+    }
     return DefWindowProcW(window, msg, wp, lp);
 }
 
@@ -332,6 +350,13 @@ static DWORD WINAPI fixture_thread(LPVOID data) {
         swprintf(item, 32, L"item %d", i);
         SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
     }
+#if FIXTURE_VLIST_ITEMS > 0 /* link -lcomctl32 */
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
+    CHECK(InitCommonControlsEx(&icc));
+    HWND vlist = child(WC_LISTVIEWW, nullptr, WS_BORDER | LVS_LIST | LVS_OWNERDATA,
+                       10, 514, 690, 40, top);
+    SendMessageW(vlist, LVM_SETITEMCOUNT, FIXTURE_VLIST_ITEMS, 0);
+#endif
     HWND parent = top;
     for (int level = 0; level < FIXTURE_NEST_LEVELS; level++) {
         wchar_t name[32];
@@ -358,13 +383,15 @@ static DWORD WINAPI fixture_thread(LPVOID data) {
 }
 
 /* Cached walk of one element, through the same walk_node() production uses
- * for a top-level window, from either the subtree or the per-level cache. */
+ * for a top-level window, from the subtree or the per-level cache, or by
+ * bounded navigation from an element-only fetch. */
 static MdA11yNode *cached_walk(UIAState *st, IUIAutomationElement *elem, UIACached mode) {
     UIAWalk w;
-    CHECK(SUCCEEDED(uia_walk_begin(st->automation, &w)));
+    CHECK(SUCCEEDED(uia_walk_begin(st->automation, st->walker, &w)));
     IUIAutomationElement *cached = nullptr;
     CHECK(SUCCEEDED(elem->BuildUpdatedCache(
-        mode == UIA_CACHED_SUBTREE ? w.subtree : w.level, &cached)) && cached);
+        mode == UIA_CACHED_SUBTREE ? w.subtree :
+        mode == UIA_CACHED_CHILDREN ? w.level : w.element, &cached)) && cached);
     st->next_id = 0;
     MdA11yNode *node = walk_node(st, &w, cached, 1, mode);
     cached->Release();
@@ -382,12 +409,21 @@ static MdA11yNode *ref_walk(UIAState *st, IUIAutomationElement *elem) {
 
 /* Production walk_top_level() over `parent`'s children at depth 2, numbered
  * as if `parent` were node n0 at depth 1 (matching ref_walk(parent)). */
-static MdA11yNode *top_level_walk(UIAState *st, const UIAWalk *w, IUIAutomationElement *parent) {
+static MdA11yNode *top_level_walk(UIAState *st, UIAWalk *w, IUIAutomationElement *parent,
+                                  HWND parent_hwnd) {
     MdA11yNode *holder = (MdA11yNode *)calloc(1, sizeof(MdA11yNode));
     CHECK(holder);
     st->next_id = 1;
-    CHECK(walk_top_level(st, st->walker, w, parent, 2, holder));
+    CHECK(walk_top_level(st, w, parent, parent_hwnd, 2, holder));
     return holder;
+}
+
+/* What production does for one top-level window: bounded navigation if it
+ * holds a wide Win32 list, else one subtree fetch. */
+static MdA11yNode *production_window_walk(UIAState *st, IUIAutomationElement *elem,
+                                          HWND hwnd, bool *wide) {
+    *wide = uia_window_wide(hwnd);
+    return cached_walk(st, elem, *wide ? UIA_CACHED_BOUNDED : UIA_CACHED_SUBTREE);
 }
 
 static void check_children(const MdA11yNode *ref, const MdA11yNode *got, const char *cell) {
@@ -403,36 +439,61 @@ static void check_children(const MdA11yNode *ref, const MdA11yNode *got, const c
 
 /* The enumeration/fallback tiers of walk_top_level_step(), and its child-cap
  * break, driven against fixture elements standing in for the desktop root. */
-static void test_top_level_paths(UIAState *st, IUIAutomationElement *window,
-                                 IUIAutomationElement *list, const MdA11yNode *ref) {
+static void test_top_level_paths(UIAState *st, IUIAutomationElement *window, HWND window_hwnd,
+                                 IUIAutomationElement *list, HWND list_hwnd,
+                                 const MdA11yNode *ref) {
     UIAWalk w;
-    CHECK(SUCCEEDED(uia_walk_begin(st->automation, &w)));
-    MdA11yNode *got = top_level_walk(st, &w, window);
-    check_children(ref, got, "top-level subtree tier == uncached");
+    CHECK(SUCCEEDED(uia_walk_begin(st->automation, st->walker, &w)));
+    /* The list box and the virtual list view are direct fixture children,
+     * i.e. top-level windows here. */
+    const int natural_wide = (FIXTURE_LIST_ITEMS > MD_UIA_WIDE_ITEMS) +
+                             (FIXTURE_VLIST_ITEMS > MD_UIA_WIDE_ITEMS);
+    MdA11yNode *got = top_level_walk(st, &w, window, window_hwnd);
+    CHECK(w.wide_count == natural_wide);
+    check_children(ref, got, natural_wide
+        ? "top-level two-step tier (wide list bounded) == uncached"
+        : "top-level subtree tier == uncached");
+    md_a11y_node_free(got);
+
+    /* Force the 300-item list box over the wide threshold: the scan must find
+     * it, the list must be walked by bounded navigation and every other window
+     * navigated element-only then refreshed with the subtree request. */
+    uia_test_wide_items = MD_UIA_MAX_CHILDREN / 2;
+    got = top_level_walk(st, &w, window, window_hwnd);
+    CHECK(std::count(w.wide, w.wide + w.wide_count, list_hwnd) == 1);
+    check_children(ref, got, "top-level two-step tier, forced wide list (bounded) == uncached");
     md_a11y_node_free(got);
 
     uia_test_rejected[0] = w.subtree;
-    got = top_level_walk(st, &w, window);
+    got = top_level_walk(st, &w, window, window_hwnd);
+    check_children(ref, got, "two-step tier, subtree refresh rejected -> per-level walk == uncached");
+    md_a11y_node_free(got);
+    uia_test_wide_items = 0;
+
+    got = top_level_walk(st, &w, window, window_hwnd);
     check_children(ref, got, "subtree fetch rejected -> element nav + per-level walk == uncached");
     md_a11y_node_free(got);
 
     uia_test_rejected[1] = w.level;
-    got = top_level_walk(st, &w, window);
+    got = top_level_walk(st, &w, window, window_hwnd);
     /* Every fetch beyond the element fails: enumeration must still reach every
-     * window, each emitted as a leaf with its own properties. */
+     * window, each emitted as a leaf with its own properties. A wide window is
+     * still walked in full: navigation needs no fetch. */
     CHECK(got->child_count == ref->child_count);
     std::string why;
+    int bounded = 0;
     for (int i = 0; i < ref->child_count; i++) {
-        CHECK(got->children[i]->child_count == 0);
         MdA11yNode leaf = *ref->children[i];
-        leaf.child_count = 0;
+        if (got->children[i]->child_count) bounded++;
+        else leaf.child_count = 0;
         if (!same_node(&leaf, got->children[i], leaf.id, why)) {
             fprintf(stderr, "leaf fallback: %s\n", why.c_str());
             CHECK(false);
         }
     }
-    printf("PASS fixture: subtree and per-level fetch rejected -> enumeration continues (%d leaves)\n",
-           got->child_count);
+    CHECK(bounded == w.wide_count);
+    printf("PASS fixture: subtree and per-level fetch rejected -> enumeration continues "
+           "(%d leaves, %d bounded)\n", got->child_count - bounded, bounded);
     md_a11y_node_free(got);
     uia_test_rejected[0] = uia_test_rejected[1] = nullptr;
 
@@ -440,7 +501,7 @@ static void test_top_level_paths(UIAState *st, IUIAutomationElement *window,
      * yield exactly the first MD_UIA_MAX_CHILDREN uncached children. */
     MdA11yNode *list_ref = ref_walk(st, list);
     CHECK(list_ref->child_count == MD_UIA_MAX_CHILDREN);
-    got = top_level_walk(st, &w, list);
+    got = top_level_walk(st, &w, list, list_hwnd);
     check_children(list_ref, got, "top-level child cap == uncached");
     md_a11y_node_free(got);
     md_a11y_node_free(list_ref);
@@ -456,6 +517,8 @@ static void report_timing(const char *cell, int nodes,
            cm, *std::min_element(cached.begin(), cached.end()), cm / nodes, rm / cm);
 }
 
+static void test_desktop(MdA11yCtx *ctx, UIAState *st, const char *cell);
+
 static void close_fixture(Fixture *fx, HANDLE thread) {
     PostMessageW(fx->window, WM_CLOSE, 0, 0);
     CHECK(WaitForSingleObject(thread, 30000) == WAIT_OBJECT_0);
@@ -463,7 +526,7 @@ static void close_fixture(Fixture *fx, HANDLE thread) {
     CloseHandle(fx->ready);
 }
 
-static void test_fixture(UIAState *st, bool interactive) {
+static void test_fixture(MdA11yCtx *ctx, UIAState *st, bool interactive) {
     Fixture fx = {};
     fx.ready = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     CHECK(fx.ready);
@@ -507,37 +570,53 @@ static void test_fixture(UIAState *st, bool interactive) {
     MdA11yNode *lvl = cached_walk(st, elem, UIA_CACHED_CHILDREN);
     if (!same_tree(ref, lvl, why)) { fprintf(stderr, "per-level cache: %s\n", why.c_str()); CHECK(false); }
     puts("PASS fixture: per-level fallback walk == uncached walk");
+    MdA11yNode *bnd = cached_walk(st, elem, UIA_CACHED_BOUNDED);
+    if (!same_tree(ref, bnd, why)) { fprintf(stderr, "bounded navigation: %s\n", why.c_str()); CHECK(false); }
+    puts("PASS fixture: bounded-navigation walk == uncached walk");
     md_a11y_node_free(sub);
     md_a11y_node_free(lvl);
+    md_a11y_node_free(bnd);
 
     IUIAutomationElement *list_elem = nullptr;
     CHECK(SUCCEEDED(st->automation->ElementFromHandle(fx.list, &list_elem)) && list_elem);
-    test_top_level_paths(st, elem, list_elem, ref);
+    test_top_level_paths(st, elem, fx.window, list_elem, fx.list, ref);
     list_elem->Release();
 
-    std::vector<double> tr, tc;
-    for (int i = 0; i < 5; i++) {
+    /* The fixture as production would walk it as a top-level window, versus
+     * the md-cw8 subtree-only fetch (the md-0by regression when wide). */
+    std::vector<double> tr, tp, ts;
+    bool wide = false;
+    for (int i = 0; i < FIXTURE_TIMING_RUNS; i++) {
         double t0 = now_ms();
         MdA11yNode *r = ref_walk(st, elem);
         double t1 = now_ms();
-        MdA11yNode *c = cached_walk(st, elem, UIA_CACHED_SUBTREE);
+        MdA11yNode *p = production_window_walk(st, elem, fx.window, &wide);
         double t2 = now_ms();
-        CHECK(same_tree(ref, c, why));
+        MdA11yNode *s = cached_walk(st, elem, UIA_CACHED_SUBTREE);
+        double t3 = now_ms();
+        CHECK(same_tree(ref, p, why) && same_tree(ref, s, why));
         tr.push_back(t1 - t0);
-        tc.push_back(t2 - t1);
+        tp.push_back(t2 - t1);
+        ts.push_back(t3 - t2);
         md_a11y_node_free(r);
-        md_a11y_node_free(c);
+        md_a11y_node_free(p);
+        md_a11y_node_free(s);
     }
-    report_timing("fixture", nodes, tr, tc);
+    printf("fixture production path: %s (list box %d items, virtual list view %d items)\n",
+           wide ? "bounded navigation" : "subtree fetch", FIXTURE_LIST_ITEMS, FIXTURE_VLIST_ITEMS);
+    report_timing("fixture production", nodes, tr, tp);
+    report_timing("fixture subtree-only (md-cw8)", nodes, tr, ts);
     md_a11y_node_free(ref);
     elem->Release();
+    /* With a wide list on screen the whole desktop takes the two-step path. */
+    if (interactive && wide) test_desktop(ctx, st, "desktop+wide fixture");
     close_fixture(&fx, thread);
 }
 
 /* The real desktop changes underneath us (clock text, focus), so pair each
  * cached walk with an uncached one taken back to back and allow a few retries
  * before declaring a mismatch. */
-static void test_desktop(MdA11yCtx *ctx, UIAState *st) {
+static void test_desktop(MdA11yCtx *ctx, UIAState *st, const char *cell) {
     CHECK(md_a11y_is_connected(ctx));
     std::string why;
     bool matched = false;
@@ -548,11 +627,11 @@ static void test_desktop(MdA11yCtx *ctx, UIAState *st) {
         uint64_t hash = 0;
         matched = same_tree(ref, cached, why, &hash);
         if (matched)
-            printf("PASS desktop: production cached walk == uncached walk "
+            printf("PASS %s: production cached walk == uncached walk "
                    "(%d nodes, %d top-level, json fnv1a %016llx, attempt %d)\n",
-                   count_nodes(ref), ref->child_count, (unsigned long long)hash, attempt);
+                   cell, count_nodes(ref), ref->child_count, (unsigned long long)hash, attempt);
         else
-            printf("desktop attempt %d differs: %s\n", attempt, why.c_str());
+            printf("%s attempt %d differs: %s\n", cell, attempt, why.c_str());
         md_a11y_node_free(ref);
         md_a11y_node_free(cached);
     }
@@ -573,7 +652,18 @@ static void test_desktop(MdA11yCtx *ctx, UIAState *st) {
         md_a11y_node_free(r);
         md_a11y_node_free(c);
     }
-    report_timing("desktop", nodes, tr, tc);
+    report_timing(cell, nodes, tr, tc);
+
+    /* The md-0by wide-list scan runs on every production walk. */
+    std::vector<double> scan;
+    UIAWalk w = {};
+    for (int i = 0; i < 7; i++) {
+        double t0 = now_ms();
+        uia_scan_wide(&w, nullptr);
+        scan.push_back(now_ms() - t0);
+    }
+    printf("TIMING %s wide-list scan: median %.3f ms (max %.3f), %d wide top-level windows\n",
+           cell, median(scan), *std::max_element(scan.begin(), scan.end()), w.wide_count);
     CHECK(md_a11y_is_connected(ctx));
 }
 
@@ -585,8 +675,8 @@ int main(int argc, char **argv) {
     CHECK(ctx);
     auto *st = static_cast<UIAState *>(ctx->backend_data);
     printf("session=%lu connected=%d\n", st->session_id, md_a11y_is_connected(ctx));
-    test_fixture(st, interactive);
-    if (interactive) test_desktop(ctx, st);
+    test_fixture(ctx, st, interactive);
+    if (interactive) test_desktop(ctx, st, "desktop");
     else puts("SKIP desktop: session 0 backend is disconnected by design (md-yre)");
     md_a11y_destroy(ctx);
     puts("ALL UIA WALK EQUIVALENCE TESTS PASSED");
