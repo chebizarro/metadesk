@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """md-ah9.11 container client qualification (rootless Podman); see client-validation.md.
 Updated by md-rk4 (no stdbuf: both binaries line-buffer stdout) and md-33e (GUI
-mode without a granted display must refuse before any signer or session work).
+mode without a granted display must refuse before any signer or session work),
+md-cdz (one retaining relay for every cell; repeat negotiations must succeed)
+and md-rnc (GUI renderer choice is logged; no libopengl0 needed).
 
-Each cell starts a fresh Tier B Sway/xdpw host container (it captures only its
-own isolated output; the host has a single startup negotiation) and a client
-container. Negotiation is real: NIP-17 session DMs over a private relay, the
+Every negotiation starts a fresh Tier B Sway/xdpw host container (it captures
+only its own isolated output; the host has a single startup negotiation) and a
+client container. All of them share one private relay that retains history, so
+every later host sees earlier requests and every later client sees earlier
+acceptances (md-6ns correlation must ignore them). Negotiation is real: NIP-17 session DMs over a private relay, the
 host role's NIP-51 allowlist with a v1 video grant (published by `access` with
 a NIP-5F host account), explicit `--bunker` NIP-46 signers holding throwaway
 keys at runtime, and the one-use stream binding. The FIPS control endpoint is a
@@ -13,7 +17,7 @@ fixture and TCP crosses a TUN-less IPv6 container bridge to the host's
 npub-derived address. This is not a FIPS daemon or encrypted-transport receipt.
 
 Cells: decode-only (headless) with stranger and legacy direct-IP negatives;
-GUI into a private Sway display (authorized socket) and GUI without a granted
+repeat (two more back-to-back headless negotiations on the same relay); GUI into a private Sway display (authorized socket) and GUI without a granted
 display (fail-closed refusal). Never mounts a host display, session bus or
 runtime directory.
 """
@@ -101,6 +105,7 @@ class Run:
         self.net = a.prefix + "-net"
         self.relay = f"ws://{FIXTURE_IP}:7777"
         self.fixture, self.counters, self.npub_clients = None, {}, 0
+        self.sessions = []  # negotiations completed on this relay, oldest first
 
     def retire_fixture(self):
         name, self.fixture = self.fixture, None
@@ -114,13 +119,9 @@ class Run:
         check(f"{name}: each --npub client queried FIPS peer readiness", peers >= self.npub_clients,
               f"show_peers={peers}, npub clients={self.npub_clients}")
 
-    def fresh_relay(self, cell, first=False):
-        """Each cell gets an empty relay. Retained history would replay an earlier
-        negotiation's session_accept to the client (see client-validation.md).
-        Raises Incomplete (after recording the failure) if setup fails."""
-        if self.fixture:
-            self.retire_fixture()
-        self.npub_clients = 0
+    def start_fixture(self):
+        """One relay for the whole run; it keeps every event (md-cdz). Raises
+        Incomplete (after recording the failure) if setup fails."""
         for f in self.w.glob("sock/*/*"):
             if f.name in ("signer.sock", "control.sock", "bunker.uri"):
                 f.unlink()
@@ -135,20 +136,20 @@ class Run:
                "--local-npub", ids["client"]["npub"], "--peer-npub", ids["host"]["npub"],
                "--signer=host=/fixture/keys/host.key", "--bunker-bin", "/fixture/nip46-bunker",
                *[f"--bunker={r}=/fixture/keys/{r}.key" for r in ("host", "client", "stranger")]]
-        self.fixture, logs = self.start(f"fixture-{cell}", args, self.a.video_image, cmd)
-        if not check(f"{cell}: fresh private relay, bunkers and control listening",
+        self.fixture, logs = self.start("fixture", args, self.a.video_image, cmd)
+        if not check("fixture: private retaining relay, bunkers and control listening",
                      bool(logs.wait(r"^fixture ready$", 30))):
             raise Incomplete
         # Host role + allowlist via Metadesk commands; bind-role verifies the live signer owner.
         hpk, cpk, cnpub = ids["host"]["pubkey"], ids["client"]["pubkey"], ids["client"]["npub"]
-        steps = [("account", "add", "nip5f", hpk, "container host"),
-                 ("account", "bind-role", "host", "nip5f", hpk)] if first else []
-        for args in [*steps, ("access", "--relay", self.relay, "add", cnpub, "video")]:
+        for args in [("account", "add", "nip5f", hpk, "container host"),
+                     ("account", "bind-role", "host", "nip5f", hpk),
+                     ("access", "--relay", self.relay, "add", cnpub, "video")]:
             r = self.account(*args)
-            if not check(f"{cell}: host {' '.join(args[:2])}", r.returncode == 0, r.stderr.strip()[-120:]):
+            if not check(f"fixture: host {' '.join(args[:2])}", r.returncode == 0, r.stderr.strip()[-120:]):
                 raise Incomplete
         listed = self.account("access", "--relay", self.relay, "list")
-        if not check(f"{cell}: allowlist is exactly client=video", listed.stdout.strip() == f"{cpk}\tvideo",
+        if not check("fixture: allowlist is exactly client=video", listed.stdout.strip() == f"{cpk}\tvideo",
                      listed.stdout.strip().replace(cpk, "<client>")):
             raise Incomplete
 
@@ -238,6 +239,33 @@ class Run:
                   shown > 0 if display_expected else shown == 0, f"displayed={shown}")
         return stats
 
+    def correlated(self, cell, hlogs, clogs):
+        """md-6ns on a retaining relay: this negotiation answered only its own
+        request, and every earlier session's request (host) and acceptance
+        (client) was replayed as history and ignored."""
+        sent = clogs.wait(r"client: sending session request DM \(request_id=([0-9a-f]{8})\.\.\.\)", 5)
+        acc = clogs.wait(r"client: session accepted \(id=(\S+)\)", 5)
+        if not check(f"{cell}: client request_id and session id logged", bool(sent and acc)):
+            return
+        rid, sid, prior = sent[1], acc[1], list(self.sessions)
+        self.sessions.append({"cell": cell, "request_id": rid, "session_id": sid})
+        if not prior:
+            return
+        cpk8 = self.ids["client"]["pubkey"][:8]
+        want = [s["request_id"] for s in prior]
+        host_seen = [m for r in want if (m := hlogs.wait(
+            rf"host: ignoring session request from relay history \({cpk8}\.\.\., request_id={r}\)", 5))]
+        cli_seen = [m for r in want if (m := clogs.wait(
+            rf"client: ignoring session_accept not answering the current request \(request_id={r}\.\.\., history\)", 5))]
+        check(f"{cell}: host ignored all {len(want)} earlier requests as relay history",
+              len(host_seen) == len(want) and not hlogs.has(rf"request_id={rid}\)")
+              and not hlogs.has(r"REJECTED session request"),
+              f"history request_ids {want}; answered {rid}")
+        check(f"{cell}: client ignored all {len(want)} earlier acceptances as history",
+              len(cli_seen) == len(want) and not clogs.has(rf"ignoring session_accept .*request_id={rid}")
+              and sid not in {s["session_id"] for s in prior},
+              f"history request_ids {want}; accepted {rid}, new session id")
+
     def host_media(self, cell, logs):
         cap = logs.wait(r"host: capture started \((\d+)x(\d+)\)", 30)
         enc = logs.wait(r"host: encoder ready \((\w+), (\d+)x(\d+)\)", 30)
@@ -299,8 +327,9 @@ def main():
         podman("network", "create", "--ipv6", "--subnet", SUBNET4, "--subnet", str(net6), run.net)
         net_created = True
 
+        run.start_fixture()
+
         # ── Cell 1: decode-only (headless) ──────────────────────────────────
-        run.fresh_relay("decode", first=True)
         host, hlogs = run.host("decode")
         stranger, slogs = run.client("stranger", "stranger", a.decode_image, [],
                                      [*run.npub_args(5000), "--no-display"])
@@ -312,6 +341,7 @@ def main():
         dec, dlogs = run.client("decode", "client", a.decode_image, [], [*run.npub_args(), "--no-display"])
         run.host_media("decode", hlogs)
         run.stream("decode", dlogs, display_expected=False)
+        run.correlated("decode", hlogs, dlogs)
         size = dlogs.wait(r"client: decoded frame size (\d+)x(\d+)", 5)
         check("decode: client logged decoded frame size", bool(size), size[0] if size else "")
         try:
@@ -340,7 +370,18 @@ def main():
               f"legacy: {summary[0] if summary else 'no summary'}, exit={lcode}")
         run.finish_host("decode", host)
 
-        # ── Cell 2: GUI, display authorization ──────────────────────────────
+        # ── Cell 2: repeat negotiations on the same retaining relay (md-cdz) ─
+        # Each is a new host and client process pair; history only grows.
+        for cell in ("repeat-1", "repeat-2"):
+            host, hlogs = run.host(cell)
+            cli, rlogs = run.client(cell, "client", a.decode_image, [], [*run.npub_args(), "--no-display"])
+            run.host_media(cell, hlogs)
+            run.stream(cell, rlogs, display_expected=False)
+            run.correlated(cell, hlogs, rlogs)
+            run.finish_client(cell, cli, display_expected=False)
+            run.finish_host(cell, host)
+
+        # ── Cell 3: GUI, display authorization ──────────────────────────────
         display, xlogs = run.start("display", ["--network", "none", *SANDBOX, "--memory", "384m",
                                                "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
                                                "-v", f"{w}/run-display:/run/metadesk:rw",
@@ -351,7 +392,6 @@ def main():
                      bool(xlogs.wait(r"AvailableSourceTypes", 60))):
             raise Incomplete
         sock = (w / "run-display/session.env").read_text().split("WAYLAND_DISPLAY=")[1].split()[0]
-        run.fresh_relay("gui")
         host, hlogs = run.host("gui")
         gui, glogs = run.client("gui", "client", a.gui_image,
                                 ["-v", f"{w}/run-display/{sock}:/run/user/1000/{sock}:rw",
@@ -359,12 +399,27 @@ def main():
                                  "-e", "LIBGL_ALWAYS_SOFTWARE=1"], run.npub_args())
         run.host_media("gui", hlogs)
         run.stream("gui", glogs, display_expected=True)
+        run.correlated("gui", hlogs, glogs)
         check("gui: client logged wayland video driver, SDL renderer and frame size",
               glogs.has(r"client: receiving stream") and glogs.has(r"^render: SDL video driver 'wayland'$")
               and glogs.has(r"^render: SDL renderer '\w+'") and glogs.has(r"client: decoded frame size \d+x\d+")
               and not glogs.has(r"render: SDL_(Init|CreateWindow|CreateRenderer) failed|no visible output"),
               "; ".join(line for line in glogs.lines
                         if line.startswith("render:") or "frame size" in line)[:240])
+        # md-rnc: SDL's opengl renderer needs a desktop GL library; without one
+        # it is skipped (not tried: it would segfault) and GLES2 is chosen.
+        # GLES2 itself (libGLESv2 + libEGL are in the image) is never skipped.
+        gl = podman("run", "--rm", "--entrypoint", "sh", a.gui_image, "-c",
+                    "ldconfig -p | grep -oE '(libGL\\.so\\.1|libOpenGL\\.so\\.0) ' | sort -u | tr -d '\\n'",
+                    check_rc=False).stdout.strip()
+        chosen = glogs.wait(r"^render: SDL renderer '(\w+)' \((accelerated|software)\)$", 0)
+        skipped = glogs.has(r"^render: skipping SDL renderer 'opengl': cannot load libGL\.so\.1 or libOpenGL\.so\.0$")
+        want = "opengl" if gl else "opengles2"
+        check(f"gui: accelerated '{want}' renderer chosen for this GL stack (md-rnc)",
+              bool(chosen) and chosen[1] == want and chosen[2] == "accelerated" and skipped == (not gl)
+              and not glogs.has(r"^render: SDL renderer '\w+' failed|skipping SDL renderer 'opengles2'"),
+              f"desktop GL in image: [{gl or 'none'}]; opengl skipped={skipped}; "
+              f"{chosen[0] if chosen else 'no renderer line'}")
         tree = json.loads(podman("exec", display, "sh", "-c",
                                  ". /run/metadesk/session.env; swaymsg -t get_tree").stdout)
         def views(node):
@@ -388,10 +443,13 @@ def main():
                 ("gui-strict", ["-e", "SDL_VIDEODRIVER=wayland"], r"render: SDL_Init failed: .*")):
             name, logs = run.client(cell, "client", a.gui_image, extra, run.npub_args(), negotiates=False)
             code = int(podman("wait", name, timeout=60).stdout.strip() or -1)
+            # The refusal is the client's last line, and `logs -f` can deliver it
+            # seconds after the container exits: wait for it, then drain to EOF.
+            refused = logs.wait(r"ERROR: no usable display for the GUI client", 30)
             logs.wait(r"$^", 5)  # drain: returns once `logs -f` reaches EOF
             why = logs.wait(refusal, 0)
             check(f"{cell}: no display granted -> GUI refused, exit 1",
-                  code == 1 and bool(why) and logs.has(r"ERROR: no usable display for the GUI client"),
+                  code == 1 and bool(why) and bool(refused),
                   f"exit={code}; {why[0] if why else 'no refusal reason'}")
             check(f"{cell}: refused before signer, relay or session work",
                   not logs.has(r"NIP-46 bunker|signer ready|session request|connecting|"
