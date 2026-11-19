@@ -723,6 +723,7 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
                 n->acl_created_at = created;
                 memcpy(n->acl_id, canon, sizeof(n->acl_id));
                 n->acl_version++;
+                pthread_cond_broadcast(&n->allowlist_cv);
             }
             pthread_mutex_unlock(&n->allowlist_mu);
             nostr_nip51_list_free(list);
@@ -1455,6 +1456,7 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
                 n->acl_created_at = nostr_event_get_created_at(signed_ev);
                 memcpy(n->acl_id, id, 65);
                 n->acl_version++;
+                pthread_cond_broadcast(&n->allowlist_cv);
                 /* Only this edit can append while acl_editing is true. */
                 n->acl_unconfirmed_count--;
             } else ret = -1;
@@ -1544,6 +1546,20 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
     operation_end(n);
     if (ret) free(copy);
     else { *entries = copy; *count = used; }
+    return ret;
+}
+
+int md_nostr_allowlist_wait_change(MdNostr *n, MdNostrAclState *state,
+                                   uint64_t *version) {
+    if (!state || !version || !owns_host(n) || !operation_begin(n)) return -1;
+    pthread_mutex_lock(&n->allowlist_mu);
+    while (n->acl_state == *state && n->acl_version == *version && !is_stopped(n))
+        pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    *state = n->acl_state;
+    *version = n->acl_version;
+    pthread_mutex_unlock(&n->allowlist_mu);
+    int ret = is_stopped(n) ? -1 : 0;
+    operation_end(n);
     return ret;
 }
 

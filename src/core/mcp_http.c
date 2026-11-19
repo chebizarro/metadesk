@@ -64,7 +64,17 @@ typedef struct {
     bool ready; /* false while the handler owns the header write */
     size_t sent;
     bool failed;
+    /* Admitted only by the live authorizer: recheck before each broadcast. */
+    bool live_auth;
+    bool revoked;
+    char pubkey[65];
 } SseClient;
+
+/* Who a request authenticated as; pubkey is empty for bearer/open access. */
+typedef struct {
+    bool live_auth;
+    char pubkey[65];
+} AuthResult;
 
 struct MdMcpHttp {
     MdMcpServer    *mcp_server;
@@ -85,6 +95,8 @@ struct MdMcpHttp {
     size_t          public_url_count;
     char          (*allowed_keys)[65];
     size_t          allowed_key_count;
+    bool          (*authorize)(const char *pubkey_hex, void *userdata);
+    void           *authorize_ud;
     AuthReplay      replay[AUTH_REPLAY_CAPACITY];
     pthread_mutex_t auth_mu;
 
@@ -365,6 +377,11 @@ static bool add_npub(MdMcpHttp *h, const char *npub)
     return true;
 }
 
+static bool nip98_enabled(const MdMcpHttp *h)
+{
+    return h->allowed_key_count || h->authorize;
+}
+
 static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
 {
     if (cfg->public_url_count > AUTH_MAX_URLS ||
@@ -425,7 +442,9 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
          * a silent fallback to unauthenticated loopback service. */
         if (!valid || !h->allowed_key_count) return false;
     }
-    if (!h->token && !h->allowed_key_count) {
+    h->authorize = cfg->nip98_authorize;
+    h->authorize_ud = cfg->nip98_authorize_userdata;
+    if (!h->token && !nip98_enabled(h)) {
         if (cfg->bind_addr && !loopback_host(cfg->bind_addr)) {
             MD_LOG_E("non-loopback MCP HTTP bind requires credentials");
             return false;
@@ -453,16 +472,17 @@ static bool signed_url_allowed(MdMcpHttp *h, const char *url)
     return false;
 }
 
-static bool authenticate(MdMcpHttp *h, const HttpRequest *req)
+static bool authenticate(MdMcpHttp *h, const HttpRequest *req, AuthResult *who)
 {
+    *who = (AuthResult){0};
     if (req->bad_auth) return false;
-    if (!h->token && !h->allowed_key_count) return true;
+    if (!h->token && !nip98_enabled(h)) return true;
     if (h->token && strncasecmp(req->authorization, "Bearer ", 7) == 0) {
         const char *token = req->authorization + 7;
         return strlen(token) == strlen(h->token) &&
             CRYPTO_memcmp(token, h->token, strlen(h->token)) == 0;
     }
-    if (!h->allowed_key_count) return false;
+    if (!nip98_enabled(h)) return false;
     NostrEvent *event = NULL;
     if (nostr_nip98_parse_auth_header(req->authorization, &event) != NOSTR_NIP98_OK)
         return false;
@@ -478,10 +498,17 @@ static bool authenticate(MdMcpHttp *h, const HttpRequest *req)
     }
     if (ok) ok = nostr_nip98_validate_auth_event(event, url, req->method, &opts) == NOSTR_NIP98_OK;
     const char *pk = nostr_event_get_pubkey(event);
+    /* Union of sources: the static set first (offline, never changes), then
+     * the live authorizer, which fails closed until its history is ready. */
     bool allowed = false;
-    for (size_t i = 0; pk && i < h->allowed_key_count; i++)
+    for (size_t i = 0; ok && pk && i < h->allowed_key_count; i++)
         if (strcmp(pk, h->allowed_keys[i]) == 0) { allowed = true; break; }
+    if (ok && pk && !allowed && h->authorize && h->authorize(pk, h->authorize_ud)) {
+        allowed = true;
+        who->live_auth = true;
+    }
     ok = ok && allowed;
+    if (ok) snprintf(who->pubkey, sizeof(who->pubkey), "%s", pk);
     if (ok) {
         char *id = nostr_event_get_id(event);
         if (!id) { nostr_event_free(event); return false; }
@@ -745,9 +772,10 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         close(client_fd);
         return;
     }
+    AuthResult who = {0};
     if (strcmp(req.path, "/mcp") == 0 &&
         (strcmp(req.method, "POST") == 0 || strcmp(req.method, "GET") == 0) &&
-        !authenticate(h, &req)) {
+        !authenticate(h, &req, &who)) {
         send_http_text(h, client_fd, 401, "Unauthorized", "Unauthorized\n");
         free(req.body);
         close(client_fd);
@@ -806,7 +834,9 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         }
         /* Reserve capacity, but broadcasts skip this fd until headers finish.
          * The handler owns it while unready; shutdown must not close/reuse it. */
-        h->sse_clients[h->sse_count++] = (SseClient){ .fd = client_fd };
+        SseClient reserved = { .fd = client_fd, .live_auth = who.live_auth };
+        memcpy(reserved.pubkey, who.pubkey, sizeof(reserved.pubkey));
+        h->sse_clients[h->sse_count++] = reserved;
         pthread_mutex_unlock(&h->sse_mu);
 
         int flags = fcntl(client_fd, F_GETFL);
@@ -904,14 +934,21 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
         free(frame);
         return -1;
     }
-    int pending = 0;
+    int pending = 0, revoked = 0;
     for (int i = 0; i < http->sse_count; i++) {
         SseClient *c = &http->sse_clients[i];
         c->sent = 0;
-        c->failed = false;
-        fds[i] = (struct pollfd){ .fd = c->ready ? c->fd : -1, .events = POLLOUT };
-        if (c->ready) pending++;
+        /* A live-list grant can be revoked while the stream is open: the
+         * next notification is withheld and the stream closed. */
+        c->revoked = c->ready && c->live_auth &&
+            !(http->authorize && http->authorize(c->pubkey, http->authorize_ud));
+        c->failed = c->revoked;
+        if (c->revoked) revoked++;
+        bool deliver = c->ready && !c->failed;
+        fds[i] = (struct pollfd){ .fd = deliver ? c->fd : -1, .events = POLLOUT };
+        if (deliver) pending++;
     }
+    if (revoked) MD_LOG_W("dropping %d SSE client(s) no longer authorized by the live allowlist", revoked);
     while (pending > 0) {
         int64_t remaining = deadline - md_now_ms();
         if (remaining <= 0) break;
@@ -935,7 +972,7 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
     for (int i = 0; i < http->sse_count; ) {
         SseClient *c = &http->sse_clients[i];
         if (c->ready && (c->failed || c->sent != frame_len)) {
-            MD_LOG_W("dropping SSE client after failed or timed-out write");
+            if (!c->revoked) MD_LOG_W("dropping SSE client after failed or timed-out write");
             close(c->fd);
             *c = http->sse_clients[--http->sse_count];
         } else {

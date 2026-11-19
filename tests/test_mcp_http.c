@@ -1204,6 +1204,239 @@ static void test_http_auth(void)
     PASS("bearer and NIP-98 POST/SSE authentication, replay, payload, Host/Origin, healthz");
 }
 
+/* ── Live NIP-98 authorizer (md-ah9.3) ───────────────────────── */
+
+static const char auth_sk2[] = "0000000000000000000000000000000000000000000000000000000000000002";
+
+typedef struct {
+    pthread_mutex_t mu;
+    char allowed[65];   /* empty: source not ready / nobody granted */
+    unsigned calls;
+} LiveAcl;
+
+static bool live_acl_authorize(const char *pk, void *ud)
+{
+    LiveAcl *acl = ud;
+    pthread_mutex_lock(&acl->mu);
+    acl->calls++;
+    bool ok = acl->allowed[0] && strcmp(pk, acl->allowed) == 0;
+    pthread_mutex_unlock(&acl->mu);
+    return ok;
+}
+
+static void live_acl_set(LiveAcl *acl, const char *pk)
+{
+    pthread_mutex_lock(&acl->mu);
+    snprintf(acl->allowed, sizeof(acl->allowed), "%s", pk ? pk : "");
+    pthread_mutex_unlock(&acl->mu);
+}
+
+static unsigned live_acl_calls(LiveAcl *acl)
+{
+    pthread_mutex_lock(&acl->mu);
+    unsigned calls = acl->calls;
+    pthread_mutex_unlock(&acl->mu);
+    return calls;
+}
+
+static char *npub_for(const char *sk)
+{
+    char *hex = nostr_key_get_public(sk);
+    MD_CHECK(hex != NULL);
+    unsigned char pk[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned value;
+        MD_CHECK(sscanf(hex + 2*i, "%2x", &value) == 1);
+        pk[i] = (unsigned char)value;
+    }
+    free(hex);
+    char *npub = NULL;
+    MD_CHECK(nostr_nip19_encode_npub(pk, &npub) == 0);
+    return npub;
+}
+
+/* Signed loopback NIP-98 header for key 1 (default) or key 2. */
+static char *loopback_auth(uint16_t port, const char *method, bool key2, bool bad_sig)
+{
+    char url[96];
+    snprintf(url, sizeof(url), "http://localhost:%u/mcp", port);
+    return signed_auth(url, method, strcmp(method, "POST") == 0 ? auth_body : NULL,
+                       0, bad_sig, key2, false);
+}
+
+/* GET /mcp with Authorization; returns an fd positioned after the headers
+ * of a 200 response, or -1. */
+static int sse_connect_auth(uint16_t port, const char *auth)
+{
+    int fd = tcp_connect(port);
+    if (fd < 0) return -1;
+    char request[4096];
+    int len = snprintf(request, sizeof(request),
+        "GET /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: %s\r\n\r\n", auth);
+    int64_t deadline = md_now_ms() + 3000;
+    if (len <= 0 || len >= (int)sizeof(request) ||
+        md_fd_write_deadline(fd, request, (size_t)len, deadline, true, NULL) != 0) {
+        close(fd);
+        return -1;
+    }
+    char headers[1024] = {0};
+    size_t total = 0;
+    while (!strstr(headers, "\r\n\r\n") && total < sizeof(headers) - 1) {
+        int64_t left = deadline - md_now_ms();
+        if (left <= 0 || md_test_wait_readable(fd, (int)left) != 1) break;
+        ssize_t n = read(fd, headers + total, 1); /* stop exactly at the blank line */
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    if (strncmp(headers, "HTTP/1.1 200", 12) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Read one SSE frame (to the blank line); false on EOF/timeout. */
+static bool sse_read_frame(int fd, char *buf, size_t cap)
+{
+    size_t total = 0;
+    buf[0] = 0;
+    int64_t deadline = md_now_ms() + 3000;
+    while (!strstr(buf, "\n\n") && total < cap - 1) {
+        int64_t left = deadline - md_now_ms();
+        if (left <= 0 || md_test_wait_readable(fd, (int)left) != 1) return false;
+        ssize_t n = read(fd, buf + total, cap - 1 - total);
+        if (n <= 0) return false;
+        total += (size_t)n;
+        buf[total] = 0;
+    }
+    return strstr(buf, "\n\n") != NULL;
+}
+
+static void test_live_authorizer(void)
+{
+    char *pk1 = nostr_key_get_public(auth_sk);
+    char *pk2 = nostr_key_get_public(auth_sk2);
+    char *npub2 = npub_for(auth_sk2);
+    MD_CHECK(pk1 && pk2 && npub2);
+    LiveAcl acl = { .mu = PTHREAD_MUTEX_INITIALIZER };
+    MdMcpServer *mcp = make_mcp_server();
+
+    /* The live source alone is a credential: non-loopback binds may start. */
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .bind_addr = "0.0.0.0",
+        .nip98_authorize = live_acl_authorize, .nip98_authorize_userdata = &acl };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    MD_CHECK(http != NULL);
+    md_mcp_http_destroy(http);
+
+    cfg.bind_addr = NULL;
+    http = md_mcp_http_create(&cfg);
+    REQUIRE_HTTP(http, mcp);
+    wire_server_to_http(mcp, http);
+    uint16_t port = md_mcp_http_port(http);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+
+    /* Not ready / no grant: fail closed, and credentials stay mandatory. */
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", NULL, NULL) == 401);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", "Bearer x", NULL) == 401);
+    char *h = loopback_auth(port, "POST", false, false);
+    unsigned before = live_acl_calls(&acl);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    MD_CHECK(live_acl_calls(&acl) == before + 1);
+    free(h);
+
+    /* A grant takes effect on the next request, without a restart. */
+    live_acl_set(&acl, pk1);
+    h = loopback_auth(port, "POST", false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 200);
+    free(h);
+    h = loopback_auth(port, "POST", true, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+
+    /* Unvalidated events never reach the live source. */
+    before = live_acl_calls(&acl);
+    h = loopback_auth(port, "POST", false, true);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    char wrong_url[96];
+    snprintf(wrong_url, sizeof(wrong_url), "http://localhost:%u/mcp", port + 1);
+    h = signed_auth(wrong_url, "POST", auth_body, 0, false, false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    h = signed_auth("http://localhost/x", "POST", "other", 0, false, false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    MD_CHECK(live_acl_calls(&acl) == before);
+
+    /* SSE admitted by the live source is dropped at the next broadcast after
+     * revocation; the notification itself is withheld. */
+    h = loopback_auth(port, "GET", false, false);
+    int sse = sse_connect_auth(port, h);
+    free(h);
+    MD_CHECK(sse >= 0);
+    if (sse >= 0) {
+        wait_sse_ready(http, sse, 1);
+        char frame[512];
+        MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":1}", 7) == 0);
+        MD_CHECK(sse_read_frame(sse, frame, sizeof(frame)) && strstr(frame, "{\"n\":1}"));
+        live_acl_set(&acl, NULL);
+        MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":2}", 7) == 0);
+        MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
+        MD_CHECK(!sse_read_frame(sse, frame, sizeof(frame)) && !strstr(frame, "n\":2"));
+        close(sse);
+    }
+    h = loopback_auth(port, "POST", false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    shutdown_http(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+
+    /* Union with the static allowlist: either source admits; the static
+     * set is never revoked by the live one. */
+    const char *npubs[] = { npub2 };
+    cfg.allow_npubs = npubs;
+    cfg.allow_npub_count = 1;
+    live_acl_set(&acl, pk1);
+    http = md_mcp_http_create(&cfg);
+    REQUIRE_HTTP(http, mcp);
+    wire_server_to_http(mcp, http);
+    port = md_mcp_http_port(http);
+    sa = (ServerArgs){ .http = http, .result = -1 };
+    pthread_create(&tid, NULL, server_thread, &sa);
+    for (int key2 = 0; key2 < 2; key2++) {
+        h = loopback_auth(port, "POST", key2, false);
+        MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 200);
+        free(h);
+    }
+    before = live_acl_calls(&acl);
+    h = loopback_auth(port, "GET", true, false);
+    sse = sse_connect_auth(port, h);
+    free(h);
+    MD_CHECK(sse >= 0);
+    MD_CHECK(live_acl_calls(&acl) == before); /* static hit: live source unused */
+    live_acl_set(&acl, NULL);
+    h = loopback_auth(port, "POST", false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    h = loopback_auth(port, "POST", true, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 200);
+    free(h);
+    if (sse >= 0) {
+        wait_sse_ready(http, sse, 1);
+        char frame[512];
+        MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":3}", 7) == 0);
+        MD_CHECK(sse_read_frame(sse, frame, sizeof(frame)) && strstr(frame, "{\"n\":3}"));
+        MD_CHECK(md_mcp_http_sse_client_count(http) == 1);
+        close(sse);
+    }
+    shutdown_http(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+    free(pk1); free(pk2); free(npub2);
+    PASS("live NIP-98 authorizer: fail-closed, live grant/revoke, SSE drop, static union");
+}
+
 static void test_unauthenticated_guards_and_read_budget(void)
 {
     MdMcpServer *mcp = make_mcp_server();
@@ -1247,6 +1480,7 @@ int main(void)
 
     test_auth_configuration();
     test_http_auth();
+    test_live_authorizer();
     test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();
