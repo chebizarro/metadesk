@@ -356,7 +356,127 @@ static int test_plaintext_no_tls(void) {
     return 0;
 }
 
-/* ── Main ────────────────────────────────────────────────────── */
+/* ── Test: concurrent send + recv on one stream, peer closes ── */
+
+/* md-9sa6: the host sends video from its capture thread while the main
+ * thread receives, polls md_stream_is_connected and reads stats on the same
+ * stream. Either direction may clear `connected` when the peer goes away.
+ * Under TSan (-Db_sanitize=thread) this reported a data race on connected
+ * and on the traffic counters before they became atomics. */
+
+#define CONCURRENT_PAYLOAD 4096
+
+typedef struct {
+    MdStream *s;
+    uint32_t sends_ok;
+} Sender;
+
+static void *sender_main(void *arg) {
+    Sender *x = arg;
+    static const uint8_t frame[CONCURRENT_PAYLOAD];
+    uint32_t seq = 0;
+    while (md_stream_send(x->s, MD_PKT_VIDEO_FRAME, seq++,
+                          frame, sizeof(frame)) == 0)
+        x->sends_ok++;
+    return NULL;
+}
+
+typedef struct {
+    MdStream *s;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool client_got_packet;      /* set by the client's receive loop */
+} Peer;
+
+/* Takes a few frames, answers with pings, and goes away only once the
+ * client's receive loop has taken one: by then that loop has read stats and
+ * received while the sender was still streaming (nothing fails a send
+ * before this close). */
+static void *peer_main(void *arg) {
+    Peer *p = arg;
+    for (int i = 0; i < 4; i++) {
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(p->s, &hdr, &payload, 5000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME);
+        free(payload);
+    }
+    for (uint32_t i = 0; i < 3; i++)
+        MD_CHECK(md_stream_send(p->s, MD_PKT_PING, i, NULL, 0) == 0);
+    const uint64_t until = md_monotonic_ns() + 10000000000ull;
+    pthread_mutex_lock(&p->mu);
+    while (!p->client_got_packet &&
+           md_cond_timedwait_until(&p->cv, &p->mu, until) != ETIMEDOUT) {}
+    pthread_mutex_unlock(&p->mu);
+    md_stream_destroy(p->s);
+    return NULL;
+}
+
+static int test_concurrent_send_recv_peer_close(void) {
+    printf("  test_concurrent_send_recv_peer_close... ");
+
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    ServerThread st = { .srv = srv };
+    pthread_t tid;
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 3000);
+    REQUIRE(client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
+    Peer peer = { .s = st.client };
+    REQUIRE(pthread_mutex_init(&peer.mu, NULL) == 0);
+    REQUIRE(md_cond_init_monotonic(&peer.cv) == 0);
+
+    Sender x = { .s = client };
+    pthread_t sender, peer_tid;
+    REQUIRE(pthread_create(&sender, NULL, sender_main, &x) == 0);
+    REQUIRE(pthread_create(&peer_tid, NULL, peer_main, &peer) == 0);
+
+    /* The host's receive loop, on the stream the sender is using. */
+    const int64_t deadline = md_now_ms() + 10000;
+    bool got_packet = false;
+    while (md_stream_is_connected(client) && md_now_ms() < deadline) {
+        MdStreamStats stats;
+        md_stream_get_stats(client, &stats);
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        if (md_stream_recv(client, &hdr, &payload, 10) != 0) continue;
+        free(payload);
+        if (!got_packet) {
+            got_packet = true;
+            pthread_mutex_lock(&peer.mu);
+            peer.client_got_packet = true;
+            pthread_cond_signal(&peer.cv);
+            pthread_mutex_unlock(&peer.mu);
+        }
+    }
+    /* The peer's close cleared connected from one side or the other. */
+    MD_CHECK(!md_stream_is_connected(client));
+    /* On a timeout, shutdown() still wakes a sender blocked in send(). */
+    md_stream_close(client);
+    REQUIRE(pthread_join(sender, NULL) == 0);
+    REQUIRE(pthread_join(peer_tid, NULL) == 0);
+
+    MdStreamStats stats;
+    md_stream_get_stats(client, &stats);
+    MD_CHECK(got_packet);
+    MD_CHECK(stats.packets_recv >= 1);
+    MD_CHECK(stats.bytes_recv == (uint64_t)stats.packets_recv * MD_PACKET_HEADER_SIZE);
+    MD_CHECK(x.sends_ok >= 4);
+    MD_CHECK(stats.packets_sent == x.sends_ok);
+    MD_CHECK(stats.bytes_sent ==
+             (uint64_t)x.sends_ok * (MD_PACKET_HEADER_SIZE + CONCURRENT_PAYLOAD));
+
+    pthread_cond_destroy(&peer.cv);
+    pthread_mutex_destroy(&peer.mu);
+    md_stream_destroy(client);
+    md_stream_server_destroy(srv);
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
     /* Ignore SIGPIPE — normal for socket tests where peers disconnect */
@@ -373,6 +493,7 @@ int main(void) {
     failures += test_recv_timeout();
     failures += test_tls_roundtrip();
     failures += test_plaintext_no_tls();
+    failures += test_concurrent_send_recv_peer_close();
 
     md_test_failures += failures;
     return md_test_report();
