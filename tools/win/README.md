@@ -230,6 +230,35 @@ the display off again about a second later anyway. Duplication then stalls
 and reports the pointer hidden, so the windows wake the display again each
 time it reports off.
 
+During each of those power changes, Desktop Duplication can block well past
+its timeout (md-4dsa). This was traced on the VM by logging AcquireNextFrame
+entry and exit against `GUID_CONSOLE_DISPLAY_STATE` notifications. Over
+10,188 calls:
+
+- Every call more than 50 ms past its timeout overlapped a power change.
+  AcquireNextFrame blocked 627 ms on a 250 ms timeout, and a staging `Map`
+  stalled 195 ms.
+- No call without a change was more than 24 ms past its timeout.
+
+So the wall-clock cells ("without test damage" and "healthy stream") keep
+their 100 ms bound, but only time calls during which the display held one
+state. A watch thread counts the notifications. Before and after each call
+the test posts a barrier message to that thread and waits for it, so every
+notification sent before the barrier has been counted.
+
+On a heavily loaded Mac host (load average 30-60 from parallel builds), a
+rare call also overran with the display steady. So a second watch thread
+wakes every millisecond and records the longest gap between its wake-ups.
+Its gap is read only after it has woken once more following the call. A gap
+of 50 ms or more means the test process, which on the VM is its virtual
+CPU, was not scheduled, and no duration bound can hold. The backend cannot
+cause that, because it blocks in DXGI rather than spinning.
+
+A call that spans a display change or such a gap is reported and repeated,
+up to 40 times. Every overrun prints the longest scheduling gap. There are
+no sleeps and no whole-test retries. `MD_DXGI_HEALTHY_REPEAT=N` repeats the
+healthy cell for qualification.
+
 The pointer cells never move the user's pointer. They show a static window
 around wherever the pointer already is and change only that window's cursor,
 using `SetCursor` on the window's own thread. Each change is therefore a
