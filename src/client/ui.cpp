@@ -181,10 +181,10 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
     /* ── Connection status ───────────────────────────────── */
     if (stats->connected) {
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f),
-                           "\xE2\x97\x89 Connected");  /* ◉ */
+                           "[+] Connected");
     } else if (stats->reconnecting) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                           "\xE2\x97\x8B Disconnected \xE2\x80\x94 reconnecting...");  /* ○ — */
+                           "[-] Disconnected - reconnecting...");
         if (stats->reconnect_delay_ms > 0) {
             ImGui::TextColored(ImVec4(0.8f, 0.7f, 0.5f, 1.0f),
                                "Next retry in %.1fs",
@@ -192,7 +192,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
         }
     } else {
         ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f),
-                           "\xE2\x97\x8B Disconnected");  /* ○ */
+                           "[-] Disconnected");
     }
 
     if (stats->status_message && stats->status_message[0]) {
