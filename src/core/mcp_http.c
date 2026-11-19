@@ -65,11 +65,13 @@ typedef struct {
     bool ready; /* false while the handler owns the header write */
     size_t sent;
     bool failed;
-    /* Admitted only by the live authorizer: recheck before each broadcast. */
+    /* Admitted only by the live authorizer: recheck before each broadcast.
+     * While that source cannot answer (MD_MCP_GRANT_UNKNOWN) the stream is
+     * held: kept open and sent nothing (md-554). */
     bool live_auth;
     bool revoked;
     bool target;    /* receives the frame being delivered */
-    uint32_t caps;  /* live grant the stream's tool set was last checked at */
+    uint32_t caps;  /* last known live grant its tool set was checked at */
     char pubkey[65];
 } SseClient;
 
@@ -479,10 +481,12 @@ static bool signed_url_allowed(MdMcpHttp *h, const char *url)
     return false;
 }
 
-/* The live source's current grant for pk, or 0 unless it admits (agent). */
+/* The live source's current answer for pk: a grant including agent, 0
+ * (denied), or MD_MCP_GRANT_UNKNOWN (it cannot answer now). */
 static uint32_t live_grant(MdMcpHttp *h, const char *pk)
 {
     uint32_t caps = h->grant ? h->grant(pk, h->grant_ud) : 0;
+    if (caps & MD_MCP_GRANT_UNKNOWN) return MD_MCP_GRANT_UNKNOWN;
     return (caps & MD_CAP_AGENT) ? caps : 0;
 }
 
@@ -518,14 +522,19 @@ static bool authenticate(MdMcpHttp *h, const HttpRequest *req, AuthResult *who)
     if (ok) ok = nostr_nip98_validate_auth_event(event, url, req->method, &opts) == NOSTR_NIP98_OK;
     const char *pk = nostr_event_get_pubkey(event);
     /* Union of sources: the static set first (offline, never changes), then
-     * the live authorizer, which fails closed until its history is ready. */
+     * the live authorizer, which fails closed (0 or UNKNOWN) until its
+     * history is ready. */
     bool allowed = false;
     for (size_t i = 0; ok && pk && i < h->allowed_key_count; i++)
         if (strcmp(pk, h->allowed_keys[i]) == 0) { allowed = true; break; }
     if (allowed) who->caps = MD_MCP_CALLER_ALL_CAPS;
-    if (ok && pk && !allowed && (who->caps = live_grant(h, pk)) != 0) {
-        allowed = true;
-        who->live_auth = true;
+    if (ok && pk && !allowed) {
+        uint32_t caps = live_grant(h, pk);
+        if (caps && caps != MD_MCP_GRANT_UNKNOWN) {
+            who->caps = caps;
+            allowed = true;
+            who->live_auth = true;
+        }
     }
     ok = ok && allowed;
     if (ok) snprintf(who->pubkey, sizeof(who->pubkey), "%s", pk);
@@ -689,6 +698,7 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 /* ── Handle a client connection ──────────────────────────────── */
 
 static void sse_regrant_locked(MdMcpHttp *h, int only_fd);
+static void sse_evict_held_locked(MdMcpHttp *h);
 
 static void handle_client(MdMcpHttp *h, int client_fd)
 {
@@ -848,6 +858,10 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
     } else if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "GET") == 0) {
         pthread_mutex_lock(&h->sse_mu);
+        /* Held streams must not starve operator credentials of a slot. */
+        if (h->sse_count >= h->sse_max_clients && !who.live_auth &&
+            !atomic_load(&h->shutdown))
+            sse_evict_held_locked(h);
         if (h->sse_count >= h->sse_max_clients || atomic_load(&h->shutdown)) {
             pthread_mutex_unlock(&h->sse_mu);
             send_http_text(h, client_fd, 503, "Service Unavailable", "SSE capacity exhausted\n");
@@ -1015,10 +1029,13 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
     pthread_mutex_lock(&http->sse_mu);
     for (int i = 0; i < http->sse_count; i++) {
         SseClient *c = &http->sse_clients[i];
-        c->target = c->ready;
         /* A live-list grant can be revoked while the stream is open: the
-         * next notification is withheld and the stream closed. */
-        c->revoked = c->ready && c->live_auth && !live_grant(http, c->pubkey);
+         * next notification is withheld and the stream closed. While the
+         * source cannot answer, the stream is held: skipped, kept open. */
+        uint32_t caps = c->ready && c->live_auth ? live_grant(http, c->pubkey)
+                                                 : MD_MCP_CALLER_ALL_CAPS;
+        c->target = c->ready && caps != MD_MCP_GRANT_UNKNOWN;
+        c->revoked = caps == 0;
     }
     int rc = sse_deliver_locked(http, frame, frame_len);
     pthread_mutex_unlock(&http->sse_mu);
@@ -1031,7 +1048,9 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
  * a visible tool set that differs from the one recorded at the previous
  * check gets one notifications/tools/list_changed. The grant is recorded
  * here under sse_mu, so each tool-set change notifies exactly once however
- * often this runs, and other streams are untouched. */
+ * often this runs, and other streams are untouched. md-554: an UNKNOWN
+ * answer leaves the stream held and its record alone, so the first known
+ * answer is compared with the last known one (one list_changed at most). */
 static void sse_regrant_locked(MdMcpHttp *h, int only_fd)
 {
     int changed = 0, revoked = 0;
@@ -1040,6 +1059,7 @@ static void sse_regrant_locked(MdMcpHttp *h, int only_fd)
         c->target = c->revoked = false;
         if (!c->ready || !c->live_auth || (only_fd >= 0 && c->fd != only_fd)) continue;
         uint32_t caps = live_grant(h, c->pubkey);
+        if (caps == MD_MCP_GRANT_UNKNOWN) continue;
         if (!caps) {
             c->revoked = true;
             revoked++;
@@ -1060,6 +1080,23 @@ static void sse_regrant_locked(MdMcpHttp *h, int only_fd)
     char *frame = note ? make_sse_frame("message", note, strlen(note), &frame_len) : NULL;
     if (note || revoked) sse_deliver_locked(h, frame, frame_len);
     free(frame);
+}
+
+/* At SSE capacity, close one ready stream that is held because its live
+ * source cannot answer, so a stream not admitted by that source can take its
+ * slot. Bounds how long a hold can cost anyone else without a timer: the
+ * newcomer's request is the event. */
+static void sse_evict_held_locked(MdMcpHttp *h)
+{
+    for (int i = 0; i < h->sse_count; i++) {
+        SseClient *c = &h->sse_clients[i];
+        if (!c->ready || !c->live_auth || live_grant(h, c->pubkey) != MD_MCP_GRANT_UNKNOWN)
+            continue;
+        MD_LOG_W("SSE capacity: closing a stream held while the live allowlist is unknown");
+        close(c->fd);
+        *c = h->sse_clients[--h->sse_count];
+        return;
+    }
 }
 
 /* The grant source's on_change: runs on its thread, never under its lock. */

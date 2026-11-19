@@ -1708,11 +1708,13 @@ static void test_unauthenticated_guards_and_read_budget(void)
 
 /* ── Grant change -> tools/list_changed (md-ht7) ────────────── */
 
-/* Two live principals and the change feed a grant source exposes. */
+/* Two live principals and the change feed a grant source exposes. While
+ * unknown (md-554: history pending, every relay down) it cannot answer. */
 typedef struct {
     pthread_mutex_t mu;
     char pk[2][65];
     uint32_t caps[2];
+    bool unknown;
     void (*on_change)(void *);
     void *on_change_ud;
 } WatchAcl;
@@ -1721,8 +1723,8 @@ static uint32_t watch_acl_grant(const char *pk, void *ud)
 {
     WatchAcl *acl = ud;
     pthread_mutex_lock(&acl->mu);
-    uint32_t caps = 0;
-    for (int i = 0; i < 2; i++)
+    uint32_t caps = acl->unknown ? MD_MCP_GRANT_UNKNOWN : 0;
+    for (int i = 0; i < 2 && !acl->unknown; i++)
         if (strcmp(pk, acl->pk[i]) == 0) caps = acl->caps[i];
     pthread_mutex_unlock(&acl->mu);
     return caps;
@@ -1744,6 +1746,18 @@ static void watch_acl_change(WatchAcl *acl, int i, uint32_t caps)
 {
     pthread_mutex_lock(&acl->mu);
     acl->caps[i] = caps;
+    void (*fn)(void *) = acl->on_change;
+    void *fn_ud = acl->on_change_ud;
+    pthread_mutex_unlock(&acl->mu);
+    MD_CHECK(fn != NULL);
+    if (fn) fn(fn_ud);
+}
+
+/* A readiness transition: the source loses or regains its answer. */
+static void watch_acl_readiness(WatchAcl *acl, bool known)
+{
+    pthread_mutex_lock(&acl->mu);
+    acl->unknown = !known;
     void (*fn)(void *) = acl->on_change;
     void *fn_ud = acl->on_change_ud;
     pthread_mutex_unlock(&acl->mu);
@@ -1919,6 +1933,133 @@ static void test_grant_change_list_changed(void)
          "bearer/other principals, revocation closes, quiesce/teardown safe");
 }
 
+static void wait_sse_count(MdMcpHttp *http, int want)
+{
+    int64_t deadline = md_now_ms() + 5000;
+    while (md_mcp_http_sse_client_count(http) != want && md_now_ms() < deadline)
+        sched_yield();
+    MD_CHECK(md_mcp_http_sse_client_count(http) == want);
+}
+
+/* md-554: while the live source cannot answer, its streams are held (open,
+ * sent nothing) and its principals refused; the first known answer closes,
+ * notifies or silently resumes each one. Bearer streams are unaffected. */
+static void test_grant_outage_holds_streams(void)
+{
+    char token_path[] = "/tmp/md-http-hold-XXXXXX";
+    int tfd = mkstemp(token_path);
+    MD_CHECK(tfd >= 0);
+    MD_CHECK(write(tfd, "hold-secret\n", 12) == 12);
+    close(tfd);
+    char *pk1 = nostr_key_get_public(auth_sk);
+    char *pk2 = nostr_key_get_public(auth_sk2);
+    MD_CHECK(pk1 && pk2);
+    WatchAcl acl = { .mu = PTHREAD_MUTEX_INITIALIZER,
+                     .caps = { MD_CAP_AGENT | MD_CAP_INPUT, MD_CAP_AGENT } };
+    snprintf(acl.pk[0], sizeof(acl.pk[0]), "%s", pk1 ? pk1 : "");
+    snprintf(acl.pk[1], sizeof(acl.pk[1]), "%s", pk2 ? pk2 : "");
+    MdMcpServer *mcp = make_caps_server();
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .token_file = token_path,
+        .nip98_grant = watch_acl_grant, .nip98_grant_userdata = &acl,
+        .nip98_grant_watch = watch_acl_watch, .max_clients = 3 };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    unlink(token_path);
+    REQUIRE_HTTP(http, mcp);
+    wire_server_to_http(mcp, http);
+    uint16_t port = md_mcp_http_port(http);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    static const char init_body[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":"
+        "{\"protocolVersion\":\"" MD_TEST_MCP_PROTOCOL "\",\"capabilities\":{}}}";
+    int status;
+    cJSON_Delete(rpc_post(port, 0, "Bearer hold-secret", init_body, &status));
+    MD_CHECK(status == 200);
+
+    /* Streams: A (pk1, agent+input), B (pk2, agent), T (bearer). */
+    int fds[5] = { -1, -1, -1, -1, -1 };
+    for (int i = 0; i < 2; i++) {
+        char *h = loopback_auth(port, "GET", i == 1, false);
+        fds[i] = sse_connect_auth(port, h);
+        free(h);
+    }
+    fds[2] = sse_connect_auth(port, "Bearer hold-secret");
+    MD_CHECK(fds[0] >= 0 && fds[1] >= 0 && fds[2] >= 0);
+    if (fds[0] < 0 || fds[1] < 0 || fds[2] < 0) goto out;
+    wait_sse_count(http, 3);
+    expect_list_changes(http, fds, (int[]){0, 0, 0}, 3, 0);
+
+    /* Outage: nothing closes. A broadcast reaches only T; live principals are
+     * refused (a GET too, so it cannot claim a slot), bearer is not. */
+    watch_acl_readiness(&acl, false);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 3);
+    static const char outage[] = "{\"outage\":1}";
+    MD_CHECK(md_mcp_http_send_sse(http, "message", outage, strlen(outage)) == 0);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 3);
+    char frame[512];
+    MD_CHECK(sse_next_frame(fds[2], frame, sizeof(frame)) && strstr(frame, outage));
+    char *h = loopback_auth(port, "POST", false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    h = loopback_auth(port, "GET", true, false);
+    MD_CHECK(auth_status(port, "GET", "/mcp", "localhost", h, NULL) == 401);
+    free(h);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", "Bearer hold-secret", NULL) == 200);
+
+    /* Back, grants unchanged: no close, no list_changed, and broadcasts
+     * resume. A and B's next frame is this sync, so the outage frame was
+     * withheld, not queued. */
+    watch_acl_readiness(&acl, true);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 3);
+    expect_list_changes(http, fds, (int[]){0, 0, 0}, 3, 1);
+    h = loopback_auth(port, "POST", false, false);
+    MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 200);
+    free(h);
+
+    /* Outage, during which A loses input and B loses agent (change events
+     * while unknown still hold). Back: B closes, A gets exactly one. */
+    watch_acl_readiness(&acl, false);
+    watch_acl_change(&acl, 0, MD_CAP_AGENT);
+    watch_acl_change(&acl, 1, MD_CAP_INPUT);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 3);
+    watch_acl_readiness(&acl, true);
+    MD_CHECK(md_mcp_http_sse_client_count(http) == 2);
+    MD_CHECK(sse_closed(fds[1]));
+    int live[3] = { fds[0], fds[2], -1 };
+    expect_list_changes(http, live, (int[]){1, 0}, 2, 2);
+    /* Another wake-up with the same answer: nothing more. */
+    watch_acl_readiness(&acl, true);
+    expect_list_changes(http, live, (int[]){0, 0}, 2, 3);
+
+    /* Capacity 3 (A, T, T2): with every grant known a newcomer gets 503;
+     * while A is held, a bearer newcomer takes A's slot. */
+    fds[3] = sse_connect_auth(port, "Bearer hold-secret");
+    MD_CHECK(fds[3] >= 0);
+    wait_sse_count(http, 3);
+    int extra = sse_connect_auth(port, "Bearer hold-secret");
+    MD_CHECK(extra < 0);
+    if (extra >= 0) close(extra);
+    watch_acl_readiness(&acl, false);
+    fds[4] = sse_connect_auth(port, "Bearer hold-secret");
+    MD_CHECK(fds[4] >= 0);
+    MD_CHECK(sse_closed(fds[0]));
+    wait_sse_count(http, 3);
+    watch_acl_readiness(&acl, true);
+    int bearers[3] = { fds[2], fds[3], fds[4] };
+    expect_list_changes(http, bearers, (int[]){0, 0, 0}, 3, 4);
+
+out:
+    for (int i = 0; i < 5; i++) if (fds[i] >= 0) close(fds[i]);
+    shutdown_http(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+    free(pk1); free(pk2);
+    PASS("allowlist outage: live streams held (no frames, no close), live requests refused; "
+         "recovery resumes, notifies once or closes; held slots yield to bearer");
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1930,6 +2071,7 @@ int main(void)
     test_live_authorizer();
     test_per_principal_tool_caps();
     test_grant_change_list_changed();
+    test_grant_outage_holds_streams();
     test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();

@@ -942,15 +942,27 @@ static void test_acl_history(const char **urls, const char *a, const char *b) {
     free(old); free(newer); free(one); free(two); free(empty);
     nostr_event_free(e1); nostr_event_free(e2); acl_finish(&s);
 
-    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    /* md-554: a zero grant says whether the policy denied or is not known. */
+    bool known = true;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && !known);
+    acl_eose(&s, 0);
     MD_CHECK(md_nostr_has_allowlist(s.bridge)); /* No event also means empty. */
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && known);
     unsigned boundary = acl_counter(&s, &s.boundaries);
     acl_control("{\"op\":\"closed\"}"); acl_wait(&s, &s.boundaries, boundary + 1);
     MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
-    MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && !known);
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, "x", UINT32_MAX, &known) == 0 && known);
+    md_nostr_stop(s.bridge); /* stopped: denies for good, not "unknown" */
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && known);
+    acl_finish(&s);
     acl_reset(); acl_bridge(&s, urls, 1, true, false);
     MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_OPEN);
+    known = false;
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, MD_CAP_AGENT, &known) == MD_CAP_AGENT && known);
     MD_CHECK(md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
     /* Relay 1's websocket handshake is deliberately still pending when
      * bridge callbacks are registered and relay 0 reaches EOSE. */
@@ -975,7 +987,7 @@ static void test_acl_history(const char **urls, const char *a, const char *b) {
     pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
     acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
-    printf("  PASS: private history, empty/unknown/open, ordering/ties, delayed handshake and EVENT/EOSE fence\n");
+    printf("  PASS: private history, empty/unknown/open (grant known-ness), ordering/ties, delayed handshake and EVENT/EOSE fence\n");
 }
 
 typedef struct { MdNostr *n; const char *pk; bool remove; int result; } AclEdit;

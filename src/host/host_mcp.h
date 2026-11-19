@@ -23,8 +23,10 @@ typedef struct HostMcpAcl HostMcpAcl;
 HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count);
 
 /* MdMcpHttpConfig.nip98_grant: pubkey_hex's agent/input grant from the live,
- * loaded list (md-ikr v1 format); 0 while not loaded or unlisted. The MCP
- * transport admits only a grant with agent and gates actions on input. */
+ * loaded list (md-ikr v1 format); 0 when unlisted or once the bridge has
+ * stopped; MD_MCP_GRANT_UNKNOWN while history is pending or every relay is
+ * down (md-554: requests deny, open streams are held). The MCP transport
+ * admits only a grant with agent and gates actions on input. */
 uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *acl);
 
 /* MdMcpHttpConfig.nip98_grant_watch: register on_change (one listener;

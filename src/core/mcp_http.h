@@ -22,6 +22,11 @@ extern "C" {
 
 #define MD_MCP_HTTP_DEFAULT_PORT 7710
 #define MD_MCP_SSE_WRITE_TIMEOUT_MS 2000
+/* A nip98_grant result meaning "this source cannot answer right now" (md-554):
+ * e.g. its history is pending or every relay is down. Not a grant: requests
+ * are refused as for 0, but open SSE streams the source admitted are held
+ * (kept open, sent nothing) instead of closed, until a known answer. */
+#define MD_MCP_GRANT_UNKNOWN 0x80000000u
 
 typedef struct MdMcpHttp MdMcpHttp;
 
@@ -46,8 +51,9 @@ typedef struct {
      * are a union; static, bearer and credential-less loopback callers get
      * MD_MCP_CALLER_ALL_CAPS). Called again for every request, so a grant
      * change applies to the next one. Must be thread-safe, non-blocking and
-     * fail closed: 0 while its source is not ready. Rechecked before every
-     * SSE broadcast so a revoked stream is dropped without a restart. */
+     * fail closed: 0 or MD_MCP_GRANT_UNKNOWN (alone) while its source is not
+     * ready. Rechecked before every SSE broadcast so a revoked (0) stream is
+     * dropped without a restart; an UNKNOWN stream is skipped and held. */
     uint32_t    (*nip98_grant)(const char *pubkey_hex, void *userdata);
     void         *nip98_grant_userdata;
     /* Optional change feed for nip98_grant (md-ht7). With both set, create
@@ -58,13 +64,19 @@ typedef struct {
      * source calls on_change once per accepted grant change, event-driven
      * (never a timer), from a thread it owns and not under its grant lock.
      * The transport then re-reads every live SSE stream's grant: a stream
-     * that lost agent is closed, and one whose visible tool set changed gets
-     * one notifications/tools/list_changed. initialize then advertises
+     * that lost agent is closed, one whose answer is MD_MCP_GRANT_UNKNOWN is
+     * held, and one whose visible tool set changed since its last known
+     * grant gets one notifications/tools/list_changed. A source that can
+     * return UNKNOWN must also call on_change when it can answer again, so
+     * held streams are re-evaluated. initialize then advertises
      * capabilities.tools.listChanged. */
     int         (*nip98_grant_watch)(void *userdata,
                                      void (*on_change)(void *on_change_ud),
                                      void *on_change_ud);
-    int           max_clients;   /* max concurrent SSE clients (default: 4) */
+    int           max_clients;   /* max concurrent SSE clients (default: 4); at
+                                  * the limit, a stream not admitted by
+                                  * nip98_grant takes the slot of one held
+                                  * (MD_MCP_GRANT_UNKNOWN) stream */
     int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
     int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;
                                   * positive: bound per-client buffering,
@@ -88,7 +100,8 @@ int md_mcp_http_run(MdMcpHttp *http);
 void md_mcp_http_shutdown(MdMcpHttp *http);
 
 /* Send an SSE event to all connected clients (live-admitted clients whose
- * grant lost agent are closed instead). Used by the server's write_fn. */
+ * grant lost agent are closed instead, and held ones skipped). Used by the
+ * server's write_fn. */
 int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
                          const char *data, size_t data_len);
 

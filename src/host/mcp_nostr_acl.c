@@ -13,9 +13,13 @@
  * accepted replacement (and each readiness transition) also wakes one watcher
  * thread, which tells the MCP transport to re-read its live streams' grants
  * (md-ht7: tools/list_changed to exactly the streams whose tool set changed).
+ * While history is pending or every relay is down the source answers
+ * MD_MCP_GRANT_UNKNOWN: requests are refused and open streams are held, sent
+ * nothing, until the next LOADED wake-up re-evaluates them (md-554).
  */
 #include "host_mcp.h"
 #include "accounts.h"
+#include "mcp_http.h"
 #include "nostr.h"
 #include "session.h"
 
@@ -78,7 +82,8 @@ static void *acl_watch_thread(void *arg) {
                     (unsigned long long)version, count, agents, inputs);
         } else if (state != logged) {
             fprintf(stderr, "host[mcp]: host allowlist history %s; "
-                            "host-allowlist NIP-98 grants deny until a relay delivers it\n",
+                            "host-allowlist NIP-98 grants deny and their SSE streams "
+                            "are held until a relay delivers it\n",
                     state == MD_NOSTR_ACL_FAILED ? "unavailable" : "pending");
         } else {
             continue;
@@ -127,10 +132,14 @@ HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count) {
 
 uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *userdata) {
     HostMcpAcl *acl = userdata;
-    /* MCP has no video: only the agent (admission) and input (actions) bits. */
-    return acl && acl->nostr
-        ? md_nostr_granted_capabilities(acl->nostr, pubkey_hex, MD_CAP_AGENT | MD_CAP_INPUT)
-        : 0;
+    if (!acl || !acl->nostr) return 0;
+    /* MCP has no video: only the agent (admission) and input (actions) bits.
+     * Grant and readiness are read together, so a stopped bridge (host role
+     * changed) denies for good while relays being down is only unknown. */
+    bool known = true;
+    uint32_t caps = md_nostr_granted_capabilities_known(acl->nostr, pubkey_hex,
+                                                        MD_CAP_AGENT | MD_CAP_INPUT, &known);
+    return known ? caps : MD_MCP_GRANT_UNKNOWN;
 }
 
 int host_mcp_acl_watch(void *userdata, void (*on_change)(void *), void *on_change_ud) {
