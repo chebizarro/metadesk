@@ -88,10 +88,13 @@ typedef struct {
 static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
     ClientCtx *ctx = userdata;
     ctx->frames_decoded++;
-
-    if (ctx->renderer) {
+    if (frame->width != ctx->frame_w || frame->height != ctx->frame_h) {
         ctx->frame_w = frame->width;
         ctx->frame_h = frame->height;
+        printf("client: decoded frame size %ux%u\n", frame->width, frame->height);
+    }
+
+    if (ctx->renderer) {
         /* Upload only; the composite (video + overlay + single present) is
          * driven from the main loop via render_client_overlay(). */
         if (md_renderer_update_frame(ctx->renderer, frame->data,
@@ -601,6 +604,9 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    /* Progress lines must reach a pipe (container log, supervisor) when
+     * printed, not when a block buffer fills or the process exits. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);  /* host going away mid-send is EPIPE, not fatal */
@@ -670,6 +676,14 @@ int main(int argc, char **argv) {
     printf("  display:   %s\n", do_display ? "SDL2" : "disabled");
     printf("  timeout:   %u ms\n", timeout_ms);
     printf("\n");
+
+    /* GUI mode needs a display a person can see. Check before any signer or
+     * session work so a missing display fails fast, never as decode-only. */
+    if (do_display && md_renderer_open_display() < 0) {
+        fprintf(stderr, "ERROR: no usable display for the GUI client; "
+                        "grant a display or use --no-display for decode-only\n");
+        return 1;
+    }
 
     /* ── Signer initialization ─────────────────────────────── */
     MdSigner *signer = NULL;
@@ -825,7 +839,15 @@ int main(int argc, char **argv) {
     if (do_display) {
         ctx.renderer = md_renderer_create(1920, 1080, "metadesk");
         if (!ctx.renderer) {
-            fprintf(stderr, "WARNING: SDL2 renderer unavailable, decode-only mode\n");
+            fprintf(stderr, "ERROR: cannot open the GUI window; "
+                            "use --no-display for decode-only\n");
+            md_decoder_destroy(decoder);
+            md_stream_destroy(stream);
+            cleanup_npub_nostr(&nostr, &ctx);
+            md_signer_destroy(signer);
+            md_account_startup_clear(&account);
+            md_renderer_close_display();
+            return 1;
         } else {
             /* Create Dear ImGui overlay on top of the renderer */
             ctx.overlay = md_overlay_create(
@@ -1061,6 +1083,7 @@ int main(int argc, char **argv) {
         md_overlay_destroy(ctx.overlay);
     if (ctx.renderer)
         md_renderer_destroy(ctx.renderer);
+    md_renderer_close_display();
 
     printf("client: done. decoded %u frames, displayed %u, tree updates %u\n",
            ctx.frames_decoded, ctx.frames_displayed, ctx.tree_updates);

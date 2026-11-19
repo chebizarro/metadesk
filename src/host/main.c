@@ -892,6 +892,11 @@ int main(int argc, char **argv) {
                             relay_count);
     }
 
+    /* Video mode only: progress and readiness lines must reach a pipe
+     * (container log, supervisor) when printed. MCP returned above with
+     * stdout untouched; its stdio transport owns fd 1 via write(2). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     install_signal_handlers();
     pthread_sigmask(SIG_UNBLOCK, &term_signals, NULL);
 

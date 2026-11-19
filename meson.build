@@ -742,6 +742,12 @@ if host_os == 'linux' or host_os == 'darwin'
     args : startup_args, timeout : 120)
 endif
 
+# Client process contracts without a TTY or display (md-rk4, md-33e).
+if enable_client and (host_os == 'linux' or host_os == 'darwin')
+  test('client startup: piped stdout + GUI display fail-closed', accounts_python,
+    args : [files('tests/test_client_startup.py'), metadesk_client], timeout : 60)
+endif
+
 # Opt-in private-keyring + disposable-netns end-to-end access/session gate (md-pss).
 if enable_nip46 and enable_client and host_os == 'linux'
   test('access session e2e', accounts_python,

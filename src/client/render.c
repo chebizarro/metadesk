@@ -33,7 +33,6 @@ struct MdRenderer {
     float         hidpi_scale_x; /* pixels / points (1.0 on non-HiDPI) */
     float         hidpi_scale_y;
     bool          open;          /* false after window close event  */
-    bool          sdl_inited;    /* true if we called SDL_Init      */
 
     MdSdlEventCallback event_cb; /* receives every SDL event first    */
     void              *event_userdata;
@@ -75,21 +74,49 @@ static int ensure_texture(MdRenderer *r, uint32_t width, uint32_t height) {
     return 0;
 }
 
+/* SDL drivers that accept windows but present them nowhere a person can
+ * see. SDL 2 selects "offscreen" on its own when no display is reachable. */
+static const char *const k_headless_video_drivers[] = {
+    "offscreen", "dummy", "evdev",
+};
+
+static bool g_display_open;
+
 /* ── Public API ──────────────────────────────────────────────── */
 
+int md_renderer_open_display(void) {
+    if (g_display_open)
+        return 0;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "render: SDL_Init failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return -1;
+    }
+    const char *driver = SDL_GetCurrentVideoDriver();
+    for (size_t i = 0; i < sizeof(k_headless_video_drivers) / sizeof(*k_headless_video_drivers); i++) {
+        if (driver && SDL_strcasecmp(driver, k_headless_video_drivers[i]) == 0) {
+            fprintf(stderr, "render: SDL video driver '%s' has no visible output\n", driver);
+            SDL_Quit();
+            return -1;
+        }
+    }
+    fprintf(stderr, "render: SDL video driver '%s'\n", driver ? driver : "?");
+    g_display_open = true;
+    return 0;
+}
+
+void md_renderer_close_display(void) {
+    if (!g_display_open)
+        return;
+    SDL_Quit();
+    g_display_open = false;
+}
+
 MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *title) {
+    if (md_renderer_open_display() < 0)
+        return NULL;
     MdRenderer *r = calloc(1, sizeof(MdRenderer));
     if (!r) return NULL;
-
-    /* Initialize SDL video subsystem (idempotent if already done) */
-    if (SDL_WasInit(SDL_INIT_VIDEO) == 0) {
-        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-            fprintf(stderr, "render: SDL_Init failed: %s\n", SDL_GetError());
-            free(r);
-            return NULL;
-        }
-        r->sdl_inited = true;
-    }
 
     /* Create window — resizable, initially at the given dimensions */
     r->window = SDL_CreateWindow(
@@ -100,7 +127,6 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
 
     if (!r->window) {
         fprintf(stderr, "render: SDL_CreateWindow failed: %s\n", SDL_GetError());
-        if (r->sdl_inited) SDL_Quit();
         free(r);
         return NULL;
     }
@@ -117,10 +143,13 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
     if (!r->sdl_renderer) {
         fprintf(stderr, "render: SDL_CreateRenderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(r->window);
-        if (r->sdl_inited) SDL_Quit();
         free(r);
         return NULL;
     }
+    SDL_RendererInfo info;
+    if (SDL_GetRendererInfo(r->sdl_renderer, &info) == 0)
+        fprintf(stderr, "render: SDL renderer '%s' (%s)\n", info.name,
+                (info.flags & SDL_RENDERER_ACCELERATED) ? "accelerated" : "software");
 
     /* Set scaling quality to linear for smooth resize */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
@@ -307,8 +336,6 @@ void md_renderer_destroy(MdRenderer *r) {
         SDL_DestroyRenderer(r->sdl_renderer);
     if (r->window)
         SDL_DestroyWindow(r->window);
-    if (r->sdl_inited)
-        SDL_Quit();
 
     free(r);
 }

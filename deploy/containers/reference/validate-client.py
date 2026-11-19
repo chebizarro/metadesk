@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """md-ah9.11 container client qualification (rootless Podman); see client-validation.md.
+Updated by md-rk4 (no stdbuf: both binaries line-buffer stdout) and md-33e (GUI
+mode without a granted display must refuse before any signer or session work).
 
 Each cell starts a fresh Tier B Sway/xdpw host container (it captures only its
 own isolated output; the host has a single startup negotiation) and a client
@@ -12,7 +14,8 @@ npub-derived address. This is not a FIPS daemon or encrypted-transport receipt.
 
 Cells: decode-only (headless) with stranger and legacy direct-IP negatives;
 GUI into a private Sway display (authorized socket) and GUI without a granted
-display. Never mounts a host display, session bus or runtime directory.
+display (fail-closed refusal). Never mounts a host display, session bus or
+runtime directory.
 """
 import argparse
 import ipaddress
@@ -184,8 +187,8 @@ class Run:
         # Content generator for the private output only, so capture has damage.
         script = ("( while :; do for c in 204060 603020 206040 402060; do "
                   "swaymsg -q output HEADLESS-1 bg \"#$c\" solid_color || exit 0; sleep 0.1; done; done ) & "
-                  # Line-buffer: without a TTY the binaries block-buffer stdout (as in access_session_e2e).
-                  f"exec stdbuf -oL -eL /opt/metadesk/bin/metadesk-host --bind {ula} --port {PORT} --relay {self.relay} "
+                  # No stdbuf: the host line-buffers its own stdout (md-rk4).
+                  f"exec /opt/metadesk/bin/metadesk-host --bind {ula} --port {PORT} --relay {self.relay} "
                   "--no-input --capture-unattended \"$@\"")
         r = self.a.render_node
         args = ["--network", self.net, "--ip6", ula, *SANDBOX, "--memory", "768m",
@@ -196,19 +199,23 @@ class Run:
         name, logs = self.start(f"host-{cell}", args, self.a.video_image,
                                 ["sh", "-c", script, "host", *self.bunker("host")])
         ready = logs.wait(r"nostr bridge ready, waiting for session requests", 90)
-        check(f"{cell}: host negotiation ready", bool(ready), name)
+        # The line must arrive while the host waits, not when it exits (md-rk4).
+        running = podman("inspect", "-f", "{{.State.Running}}", name, check_rc=False).stdout.strip()
+        check(f"{cell}: host negotiation ready (logged while running, no stdbuf)",
+              bool(ready) and running == "true", f"{name} running={running}")
         return name, logs
 
-    def client(self, cell, role, image, extra, client_args):
+    def client(self, cell, role, image, extra, client_args, negotiates=True):
+        """negotiates=False: the client is expected to stop before any
+        signer, relay or FIPS control use (no show_peers query expected)."""
         args = ["--network", self.net, *SANDBOX, "--memory", "768m",
                 "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777",
                 "--tmpfs", "/run/user/1000:rw,nosuid,nodev,mode=0700,U", *extra,
-                "--entrypoint", "stdbuf"]
-        client_args = ["-oL", "-eL", "/opt/metadesk/bin/metadesk-client", *client_args]
+                "--entrypoint", "/opt/metadesk/bin/metadesk-client"]  # no stdbuf (md-rk4)
         if role:
             args += ["-v", f"{self.w}/sock/fips:/run/fips:rw"]
             client_args = [*client_args, *self.bunker(role)]
-            self.npub_clients += 1
+            self.npub_clients += negotiates
         return self.start(f"client-{cell}", args, image, client_args)
 
     def npub_args(self, timeout=15000):
@@ -305,6 +312,8 @@ def main():
         dec, dlogs = run.client("decode", "client", a.decode_image, [], [*run.npub_args(), "--no-display"])
         run.host_media("decode", hlogs)
         run.stream("decode", dlogs, display_expected=False)
+        size = dlogs.wait(r"client: decoded frame size (\d+)x(\d+)", 5)
+        check("decode: client logged decoded frame size", bool(size), size[0] if size else "")
         try:
             (caps, ro) = sandbox_receipt("decode", dec)
         except RuntimeError as e:
@@ -350,10 +359,12 @@ def main():
                                  "-e", "LIBGL_ALWAYS_SOFTWARE=1"], run.npub_args())
         run.host_media("gui", hlogs)
         run.stream("gui", glogs, display_expected=True)
-        check("gui: SDL renderer created on the granted socket",
-              glogs.has(r"client: receiving stream") and not glogs.has(r"SDL2 renderer unavailable|render: "
-                                                                      r"SDL_(Init|CreateWindow|CreateRenderer) failed"),
-              "; ".join(line for line in glogs.lines if line.startswith("render:"))[:200])
+        check("gui: client logged wayland video driver, SDL renderer and frame size",
+              glogs.has(r"client: receiving stream") and glogs.has(r"^render: SDL video driver 'wayland'$")
+              and glogs.has(r"^render: SDL renderer '\w+'") and glogs.has(r"client: decoded frame size \d+x\d+")
+              and not glogs.has(r"render: SDL_(Init|CreateWindow|CreateRenderer) failed|no visible output"),
+              "; ".join(line for line in glogs.lines
+                        if line.startswith("render:") or "frame size" in line)[:240])
         tree = json.loads(podman("exec", display, "sh", "-c",
                                  ". /run/metadesk/session.env; swaymsg -t get_tree").stdout)
         def views(node):
@@ -368,39 +379,24 @@ def main():
         run.finish_client("gui", gui, display_expected=True)
         run.finish_host("gui", host)
 
-        # No display granted, default environment: SDL may pick a headless driver.
-        run.fresh_relay("gui-nodisplay")
-        host, hlogs = run.host("gui-nodisplay")
-        nod, nlogs = run.client("gui-nodisplay", "client", a.gui_image, [], run.npub_args())
-        run.host_media("gui-nodisplay", hlogs)
-        stats = run.stream("gui-nodisplay", nlogs, display_expected=True)
-        egl = podman("exec", nod, "sh", "-c", "for p in /proc/[0-9]*; do [ \"$(cat $p/comm)\" = metadesk-client ] && "
-                     "grep -c libEGL_mesa $p/maps; done; ls -A /run/user/1000 | wc -l", check_rc=False).stdout.split()
-        check("gui-nodisplay: nothing granted (no socket, no display env)", egl[-1:] == ["0"],
-              f"runtime entries={egl[-1:]}")
-        results.append({"check": "gui-nodisplay: display authorization result", "result": "INFO",
-                        "detail": "no display granted, yet the client reports displayed frames into SDL's "
-                                  f"headless EGL fallback (libEGL_mesa maps={egl[:1]}): "
-                                  + (stats[0] if stats else "no stats") + "; no visible output exists"})
-        run.finish_client("gui-nodisplay", nod, display_expected=True)
-        run.finish_host("gui-nodisplay", host)
-
-        # No display granted, Wayland required: SDL refuses and the client drops to decode-only.
-        run.fresh_relay("gui-strict")
-        host, hlogs = run.host("gui-strict")
-        strict, slogs = run.client("gui-strict", "client", a.gui_image, ["-e", "SDL_VIDEODRIVER=wayland"],
-                                   run.npub_args())
-        sdl = slogs.wait(r"render: SDL_Init failed: (.*)", 60)
-        fallback = slogs.wait(r"WARNING: SDL2 renderer unavailable, decode-only mode", 10)
-        check("gui-strict: SDL_VIDEODRIVER=wayland without a socket -> SDL init refused", bool(sdl),
-              sdl[0] if sdl else "")
-        run.host_media("gui-strict", hlogs)
-        run.stream("gui-strict", slogs, display_expected=False)
-        results.append({"check": "gui-strict: display authorization result", "result": "INFO",
-                        "detail": "refused display -> client continued decode-only, exit 0 (fails open to "
-                                  "decode, not closed): " + (fallback[0] if fallback else "no fallback line")})
-        run.finish_client("gui-strict", strict, display_expected=False)
-        run.finish_host("gui-strict", host)
+        # No display granted: GUI mode refuses before any signer, relay or
+        # session work (md-33e); it never falls back to offscreen or decode-only.
+        # Same image, sandbox and argv as the granted cell; only the grant differs.
+        for cell, extra, refusal in (
+                ("gui-nodisplay", [], r"render: SDL video driver '(\w+)' has no visible output|"
+                                      r"render: SDL_Init failed: .*"),
+                ("gui-strict", ["-e", "SDL_VIDEODRIVER=wayland"], r"render: SDL_Init failed: .*")):
+            name, logs = run.client(cell, "client", a.gui_image, extra, run.npub_args(), negotiates=False)
+            code = int(podman("wait", name, timeout=60).stdout.strip() or -1)
+            logs.wait(r"$^", 5)  # drain: returns once `logs -f` reaches EOF
+            why = logs.wait(refusal, 0)
+            check(f"{cell}: no display granted -> GUI refused, exit 1",
+                  code == 1 and bool(why) and logs.has(r"ERROR: no usable display for the GUI client"),
+                  f"exit={code}; {why[0] if why else 'no refusal reason'}")
+            check(f"{cell}: refused before signer, relay or session work",
+                  not logs.has(r"NIP-46 bunker|signer ready|session request|connecting|"
+                               r"receiving stream|decode-only mode|decoded="),
+                  "; ".join(logs.lines[-3:])[:200])
     except Incomplete:
         check("qualification ran every cell", False, "stopped after a failed prerequisite")
     finally:

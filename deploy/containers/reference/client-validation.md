@@ -8,6 +8,13 @@ session negotiation over a private relay with throwaway keys. The decode-only
 **separately** below. Driver result: **73/73 checks**, 79 s, aggregate exit 0
 (final run after review hardening; the prior run was 69/69).
 
+**Re-run for md-rk4 + md-33e** (2026-11-18, same VM and pins, master `66c1886`
+plus the fix): **44/44 checks**, 53 s, exit 0, with images built from this tree
+(`rk4-*` tags). The driver no longer uses `stdbuf`, and the two no-display GUI
+cells are now clean refusals. They stop before any host, relay or signer work,
+so they need no host or fixture of their own; that is why there are fewer
+checks.
+
 Scope boundary: the FIPS control endpoint is a **fixture** and TCP crosses a
 TUN-less IPv6 container bridge to the host's npub-derived address. This is not
 a FIPS daemon, mesh or encrypted-transport receipt; that is **md-ah9.6**.
@@ -94,12 +101,16 @@ dir, with `WAYLAND_DISPLAY` set. Each sub-cell uses a fresh host and relay.
 
 | Display grant | Result |
 |---|---|
-| **Granted socket** (`SDL_VIDEODRIVER=wayland`) | PASS: SDL renderer on the socket; `decoded=96 displayed=96`; Sway tree shows a visible `xdg_shell` view `app_id=metadesk-client`, `name=metadesk`, 1920×1055 on `HEADLESS-1`; SIGTERM exit 0, `displayed 100` |
-| **Nothing granted**, default env | **Fails open, invisible**: SDL silently picks its `offscreen` EGL driver (Mesa loaded, `libEGL_mesa` mapped). Client reports `displayed=96`, exit 0. No socket or env existed, so nothing was visible. **md-33e** |
-| **Nothing granted**, `SDL_VIDEODRIVER=wayland` | Refused: `render: SDL_Init failed: wayland not available` → `WARNING: SDL2 renderer unavailable, decode-only mode`, `displayed=0`, decoding continues, exit 0. Fails open to decode, not closed. **md-33e** |
+| **Granted socket** (`SDL_VIDEODRIVER=wayland`) | PASS: client logs `render: SDL video driver 'wayland'`, `render: SDL renderer 'opengl' (accelerated)`, `client: decoded frame size 1920x1080`; `decoded=96 displayed=96`; Sway tree shows a visible `xdg_shell` view `app_id=metadesk-client`, `name=metadesk`, 1920×1055 on `HEADLESS-1`; SIGTERM exit 0, `displayed 100` |
+| **Nothing granted**, default env | PASS (refused, md-33e fixed): `render: SDL video driver 'offscreen' has no visible output` → `ERROR: no usable display for the GUI client; grant a display or use --no-display for decode-only`, exit 1. No bunker connect, relay, FIPS control query or session request (`show_peers` counted only the granted client). *Before:* SDL silently used `offscreen` (Mesa EGL), reported `displayed=96`, exit 0, nothing visible. |
+| **Nothing granted**, `SDL_VIDEODRIVER=wayland` | PASS (refused, md-33e fixed): `render: SDL_Init failed: wayland not available` → the same `ERROR`, exit 1, before any signer or session work. *Before:* `WARNING: SDL2 renderer unavailable, decode-only mode`, decoding continued, exit 0. |
 
-So the `displayed` counter is not evidence of a visible window. Require
-`SDL_VIDEODRIVER=wayland` and check the compositor tree, as this driver does.
+The client refuses SDL's headless video drivers (`offscreen`, `dummy`,
+`evdev`), and it checks the display at startup, before signer or session work.
+A window or renderer failure after connecting is also fatal (exit 1). Only
+explicit `--no-display` decodes without a window. The `displayed` counter
+still counts frames handed to SDL, so the driver keeps checking the
+compositor tree for a visible view.
 Wayland authorization is socket access alone; the private socket here is
 mode 0700 and owned by the keep-ID user.
 
@@ -120,13 +131,17 @@ adding `libopengl0=1.7.0-1build1` fixed the default path, which then picks
   from relay history. On a retained-history relay, the second negotiation
   accepted the previous session's ID, and the host correctly failed it
   closed (`rejected unproven client #1`). Fresh relays per cell avoid it.
-- **md-33e (P3, bug):** GUI display authorization fails open and is
-  unobservable: no selected-driver or frame-dimension logging; SDL GL crash
-  fallback.
-- **md-rk4 (P3, bug):** both binaries block-buffer stdout without a TTY.
-  `podman logs` showed `waiting for session requests` only after the host's
-  60 s request timeout. The driver uses `stdbuf -oL -eL`, like
-  `tests/access_session_e2e.py`.
+- **md-33e (P3, bug, fixed):** GUI display authorization failed open and was
+  unobservable. GUI mode now fails closed (above) and logs the SDL video
+  driver, the renderer and the decoded frame size. The SDL `opengl` crash
+  without `libOpenGL.so.0` is still handled by packaging (`libopengl0`); a
+  client-side GLES2 fallback is follow-up **md-rnc**.
+- **md-rk4 (P3, bug, fixed):** both binaries block-buffered stdout without a
+  TTY. `podman logs` showed `waiting for session requests` only after the
+  host's 60 s request timeout. Both now line-buffer stdout: the client at
+  startup, the host only in video mode, because MCP stdio owns fd 1. The host
+  cell checks that the readiness line arrives while the host is running. The
+  driver and `tests/access_session_e2e.py` no longer use `stdbuf`.
 - Saved NIP-46 accounts would need a Secret Service, and Tier B's
   `sway-session.sh` deliberately replaces the session bus with its private
   portal bus. So explicit `--bunker` was used rather than editing Tier B
@@ -200,3 +215,9 @@ task Podman API service, the bundle/build tree, throwaway keys and `~/wt-cont`
 were removed. Only the shared Ubuntu base image remained. VM free disk:
 9.0 GB at start, 6.0 GB lowest, **7.4 GB** at the end (`df -h /`). Other agents
 shared the VM, and it never went below 3 GB. GNOME was never touched.
+
+md-rk4/md-33e re-run: the `rk4-*` images (removed by exact tag), the bundle and
+build trees, throwaway keys and `~/wt-rk4` were removed, and the driver removed
+its containers and network. VM free disk was 7.4 GB at start, 6.3 GB lowest and
+7.3 GB at the end. GNOME was never touched; host-side SDL probes forced
+`dummy`/`offscreen` or pointed `XDG_RUNTIME_DIR` away from the session.

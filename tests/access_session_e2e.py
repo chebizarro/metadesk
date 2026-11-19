@@ -89,7 +89,8 @@ def inside(host, client, bunker, root):
         def launch(name, args, target):
             ready = threading.Event()
             logs[name] = []
-            p = subprocess.Popen(["stdbuf", "-oL", "-eL", *args], env=env, stdout=subprocess.PIPE,
+            p = subprocess.Popen(args, env=env,  # binaries line-buffer stdout (md-rk4)
+                                 stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True)
             children.append(p)
             def read():
