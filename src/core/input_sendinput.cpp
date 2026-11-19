@@ -113,12 +113,16 @@ static const KeyMapEntry key_map[] = {
     { 0, 0 } /* sentinel */
 };
 
-static WORD linux_key_to_vk(uint32_t keysym) {
+/* "Not found" is the return value, never an in-band keycode (same
+ * convention as input_cgevent.m, where keycode 0 is a real key). */
+static bool linux_key_to_vk(uint32_t keysym, WORD *vk) {
     for (const KeyMapEntry *m = key_map; m->linux_key != 0; m++) {
-        if (m->linux_key == keysym)
-            return m->vk;
+        if (m->linux_key == keysym) {
+            *vk = m->vk;
+            return true;
+        }
     }
-    return 0;
+    return false;
 }
 
 /* Check if keysym is an extended key (needs KEYEVENTF_EXTENDEDKEY) */
@@ -203,35 +207,29 @@ static int si_mouse_button(MdInputCtx *ctx, int button, int pressed) {
     return (SendInput(1, &input, sizeof(INPUT)) == 1) ? 0 : -1;
 }
 
+/* One wheel event: positive is up (WHEEL) or right (HWHEEL), as in the HAL. */
+static bool si_wheel(DWORD flag, int detents) {
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = flag;
+    input.mi.mouseData = (DWORD)(detents * WHEEL_DELTA);
+    return SendInput(1, &input, sizeof(INPUT)) == 1;
+}
+
 static int si_mouse_scroll(MdInputCtx *ctx, int dx, int dy) {
     (void)ctx;
-
-    /* Vertical scroll */
-    if (dy != 0) {
-        INPUT input = {};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        input.mi.mouseData = (DWORD)(dy * WHEEL_DELTA);
-        SendInput(1, &input, sizeof(INPUT));
-    }
-
-    /* Horizontal scroll */
-    if (dx != 0) {
-        INPUT input = {};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        input.mi.mouseData = (DWORD)(dx * WHEEL_DELTA);
-        SendInput(1, &input, sizeof(INPUT));
-    }
-
-    return 0;
+    /* Both axes are attempted; either one failing fails the call. */
+    bool ok = true;
+    if (dy != 0) ok = si_wheel(MOUSEEVENTF_WHEEL, dy) && ok;
+    if (dx != 0) ok = si_wheel(MOUSEEVENTF_HWHEEL, dx) && ok;
+    return ok ? 0 : -1;
 }
 
 static int si_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
     (void)ctx;
 
-    WORD vk = linux_key_to_vk(keysym);
-    if (vk == 0) {
+    WORD vk = 0;
+    if (!linux_key_to_vk(keysym, &vk)) {
         MD_LOG_I("unknown keysym 0x%04x", keysym);
         return -1;
     }
@@ -261,9 +259,10 @@ static int si_type_text(MdInputCtx *ctx, const char *utf8) {
 
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wstr, wlen);
 
-    /* Send each character via KEYEVENTF_UNICODE.
-     * This bypasses keyboard layout and sends Unicode directly. */
-    for (int i = 0; i < wlen - 1; i++) { /* -1 to skip null terminator */
+    /* Send each UTF-16 unit via KEYEVENTF_UNICODE (layout independent).
+     * Stop at the first rejected injection, like every other primitive. */
+    int ret = 0;
+    for (int i = 0; i < wlen - 1 && ret == 0; i++) { /* -1 skips the NUL */
         INPUT inputs[2] = {};
 
         /* Key down */
@@ -276,12 +275,12 @@ static int si_type_text(MdInputCtx *ctx, const char *utf8) {
         inputs[1].ki.wScan = (WORD)wstr[i];
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
 
-        SendInput(2, inputs, sizeof(INPUT));
-        md_input_settle();
+        if (SendInput(2, inputs, sizeof(INPUT)) != 2) ret = -1;
+        else md_input_settle();
     }
 
     free(wstr);
-    return 0;
+    return ret;
 }
 
 static void si_destroy(MdInputCtx *ctx) {
@@ -293,6 +292,7 @@ static void si_destroy(MdInputCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+/* Positional: must match the MdInputBackend member order in input.h. */
 static const MdInputBackend sendinput_backend = {
     si_init,
     si_mouse_move,
@@ -301,6 +301,7 @@ static const MdInputBackend sendinput_backend = {
     si_key_event,
     si_type_text,
     si_destroy,
+    nullptr, /* is_ready: stateless, ctx->ready is set by init */
 };
 
 extern "C"

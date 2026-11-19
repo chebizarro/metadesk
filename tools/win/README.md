@@ -103,6 +103,41 @@ Reference numbers on the Win11 ARM64 VM (console session, medians):
 | Desktop, 281 nodes | 570-790 ms | 2.8-3.0x | 2.7-2.9x |
 | Desktop plus the 5000-item fixture | 1420 ms | | 660 ms (2.1x) |
 
+## DXGI capture and SendInput (md-7yc)
+
+```sh
+bash tools/win/build-media-harness.sh
+./build-win-media/test_sendinput_win.exe
+./build-win-media/test_capture_dxgi_win.exe                 # session 0 cell
+./build-win-media/test_capture_dxgi_win.exe --interactive   # console only
+```
+
+The script compiles `capture_dxgi.cpp` and `input_sendinput.cpp` with
+`-Wall -Wextra -Werror`.
+
+`test_sendinput_win.exe` replaces `SendInput` with a recorder in its own
+translation unit. It checks the INPUT records and the propagation of
+rejected injections. It never injects input, so it is safe in any session.
+Never aim real SendInput at the console: it moves the user's pointer and types
+into the user's applications.
+
+`test_capture_dxgi_win.exe` checks the capture HAL contract. In session 0,
+`init` fails cleanly (`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`). With
+`--interactive` it covers:
+
+- ERROR before start and after stop, returned promptly
+- IDLE versus frames within the timeout
+- frame fields and QPC-nanosecond timestamps
+- an unreleased frame reclaimed by the next call
+- access loss, then recovery through stop + start
+
+Desktop Duplication delivers no frames while the console display is powered
+off, which is the VM console's usual state. It also delivers none on a static
+desktop. The test therefore shows a 64x64 non-activating window that repaints
+on a timer. That window turns the display on (`SC_MONITORPOWER` sent to
+itself, plus `ES_DISPLAY_REQUIRED` while it lives). It then waits for
+`GUID_CONSOLE_DISPLAY_STATE` to report the display on.
+
 ## Real lock/disconnect qualification
 
 The normal liveness test injects provider errors at the root-call boundary and
@@ -134,7 +169,8 @@ probe detects a silent provider failure while idle. Loss is terminal: unlock or
 reconnect requires a new context. Owners must stop starting new API calls before
 destroy; admitted tree calls and late callback dispatch are drained internally.
 
-Also compile `src/core/a11y_uia.cpp` with MSVC ARM64 `/std:c++17 /W4 /WX /EHsc
-/permissive-`. Use real dependency headers or the VM's documented type-only
-pthread/cJSON stubs for this compile-only check. Do not define
-`WIN32_LEAN_AND_MEAN` (it breaks UIAutomationCore headers).
+Also compile `src/core/a11y_uia.cpp`, `capture_dxgi.cpp`, `input_sendinput.cpp`
+and the three Windows test translation units with MSVC ARM64
+`/std:c++17 /W4 /WX /EHsc /permissive-`. Use real dependency headers or the
+VM's type-only pthread/cJSON stubs for this compile-only check. Do not define
+`WIN32_LEAN_AND_MEAN` for the UIA files (it breaks UIAutomationCore headers).
