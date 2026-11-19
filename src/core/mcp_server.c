@@ -3,6 +3,7 @@
  * MCP server core — method routing, capability handshake, tool/resource dispatch.
  */
 #include "mcp_server.h"
+#include "session.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@ struct MdMcpServer {
      * dispatch owner may use this sink; other threads use write_fn. */
     MdMcpWriteFn     active_sink;
     void            *active_sink_ud;
+    uint32_t         active_caps; /* caller grant of the active dispatch */
 
     /* Registered tools */
     MdMcpTool        tools[MD_MCP_MAX_TOOLS];
@@ -148,12 +150,15 @@ static int handle_ping(MdMcpServer *s, const MdJsonRpcId *id)
     return send_json(s, md_jsonrpc_make_response(id, cJSON_CreateObject()));
 }
 
-static int handle_tools_list(MdMcpServer *s, const MdJsonRpcId *id)
+static int handle_tools_list(MdMcpServer *s, const MdJsonRpcId *id,
+                             uint32_t caller_caps)
 {
     cJSON *result = cJSON_CreateObject();
     cJSON *tools = cJSON_CreateArray();
 
     for (int i = 0; i < s->tool_count; i++) {
+        if (s->tools[i].required_caps & ~caller_caps)
+            continue;  /* not this principal's tool surface */
         cJSON *tool = cJSON_CreateObject();
         cJSON_AddStringToObject(tool, "name", s->tools[i].name);
         if (s->tools[i].description)
@@ -168,8 +173,32 @@ static int handle_tools_list(MdMcpServer *s, const MdJsonRpcId *id)
     return send_json(s, md_jsonrpc_make_response(id, result));
 }
 
+/* isError result naming each grant the caller lacks. */
+static cJSON *missing_grant_result(const char *tool, uint32_t missing)
+{
+    const char *names[8];
+    int n = md_caps_to_strings(missing, names, (int)(sizeof(names) / sizeof(names[0])));
+    char grants[64] = "";
+    for (int i = 0; i < n; i++) {
+        size_t used = strlen(grants);
+        snprintf(grants + used, sizeof(grants) - used, "%s'%s'", i ? ", " : "", names[i]);
+    }
+    char text[256];
+    snprintf(text, sizeof(text),
+             "Error: tool '%s' requires the %s grant, which this MCP principal lacks",
+             tool, n > 0 ? grants : "(unknown)");
+    cJSON *result = cJSON_CreateObject();
+    cJSON *content = cJSON_AddArrayToObject(result, "content");
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "type", "text");
+    cJSON_AddStringToObject(item, "text", text);
+    cJSON_AddItemToArray(content, item);
+    cJSON_AddBoolToObject(result, "isError", true);
+    return result;
+}
+
 static int handle_tools_call(MdMcpServer *s, const MdJsonRpcId *id,
-                             const cJSON *params)
+                             const cJSON *params, uint32_t caller_caps)
 {
     if (!params) {
         return send_error(s, id, MD_JSONRPC_INVALID_PARAMS, "Missing params");
@@ -192,6 +221,15 @@ static int handle_tools_call(MdMcpServer *s, const MdJsonRpcId *id,
     if (!tool) {
         return send_error(s, id, MD_JSONRPC_INVALID_PARAMS,
                           "Unknown tool");
+    }
+
+    /* Clients may call tools they were not listed: refuse before the
+     * handler runs, as a tool error rather than a protocol error. */
+    uint32_t missing = tool->required_caps & ~caller_caps;
+    if (missing) {
+        MD_LOG_I("refusing %s: caller lacks grant 0x%x", tool->name, missing);
+        return send_json(s, md_jsonrpc_make_response(
+            id, missing_grant_result(tool->name, missing)));
     }
 
     /* Extract arguments */
@@ -351,11 +389,13 @@ static int handle_resources_unsubscribe(MdMcpServer *s, const MdJsonRpcId *id,
 /* ── Main dispatch ───────────────────────────────────────────── */
 
 static int dispatch_message(MdMcpServer *server,
-                            const char *json, size_t len);
+                            const char *json, size_t len,
+                            uint32_t caller_caps);
 
-int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
-                                           const char *json, size_t len,
-                                           MdMcpWriteFn sink, void *sink_ud)
+int md_mcp_server_handle_message_as(MdMcpServer *server,
+                                    const char *json, size_t len,
+                                    MdMcpWriteFn sink, void *sink_ud,
+                                    uint32_t caller_caps)
 {
     if (!server || !json || len == 0)
         return -1;
@@ -366,17 +406,38 @@ int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
     server->dispatch_owner = pthread_self();
     server->active_sink = sink;
     server->active_sink_ud = sink_ud;
+    server->active_caps = caller_caps;
     pthread_mutex_unlock(&server->sink_mu);
 
-    int rc = dispatch_message(server, json, len);
+    int rc = dispatch_message(server, json, len, caller_caps);
 
     pthread_mutex_lock(&server->sink_mu);
     server->dispatch_active = false;
     server->active_sink = NULL;
     server->active_sink_ud = NULL;
+    server->active_caps = 0;
     pthread_mutex_unlock(&server->sink_mu);
     pthread_mutex_unlock(&server->dispatch_mu);
     return rc;
+}
+
+int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
+                                           const char *json, size_t len,
+                                           MdMcpWriteFn sink, void *sink_ud)
+{
+    return md_mcp_server_handle_message_as(server, json, len, sink, sink_ud,
+                                           MD_MCP_CALLER_ALL_CAPS);
+}
+
+uint32_t md_mcp_server_caller_caps(MdMcpServer *server)
+{
+    if (!server) return 0;
+    pthread_mutex_lock(&server->sink_mu);
+    uint32_t caps = server->dispatch_active &&
+                    pthread_equal(server->dispatch_owner, pthread_self())
+                        ? server->active_caps : 0;
+    pthread_mutex_unlock(&server->sink_mu);
+    return caps;
 }
 
 int md_mcp_server_handle_message(MdMcpServer *server,
@@ -389,7 +450,8 @@ int md_mcp_server_handle_message(MdMcpServer *server,
 /* Shared dispatch body — caller holds dispatch_mu and has set any
  * per-request sink. */
 static int dispatch_message(MdMcpServer *server,
-                            const char *json, size_t len)
+                            const char *json, size_t len,
+                            uint32_t caller_caps)
 {
     MdJsonRpcRequest req;
     MdJsonRpcParseResult prc = md_jsonrpc_parse_request(&req, json, len);
@@ -439,9 +501,9 @@ static int dispatch_message(MdMcpServer *server,
     if (strcmp(req.method, "ping") == 0) {
         rc = handle_ping(server, &req.id);
     } else if (strcmp(req.method, "tools/list") == 0) {
-        rc = handle_tools_list(server, &req.id);
+        rc = handle_tools_list(server, &req.id, caller_caps);
     } else if (strcmp(req.method, "tools/call") == 0) {
-        rc = handle_tools_call(server, &req.id, req.params);
+        rc = handle_tools_call(server, &req.id, req.params, caller_caps);
     } else if (strcmp(req.method, "resources/list") == 0) {
         rc = handle_resources_list(server, &req.id);
     } else if (strcmp(req.method, "resources/read") == 0) {
@@ -586,6 +648,7 @@ int md_mcp_server_register_tool(MdMcpServer *server, const MdMcpTool *tool)
     slot->input_schema = tool->input_schema;  /* takes ownership */
     slot->handler = tool->handler;
     slot->userdata = tool->userdata;
+    slot->required_caps = tool->required_caps;
     server->tool_count++;
 
     return 0;

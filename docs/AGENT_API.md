@@ -36,6 +36,12 @@ The host reads JSON-RPC 2.0 messages from stdin and writes responses to stdout, 
 
 All tools are prefixed with `metadesk_`. Read tools take a fresh accessibility snapshot; actions target accessibility node IDs.
 
+The action tools below exist only when the host has input: they are absent under
+`--no-input` or with no input backend. Over authenticated MCP HTTP they also
+need the caller's `input` grant. A host-allowlist principal granted only
+`agent` sees just the read tools, and an action call returns `isError` naming
+`input` (see [MCP HTTP authentication](mcp-auth.md#per-principal-tool-capabilities-md-5km)).
+
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
 | `metadesk_click` | Click a UI element | `target_id` |

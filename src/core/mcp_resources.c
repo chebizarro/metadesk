@@ -85,13 +85,16 @@ static cJSON *read_session_info(void *userdata)
         }
         cJSON_AddStringToObject(info, "state", state_str);
 
-        /* Capabilities */
+        /* Effective capabilities: what the host offers, narrowed to the
+         * requesting principal's grant (md-5km). */
+        uint32_t effective = ctx->session->capabilities &
+                             md_mcp_server_caller_caps(ctx->server);
         cJSON *caps = cJSON_CreateArray();
-        if (ctx->session->capabilities & MD_CAP_VIDEO)
+        if (effective & MD_CAP_VIDEO)
             cJSON_AddItemToArray(caps, cJSON_CreateString("video"));
-        if (ctx->session->capabilities & MD_CAP_AGENT)
+        if (effective & MD_CAP_AGENT)
             cJSON_AddItemToArray(caps, cJSON_CreateString("agent"));
-        if (ctx->session->capabilities & MD_CAP_INPUT)
+        if (effective & MD_CAP_INPUT)
             cJSON_AddItemToArray(caps, cJSON_CreateString("input"));
         cJSON_AddItemToObject(info, "capabilities", caps);
 

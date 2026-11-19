@@ -4,7 +4,9 @@
  * The production MCP HTTP server and the production host-allowlist NIP-98
  * source (src/host/mcp_nostr_acl.c: saved host role -> live kind-30000 REQ)
  * on loopback, without the accessibility/input backends a real desktop host
- * needs. Tools: "echo" and "notify" (broadcasts one SSE notification).
+ * needs. Tools, gated like the real ones (md-5km): "echo" and "notify"
+ * (broadcasts one SSE notification) need agent; "act" stands in for an
+ * action tool and needs agent+input.
  *
  * Usage: mcp_proxy_host_fixture RELAY_URL [--allow-npub NPUB]
  * Prints "PORT <n>" on stdout once listening; exits when stdin closes.
@@ -12,6 +14,7 @@
 #include "host_mcp.h"
 #include "mcp_http.h"
 #include "mcp_server.h"
+#include "session.h"
 #include "log.h"
 
 #include <cjson/cJSON.h>
@@ -68,6 +71,11 @@ static cJSON *notify_tool(const cJSON *args, bool *is_error, char **msg, void *u
     return text_result("notified");
 }
 
+static cJSON *act_tool(const cJSON *args, bool *is_error, char **msg, void *ud) {
+    (void)args; (void)is_error; (void)msg; (void)ud;
+    return text_result("acted");
+}
+
 static void *serve(void *arg) {
     md_mcp_http_run(arg);
     return NULL;
@@ -92,17 +100,23 @@ int main(int argc, char **argv) {
     MdMcpServerConfig scfg = { .server_name = "mcp-proxy-fixture", .server_version = "0" };
     MdMcpServer *server = md_mcp_server_create(&scfg);
     MdMcpTool echo = { .name = "echo", .description = "echo text",
-                       .input_schema = schema(), .handler = echo_tool };
+                       .input_schema = schema(), .handler = echo_tool,
+                       .required_caps = MD_CAP_AGENT };
     MdMcpTool notify = { .name = "notify", .description = "broadcast one notification",
-                         .input_schema = schema(), .handler = notify_tool };
+                         .input_schema = schema(), .handler = notify_tool,
+                         .required_caps = MD_CAP_AGENT };
+    MdMcpTool act = { .name = "act", .description = "stand-in action tool",
+                      .input_schema = schema(), .handler = act_tool,
+                      .required_caps = MD_CAP_AGENT | MD_CAP_INPUT };
     const char *npubs[] = { argc == 4 ? argv[3] : NULL };
     MdMcpHttpConfig hcfg = {
         .server = server, .ephemeral_port = true,
         .allow_npubs = npubs, .allow_npub_count = argc == 4 ? 1 : 0,
-        .nip98_authorize = host_mcp_acl_authorize, .nip98_authorize_userdata = acl,
+        .nip98_grant = host_mcp_acl_grant, .nip98_grant_userdata = acl,
     };
     if (!server || md_mcp_server_register_tool(server, &echo) ||
         md_mcp_server_register_tool(server, &notify) ||
+        md_mcp_server_register_tool(server, &act) ||
         !(g_http = md_mcp_http_create(&hcfg)) ||
         md_mcp_server_set_write_fn(server, md_mcp_http_write, g_http)) {
         fprintf(stderr, "fixture: setup failed\n");

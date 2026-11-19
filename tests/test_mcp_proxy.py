@@ -8,7 +8,10 @@ keys only; no user HOME/keyring/relay/desktop.
 
 Proves: fail-closed until EOSE; an agent-granted npub succeeds (responses
 and SSE notifications); unlisted and video-only npubs get 401; revocation
-and re-grant take effect on the running host without a restart.
+and re-grant take effect on the running host without a restart. md-5km:
+agent without input lists no action tool and gets isError naming input on
+call; adding/removing input applies to the next request; a static
+--allow-npub principal keeps the full tool surface.
 """
 import json
 import os
@@ -21,7 +24,7 @@ import threading
 import time
 sys.dont_write_bytecode = True
 from account_startup_fixture import Relay, Peer, PrivateUnixServer, matches
-from test_access_cli import Signer, HOST_PK, CLIENT_PK
+from test_access_cli import Signer, HOST_PK, CLIENT_PK, HOST_NPUB
 
 ALLOWLIST_FILTER = {"kinds": [30000], "authors": [HOST_PK],
                     "#d": ["metadesk-allowlist"], "limit": 1}
@@ -114,6 +117,32 @@ INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
 def call(proc, rid, tool, args=None):
     proc.send({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                "params": {"name": tool, "arguments": args or {}}})
+
+
+def tool_names(proc, rid):
+    proc.send({"jsonrpc": "2.0", "id": rid, "method": "tools/list"})
+    reply = json.loads(proc.line())
+    assert reply.get("id") == rid and "result" in reply, reply
+    return sorted(t["name"] for t in reply["result"]["tools"])
+
+
+def call_result(proc, rid, tool, args=None):
+    call(proc, rid, tool, args)
+    reply = json.loads(proc.line())
+    assert reply.get("id") == rid and "result" in reply, reply  # never a protocol error
+    return reply["result"]
+
+
+def expect_refused(proc, rid, tool):
+    result = call_result(proc, rid, tool)
+    text = result["content"][0]["text"]
+    assert result.get("isError") is True and "requires the 'input' grant" in text, result
+    return text
+
+
+def expect_acted(proc, rid):
+    result = call_result(proc, rid, "act")
+    assert not result.get("isError") and result["content"][0]["text"] == "acted", result
 
 
 def expect_401(proc, rid):
@@ -214,6 +243,12 @@ def main():
             assert json.loads(agent.line())["error"]["code"] == -32700
             print("PASS: agent-granted npub: initialize, tools, ping, SSE notification")
 
+            # 2b. agent without input: no action tool listed; calling it anyway
+            # is a tool error naming the missing grant (md-5km).
+            assert tool_names(agent, 20) == ["echo", "notify"]
+            expect_refused(agent, 21, "act")
+            print("PASS: agent-only grant hides action tools and refuses calls naming 'input'")
+
             # 3. Unlisted and video-only npubs get 401 (exit cleanly on EOF).
             for name in ("stranger", "video"):
                 other = Proc([host, "mcp-proxy", "--key-file", keys[name], url], env, name)
@@ -236,7 +271,20 @@ def main():
             call(agent, 6, "echo", {"text": "regranted"})
             reply = json.loads(agent.line())
             assert reply["id"] == 6 and reply["result"]["content"][0]["text"] == "regranted", reply
+            expect_refused(agent, 7, "act")
             print("PASS: revocation and re-grant apply live on the running host")
+
+            # 4b. Granting input enables actions on the next request; removing
+            # it disables them again, with no restart or reconnect (md-5km).
+            publish(relay, sign(crypto, env, grants("v1:agent,input"), now + 3))
+            hostp.expect_err("host allowlist updated (v4): 2 member(s), 1 with agent (1 also input)")
+            assert tool_names(agent, 8) == ["act", "echo", "notify"]
+            expect_acted(agent, 9)
+            publish(relay, sign(crypto, env, grants("v1:agent"), now + 4))
+            hostp.expect_err("host allowlist updated (v5): 2 member(s), 1 with agent (0 also input)")
+            expect_refused(agent, 10, "act")
+            assert tool_names(agent, 11) == ["echo", "notify"]
+            print("PASS: input grant/removal gates action tools on the next request")
 
             rc, elapsed = agent.close()
             assert rc == 0 and elapsed < 5, (rc, elapsed, agent.log)
@@ -255,11 +303,33 @@ def main():
 
             rc, _ = hostp.close()
             assert rc == 0, hostp.log
-            # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap REQ.
+
+            # 6. Static --allow-npub principal: full tool surface (documented
+            # operator credential), although its live grant is video-only.
+            statp = Proc([fixture, url_relay, "--allow-npub", HOST_NPUB], env, "static-fixture")
+            procs.append(statp)
+            sport = int(statp.line().split()[1])
+            statp.expect_err("host allowlist loaded")
+            static = Proc([host, "mcp-proxy", "--key-file", keys["video"], "--no-sse",
+                           f"http://[::1]:{sport}/mcp"], env, "static")
+            procs.append(static)
+            static.send(INIT)
+            assert json.loads(static.line())["result"]["serverInfo"]["name"] == "mcp-proxy-fixture"
+            static.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            assert tool_names(static, 2) == ["act", "echo", "notify"]
+            expect_acted(static, 3)
+            rc, _ = static.close()
+            assert rc == 0, static.log
+            rc, _ = statp.close()
+            assert rc == 0, statp.log
+            print("PASS: static --allow-npub principal keeps action tools")
+
+            # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap REQ;
+            # one REQ/EOSE per host fixture run.
             with relay.lock:
                 assert relay.filters and all(f == ALLOWLIST_FILTER for f in relay.filters), relay.filters
-                assert relay.reqs == relay.eoses == 1, (relay.reqs, relay.eoses)
-            print("Private relay: 1 REQ/EOSE (allowlist only), live EVENT pushes; throwaway keys")
+                assert relay.reqs == relay.eoses == 2, (relay.reqs, relay.eoses)
+            print("Private relay: 1 REQ/EOSE per host (allowlist only), live EVENT pushes; throwaway keys")
         finally:
             relay.history_release.set()
             for proc in procs:

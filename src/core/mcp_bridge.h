@@ -64,9 +64,9 @@ typedef struct {
     const char *const *http_allow_npubs;
     size_t        http_allow_npub_count;
     const char   *http_allow_file;
-    /* Live NIP-98 authorizer; see MdMcpHttpConfig.nip98_authorize. */
-    bool        (*http_nip98_authorize)(const char *pubkey_hex, void *userdata);
-    void         *http_nip98_authorize_userdata;
+    /* Live NIP-98 grant source; see MdMcpHttpConfig.nip98_grant. */
+    uint32_t    (*http_nip98_grant)(const char *pubkey_hex, void *userdata);
+    void         *http_nip98_grant_userdata;
 } MdMcpBridgeConfig;
 
 /* Create the full MCP bridge: MdSession + MdAgent + MdMcpServer +

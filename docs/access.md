@@ -98,7 +98,10 @@ stream. Dynamic revocation/renegotiation remains P3.8 work.
 
 The same list can also authorize NIP-98 MCP HTTP agents: run the host with
 `--mcp-http --mcp-allow-host-list`, and an `agent` grant admits that npub live,
-without a restart. See [MCP HTTP authentication](mcp-auth.md).
+without a restart. As in sessions, MCP action tools also need `input`: an
+`agent`-only MCP principal gets the read tools, and its action calls are
+refused with an error naming `input`. Unlike sessions, a grant change applies to the
+next MCP request. See [MCP HTTP authentication](mcp-auth.md#per-principal-tool-capabilities-md-5km).
 
 Unknown, failed and loaded-empty lists deny admission. **No open/dev mode was
 added.** A loopback-only, loudly warned opt-in can be revisited on request; it is

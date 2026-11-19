@@ -13,6 +13,7 @@
  * SSE client capacity is configurable.
  */
 #include "mcp_http.h"
+#include "session.h"
 #define MD_LOG_TAG "mcp-http"
 #include "log.h"
 #include <fcntl.h>
@@ -70,10 +71,12 @@ typedef struct {
     char pubkey[65];
 } SseClient;
 
-/* Who a request authenticated as; pubkey is empty for bearer/open access. */
+/* Who a request authenticated as; pubkey is empty for bearer/open access.
+ * caps is that principal's effective grant for this request only. */
 typedef struct {
     bool live_auth;
     char pubkey[65];
+    uint32_t caps;
 } AuthResult;
 
 struct MdMcpHttp {
@@ -95,8 +98,8 @@ struct MdMcpHttp {
     size_t          public_url_count;
     char          (*allowed_keys)[65];
     size_t          allowed_key_count;
-    bool          (*authorize)(const char *pubkey_hex, void *userdata);
-    void           *authorize_ud;
+    uint32_t      (*grant)(const char *pubkey_hex, void *userdata);
+    void           *grant_ud;
     AuthReplay      replay[AUTH_REPLAY_CAPACITY];
     pthread_mutex_t auth_mu;
 
@@ -379,7 +382,7 @@ static bool add_npub(MdMcpHttp *h, const char *npub)
 
 static bool nip98_enabled(const MdMcpHttp *h)
 {
-    return h->allowed_key_count || h->authorize;
+    return h->allowed_key_count || h->grant;
 }
 
 static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
@@ -442,8 +445,8 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
          * a silent fallback to unauthenticated loopback service. */
         if (!valid || !h->allowed_key_count) return false;
     }
-    h->authorize = cfg->nip98_authorize;
-    h->authorize_ud = cfg->nip98_authorize_userdata;
+    h->grant = cfg->nip98_grant;
+    h->grant_ud = cfg->nip98_grant_userdata;
     if (!h->token && !nip98_enabled(h)) {
         if (cfg->bind_addr && !loopback_host(cfg->bind_addr)) {
             MD_LOG_E("non-loopback MCP HTTP bind requires credentials");
@@ -472,16 +475,28 @@ static bool signed_url_allowed(MdMcpHttp *h, const char *url)
     return false;
 }
 
+/* The live source's current grant for pk, or 0 unless it admits (agent). */
+static uint32_t live_grant(MdMcpHttp *h, const char *pk)
+{
+    uint32_t caps = h->grant ? h->grant(pk, h->grant_ud) : 0;
+    return (caps & MD_CAP_AGENT) ? caps : 0;
+}
+
 static bool authenticate(MdMcpHttp *h, const HttpRequest *req, AuthResult *who)
 {
     *who = (AuthResult){0};
     if (req->bad_auth) return false;
+    /* Operator-configured credentials (no credential on loopback, the bearer
+     * token, the static npub set) carry no grant vocabulary: full caps,
+     * still subject to host policy (--no-input, input readiness). */
+    who->caps = MD_MCP_CALLER_ALL_CAPS;
     if (!h->token && !nip98_enabled(h)) return true;
     if (h->token && strncasecmp(req->authorization, "Bearer ", 7) == 0) {
         const char *token = req->authorization + 7;
         return strlen(token) == strlen(h->token) &&
             CRYPTO_memcmp(token, h->token, strlen(h->token)) == 0;
     }
+    who->caps = 0;
     if (!nip98_enabled(h)) return false;
     NostrEvent *event = NULL;
     if (nostr_nip98_parse_auth_header(req->authorization, &event) != NOSTR_NIP98_OK)
@@ -503,7 +518,8 @@ static bool authenticate(MdMcpHttp *h, const HttpRequest *req, AuthResult *who)
     bool allowed = false;
     for (size_t i = 0; ok && pk && i < h->allowed_key_count; i++)
         if (strcmp(pk, h->allowed_keys[i]) == 0) { allowed = true; break; }
-    if (ok && pk && !allowed && h->authorize && h->authorize(pk, h->authorize_ud)) {
+    if (allowed) who->caps = MD_MCP_CALLER_ALL_CAPS;
+    if (ok && pk && !allowed && (who->caps = live_grant(h, pk)) != 0) {
         allowed = true;
         who->live_auth = true;
     }
@@ -801,9 +817,10 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             /* Dispatch to MCP server with a per-request capture sink —
              * this request's response(s) come back through it. */
             HttpResponseCapture capture = {0};
-            md_mcp_server_handle_message_with_sink(h->mcp_server,
-                                                   req.body, req.body_len,
-                                                   http_capture_write, &capture);
+            md_mcp_server_handle_message_as(h->mcp_server,
+                                            req.body, req.body_len,
+                                            http_capture_write, &capture,
+                                            who.caps);
 
             char *resp = capture_take_body(&capture);
             bool capture_failed = capture.failed;
@@ -940,8 +957,7 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
         c->sent = 0;
         /* A live-list grant can be revoked while the stream is open: the
          * next notification is withheld and the stream closed. */
-        c->revoked = c->ready && c->live_auth &&
-            !(http->authorize && http->authorize(c->pubkey, http->authorize_ud));
+        c->revoked = c->ready && c->live_auth && !live_grant(http, c->pubkey);
         c->failed = c->revoked;
         if (c->revoked) revoked++;
         bool deliver = c->ready && !c->failed;

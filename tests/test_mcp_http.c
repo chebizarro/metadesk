@@ -9,6 +9,7 @@
 #include "md_mcp_fixture.h"
 #include "mcp_http.h"
 #include "jsonrpc.h"
+#include "session.h"
 #include <nostr-event.h>
 #include <nostr-keys.h>
 #include <nostr/nip98/nip98.h>
@@ -28,6 +29,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include "md_test.h"
 
 
@@ -1211,24 +1213,32 @@ static const char auth_sk2[] = "000000000000000000000000000000000000000000000000
 typedef struct {
     pthread_mutex_t mu;
     char allowed[65];   /* empty: source not ready / nobody granted */
+    uint32_t caps;      /* the allowed key's grant */
     unsigned calls;
 } LiveAcl;
 
-static bool live_acl_authorize(const char *pk, void *ud)
+static uint32_t live_acl_grant(const char *pk, void *ud)
 {
     LiveAcl *acl = ud;
     pthread_mutex_lock(&acl->mu);
     acl->calls++;
-    bool ok = acl->allowed[0] && strcmp(pk, acl->allowed) == 0;
+    uint32_t caps = acl->allowed[0] && strcmp(pk, acl->allowed) == 0 ? acl->caps : 0;
     pthread_mutex_unlock(&acl->mu);
-    return ok;
+    return caps;
 }
 
-static void live_acl_set(LiveAcl *acl, const char *pk)
+static void live_acl_set_caps(LiveAcl *acl, const char *pk, uint32_t caps)
 {
     pthread_mutex_lock(&acl->mu);
     snprintf(acl->allowed, sizeof(acl->allowed), "%s", pk ? pk : "");
+    acl->caps = caps;
     pthread_mutex_unlock(&acl->mu);
+}
+
+/* Grant pk "agent" (NULL revokes everyone). */
+static void live_acl_set(LiveAcl *acl, const char *pk)
+{
+    live_acl_set_caps(acl, pk, MD_CAP_AGENT);
 }
 
 static unsigned live_acl_calls(LiveAcl *acl)
@@ -1320,7 +1330,7 @@ static void test_live_authorizer(void)
 
     /* The live source alone is a credential: non-loopback binds may start. */
     MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .bind_addr = "0.0.0.0",
-        .nip98_authorize = live_acl_authorize, .nip98_authorize_userdata = &acl };
+        .nip98_grant = live_acl_grant, .nip98_grant_userdata = &acl };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     MD_CHECK(http != NULL);
     md_mcp_http_destroy(http);
@@ -1437,6 +1447,230 @@ static void test_live_authorizer(void)
     PASS("live NIP-98 authorizer: fail-closed, live grant/revoke, SSE drop, static union");
 }
 
+/* ── Per-principal tool capabilities (md-5km) ─────────────────── */
+
+static atomic_int act_calls;
+
+static cJSON *caps_text(const char *text)
+{
+    cJSON *content = cJSON_CreateArray();
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "type", "text");
+    cJSON_AddStringToObject(item, "text", text);
+    cJSON_AddItemToArray(content, item);
+    return content;
+}
+
+static cJSON *read_tool(const cJSON *args, bool *is_error, char **msg, void *ud)
+{
+    (void)args; (void)is_error; (void)msg; (void)ud;
+    return caps_text("read ok");
+}
+
+static cJSON *act_tool(const cJSON *args, bool *is_error, char **msg, void *ud)
+{
+    (void)args; (void)is_error; (void)msg; (void)ud;
+    atomic_fetch_add(&act_calls, 1);
+    return caps_text("acted");
+}
+
+/* POST one JSON-RPC body (signed by key 1/2, as `auth`, or none) and return
+ * the parsed response body; *status gets the HTTP status. */
+static cJSON *rpc_post(uint16_t port, int signer, const char *auth,
+                       const char *body, int *status)
+{
+    char *signed_hdr = NULL;
+    if (signer) {
+        char url[96];
+        snprintf(url, sizeof(url), "http://localhost:%u/mcp", port);
+        signed_hdr = signed_auth(url, "POST", body, 0, false, signer == 2, false);
+        auth = signed_hdr;
+    }
+    char request[8192], response[16384];
+    int len = snprintf(request, sizeof(request),
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\n%s%s%s"
+        "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+        auth ? "Authorization: " : "", auth ? auth : "", auth ? "\r\n" : "",
+        strlen(body), body);
+    free(signed_hdr);
+    MD_CHECK(len > 0 && len < (int)sizeof(request));
+    *status = -1;
+    if (http_request(port, request, response, sizeof(response)) <= 0) return NULL;
+    MD_CHECK(sscanf(response, "HTTP/1.1 %d", status) == 1);
+    const char *json = strstr(response, "\r\n\r\n");
+    return json ? cJSON_Parse(json + 4) : NULL;
+}
+
+static const char list_body[] = "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/list\"}";
+static const char call_act_body[] =
+    "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"act\",\"arguments\":{}}}";
+static const char call_read_body[] =
+    "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{}}}";
+
+/* tools/list as a principal: -1 unless 200; else listed count, *has_act. */
+static int listed_as(uint16_t port, int signer, const char *auth, bool *has_act)
+{
+    int status;
+    cJSON *resp = rpc_post(port, signer, auth, list_body, &status);
+    *has_act = false;
+    int n = -1;
+    if (status == 200 && resp) {
+        cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
+        n = cJSON_GetArraySize(tools);
+        cJSON *tool;
+        cJSON_ArrayForEach(tool, tools)
+            if (strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(tool, "name")), "act") == 0)
+                *has_act = true;
+    }
+    cJSON_Delete(resp);
+    return n;
+}
+
+/* tools/call as a principal: 200 with isError -> 1, 200 ok -> 0, else -1.
+ * *text receives the first content text (caller frees) when 200. */
+static int called_as(uint16_t port, int signer, const char *auth,
+                     const char *body, char **text)
+{
+    int status;
+    cJSON *resp = rpc_post(port, signer, auth, body, &status);
+    int rc = -1;
+    if (text) *text = NULL;
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    if (status == 200 && cJSON_IsObject(result)) {
+        rc = cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")) ? 1 : 0;
+        const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(
+            cJSON_GetArrayItem(cJSON_GetObjectItem(result, "content"), 0), "text"));
+        if (text) *text = strdup(t ? t : "");
+    }
+    cJSON_Delete(resp);
+    return rc;
+}
+
+static MdMcpServer *make_caps_server(void)
+{
+    MdMcpServer *mcp = make_mcp_server();
+    MdMcpTool read = { .name = "read", .description = "read", .handler = read_tool,
+                       .input_schema = cJSON_CreateObject(), .required_caps = MD_CAP_AGENT };
+    MdMcpTool act = { .name = "act", .description = "act", .handler = act_tool,
+                      .input_schema = cJSON_CreateObject(),
+                      .required_caps = MD_CAP_AGENT | MD_CAP_INPUT };
+    MD_CHECK(md_mcp_server_register_tool(mcp, &read) == 0);
+    MD_CHECK(md_mcp_server_register_tool(mcp, &act) == 0);
+    md_test_mcp_handshake(mcp);
+    return mcp;
+}
+
+static void test_per_principal_tool_caps(void)
+{
+    char *pk1 = nostr_key_get_public(auth_sk);
+    char *npub2 = npub_for(auth_sk2);
+    MD_CHECK(pk1 && npub2);
+    char token_path[] = "/tmp/md-http-caps-XXXXXX";
+    int fd = mkstemp(token_path);
+    MD_CHECK(fd >= 0);
+    MD_CHECK(write(fd, "caps-secret\n", 12) == 12);
+    close(fd);
+    LiveAcl acl = { .mu = PTHREAD_MUTEX_INITIALIZER };
+    MdMcpServer *mcp = make_caps_server();
+    const char *npubs[] = { npub2 };
+    MdMcpHttpConfig cfg = { .server = mcp, .ephemeral_port = true, .token_file = token_path,
+        .allow_npubs = npubs, .allow_npub_count = 1,
+        .nip98_grant = live_acl_grant, .nip98_grant_userdata = &acl };
+    MdMcpHttp *http = md_mcp_http_create(&cfg);
+    unlink(token_path);
+    REQUIRE_HTTP(http, mcp);
+    wire_server_to_http(mcp, http);
+    uint16_t port = md_mcp_http_port(http);
+    ServerArgs sa = { .http = http, .result = -1 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, server_thread, &sa);
+    bool has_act;
+    char *text = NULL;
+    atomic_store(&act_calls, 0);
+
+    /* Live agent-only: reads, no listed actions, and a named refusal. */
+    live_acl_set_caps(&acl, pk1, MD_CAP_AGENT);
+    MD_CHECK(listed_as(port, 1, NULL, &has_act) == 1 && !has_act);
+    MD_CHECK(called_as(port, 1, NULL, call_act_body, &text) == 1);
+    MD_CHECK(text && strstr(text, "tool 'act' requires the 'input' grant"));
+    free(text);
+    MD_CHECK(called_as(port, 1, NULL, call_read_body, &text) == 0);
+    free(text);
+    MD_CHECK(atomic_load(&act_calls) == 0);
+
+    /* Grant input: the next request sees it, without a restart. */
+    live_acl_set_caps(&acl, pk1, MD_CAP_AGENT | MD_CAP_INPUT);
+    MD_CHECK(listed_as(port, 1, NULL, &has_act) == 2 && has_act);
+    MD_CHECK(called_as(port, 1, NULL, call_act_body, &text) == 0 && text && !strcmp(text, "acted"));
+    free(text);
+    MD_CHECK(atomic_load(&act_calls) == 1);
+    /* Video is irrelevant to MCP and harmless. */
+    live_acl_set_caps(&acl, pk1, MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
+    MD_CHECK(called_as(port, 1, NULL, call_act_body, NULL) == 0);
+    MD_CHECK(atomic_load(&act_calls) == 2);
+
+    /* Narrow back to agent: the very next call is refused. */
+    live_acl_set_caps(&acl, pk1, MD_CAP_AGENT);
+    MD_CHECK(called_as(port, 1, NULL, call_act_body, NULL) == 1);
+    MD_CHECK(listed_as(port, 1, NULL, &has_act) == 1 && !has_act);
+    MD_CHECK(atomic_load(&act_calls) == 2);
+
+    /* input without agent is not admission (no implied bits). */
+    live_acl_set_caps(&acl, pk1, MD_CAP_INPUT);
+    MD_CHECK(listed_as(port, 1, NULL, &has_act) == -1);
+    live_acl_set_caps(&acl, pk1, MD_CAP_VIDEO);
+    MD_CHECK(listed_as(port, 1, NULL, &has_act) == -1);
+
+    /* Static npub and bearer principals keep the full host surface, even
+     * while the live source grants nobody anything. */
+    live_acl_set(&acl, NULL);
+    MD_CHECK(listed_as(port, 2, NULL, &has_act) == 2 && has_act);
+    MD_CHECK(called_as(port, 2, NULL, call_act_body, NULL) == 0);
+    MD_CHECK(listed_as(port, 0, "Bearer caps-secret", &has_act) == 2 && has_act);
+    MD_CHECK(called_as(port, 0, "Bearer caps-secret", call_act_body, NULL) == 0);
+    MD_CHECK(atomic_load(&act_calls) == 4);
+    MD_CHECK(listed_as(port, 0, NULL, &has_act) == -1);
+
+    /* SSE admitted live is rechecked at broadcast: still admitted while the
+     * grant keeps agent, dropped once it does not. */
+    live_acl_set_caps(&acl, pk1, MD_CAP_AGENT | MD_CAP_INPUT);
+    char *h = loopback_auth(port, "GET", false, false);
+    int sse = sse_connect_auth(port, h);
+    free(h);
+    MD_CHECK(sse >= 0);
+    if (sse >= 0) {
+        wait_sse_ready(http, sse, 1);
+        char frame[512];
+        live_acl_set_caps(&acl, pk1, MD_CAP_AGENT);
+        MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":1}", 7) == 0);
+        MD_CHECK(sse_read_frame(sse, frame, sizeof(frame)) && strstr(frame, "{\"n\":1}"));
+        live_acl_set_caps(&acl, pk1, MD_CAP_INPUT);
+        MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":2}", 7) == 0);
+        MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
+        MD_CHECK(!sse_read_frame(sse, frame, sizeof(frame)) && !strstr(frame, "n\":2"));
+        close(sse);
+    }
+    shutdown_http(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+
+    /* Credential-less loopback (operator's choice) is unchanged: full. */
+    MdMcpHttpConfig open_cfg = { .server = mcp, .ephemeral_port = true };
+    http = md_mcp_http_create(&open_cfg);
+    REQUIRE_HTTP(http, mcp);
+    port = md_mcp_http_port(http);
+    sa = (ServerArgs){ .http = http, .result = -1 };
+    pthread_create(&tid, NULL, server_thread, &sa);
+    MD_CHECK(listed_as(port, 0, NULL, &has_act) == 2 && has_act);
+    shutdown_http(http);
+    pthread_join(tid, NULL);
+    md_mcp_http_destroy(http);
+    md_mcp_server_destroy(mcp);
+    free(pk1); free(npub2);
+    PASS("per-principal caps: live agent-only hides/refuses actions, grant changes apply "
+         "next request, static/bearer/open full, SSE recheck needs agent");
+}
+
 static void test_unauthenticated_guards_and_read_budget(void)
 {
     MdMcpServer *mcp = make_mcp_server();
@@ -1481,6 +1715,7 @@ int main(void)
     test_auth_configuration();
     test_http_auth();
     test_live_authorizer();
+    test_per_principal_tool_caps();
     test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();

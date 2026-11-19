@@ -489,7 +489,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-allow-npub NPUB  MCP HTTP authorized signer (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-file PATH  MCP HTTP npub allowlist (one per line)\n");
     fprintf(stderr, "  --mcp-allow-host-list  Also authorize NIP-98 signers granted 'agent' by the saved\n"
-                    "                   host role's live metadesk-allowlist (uses --relay)\n");
+                    "                   host role's live metadesk-allowlist (uses --relay);\n"
+                    "                   action tools also need their 'input' grant\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
     fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
@@ -630,8 +631,8 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
     if (acl_relays) {
         acl = host_mcp_acl_start(acl_relays, acl_relay_count);
         if (!acl) goto cleanup;
-        cfg.http_nip98_authorize = host_mcp_acl_authorize;
-        cfg.http_nip98_authorize_userdata = acl;
+        cfg.http_nip98_grant = host_mcp_acl_grant;
+        cfg.http_nip98_grant_userdata = acl;
     }
     bridge = md_mcp_bridge_create(&cfg);
     if (!bridge) {
