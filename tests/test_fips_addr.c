@@ -118,6 +118,52 @@ static void test_fips_reference_vectors(void) {
     PASS();
 }
 
+/* Exercise the bit accumulator with exact outputs, including all high bits. */
+static void test_bech32_decode_vectors(void) {
+    TEST("bech32 accumulator regression vectors");
+
+    for (size_t i = 0; i < sizeof(FIPS_ADDR_VECTORS) / sizeof(FIPS_ADDR_VECTORS[0]); i++) {
+        char hex[65];
+        if (md_fips_npub_to_pubkey_hex(FIPS_ADDR_VECTORS[i].npub, hex, sizeof(hex)) != 0 ||
+            strcmp(hex, FIPS_ADDR_VECTORS[i].pk_hex) != 0) {
+            FAIL("known npub decoded incorrectly"); return;
+        }
+    }
+
+    static const struct {
+        const char *npub;
+        const char *hex;
+    } vectors[] = {
+        {
+            "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzqujme",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        {
+            "npub1lllllllllllllllllllllllllllllllllllllllllllllllllllsq7lrjw",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        },
+    };
+    for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        char hex[65];
+        if (md_fips_npub_to_pubkey_hex(vectors[i].npub, hex, sizeof(hex)) != 0 ||
+            strcmp(hex, vectors[i].hex) != 0) {
+            FAIL("boundary npub decoded incorrectly"); return;
+        }
+    }
+
+    /* Valid bech32 checksum, 79 all-one data words: maximum 90-char input,
+     * but too much payload for a 32-byte npub. Must reject without overflow. */
+    const char *max_input =
+        "npub1lllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllmnhkce";
+    char hex[65];
+    if (strlen(max_input) != 90 ||
+            md_fips_npub_to_pubkey_hex(max_input, hex, sizeof(hex)) == 0) {
+        FAIL("maximal-length oversized npub accepted"); return;
+    }
+
+    PASS();
+}
+
 /* ── Test: raw pubkey derivation ───────────────────────────── */
 
 static void test_raw_pubkey(void) {
@@ -272,6 +318,7 @@ int main(void) {
 
     test_addr_has_fips_prefix();
     test_fips_reference_vectors();
+    test_bech32_decode_vectors();
     test_raw_pubkey();
     test_dns_name();
     test_validation();

@@ -151,15 +151,16 @@ static int bech32_decode(const char *input,
 static int convert_bits(const uint8_t *data, size_t data_len,
                         int from_bits, int to_bits, bool pad,
                         uint8_t *out, size_t out_max) {
-    int acc = 0;
+    uint32_t acc = 0;
     int bits = 0;
     size_t out_len = 0;
-    int maxv = (1 << to_bits) - 1;
+    uint32_t maxv = (1u << to_bits) - 1;
+    uint32_t max_acc = (1u << (from_bits + to_bits - 1)) - 1;
 
     for (size_t i = 0; i < data_len; i++) {
         if (data[i] >> from_bits)
             return -1;
-        acc = (acc << from_bits) | data[i];
+        acc = ((acc << from_bits) | data[i]) & max_acc;
         bits += from_bits;
         while (bits >= to_bits) {
             bits -= to_bits;
@@ -186,7 +187,8 @@ static int decode_npub(const char *npub, uint8_t *pubkey_out) {
     if (!npub || !pubkey_out) return -1;
 
     char hrp[16];
-    uint8_t data5[64];
+    /* At most 90 chars minus a one-char HRP, separator and checksum. */
+    uint8_t data5[82];
     size_t data5_len = 0;
 
     if (bech32_decode(npub, hrp, sizeof(hrp), data5, &data5_len) < 0)
