@@ -21,6 +21,21 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#include "md_time.h"
+
+#ifdef __linux__
+#include <sys/syscall.h>
+/* md-l4f4: step this process's CLOCK_REALTIME, as an NTP or admin clock step
+ * would, without touching the host clock. libmetadesk.so's clock_gettime
+ * binds to this definition; the kernel's own timed waits do not see the
+ * step, exactly like a step taken between reading the clock and waiting. */
+static _Atomic long wall_step_s;
+int clock_gettime(clockid_t id, struct timespec *ts) {
+    long r = syscall(SYS_clock_gettime, id, ts);
+    if (r == 0 && id == CLOCK_REALTIME) ts->tv_sec += atomic_load(&wall_step_s);
+    return (int)r;
+}
+#endif
 
 static void test_keypair_generation(void) {
     char *sk = NULL, *pk = NULL;
@@ -764,7 +779,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     unsigned received, boundaries, signed_count, auth_results, processing, admitted;
-    unsigned sign_entered, draining;
+    unsigned sign_entered, draining, history_waiting;
     bool hold_signed, release_signed, hold_processing, release_processing;
     bool hold_backend_sign, release_backend_sign;
     atomic_bool fail_sign;
@@ -774,9 +789,12 @@ typedef struct {
 
 static void acl_hook(MdNostrTestPoint point, void *data) {
     AclTest *s = data;
-    if (point == MD_NOSTR_TEST_ADMITTED) {
+    if (point == MD_NOSTR_TEST_ADMITTED || point == MD_NOSTR_TEST_HISTORY_WAITING) {
+        /* HISTORY_WAITING holds the allowlist lock: record it, nothing more. */
         pthread_mutex_lock(&s->mu);
-        s->admitted++; pthread_cond_broadcast(&s->cv);
+        if (point == MD_NOSTR_TEST_ADMITTED) s->admitted++;
+        else s->history_waiting++;
+        pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         return;
     }
@@ -1240,12 +1258,70 @@ static void test_auth_wire(const char **urls, const char *a) {
     printf("  NOTE: protected REQ recovery still uses nostrc pool reconciliation (md-1be); md-xcy remains open\n");
 }
 
+/* md-l4f4: md_nostr_wait_history waits on md_monotonic_ns(). */
+typedef struct { MdNostr *bridge; uint32_t timeout_ms; int result; } HistoryWait;
+static void *history_wait_thread(void *data) {
+    HistoryWait *w = data;
+    w->result = md_nostr_wait_history(w->bridge, w->timeout_ms);
+    return NULL;
+}
+/* Milliseconds a timed-out wait_history(timeout_ms) took; the relay has the
+ * REQ and has not answered, so history stays pending throughout. */
+static uint64_t history_timeout_ms(MdNostr *bridge, uint32_t timeout_ms) {
+    const uint64_t start = md_monotonic_ns();
+    MD_CHECK(md_nostr_wait_history(bridge, timeout_ms) == -1);
+    return (md_monotonic_ns() - start) / 1000000u;
+}
+static void test_history_wait(const char **urls) {
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    uint64_t ms = history_timeout_ms(s.bridge, 200);
+    MD_CHECK(ms >= 200 && ms < 10000);
+#ifdef __linux__
+    /* The wall clock reads an hour behind: a REALTIME deadline computed now
+     * has already passed for the condvar, cutting the wait short. */
+    atomic_store(&wall_step_s, -3600);
+    ms = history_timeout_ms(s.bridge, 200);
+    atomic_store(&wall_step_s, 0);
+    MD_CHECK(ms >= 200 && ms < 10000);
+#endif
+    /* EOSE ends a long wait at the boundary, not at the timeout. The waiter
+     * is blocked on the condvar before EOSE: only the broadcast wakes it. */
+    HistoryWait w = { s.bridge, 30000, -2 };
+    pthread_t waiter;
+    uint64_t start = md_monotonic_ns();
+    unsigned waiting = acl_counter(&s, &s.history_waiting);
+    MD_CHECK(pthread_create(&waiter, NULL, history_wait_thread, &w) == 0);
+    acl_wait(&s, &s.history_waiting, waiting + 1);
+    acl_eose(&s, 0);
+    pthread_join(waiter, NULL);
+    MD_CHECK(w.result == 0);
+    MD_CHECK(md_monotonic_ns() - start < 20000000000ull);
+    MD_CHECK(md_nostr_wait_history(s.bridge, 0) == 0); /* already loaded */
+    acl_finish(&s);
+
+    /* md_nostr_stop wakes a blocked wait. */
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    w = (HistoryWait){ s.bridge, 30000, -2 };
+    start = md_monotonic_ns();
+    waiting = acl_counter(&s, &s.history_waiting);
+    MD_CHECK(pthread_create(&waiter, NULL, history_wait_thread, &w) == 0);
+    acl_wait(&s, &s.history_waiting, waiting + 1);
+    md_nostr_stop(s.bridge);
+    pthread_join(waiter, NULL);
+    MD_CHECK(w.result == -1);
+    MD_CHECK(md_monotonic_ns() - start < 20000000000ull);
+    acl_finish(&s);
+    printf("  PASS: history wait: bounded on the monotonic clock (wall-clock step on Linux), blocked waiter woken by EOSE and by stop\n");
+}
+
 static int acl_fixture_tests(const char **urls) {
     char *a = md_nostr_get_pubkey(dm_sender_sk);
     char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     test_acl_history(urls, a, b);
     test_acl_refusals(urls, a);
     test_acl_edits(urls, a, b);
+    test_history_wait(urls);
     test_auth_wire(urls, a);
     free(a); free(b);
     return md_test_report();

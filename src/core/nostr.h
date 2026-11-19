@@ -208,12 +208,15 @@ int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms);
 
 /* Deterministic lifecycle diagnostics for tests. Configure only while idle;
  * hooks run outside bridge locks and must not re-enter bridge APIs. NULL is
- * the production default. ADMITTED may block to hold an in-flight reader. */
+ * the production default. ADMITTED may block to hold an in-flight reader.
+ * HISTORY_WAITING is the exception to "outside locks": it fires with the
+ * allowlist lock held, just before md_nostr_wait_history() blocks, so its
+ * hook may only record that it ran. */
 typedef enum {
     MD_NOSTR_TEST_ADMITTED, MD_NOSTR_TEST_SERIALIZING, MD_NOSTR_TEST_DRAINING,
     MD_NOSTR_TEST_ALLOWLIST_RECEIVED, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY,
     MD_NOSTR_TEST_ALLOWLIST_SIGNED, MD_NOSTR_TEST_AUTH_RESULT,
-    MD_NOSTR_TEST_ALLOWLIST_PROCESSING
+    MD_NOSTR_TEST_ALLOWLIST_PROCESSING, MD_NOSTR_TEST_HISTORY_WAITING
 } MdNostrTestPoint;
 void md_nostr_set_test_hook(MdNostr *n,
     void (*hook)(MdNostrTestPoint, void *), void *userdata);

@@ -32,6 +32,7 @@
 #include <go.h>
 #include <nostr-kinds.h>
 #include "log.h"
+#include "md_time.h"
 #define MD_LOG_TAG "nostr"
 
 /* Forward declaration — defined after DM helpers, used by auth handler */
@@ -797,11 +798,8 @@ void md_nostr_drain_dm(MdNostr *n) {
 
 int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms) {
     if (!operation_begin(n)) return -1;
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline); /* allowlist_cv's default clock */
-    deadline.tv_sec += timeout_ms / 1000;
-    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    /* md-l4f4: a wall-clock step must neither extend nor cut short the wait. */
+    const uint64_t deadline = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000u;
     pthread_mutex_lock(&n->allowlist_mu);
     bool pending = true, ok = false, expired = false;
     while (!is_stopped(n)) {
@@ -811,9 +809,12 @@ int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms) {
             ok |= n->relay_states[i].history_ok;
         }
         if (!pending || expired) break;
-        /* EOSE/CLOSED/connection-state callbacks broadcast; no polling. */
-        expired = pthread_cond_timedwait(&n->allowlist_cv, &n->allowlist_mu,
-                                         &deadline) != 0;
+        /* EOSE/CLOSED/connection-state callbacks broadcast; no polling.
+         * Fired with allowlist_mu held: any boundary the test causes next
+         * needs the lock, so it lands while this thread is in the wait. */
+        test_point(n, MD_NOSTR_TEST_HISTORY_WAITING);
+        expired = md_cond_timedwait_until(&n->allowlist_cv, &n->allowlist_mu,
+                                          deadline) != 0;
     }
     pthread_mutex_unlock(&n->allowlist_mu);
     int ret = !pending && ok && !is_stopped(n) ? 0 : -1;
@@ -988,7 +989,9 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (!n) return NULL;
 
     pthread_mutex_init(&n->allowlist_mu, NULL);
-    pthread_cond_init(&n->allowlist_cv, NULL);
+    /* md-l4f4: monotonic, for md_nostr_wait_history's bounded wait; every
+     * other wait on it is untimed. */
+    md_cond_init_monotonic(&n->allowlist_cv);
     pthread_mutex_init(&n->work_mu, NULL);
     pthread_cond_init(&n->work_cv, NULL);
     n->acl_open = cfg->allowlist_open;
