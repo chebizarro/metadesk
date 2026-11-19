@@ -220,12 +220,12 @@ static int connect_socket(const char *path) {
     }
     return fd;
 }
-static int wayland_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+static int wayland_init(MdInputCtx *ctx) {
     WaylandInput *s = calloc(1, sizeof(*s));
     if (!s) return -1;
     if (pthread_mutex_init(&s->mutex, NULL)) { free(s); return -1; }
     ctx->backend_data = s;
-    int fd = connect_socket(cfg->wayland_display);
+    int fd = connect_socket(ctx->config.wayland_display);
     if (fd < 0) goto fail;
     s->display = wl_display_connect_to_fd(fd); /* takes fd even on failure */
     if (!s->display) goto fail;

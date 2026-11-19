@@ -13,6 +13,8 @@
 #include <linux/uinput.h>
 #include <linux/input-event-codes.h>
 
+#include <libudev.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -49,12 +51,81 @@ static int syn(int fd) {
     return emit(fd, EV_SYN, SYN_REPORT, 0);
 }
 
-static void uinput_delay(void) {
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5ms */
-    nanosleep(&ts, NULL);
+/* ── Device creation ───────────────────────────────────────────────────────── */
+
+/* Bound on waiting for udev to announce a new device; normally milliseconds. */
+#define UINPUT_UDEV_SETTLE_MS 1000
+
+static int64_t uinput_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* ── Device creation ─────────────────────────────────────────── */
+/* True for the udev "add" of the evdev node whose parent is input device
+ * @sysname (e.g. event7 under input42) — what libinput consumers open. */
+static bool uinput_is_our_event_node(struct udev_device *dev, const char *sysname) {
+    const char *action = udev_device_get_action(dev);
+    const char *name = udev_device_get_sysname(dev);
+    struct udev_device *parent = udev_device_get_parent(dev); /* owned by dev */
+    const char *parent_name = parent ? udev_device_get_sysname(parent) : NULL;
+    return action && strcmp(action, "add") == 0 && name &&
+           strncmp(name, "event", 5) == 0 && udev_device_get_devnode(dev) &&
+           parent_name && strcmp(parent_name, sysname) == 0;
+}
+
+/* UI_DEV_CREATE registers the device synchronously, but libinput consumers
+ * learn of it only from udev's broadcast after rule processing. Subscribe
+ * before creating so that broadcast cannot be missed, then wait for it
+ * (bounded) instead of sleeping. This is the last observable precondition:
+ * the consumer opening the node afterwards is not observable from here, and
+ * events injected before that open are not delivered to it. Without a
+ * running udevd (e.g. a container) nothing announces the device, so there
+ * is nothing to wait for. */
+static int uinput_dev_create(int fd, const char *label) {
+    struct udev *udev = udev_new();
+    struct udev_monitor *mon = NULL;
+    if (udev) {
+        struct udev_queue *queue = udev_queue_new(udev);
+        bool udevd = queue && udev_queue_get_udev_is_active(queue);
+        if (queue) udev_queue_unref(queue);
+        if (udevd) mon = udev_monitor_new_from_netlink(udev, "udev");
+        if (mon && (udev_monitor_filter_add_match_subsystem_devtype(mon, "input", NULL) < 0 ||
+                    udev_monitor_enable_receiving(mon) < 0)) {
+            udev_monitor_unref(mon);
+            mon = NULL;
+        }
+    }
+
+    int rc = ioctl(fd, UI_DEV_CREATE);
+    char sysname[64] = {0};
+    if (rc == 0 && mon &&
+        ioctl(fd, UI_GET_SYSNAME(sizeof(sysname) - 1), sysname) >= 0) {
+        struct pollfd pfd = { .fd = udev_monitor_get_fd(mon), .events = POLLIN };
+        int64_t deadline = uinput_now_ms() + UINPUT_UDEV_SETTLE_MS;
+        bool settled = false;
+        while (!settled) {
+            int64_t left = deadline - uinput_now_ms();
+            if (left <= 0) break;
+            int n = poll(&pfd, 1, (int)left);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            struct udev_device *dev;
+            /* Unrelated input hotplug traffic must not outlast the deadline. */
+            while (!settled && uinput_now_ms() < deadline &&
+                   (dev = udev_monitor_receive_device(mon)) != NULL) {
+                settled = uinput_is_our_event_node(dev, sysname);
+                udev_device_unref(dev);
+            }
+        }
+        if (!settled)
+            MD_LOG_W("%s: udev did not announce %s within %d ms", label, sysname,
+                     UINPUT_UDEV_SETTLE_MS);
+    }
+    if (mon) udev_monitor_unref(mon);
+    if (udev) udev_unref(udev);
+    return rc;
+}
 
 static int create_keyboard(void) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
@@ -93,9 +164,7 @@ static int create_keyboard(void) {
     setup.id.version = 1;
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) { close(fd); return -1; }
-    if (ioctl(fd, UI_DEV_CREATE) < 0) { close(fd); return -1; }
-
-    uinput_delay();
+    if (uinput_dev_create(fd, "keyboard") < 0) { close(fd); return -1; }
     return fd;
 }
 
@@ -140,24 +209,23 @@ static int create_mouse(uint32_t screen_w, uint32_t screen_h) {
     setup.id.version = 1;
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) { close(fd); return -1; }
-    if (ioctl(fd, UI_DEV_CREATE) < 0) { close(fd); return -1; }
-
-    uinput_delay();
+    if (uinput_dev_create(fd, "mouse") < 0) { close(fd); return -1; }
     return fd;
 }
 
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static bool uinput_dimensions_are_valid(const MdInputConfig *cfg) {
-    return cfg && cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+    return cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
            cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
 }
 
 static void uinput_destroy(MdInputCtx *ctx);  /* defined below; used on init failure */
 
-static int uinput_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+static int uinput_init(MdInputCtx *ctx) {
+    const MdInputConfig *cfg = &ctx->config;
     if (!uinput_dimensions_are_valid(cfg)) {
-        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg->screen_width, cfg->screen_height);
         return -1;
     }
 
@@ -242,77 +310,20 @@ static int uinput_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
     return 0;
 }
 
-/* Map ASCII char to keysym + shift flag. */
-static uint32_t char_to_keysym(char c, bool *need_shift) {
-    *need_shift = false;
-
-    if (c >= 'a' && c <= 'z') return md_input_keysym_from_name((char[]){c, 0});
-    if (c >= 'A' && c <= 'Z') {
-        *need_shift = true;
-        char lower = (char)(c - 'A' + 'a');
-        return md_input_keysym_from_name((char[]){lower, 0});
-    }
-    if (c >= '0' && c <= '9') return md_input_keysym_from_name((char[]){c, 0});
-
-    switch (c) {
-    case ' ':  return md_input_keysym_from_name("space");
-    case '\n': return md_input_keysym_from_name("enter");
-    case '\t': return md_input_keysym_from_name("tab");
-    case '-':  return md_input_keysym_from_name("-");
-    case '=':  return md_input_keysym_from_name("=");
-    case '[':  return md_input_keysym_from_name("[");
-    case ']':  return md_input_keysym_from_name("]");
-    case ';':  return md_input_keysym_from_name(";");
-    case '\'': return md_input_keysym_from_name("'");
-    case '`':  return md_input_keysym_from_name("`");
-    case '\\': return md_input_keysym_from_name("\\");
-    case ',':  return md_input_keysym_from_name(",");
-    case '.':  return md_input_keysym_from_name(".");
-    case '/':  return md_input_keysym_from_name("/");
-
-    /* Shifted symbols */
-    case '!': *need_shift = true; return md_input_keysym_from_name("1");
-    case '@': *need_shift = true; return md_input_keysym_from_name("2");
-    case '#': *need_shift = true; return md_input_keysym_from_name("3");
-    case '$': *need_shift = true; return md_input_keysym_from_name("4");
-    case '%': *need_shift = true; return md_input_keysym_from_name("5");
-    case '^': *need_shift = true; return md_input_keysym_from_name("6");
-    case '&': *need_shift = true; return md_input_keysym_from_name("7");
-    case '*': *need_shift = true; return md_input_keysym_from_name("8");
-    case '(': *need_shift = true; return md_input_keysym_from_name("9");
-    case ')': *need_shift = true; return md_input_keysym_from_name("0");
-    case '_': *need_shift = true; return md_input_keysym_from_name("-");
-    case '+': *need_shift = true; return md_input_keysym_from_name("=");
-    case '{': *need_shift = true; return md_input_keysym_from_name("[");
-    case '}': *need_shift = true; return md_input_keysym_from_name("]");
-    case ':': *need_shift = true; return md_input_keysym_from_name(";");
-    case '"': *need_shift = true; return md_input_keysym_from_name("'");
-    case '~': *need_shift = true; return md_input_keysym_from_name("`");
-    case '|': *need_shift = true; return md_input_keysym_from_name("\\");
-    case '<': *need_shift = true; return md_input_keysym_from_name(",");
-    case '>': *need_shift = true; return md_input_keysym_from_name(".");
-    case '?': *need_shift = true; return md_input_keysym_from_name("/");
-    }
-
-    return 0;
-}
-
 static int uinput_type_text(MdInputCtx *ctx, const char *utf8) {
     UinputState *st = ctx->backend_data;
     if (!st || st->kbd_fd < 0 || !utf8) return -1;
 
-    uint32_t shift_sym = md_input_keysym_from_name("shift");
+    const uint16_t shift_sym = KEY_LEFTSHIFT;
 
     for (const char *p = utf8; *p != '\0'; p++) {
-        if ((unsigned char)*p > 127)
-            continue; /* skip non-ASCII for now */
-
-        bool need_shift = false;
-        uint32_t sym = char_to_keysym(*p, &need_shift);
-        if (sym == 0) continue;
+        uint32_t sym;
+        bool need_shift;
+        if (!md_input_ascii_key(*p, &sym, &need_shift))
+            continue; /* non-ASCII and unmapped characters are skipped */
 
         if (need_shift) {
-            if (emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 1) < 0 ||
+            if (emit(st->kbd_fd, EV_KEY, shift_sym, 1) < 0 ||
                 syn(st->kbd_fd) < 0)
                 return -1;
         }
@@ -320,13 +331,13 @@ static int uinput_type_text(MdInputCtx *ctx, const char *utf8) {
         if (emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 1) < 0 ||
             syn(st->kbd_fd) < 0)
             return -1;
-        uinput_delay();
+        md_input_settle();
         if (emit(st->kbd_fd, EV_KEY, (uint16_t)sym, 0) < 0 ||
             syn(st->kbd_fd) < 0)
             return -1;
 
         if (need_shift) {
-            if (emit(st->kbd_fd, EV_KEY, (uint16_t)shift_sym, 0) < 0 ||
+            if (emit(st->kbd_fd, EV_KEY, shift_sym, 0) < 0 ||
                 syn(st->kbd_fd) < 0)
                 return -1;
         }

@@ -328,11 +328,62 @@ static int test_keysym_lookup(void) {
     MD_CHECK(md_input_keysym_from_name("CTRL")  == 0x001D);
     MD_CHECK(md_input_keysym_from_name("Shift") == 0x002A);
     MD_CHECK(md_input_keysym_from_name("F1")    == 0x003B);
+    MD_CHECK(md_input_keysym_from_name("A")     == 0x001E);
 
     /* Unknown → 0 */
     MD_CHECK(md_input_keysym_from_name("nonexistent") == 0);
     MD_CHECK(md_input_keysym_from_name(NULL)          == 0);
     MD_CHECK(md_input_keysym_from_name("")            == 0);
+
+    printf("OK\n");
+    return 0;
+}
+
+/* ── Test: ASCII text table agrees with the key-name vocabulary ─ */
+
+static bool ascii_is(char c, const char *name, bool shift) {
+    uint32_t sym = 0;
+    bool shifted = !shift;
+    return md_input_ascii_key(c, &sym, &shifted) && sym != 0 &&
+           sym == md_input_keysym_from_name(name) && shifted == shift;
+}
+
+static int test_ascii_key_table(void) {
+    printf("  test_ascii_key_table... ");
+
+    for (char c = 'a'; c <= 'z'; c++) {
+        char name[2] = { c, 0 };
+        MD_CHECK(ascii_is(c, name, false));
+        MD_CHECK(ascii_is((char)(c - 'a' + 'A'), name, true));
+    }
+    for (char c = '0'; c <= '9'; c++) {
+        char name[2] = { c, 0 };
+        MD_CHECK(ascii_is(c, name, false));
+    }
+    /* US layout: each shifted symbol shares its base key. */
+    const char *base = "1234567890-=[];'`\\,./";
+    const char *upper = "!@#$%^&*()_+{}:\"~|<>?";
+    for (size_t i = 0; base[i]; i++) {
+        char name[2] = { base[i], 0 };
+        MD_CHECK(ascii_is(base[i], name, false));
+        MD_CHECK(ascii_is(upper[i], name, true));
+    }
+    MD_CHECK(ascii_is(' ', "space", false));
+    MD_CHECK(ascii_is('\n', "enter", false));
+    MD_CHECK(ascii_is('\t', "tab", false));
+
+    /* Exactly printable ASCII + tab + newline; everything else refused. */
+    int mapped = 0;
+    for (int c = -128; c < 128; c++) {
+        if (md_input_ascii_key((char)c, NULL, NULL)) {
+            mapped++;
+            MD_CHECK((c >= 0x20 && c <= 0x7E) || c == '\t' || c == '\n');
+        }
+    }
+    MD_CHECK(mapped == 95 + 2);
+    MD_CHECK(!md_input_ascii_key('\r', NULL, NULL));
+    MD_CHECK(!md_input_ascii_key('\x7f', NULL, NULL));
+    MD_CHECK(!md_input_ascii_key((char)0xC3, NULL, NULL)); /* UTF-8 lead byte */
 
     printf("OK\n");
     return 0;
@@ -646,6 +697,7 @@ int main(void) {
     failures += test_action_dispatch();
     failures += test_action_from_json();
     failures += test_keysym_lookup();
+    failures += test_ascii_key_table();
     failures += test_dbl_and_right_click();
     failures += test_mouse_scroll();
     failures += test_type_key_combo_edges();

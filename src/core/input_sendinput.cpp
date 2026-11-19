@@ -40,11 +40,6 @@ struct SendInputState {
     uint32_t screen_h;
 };
 
-/* Small delay between events */
-static void si_delay(void) {
-    Sleep(5); /* 5ms */
-}
-
 /* ── Linux KEY_* → Windows VK_* translation ──────────────────── */
 
 struct KeyMapEntry {
@@ -144,13 +139,14 @@ static bool is_extended_key(WORD vk) {
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static bool si_dimensions_are_valid(const MdInputConfig *cfg) {
-    return cfg && cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+    return cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
            cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
 }
 
-static int si_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+static int si_init(MdInputCtx *ctx) {
+    const MdInputConfig *cfg = &ctx->config;
     if (!si_dimensions_are_valid(cfg)) {
-        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg->screen_width, cfg->screen_height);
         return -1;
     }
 
@@ -281,7 +277,7 @@ static int si_type_text(MdInputCtx *ctx, const char *utf8) {
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
 
         SendInput(2, inputs, sizeof(INPUT));
-        si_delay();
+        md_input_settle();
     }
 
     free(wstr);
