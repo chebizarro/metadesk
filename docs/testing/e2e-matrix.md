@@ -2,8 +2,9 @@
 
 Owner: **md-5zi** (full matrix execution and failing-cell bugs). Container
 receipts incorporated by **md-ah9.12** against master `c571b5d`; no new runtime
-tests were run for this documentation task. This is the owning matrix, not a
-new E2E harness.
+tests were run for that documentation task. Container client cells were added by
+**md-ah9.11** against master `8eebb6c`. This is the owning matrix, not a new E2E
+harness.
 
 ## Status and counting
 
@@ -20,8 +21,8 @@ checks, not full E2E passes. Counts exclude the checklist and summary tables.
 | Scope | PASS | FAIL | not yet run | pending | N/A | Total |
 |---|---:|---:|---:|---:|---:|---:|
 | General host/client pairings | 0 | 0 | 32 | 0 | 0 | 32 |
-| Containers | 85 | 2 | 4 | 6 | 1 | 98 |
-| Total | 85 | 2 | 36 | 6 | 1 | 130 |
+| Containers | 91 | 5 | 4 | 5 | 1 | 106 |
+| Total | 91 | 5 | 36 | 5 | 1 | 138 |
 
 ## General roles × platforms × transports
 
@@ -254,6 +255,34 @@ printable ASCII/tab/newline, not arbitrary Unicode/IME input. The inherited
 native-device-creation safety deviation and md-2ml fix remain documented in
 the source; final Linux gates ran without devices or host session/runtime mounts.
 
+### Container client (decode-only and GUI)
+
+Source: [client-validation.md](../../deploy/containers/reference/client-validation.md).
+Validated **2026-11-18**: rootless **Podman 4.9.3**, Ubuntu 24.04 aarch64,
+metadesk **8eebb6c**. The host is the Tier B Sway/xdpw container (render node,
+GLES2, isolated 1920×1080 output, x264). A loopback host has no frame source
+without capturing the live desktop. Negotiation is real NIP-17 over a private
+relay, with a v1 `video` grant, throwaway NIP-46 bunkers and one-use stream
+binding. The FIPS control endpoint is a fixture and TCP uses a TUN-less IPv6
+container bridge to the npub-derived address. This is **not** a FIPS/mesh
+receipt. Headless and display-authorization results are separate rows.
+
+| Client check | Rootless Podman 4.9.3 |
+|---|---|
+| Non-allowlisted client refused before any stream | PASS: host `REJECTED … non-allowlisted`; client exit 1; no TCP client |
+| Decode-only (`--no-display`): negotiate, bind, decode | PASS: 1920×1080 x264; 102 decoded, 0 displayed; SIGTERM exit 0 in 0.17 s |
+| Decode-only sandbox: no display server/devices/caps | PASS: CapEff 0; no `/dev/dri`; no display env/socket; no EGL/GLES in image |
+| Legacy direct-IP client (no session proof) | PASS (fails closed): host `rejected unproven client #2`; no stream |
+| GUI, granted private Wayland socket | PASS: 100 displayed; visible `xdg_shell` view `metadesk-client` 1920×1055 on the private output |
+| GUI, no display granted (default env) | FAIL: SDL silently uses its `offscreen` EGL driver and reports displayed frames, exit 0; **md-33e** |
+| GUI, no display granted, `SDL_VIDEODRIVER=wayland` | PASS (refused): `SDL_Init failed`; continues decode-only, exit 0; fail-open note in **md-33e** |
+| Repeat negotiation on a history-retaining relay | FAIL: stale `session_accept` replayed; host rejects the stale proof; **md-6ns** |
+| NIP-5F signer for a live host session | FAIL: decrypted seal JSON not unescaped, `DM rejected: invalid-seal`; **md-ebm** |
+
+Reproduce with the source's bundle/image builds and
+`deploy/containers/reference/validate-client.py` (fresh relay per cell).
+The GUI image needs `libopengl0`: without it SDL 2.30 segfaults on Wayland.
+
 ### Remaining container acceptance cells
 
 | Cell | Status / owner and required evidence |
@@ -262,8 +291,7 @@ the source; final Linux gates ran without devices or host session/runtime mounts
 | FIPS socket available but route absent | pending **md-ah9.5**: reject unavailable routing; socket existence is not readiness. Results doc: **to be added by md-ah9.5**. |
 | Kubernetes / pinned desktop node | pending **md-ah9.7** (W4): readiness, identity/socket mounts, RBAC port forwarding and clean termination. |
 | Binary-session FIPS | pending **md-ah9.6**: binary host/client session over mesh, not MCP-only reachability. |
-| Client in container / direct IP | pending **md-ah9.11**: decode without display server; no false semantic-only claim. |
-| Client in container / FIPS | pending **md-ah9.11**, mesh prerequisite **md-ah9.5**, binary prerequisite **md-ah9.6**: control readiness before connection and actual decode. Mesh results doc: **to be added by md-ah9.5**. |
+| Client in container / FIPS | pending **md-ah9.6** (binary session over the mesh): real `fipsd` control readiness before connection and actual decode. Client image and decode were qualified by md-ah9.11 (above). Mesh reference: [mesh-validation.md](../../deploy/containers/reference/mesh-validation.md). |
 | MCP HTTP / authenticated proxy | not yet run: unauthorized POST and SSE denied; authorized tree access. Local bearer receipts do not qualify an external proxy. |
 | Sway video / software full stream | not yet run: portal capture, changing frames, x264 selection and dimensions together; pinned pixman capture is a known negative, not a software-stream pass. |
 | Sway virtual input / a11y-observed result | not yet run: target-only input plus accessible state change; `wev` input receipts alone are insufficient. |
