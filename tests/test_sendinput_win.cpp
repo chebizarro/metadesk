@@ -10,6 +10,13 @@
  * Covers md-ty3 I6 (si_mouse_scroll ignored SendInput's result; type_text
  * did too) and I7 (lookup "not found" is the return value, not VK 0), plus
  * keymap coverage of the HAL's key vocabulary and its US ASCII table.
+ *
+ * md-w65: GetSystemMetrics is replaced the same way, by a synthetic desktop
+ * layout (virtual desktop bounds), so mouse moves are checked
+ * against multi-monitor, negative-origin and mixed-DPI layouts the test
+ * machine does not have. Every recorded move is decoded the way Windows
+ * decodes MOUSEEVENTF_VIRTUALDESK (pixel = left + n * width / 65536) and
+ * must land on the exact intended desktop pixel.
  */
 #include <windows.h>
 
@@ -26,8 +33,23 @@ static UINT WINAPI recorded_send_input(UINT count, LPINPUT inputs, int size) {
     return count;
 }
 
+/* Synthetic physical desktop: the virtual desktop's bounding rectangle. */
+static struct { int vx, vy, vw, vh; } layout;
+
+static int WINAPI synthetic_metrics(int index) {
+    switch (index) {
+    case SM_XVIRTUALSCREEN:  return layout.vx;
+    case SM_YVIRTUALSCREEN:  return layout.vy;
+    case SM_CXVIRTUALSCREEN: return layout.vw;
+    case SM_CYVIRTUALSCREEN: return layout.vh;
+    default:                 return 0;
+    }
+}
+
 #define SendInput recorded_send_input
+#define GetSystemMetrics synthetic_metrics
 #include "../src/core/input_sendinput.cpp"
+#undef GetSystemMetrics
 #undef SendInput
 
 #include <cstdio>
@@ -43,13 +65,162 @@ static void reset(int fail = 0) {
     fail_on_send = fail;
 }
 
+/* How Windows turns a MOUSEEVENTF_VIRTUALDESK value back into a pixel. */
+static LONG decode(LONG n, int lo, int len) {
+    return (LONG)(lo + (int64_t)n * len / 65536);
+}
+
+static void set_layout(int vx, int vy, int vw, int vh) {
+    layout = { vx, vy, vw, vh };
+}
+
+/* Where the last recorded move lands on the synthetic desktop. */
+static POINT landed() {
+    const MOUSEINPUT &mi = sent.back().mi;
+    CHECK(sent.back().type == INPUT_MOUSE &&
+          mi.dwFlags == (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE));
+    CHECK(mi.dx >= 0 && mi.dx <= 65535 && mi.dy >= 0 && mi.dy <= 65535);
+    return { decode(mi.dx, layout.vx, layout.vw), decode(mi.dy, layout.vy, layout.vh) };
+}
+
+/* A frame of w x h addressing the output at (ox,oy) ow x oh; ow == 0 is the
+ * legacy configuration without output bounds. */
+static MdInputCtx make_ctx(uint32_t w, uint32_t h, int32_t ox = 0, int32_t oy = 0,
+                           uint32_t ow = 0, uint32_t oh = 0) {
+    MdInputCtx ctx = {};
+    ctx.vtable = &sendinput_backend;
+    ctx.config.screen_width = w;
+    ctx.config.screen_height = h;
+    ctx.config.output_x = ox;
+    ctx.config.output_y = oy;
+    ctx.config.output_width = ow;
+    ctx.config.output_height = oh;
+    CHECK(sendinput_backend.init(&ctx) == 0);
+    return ctx;
+}
+
+static bool moves_to(MdInputCtx *ctx, int x, int y, LONG want_x, LONG want_y) {
+    reset();
+    CHECK(si_mouse_move(ctx, x, y) == 0 && sent.size() == 1);
+    const POINT p = landed();
+    if (p.x == want_x && p.y == want_y) return true;
+    fprintf(stderr, "  frame (%d,%d) landed on (%ld,%ld), want (%ld,%ld)\n", x, y, p.x, p.y,
+            want_x, want_y);
+    return false;
+}
+
+/* md-w65: every pixel of every virtual-desktop width round-trips through
+ * the normalisation exactly, including the far edge and negative origins. */
+static void test_normalize() {
+    int widths = 0;
+    for (int64_t len : { 64, 100, 768, 1024, 1080, 1366, 1920, 2560, 3000, 3840, 4480,
+                         5120, 5760, 7680, 10240, 16384, 32767 }) {
+        for (int64_t lo : { (int64_t)0, (int64_t)-1920, (int64_t)-7, (int64_t)1366 }) {
+            const Span desk = { lo, len };
+            for (int64_t p = lo; p < lo + len; p++) {
+                const LONG n = si_normalize(p, desk);
+                if (decode(n, (int)lo, (int)len) != p) {
+                    fprintf(stderr, "width %lld origin %lld: pixel %lld -> %ld -> %ld\n",
+                            (long long)len, (long long)lo, (long long)p, n,
+                            decode(n, (int)lo, (int)len));
+                    CHECK(false);
+                }
+            }
+            /* Outside the virtual desktop clamps to its edges. */
+            CHECK(decode(si_normalize(lo - 50, desk), (int)lo, (int)len) == lo);
+            CHECK(decode(si_normalize(lo + len + 50, desk), (int)lo, (int)len) == lo + len - 1);
+        }
+        widths++;
+    }
+    printf("PASS normalisation: every pixel of %d virtual-desktop widths x 4 origins "
+           "round-trips exactly\n", widths);
+}
+
+/* md-w65: moves land on the configured output in the synthetic layout. */
+static void test_targets() {
+    /* Legacy (no output bounds): frame coordinates are global desktop
+     * pixels, e.g. MCP clicks at UIA coordinates. */
+    set_layout(0, 0, 1920, 1080);
+    MdInputCtx ctx = make_ctx(1920, 1080);
+    CHECK(moves_to(&ctx, 0, 0, 0, 0) && moves_to(&ctx, 1919, 1079, 1919, 1079));
+    CHECK(moves_to(&ctx, 1, 1, 1, 1) && moves_to(&ctx, 960, 540, 960, 540));
+    /* Primary 1920x1080 at (0,0) and a 2560x1440 display to its left and
+     * above: the virtual desktop is (-2560,-200) 4480x1440. Global points on
+     * either display are reached, off-desktop ones clamp onto its edge. */
+    set_layout(-2560, -200, 4480, 1440);
+    CHECK(moves_to(&ctx, 0, 0, 0, 0) && moves_to(&ctx, 1919, 1079, 1919, 1079));
+    CHECK(moves_to(&ctx, -2000, -150, -2000, -150) && moves_to(&ctx, 5000, 2000, 1919, 1239));
+    sendinput_backend.destroy(&ctx);
+
+    /* Capturing the left display: its corners and centre. */
+    ctx = make_ctx(2560, 1440, -2560, -200, 2560, 1440);
+    CHECK(moves_to(&ctx, 0, 0, -2560, -200) && moves_to(&ctx, 2559, 1439, -1, 1239));
+    CHECK(moves_to(&ctx, 1280, 720, -1280, 520));
+    /* Off-frame coordinates clamp onto the frame, never onto the primary. */
+    CHECK(moves_to(&ctx, -40, 5000, -2560, 1239) && moves_to(&ctx, 9999, -1, -1, -200));
+    /* Agent actions carry global (UIA) coordinates: a click on the captured
+     * output lands on that exact pixel; one on the primary is refused. */
+    MdAction click = {};
+    click.type = MD_ACTION_CLICK;
+    click.region[0] = -1000;
+    click.region[1] = 300;
+    reset();
+    CHECK(md_input_execute_action(&ctx, &click) == 0 && sent.size() == 3);
+    sent.resize(1);
+    CHECK(landed().x == -1000 && landed().y == 300);
+    click.region[0] = 100;
+    reset();
+    CHECK(md_input_execute_action(&ctx, &click) == -1 && sends == 0);
+    sendinput_backend.destroy(&ctx);
+
+    /* Mixed DPI: a 3840x2160 display (at 150%) right of a 1920x1080 primary
+     * (100%), in physical pixels: the virtual desktop is (0,0) 5760x2160. A
+     * frame of the same size lands 1:1; a frame of another size (a scaled
+     * stream) is scaled onto it by md_input_map_to_output. */
+    set_layout(0, 0, 5760, 2160);
+    ctx = make_ctx(3840, 2160, 1920, 0, 3840, 2160);
+    CHECK(moves_to(&ctx, 0, 0, 1920, 0) && moves_to(&ctx, 3839, 2159, 5759, 2159));
+    CHECK(moves_to(&ctx, 1234, 567, 1920 + 1234, 567));
+    sendinput_backend.destroy(&ctx);
+    ctx = make_ctx(2560, 1440, 1920, 0, 3840, 2160);
+    CHECK(moves_to(&ctx, 0, 0, 1920, 0) && moves_to(&ctx, 2559, 1439, 5758, 2158));
+    CHECK(moves_to(&ctx, 1280, 720, 1920 + 1920, 1080));
+    sendinput_backend.destroy(&ctx);
+
+    /* A rotated (portrait) display: its desktop rectangle is already in the
+     * rotated orientation and so is the captured frame (md-dbg), so the
+     * mapping is the same linear one. 1080x1920 portrait above-left of the
+     * primary. */
+    set_layout(-1080, -840, 3000, 1920);
+    ctx = make_ctx(1080, 1920, -1080, -840, 1080, 1920);
+    CHECK(moves_to(&ctx, 0, 0, -1080, -840) && moves_to(&ctx, 1079, 1919, -1, 1079));
+    sendinput_backend.destroy(&ctx);
+
+    /* The layout changes under a running backend (a display was attached):
+     * the virtual desktop is re-read on every move. */
+    set_layout(0, 0, 1920, 1080);
+    ctx = make_ctx(1920, 1080, 0, 0, 1920, 1080);
+    CHECK(moves_to(&ctx, 100, 100, 100, 100));
+    set_layout(-1920, 0, 3840, 1080);
+    CHECK(moves_to(&ctx, 100, 100, 100, 100));
+
+    /* No display at all: nothing is sent. */
+    set_layout(0, 0, 0, 0);
+    reset();
+    CHECK(si_mouse_move(&ctx, 10, 10) == -1 && sends == 0);
+    sendinput_backend.destroy(&ctx);
+    puts("PASS targets: legacy global points, non-primary and negative-origin outputs, "
+         "global-coordinate actions, mixed-DPI scaling, portrait, live layout change, "
+         "no display");
+}
+
 static void test_mouse(MdInputCtx *ctx) {
+    set_layout(0, 0, 1920, 1080);
     reset();
     CHECK(si_mouse_move(ctx, 0, 0) == 0 && sent.size() == 1);
-    CHECK(sent[0].type == INPUT_MOUSE && sent[0].mi.dx == 0 && sent[0].mi.dy == 0 &&
-          sent[0].mi.dwFlags == (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE));
+    CHECK(landed().x == 0 && landed().y == 0);
     CHECK(si_mouse_move(ctx, 1919, 1079) == 0 && sent.size() == 2);
-    CHECK(sent[1].mi.dx == 65535 && sent[1].mi.dy == 65535);
+    CHECK(landed().x == 1919 && landed().y == 1079);
     reset(1);
     CHECK(si_mouse_move(ctx, 10, 10) == -1);
 
@@ -175,6 +346,8 @@ int main() {
     ctx.config.screen_height = 1080;
     CHECK(be->init(&ctx) == 0 && ctx.ready && ctx.backend_data);
 
+    test_normalize();
+    test_targets();
     test_mouse(&ctx);
     test_scroll(&ctx);
     test_keys(&ctx);

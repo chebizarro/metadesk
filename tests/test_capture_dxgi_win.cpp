@@ -271,6 +271,11 @@ static void unit_tests() {
         CHECK(output_choose("\\\\.\\DISPLAY2", d, 2) == 1);
         CHECK(output_choose("\\\\.\\display2", d, 2) == 1);
         CHECK(output_choose("DISPLAY3", d, 2) == -1 && output_choose("-1", d, 2) == -1);
+        CHECK(output_choose("id:2", d, 2) == 1 && output_choose("ID:1", d, 2) == 0);
+        CHECK(output_choose("id:3", d, 2) == -1 && output_choose("id:0", d, 2) == -1);
+        CHECK(display_number("DISPLAY12") == 12 && display_number("display7") == 7);
+        CHECK(display_number("DISPLAY") == 0 && display_number("DISPLAY2x") == 0 &&
+              display_number("MONITOR2") == 0);
         CHECK(output_choose("1x", d, 2) == -1 && output_choose(" 1", d, 2) == -1);
         d[1].DesktopCoordinates = { -1920, 0, 0, 1080 };      /* no output at origin */
         CHECK(output_choose(nullptr, d, 2) == 0);
@@ -465,9 +470,11 @@ static void output_cells(const MdCaptureBackend *be) {
     for (UINT i = 0; i < outs.count; i++) {
         char name[128];
         output_name(outs.desc[i], name, (int)sizeof(name));
-        const RECT &r = outs.desc[i].DesktopCoordinates;
-        printf("output %u: %s %ldx%ld at (%ld,%ld)%s\n", i, name, r.right - r.left,
-               r.bottom - r.top, r.left, r.top, output_is_primary(outs.desc[i]) ? " primary" : "");
+        const RECT &r = outs.desc[i].DesktopCoordinates, &p = outs.rect[i];
+        printf("output %u: %s %ldx%ld at (%ld,%ld)%s; physical %ldx%ld at (%ld,%ld)\n", i, name,
+               r.right - r.left, r.bottom - r.top, r.left, r.top,
+               output_is_primary(outs.desc[i]) ? " primary" : "", p.right - p.left,
+               p.bottom - p.top, p.left, p.top);
         if (primary < 0 && output_is_primary(outs.desc[i])) primary = (int)i;
     }
     CHECK(primary >= 0);
@@ -489,13 +496,17 @@ static void output_cells(const MdCaptureBackend *be) {
             CHECK(be->init(&ctx) == 0);
             st = static_cast<DxgiState *>(ctx.backend_data);
             CHECK(st->output_index == i);
-            const RECT &r = outs.desc[i].DesktopCoordinates;
+            const RECT &r = outs.rect[i];
             const uint32_t dw = (uint32_t)(r.right - r.left), dh = (uint32_t)(r.bottom - r.top);
             CHECK((ctx.width == dw && ctx.height == dh) || (ctx.width == dh && ctx.height == dw));
+            /* md-w65: where input must aim, in physical desktop pixels. */
+            CHECK(ctx.output_rect.x == r.left && ctx.output_rect.y == r.top &&
+                  ctx.output_rect.width == dw && ctx.output_rect.height == dh);
             be->destroy(&ctx);
         }
     }
-    printf("PASS every output selectable by index, device name and bare name (%u)\n", outs.count);
+    printf("PASS every output selectable by index, device name and bare name (%u); "
+           "ctx->output_rect is its physical rectangle\n", outs.count);
 
     snprintf(index, sizeof(index), "%u", outs.count);
     for (const char *spec : { (const char *)index, "DISPLAY99", "1x" }) {

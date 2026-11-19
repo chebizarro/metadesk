@@ -26,11 +26,20 @@
  * stop only clears ctx->active, so it is safe while another thread waits in
  * get_frame; everything else runs on the capture thread or after it joined.
  *
- * Output selection: config.output is NULL/"" for the primary display (the
- * one at the desktop origin), a decimal index into the attached outputs in
- * DXGI order (adapter by adapter), or a GDI device name such as
- * "\\.\DISPLAY2" (prefix optional, case-insensitive). An unknown selection
- * fails init and logs the attached outputs.
+ * Output selection (md_capture_display_choose): config.output is NULL/"" for
+ * the primary display (the one at the desktop origin), a decimal index into
+ * the attached outputs in DXGI order (adapter by adapter), a GDI device name
+ * such as "\\.\DISPLAY2" (prefix optional, case-insensitive), or "id:2" for
+ * \\.\DISPLAY2. An unknown selection fails init and logs the attached
+ * outputs.
+ *
+ * Desktop placement: ctx->output_rect (md_capture_get_output_rect) is the
+ * captured output's rectangle in physical virtual-desktop pixels, which the
+ * host copies into MdInputConfig.output_* so SendInput aims at the captured
+ * output. DXGI_OUTPUT_DESC.DesktopCoordinates is DPI-virtualized for a
+ * process that is not per-monitor DPI aware, so the rectangle comes from
+ * GetMonitorInfo on the output's monitor, queried per-monitor aware
+ * (win_dpi.h); the frame itself is always physical pixels.
  *
  * Damage: an unchanged desktop is IDLE. A pointer-only update (LastPresentTime
  * 0) leaves the desktop image unchanged. Without show_cursor it is IDLE, since
@@ -69,6 +78,7 @@ extern "C" {
 #include <cstdint>
 #include <cstring>
 #include "log.h"
+#include "win_dpi.h"
 #define MD_LOG_TAG "capture_dxgi"
 
 /* ── Backend-private state ───────────────────────────────────── */
@@ -99,6 +109,7 @@ struct DxgiState {
     LUID                     adapter_luid; /* the device's adapter */
 
     DXGI_OUTPUT_DESC         output_desc; /* the duplicated output */
+    RECT                     output_rect; /* its physical desktop rectangle */
     UINT                     output_index;
     uint32_t                 width;
     uint32_t                 height;
@@ -301,6 +312,7 @@ struct OutputList {
     IDXGIAdapter1    *adapter[MAX_OUTPUTS];
     IDXGIOutput      *output[MAX_OUTPUTS];
     DXGI_OUTPUT_DESC  desc[MAX_OUTPUTS];
+    RECT              rect[MAX_OUTPUTS]; /* physical desktop rectangles */
 };
 
 /* The primary display is the one at the virtual desktop origin. */
@@ -317,25 +329,38 @@ static const char *strip_device_prefix(const char *name) {
     return strncmp(name, "\\\\.\\", 4) == 0 ? name + 4 : name;
 }
 
-/* Index of the output `spec` selects in `descs`, or -1. */
+/* N of a GDI device name "DISPLAYN" (prefix stripped), or 0. */
+static uint32_t display_number(const char *bare) {
+    if (_strnicmp(bare, "DISPLAY", 7) != 0 || !bare[7]) return 0;
+    const size_t digits = strspn(bare + 7, "0123456789");
+    return bare[7 + digits] == '\0' && digits <= 9 ? (uint32_t)strtoul(bare + 7, nullptr, 10) : 0;
+}
+
+/* Index of the output `spec` selects in `descs`, or -1: the shared parser
+ * over the outputs' device names without the "\\.\" prefix, the primary
+ * flagged, and id N meaning \\.\DISPLAYN. */
 static int output_choose(const char *spec, const DXGI_OUTPUT_DESC *descs, UINT count) {
-    if (!spec || !*spec) {
-        for (UINT i = 0; i < count; i++)
-            if (output_is_primary(descs[i])) return (int)i;
-        return count ? 0 : -1;
-    }
-    const size_t digits = strspn(spec, "0123456789");
-    if (spec[digits] == '\0' && digits <= 4) {
-        const UINT index = (UINT)atoi(spec);
-        return index < count ? (int)index : -1;
-    }
+    if (count > MAX_OUTPUTS) count = MAX_OUTPUTS;
+    char names[MAX_OUTPUTS][128];
+    MdCaptureDisplay displays[MAX_OUTPUTS];
     for (UINT i = 0; i < count; i++) {
-        char name[128];
-        output_name(descs[i], name, (int)sizeof(name));
-        if (_stricmp(strip_device_prefix(spec), strip_device_prefix(name)) == 0)
-            return (int)i;
+        char full[128];
+        output_name(descs[i], full, (int)sizeof(full));
+        const char *bare = strip_device_prefix(full);
+        memcpy(names[i], bare, strlen(bare) + 1);
+        displays[i] = { display_number(names[i]), names[i], output_is_primary(descs[i]) };
     }
-    return -1;
+    return md_capture_display_choose(displays, count, spec ? strip_device_prefix(spec) : spec);
+}
+
+/* The output's desktop rectangle in physical pixels: its monitor's, read
+ * per-monitor DPI aware. Falls back to DesktopCoordinates. */
+static RECT output_physical_rect(const DXGI_OUTPUT_DESC &d) {
+    MdPhysicalPixels physical;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    return d.Monitor && GetMonitorInfoW(d.Monitor, &mi) ? mi.rcMonitor
+                                                        : d.DesktopCoordinates;
 }
 
 /* Attached outputs of every adapter, in DXGI enumeration order. */
@@ -354,6 +379,7 @@ static HRESULT outputs_enum(OutputList *list) {
                 adapter->AddRef();
                 list->adapter[list->count] = adapter;
                 list->output[list->count] = output;
+                list->rect[list->count] = output_physical_rect(desc);
                 list->desc[list->count++] = desc;
                 output = nullptr;
             }
@@ -383,7 +409,7 @@ static void outputs_log(const OutputList &list, const char *spec) {
     for (UINT i = 0; i < list.count; i++) {
         char name[128];
         output_name(list.desc[i], name, (int)sizeof(name));
-        const RECT &r = list.desc[i].DesktopCoordinates;
+        const RECT &r = list.rect[i];
         MD_LOG_E("  %u: %s %ldx%ld at (%ld,%ld)%s", i, name, r.right - r.left,
                  r.bottom - r.top, r.left, r.top,
                  output_is_primary(list.desc[i]) ? " primary" : "");
@@ -477,6 +503,7 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
     }
     safe_release(output1);
     st->output_desc = outs.desc[pick];
+    st->output_rect = outs.rect[pick];
     st->output_index = (UINT)pick;
     outputs_release(&outs);
     if (FAILED(hr)) return hr;
@@ -497,9 +524,12 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
     }
     char name[128];
     output_name(st->output_desc, name, (int)sizeof(name));
-    const RECT &r = st->output_desc.DesktopCoordinates;
+    const RECT &r = st->output_rect;
     MD_LOG_I("duplicating output %u %s (%ux%u at %ld,%ld)", st->output_index, name,
              st->width, st->height, r.left, r.top);
+    if ((uint32_t)(r.right - r.left) != st->width || (uint32_t)(r.bottom - r.top) != st->height)
+        MD_LOG_I("output rectangle %ldx%ld differs from its %ux%u mode; input is scaled onto it",
+                 r.right - r.left, r.bottom - r.top, st->width, st->height);
     /* A new duplication resends the pointer; the staging copy is stale. */
     st->pointer.visible = false;
     st->pointer.has_shape = false;
@@ -507,6 +537,8 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
     st->delivered = false;
     ctx->width  = st->width;
     ctx->height = st->height;
+    ctx->output_rect = { (int32_t)r.left, (int32_t)r.top, (uint32_t)(r.right - r.left),
+                     (uint32_t)(r.bottom - r.top) };
     return S_OK;
 }
 

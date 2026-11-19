@@ -7,8 +7,19 @@
  *   - SendInput with INPUT_KEYBOARD for key events
  *   - SendInput with KEYEVENTF_UNICODE for type_text (Unicode)
  *
- * Mouse movement uses MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE
- * with coordinates normalized to 0–65535 range.
+ * Mouse movement uses MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK |
+ * MOUSEEVENTF_MOVE. md_input_map_to_output (input.c) maps the client's
+ * frame-relative point into config.output_* (the captured output:
+ * md_capture_get_output_rect); without output bounds the point is already
+ * global. That desktop pixel is then normalised to 0-65535 across
+ * the virtual desktop (SM_*VIRTUALSCREEN, which may start at negative
+ * coordinates). Both are physical pixels: DXGI publishes the output in
+ * physical pixels and the virtual desktop is read per-monitor DPI aware
+ * (win_dpi.h), so mixed-DPI layouts map exactly. Windows turns a normalised
+ * value n back into the pixel n * width / 65536, rounded down (Microsoft's
+ * UI Automation client, Input.cs, relies on the same rule), so the backend
+ * aims at the centre of the pixel: the result is that pixel whichever way
+ * the system rounds, never its neighbour.
  *
  * Key events translate Linux KEY_* scan codes to Windows virtual
  * key codes (VK_*) via a mapping table.
@@ -30,15 +41,41 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include <cmath>
 #include "log.h"
+#include "win_dpi.h"
 #define MD_LOG_TAG "input_sendinput"
 
-/* ── Backend-private state ───────────────────────────────────── */
+/* ── Backend-private state ───────────────────────────────────────────── */
 
 struct SendInputState {
     uint32_t screen_w;
     uint32_t screen_h;
 };
+
+/* ── Virtual-desktop normalisation (pure) ───────────────────────────── */
+
+/* One axis of the virtual desktop: first pixel and pixel count. */
+struct Span {
+    int64_t lo, len;
+};
+
+/* Desktop pixel p (clamped into the virtual desktop) to the 0-65535 value
+ * Windows maps back onto p: the centre of p's n * len / 65536 block. */
+static LONG si_normalize(int64_t p, Span desk) {
+    const int64_t q = p < desk.lo ? 0 : p >= desk.lo + desk.len ? desk.len - 1 : p - desk.lo;
+    const int64_t n = (2 * q + 1) * 65536 / (2 * desk.len);
+    return (LONG)(n > 65535 ? 65535 : n);
+}
+
+/* The virtual desktop SendInput normalises against, in physical pixels.
+ * False if it is empty (no attached display). */
+static bool si_virtual_desktop(Span *dx, Span *dy) {
+    MdPhysicalPixels physical;
+    *dx = { GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    *dy = { GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    return dx->len > 0 && dy->len > 0;
+}
 
 /* ── Linux KEY_* → Windows VK_* translation ──────────────────── */
 
@@ -159,6 +196,10 @@ static int si_init(MdInputCtx *ctx) {
 
     st->screen_w = cfg->screen_width;
     st->screen_h = cfg->screen_height;
+    if (cfg->output_width && cfg->output_height)
+        MD_LOG_I("frame %ux%u maps onto the desktop at (%d,%d) %ux%u", st->screen_w,
+                 st->screen_h, cfg->output_x, cfg->output_y, cfg->output_width,
+                 cfg->output_height);
 
     ctx->backend_data = st;
     ctx->ready = true;
@@ -171,15 +212,16 @@ static int si_mouse_move(MdInputCtx *ctx, int x, int y) {
         st->screen_h < MD_INPUT_MIN_SCREEN_DIMENSION)
         return -1;
 
-    /* Convert to absolute coordinates (0–65535 range) */
-    int ax = (int)(((long long)x * 65535) / (long long)(st->screen_w - 1));
-    int ay = (int)(((long long)y * 65535) / (long long)(st->screen_h - 1));
+    Span dx, dy;
+    if (!si_virtual_desktop(&dx, &dy)) return -1;
+    double gx = 0, gy = 0; /* the desktop pixel, from its top-left corner */
+    md_input_map_to_output(&ctx->config, x, y, &gx, &gy);
 
     INPUT input = {};
     input.type = INPUT_MOUSE;
-    input.mi.dx = ax;
-    input.mi.dy = ay;
-    input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+    input.mi.dx = si_normalize((int64_t)std::floor(gx), dx);
+    input.mi.dy = si_normalize((int64_t)std::floor(gy), dy);
+    input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
 
     return (SendInput(1, &input, sizeof(INPUT)) == 1) ? 0 : -1;
 }

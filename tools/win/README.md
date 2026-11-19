@@ -121,6 +121,26 @@ rejected injections. It never injects input, so it is safe in any session.
 Never aim real SendInput at the console: it moves the user's pointer and types
 into the user's applications.
 
+The test also replaces `GetSystemMetrics` with a synthetic virtual desktop
+(md-w65), so mouse moves are checked against layouts the VM does not have:
+a non-primary output, negative origins, mixed DPI, a portrait output, and a
+layout that changes while the backend runs. Each recorded move is decoded
+the way Windows decodes `MOUSEEVENTF_VIRTUALDESK` (pixel = left +
+n * width / 65536) and must land on the exact intended pixel. The mapping
+works in two steps:
+
+1. `md_input_map_to_output` (input.c) maps the frame point into the captured
+   output's rectangle (`MdInputConfig.output_*`, copied from
+   `md_capture_get_output_rect`).
+2. The backend aims at the centre of that desktop pixel, across the virtual
+   desktop.
+
+The DXGI backend publishes that rectangle in physical pixels:
+`GetMonitorInfo` on the output's monitor, read per-monitor DPI aware
+(`win_dpi.h`). The virtual desktop is read the same way, because
+`DXGI_OUTPUT_DESC.DesktopCoordinates` and `SM_*VIRTUALSCREEN` are
+DPI-virtualized for a process that is not DPI aware.
+
 `test_capture_dxgi_win.exe` checks the capture HAL contract. Both modes start
 with synthetic cells that need no desktop:
 
