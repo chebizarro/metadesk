@@ -189,7 +189,7 @@ MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg) {
         ctx->config.show_cursor = true;
     }
 
-    if (ctx->vtable->init(ctx, &ctx->config) != 0) {
+    if (ctx->vtable->init(ctx) != 0) {
         free(ctx);
         return NULL;
     }
@@ -202,9 +202,9 @@ int md_capture_start(MdCaptureCtx *ctx) {
     return ctx->vtable->start(ctx);
 }
 
-int md_capture_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
+int md_capture_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     if (!ctx || !out || !ctx->vtable || !ctx->vtable->get_frame) return MD_CAPTURE_ERROR;
-    int result = ctx->vtable->get_frame(ctx, out);
+    int result = ctx->vtable->get_frame(ctx, out, timeout_ms);
     if (result == 0 && out->buf_type == MD_BUF_CPU && !out->data) {
         /* Enforce the HAL contract even if a backend violates its mapping
          * precondition. Return its borrowed storage before reporting failure. */
@@ -224,12 +224,19 @@ bool md_capture_is_active(const MdCaptureCtx *ctx) {
     return ctx ? ctx->active : false;
 }
 
-int md_capture_get_size(const MdCaptureCtx *ctx, uint32_t *width, uint32_t *height) {
+int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
+                         uint32_t *width, uint32_t *height) {
     if (!ctx || !width || !height) return -1;
+    if (ctx->vtable && ctx->vtable->wait_size)
+        return ctx->vtable->wait_size(ctx, timeout_ms, width, height);
     if (ctx->width == 0 || ctx->height == 0) return -1;
     *width  = ctx->width;
     *height = ctx->height;
     return 0;
+}
+
+int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height) {
+    return md_capture_wait_size(ctx, 0, width, height);
 }
 
 void md_capture_stop(MdCaptureCtx *ctx) {

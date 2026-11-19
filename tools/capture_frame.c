@@ -68,7 +68,8 @@ int main(int argc, char **argv) {
 
     /* Get one frame */
     MdFrame frame;
-    int ret = md_capture_get_frame(cap, &frame);
+    /* Consent happened in start; allow time for format negotiation. */
+    int ret = md_capture_get_frame(cap, &frame, 5000);
     if (ret != 0) {
         fprintf(stderr, "ERROR: no frame received.\n");
         md_capture_destroy(cap);

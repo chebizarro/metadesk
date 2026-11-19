@@ -162,15 +162,25 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
 
 /* ── Map capture pixel format to encoder pixel format ──────────── */
 
+/* Exhaustive: an RGB-ordered frame labelled BGRX would swap red and blue. */
 static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
     switch (cfmt) {
+    case MD_PIX_CAPTURE_BGRX: return MD_PIX_FMT_BGRX;
     case MD_PIX_CAPTURE_BGRA: return MD_PIX_FMT_BGRA;
+    case MD_PIX_CAPTURE_RGBX: return MD_PIX_FMT_RGBX;
+    case MD_PIX_CAPTURE_RGBA: return MD_PIX_FMT_RGBA;
     case MD_PIX_CAPTURE_NV12: return MD_PIX_FMT_NV12;
-    default:                  return MD_PIX_FMT_BGRX;
     }
+    return MD_PIX_FMT_BGRX; /* unreachable: backends emit only the above */
 }
 
 #define HOST_CAPTURE_SIZE_WAIT_MS 2000
+/* Upper bound on one idle get_frame wait, so has_client and g_running are
+ * re-sampled while a damage-driven stream is quiet. */
+#define HOST_CAPTURE_FRAME_WAIT_MS 100
+/* Pacing after MD_CAPTURE_ERROR (returned without waiting) while the
+ * watchdog decides whether to restart. */
+#define HOST_CAPTURE_ERROR_BACKOFF_US 10000
 /* Restart only broken capture, not healthy damage-driven idle streams.
  * Authorization removal is separately opt-in and forbidden unattended. */
 #define HOST_CAPTURE_STALL_MS      4000
@@ -196,27 +206,21 @@ static int host_wait_capture_dimensions(MdCaptureCtx *capture,
     if (!capture || !width || !height)
         return -1;
 
-    for (uint32_t waited_ms = 0; waited_ms <= HOST_CAPTURE_SIZE_WAIT_MS;
-         waited_ms += 10) {
-        uint32_t w = 0, h = 0;
-        if (md_capture_get_size(capture, &w, &h) == 0) {
-            if (host_dimensions_are_valid(w, h)) {
-                *width = w;
-                *height = h;
-                return 0;
-            }
-            fprintf(stderr,
-                    "host: WARNING: capture reported invalid dimensions %ux%u; "
-                    "minimum is %ux%u\n",
-                    w, h,
-                    MD_INPUT_MIN_SCREEN_DIMENSION,
-                    MD_INPUT_MIN_SCREEN_DIMENSION);
-            return -1;
-        }
-        usleep(10000);
+    uint32_t w = 0, h = 0;
+    if (md_capture_wait_size(capture, HOST_CAPTURE_SIZE_WAIT_MS, &w, &h) != 0)
+        return -1;
+    if (!host_dimensions_are_valid(w, h)) {
+        fprintf(stderr,
+                "host: WARNING: capture reported invalid dimensions %ux%u; "
+                "minimum is %ux%u\n",
+                w, h,
+                MD_INPUT_MIN_SCREEN_DIMENSION,
+                MD_INPUT_MIN_SCREEN_DIMENSION);
+        return -1;
     }
-
-    return -1;
+    *width = w;
+    *height = h;
+    return 0;
 }
 
 /* ── Capture thread: pull frames and encode ──────────────────── */
@@ -240,7 +244,8 @@ static void *capture_thread_func(void *arg) {
         bool has_client = (ctx->client != NULL);
         pthread_mutex_unlock(&ctx->client_mu);
         MdFrame frame;
-        int capture_result = md_capture_get_frame(cap, &frame);
+        int capture_result = md_capture_get_frame(cap, &frame,
+                                                  HOST_CAPTURE_FRAME_WAIT_MS);
         MdCaptureRecovery recovery = md_capture_watchdog_step(&watchdog,
             capture_result, has_client, md_stream_now_ms(),
             HOST_CAPTURE_STALL_MS, HOST_CAPTURE_MAX_RESTARTS);
@@ -263,7 +268,8 @@ static void *capture_thread_func(void *arg) {
                         fprintf(stderr, "host: capture restart failed\n");
                 }
             }
-            if (capture_result != MD_CAPTURE_IDLE) usleep(10000);
+            if (capture_result != MD_CAPTURE_IDLE)
+                usleep(HOST_CAPTURE_ERROR_BACKOFF_US);
             continue;
         }
 

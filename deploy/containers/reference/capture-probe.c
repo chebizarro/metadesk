@@ -79,7 +79,7 @@ static int probe(MdCaptureCtx *ctx) {
                 redraw = now() + .25;
             }
             MdFrame f = {0};
-            if (md_capture_get_frame(ctx, &f)) {
+            if (md_capture_get_frame(ctx, &f, 1000)) {
                 timeouts++;
                 /* The backend can return immediately before STREAMING. This
                  * is retry pacing, never a success criterion or consent wait. */
@@ -126,7 +126,7 @@ static int probe(MdCaptureCtx *ctx) {
         double idle_start = now();
         for (unsigned i = 0; i < 5; i++) {
             MdFrame f = {0};
-            int result = md_capture_get_frame(ctx, &f);
+            int result = md_capture_get_frame(ctx, &f, 1000);
             if (result == MD_CAPTURE_IDLE) idle_timeouts++;
             else if (result == MD_CAPTURE_ERROR) idle_errors++;
             else { idle_frames++; md_capture_release_frame(ctx, &f); }
@@ -146,7 +146,7 @@ static int probe(MdCaptureCtx *ctx) {
         /* Only this container's PID namespace; never a host/live service. */
         if (system("python3 -c 'import pathlib,os,signal; [os.kill(int(p.name),signal.SIGTERM) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and (p/\"comm\").exists() and (p/\"comm\").read_text().strip()==\"pipewire\"]'") != 0) return 10;
         MdFrame f = {0};
-        int broken = md_capture_get_frame(ctx, &f);
+        int broken = md_capture_get_frame(ctx, &f, 1000);
         if (broken == 0) md_capture_release_frame(ctx, &f);
         printf("broken_result=%d\n", broken);
         if (broken != MD_CAPTURE_ERROR) return 10;
@@ -160,7 +160,7 @@ static int probe(MdCaptureCtx *ctx) {
         double deadline = now() + 3;
         do {
             if (system(commands[0]) != 0) return 4;
-            held_result = md_capture_get_frame(ctx, &held);
+            held_result = md_capture_get_frame(ctx, &held, 1000);
         } while (held_result != 0 && now() < deadline);
         if (held_result != 0 || !held.data) return 11;
         uint8_t pixel = held.data[0];
@@ -173,14 +173,14 @@ static int probe(MdCaptureCtx *ctx) {
         }
         /* get_frame observes stopping without taking another buffer. */
         MdFrame next = {0};
-        int stopped = md_capture_get_frame(ctx, &next);
+        int stopped = md_capture_get_frame(ctx, &next, 1000);
         if (stopped == 0) md_capture_release_frame(ctx, &next);
         bool waiting = stopped == MD_CAPTURE_ERROR &&
                        !atomic_load_explicit(&task.completed, memory_order_acquire);
         bool intact = waiting && held.data[0] == pixel;
         md_capture_release_frame(ctx, &held);
         pthread_join(stopper, NULL);
-        int after_stop = md_capture_get_frame(ctx, &next);
+        int after_stop = md_capture_get_frame(ctx, &next, 1000);
         printf("held_buffer_intact=%d after_stop=%d stop_waiting=%d\n", intact, after_stop, waiting);
         if (!waiting || !intact || after_stop != MD_CAPTURE_ERROR) return 11;
     }
