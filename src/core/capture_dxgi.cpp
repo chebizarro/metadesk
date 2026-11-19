@@ -59,7 +59,10 @@
  * output. DXGI_OUTPUT_DESC.DesktopCoordinates is DPI-virtualized for a
  * process that is not per-monitor DPI aware, so the rectangle comes from
  * GetMonitorInfo on the output's monitor, queried per-monitor aware
- * (win_dpi.h); the frame itself is always physical pixels.
+ * (win_dpi.h); the frame itself is always physical pixels. Agent and MCP
+ * clicks arrive in UI Automation coordinates, which are physical only in a
+ * per-monitor aware process (md-m5x4: the host sets that first thing in
+ * main), so init logs when the process is not.
  *
  * Damage: an unchanged desktop is IDLE. A pointer-only update (LastPresentTime
  * 0) leaves the desktop image unchanged. Without show_cursor it is IDLE, since
@@ -921,6 +924,10 @@ static int dxgi_init(MdCaptureCtx *ctx) {
     auto *st = (DxgiState *)calloc(1, sizeof(DxgiState));
     if (!st) return -1;
     QueryPerformanceFrequency(&st->qpc_hz);
+    if (md_win_dpi_process_awareness() == MD_DPI_PROCESS_NOT_PER_MONITOR)
+        MD_LOG_I("process is not per-monitor DPI aware: on displays scaled above 100%% UI "
+                 "Automation coordinates (agent and MCP clicks) are DPI-virtualized "
+                 "(call md_win_dpi_process_init first)");
     if (FAILED(open_duplication(ctx, st))) {
         free_state(st);
         return -1;

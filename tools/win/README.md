@@ -108,6 +108,7 @@ Reference numbers on the Win11 ARM64 VM (console session, medians):
 ```sh
 bash tools/win/build-media-harness.sh
 ./build-win-media/test_sendinput_win.exe
+./build-win-media/test_win_dpi_win.exe
 ./build-win-media/test_capture_dxgi_win.exe                 # session 0 cell
 ./build-win-media/test_capture_dxgi_win.exe --interactive   # console only
 ```
@@ -140,6 +141,58 @@ The DXGI backend publishes that rectangle in physical pixels:
 (`win_dpi.h`). The virtual desktop is read the same way, because
 `DXGI_OUTPUT_DESC.DesktopCoordinates` and `SM_*VIRTUALSCREEN` are
 DPI-virtualized for a process that is not DPI aware.
+
+### Per-monitor DPI awareness (md-m5x4)
+
+Agent and MCP clicks use UI Automation `BoundingRectangle` coordinates,
+which are physical only for a DPI-aware client. The host therefore calls
+`md_win_dpi_process_init()` (`win_dpi.h`) as the first statement of
+`main()`, before any window, UIA, DXGI or input call. That makes the process
+per-monitor v2 aware (`SetProcessDpiAwarenessContext`, Windows 10 1703+;
+per-monitor v1 through shcore on 8.1 to 1607), and every thread inherits
+it. If a manifest or Windows already set the awareness, the call is
+refused and the awareness in effect is reported. Over SSH, Windows starts
+processes per-monitor v1 aware. DXGI `init` logs when the process is not
+per-monitor aware.
+
+The API call is used instead of an application manifest because the meson
+Windows build is still blocked. A manifest needs `windows.compile_resources`,
+and MinGW and MSVC embed it differently (MSVC also embeds its own default
+manifest). None of that can be built or verified yet, while the call is
+exercised by the standalone harnesses today. If a manifest is added later,
+the call becomes a no-op.
+
+With the process per-monitor aware, every coordinate source is physical
+virtual-desktop pixels:
+
+- UIA node rectangles. Walks also run inside an `MdPhysicalPixels` scope.
+- The DXGI output rectangle and the "all" frame bounds. Regions are
+  mode-sized, so physical rectangles make them abut exactly.
+- `SendInput`'s virtual desktop.
+- `md_input_execute_action`'s global-to-frame conversion, which inverts
+  `md_input_map_to_output`.
+
+The backend scopes also keep tools and tests that never called the init
+correct.
+
+The VM has one 100% output, so mixed DPI is covered synthetically:
+
+- `test_sendinput_win` fakes `GetSystemMetrics` so it DPI-virtualizes
+  (logical units at 150%) for threads that are not per-monitor aware, and
+  runs every move on a forced-unaware thread. A mixed 100/125/150% layout
+  checks that agent clicks land on the exact physical pixel, both 1:1 and
+  in "all". A scaled stream lands within one frame pixel's footprint. MCP
+  global points are exact. The cell runs on an unaware thread, then in a
+  per-monitor process.
+- `test_capture_dxgi_win` fakes `GetMonitorInfoW` for synthetic monitors
+  the same way. It checks physical output rectangles from an unaware
+  thread, scope restoration and the composed "all" layout.
+- `test_win_dpi_win.c` compiles `win_dpi.h` as C with `src/host/main.c`'s
+  include block. In the console it checks unaware to per-monitor v2, a
+  repeated call and thread inheritance. In session 0 it checks that the
+  preset v1 awareness is reported.
+
+A real scaled or mixed-DPI display is not covered.
 
 `test_capture_dxgi_win.exe` checks the capture HAL contract. Both modes start
 with synthetic cells that need no desktop:
@@ -284,3 +337,6 @@ and the three Windows test translation units with MSVC ARM64
 `/std:c++17 /W4 /WX /EHsc /permissive-`. Use real dependency headers or the
 VM's type-only pthread/cJSON stubs for this compile-only check. Do not define
 `WIN32_LEAN_AND_MEAN` for the UIA files (it breaks UIAutomationCore headers).
+Compile `tests/test_win_dpi_win.c` as C (`/std:c11 /W4 /WX /Tc`) and link
+it with `user32.lib`: it stands in for `src/host/main.c`'s use of
+`win_dpi.h` until the product builds on Windows.

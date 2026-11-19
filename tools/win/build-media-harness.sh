@@ -11,6 +11,8 @@
 #                                 frames, IDLE, timeouts, stop, loss recovery)
 #   - test_sendinput_win.exe    : SendInput backend with SendInput replaced by
 #                                 a recorder in the test TU (never injects input)
+#   - test_win_dpi_win.exe      : win_dpi.h compiled as C, as src/host/main.c
+#                                 includes it: process per-monitor v2 (md-m5x4)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-$ROOT/build-win-media}"
@@ -32,5 +34,7 @@ $CXX $CXXFLAGS -o "$OUT/test_capture_dxgi_win.exe" "$ROOT/tests/test_capture_dxg
 echo "== link test_sendinput_win.exe"
 $CXX $CXXFLAGS -o "$OUT/test_sendinput_win.exe" "$ROOT/tests/test_sendinput_win.cpp" \
   "$OUT/input.o" "$OUT/log.o" -luser32
+echo "== link test_win_dpi_win.exe"
+$CC $CFLAGS -o "$OUT/test_win_dpi_win.exe" "$ROOT/tests/test_win_dpi_win.c" -luser32
 echo "== done: $OUT"
 ls -la "$OUT"/*.exe

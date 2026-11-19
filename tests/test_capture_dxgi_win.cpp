@@ -27,8 +27,59 @@
  * pointer already is and change only that window's own cursor (SetCursor on
  * its thread), so each change is a pointer-only update. The windows never
  * take focus, send input or touch other windows.
+ *
+ * md-m5x4: GetMonitorInfoW is replaced, in this translation unit only, by a
+ * fake that DPI-virtualizes a synthetic mixed-DPI layout for threads that
+ * are not per-monitor aware, as Windows does, and forwards real monitors.
+ * The VM has one output at 100%, so mixed DPI is covered synthetically only.
  */
+#include <windows.h>
+#include "../src/core/win_dpi.h"
+
+/* Physical desktop rectangles and DPI of the synthetic monitors. */
+struct SyntheticMonitor {
+    RECT physical;
+    UINT dpi;
+};
+static const SyntheticMonitor synthetic_monitors[] = {
+    { { 0, 0, 1920, 1080 }, 96 },         /* primary, 100% */
+    { { 1920, -540, 5760, 1620 }, 144 },  /* 3840x2160 at 150%, right */
+    { { -2560, 0, 0, 1440 }, 120 },       /* 2560x1440 at 125%, left */
+};
+static const int synthetic_monitor_count = 3;
+
+static HMONITOR synthetic_monitor(int i) { return (HMONITOR)(INT_PTR)(0x5D000 + i); }
+
+static bool thread_per_monitor_aware() {
+    auto get = (MdGetDpiContextFn)md_win_dpi_proc(L"user32.dll", "GetThreadDpiAwarenessContext");
+    auto awareness = (MdDpiContextAwarenessFn)md_win_dpi_proc(
+        L"user32.dll", "GetAwarenessFromDpiAwarenessContext");
+    return get && awareness && awareness(get()) == 2; /* DPI_AWARENESS_PER_MONITOR_AWARE */
+}
+
+/* What a thread that is not per-monitor aware sees: the rectangle in
+ * 96-DPI logical units. */
+static RECT virtualized(const SyntheticMonitor &m) {
+    const RECT &p = m.physical;
+    const auto s = [&](LONG v) { return (LONG)((LONGLONG)v * 96 / (LONGLONG)m.dpi); };
+    return { s(p.left), s(p.top), s(p.right), s(p.bottom) };
+}
+
+static BOOL WINAPI dpi_monitor_info(HMONITOR monitor, LPMONITORINFO mi) {
+    for (int i = 0; i < synthetic_monitor_count; i++) {
+        if (monitor != synthetic_monitor(i)) continue;
+        if (!mi || mi->cbSize < sizeof(MONITORINFO)) return FALSE;
+        const SyntheticMonitor &m = synthetic_monitors[i];
+        mi->rcMonitor = mi->rcWork = thread_per_monitor_aware() ? m.physical : virtualized(m);
+        mi->dwFlags = i == 0 ? MONITORINFOF_PRIMARY : 0;
+        return TRUE;
+    }
+    return GetMonitorInfoW(monitor, mi);
+}
+
+#define GetMonitorInfoW dpi_monitor_info
 #include "../src/core/capture_dxgi.cpp"
+#undef GetMonitorInfoW
 
 #include <climits>
 #include <cstdio>
@@ -303,6 +354,73 @@ static void all_outputs_unit_tests() {
     puts("PASS pointer across outputs: owner-only hide, newer visible report wins, offsets");
 }
 
+/* md-m5x4: output rectangles are physical on a mixed-DPI desktop even on a
+ * thread that is not per-monitor aware, so "all" composes each output's
+ * physical-size image into a region of exactly that size and the published
+ * rectangle is the physical bounding rectangle SendInput targets. */
+static void dpi_unit_tests() {
+    typedef HANDLE(WINAPI * SetThreadContext)(HANDLE);
+    auto set_thread = (SetThreadContext)md_win_dpi_proc(L"user32.dll", "SetThreadDpiAwarenessContext");
+    CHECK(set_thread); /* Windows 10 1607+ */
+    const HANDLE before = set_thread(MD_DPI_CONTEXT_UNAWARE);
+    CHECK(before && !thread_per_monitor_aware());
+
+    /* The fake virtualizes, as Windows does, so a query outside the
+     * backend's per-monitor scope would be caught. */
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    CHECK(dpi_monitor_info(synthetic_monitor(1), &mi));
+    CHECK(mi.rcMonitor.left == 1280 && mi.rcMonitor.top == -360 && mi.rcMonitor.right == 3840);
+
+    MdCaptureCtx ctx = {};
+    DxgiState st = {};
+    st.count = 3;
+    st.all = true;
+    for (int i = 0; i < 3; i++) {
+        const SyntheticMonitor &m = synthetic_monitors[i];
+        DXGI_OUTPUT_DESC d = {};
+        d.Monitor = synthetic_monitor(i);
+        d.DesktopCoordinates = virtualized(m); /* what DXGI reports to this thread */
+        d.AttachedToDesktop = TRUE;
+        st.out[i].rect = output_physical_rect(d);
+        CHECK(!thread_per_monitor_aware()); /* the scope restored the context */
+        CHECK(EqualRect(&st.out[i].rect, &m.physical));
+        /* Desktop Duplication images are physical: the mode is the
+         * rectangle's size, so the image fills its region exactly. */
+        output_configure(&st.out[i], (uint32_t)(m.physical.right - m.physical.left),
+                         (uint32_t)(m.physical.bottom - m.physical.top), DXGI_MODE_ROTATION_IDENTITY);
+    }
+    /* A monitor the fake does not know (none) falls back to DXGI's own. */
+    {
+        DXGI_OUTPUT_DESC d = {};
+        d.DesktopCoordinates = { 7, 8, 9, 10 };
+        const RECT r = output_physical_rect(d);
+        CHECK(r.left == 7 && r.bottom == 10);
+    }
+    CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+    /* Bounding rectangle (-2560,-540) to (5760,1620). */
+    CHECK(ctx.width == 8320 && ctx.height == 2160);
+    CHECK(ctx.output_rect.x == -2560 && ctx.output_rect.y == -540 &&
+          ctx.output_rect.width == 8320 && ctx.output_rect.height == 2160);
+    CHECK(st.out[0].frame_x == 2560 && st.out[0].frame_y == 540);
+    CHECK(st.out[1].frame_x == 4480 && st.out[1].frame_y == 0 && st.out[1].width == 3840);
+    CHECK(st.out[2].frame_x == 0 && st.out[2].frame_y == 540 && st.out[2].width == 2560);
+    /* Adjacent outputs abut without overlap: the 150% output starts where
+     * the primary's region ends, in frame and desktop pixels alike. */
+    CHECK(st.out[0].frame_x + st.out[0].width == st.out[1].frame_x);
+    CHECK(st.out[2].frame_x + st.out[2].width == st.out[0].frame_x);
+    /* A UIA point on the 150% output (physical, from a per-monitor aware
+     * process) is its frame pixel: frame = global - output_rect origin. */
+    const LONG gx = 1920 + 1000, gy = -540 + 700;
+    CHECK(gx - ctx.output_rect.x == (LONG)st.out[1].frame_x + 1000 &&
+          gy - ctx.output_rect.y == (LONG)st.out[1].frame_y + 700);
+    free(st.canvas);
+
+    set_thread(before);
+    puts("PASS mixed DPI (synthetic): physical output rects from a DPI-unaware thread, "
+         "'all' regions abut, UIA physical points map to frame pixels");
+}
+
 static void unit_tests() {
     const Bgr bg = { 10, 100, 200 };
 
@@ -489,6 +607,7 @@ static void unit_tests() {
 
     rotation_unit_tests();
     all_outputs_unit_tests();
+    dpi_unit_tests();
 }
 
 /* ── Test windows ────────────────────────────────────────────── */
@@ -1155,6 +1274,9 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const bool interactive = argc > 1 && strcmp(argv[1], "--interactive") == 0;
+    /* As the host does (md-m5x4): GetCursorPos, window and output
+     * rectangles then agree with DXGI's physical pixels on any DPI. */
+    CHECK(md_win_dpi_process_init() != MD_DPI_PROCESS_NOT_PER_MONITOR);
     unit_tests();
 
     const MdCaptureBackend *be = md_capture_backend_create();
