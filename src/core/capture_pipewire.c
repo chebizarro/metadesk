@@ -39,6 +39,7 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include "log.h"
+#include "md_time.h"
 #define MD_LOG_TAG "capture_pipewire"
 
 /* ══════════════════════════════════════════════════════════════
@@ -84,12 +85,6 @@ typedef struct {
     bool            opened;
 } PortalScreencast;
 
-static uint64_t monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
 /* Absolute CLOCK_MONOTONIC time for pthread_cond_timedwait on the backend's
  * frame_cond (initialised with that clock). */
 static struct timespec monotonic_timespec(uint64_t at_ns) {
@@ -101,7 +96,7 @@ static struct timespec monotonic_timespec(uint64_t at_ns) {
 #define PW_CONNECT_DEADLINE_NS 5000000000ULL
 
 static int portal_remaining_ms(PortalScreencast *p, int limit) {
-    uint64_t now = monotonic_ns();
+    uint64_t now = md_monotonic_ns();
     if (now >= p->deadline_ns) return 0;
     uint64_t ms = (p->deadline_ns - now) / 1000000;
     return ms < (uint64_t)limit ? (int)ms : limit;
@@ -195,15 +190,15 @@ static uint32_t portal_wait_response(PortalScreencast *p,
                                      int timeout_ms,
                                      DBusMessage **out_msg) {
     uint32_t result = UINT32_MAX;
-    uint64_t deadline = monotonic_ns() + (uint64_t)timeout_ms * 1000000;
+    uint64_t deadline = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000;
     if (deadline > p->deadline_ns) deadline = p->deadline_ns;
 
-    while (monotonic_ns() < deadline) {
-        int remaining = (int)((deadline - monotonic_ns()) / 1000000);
+    while (md_monotonic_ns() < deadline) {
+        int remaining = (int)((deadline - md_monotonic_ns()) / 1000000);
         if (remaining <= 0) break;
         if (!dbus_connection_read_write(p->bus, remaining > 100 ? 100 : remaining)) break;
         DBusMessage *msg;
-        while (monotonic_ns() < deadline &&
+        while (md_monotonic_ns() < deadline &&
                (msg = dbus_connection_pop_message(p->bus)) != NULL) {
             if (dbus_message_is_signal(msg, PORTAL_REQUEST, "Response")
                 && dbus_message_has_sender(msg, p->owner)
@@ -289,7 +284,7 @@ static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfi
     char restore_token[1024] = {0};
     memset(portal, 0, sizeof(*portal));
     portal->pw_fd = -1;
-    portal->deadline_ns = monotonic_ns() + (uint64_t)md_capture_consent_timeout_ms(cfg) * 1000000;
+    portal->deadline_ns = md_monotonic_ns() + (uint64_t)md_capture_consent_timeout_ms(cfg) * 1000000;
 
     /* Connect to a private session-bus connection: no shared message draining. */
     DBusError err;
@@ -814,7 +809,7 @@ static void on_process(void *userdata) {
     }
     /* pw_buffer.time is zero on xdpw 0.7.1. Use CLOCK_MONOTONIC receipt
      * time in ns, not that unspecified producer value. Ownership is unchanged. */
-    uint64_t timestamp = monotonic_ns();
+    uint64_t timestamp = md_monotonic_ns();
     if (timestamp <= pw->last_timestamp_ns) timestamp = pw->last_timestamp_ns + 1;
     pw->last_timestamp_ns = timestamp;
 
@@ -1016,7 +1011,7 @@ static int pw_start(MdCaptureCtx *ctx) {
     if (pw->thread_started || pw->stream) return -1;
     pw->generation++;
     if (pw->trace_buffers) MD_LOG_I("capture start gen=%u", pw->generation);
-    pw->started_ns = monotonic_ns();
+    pw->started_ns = md_monotonic_ns();
     pw->connected = false;
     pw->broken = false;
     pw->stopping = false;
@@ -1109,7 +1104,7 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     PipewireState *pw = ctx->backend_data;
     if (!pw) return MD_CAPTURE_ERROR;
 
-    uint64_t until = monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    uint64_t until = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&pw->frame_lock);
 
     /* Damage-driven capture can legitimately remain idle indefinitely.
@@ -1120,14 +1115,14 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
         uint64_t limit = until;
         if (!pw->connected && pw->started_ns + PW_CONNECT_DEADLINE_NS < limit)
             limit = pw->started_ns + PW_CONNECT_DEADLINE_NS;
-        if (monotonic_ns() >= limit) break;
+        if (md_monotonic_ns() >= limit) break;
         struct timespec ts = monotonic_timespec(limit);
         pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &ts);
     }
 
     if (pw->stopping || !pw->frame_ready) {
         bool broken = pw->stopping || pw->broken || (!pw->connected &&
-            monotonic_ns() - pw->started_ns >= PW_CONNECT_DEADLINE_NS);
+            md_monotonic_ns() - pw->started_ns >= PW_CONNECT_DEADLINE_NS);
         pthread_mutex_unlock(&pw->frame_lock);
         return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
@@ -1145,7 +1140,7 @@ static int pw_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
     PipewireState *pw = ctx->backend_data;
     if (!pw) return -1;
 
-    struct timespec deadline = monotonic_timespec(monotonic_ns() +
+    struct timespec deadline = monotonic_timespec(md_monotonic_ns() +
                                                   (uint64_t)timeout_ms * 1000000ULL);
     pthread_mutex_lock(&pw->frame_lock);
     while ((!ctx->width || !ctx->height) && !pw->broken && !pw->stopping &&

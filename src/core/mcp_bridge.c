@@ -8,6 +8,7 @@
 #include "mcp_bridge.h"
 #define MD_LOG_TAG "mcp-bridge"
 #include "log.h"
+#include "md_time.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -231,14 +232,8 @@ static void *bridge_watch_desktop(void *userdata)
             md_mcp_bridge_shutdown(life->bridge);
             return NULL;
         }
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_nsec += 100 * 1000000L;
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec++;
-            deadline.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&life->cv, &life->mu, &deadline);
+        md_cond_timedwait_until(&life->cv, &life->mu,
+                                md_monotonic_ns() + 100 * 1000000ULL);
     }
     pthread_mutex_unlock(&life->mu);
     return NULL;
@@ -249,7 +244,7 @@ int md_mcp_bridge_run_supervised(MdMcpBridge *bridge)
     if (!bridge) return -1;
     McpLifecycle life = { .bridge = bridge };
     if (pthread_mutex_init(&life.mu, NULL) != 0) return -1;
-    if (pthread_cond_init(&life.cv, NULL) != 0) {
+    if (md_cond_init_monotonic(&life.cv) != 0) {
         pthread_mutex_destroy(&life.mu);
         return -1;
     }

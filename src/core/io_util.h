@@ -6,14 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <time.h>
 
-static inline int64_t md_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
+#include "md_time.h" /* md_now_ms(): deadlines below are on its clock */
 
 /* One nonblocking socket send, without changing the open file description.
  * On platforms without MSG_NOSIGNAL the socket must have SO_NOSIGPIPE set. */

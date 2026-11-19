@@ -9,6 +9,7 @@
 #endif
 
 #include "fips_control.h"
+#include "md_time.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -258,20 +259,6 @@ md_fc_inspect_sessions(const cJSON *data, const char *peer_npub,
     return prior_state;
 }
 
-static uint64_t md_fc_time_ms(void)
-{
-#if defined(_WIN32)
-    return (uint64_t)time(NULL) * 1000u;
-#elif defined(CLOCK_MONOTONIC)
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
-    return (uint64_t)time(NULL) * 1000u;
-#else
-    return (uint64_t)time(NULL) * 1000u;
-#endif
-}
-
 static void md_fc_sleep_ms(uint32_t ms)
 {
     if (ms == 0) return;
@@ -287,7 +274,7 @@ static void md_fc_sleep_ms(uint32_t ms)
 
 static uint32_t md_fc_remaining_request_timeout(uint64_t deadline_ms)
 {
-    uint64_t now = md_fc_time_ms();
+    uint64_t now = md_now_ms();
     if (now >= deadline_ms) return 0;
     uint64_t remaining = deadline_ms - now;
     if (remaining > MD_FIPS_CONTROL_DEFAULT_TIMEOUT_MS)
@@ -315,7 +302,7 @@ md_fips_control_wait_peer_ready(const char *socket_override,
     if (poll_interval_ms == 0)
         poll_interval_ms = MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS;
 
-    uint64_t deadline = md_fc_time_ms() + total_timeout_ms;
+    uint64_t deadline = md_now_ms() + total_timeout_ms;
     MdFipsPeerReadinessState last_state = MD_FIPS_PEER_NOT_FOUND;
     MdFipsControlResult last_result = MD_FIPS_CONTROL_OK;
     char last_socket[MD_FIPS_CONTROL_PATH_MAX] = {0};
@@ -399,7 +386,7 @@ md_fips_control_wait_peer_ready(const char *socket_override,
             return last_state;
         }
 
-        uint64_t now = md_fc_time_ms();
+        uint64_t now = md_now_ms();
         if (now >= deadline) break;
         uint64_t remaining = deadline - now;
         md_fc_sleep_ms((uint32_t)(remaining < poll_interval_ms ? remaining : poll_interval_ms));
@@ -577,23 +564,15 @@ static char *md_fc_build_request_json(const char *command, const cJSON *params,
 }
 
 #ifndef _WIN32
-static uint64_t md_fc_now_ms(void)
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
-    return 0;
-}
-
 static uint64_t md_fc_deadline_ms(uint32_t timeout_ms)
 {
     if (timeout_ms == 0) timeout_ms = MD_FIPS_CONTROL_DEFAULT_TIMEOUT_MS;
-    return md_fc_now_ms() + timeout_ms;
+    return md_now_ms() + timeout_ms;
 }
 
 static int md_fc_remaining_poll_ms(uint64_t deadline_ms)
 {
-    uint64_t now = md_fc_now_ms();
+    uint64_t now = md_now_ms();
     if (now >= deadline_ms) return 0;
     uint64_t remaining = deadline_ms - now;
     if (remaining > 2147483647u) return 2147483647;

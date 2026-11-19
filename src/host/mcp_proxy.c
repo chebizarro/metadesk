@@ -23,6 +23,7 @@
 #include "host_mcp.h"
 #include "accounts.h"
 #include "mcp_server.h"
+#include "md_time.h"
 #include "nostr.h"
 #include "signer.h"
 
@@ -365,13 +366,9 @@ static void *sse_main(void *arg) {
                     status);
         if (status == 200) backoff = PROXY_SSE_BACKOFF_MIN_MS;
         last = status;
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_sec += backoff / 1000;
-        until.tv_nsec += (long)(backoff % 1000) * 1000000L;
-        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+        uint64_t until = md_monotonic_ns() + (uint64_t)backoff * 1000000u;
         pthread_mutex_lock(&p->mu);
-        while (!p->stop && pthread_cond_timedwait(&p->cv, &p->mu, &until) != ETIMEDOUT) {}
+        while (!p->stop && md_cond_timedwait_until(&p->cv, &p->mu, until) != ETIMEDOUT) {}
         pthread_mutex_unlock(&p->mu);
         if (backoff < PROXY_SSE_BACKOFF_MAX_MS) backoff *= 2;
     }
@@ -561,7 +558,7 @@ int md_host_mcp_proxy_cli(int argc, char **argv) {
     Proxy p = { .url = url, .signer = signer, .sse = sse };
     pthread_mutex_init(&p.out_mu, NULL);
     pthread_mutex_init(&p.mu, NULL);
-    pthread_cond_init(&p.cv, NULL);
+    md_cond_init_monotonic(&p.cv);
 
     char *line = NULL;
     size_t cap = 0;

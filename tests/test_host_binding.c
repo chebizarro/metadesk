@@ -51,11 +51,8 @@ static MdSessionAccept reserve(MdSession *s, uint32_t caps) {
     md_session_init(s);
     MD_CHECK(md_session_request(s, "authenticated-client", caps, MD_TREE_FORMAT_COMPACT) == 0);
     MD_CHECK(md_session_accept(s, "negotiated-id", caps) == 0);
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
     MdSessionAccept acc;
-    MD_CHECK(md_session_prepare_binding(s, &acc,
-        (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000) == 0);
+    MD_CHECK(md_session_prepare_binding(s, &acc, (uint64_t)md_now_ms()) == 0);
     char *dm = md_session_accept_to_json(&acc);
     MD_CHECK(dm && md_session_accept_from_json(dm, &acc) == 0);
     free(dm);
@@ -296,10 +293,8 @@ static void test_relay_grant(const char *url, uint32_t expected) {
         MdSession s; md_session_init(&s);
         HostCtx ctx = request; ctx.session = &s;
         MD_CHECK(host_accept_request(&ctx, n, "negotiated-id", false) == 0);
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
         MdSessionAccept acc;
-        MD_CHECK(md_session_prepare_binding(&s, &acc,
-            (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000) == 0);
+        MD_CHECK(md_session_prepare_binding(&s, &acc, (uint64_t)md_now_ms()) == 0);
         Pair p = pair(); send_proof(p, &acc);
         MD_CHECK(host_bind_candidate(&ctx, p.host) == 0);
         ack(p, MD_CAP_VIDEO); ctx.client = p.host;

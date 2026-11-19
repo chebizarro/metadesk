@@ -7,36 +7,17 @@
  * capture_screencapturekit.m, or capture_dxgi.cpp.
  */
 #include "capture.h"
+#include "md_time.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include <time.h>
-#endif
 
 /* ── Frame clock ─────────────────────────────────────────────── */
 
 uint64_t md_capture_clock_ns(void) {
-#if defined(_WIN32)
-    /* Same conversion as capture_dxgi.cpp's qpc_to_ns. */
-    LARGE_INTEGER hz, now;
-    QueryPerformanceFrequency(&hz);
-    QueryPerformanceCounter(&now);
-    const uint64_t f = (uint64_t)hz.QuadPart, t = (uint64_t)now.QuadPart;
-    return t / f * 1000000000ull + t % f * 1000000000ull / f;
-#elif defined(__APPLE__)
-    /* libSystem-only symbol, out of libnsync's clock_gettime's reach. */
-    return clock_gettime_nsec_np(CLOCK_MONOTONIC);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
+    return md_monotonic_ns();
 }
 
 uint64_t md_capture_rebase_ns(uint64_t src_ts, uint64_t src_now,

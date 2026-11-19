@@ -800,19 +800,13 @@ static void test_atspi_state_compaction(void) {
 #endif
 
 #ifdef __linux__
-static int64_t fixture_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 /* Bounded line reads also distinguish EOF from a readiness marker. */
 static bool fixture_line(int fd, char *line, size_t size) {
     size_t used = 0;
-    int64_t deadline = fixture_now_ms() + 5000;
+    int64_t deadline = md_now_ms() + 5000;
     while (used + 1 < size) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int64_t left = deadline - fixture_now_ms();
+        int64_t left = deadline - md_now_ms();
         if (left <= 0 || poll(&pfd, 1, (int)left) <= 0) return false;
         char ch;
         if (read(fd, &ch, 1) != 1) return false;
@@ -983,7 +977,7 @@ static void fixture_backend_child(int fd, bool unsubscribe) {
 /* Process-group collection needs waitpid(WNOHANG): a group has no single
  * pollable fd. This deadline is cleanup only, never backend liveness. */
 static bool fixture_reap(pid_t pid, int *status, int timeout_ms) {
-    int64_t deadline = fixture_now_ms() + timeout_ms;
+    int64_t deadline = md_now_ms() + timeout_ms;
     for (;;) {
         pid_t got = waitpid(pid, status, WNOHANG);
         if (got > 0) {
@@ -991,7 +985,7 @@ static bool fixture_reap(pid_t pid, int *status, int timeout_ms) {
             continue; /* process group: collect all adopted service children */
         }
         if (got < 0) return errno == ECHILD;
-        int64_t left = deadline - fixture_now_ms();
+        int64_t left = deadline - md_now_ms();
         if (left <= 0) return false;
         poll(NULL, 0, left < 10 ? (int)left : 10);
     }
@@ -1105,7 +1099,7 @@ static void test_private_bus_loss(const char *host, bool host_only) {
                 MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(reply, "result")));
                 cJSON_Delete(reply);
             } else if (ready) MD_CHECK(strcmp(line, "R") == 0);
-            int64_t before = fixture_now_ms();
+            int64_t before = md_now_ms();
             /* Only the PID returned by this fixture's fork, never a PID
              * looked up from a shared bus or process-name search. */
             MD_CHECK(kill(bus_pid, SIGTERM) == 0);
@@ -1118,7 +1112,7 @@ static void test_private_bus_loss(const char *host, bool host_only) {
             }
             /* EOF follows complete host/backend cleanup. */
             struct pollfd pfd = { .fd = out[0], .events = POLLIN };
-            int64_t left = 5000 - (fixture_now_ms() - before);
+            int64_t left = 5000 - (md_now_ms() - before);
             char ch;
             bool exited = left > 0 && poll(&pfd, 1, (int)left) > 0 && read(out[0], &ch, 1) == 0;
             MD_CHECK(exited);
@@ -1127,9 +1121,9 @@ static void test_private_bus_loss(const char *host, bool host_only) {
             MD_CHECK(collected);
             if (collected) child = -1;
             MD_CHECK(collected && WIFEXITED(status) && WEXITSTATUS(status) == (mode == 2 ? 1 : 0));
-            MD_CHECK(fixture_now_ms() - before < 5000);
+            MD_CHECK(md_now_ms() - before < 5000);
             printf("  private bus loss mode %d: %lld ms, status=%d\n", mode,
-                   (long long)(fixture_now_ms() - before), status);
+                   (long long)(md_now_ms() - before), status);
         }
 cleanup:
         if (child > 0) {

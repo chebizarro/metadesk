@@ -17,6 +17,7 @@
 #include "mcp_server.h"
 #include "session.h"
 #include "log.h"
+#include "md_time.h"
 
 #include <cjson/cJSON.h>
 #include <netinet/in.h>
@@ -31,12 +32,6 @@
 #include <unistd.h>
 
 static MdMcpHttp *g_http;
-
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 static cJSON *text_result(const char *text) {
     cJSON *content = cJSON_CreateArray();
@@ -61,8 +56,8 @@ static cJSON *notify_tool(const cJSON *args, bool *is_error, char **msg, void *u
     (void)ud;
     const cJSON *text = cJSON_GetObjectItemCaseSensitive(args, "text");
     int want = cJSON_IsString(text) ? atoi(text->valuestring) : 1;
-    int64_t deadline = now_ms() + 5000;
-    while (md_mcp_http_sse_client_count(g_http) < (want > 0 ? want : 1) && now_ms() < deadline)
+    int64_t deadline = md_now_ms() + 5000;
+    while (md_mcp_http_sse_client_count(g_http) < (want > 0 ? want : 1) && md_now_ms() < deadline)
         sched_yield();
     static const char note[] =
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","

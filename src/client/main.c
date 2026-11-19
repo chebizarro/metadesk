@@ -27,6 +27,7 @@
 #include "ui.h"
 #include "packet.h"
 #include "input_event.h"
+#include "md_time.h"
 
 #include <SDL2/SDL.h>
 
@@ -197,9 +198,7 @@ static void usage(const char *argv0) {
 /* ── Timing helper ───────────────────────────────────────────── */
 
 static int64_t now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return (int64_t)(md_monotonic_ns() / 1000u);
 }
 
 

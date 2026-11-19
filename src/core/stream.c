@@ -14,6 +14,7 @@
  * own header timestamp is not used (no cross-peer echo protocol).
  */
 #include "stream.h"
+#include "md_time.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -25,7 +26,6 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
-#include <time.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -73,9 +73,7 @@ struct MdStreamServer {
 /* ── Timestamp utility ───────────────────────────────────────── */
 
 uint32_t md_stream_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (uint32_t)md_now_ms();
 }
 
 /* ── Internal helpers ────────────────────────────────────────── */
@@ -699,10 +697,9 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
     return 0;
 }
 
+/* Session binding deadlines share md_session_prepare_binding()'s clock. */
 static uint64_t stream_now_ms64(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    return (uint64_t)md_now_ms();
 }
 
 void md_stream_close(MdStream *s) {
