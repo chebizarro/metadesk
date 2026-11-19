@@ -4,9 +4,10 @@
 # (NIP-46 for --bunker at runtime; the Tier B host image uses the same bundle.)
 # metadesk-host ships only for `metadesk-host account` (client role binding).
 # Targets: decode (--no-display, no display stack) and gui (adds the pinned
-# Wayland/EGL/GL runtime that SDL2 dlopens; still needs an explicitly mounted socket).
-# libopengl0 is required: without it SDL 2.30's default opengl renderer
-# segfaults on Wayland instead of falling back to GLES2 (client-validation.md).
+# Wayland/EGL/GLES runtime that SDL2 dlopens; still needs an explicitly mounted socket).
+# No desktop GL (libopengl0/libgl1): the client skips SDL's opengl renderer when
+# neither libGL.so.1 nor libOpenGL.so.0 loads and uses GLES2 (md-rnc,
+# client-validation.md).
 ARG BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
 FROM ${BASE} AS decode
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +31,7 @@ USER 0:0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libwayland-client0=1.22.0-2.1build1 libwayland-cursor0=1.22.0-2.1build1 \
       libwayland-egl1=1.22.0-2.1build1 libxkbcommon0=1.6.0-1build1 \
-      libegl1=1.7.0-1build1 libgles2=1.7.0-1build1 libopengl0=1.7.0-1build1 \
+      libegl1=1.7.0-1build1 libgles2=1.7.0-1build1 \
       libegl-mesa0=25.2.8-0ubuntu0.24.04.5 libgl1-mesa-dri=25.2.8-0ubuntu0.24.04.5 \
     && rm -rf /var/lib/apt/lists/*
 USER 1000:1000

@@ -15,6 +15,14 @@ cells are now clean refusals. They stop before any host, relay or signer work,
 so they need no host or fixture of their own; that is why there are fewer
 checks.
 
+**Re-run for md-cdz + md-rnc** (2026-11-18, same VM and pins, master `85af248`
+plus the change, `cdz-*` tags): **73/73 checks**, 81 s, exit 0. Every cell now
+shares **one private relay that retains history** (no fresh relay per cell).
+A new repeat cell runs two more back-to-back negotiations on it, and every
+later session must succeed while ignoring all earlier ones (md-cdz, below).
+The GUI image no longer installs `libopengl0`; the client skips SDL's `opengl`
+renderer and presents through `opengles2` (md-rnc, below).
+
 Scope boundary: the FIPS control endpoint is a **fixture** and TCP crosses a
 TUN-less IPv6 container bridge to the host's npub-derived address. This is not
 a FIPS daemon, mesh or encrypted-transport receipt; that is **md-ah9.6**.
@@ -47,6 +55,12 @@ touch the live GNOME session.
 | Codec | host x264 `0.164.3108` (NVENC probed, `libcuda.so.1` absent), client FFmpeg `libavcodec60 6.1.1-3ubuntu5` |
 | SDL | bundled `libSDL2 2.30.0+dfsg-1ubuntu3.1`, ImGui `1.90.4` |
 
+md-cdz/md-rnc re-run pins: metadesk master `85af248` plus the change; nostrc
+unchanged (`da2e4d62b`); bundle 152 MB. Images: `localhost/cdz-video:wip` =
+`040b51bf31c9…`, `cdz-client:wip-decode` = `050dcd3eeb4d…`, `cdz-client:wip-gui` =
+`70add021745b…`. The GUI image has `libegl1`/`libgles2` `1.7.0-1build1` and
+**no** `libopengl0`/`libgl1`. Other package pins are unchanged.
+
 ## Topology and session path
 
 - One task network, `cont-ah911-net`, dual-stack: `10.89.97.0/24` plus the `/64`
@@ -59,8 +73,11 @@ touch the live GNOME session.
     0600 key file and a random transport key and `connect` secret;
   - a NIP-5F signer for the host account (`nip5f-crypto.c`);
   - a FIPS control socket that reports the host peer as connected.
-- **A fresh fixture/relay is used per cell** (see md-6ns below).
-- `metadesk-host account add/bind-role host nip5f` verifies the live signer
+- **One fixture/relay serves the whole run and keeps every event** (md-cdz).
+  Each negotiation still gets a new host and client process, so each later
+  host replays every earlier request and each later client replays every
+  earlier acceptance from relay history.
+- `metadesk-host account add/bind-role host nip5f` (once) verifies the live signer
   owner. `access add CLIENT_NPUB video` publishes a v1 `video` grant, and
   `access list` must equal exactly `<client>\tvideo`.
 - Host and client run with an explicit `--bunker URI` (NIP-46): NIP-17
@@ -92,16 +109,46 @@ in the **decode** image. All checks PASS:
 and still requests capabilities (granted `video` here), so it isn't a
 semantic-only agent client. It needed no new bead.
 
-## Cell 2 — GUI: display authorization results (separate)
+## Cell 2 — repeat negotiations on one retaining relay (md-cdz)
+
+After the decode cell, two more headless host/client pairs (`repeat-1`,
+`repeat-2`) negotiate back to back on the same relay, then the GUI cell is the
+fourth negotiation. The driver records each client's logged `request_id`
+(8-hex prefix) and session id. Every later negotiation must stream (≥ 60
+decoded frames, SIGTERM exit 0), and:
+
+- the new host logs `ignoring session request from relay history` for
+  **every** earlier client request_id, never for the one it answers, and
+  never `REJECTED` anything (the stranger's old request is history too);
+- the new client logs `ignoring session_accept not answering the current
+  request (request_id=…, history)` for **every** earlier acceptance, never
+  for its own, and accepts a session id that no earlier session used.
+
+Final run, all PASS:
+
+| Negotiation | Earlier sessions ignored (host requests / client acceptances) | Answered | Decoded |
+|---|---|---|---|
+| decode | none (empty relay) | `dc9da4be` | 103 at SIGTERM |
+| repeat-1 | `dc9da4be` / `dc9da4be` | `c4dc0be0` | 98 |
+| repeat-2 | `dc9da4be c4dc0be0` (+ stranger `be13d388`) / both | `52d57515` | 98 |
+| gui | all three (+ stranger) / all three | `fe8386f6` | 106, displayed 106 |
+
+Fixture totals for the run: 23 REQ, 23 EOSE, 229 events and 229 OK on one
+relay; `show_peers` 5 for 5 `--npub` clients. Before md-6ns this cell failed
+at the second negotiation (stale acceptance, host `rejected unproven
+client #1`).
+
+## Cell 3 — GUI: display authorization results (separate)
 
 Display is a separate private Sway container (`--network none`, pixman,
 **no devices**, `MD_VIDEO_CONSENT=deny`). Granting display means bind-mounting
 **only** its mode-0700 `wayland-1` socket into the client's private runtime
-dir, with `WAYLAND_DISPLAY` set. Each sub-cell uses a fresh host and relay.
+dir, with `WAYLAND_DISPLAY` set. The granted sub-cell uses a fresh host on the
+shared relay.
 
 | Display grant | Result |
 |---|---|
-| **Granted socket** (`SDL_VIDEODRIVER=wayland`) | PASS: client logs `render: SDL video driver 'wayland'`, `render: SDL renderer 'opengl' (accelerated)`, `client: decoded frame size 1920x1080`; `decoded=96 displayed=96`; Sway tree shows a visible `xdg_shell` view `app_id=metadesk-client`, `name=metadesk`, 1920×1055 on `HEADLESS-1`; SIGTERM exit 0, `displayed 100` |
+| **Granted socket** (`SDL_VIDEODRIVER=wayland`) | PASS: client logs `render: SDL video driver 'wayland'`, `render: skipping SDL renderer 'opengl': cannot load libGL.so.1 or libOpenGL.so.0`, `render: SDL renderer 'opengles2' (accelerated)`, `client: decoded frame size 1920x1080`; `decoded=98 displayed=98`; Sway tree shows a visible `xdg_shell` view `app_id=metadesk-client`, `name=metadesk`, 1920×1055 on `HEADLESS-1`; SIGTERM exit 0, `displayed 106` |
 | **Nothing granted**, default env | PASS (refused, md-33e fixed): `render: SDL video driver 'offscreen' has no visible output` → `ERROR: no usable display for the GUI client; grant a display or use --no-display for decode-only`, exit 1. No bunker connect, relay, FIPS control query or session request (`show_peers` counted only the granted client). *Before:* SDL silently used `offscreen` (Mesa EGL), reported `displayed=96`, exit 0, nothing visible. |
 | **Nothing granted**, `SDL_VIDEODRIVER=wayland` | PASS (refused, md-33e fixed): `render: SDL_Init failed: wayland not available` → the same `ERROR`, exit 1, before any signer or session work. *Before:* `WARNING: SDL2 renderer unavailable, decode-only mode`, decoding continued, exit 0. |
 
@@ -114,11 +161,57 @@ compositor tree for a visible view.
 Wayland authorization is socket access alone; the private socket here is
 mode 0700 and owned by the keep-ID user.
 
-**Packaging fix (in `Dockerfile.client`):** with EGL/GLES present but no
-desktop-GL `libOpenGL.so.0`, SDL 2.30's default `opengl` renderer **segfaults**
-(exit 139) on Wayland instead of falling back. Forcing `opengles2` worked, and
-adding `libopengl0=1.7.0-1build1` fixed the default path, which then picks
-`opengl`. Diagnosis used a probe mirroring `render.c`.
+### Renderer selection (md-rnc)
+
+SDL 2.30's GL renderers on Wayland **segfault** (exit 139), rather than fail,
+when a library they need is absent: `opengl` without `libGL.so.1` or
+`libOpenGL.so.0`, and `opengl`/`opengles2` without `libEGL.so.1` or
+`libGLESv2.so.2`. md-ah9.11 worked around the first case by installing
+`libopengl0`. A crash cannot be retried, so `src/client/render.c` now plans
+the order instead of calling `SDL_CreateRenderer(-1)`:
+
+1. The `SDL_RENDER_DRIVER` hint first, if it names a driver; then the other
+   accelerated drivers in SDL's order (`opengl`, `opengles2` here); then
+   `software`.
+2. Before a GL driver is tried, its libraries are probed with
+   `SDL_LoadObject`. On non-X11 video drivers that means desktop GL + EGL for
+   `opengl` and GLES + EGL for `opengles2`; X11 (GLX) requires only desktop GL
+   of `opengl`. An SDL library override (`SDL_VIDEO_GL_DRIVER`,
+   `SDL_VIDEO_EGL_DRIVER`) is probed alone when set. A failed probe logs
+   `render: skipping SDL renderer 'NAME': cannot load LIB` and the driver is
+   not tried, not even when it is the hint.
+3. Wayland has no native window framebuffer, so SDL's `software` renderer
+   presents through a texture on the first non-software driver it can create,
+   which would be `opengl` again. Once anything is skipped, the client pins
+   `SDL_FRAMEBUFFER_ACCELERATION` to the first planned accelerated driver
+   (or `0` if there is none). An operator's own env setting still wins.
+4. Each failure logs `render: SDL renderer 'NAME' failed: …`, and the choice
+   logs `render: SDL renderer 'NAME' (accelerated|software)`. If nothing can
+   be created, md-33e's fatal path applies (exit 1).
+
+Full driver runs on this VM. The first row is the gate. The others used a
+derived image or an injected env var, so they are not part of the gate. Rows 1,
+3 and 4 ran the final binary. Rows 2, 5 and 6 ran a build that differed only in
+logging an empty SDL error as blank rather than `no error reported`.
+
+| GUI image / environment | Renderer log | Result |
+|---|---|---|
+| shipped `gui` (no `libopengl0`) | `opengl` skipped → `opengles2` (accelerated) | PASS 73/73; frames displayed, window visible |
+| `gui` + `libopengl0=1.7.0-1build1` | `opengl` (accelerated), nothing skipped | PASS 73/73 (the cell expects `opengl` when the image has desktop GL) |
+| shipped, `SDL_RENDER_DRIVER=opengl` | `opengl` skipped despite the hint → `opengles2` | PASS 73/73; 105 displayed |
+| shipped, `SDL_RENDER_DRIVER=software` | `opengl` skipped → `software` (framebuffer on `opengles2`) | 104 displayed, window visible, SIGTERM exit 0; only the "expects `opengles2`" check fails, by design. **Before step 3: exit 139** |
+| `libEGL.so.1` removed | `opengl` and `opengles2` skipped; `software` failed | exit 1, `ERROR: cannot open the GUI window`, no crash. SDL alone: exit 139 |
+| `libGLESv2.so.2` removed | `opengl` and `opengles2` skipped; `software` failed | exit 1, no crash. SDL alone: exit 139 |
+
+`SDL_VIDEO_EGL_DRIVER` pointing at a nonexistent file also crashes SDL's
+`opengles2` while `libEGL.so.1` exists; the probe treats the override as the
+only candidate, so it is skipped too.
+
+**`libopengl0` was dropped from `Dockerfile.client`.** The client no longer
+needs it, and the shipped image now exercises the fallback path on every gate
+run, so a regression in the probe shows up as a crash instead of being
+masked by packaging. The desktop-GL path stays covered by the `libopengl0`
+comparison run above and by desktop installs.
 
 ## Findings and beads
 
@@ -130,14 +223,15 @@ adding `libopengl0=1.7.0-1build1` fixed the default path, which then picks
 - **md-6ns (P2, bug):** the client accepts a stale `session_accept` replayed
   from relay history. On a retained-history relay, the second negotiation
   accepted the previous session's ID, and the host correctly failed it
-  closed (`rejected unproven client #1`). Fresh relays per cell avoid it.
-  *Fixed by md-6ns* (request_id correlation and a host live/EOSE gate; see
-  `docs/stream-binding.md`). A same-relay repeat cell is md-cdz.
+  closed (`rejected unproven client #1`). *Fixed by md-6ns* (request_id
+  correlation and a host live/EOSE gate; see `docs/stream-binding.md`).
+  **md-cdz** removed the fresh-relay-per-cell workaround and added the
+  same-relay repeat cell (Cell 2).
 - **md-33e (P3, bug, fixed):** GUI display authorization failed open and was
   unobservable. GUI mode now fails closed (above) and logs the SDL video
   driver, the renderer and the decoded frame size. The SDL `opengl` crash
-  without `libOpenGL.so.0` is still handled by packaging (`libopengl0`); a
-  client-side GLES2 fallback is follow-up **md-rnc**.
+  without `libOpenGL.so.0` is now handled in the client (**md-rnc**, fixed;
+  renderer selection above), and `libopengl0` is gone from the image.
 - **md-rk4 (P3, bug, fixed):** both binaries block-buffered stdout without a
   TTY. `podman logs` showed `waiting for session requests` only after the
   host's 60 s request timeout. Both now line-buffer stdout: the client at
@@ -149,7 +243,13 @@ adding `libopengl0=1.7.0-1build1` fixed the default path, which then picks
   portal bus. So explicit `--bunker` was used rather than editing Tier B
   files. A host-role restore from NIP-46 inside Tier B stays unqualified.
 - The fixture relay drops connections idle for 45 s (a `tests/` safety bound).
-  Each cell finishes well inside it.
+  The shared relay and its bunkers now live for the whole ~80 s run. nostrc
+  sends a WebSocket PING after 25 s of silence and the relay answers it, so
+  the long-lived bunker connections stay up. Each host/client process
+  connects fresh and finishes well inside the bound.
+- md-33e's no-display check read the refusal line after a 5 s drain. In one
+  run `podman logs -f` delivered it later than that, after the container had
+  exited. The check now waits for the line itself, then drains.
 
 ## Reproduce
 
@@ -176,8 +276,8 @@ python3 -B validate-client.py --work WORK --video-image localhost/cont-video:REV
   --decode-image localhost/cont-client:REV-decode --gui-image localhost/cont-client:REV-gui
 ```
 
-The driver generates three throwaway keys and creates `cont-ah911-*`
-containers and network. It removes all of them on exit, writes
+The driver generates three throwaway keys and creates `PREFIX-*` (default
+`cont-ah911`, `--prefix`) containers and network. It removes all of them on exit, writes
 `WORK/evidence.json` (results, fixture counters, logs; no keys or tokens). It
 exits nonzero on any FAIL, including a setup failure that stops later cells.
 It removes the network only if it created it. Its waits follow `podman logs -f` lines through a
@@ -202,11 +302,22 @@ EOSE/OK in the unchanged nostrc/metadesk layers.
   not worked around in product code.
 
 `nostr-protocol-smells` skill pass (report-only):
-- **Medium F:** fresh relays per cell keep this suite from catching md-6ns.
-  After md-6ns, add a same-relay repeat-negotiation cell (md-cdz).
-- **Low F:** the bunker accepts a reused `connect` secret (test-only).
+- **Medium F (resolved by md-cdz):** fresh relays per cell kept this suite
+  from catching md-6ns. One retaining relay now serves every cell, and the
+  repeat cell asserts history is ignored by request_id and liveness.
+- **Low F:** the bunker accepts a reused `connect` secret (test-only). With one
+  fixture per run this is now relied on: every host (or client) process
+  re-presents its role's secret, and the bunker serves only the latest.
 - **Low J:** no `OK false`/`CLOSED`/`AUTH` negatives in these cells; md-pss/md-ikr
   cover them.
+- **md-cdz pass (diff-scoped):** the repeat cell waits only on log lines, and
+  each client starts after its host's post-EOSE readiness line, so the
+  live/history split is the EOSE boundary, not timing. Low J: the "never
+  answered history / never REJECTED" negatives are checked once, after the
+  session streams; history precedes EOSE, so this is complete in practice.
+  Low F: each earlier request_id must be ignored at least once, not exactly
+  once (one relay per host makes duplicates unlikely). Both are optional test
+  hardening.
 - **Out of diff, needs review:** the reused `tests/` relay closes idle sockets
   after 45 s, a timer-driven close. Cells finish well inside it.
 
@@ -223,3 +334,12 @@ build trees, throwaway keys and `~/wt-rk4` were removed, and the driver removed
 its containers and network. VM free disk was 7.4 GB at start, 6.3 GB lowest and
 7.3 GB at the end. GNOME was never touched; host-side SDL probes forced
 `dummy`/`offscreen` or pointed `XDG_RUNTIME_DIR` away from the session.
+
+md-cdz/md-rnc re-run: the `cdz-*` images and the derived probe images
+(`probe-noegl`, `probe-nogles`, `wip-gui-gl`) were removed by exact tag, and
+dangling layers were pruned. The bundle and build trees, throwaway keys, probe
+display container and `~/wt-cdz` were removed. The driver removed its
+containers and network. Only the shared Ubuntu base image remained. VM free
+disk was 9.0 GB at start, 5.5 GB lowest and 8.9 GB at the end; the VM is
+shared with other agents. GNOME was never touched: every SDL probe ran inside
+a container against the private Sway socket.

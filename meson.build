@@ -742,6 +742,15 @@ if host_os == 'linux' or host_os == 'darwin'
     args : startup_args, timeout : 120)
 endif
 
+# Renderer selection plan: probed drivers skipped, GLES2 then software (md-rnc).
+if enable_client
+  test_render_select = executable('test_render_select',
+    files('tests/test_render_select.c', 'src/client/render.c'),
+    include_directories : [core_inc, include_directories('src/client')],
+    dependencies : [dep_metadesk, dep_sdl2])
+  test('client render driver selection', test_render_select)
+endif
+
 # Client process contracts without a TTY or display (md-rk4, md-33e).
 if enable_client and (host_os == 'linux' or host_os == 'darwin')
   test('client startup: piped stdout + GUI display fail-closed', accounts_python,

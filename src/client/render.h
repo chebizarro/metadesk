@@ -11,8 +11,9 @@
 #ifndef MD_RENDER_H
 #define MD_RENDER_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,36 @@ int md_renderer_open_display(void);
 
 /* Shut SDL down after every renderer is destroyed. */
 void md_renderer_close_display(void);
+
+/* Renderer selection (md-rnc). One SDL render driver, in SDL's list order. */
+typedef struct {
+    const char *name;
+    bool        accelerated;   /* SDL_RENDERER_ACCELERATED */
+} MdRenderDriver;
+
+/* False if creating the named driver cannot work here; such a driver is left
+ * out of the plan rather than tried (SDL's GL drivers crash, rather than
+ * fail, when their libraries are missing). */
+typedef bool (*MdRenderDriverUsable)(const char *name, void *userdata);
+
+/* Try order for SDL render drivers: the driver named by `hint`
+ * (SDL_RENDER_DRIVER, case-insensitive) first if it exists, then the other
+ * accelerated drivers in SDL's order (opengl, opengles2, opengles on Linux),
+ * then the rest (software). Drivers `usable` rejects are omitted; NULL
+ * `usable` accepts all. Writes at most `cap` indices into `drivers` to
+ * `order` and returns how many. */
+size_t md_render_driver_plan(const MdRenderDriver *drivers, size_t n,
+                             const char *hint, MdRenderDriverUsable usable,
+                             void *userdata, int *order, size_t cap);
+
+/* Value for SDL_HINT_FRAMEBUFFER_ACCELERATION once the plan has skipped a
+ * driver. SDL's software renderer presents through a window framebuffer, and
+ * where the video driver has none (Wayland) SDL builds one on the first
+ * non-software driver it can create, ignoring the plan. Naming the first
+ * planned accelerated driver (or "0", no texture framebuffer, if none is
+ * planned) keeps it off the skipped one. */
+const char *md_render_framebuffer_accel(const MdRenderDriver *drivers,
+                                        const int *order, size_t planned);
 
 /* Present a decoded RGBA frame in one call (upload + draw + present).
  * Kept for simple callers; the client composite path uses the split

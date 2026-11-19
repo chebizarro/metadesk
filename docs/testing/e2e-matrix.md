@@ -4,7 +4,8 @@ Owner: **md-5zi** (full matrix execution and failing-cell bugs). Container
 receipts incorporated by **md-ah9.12** against master `c571b5d`; no new runtime
 tests were run for that documentation task. Container client cells were added by
 **md-ah9.11** against master `8eebb6c`; md-rk4/md-33e re-ran those cells against
-`66c1886` plus their fix. This is the owning matrix, not a new E2E harness.
+`66c1886` plus their fix, and md-cdz/md-rnc against `85af248` plus theirs. This
+is the owning matrix, not a new E2E harness.
 
 ## Status and counting
 
@@ -260,7 +261,8 @@ the source; final Linux gates ran without devices or host session/runtime mounts
 Source: [client-validation.md](../../deploy/containers/reference/client-validation.md).
 Validated **2026-11-18**: rootless **Podman 4.9.3**, Ubuntu 24.04 aarch64,
 metadesk **8eebb6c**; re-run by md-rk4/md-33e on `66c1886` plus the fix (44/44
-checks, no `stdbuf`). The host is the Tier B Sway/xdpw container (render node,
+checks, no `stdbuf`) and by md-cdz/md-rnc on `85af248` plus the fix (73/73
+checks, one retaining relay for every cell, no `libopengl0`). The host is the Tier B Sway/xdpw container (render node,
 GLES2, isolated 1920×1080 output, x264). A loopback host has no frame source
 without capturing the live desktop. Negotiation is real NIP-17 over a private
 relay, with a v1 `video` grant, throwaway NIP-46 bunkers and one-use stream
@@ -275,15 +277,17 @@ receipt. Headless and display-authorization results are separate rows.
 | Decode-only (`--no-display`): negotiate, bind, decode | PASS: 1920×1080 x264; 102 decoded, 0 displayed; SIGTERM exit 0 in 0.17 s |
 | Decode-only sandbox: no display server/devices/caps | PASS: CapEff 0; no `/dev/dri`; no display env/socket; no EGL/GLES in image |
 | Legacy direct-IP client (no session proof) | PASS (fails closed): host `rejected unproven client #2`; no stream |
-| GUI, granted private Wayland socket | PASS: logs `SDL video driver 'wayland'`, renderer `opengl`, frame 1920×1080; 100 displayed; visible `xdg_shell` view `metadesk-client` 1920×1055 on the private output |
+| GUI, granted private Wayland socket | PASS: logs `SDL video driver 'wayland'`, renderer `opengles2`, frame 1920×1080; 106 displayed; visible `xdg_shell` view `metadesk-client` 1920×1055 on the private output |
+| GUI renderer selection without desktop GL (**md-rnc**) | PASS: image has EGL/GLES but no `libOpenGL.so.0`/`libGL.so.1`; client logs `skipping SDL renderer 'opengl': cannot load …` → `opengles2` (accelerated), no crash. With `libopengl0` added: `opengl`, 73/73. Without `libEGL`/`libGLESv2`: fails closed, exit 1 (SDL alone: exit 139) |
 | GUI, no display granted (default env) | PASS (refused): `SDL video driver 'offscreen' has no visible output`, exit 1 before signer/relay/session work; **md-33e** fixed |
 | GUI, no display granted, `SDL_VIDEODRIVER=wayland` | PASS (refused): `SDL_Init failed: wayland not available`, exit 1 before signer/relay/session work; no decode-only fallback (**md-33e**) |
-| Repeat negotiation on a history-retaining relay | FAIL: stale `session_accept` replayed; host rejects the stale proof; **md-6ns** |
+| Repeat negotiation on a history-retaining relay | PASS (**md-cdz**, after md-6ns): four negotiations on one relay (decode, repeat-1, repeat-2, GUI); each later host ignores every earlier request and each later client every earlier acceptance as history, by request_id, and every session streams |
 | NIP-5F signer for a live host session | FAIL: decrypted seal JSON not unescaped, `DM rejected: invalid-seal`; **md-ebm** |
 
 Reproduce with the source's bundle/image builds and
-`deploy/containers/reference/validate-client.py` (fresh relay per cell).
-The GUI image needs `libopengl0`: without it SDL 2.30 segfaults on Wayland.
+`deploy/containers/reference/validate-client.py` (one retaining relay for the whole run).
+The GUI image needs no desktop GL: the client probes GL libraries before SDL
+can crash on them (md-rnc).
 
 ### Remaining container acceptance cells
 
