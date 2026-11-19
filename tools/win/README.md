@@ -9,6 +9,7 @@ In an MSYS2 CLANGARM64 shell with libcjson installed:
 bash tools/win/build-uia-harness.sh
 ./build-win-uia/test_atspi.exe
 ./build-win-uia/test_uia_liveness.exe
+./build-win-uia/test_uia_walk_equiv.exe
 ```
 
 The last command is the **session-0** cell: run it through Windows OpenSSH.
@@ -23,18 +24,57 @@ The user must be logged in at the VM console. In that console (not SSH), with
 
 ```powershell
 .\build-win-uia\test_uia_liveness.exe --interactive
+.\build-win-uia\test_uia_walk_equiv.exe --interactive
 $env:MD_A11Y_LIVE_TESTS = '1'
 .\build-win-uia\test_atspi.exe
 .\build-win-uia\atspi_dump.exe --compact
 ```
 
-From SSH, scp a PowerShell script rather than nesting shell quotations. Have
-it register a uniquely named one-shot task using
-`New-ScheduledTaskPrincipal -UserId (whoami) -LogonType Interactive`, run the
-commands above, capture their individual exit codes, wait for completion with
-a deadline, and stop/unregister the task in a `finally` block. Delete temporary
-scripts and outputs when finished. SSH itself runs in session 0 even when
-`quser` reports an active console.
+From SSH, scp a PowerShell script rather than nesting shell quotations.
+`run-interactive.ps1` does the scheduling. It registers a uniquely named
+one-shot task using
+`New-ScheduledTaskPrincipal -UserId (whoami) -LogonType Interactive`, waits
+with a deadline for your `.cmd` to create its done file, and stops and
+unregisters the task in a `finally` block. It exits 3 when no console session
+is active, so record that interactive cell as pending.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run-interactive.ps1 `
+    -Command C:\path\job.cmd -DoneFile C:\path\job.done -TimeoutSeconds 300
+```
+
+The `.cmd` runs the commands above, captures each exit code to its outputs,
+and creates the done file last. Delete temporary scripts and outputs when
+finished. SSH itself runs in session 0 even when `quser` reports an active
+console.
+
+## Walk equivalence and timing (md-cw8)
+
+The backend walks each top-level window with one `TreeScope_Subtree`
+cache-request round trip. `test_uia_walk_equiv.exe` keeps a verbatim copy of
+the old uncached TreeWalker walk and requires identical output: the same node
+structure plus byte-identical JSON and compact serialisation at a fixed
+timestamp. It runs these cells:
+
+- A Win32 fixture window: buttons (one disabled), a checkbox, an edit, a
+  label, a 300-item list (the 256-child cap) and nested group boxes deeper than
+  the 32-level depth cap. Both the subtree cache and the per-level fallback
+  are compared.
+- The production top-level enumeration over fixture elements. This covers the
+  subtree tier, a forced fallback to element navigation plus a per-level walk,
+  a forced leaf fallback (enumeration must continue) and the top-level cap.
+  The failures are forced through the test-only `uia_test_rejected` seam.
+- With `--interactive`, the real desktop: the production `uia_get_tree` versus
+  the uncached reference, retried up to 5 times if the desktop changes between
+  walks. It prints uncached and cached medians.
+
+In session 0 both cells SKIP. Windows on that non-interactive window station
+are never visible, so UIA exposes no fixture children, and the backend rejects
+desktop walks there by design.
+
+To measure the known overfetch cost on wide lists, compile with
+`-DFIXTURE_LIST_ITEMS=5000`. UIA cannot bound a subtree cache fetch, so nodes
+beyond the caps are fetched and then dropped.
 
 ## Real lock/disconnect qualification
 

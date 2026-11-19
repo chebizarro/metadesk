@@ -4,8 +4,9 @@
  *
  * Uses Microsoft UI Automation COM API to:
  *   1. CoCreateInstance IUIAutomation
- *   2. GetRootElement → walk tree via TreeWalker
- *   3. Extract: ControlType, Name, BoundingRectangle, IsEnabled, etc.
+ *   2. GetRootElement → walk tree via TreeWalker, prefetching each top-level
+ *      window's subtree with one IUIAutomationCacheRequest round trip
+ *   3. Extract (from the cache): ControlType, Name, BoundingRectangle, etc.
  *   4. Build MdA11yNode tree
  *   5. Compute deltas by comparing current vs previous snapshot
  *   6. (Phase 2) Event handlers for live changes
@@ -318,23 +319,23 @@ static const char *control_type_to_role(CONTROLTYPEID ctid) {
     return md_a11y_role_name(MD_A11Y_ROLE_UNKNOWN);
 }
 
-/* Extract states from UIA element properties */
+/* Extract states from cached UIA element properties */
 static void extract_states(IUIAutomationElement *elem, MdA11yNode *node) {
     char *states[8];
     int count = 0;
 
     BOOL boolVal;
 
-    if (SUCCEEDED(elem->get_CurrentIsEnabled(&boolVal)) && boolVal)
+    if (SUCCEEDED(elem->get_CachedIsEnabled(&boolVal)) && boolVal)
         states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_ENABLED));
 
-    if (SUCCEEDED(elem->get_CurrentHasKeyboardFocus(&boolVal)) && boolVal)
+    if (SUCCEEDED(elem->get_CachedHasKeyboardFocus(&boolVal)) && boolVal)
         states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSED));
 
-    if (SUCCEEDED(elem->get_CurrentIsKeyboardFocusable(&boolVal)) && boolVal)
+    if (SUCCEEDED(elem->get_CachedIsKeyboardFocusable(&boolVal)) && boolVal)
         states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_FOCUSABLE));
 
-    if (SUCCEEDED(elem->get_CurrentIsOffscreen(&boolVal)) && !boolVal) {
+    if (SUCCEEDED(elem->get_CachedIsOffscreen(&boolVal)) && !boolVal) {
         states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_VISIBLE));
         states[count++] = _strdup(md_a11y_state_name(MD_A11Y_STATE_SHOWING));
     }
@@ -350,11 +351,179 @@ static void extract_states(IUIAutomationElement *elem, MdA11yNode *node) {
     }
 }
 
-/* ── Tree walking ────────────────────────────────────────────── */
+/* ── Tree walking ────────────────────────────────────────────── *
+ *
+ * Every Current* property read and TreeWalker step is a cross-process round
+ * trip; reading eight properties plus two navigation steps per node cost
+ * several ms/node. The walk instead asks UIA to prefetch what it needs:
+ * top-level windows are still enumerated with the ContentViewWalker, but
+ * through the *BuildCache navigation calls with a TreeScope_Subtree request,
+ * so each window arrives with its whole content-view subtree and every walked
+ * property in one round trip. Nodes are then built from get_Cached* reads and
+ * GetCachedChildren, which stay in-process. The request's TreeFilter is the
+ * content-view condition, i.e. the same view ContentViewWalker navigates.
+ *
+ * If a window's subtree fetch fails, navigation is retried with an
+ * element-only request and the window is walked one Element|Children fetch
+ * per node, so one bad app degrades to per-level cost instead of vanishing or
+ * ending enumeration.
+ *
+ * Tradeoff: UIA cannot bound a subtree cache fetch by depth or width (the
+ * transaction timeout is per provider call, not per request), so nodes past
+ * MD_UIA_MAX_DEPTH / MD_UIA_MAX_CHILDREN are fetched and then dropped. Output
+ * is still capped exactly as before, but a window holding a very wide
+ * non-virtualised list costs more than the capped uncached walk did (5000
+ * Win32 list-box items: ~1.2-1.6 s vs ~0.6-0.8 s on the reference VM).
+ * Bounded BuildCache navigation avoids that but is only ~1.5-2x faster than
+ * uncached; see md-cw8 notes and its follow-up bead. */
 
-static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
-                                 IUIAutomationElement *elem, int depth) {
-    if (!st || !walker || !elem || depth > MD_UIA_MAX_DEPTH)
+/* Everything walk_node() and extract_states() read. */
+static const PROPERTYID uia_walk_props[] = {
+    UIA_RuntimeIdPropertyId,
+    UIA_ControlTypePropertyId,
+    UIA_NamePropertyId,
+    UIA_IsEnabledPropertyId,
+    UIA_HasKeyboardFocusPropertyId,
+    UIA_IsKeyboardFocusablePropertyId,
+    UIA_IsOffscreenPropertyId,
+    UIA_BoundingRectanglePropertyId,
+};
+
+struct UIAWalk {
+    IUIAutomationCacheRequest *subtree;  /* props + Subtree */
+    IUIAutomationCacheRequest *level;    /* props + Element|Children */
+    IUIAutomationCacheRequest *element;  /* props + Element */
+};
+
+/* What a cached element carries beyond its own properties. */
+enum UIACached {
+    UIA_CACHED_ELEMENT,   /* no children cached */
+    UIA_CACHED_CHILDREN,  /* its children (with properties) are cached */
+    UIA_CACHED_SUBTREE,   /* every descendant's children are cached too */
+};
+
+static void uia_walk_end(UIAWalk *w) {
+    SAFE_RELEASE(w->subtree);
+    SAFE_RELEASE(w->level);
+    SAFE_RELEASE(w->element);
+}
+
+static HRESULT uia_cache_request(IUIAutomation *automation,
+                                 IUIAutomationCondition *view, TreeScope scope,
+                                 IUIAutomationCacheRequest **out) {
+    IUIAutomationCacheRequest *req = nullptr;
+    HRESULT hr = automation->CreateCacheRequest(&req);
+    if (SUCCEEDED(hr) && !req) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = req->put_TreeFilter(view);
+    if (SUCCEEDED(hr)) hr = req->put_TreeScope(scope);
+    for (PROPERTYID id : uia_walk_props)
+        if (SUCCEEDED(hr)) hr = req->AddProperty(id);
+    if (FAILED(hr)) SAFE_RELEASE(req);
+    *out = req;
+    return hr;
+}
+
+/* Cache requests are client-side objects: building them makes no
+ * cross-process call. */
+static HRESULT uia_walk_begin(IUIAutomation *automation, UIAWalk *w) {
+    *w = {};
+    IUIAutomationCondition *view = nullptr;
+    HRESULT hr = automation->get_ContentViewCondition(&view);
+    if (SUCCEEDED(hr) && !view) hr = E_FAIL;
+    if (SUCCEEDED(hr))
+        hr = uia_cache_request(automation, view, TreeScope_Subtree, &w->subtree);
+    if (SUCCEEDED(hr))
+        hr = uia_cache_request(automation, view,
+            static_cast<TreeScope>(TreeScope_Element | TreeScope_Children), &w->level);
+    if (SUCCEEDED(hr))
+        hr = uia_cache_request(automation, view, TreeScope_Element, &w->element);
+    SAFE_RELEASE(view);
+    if (FAILED(hr)) uia_walk_end(w);
+    return hr;
+}
+
+/* Format a UIA RuntimeId (VT_I4 SAFEARRAY) as "u:2a.101b0.4". */
+static void set_runtime_id(MdA11yNode *node, SAFEARRAY *rid) {
+    LONG lb = 0, ub = -1;
+    SafeArrayGetLBound(rid, 1, &lb);
+    SafeArrayGetUBound(rid, 1, &ub);
+    char buf[256];
+    size_t off = 0;
+    for (LONG i = lb; i <= ub && off < sizeof(buf) - 12; i++) {
+        int v = 0;
+        if (SUCCEEDED(SafeArrayGetElement(rid, &i, &v)))
+            off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                    "%s%x", i == lb ? "u:" : ".",
+                                    (unsigned)v);
+    }
+    if (off > 2) {
+        free(node->id);
+        node->id = _strdup(buf);
+    }
+}
+
+static MdA11yNode *walk_node(UIAState *st, const UIAWalk *w,
+                             IUIAutomationElement *elem, int depth,
+                             UIACached cached);
+
+/* Attach elem's cached children. In UIA_CACHED_CHILDREN mode each child is
+ * refreshed with the per-level request (one round trip per node) so that its
+ * own children are cached; if that refresh fails the child is a leaf, as when
+ * the uncached GetFirstChildElement failed. In UIA_CACHED_SUBTREE mode
+ * nothing is fetched. Returns false only on allocation failure, which (as
+ * before) discards the parent. */
+static bool walk_children(UIAState *st, const UIAWalk *w,
+                          IUIAutomationElement *elem, int depth,
+                          UIACached cached, MdA11yNode *node) {
+    IUIAutomationElementArray *kids = nullptr;
+    int len = 0;
+    if (FAILED(elem->GetCachedChildren(&kids)) || !kids ||
+        FAILED(kids->get_Length(&len)) || len <= 0) {
+        SAFE_RELEASE(kids);
+        return true;
+    }
+    node->children = (MdA11yNode **)calloc(
+        (size_t)(len < MD_UIA_MAX_CHILDREN ? len : MD_UIA_MAX_CHILDREN),
+        sizeof(MdA11yNode *));
+    if (!node->children) {
+        kids->Release();
+        return false;
+    }
+    /* The cap counts emitted children, not attempted ones. */
+    for (int i = 0; i < len && node->child_count < MD_UIA_MAX_CHILDREN; i++) {
+        IUIAutomationElement *child = nullptr;
+        if (FAILED(kids->GetElement(i, &child)) || !child) continue;
+        UIACached child_cached = UIA_CACHED_SUBTREE;
+        if (cached != UIA_CACHED_SUBTREE) {
+            IUIAutomationElement *refreshed = nullptr;
+            child_cached = UIA_CACHED_ELEMENT;
+            /* Children of a node at the depth cap are never emitted. */
+            if (depth + 1 < MD_UIA_MAX_DEPTH &&
+                SUCCEEDED(child->BuildUpdatedCache(w->level, &refreshed)) &&
+                refreshed) {
+                child->Release();
+                child = refreshed;
+                child_cached = UIA_CACHED_CHILDREN;
+            }
+        }
+        MdA11yNode *child_node = walk_node(st, w, child, depth + 1, child_cached);
+        child->Release();
+        if (child_node) node->children[node->child_count++] = child_node;
+    }
+    if (node->child_count == 0) {
+        free(node->children);
+        node->children = nullptr;
+    }
+    kids->Release();
+    return true;
+}
+
+/* Build a node from elem's cache. Ids are assigned in DFS preorder, as the
+ * uncached TreeWalker walk did, so RuntimeId-less nodes keep their ids. */
+static MdA11yNode *walk_node(UIAState *st, const UIAWalk *w,
+                             IUIAutomationElement *elem, int depth,
+                             UIACached cached) {
+    if (!st || !w || !elem || depth > MD_UIA_MAX_DEPTH)
         return nullptr;
 
     MdA11yNode *node = (MdA11yNode *)calloc(1, sizeof(MdA11yNode));
@@ -364,37 +533,21 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
 
     /* Prefer the platform's stable element identity over DFS position.
      * UIA RuntimeId survives across walks; the DFS counter does not. */
-    {
-        SAFEARRAY *rid = nullptr;
-        if (SUCCEEDED(elem->GetRuntimeId(&rid)) && rid) {
-            LONG lb = 0, ub = -1;
-            SafeArrayGetLBound(rid, 1, &lb);
-            SafeArrayGetUBound(rid, 1, &ub);
-            char buf[256];
-            size_t off = 0;
-            for (LONG i = lb; i <= ub && off < sizeof(buf) - 12; i++) {
-                int v = 0;
-                if (SUCCEEDED(SafeArrayGetElement(rid, &i, &v)))
-                    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
-                                            "%s%x", i == lb ? "u:" : ".",
-                                            (unsigned)v);
-            }
-            SafeArrayDestroy(rid);
-            if (off > 2) {
-                free(node->id);
-                node->id = _strdup(buf);
-            }
-        }
-    }
+    VARIANT rid;
+    VariantInit(&rid);
+    if (SUCCEEDED(elem->GetCachedPropertyValue(UIA_RuntimeIdPropertyId, &rid)) &&
+        rid.vt == (VT_ARRAY | VT_I4) && rid.parray)
+        set_runtime_id(node, rid.parray);
+    VariantClear(&rid);
 
     /* Role (ControlType) */
     CONTROLTYPEID ctid = 0;
-    elem->get_CurrentControlType(&ctid);
+    elem->get_CachedControlType(&ctid);
     node->role = _strdup(control_type_to_role(ctid));
 
     /* Label (Name property) */
     BSTR bstrName = nullptr;
-    if (SUCCEEDED(elem->get_CurrentName(&bstrName)) && bstrName) {
+    if (SUCCEEDED(elem->get_CachedName(&bstrName)) && bstrName) {
         node->label = bstr_to_cstr(bstrName);
         SysFreeString(bstrName);
     }
@@ -404,56 +557,71 @@ static MdA11yNode *walk_element(UIAState *st, IUIAutomationTreeWalker *walker,
 
     /* Bounding rectangle */
     RECT rect;
-    if (SUCCEEDED(elem->get_CurrentBoundingRectangle(&rect))) {
+    if (SUCCEEDED(elem->get_CachedBoundingRectangle(&rect))) {
         node->x = rect.left;
         node->y = rect.top;
         node->w = rect.right - rect.left;
         node->h = rect.bottom - rect.top;
     }
 
-    /* Walk children via TreeWalker */
-    IUIAutomationElement *child = nullptr;
-    HRESULT hr = walker->GetFirstChildElement(elem, &child);
-    if (SUCCEEDED(hr) && child) {
-        /* Count and collect children */
-        /* Heap-allocated: with recursion depth MD_UIA_MAX_DEPTH the
-         * stack copies would total ~64 KB. */
-        MdA11yNode **children =
-            (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
-        if (!children) {
-            SAFE_RELEASE(child);
-            md_a11y_node_free(node);
-            return nullptr;
-        }
-        int childCount = 0;
-
-        while (child && childCount < MD_UIA_MAX_CHILDREN) {
-            MdA11yNode *childNode = walk_element(st, walker, child, depth + 1);
-            if (childNode)
-                children[childCount++] = childNode;
-
-            IUIAutomationElement *next = nullptr;
-            hr = walker->GetNextSiblingElement(child, &next);
-            child->Release();
-            child = (SUCCEEDED(hr)) ? next : nullptr;
-        }
-        /* Exiting on the child cap leaves `child` held */
-        SAFE_RELEASE(child);
-
-        if (childCount > 0) {
-            node->children = (MdA11yNode **)calloc((size_t)childCount, sizeof(MdA11yNode *));
-            if (node->children) {
-                memcpy(node->children, children, (size_t)childCount * sizeof(MdA11yNode *));
-                node->child_count = childCount;
-            } else {
-                for (int i = 0; i < childCount; i++)
-                    md_a11y_node_free(children[i]);
-            }
-        }
-        free(children);
+    if (depth < MD_UIA_MAX_DEPTH && cached != UIA_CACHED_ELEMENT &&
+        !walk_children(st, w, elem, depth, cached, node)) {
+        md_a11y_node_free(node);
+        return nullptr;
     }
 
     return node;
+}
+
+#ifdef MD_UIA_TESTING
+/* Only the standalone harness defines this seam: fetches using these requests
+ * fail, forcing walk_top_level_step's fallback tiers. */
+static const IUIAutomationCacheRequest *uia_test_rejected[2] = { nullptr, nullptr };
+#endif
+
+static bool uia_fetch_rejected(const IUIAutomationCacheRequest *req) {
+#ifdef MD_UIA_TESTING
+    return req && (req == uia_test_rejected[0] || req == uia_test_rejected[1]);
+#else
+    (void)req;
+    return false;
+#endif
+}
+
+/* Navigate to a top-level sibling (or first child when `first`) of `from`,
+ * prefetching its whole subtree in the same round trip. If that fails, the
+ * fetch rather than the navigation may be at fault: navigate again with only
+ * the element's properties, then try a per-level refresh (leaving the window
+ * a leaf if even that fails). Only a failed element-only navigation ends
+ * enumeration, as a failed uncached GetNextSiblingElement did. */
+static HRESULT walk_top_level_step(IUIAutomationTreeWalker *walker,
+                                   const UIAWalk *w, IUIAutomationElement *from,
+                                   bool first, IUIAutomationElement **out,
+                                   UIACached *cached) {
+    *out = nullptr;
+    *cached = UIA_CACHED_SUBTREE;
+    HRESULT hr = uia_fetch_rejected(w->subtree) ? E_FAIL : first
+        ? walker->GetFirstChildElementBuildCache(from, w->subtree, out)
+        : walker->GetNextSiblingElementBuildCache(from, w->subtree, out);
+    if (SUCCEEDED(hr)) return hr;
+
+    SAFE_RELEASE(*out);
+    *cached = UIA_CACHED_ELEMENT;
+    hr = first
+        ? walker->GetFirstChildElementBuildCache(from, w->element, out)
+        : walker->GetNextSiblingElementBuildCache(from, w->element, out);
+    if (FAILED(hr)) {
+        SAFE_RELEASE(*out);
+        return hr;
+    }
+    IUIAutomationElement *refreshed = nullptr;
+    if (*out && !uia_fetch_rejected(w->level) &&
+        SUCCEEDED((*out)->BuildUpdatedCache(w->level, &refreshed)) && refreshed) {
+        (*out)->Release();
+        *out = refreshed;
+        *cached = UIA_CACHED_CHILDREN;
+    }
+    return hr;
 }
 
 /* ── Vtable implementation ───────────────────────────────────── */
@@ -545,6 +713,58 @@ static int uia_init(MdA11yCtx *ctx) {
     return 0;
 }
 
+/* Attach the walker children of `parent` (the desktop root in production) to
+ * `node` as depth-`depth` nodes. Returns false only on allocation failure. */
+static bool walk_top_level(UIAState *st, IUIAutomationTreeWalker *walker,
+                           const UIAWalk *w, IUIAutomationElement *parent,
+                           int depth, MdA11yNode *node) {
+    IUIAutomationElement *child = nullptr;
+    UIACached cached = UIA_CACHED_SUBTREE;
+    HRESULT hr = walk_top_level_step(walker, w, parent, true, &child, &cached);
+    if (FAILED(hr) || !child) {
+        SAFE_RELEASE(child);
+        return true;
+    }
+
+    /* Heap-allocated: up to MD_UIA_MAX_CHILDREN pointers. */
+    MdA11yNode **children =
+        (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
+    if (!children) {
+        child->Release();
+        return false;
+    }
+    int childCount = 0;
+
+    while (child && childCount < MD_UIA_MAX_CHILDREN) {
+        MdA11yNode *childNode = walk_node(st, w, child, depth, cached);
+        if (childNode)
+            children[childCount++] = childNode;
+
+        /* Prefetching past the child cap would fetch a whole subtree only
+         * to drop it. */
+        if (childCount == MD_UIA_MAX_CHILDREN) break;
+        IUIAutomationElement *next = nullptr;
+        hr = walk_top_level_step(walker, w, child, false, &next, &cached);
+        child->Release();
+        child = (SUCCEEDED(hr)) ? next : nullptr;
+    }
+    /* Exiting on the child cap leaves `child` held */
+    SAFE_RELEASE(child);
+
+    if (childCount > 0) {
+        node->children = (MdA11yNode **)calloc((size_t)childCount, sizeof(MdA11yNode *));
+        if (node->children) {
+            memcpy(node->children, children, (size_t)childCount * sizeof(MdA11yNode *));
+            node->child_count = childCount;
+        } else {
+            for (int i = 0; i < childCount; i++)
+                md_a11y_node_free(children[i]);
+        }
+    }
+    free(children);
+    return true;
+}
+
 static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
                                       IUIAutomationTreeWalker *walker,
                                       MdA11yNode **out_root) {
@@ -554,14 +774,22 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     *out_root = nullptr;
     st->next_id = 0;
 
-    /* Get the root element (desktop) */
+    /* Get the root element (desktop). This is the liveness probe: root
+     * provider failures latch loss inside uia_root(). */
     IUIAutomationElement *rootElem = nullptr;
     HRESULT hr = uia_root(st, automation, &rootElem);
     if (FAILED(hr) || !rootElem) return -1;
 
+    UIAWalk w;
+    if (FAILED(uia_walk_begin(automation, &w))) {
+        rootElem->Release();
+        return -1;
+    }
+
     /* Create root node */
     MdA11yNode *root = (MdA11yNode *)calloc(1, sizeof(MdA11yNode));
     if (!root) {
+        uia_walk_end(&w);
         rootElem->Release();
         return -1;
     }
@@ -571,45 +799,12 @@ static int uia_get_tree_with_unlocked(UIAState *st, IUIAutomation *automation,
     root->label = _strdup("Desktop");
 
     /* Walk top-level children (application windows) */
-    IUIAutomationElement *child = nullptr;
-    hr = walker->GetFirstChildElement(rootElem, &child);
+    bool ok = walk_top_level(st, walker, &w, rootElem, 1, root);
     rootElem->Release();
-
-    if (SUCCEEDED(hr) && child) {
-        MdA11yNode **children =
-            (MdA11yNode **)calloc(MD_UIA_MAX_CHILDREN, sizeof(MdA11yNode *));
-        if (!children) {
-            SAFE_RELEASE(child);
-            md_a11y_node_free(root);
-            *out_root = nullptr;
-            return -1;
-        }
-        int childCount = 0;
-
-        while (child && childCount < MD_UIA_MAX_CHILDREN) {
-            MdA11yNode *childNode = walk_element(st, walker, child, 1);
-            if (childNode)
-                children[childCount++] = childNode;
-
-            IUIAutomationElement *next = nullptr;
-            hr = walker->GetNextSiblingElement(child, &next);
-            child->Release();
-            child = (SUCCEEDED(hr)) ? next : nullptr;
-        }
-        /* Exiting on the child cap leaves `child` held */
-        SAFE_RELEASE(child);
-
-        if (childCount > 0) {
-            root->children = (MdA11yNode **)calloc((size_t)childCount, sizeof(MdA11yNode *));
-            if (root->children) {
-                memcpy(root->children, children, (size_t)childCount * sizeof(MdA11yNode *));
-                root->child_count = childCount;
-            } else {
-                for (int i = 0; i < childCount; i++)
-                    md_a11y_node_free(children[i]);
-            }
-        }
-        free(children);
+    uia_walk_end(&w);
+    if (!ok) {
+        md_a11y_node_free(root);
+        return -1;
     }
 
     *out_root = root;
