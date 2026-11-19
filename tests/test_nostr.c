@@ -954,7 +954,8 @@ static void test_acl_history(const char **urls, const char *a, const char *b) {
     acl_control("{\"op\":\"closed\"}"); acl_wait(&s, &s.boundaries, boundary + 1);
     MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
-    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && !known);
+    /* md-ip2k: the only relay refused (restricted:): a definite deny. */
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && known);
     MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, "x", UINT32_MAX, &known) == 0 && known);
     md_nostr_stop(s.bridge); /* stopped: denies for good, not "unknown" */
     MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && known);
@@ -988,6 +989,102 @@ static void test_acl_history(const char **urls, const char *a, const char *b) {
     acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); acl_finish(&s);
     printf("  PASS: private history, empty/unknown/open (grant known-ness), ordering/ties, delayed handshake and EVENT/EOSE fence\n");
+}
+
+static void acl_closed(AclTest *s, int relay, const char *reason) {
+    unsigned count = acl_counter(s, &s->boundaries);
+    acl_control("{\"op\":\"closed\",\"relay\":%d,\"reason\":\"%s\"}", relay, reason);
+    acl_wait(s, &s->boundaries, count + 1);
+}
+static bool acl_known(AclTest *s, const char *pk, uint32_t *grant) {
+    bool known = false;
+    *grant = md_nostr_granted_capabilities_known(s->bridge, pk, UINT32_MAX, &known);
+    return known;
+}
+static void acl_auth_result(AclTest *s, bool ok) {
+    unsigned results = acl_counter(s, &s->auth_results);
+    acl_control("{\"op\":\"auth_result\",\"ok\":%s}", ok ? "true" : "false");
+    acl_wait(s, &s->auth_results, results + 1);
+}
+
+/* md-ip2k: CLOSED is classified by its NIP-01 prefix. A terminal refusal by
+ * every relay is FAILED and known (deny); rate-limited, awaiting AUTH and a
+ * relay being down are UNKNOWN. Each recovers when a relay serves history. */
+static void test_acl_refusals(const char **urls, const char *a) {
+    AclTest s;
+    char why[512];
+    uint32_t grant = 0;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    char *list = acl_event(&s, time(NULL) - 50, a);
+    acl_deliver(&s, 0, list); acl_eose(&s, 0);
+    /* Membership without a metadesk-caps scope: a known zero grant. */
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a) && acl_known(&s, a, &grant) && grant == 0);
+
+    acl_closed(&s, 0, "rate-limited: slow down");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!acl_known(&s, a, &grant) && grant == 0);
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 0 && !why[0]);
+    acl_control("{\"op\":\"req\",\"count\":2}"); /* the pool's re-REQ */
+    acl_eose(&s, 0);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+
+    acl_closed(&s, 0, "restricted: private fixture");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
+    MD_CHECK(acl_known(&s, a, &grant) && grant == 0);
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 1);
+    MD_CHECK(strstr(why, urls[0]) && strstr(why, ": restricted: private fixture"));
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == -1); /* fails, never blocks */
+    acl_control("{\"op\":\"req\",\"count\":3}");
+    acl_deliver(&s, 0, list); acl_eose(&s, 0); /* served again: recovery */
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a) && acl_known(&s, a, &grant));
+
+    /* auth-required with no challenge on this connection: no AUTH path. */
+    acl_closed(&s, 0, "auth-required: private fixture");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 1 &&
+             strstr(why, "auth-required: private fixture"));
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-late\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN); /* awaiting our AUTH */
+    MD_CHECK(!acl_known(&s, a, &grant) && grant == 0);
+    acl_control("{\"op\":\"auth\",\"count\":1}");
+    acl_auth_result(&s, false);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED); /* AUTH rejected */
+    MD_CHECK(acl_known(&s, a, &grant) && grant == 0);
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-again\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN); /* a re-challenge reopens the path */
+    acl_control("{\"op\":\"auth\",\"count\":2}");
+    acl_auth_result(&s, true);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    acl_control("{\"op\":\"req\",\"count\":4}");
+    acl_eose(&s, 0);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+    acl_finish(&s);
+
+    /* One refusing relay beside a live one stays live; beside a relay that
+     * is down it is unknown; only both refusing is FAILED. */
+    acl_reset(); acl_bridge(&s, urls, 2, false, false);
+    acl_deliver(&s, 0, list); acl_eose(&s, 0);
+    acl_closed(&s, 1, "restricted: private fixture");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+    MD_CHECK(md_nostr_is_allowed(s.bridge, a) && acl_known(&s, a, &grant));
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 1 && strstr(why, urls[1]) &&
+             !strstr(why, urls[0]));
+    acl_control("{\"op\":\"drop\",\"relay\":0}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!acl_known(&s, a, &grant) && grant == 0);
+    acl_control("{\"op\":\"release_connection\",\"relay\":0}");
+    acl_control("{\"op\":\"req\",\"relay\":0,\"count\":2}");
+    acl_closed(&s, 0, "blocked: private fixture");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
+    MD_CHECK(acl_known(&s, a, &grant) && grant == 0);
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 2 &&
+             strstr(why, "blocked: private fixture") && strstr(why, "; "));
+    acl_control("{\"op\":\"req\",\"relay\":0,\"count\":3}");
+    acl_eose(&s, 0);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+    free(list); acl_finish(&s);
+    printf("  PASS: CLOSED prefixes: restricted/blocked/auth-required without AUTH refuse (known deny), rate-limited/awaiting AUTH/relay down unknown, mixed relays, recovery\n");
 }
 
 typedef struct { MdNostr *n; const char *pk; bool remove; int result; } AclEdit;
@@ -1105,11 +1202,15 @@ static void test_auth_wire(const char **urls, const char *a) {
     nostr_event_free(ev);
     acl_control("{\"op\":\"protected\",\"count\":0}");
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    /* md-ip2k: auth-required while our AUTH is pending is not a refusal. */
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
     unsigned results = acl_counter(&s, &s.auth_results);
     acl_control("{\"op\":\"auth_result\",\"ok\":false}");
     acl_wait(&s, &s.auth_results, results + 1);
+    acl_wait_state(&s, MD_NOSTR_ACL_FAILED); /* rejected: no AUTH path left */
     acl_control("{\"op\":\"protected\",\"count\":0}");
     acl_control("{\"op\":\"challenge\",\"value\":\"challenge-two\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN); /* re-challenge: awaiting AUTH again */
     acl_control("{\"op\":\"auth\",\"count\":2}");
     MD_CHECK(strstr(acl_reply, "challenge-two"));
     results = acl_counter(&s, &s.auth_results);
@@ -1143,6 +1244,7 @@ static int acl_fixture_tests(const char **urls) {
     char *a = md_nostr_get_pubkey(dm_sender_sk);
     char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     test_acl_history(urls, a, b);
+    test_acl_refusals(urls, a);
     test_acl_edits(urls, a, b);
     test_auth_wire(urls, a);
     free(a); free(b);

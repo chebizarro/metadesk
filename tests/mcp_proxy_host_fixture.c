@@ -9,7 +9,7 @@
  * action tool and needs agent+input. The allowlist change feed is wired
  * as in the host (md-ht7), so grant changes reach the SSE streams.
  *
- * Usage: mcp_proxy_host_fixture RELAY_URL [--allow-npub NPUB]
+ * Usage: mcp_proxy_host_fixture RELAY_URL... [--allow-npub NPUB]
  * Prints "PORT <n>" on stdout once listening; exits when stdin closes.
  */
 #include "host_mcp.h"
@@ -90,7 +90,14 @@ static cJSON *schema(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2 && !(argc == 4 && !strcmp(argv[2], "--allow-npub"))) return 2;
+    int relay_count = 1;
+    while (relay_count + 1 < argc && strcmp(argv[relay_count + 1], "--allow-npub")) relay_count++;
+    const char *npub = NULL;
+    if (relay_count + 1 < argc) {
+        if (relay_count + 3 != argc) return 2;
+        npub = argv[argc - 1];
+    }
+    if (argc < 2 || !strcmp(argv[1], "--allow-npub")) return 2;
     sigset_t term;
     sigemptyset(&term);
     sigaddset(&term, SIGINT);
@@ -98,8 +105,7 @@ int main(int argc, char **argv) {
     pthread_sigmask(SIG_BLOCK, &term, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    const char *relays[] = { argv[1] };
-    HostMcpAcl *acl = host_mcp_acl_start(relays, 1);
+    HostMcpAcl *acl = host_mcp_acl_start((const char *const *)&argv[1], relay_count);
     if (!acl) return 1;
     MdMcpServerConfig scfg = { .server_name = "mcp-proxy-fixture", .server_version = "0" };
     MdMcpServer *server = md_mcp_server_create(&scfg);
@@ -112,10 +118,10 @@ int main(int argc, char **argv) {
     MdMcpTool act = { .name = "act", .description = "stand-in action tool",
                       .input_schema = schema(), .handler = act_tool,
                       .required_caps = MD_CAP_AGENT | MD_CAP_INPUT };
-    const char *npubs[] = { argc == 4 ? argv[3] : NULL };
+    const char *npubs[] = { npub };
     MdMcpHttpConfig hcfg = {
         .server = server, .ephemeral_port = true,
-        .allow_npubs = npubs, .allow_npub_count = argc == 4 ? 1 : 0,
+        .allow_npubs = npubs, .allow_npub_count = npub ? 1 : 0,
         .nip98_grant = host_mcp_acl_grant, .nip98_grant_userdata = acl,
         .nip98_grant_watch = host_mcp_acl_watch,
     };

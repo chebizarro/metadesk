@@ -54,13 +54,26 @@ static NostrEvent *event_from_json(const char *json) {
     return ev;
 }
 
+/* How a relay last ended the subscription, from the CLOSED reason's NIP-01
+ * machine-readable prefix (md-ip2k). Reset by EOSE and by every connection
+ * change, so it only ever describes the current connection. */
+typedef enum {
+    MD_RELAY_CLOSED_NONE = 0, /* no CLOSED since the last EOSE/connection change */
+    MD_RELAY_CLOSED_RETRY,    /* "rate-limited:": the relay asks for a later retry */
+    MD_RELAY_CLOSED_AUTH,     /* "auth-required:": refused only with no AUTH path */
+    MD_RELAY_CLOSED_REFUSED,  /* any other or no prefix: restricted:, blocked:, ... */
+} MdRelayClosed;
+
 typedef struct {
     MdNostr *bridge;
     size_t index;
     bool history_done, history_ok; /* allowlist_mu */
+    MdRelayClosed closed;          /* allowlist_mu */
+    char closed_reason[160];       /* allowlist_mu, for operator logs */
     NostrRelayConnectionState connection_state;
     char *challenge;              /* work_mu, one queued challenge per relay */
     uint64_t auth_generation;
+    bool auth_failed;             /* work_mu: our answer to auth_generation failed */
     char auth_id[65];
 } MdRelayState;
 
@@ -81,6 +94,7 @@ struct MdNostr {
     pthread_cond_t     allowlist_cv;
     MdNostrAclState    acl_state;
     bool               acl_open, acl_editing;
+    bool               acl_sub_failed; /* no REQ was ever issued: FAILED for good */
     uint64_t           acl_version;
     int64_t            acl_created_at;
     char               acl_id[65];
@@ -231,35 +245,106 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
     return 0;
 }
 
+/* NIP-01 CLOSED reasons start with a machine-readable "prefix:". Only two
+ * say that the same REQ may succeed on this connection: rate-limited (later)
+ * and auth-required (after NIP-42 AUTH). Everything else, including an
+ * unprefixed reason, is the relay's answer for this connection. */
+static MdRelayClosed classify_closed(const char *reason) {
+    if (reason && !strncmp(reason, "auth-required:", 14)) return MD_RELAY_CLOSED_AUTH;
+    if (reason && !strncmp(reason, "rate-limited:", 13)) return MD_RELAY_CLOSED_RETRY;
+    return MD_RELAY_CLOSED_REFUSED;
+}
+
+/* An AUTH path exists while this connection has a NIP-42 challenge and our
+ * answer to it has not failed (OK false, signing or transport failure). An
+ * accepted answer stays a path: the pool's next REQ settles it. Caller holds
+ * allowlist_mu (lock order: allowlist_mu, then work_mu). */
+static bool auth_path_open(MdNostr *n, MdRelayState *rs) {
+    uint64_t generation = 0;
+    char *challenge = nostr_relay_get_auth_challenge(n->relays[rs->index], &generation);
+    bool open = challenge != NULL;
+    free(challenge);
+    pthread_mutex_lock(&n->work_mu);
+    open = open && n->signer && !n->closing &&
+           !(rs->auth_failed && generation == rs->auth_generation);
+    pthread_mutex_unlock(&n->work_mu);
+    return open;
+}
+
+/* The relay definitely will not deliver history on this connection: its last
+ * boundary was a terminal CLOSED. Disconnected/backoff relays, rate limits
+ * and pending AUTH are transient. Caller holds allowlist_mu. */
+static bool relay_refused_locked(MdNostr *n, MdRelayState *rs) {
+    return rs->history_done && !rs->history_ok &&
+        (rs->closed == MD_RELAY_CLOSED_REFUSED ||
+         (rs->closed == MD_RELAY_CLOSED_AUTH && !auth_path_open(n, rs)));
+}
+
+static bool history_pending_locked(const MdNostr *n) {
+    for (size_t i = 0; i < n->relay_count; i++)
+        if (!n->relay_states[i].history_done) return true;
+    return false;
+}
+
 /* Recompute readiness only at protocol/connection boundaries. A relay that
- * fails is terminal but supplies no trustworthy empty history. At least one
- * successful EOSE and no pending relays are required to authorize. */
+ * fails supplies no trustworthy empty history. At least one successful EOSE
+ * and no pending relays are required to authorize. With no history, the
+ * answer is FAILED (definitely denied) only when every relay refused the
+ * subscription; while any relay is down, rate-limited or awaiting AUTH it is
+ * UNKNOWN, since its reconnect + re-REQ may still deliver history. */
 static void update_acl_readiness(MdNostr *n) {
-    bool pending = false, ok = false;
+    bool pending = false, ok = false, refused = n->relay_count > 0;
     for (size_t i = 0; i < n->relay_count; i++) {
-        pending |= !n->relay_states[i].history_done;
-        ok |= n->relay_states[i].history_ok;
+        MdRelayState *rs = &n->relay_states[i];
+        pending |= !rs->history_done;
+        ok |= rs->history_ok;
+        refused = refused && relay_refused_locked(n, rs);
     }
-    n->acl_state = n->acl_open ? MD_NOSTR_ACL_OPEN : pending ? MD_NOSTR_ACL_UNKNOWN :
-        ok ? MD_NOSTR_ACL_LOADED : MD_NOSTR_ACL_FAILED;
+    n->acl_state = n->acl_open ? MD_NOSTR_ACL_OPEN :
+        n->acl_sub_failed ? MD_NOSTR_ACL_FAILED :
+        pending ? MD_NOSTR_ACL_UNKNOWN : ok ? MD_NOSTR_ACL_LOADED :
+        refused ? MD_NOSTR_ACL_FAILED : MD_NOSTR_ACL_UNKNOWN;
     /* Also wakes md_nostr_wait_history(), which open ACLs still need. */
     pthread_cond_broadcast(&n->allowlist_cv);
+}
+
+/* A relay's AUTH path appeared or failed outside a subscription boundary. */
+static void readiness_changed(MdNostr *n) {
+    if (is_stopped(n)) return;
+    pthread_mutex_lock(&n->allowlist_mu);
+    update_acl_readiness(n);
+    pthread_mutex_unlock(&n->allowlist_mu);
+    test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
 }
 
 static void md_nostr_subscription_handler(NostrRelay *relay, const char *state,
                                          const char *reason, void *data) {
     MdNostr *n = data;
     if (is_stopped(n)) return;
+    bool closed = !strcmp(state, "CLOSED"), report = false, refused = false;
+    MdRelayClosed kind = closed ? classify_closed(reason) : MD_RELAY_CLOSED_NONE;
+    char text[sizeof(((MdRelayState *)0)->closed_reason)];
+    snprintf(text, sizeof(text), "%s", !closed ? "" : reason && *reason ? reason : "(no reason)");
     pthread_mutex_lock(&n->allowlist_mu);
     for (size_t i = 0; i < n->relay_count; i++) if (n->relays[i] == relay) {
-        n->relay_states[i].history_done = true;
-        n->relay_states[i].history_ok = !strcmp(state, "EOSE");
+        MdRelayState *rs = &n->relay_states[i];
+        rs->history_done = true;
+        rs->history_ok = !strcmp(state, "EOSE");
+        /* The pool re-fires the REQ after every CLOSED (md-odg): report a
+         * relay's answer when it changes, not once per identical frame. */
+        report = closed && (rs->closed != kind || strcmp(rs->closed_reason, text));
+        rs->closed = kind;
+        memcpy(rs->closed_reason, text, sizeof(text));
+        refused = relay_refused_locked(n, rs);
     }
     update_acl_readiness(n);
     pthread_mutex_unlock(&n->allowlist_mu);
-    if (!strcmp(state, "CLOSED"))
-        MD_LOG_W("subscription CLOSED on %s: %s", nostr_relay_get_url_const(relay),
-                 reason ? reason : "(no reason)");
+    if (report)
+        MD_LOG_W("subscription CLOSED on %s: %s (%s)", nostr_relay_get_url_const(relay), text,
+                 kind == MD_RELAY_CLOSED_RETRY ? "rate-limited: transient, the pool retries" :
+                 !refused ? "awaiting NIP-42 AUTH: transient" :
+                 kind == MD_RELAY_CLOSED_AUTH ? "auth-required with no usable NIP-42 AUTH: refused" :
+                 "refused: no history from this relay until it serves the REQ again");
     test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
 }
 
@@ -280,6 +365,9 @@ static void md_nostr_relay_state_handler(NostrRelay *relay,
     rs->history_done = current == NOSTR_RELAY_STATE_DISCONNECTED ||
                        current == NOSTR_RELAY_STATE_BACKOFF;
     rs->history_ok = false;
+    /* A refusal belongs to the connection that answered it: loss is transient. */
+    rs->closed = MD_RELAY_CLOSED_NONE;
+    rs->closed_reason[0] = '\0';
     update_acl_readiness(n);
     pthread_mutex_unlock(&n->allowlist_mu);
     test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
@@ -295,6 +383,16 @@ static void md_nostr_relay_state_handler(NostrRelay *relay,
  * This is required for relays that gate subscriptions or event
  * storage behind authentication.
  */
+/* Our answer to the challenge of generation failed: an "auth-required:"
+ * CLOSED on this connection is now a refusal (md-ip2k). */
+static void auth_answer_failed(MdNostr *n, MdRelayState *rs, uint64_t generation) {
+    pthread_mutex_lock(&n->work_mu);
+    bool current = !n->closing && generation == rs->auth_generation;
+    if (current) rs->auth_failed = true;
+    pthread_mutex_unlock(&n->work_mu);
+    if (current) readiness_changed(n);
+}
+
 static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
                       uint64_t generation) {
     NostrRelay *relay = n->relays[rs->index];
@@ -335,6 +433,7 @@ static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
     nostr_event_free(ev);
     if (!signed_ev) {
         MD_LOG_E("AUTH sign failed for %s", relay_url ? relay_url : "(unknown)");
+        auth_answer_failed(n, rs, generation);
         return;
     }
 
@@ -363,6 +462,7 @@ static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
             MD_LOG_W("AUTH transport failed on %s: %s", relay_url,
                      error ? error->message : "no write result");
             if (error) free_error(error);
+            auth_answer_failed(n, rs, generation);
         }
         /* Only md_nostr_ok_handler may report relay authentication success. */
     }
@@ -382,16 +482,21 @@ static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge, void
     char *copy = strdup(challenge);
     if (!copy) return;
     pthread_mutex_lock(&n->work_mu);
-    if (!n->closing && generation != rs->auth_generation) {
+    bool queued = !n->closing && generation != rs->auth_generation;
+    if (queued) {
         free(rs->challenge);
         rs->challenge = copy;
         copy = NULL;
         rs->auth_generation = generation;
+        rs->auth_failed = false;
         rs->auth_id[0] = '\0';
         pthread_cond_broadcast(&n->work_cv);
     }
     pthread_mutex_unlock(&n->work_mu);
     free(copy);
+    /* A (re-)challenge opens an AUTH path: an "auth-required:" refusal on
+     * this connection becomes transient again. */
+    if (queued) readiness_changed(n);
 }
 
 static void *auth_worker(void *data) {
@@ -427,11 +532,15 @@ static void md_nostr_ok_handler(const char *event_id, bool ok,
     if (!n || is_stopped(n)) return;
     pthread_mutex_lock(&n->work_mu);
     bool auth_result = event_id && rs->auth_id[0] && !strcmp(event_id, rs->auth_id);
-    if (auth_result) rs->auth_id[0] = '\0';
+    if (auth_result) {
+        rs->auth_id[0] = '\0';
+        if (!ok) rs->auth_failed = true; /* for rs->auth_generation */
+    }
     pthread_mutex_unlock(&n->work_mu);
     if (auth_result) {
         if (ok) MD_LOG_I("AUTH accepted by %s", n->relay_urls[rs->index]);
         else MD_LOG_W("AUTH rejected by %s: %s", n->relay_urls[rs->index], reason ? reason : "");
+        if (!ok) readiness_changed(n);
         test_point(n, MD_NOSTR_TEST_AUTH_RESULT);
     }
 
@@ -1028,7 +1137,8 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
      * leave the first subscription matching against freed memory. */
     if (md_nostr_subscribe(n) != 0) {
         pthread_mutex_lock(&n->allowlist_mu);
-        if (!n->acl_open) n->acl_state = MD_NOSTR_ACL_FAILED;
+        n->acl_sub_failed = true; /* no REQ: no boundary will ever arrive */
+        update_acl_readiness(n);
         pthread_mutex_unlock(&n->allowlist_mu);
     }
 
@@ -1321,7 +1431,8 @@ uint32_t md_nostr_granted_capabilities_known(MdNostr *n, const char *pk,
     if (pk && strlen(pk) == 64 && strspn(pk, "0123456789abcdef") == 64 &&
         owns_host(n) && operation_begin(n)) {
         pthread_mutex_lock(&n->allowlist_mu);
-        settled = n->acl_state == MD_NOSTR_ACL_OPEN || n->acl_state == MD_NOSTR_ACL_LOADED;
+        /* FAILED is definite (every relay refused): deny, not "unknown". */
+        settled = n->acl_state != MD_NOSTR_ACL_UNKNOWN;
         grant = n->acl_state == MD_NOSTR_ACL_OPEN
             ? MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT
             : n->acl_state == MD_NOSTR_ACL_LOADED ? entry_grant(n->allowlist, pk) : 0;
@@ -1448,8 +1559,9 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     NostrEvent *ev = NULL, *signed_ev = NULL;
     pthread_mutex_lock(&n->allowlist_mu);
     /* Existing callers may edit immediately after create. Wait for an actual
-     * history/failure boundary, never build from a partially received list. */
-    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && !is_stopped(n))
+     * history/failure boundary, never build from a partially received list.
+     * UNKNOWN with no relay pending (all down/awaiting AUTH) fails at once. */
+    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
         pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
     if (is_stopped(n) || n->acl_state != MD_NOSTR_ACL_LOADED || n->acl_editing ||
         n->acl_unconfirmed_count == MD_ACL_UNCONFIRMED_MAX) {
@@ -1595,7 +1707,7 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
     MdAllowlistEntry *copy = NULL;
     size_t used = 0;
     pthread_mutex_lock(&n->allowlist_mu);
-    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && !is_stopped(n))
+    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
         pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
     if (n->acl_state == MD_NOSTR_ACL_LOADED && !is_stopped(n)) {
         size_t capacity = n->allowlist ? n->allowlist->count : 0;
@@ -1632,6 +1744,26 @@ int md_nostr_allowlist_wait_change(MdNostr *n, MdNostrAclState *state,
     int ret = is_stopped(n) ? -1 : 0;
     operation_end(n);
     return ret;
+}
+
+size_t md_nostr_allowlist_refusals(MdNostr *n, char *buf, size_t len) {
+    if (buf && len) buf[0] = '\0';
+    if (!owns_host(n) || !operation_begin(n)) return 0;
+    size_t count = 0, used = 0;
+    pthread_mutex_lock(&n->allowlist_mu);
+    for (size_t i = 0; i < n->relay_count; i++) {
+        MdRelayState *rs = &n->relay_states[i];
+        if (!relay_refused_locked(n, rs)) continue;
+        if (buf && used < len) {
+            int w = snprintf(buf + used, len - used, "%s%s: %s", count ? "; " : "",
+                             n->relay_urls[i], rs->closed_reason);
+            if (w > 0) used += (size_t)w;
+        }
+        count++;
+    }
+    pthread_mutex_unlock(&n->allowlist_mu);
+    operation_end(n);
+    return count;
 }
 
 MdNostrAclState md_nostr_allowlist_state(MdNostr *n) {

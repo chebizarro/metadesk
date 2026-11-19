@@ -15,7 +15,11 @@
  * (md-ht7: tools/list_changed to exactly the streams whose tool set changed).
  * While history is pending or every relay is down the source answers
  * MD_MCP_GRANT_UNKNOWN: requests are refused and open streams are held, sent
- * nothing, until the next LOADED wake-up re-evaluates them (md-554).
+ * nothing, until the next LOADED wake-up re-evaluates them (md-554). Once
+ * every relay has refused the subscription with a terminal CLOSED (FAILED,
+ * md-ip2k) the answer is a known deny instead: held streams close on that
+ * wake-up and the log names each relay and its reason. A relay that later
+ * serves history again (e.g. after a re-challenge) reloads the list as usual.
  */
 #include "host_mcp.h"
 #include "accounts.h"
@@ -80,11 +84,17 @@ static void *acl_watch_thread(void *arg) {
                             "%zu with agent (%zu also input)\n",
                     logged == MD_NOSTR_ACL_LOADED ? "updated" : "loaded",
                     (unsigned long long)version, count, agents, inputs);
+        } else if (state == MD_NOSTR_ACL_FAILED && state != logged) {
+            char why[1024];
+            if (!md_nostr_allowlist_refusals(acl->nostr, why, sizeof(why)))
+                snprintf(why, sizeof(why), "no allowlist subscription was issued");
+            fprintf(stderr, "host[mcp]: host allowlist refused by every relay (%s); "
+                            "host-allowlist NIP-98 requests are refused (401) and their "
+                            "SSE streams closed until a relay delivers it\n", why);
         } else if (state != logged) {
-            fprintf(stderr, "host[mcp]: host allowlist history %s; "
+            fprintf(stderr, "host[mcp]: host allowlist history pending; "
                             "host-allowlist NIP-98 grants deny and their SSE streams "
-                            "are held until a relay delivers it\n",
-                    state == MD_NOSTR_ACL_FAILED ? "unavailable" : "pending");
+                            "are held until a relay delivers it\n");
         } else {
             continue;
         }
@@ -135,7 +145,8 @@ uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *userdata) {
     if (!acl || !acl->nostr) return 0;
     /* MCP has no video: only the agent (admission) and input (actions) bits.
      * Grant and readiness are read together, so a stopped bridge (host role
-     * changed) denies for good while relays being down is only unknown. */
+     * changed) or every relay refusing the subscription denies, while relays
+     * being down (or awaiting AUTH) is only unknown. */
     bool known = true;
     uint32_t caps = md_nostr_granted_capabilities_known(acl->nostr, pubkey_hex,
                                                         MD_CAP_AGENT | MD_CAP_INPUT, &known);
