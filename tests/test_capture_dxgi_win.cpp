@@ -165,18 +165,142 @@ static void rotation_unit_tests() {
      * CPU frame. */
     MdCaptureCtx ctx = {};
     DxgiState st = {};
+    st.count = 1;
+    st.out[0].rect = { 0, 0, 1920, 1080 };
     for (const DXGI_MODE_ROTATION r : rotations) {
-        CHECK(SUCCEEDED(frame_configure(&ctx, &st, 1920, 1080, r)));
+        output_configure(&st.out[0], 1920, 1080, r);
+        CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
         const bool portrait = r == DXGI_MODE_ROTATION_ROTATE90 || r == DXGI_MODE_ROTATION_ROTATE270;
-        CHECK(st.image_w == 1920 && st.image_h == 1080);
+        CHECK(st.out[0].image_w == 1920 && st.out[0].image_h == 1080);
         CHECK(ctx.width == (portrait ? 1080u : 1920u) && ctx.height == (portrait ? 1920u : 1080u));
         CHECK(st.width == ctx.width && st.height == ctx.height);
-        CHECK(r == DXGI_MODE_ROTATION_IDENTITY ? st.turns == 0
-                                               : st.rotated && st.rotated_cap >= 1920u * 1080 * 4);
+        CHECK(r == DXGI_MODE_ROTATION_IDENTITY ? !st.canvas_mode
+              : st.canvas_mode && st.canvas_cap >= 1920u * 1080 * 4);
     }
-    free(st.rotated);
+    free(st.canvas);
     puts("PASS rotation: all four rotations match Microsoft's sample mapping (tiles, padding, "
          "inverse), frames sized in desktop orientation");
+}
+
+/* md-246: several outputs composed into one frame. */
+static void all_outputs_unit_tests() {
+    CHECK(output_is_all("all") && output_is_all("ALL") && output_is_all("All"));
+    CHECK(!output_is_all(nullptr) && !output_is_all("") && !output_is_all("all1") &&
+          !output_is_all("0") && !output_is_all("al"));
+
+    /* Layout: primary 1920x1080 at (0,0); a 2560x1440 output above-left at
+     * (-2560,-200); a portrait output (ROTATE90 of a 1920x1080 image) right
+     * of the primary with an 80-pixel gap, at (2000,100). */
+    {
+        MdCaptureCtx ctx = {};
+        DxgiState st = {};
+        st.count = 3;
+        st.all = true;
+        st.out[0].rect = { 0, 0, 1920, 1080 };
+        output_configure(&st.out[0], 1920, 1080, DXGI_MODE_ROTATION_IDENTITY);
+        st.out[1].rect = { -2560, -200, 0, 1240 };
+        output_configure(&st.out[1], 2560, 1440, DXGI_MODE_ROTATION_IDENTITY);
+        st.out[2].rect = { 2000, 100, 3080, 2020 };
+        output_configure(&st.out[2], 1920, 1080, DXGI_MODE_ROTATION_ROTATE90);
+        CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+        CHECK(st.canvas_mode && ctx.width == 5640 && ctx.height == 2220);
+        CHECK(ctx.output_rect.x == -2560 && ctx.output_rect.y == -200 &&
+              ctx.output_rect.width == 5640 && ctx.output_rect.height == 2220);
+        CHECK(st.out[0].frame_x == 2560 && st.out[0].frame_y == 200);
+        CHECK(st.out[1].frame_x == 0 && st.out[1].frame_y == 0);
+        CHECK(st.out[2].frame_x == 4560 && st.out[2].frame_y == 300 &&
+              st.out[2].width == 1080 && st.out[2].height == 1920);
+        free(st.canvas);
+    }
+
+    /* Composition, pixel for pixel: A 4x3 at (0,0), B 2x2 at (-3,-1), and C a
+     * 3x2 image rotated 90 degrees (a 2x3 region) at (6,0). The frame is
+     * (-3,-1) 11x4; everything outside the three regions stays opaque black. */
+    {
+        MdCaptureCtx ctx = {};
+        DxgiState st = {};
+        st.count = 3;
+        st.all = true;
+        const DXGI_MODE_ROTATION rot[3] = { DXGI_MODE_ROTATION_IDENTITY,
+            DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90 };
+        const uint32_t iw[3] = { 4, 2, 3 }, ih[3] = { 3, 2, 2 };
+        const LONG ox[3] = { 0, -3, 6 }, oy[3] = { 0, -1, 0 };
+        for (int i = 0; i < 3; i++) {
+            output_configure(&st.out[i], iw[i], ih[i], rot[i]);
+            st.out[i].rect = { ox[i], oy[i], ox[i] + (LONG)st.out[i].width,
+                               oy[i] + (LONG)st.out[i].height };
+        }
+        CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+        CHECK(ctx.width == 11 && ctx.height == 4 && ctx.output_rect.x == -3 &&
+              ctx.output_rect.y == -1);
+        std::vector<uint32_t> expect(11 * 4, 0xFF000000u);
+        std::vector<uint8_t> first; /* output A's image, re-sent below */
+        for (int i = 0; i < 3; i++) {
+            const uint32_t pitch = iw[i] * 4 + 8; /* padded rows */
+            std::vector<uint8_t> image((size_t)pitch * ih[i], 0xEE);
+            for (uint32_t y = 0; y < ih[i]; y++)
+                for (uint32_t x = 0; x < iw[i]; x++) {
+                    const uint32_t v = (uint32_t)(i + 1) << 16 | y << 8 | x;
+                    memcpy(&image[(size_t)y * pitch + x * 4], &v, 4);
+                    uint32_t fx, fy;
+                    sample_rotation(st.out[i].turns, x, y, iw[i], ih[i], &fx, &fy);
+                    expect[(st.out[i].frame_y + fy) * 11 + st.out[i].frame_x + fx] = v;
+                }
+            output_blit(&st, st.out[i], image.data(), pitch);
+            if (i == 0) first = image;
+        }
+        CHECK(memcmp(st.canvas, expect.data(), expect.size() * 4) == 0);
+
+        /* A pointer drawn over B is taken off before A's next image lands, so
+         * B's pixels come back and the save-under stays valid. */
+        uint8_t shape[2 * 2 * 4];
+        memset(shape, 0xFF, sizeof(shape)); /* opaque white */
+        PointerState &p = st.pointer;
+        p.shape = shape;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, 2, 2, 8);
+        p.has_shape = p.visible = true;
+        p.x = 0;
+        p.y = 0;
+        CHECK(pointer_composite(&p, st.canvas, 11 * 4, 11, 4) && p.under_rect.w == 2);
+        CHECK(memcmp(st.canvas, expect.data(), expect.size() * 4) != 0);
+        output_blit(&st, st.out[0], first.data(), iw[0] * 4 + 8);
+        CHECK(p.under_rect.w == 0 && memcmp(st.canvas, expect.data(), expect.size() * 4) == 0);
+        free(p.under);
+        p.shape = nullptr;
+        free(st.canvas);
+    }
+    puts("PASS all outputs: bounding-rectangle layout (negative origin, gap, portrait), "
+         "pixel-exact composition with black gaps, pointer save-under across outputs");
+
+    /* Pointer ownership: output 1's region starts at (50,10) in a 100x100
+     * frame. A "not visible" report only counts from the output that placed
+     * the pointer, and the newer of two visible reports wins. */
+    {
+        PointerState p = {};
+        uint8_t shape[4 * 4 * 4] = {};
+        p.shape = shape;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, 4, 4, 16);
+        p.has_shape = true;
+        auto report = [&](UINT output, BOOL visible, LONG x, LONG y, LONGLONG when) {
+            DXGI_OUTDUPL_FRAME_INFO info = {};
+            info.LastMouseUpdateTime.QuadPart = when;
+            info.PointerPosition.Visible = visible;
+            info.PointerPosition.Position = { x, y };
+            PointerRect r;
+            const bool drawn = pointer_drawn(&p, 100, 100, &r);
+            const LONG ox = output ? 50 : 0, oy = output ? 10 : 0;
+            return pointer_apply(&p, info, output, ox, oy, drawn, false, 100, 100);
+        };
+        CHECK(report(1, TRUE, 5, 5, 10) && p.visible && p.x == 55 && p.y == 15 && p.owner == 1);
+        CHECK(!report(0, FALSE, 0, 0, 11) && p.visible && p.x == 55);  /* not on output 0 */
+        CHECK(report(0, TRUE, 3, 4, 12) && p.x == 3 && p.y == 4 && p.owner == 0); /* moved over */
+        CHECK(!report(1, TRUE, 6, 6, 11) && p.x == 3);                 /* older than output 0's */
+        CHECK(!report(1, FALSE, 0, 0, 13) && p.visible);              /* not on output 1 */
+        CHECK(report(0, FALSE, 0, 0, 14) && !p.visible);              /* hidden by its owner */
+        CHECK(report(1, TRUE, 0, 0, 15) && p.visible && p.x == 50 && p.y == 10 && p.owner == 1);
+        CHECK(!report(1, TRUE, 9, 9, 0) && p.x == 50);                 /* stale position */
+    }
+    puts("PASS pointer across outputs: owner-only hide, newer visible report wins, offsets");
 }
 
 static void unit_tests() {
@@ -298,7 +422,7 @@ static void unit_tests() {
         auto apply = [&](const DXGI_OUTDUPL_FRAME_INFO &i, bool new_shape) {
             PointerRect r;
             const bool drawn = pointer_drawn(&p, 100, 100, &r);
-            return pointer_apply(&p, i, drawn, new_shape, 100, 100);
+            return pointer_apply(&p, i, 0, 0, 0, drawn, new_shape, 100, 100);
         };
         DXGI_OUTDUPL_FRAME_INFO info = {};
         CHECK(!apply(info, false));                           /* no update */
@@ -332,7 +456,7 @@ static void unit_tests() {
         PointerRect r;
         const bool was_drawn = pointer_drawn(&p, 100, 100, &r);
         p.has_shape = false;                                  /* unusable new shape: */
-        CHECK(was_drawn && pointer_apply(&p, info, was_drawn, true, 100, 100)); /* removed */
+        CHECK(was_drawn && pointer_apply(&p, info, 0, 0, 0, was_drawn, true, 100, 100)); /* removed */
     }
     puts("PASS pointer damage: appear, disappear, move or new shape while drawn; else none");
 
@@ -364,6 +488,7 @@ static void unit_tests() {
     puts("PASS output selectors: primary default, index, device name; unknown -> none");
 
     rotation_unit_tests();
+    all_outputs_unit_tests();
 }
 
 /* ── Test windows ────────────────────────────────────────────── */
@@ -564,7 +689,7 @@ static void output_cells(const MdCaptureBackend *be) {
     MdCaptureCtx ctx = make_ctx(be, true, nullptr);
     CHECK(be->init(&ctx) == 0);
     auto *st = static_cast<DxgiState *>(ctx.backend_data);
-    CHECK(st->output_index == (UINT)primary && output_is_primary(st->output_desc));
+    CHECK(st->count == 1 && st->out[0].index == (UINT)primary && output_is_primary(st->out[0].desc));
     be->destroy(&ctx);
     puts("PASS default output is the primary display");
 
@@ -577,7 +702,7 @@ static void output_cells(const MdCaptureBackend *be) {
             ctx = make_ctx(be, true, spec);
             CHECK(be->init(&ctx) == 0);
             st = static_cast<DxgiState *>(ctx.backend_data);
-            CHECK(st->output_index == i);
+            CHECK(st->count == 1 && st->out[0].index == i);
             const RECT &r = outs.rect[i];
             const uint32_t dw = (uint32_t)(r.right - r.left), dh = (uint32_t)(r.bottom - r.top);
             CHECK((ctx.width == dw && ctx.height == dh) || (ctx.width == dh && ctx.height == dw));
@@ -608,8 +733,9 @@ static Bgr frame_px(const MdFrame &f, LONG x, LONG y);
  * static window must appear exactly where the rotation puts it. */
 static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     auto *st = static_cast<DxgiState *>(ctx->backend_data);
-    const RECT out = st->output_rect;
-    const uint32_t w = st->image_w, h = st->image_h;
+    OutputDup &o = st->out[0];
+    const RECT out = o.rect;
+    const uint32_t w = o.image_w, h = o.image_h;
     const RECT win = { 40, 40, 200, 120 }; /* image coordinates, not square */
     TestWindow mark = {};
     mark.color = RGB(20, 200, 60);
@@ -628,8 +754,9 @@ static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     };
     for (const DXGI_MODE_ROTATION r : { DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
                                         DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_IDENTITY }) {
-        CHECK(SUCCEEDED(frame_configure(ctx, st, w, h, r)));
-        st->delivered = false; /* as after re-duplicating: copy the whole desktop */
+        output_configure(&o, w, h, r);
+        CHECK(SUCCEEDED(frame_layout(ctx, st)));
+        o.delivered = false; /* as after re-duplicating: copy the whole desktop */
         const int turns = rotation_turns(r);
         uint32_t fw, fh;
         rotated_size(turns, w, h, &fw, &fh);
@@ -655,9 +782,48 @@ static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
         printf("PASS forced rotation %d degrees: %ux%u frame, the window lands where "
                "the rotation puts it\n", turns * 90, fw, fh);
     }
-    CHECK(st->turns == 0 && ctx->width == w && ctx->height == h);
+    CHECK(o.turns == 0 && ctx->width == w && ctx->height == h);
     window_stop(&damage);
     window_stop(&mark);
+}
+
+/* ── Interactive: all outputs as one frame (md-246) ─────────────── */
+
+static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx);
+
+/* "all" on the console. The VM has a single output, so this runs the
+ * composed path (canvas frame, layout, per-output copies, the pointer in
+ * frame coordinates) on real frames rather than several outputs; those are
+ * the synthetic cells. */
+static void all_cells(const MdCaptureBackend *be) {
+    OutputList outs = {};
+    CHECK(SUCCEEDED(outputs_enum(&outs)) && outs.count > 0);
+    LONG l = LONG_MAX, t = LONG_MAX, r = LONG_MIN, b = LONG_MIN;
+    for (UINT i = 0; i < outs.count; i++) {
+        const RECT &o = outs.rect[i];
+        l = o.left < l ? o.left : l;
+        t = o.top < t ? o.top : t;
+        r = o.right > r ? o.right : r;
+        b = o.bottom > b ? o.bottom : b;
+    }
+    MdCaptureCtx ctx = make_ctx(be, true, "ALL");
+    CHECK(be->init(&ctx) == 0);
+    auto *st = static_cast<DxgiState *>(ctx.backend_data);
+    CHECK(st->all && st->canvas_mode && st->count == outs.count);
+    CHECK(ctx.output_rect.x == l && ctx.output_rect.y == t &&
+          ctx.output_rect.width == (uint32_t)(r - l) && ctx.output_rect.height == (uint32_t)(b - t));
+    CHECK(ctx.width == ctx.output_rect.width && ctx.height == ctx.output_rect.height);
+    printf("PASS \"all\": %u output(s) as one %ux%u frame at (%d,%d)\n", st->count, ctx.width,
+           ctx.height, ctx.output_rect.x, ctx.output_rect.y);
+    outputs_release(&outs);
+
+    CHECK(be->start(&ctx) == 0);
+    rotation_cells(be, &ctx);   /* canvas frames, every rotation */
+    pointer_cells(be, &ctx);    /* the pointer composited into the canvas */
+    be->stop(&ctx);
+    be->destroy(&ctx);
+    CHECK(!ctx.backend_data);
+    puts("PASS \"all\": frames, rotation and pointer cells on the composed frame");
 }
 
 /* ── Interactive: real pointer shapes ──────────────────────── */
@@ -829,7 +995,9 @@ static Seen wait_cursor(const MdCaptureBackend *be, MdCaptureCtx *ctx, const Tes
 
 static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     auto *st = static_cast<DxgiState *>(ctx->backend_data);
-    const RECT out = st->output_desc.DesktopCoordinates;
+    /* Frame coordinates are desktop coordinates minus the frame's origin. */
+    const MdCaptureRect fr = ctx->output_rect;
+    const RECT out = { fr.x, fr.y, fr.x + (LONG)fr.width, fr.y + (LONG)fr.height };
     POINT pt;
     CHECK(GetCursorPos(&pt));
     if (pt.x < out.left || pt.x >= out.right || pt.y < out.top || pt.y >= out.bottom) {
@@ -998,6 +1166,8 @@ int main(int argc, char **argv) {
         CHECK(rc == -1 && !ctx.backend_data && !ctx.active);
         ctx = make_ctx(be, true, "99");
         CHECK(be->init(&ctx) == -1 && !ctx.backend_data);
+        ctx = make_ctx(be, true, "all");
+        CHECK(be->init(&ctx) == -1 && !ctx.backend_data);
         puts("PASS session 0: init fails cleanly without an interactive desktop");
         puts("ALL DXGI CAPTURE TESTS PASSED (session 0)");
         return 0;
@@ -1034,17 +1204,17 @@ int main(int argc, char **argv) {
     printf("PASS without test damage: %s after %.0f ms (timeout 300)\n",
            rc == 0 ? "frame" : "IDLE", took);
 
-    const RECT origin = st->output_desc.DesktopCoordinates;
+    const RECT origin = st->out[0].rect;
     TestWindow damage = {};
     damage.rect = { origin.left, origin.top, origin.left + 64, origin.top + 64 };
     damage.animate = true;
     window_start(&damage);
     CHECK(be->get_frame(&ctx, &f, 2000) == 0);
     check_frame(&ctx, st, f, &last_ts, &last_seq);
-    CHECK(st->mapped);
+    CHECK(st->out[0].mapped);
     be->release_frame(&ctx, &f);
     be->release_frame(&ctx, &f); /* idempotent */
-    CHECK(!st->mapped);
+    CHECK(!st->out[0].mapped);
     puts("PASS damaged desktop delivers a frame (BGRA, CPU, stride, QPC ns, seq)");
 
     /* A healthy stream answers 0 or IDLE within the timeout, never ERROR. */
@@ -1075,24 +1245,24 @@ int main(int argc, char **argv) {
     /* Duplication loss: ERROR promptly, then the HAL's stop + start recovers
      * and the first frame after re-duplicating is delivered. */
     CHECK(frame_failed(&ctx, st, DXGI_ERROR_ACCESS_LOST) == MD_CAPTURE_ERROR);
-    CHECK(!ctx.active && !st->duplication);
+    CHECK(!ctx.active && !st->out[0].duplication);
     t0 = now_ms();
     CHECK(be->get_frame(&ctx, &f, 2000) == MD_CAPTURE_ERROR && now_ms() - t0 < 50);
     be->stop(&ctx);
-    CHECK(be->start(&ctx) == 0 && ctx.active && st->duplication);
+    CHECK(be->start(&ctx) == 0 && ctx.active && st->out[0].duplication);
     CHECK(be->get_frame(&ctx, &f, 2000) == 0);
     check_frame(&ctx, st, f, &last_ts, &last_seq);
     puts("PASS access loss -> ERROR promptly; stop + start re-duplicates and delivers");
 
     /* That frame is still borrowed: the next get_frame must reclaim it before
      * copying into the staging texture again. */
-    CHECK(st->mapped);
+    CHECK(st->out[0].mapped);
     rc = be->get_frame(&ctx, &f, 100);
     CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
-    if (rc == MD_CAPTURE_IDLE) CHECK(!st->mapped);
+    if (rc == MD_CAPTURE_IDLE) CHECK(!st->out[0].mapped);
     else check_frame(&ctx, st, f, &last_ts, &last_seq);
     be->release_frame(&ctx, &f);
-    CHECK(!st->mapped);
+    CHECK(!st->out[0].mapped);
     printf("PASS unreleased frame reclaimed by the next get_frame (%s)\n",
            rc == 0 ? "new frame" : "IDLE");
 
@@ -1100,7 +1270,7 @@ int main(int argc, char **argv) {
 
     /* A non-loss failure is reported without tearing the duplication down. */
     CHECK(frame_failed(&ctx, st, E_INVALIDARG) == MD_CAPTURE_ERROR &&
-          ctx.active && st->duplication);
+          ctx.active && st->out[0].duplication);
 
     be->stop(&ctx);
     t0 = now_ms();
@@ -1115,6 +1285,7 @@ int main(int argc, char **argv) {
 
     be->destroy(&ctx);
     CHECK(!ctx.backend_data);
+    all_cells(be);
     puts("ALL DXGI CAPTURE TESTS PASSED (interactive)");
     return 0;
 }

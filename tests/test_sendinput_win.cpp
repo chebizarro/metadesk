@@ -203,6 +203,15 @@ static void test_targets() {
     CHECK(moves_to(&ctx, 0, 0, -1080, -840) && moves_to(&ctx, 1079, 1919, -1, 1079));
     sendinput_backend.destroy(&ctx);
 
+    /* DXGI "all" (md-246): the frame is the outputs' bounding rectangle, here
+     * (-2560,-200) 5640x2220 around a primary, an above-left display and a
+     * portrait one past a gap, so frame pixels map 1:1 onto global pixels. */
+    set_layout(-2560, -200, 5640, 2220);
+    ctx = make_ctx(5640, 2220, -2560, -200, 5640, 2220);
+    CHECK(moves_to(&ctx, 0, 0, -2560, -200) && moves_to(&ctx, 2560 + 100, 200 + 50, 100, 50));
+    CHECK(moves_to(&ctx, 5639, 2219, 3079, 2019));
+    sendinput_backend.destroy(&ctx);
+
     /* The layout changes under a running backend (a display was attached):
      * the virtual desktop is re-read on every move. */
     set_layout(0, 0, 1920, 1080);

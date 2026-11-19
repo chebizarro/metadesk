@@ -72,8 +72,9 @@ typedef struct {
     /* Output (display) to capture. NULL or "" = the primary display; a
      * decimal index selects by position in the backend's display list.
      *   Windows (DXGI): index into the attached outputs, a GDI device name
-     *     such as "\\.\DISPLAY2" (the "\\.\" prefix is optional), or
-     *     "id:2" for \\.\DISPLAY2.
+     *     such as "\\.\DISPLAY2" (the "\\.\" prefix is optional),
+     *     "id:2" for \\.\DISPLAY2, or "all": every output composed into one
+     *     frame covering their bounding rectangle (gaps black).
      *   macOS (ScreenCaptureKit): index into SCShareableContent.displays,
      *     "id:N" for a CGDirectDisplayID, or a display name (NSScreen
      *     localizedName, case-insensitive, must be unique).
@@ -85,7 +86,8 @@ typedef struct {
 
 /* Bounds of the captured output in the platform's global desktop space
  * (Windows: physical virtual-desktop pixels, in the output's desktop
- * orientation like the frames, so a rotated output maps linearly;
+ * orientation like the frames, so a rotated output maps linearly; for
+ * "all", the outputs' bounding rectangle;
  * macOS: CoreGraphics global display points, origin at the main display's
  * top-left). width == 0 means the backend has not published it. */
 typedef struct {
