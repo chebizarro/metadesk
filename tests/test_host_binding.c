@@ -29,8 +29,9 @@ int test_action(MdAgent *a, MdStream *s, uint32_t *seq,
                 const uint8_t *p, uint32_t n) {
     (void)a; (void)s; (void)seq; (void)p; (void)n; action_calls++; return 0;
 }
+static int move_x, move_y;
 int test_move(MdInput *i, int x, int y) {
-    (void)i; (void)x; (void)y; input_calls++; return 0;
+    (void)i; move_x = x; move_y = y; input_calls++; return 0;
 }
 
 typedef struct { MdStream *peer, *host; } Pair;
@@ -85,10 +86,65 @@ static void closed(Pair p) {
     MD_CHECK(md_stream_recv(p.peer, &hdr, &payload, 1000) < 0);
     free(payload);
 }
+/* The frame the client tags its input with (md-383x): TEST_FRAME_W x
+ * TEST_FRAME_H from packet 0 on; one packet has gone out. */
+#define TEST_FRAME_W 640
+#define TEST_FRAME_H 360
+static const uint32_t test_pkt_seq = 1;
 static HostCtx context(MdSession *s) {
     HostCtx ctx = { .session = s, .agent = (MdAgent *)(uintptr_t)1,
                     .input = (MdInput *)(uintptr_t)1 };
+    ctx.sync.packet_seq = &test_pkt_seq;
+    ctx.sync.width = TEST_FRAME_W;
+    ctx.sync.height = TEST_FRAME_H;
     return ctx;
+}
+/* Dispatch one MOVE to (x, y) on the frame_w x frame_h frame of video
+ * packet seq; legacy omits the frame tag (a client built before md-383x).
+ * True if it injected. */
+static bool dispatch_move(HostCtx *ctx, int16_t x, int16_t y, uint16_t frame_w,
+                          uint16_t frame_h, uint32_t seq, bool legacy) {
+    uint8_t buf[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
+    MD_CHECK(md_input_event_pack(buf, sizeof(buf), MD_INPUT_EV_MOVE, 0, x, y,
+                                 NULL, 0, frame_w, frame_h, seq) == sizeof(buf));
+    MdPacketHeader hdr = { .type = MD_PKT_INPUT,
+                           .payload_len = legacy ? MD_INPUT_EVENT_HDR_LEN
+                                                 : sizeof(buf) };
+    unsigned before = input_calls;
+    handle_client_packet(ctx, &hdr, buf);
+    return input_calls == before + 1;
+}
+/* The real dispatch interprets points against the frame the client showed:
+ * packets 10.. went out at half the size on the same output, 50.. at the
+ * current size, and 100 is the next to be sent. */
+static void check_frame_tags(HostCtx *ctx) {
+    const MdCaptureRect r = { 0, 0, 1280, 720 };
+    ctx->pkt_seq = 100;
+    ctx->sync.packet_seq = &ctx->pkt_seq;
+    ctx->sync.first_seq = 50;
+    ctx->sync.rect = ctx->sync.prev_rect = r;
+    ctx->sync.prev_first_seq = 10;
+    ctx->sync.prev_width = TEST_FRAME_W / 2;
+    ctx->sync.prev_height = TEST_FRAME_H / 2;
+    const uint16_t W = TEST_FRAME_W, H = TEST_FRAME_H;
+    MD_CHECK(dispatch_move(ctx, 320, 180, W, H, 60, false));
+    MD_CHECK(move_x == 320 && move_y == 180);
+    MD_CHECK(!dispatch_move(ctx, 320, 180, W, H, 60, true));   /* untagged */
+    MD_CHECK(!dispatch_move(ctx, 320, 180, 0, 0, 60, false));  /* no frame */
+    MD_CHECK(!dispatch_move(ctx, 320, 180, 1280, 720, 60, false));
+    MD_CHECK(!dispatch_move(ctx, (int16_t)W, 0, W, H, 60, false));
+    MD_CHECK(!dispatch_move(ctx, 320, 180, W, H, 100, false)); /* not sent */
+    MD_CHECK(!dispatch_move(ctx, 320, 180, W, H, 20, false));  /* wrong size */
+    MD_CHECK(dispatch_move(ctx, 160, 90, W / 2, H / 2, 20, false));
+    MD_CHECK(move_x == 320 && move_y == 180);                  /* rescaled */
+    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 5, false)); /* older */
+    ctx->sync.prev_rect.x = 1280; /* another output: not translatable */
+    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 20, false));
+    MD_CHECK(ctx->sync.points_translated == 1);
+    MdSession *session = ctx->session;
+    const HostCtx fresh = context(session);
+    ctx->sync = fresh.sync;
+    ctx->pkt_seq = 0;
 }
 static void test_candidate_and_second_client(void) {
     MdSession s;
@@ -107,14 +163,16 @@ static void test_candidate_and_second_client(void) {
     MD_CHECK(ctx.client == NULL); /* ACK precedes publication. */
     ack(first, acc.granted);
     ctx.client = first.host;
-    uint8_t move[MD_INPUT_EVENT_HDR_LEN];
-    MD_CHECK(md_input_event_pack(move, sizeof(move), MD_INPUT_EV_MOVE, 0, 1, 2, NULL, 0));
+    uint8_t move[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
+    MD_CHECK(md_input_event_pack(move, sizeof(move), MD_INPUT_EV_MOVE, 0, 1, 2,
+                                 NULL, 0, TEST_FRAME_W, TEST_FRAME_H, 0));
     MdPacketHeader allowed = { .type = MD_PKT_INPUT, .payload_len = sizeof(move) };
     unsigned moves = input_calls, actions = action_calls;
     handle_client_packet(&ctx, &allowed, move);
     allowed.type = MD_PKT_ACTION;
     handle_client_packet(&ctx, &allowed, move);
     MD_CHECK(input_calls == moves + 1 && action_calls == actions + 1);
+    check_frame_tags(&ctx);
     Pair second = pair();
     send_proof(second, &acc); /* Knowledge of a consumed token is useless. */
     MD_CHECK(host_bind_candidate(&ctx, second.host) < 0);
@@ -136,8 +194,9 @@ static void test_unbound_dispatch(void) {
         MdSession s; reserve(&s, MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT);
         HostCtx ctx = context(&s);
         Pair p = pair(); ctx.client = p.host;
-        uint8_t input[MD_INPUT_EVENT_HDR_LEN];
-        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 1, 2, NULL, 0));
+        uint8_t input[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
+        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 1, 2,
+                                     NULL, 0, TEST_FRAME_W, TEST_FRAME_H, 0));
         MdPacketHeader hdr = { .type = action ? MD_PKT_ACTION : MD_PKT_INPUT,
                                .payload_len = sizeof(input) };
         unsigned moves = input_calls, actions = action_calls;
@@ -194,8 +253,9 @@ static void test_denied_capabilities(void) {
         MD_CHECK(poll(&fd, 1, 0) == 0);
         unsigned trees = tree_calls; host_send_initial_tree(&ctx);
         MD_CHECK(tree_calls == trees + 1);
-        uint8_t input[MD_INPUT_EVENT_HDR_LEN];
-        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 12, 34, NULL, 0));
+        uint8_t input[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
+        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 12, 34,
+                                     NULL, 0, TEST_FRAME_W, TEST_FRAME_H, 0));
         MdPacketHeader hdr = { .type = action ? MD_PKT_ACTION : MD_PKT_INPUT,
                                .payload_len = sizeof(input) };
         unsigned moves = input_calls, actions = action_calls;
@@ -300,8 +360,9 @@ static void test_relay_grant(const char *url, uint32_t expected) {
         ack(p, MD_CAP_VIDEO); ctx.client = p.host;
         unsigned trees = tree_calls; host_send_initial_tree(&ctx);
         MD_CHECK(tree_calls == trees);
-        uint8_t input[MD_INPUT_EVENT_HDR_LEN];
-        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 1, 2, NULL, 0));
+        uint8_t input[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
+        MD_CHECK(md_input_event_pack(input, sizeof(input), MD_INPUT_EV_MOVE, 0, 1, 2,
+                                     NULL, 0, TEST_FRAME_W, TEST_FRAME_H, 0));
         MdPacketHeader hdr = { .type = action ? MD_PKT_ACTION : MD_PKT_INPUT,
                                .payload_len = sizeof(input) };
         unsigned moves = input_calls, actions = action_calls;
