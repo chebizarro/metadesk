@@ -14,13 +14,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "log.h"
 #define MD_LOG_TAG "input"
 
-/* Small delay between synthetic events for reliability. */
-static void input_delay(void) {
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5ms */
+void md_input_settle(void) {
+#ifdef _WIN32
+    Sleep(MD_INPUT_EVENT_SETTLE_MS);
+#else
+    struct timespec ts = { .tv_sec = 0,
+                           .tv_nsec = (long)MD_INPUT_EVENT_SETTLE_MS * 1000000L };
     nanosleep(&ts, NULL);
+#endif
 }
 
 /* ── Key name → keysym mapping (platform-neutral) ────────────── */
@@ -125,16 +132,60 @@ uint32_t md_input_keysym_from_name(const char *name) {
         if (strcasecmp(e->name, name) == 0)
             return e->keysym;
     }
-    /* Single ASCII character fallback */
-    if (name[0] != '\0' && name[1] == '\0') {
-        char c = name[0];
-        /* Search the table for single-char entries */
-        for (const KeyNameEntry *e = key_names; e->name != NULL; e++) {
-            if (e->name[0] == c && e->name[1] == '\0')
-                return e->keysym;
-        }
-    }
     return 0;
+}
+
+/* Direct-indexed US layout for text injection; tests pin it to key_names. */
+typedef struct {
+    uint16_t keysym;
+    bool     shift;
+} AsciiKey;
+
+#define K(sym) { (sym), false }
+#define S(sym) { (sym), true }
+static const AsciiKey ascii_keys[128] = {
+    ['\t'] = K(0x0F), ['\n'] = K(0x1C), [' '] = K(0x39),
+
+    ['a'] = K(0x1E), ['b'] = K(0x30), ['c'] = K(0x2E), ['d'] = K(0x20),
+    ['e'] = K(0x12), ['f'] = K(0x21), ['g'] = K(0x22), ['h'] = K(0x23),
+    ['i'] = K(0x17), ['j'] = K(0x24), ['k'] = K(0x25), ['l'] = K(0x26),
+    ['m'] = K(0x32), ['n'] = K(0x31), ['o'] = K(0x18), ['p'] = K(0x19),
+    ['q'] = K(0x10), ['r'] = K(0x13), ['s'] = K(0x1F), ['t'] = K(0x14),
+    ['u'] = K(0x16), ['v'] = K(0x2F), ['w'] = K(0x11), ['x'] = K(0x2D),
+    ['y'] = K(0x15), ['z'] = K(0x2C),
+
+    ['A'] = S(0x1E), ['B'] = S(0x30), ['C'] = S(0x2E), ['D'] = S(0x20),
+    ['E'] = S(0x12), ['F'] = S(0x21), ['G'] = S(0x22), ['H'] = S(0x23),
+    ['I'] = S(0x17), ['J'] = S(0x24), ['K'] = S(0x25), ['L'] = S(0x26),
+    ['M'] = S(0x32), ['N'] = S(0x31), ['O'] = S(0x18), ['P'] = S(0x19),
+    ['Q'] = S(0x10), ['R'] = S(0x13), ['S'] = S(0x1F), ['T'] = S(0x14),
+    ['U'] = S(0x16), ['V'] = S(0x2F), ['W'] = S(0x11), ['X'] = S(0x2D),
+    ['Y'] = S(0x15), ['Z'] = S(0x2C),
+
+    ['1'] = K(0x02), ['2'] = K(0x03), ['3'] = K(0x04), ['4'] = K(0x05),
+    ['5'] = K(0x06), ['6'] = K(0x07), ['7'] = K(0x08), ['8'] = K(0x09),
+    ['9'] = K(0x0A), ['0'] = K(0x0B),
+    ['!'] = S(0x02), ['@'] = S(0x03), ['#'] = S(0x04), ['$'] = S(0x05),
+    ['%'] = S(0x06), ['^'] = S(0x07), ['&'] = S(0x08), ['*'] = S(0x09),
+    ['('] = S(0x0A), [')'] = S(0x0B),
+
+    ['-']  = K(0x0C), ['_'] = S(0x0C), ['='] = K(0x0D), ['+'] = S(0x0D),
+    ['[']  = K(0x1A), ['{'] = S(0x1A), [']'] = K(0x1B), ['}'] = S(0x1B),
+    [';']  = K(0x27), [':'] = S(0x27), ['\''] = K(0x28), ['"'] = S(0x28),
+    ['`']  = K(0x29), ['~'] = S(0x29), ['\\'] = K(0x2B), ['|'] = S(0x2B),
+    [',']  = K(0x33), ['<'] = S(0x33), ['.'] = K(0x34), ['>'] = S(0x34),
+    ['/']  = K(0x35), ['?'] = S(0x35),
+};
+#undef K
+#undef S
+
+bool md_input_ascii_key(char c, uint32_t *keysym, bool *shift) {
+    unsigned char u = (unsigned char)c;
+    if (u >= sizeof(ascii_keys) / sizeof(ascii_keys[0]) || !ascii_keys[u].keysym)
+        return false;
+    if (keysym) *keysym = ascii_keys[u].keysym;
+    if (shift) *shift = ascii_keys[u].shift;
+    return true;
 }
 
 /* ── Public convenience API ──────────────────────────────────── */
@@ -185,7 +236,7 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
         input_apply_fallback_dimensions(&inp->config, "config is NULL");
     }
 
-    if (inp->vtable->init(inp, &inp->config) != 0) {
+    if (inp->vtable->init(inp) != 0) {
         free(inp);
         return NULL;
     }
@@ -211,7 +262,7 @@ int md_input_click(MdInput *inp, int x, int y, int button) {
     if (inp->vtable->mouse_button(inp, button, 1) < 0)
         return -1;
 
-    input_delay();
+    md_input_settle();
 
     if (inp->vtable->mouse_button(inp, button, 0) < 0)
         return -1;
@@ -222,7 +273,7 @@ int md_input_click(MdInput *inp, int x, int y, int button) {
 int md_input_dbl_click(MdInput *inp, int x, int y) {
     int ret = md_input_click(inp, x, y, MD_MOUSE_LEFT);
     if (ret < 0) return ret;
-    input_delay();
+    md_input_settle();
     return md_input_click(inp, x, y, MD_MOUSE_LEFT);
 }
 
@@ -265,7 +316,7 @@ int md_input_key_combo(MdInput *inp, const char **keys, int key_count) {
         pressed_count++;
     }
 
-    input_delay();
+    md_input_settle();
 
     /* Release in reverse order. Keep releasing remaining keys even if one
      * release fails, then report the failure to the caller. */
@@ -321,7 +372,7 @@ int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
 #endif
             if (md_input_key_combo(inp, select_all, 2) < 0)
                 return -1;
-            input_delay();
+            md_input_settle();
             return md_input_type_text(inp, action->text);
         }
         return 0;

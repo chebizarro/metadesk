@@ -55,6 +55,9 @@ typedef struct {
      * the new one (the PipeWire backend already guards this). */
     bool                    frame_checked_out;
 
+    /* One diagnostic for a pixel format outside the requested set. */
+    bool                    format_warned;
+
     /* Sequence counter */
     atomic_uint_least32_t   seq;
 
@@ -112,8 +115,13 @@ API_AVAILABLE(macos(12.3))
         capFmt = MD_PIX_CAPTURE_RGBA;
         break;
     default:
-        capFmt = MD_PIX_CAPTURE_BGRA; /* best guess */
-        break;
+        /* sck_start requests 32BGRA; never relabel unknown bytes. */
+        if (!sck->format_warned) {
+            sck->format_warned = true;
+            MD_LOG_W("dropping frames with unsupported pixel format 0x%08x", (unsigned)pixFmt);
+        }
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return;
     }
 
     /* Get timestamp */
@@ -176,9 +184,7 @@ API_AVAILABLE(macos(12.3))
 
 /* ── Backend vtable implementation ───────────────────────────── */
 
-static int sck_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
-    (void)cfg;
-
+static int sck_init(MdCaptureCtx *ctx) {
     SCKState *sck = calloc(1, sizeof(SCKState));
     if (!sck) return -1;
 
@@ -190,14 +196,11 @@ static int sck_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     return 0;
 }
 
+/* sck_start/sck_stop are reachable only through screencapturekit_backend,
+ * which md_capture_backend_create gates at runtime; the annotations let the
+ * compiler prove that instead of re-checking per call. */
+API_AVAILABLE(macos(12.3))
 static int sck_start(MdCaptureCtx *ctx) {
-    if (@available(macOS 12.3, *)) {
-        /* ok */
-    } else {
-        MD_LOG_I("ScreenCaptureKit requires macOS 12.3+");
-        return -1;
-    }
-
     SCKState *sck = ctx->backend_data;
     if (!sck) return -1;
 
@@ -295,27 +298,28 @@ static int sck_start(MdCaptureCtx *ctx) {
     return 0;
 }
 
-static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
+static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     SCKState *sck = ctx->backend_data;
-    if (!sck) return -1;
+    if (!sck) return MD_CAPTURE_ERROR;
 
+    /* macOS has no pthread_condattr_setclock: wait relative to a monotonic
+     * deadline, recomputing the remainder after every wakeup. */
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) +
+                        (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&sck->frame_lock);
-
-    /* Wait for a frame from the SCK delegate */
     while (!sck->frame_ready && ctx->active) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100000000L; /* 100ms timeout */
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_nsec -= 1000000000L;
-            ts.tv_sec += 1;
-        }
-        pthread_cond_timedwait(&sck->frame_cond, &sck->frame_lock, &ts);
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        if (now >= deadline) break;
+        uint64_t left = deadline - now;
+        struct timespec rel = { .tv_sec = (time_t)(left / 1000000000ULL),
+                                .tv_nsec = (long)(left % 1000000000ULL) };
+        pthread_cond_timedwait_relative_np(&sck->frame_cond, &sck->frame_lock, &rel);
     }
 
     if (!sck->frame_ready) {
+        bool active = ctx->active;
         pthread_mutex_unlock(&sck->frame_lock);
-        return -1; /* capture stopped */
+        return active ? MD_CAPTURE_IDLE : MD_CAPTURE_ERROR;
     }
 
     *out = sck->pending_frame;
@@ -344,13 +348,8 @@ static void sck_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {
     pthread_mutex_unlock(&sck->frame_lock);
 }
 
+API_AVAILABLE(macos(12.3))
 static void sck_stop(MdCaptureCtx *ctx) {
-    if (@available(macOS 12.3, *)) {
-        /* ok */
-    } else {
-        return;
-    }
-
     SCKState *sck = ctx->backend_data;
     if (!sck) return;
 
@@ -399,6 +398,7 @@ static void sck_destroy(MdCaptureCtx *ctx) {
 
 /* ── Singleton vtable ────────────────────────────────────────── */
 
+API_AVAILABLE(macos(12.3))
 static const MdCaptureBackend screencapturekit_backend = {
     .init          = sck_init,
     .start         = sck_start,

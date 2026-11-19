@@ -36,12 +36,6 @@ typedef struct {
     CGPoint  last_mouse;  /* track last mouse position for button events */
 } CGEventState;
 
-/* Small delay between events for system to process them. */
-static void cg_delay(void) {
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5ms */
-    nanosleep(&ts, NULL);
-}
-
 /* ── Linux KEY_* → macOS kVK_* translation ───────────────────── */
 
 /* Our canonical keysym space uses Linux KEY_* scan codes (set in input.c).
@@ -143,13 +137,14 @@ static CGEventFlags modifier_flag_for_keysym(uint32_t keysym) {
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static bool cg_dimensions_are_valid(const MdInputConfig *cfg) {
-    return cfg && cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
+    return cfg->screen_width >= MD_INPUT_MIN_SCREEN_DIMENSION &&
            cfg->screen_height >= MD_INPUT_MIN_SCREEN_DIMENSION;
 }
 
-static int cg_init(MdInputCtx *ctx, const MdInputConfig *cfg) {
+static int cg_init(MdInputCtx *ctx) {
+    const MdInputConfig *cfg = &ctx->config;
     if (!cg_dimensions_are_valid(cfg)) {
-        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg ? cfg->screen_width : 0, cfg ? cfg->screen_height : 0);
+        MD_LOG_E("ERROR — screen dimensions must be configured and >= %u (got %ux%u)", MD_INPUT_MIN_SCREEN_DIMENSION, cfg->screen_width, cfg->screen_height);
         return -1;
     }
 
@@ -300,7 +295,7 @@ static int cg_type_text(MdInputCtx *ctx, const char *utf8) {
             CGEventPost(kCGHIDEventTap, up);
             CFRelease(up);
 
-            cg_delay();
+            md_input_settle();
         }
     }
 

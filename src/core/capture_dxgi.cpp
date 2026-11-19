@@ -90,9 +90,7 @@ static HRESULT create_staging_texture(DxgiState *st) {
 
 /* ── Vtable implementation ───────────────────────────────────── */
 
-static int dxgi_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
-    (void)cfg;
-
+static int dxgi_init(MdCaptureCtx *ctx) {
     auto *st = (DxgiState *)calloc(1, sizeof(DxgiState));
     if (!st) return -1;
 
@@ -178,39 +176,29 @@ static int dxgi_start(MdCaptureCtx *ctx) {
     return 0; /* DXGI doesn't need an explicit start — AcquireNextFrame drives it */
 }
 
-static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
+static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     auto *st = (DxgiState *)ctx->backend_data;
-    if (!st || !st->duplication) return -1;
+    if (!st || !st->duplication) return MD_CAPTURE_ERROR;
 
     /* Release previous frame if still held */
     release_acquired_frame(st);
 
-    /* Acquire the next desktop frame.
-     * timeout_ms=100: wait up to 100ms for a new frame.
-     * Returns DXGI_ERROR_WAIT_TIMEOUT if the desktop hasn't changed. */
+    /* An unchanged desktop is DXGI_ERROR_WAIT_TIMEOUT: healthy idle, not a
+     * device error. */
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource *resource = nullptr;
-    HRESULT hr;
-
-    /* Retry loop — skip timeout results */
-    for (int attempts = 0; attempts < 20; attempts++) {
-        hr = st->duplication->AcquireNextFrame(100, &frameInfo, &resource);
-
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT)
-            continue; /* no new frame yet, retry */
-
-        if (FAILED(hr)) {
-            if (hr == DXGI_ERROR_ACCESS_LOST) {
-                /* Desktop switch or mode change — need to reinitialize */
-                MD_LOG_I("access lost, need reinit");
-                ctx->active = false;
-            }
-            return -1;
+    HRESULT hr = st->duplication->AcquireNextFrame(timeout_ms, &frameInfo, &resource);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+        return MD_CAPTURE_IDLE;
+    if (FAILED(hr)) {
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            /* Desktop switch or mode change — need to reinitialize */
+            MD_LOG_I("access lost, need reinit");
+            ctx->active = false;
         }
-        break; /* got a frame */
+        return MD_CAPTURE_ERROR;
     }
-
-    if (!resource) return -1;
+    if (!resource) return MD_CAPTURE_ERROR;
 
     st->frame_acquired = true;
     st->desktop_resource = resource;

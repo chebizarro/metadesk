@@ -74,9 +74,11 @@ typedef struct {
 /* ── Backend vtable (spec §2.3.1) ────────────────────────────── */
 
 typedef struct MdCaptureBackend {
-    int   (*init)(MdCaptureCtx *ctx, const MdCaptureConfig *cfg);
+    /* ctx->config is populated before init. */
+    int   (*init)(MdCaptureCtx *ctx);
     int   (*start)(MdCaptureCtx *ctx);
-    int   (*get_frame)(MdCaptureCtx *ctx, MdFrame *out);
+    /* Wait at most timeout_ms; see md_capture_get_frame for results. */
+    int   (*get_frame)(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms);
     void  (*release_frame)(MdCaptureCtx *ctx, MdFrame *frame);
     void  (*stop)(MdCaptureCtx *ctx);
     void  (*destroy)(MdCaptureCtx *ctx);
@@ -84,6 +86,11 @@ typedef struct MdCaptureBackend {
      * screencast restore_token) so the next start re-prompts for consent.
      * May be NULL. Kept last so positional vtable initializers stay valid. */
     void  (*forget_authorization)(MdCaptureCtx *ctx);
+    /* Optional: for backends that learn the size asynchronously, wait up to
+     * timeout_ms for negotiation (0 on success, -1 on timeout/broken stream).
+     * NULL means ctx->width/height are set synchronously by init/start. */
+    int   (*wait_size)(MdCaptureCtx *ctx, uint32_t timeout_ms,
+                       uint32_t *width, uint32_t *height);
 } MdCaptureBackend;
 
 /* ── Capture context ─────────────────────────────────────────── */
@@ -147,10 +154,11 @@ size_t md_capture_restore_token_load(char *buf, size_t size);
 int md_capture_restore_token_save(const char *token);
 int md_capture_restore_token_forget(void);
 
-/* Get the next captured frame (may block until a frame is available).
- * Returns 0 on success, MD_CAPTURE_IDLE for a healthy stream without damage,
- * or MD_CAPTURE_ERROR for a broken/stopped stream. */
-int md_capture_get_frame(MdCaptureCtx *ctx, MdFrame *out);
+/* Get the next captured frame, waiting at most timeout_ms (0 = poll).
+ * Returns 0 on success, MD_CAPTURE_IDLE when a healthy stream delivered no
+ * damage within the timeout, or MD_CAPTURE_ERROR for a broken/stopped stream
+ * (returned promptly, without waiting out the timeout). */
+int md_capture_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms);
 
 /* Release a frame returned by get_frame (returns buffer to backend). */
 void md_capture_release_frame(MdCaptureCtx *ctx, MdFrame *frame);
@@ -158,8 +166,13 @@ void md_capture_release_frame(MdCaptureCtx *ctx, MdFrame *frame);
 /* Query whether capture is currently active. */
 bool md_capture_is_active(const MdCaptureCtx *ctx);
 
-/* Get the negotiated frame dimensions (valid after first frame). */
-int md_capture_get_size(const MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);
+/* Wait up to timeout_ms for the negotiated frame dimensions. Returns 0 with
+ * the size, or -1 on timeout, a broken stream or invalid arguments. */
+int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
+                         uint32_t *width, uint32_t *height);
+
+/* Non-blocking md_capture_wait_size(ctx, 0, ...). */
+int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);
 
 /* Stop capture. Release borrowed frames first. A concurrent stop waits for
  * the consumer's release before destroying its buffer storage. */

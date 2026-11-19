@@ -29,6 +29,7 @@
 
 #include <dbus/dbus.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,16 @@ static uint64_t monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Absolute CLOCK_MONOTONIC time for pthread_cond_timedwait on the backend's
+ * frame_cond (initialised with that clock). */
+static struct timespec monotonic_timespec(uint64_t at_ns) {
+    return (struct timespec){ .tv_sec = (time_t)(at_ns / 1000000000ULL),
+                              .tv_nsec = (long)(at_ns % 1000000000ULL) };
+}
+
+/* A started stream that never reaches PAUSED/STREAMING is broken. */
+#define PW_CONNECT_DEADLINE_NS 5000000000ULL
+
 static int portal_remaining_ms(PortalScreencast *p, int limit) {
     uint64_t now = monotonic_ns();
     if (now >= p->deadline_ns) return 0;
@@ -125,11 +136,6 @@ static void dict_append_sv_string(DBusMessageIter *dict,
 static void dict_append_sv_uint32(DBusMessageIter *dict,
                                   const char *key, uint32_t val) {
     dict_append_sv(dict, key, DBUS_TYPE_UINT32, "u", &val);
-}
-
-static void dict_append_sv_bool(DBusMessageIter *dict,
-                                 const char *key, dbus_bool_t val) {
-    dict_append_sv(dict, key, DBUS_TYPE_BOOLEAN, "b", &val);
 }
 
 /* Look up a string value in an a{sv} dict iter positioned at the array */
@@ -722,13 +728,16 @@ static void on_param_changed(void *userdata, uint32_t id,
     if (spa_format_video_raw_parse(param, &info) < 0)
         return;
 
+    /* Published under the frame lock: md_capture_wait_size() waits on it. */
+    pthread_mutex_lock(&pw->frame_lock);
     ctx->width     = info.size.width;
     ctx->height    = info.size.height;
     pw->spa_format = info.format;
-
-    /* Calculate stride from format and width */
-    uint32_t bpp = 4; /* most formats are 4 bytes/pixel (BGRx, RGBx, etc.) */
-    pw->stride = ctx->width * bpp;
+    /* Every negotiated format is 4 bytes/pixel. on_process prefers the
+     * producer's chunk->stride; this is only the fallback when it is 0. */
+    pw->stride = ctx->width * 4;
+    pthread_cond_broadcast(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
 
     /* Tell PipeWire what buffer types we support.
      * Prefer DMA-BUF if configured, always support SHM as fallback. */
@@ -750,14 +759,15 @@ static void on_param_changed(void *userdata, uint32_t id,
                  pw->generation, info.format, info.size.width, info.size.height, data_type, rc);
 }
 
-/* Map SPA video format to our capture pixel format. */
-static MdCapturePixFmt spa_to_capture_fmt(uint32_t spa_fmt) {
-    /* SPA_VIDEO_FORMAT values are enums; map the common ones */
+/* Map the negotiated SPA format (the closed EnumFormat set offered in
+ * pw_start) to a capture format. Anything else is refused, not guessed. */
+static bool spa_to_capture_fmt(uint32_t spa_fmt, MdCapturePixFmt *out) {
     switch (spa_fmt) {
-    case SPA_VIDEO_FORMAT_RGBA:  return MD_PIX_CAPTURE_RGBA;
-    case SPA_VIDEO_FORMAT_BGRA:  return MD_PIX_CAPTURE_BGRA;
-    case SPA_VIDEO_FORMAT_RGBx:  return MD_PIX_CAPTURE_RGBX;
-    default:                     return MD_PIX_CAPTURE_BGRX;
+    case SPA_VIDEO_FORMAT_BGRx: *out = MD_PIX_CAPTURE_BGRX; return true;
+    case SPA_VIDEO_FORMAT_BGRA: *out = MD_PIX_CAPTURE_BGRA; return true;
+    case SPA_VIDEO_FORMAT_RGBx: *out = MD_PIX_CAPTURE_RGBX; return true;
+    case SPA_VIDEO_FORMAT_RGBA: *out = MD_PIX_CAPTURE_RGBA; return true;
+    default:                    return false;
     }
 }
 
@@ -782,7 +792,9 @@ static void on_process(void *userdata) {
      * never advertise a CPU frame whose backing pointer is NULL. */
     uint32_t stride = d->chunk->stride > 0 ? (uint32_t)d->chunk->stride : pw->stride;
     uint64_t needed = ctx->height ? (uint64_t)(ctx->height - 1) * stride + (uint64_t)ctx->width * 4 : 0;
-    if (!ctx->width || !ctx->height || stride < (uint64_t)ctx->width * 4 ||
+    MdCapturePixFmt format;
+    if (!spa_to_capture_fmt(pw->spa_format, &format) ||
+        !ctx->width || !ctx->height || stride < (uint64_t)ctx->width * 4 ||
         /* xdpw/PW 1.0.5 supplies flags=0 even for readable MAP_BUFFERS.
          * Reject an explicit write-only descriptor, not that legacy default. */
         d->chunk->stride < 0 || (d->flags && !(d->flags & SPA_DATA_FLAG_READABLE)) ||
@@ -791,12 +803,12 @@ static void on_process(void *userdata) {
         (d->type == SPA_DATA_DmaBuf && (!pw->prefer_dmabuf || d->fd < 0)) ||
         (d->type != SPA_DATA_DmaBuf &&
          ((d->type != SPA_DATA_MemFd && d->type != SPA_DATA_MemPtr) || !d->data))) {
-        MD_LOG_I("reject buffer: type=%u flags=%u mapped=%d max=%u offset=%u size=%u stride=%d",
-                 d->type, d->flags, d->data != NULL, d->maxsize,
+        MD_LOG_I("reject buffer: format=%u type=%u flags=%u mapped=%d max=%u offset=%u size=%u stride=%d",
+                 pw->spa_format, d->type, d->flags, d->data != NULL, d->maxsize,
                  d->chunk->offset, d->chunk->size, d->chunk->stride);
         pthread_mutex_lock(&pw->frame_lock);
         pw->broken = true;
-        pthread_cond_signal(&pw->frame_cond);
+        pthread_cond_broadcast(&pw->frame_cond);
         pthread_mutex_unlock(&pw->frame_lock);
         goto requeue;
     }
@@ -811,7 +823,7 @@ static void on_process(void *userdata) {
         .width        = ctx->width,
         .height       = ctx->height,
         .stride       = stride,
-        .format       = spa_to_capture_fmt(pw->spa_format),
+        .format       = format,
         .seq          = atomic_fetch_add_explicit(&pw->seq, 1, memory_order_relaxed),
         .timestamp_ns = timestamp,
     };
@@ -857,7 +869,7 @@ static void on_process(void *userdata) {
     pw->pending_frame = frame;
     pw->held_pw_buf   = pw_buf;
     pw->frame_ready   = true;
-    pthread_cond_signal(&pw->frame_cond);
+    pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
     return; /* don't requeue — consumer calls release_frame */
 
@@ -879,7 +891,7 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
     if (state == PW_STREAM_STATE_STREAMING || state == PW_STREAM_STATE_PAUSED)
         pw->connected = true;
     pw->broken = state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED;
-    pthread_cond_signal(&pw->frame_cond);
+    pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
 }
 
@@ -925,9 +937,8 @@ static void *pw_thread_func(void *arg) {
 
 /* ── Backend vtable implementation ───────────────────────────── */
 
-static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
+static int pw_backend_init(MdCaptureCtx *ctx) {
     /* Initialize PipeWire (idempotent, safe to call multiple times) */
-    (void)cfg;
     pw_init(NULL, NULL);
     if (!dbus_threads_init_default()) return -1;
 
@@ -941,7 +952,13 @@ static int pw_backend_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg) {
     pw->portal.pw_fd = -1;
     pw->broken = true;
     pthread_mutex_init(&pw->frame_lock, NULL);
-    pthread_cond_init(&pw->frame_cond, NULL);
+    /* Timed waits are deadlines on the monotonic clock, immune to wall-clock
+     * steps. */
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&pw->frame_cond, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
 
     pw->loop = pw_main_loop_new(NULL);
     if (!pw->loop) goto fail;
@@ -1088,28 +1105,29 @@ static int pw_start(MdCaptureCtx *ctx) {
     return 0;
 }
 
-static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
+static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     PipewireState *pw = ctx->backend_data;
-    if (!pw) return -1;
+    if (!pw) return MD_CAPTURE_ERROR;
 
+    uint64_t until = monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&pw->frame_lock);
 
     /* Damage-driven capture can legitimately remain idle indefinitely.
-     * A connected paused/streaming stream is not broken merely for silence. */
-    for (int waited = 0; !pw->frame_ready && !pw->broken && !pw->stopping && waited < 10; waited++) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100000000L; /* 100ms timeout */
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_nsec -= 1000000000L;
-            ts.tv_sec += 1;
-        }
+     * A connected paused/streaming stream is not broken merely for silence;
+     * an unconnected one is, once the connect deadline passes, so that
+     * deadline also bounds the wait. */
+    while (!pw->frame_ready && !pw->broken && !pw->stopping) {
+        uint64_t limit = until;
+        if (!pw->connected && pw->started_ns + PW_CONNECT_DEADLINE_NS < limit)
+            limit = pw->started_ns + PW_CONNECT_DEADLINE_NS;
+        if (monotonic_ns() >= limit) break;
+        struct timespec ts = monotonic_timespec(limit);
         pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &ts);
     }
 
     if (pw->stopping || !pw->frame_ready) {
         bool broken = pw->stopping || pw->broken || (!pw->connected &&
-            monotonic_ns() - pw->started_ns > 5000000000ULL);
+            monotonic_ns() - pw->started_ns >= PW_CONNECT_DEADLINE_NS);
         pthread_mutex_unlock(&pw->frame_lock);
         return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
@@ -1119,6 +1137,26 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out) {
     pw->frame_ready = false;
     pthread_mutex_unlock(&pw->frame_lock);
     return 0;
+}
+
+/* Format negotiation (on_param_changed) publishes the size asynchronously. */
+static int pw_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
+                        uint32_t *width, uint32_t *height) {
+    PipewireState *pw = ctx->backend_data;
+    if (!pw) return -1;
+
+    struct timespec deadline = monotonic_timespec(monotonic_ns() +
+                                                  (uint64_t)timeout_ms * 1000000ULL);
+    pthread_mutex_lock(&pw->frame_lock);
+    while ((!ctx->width || !ctx->height) && !pw->broken && !pw->stopping &&
+           pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &deadline) != ETIMEDOUT) {}
+    int rc = ctx->width && ctx->height && !pw->broken && !pw->stopping ? 0 : -1;
+    if (rc == 0) {
+        *width  = ctx->width;
+        *height = ctx->height;
+    }
+    pthread_mutex_unlock(&pw->frame_lock);
+    return rc;
 }
 
 static void pw_release_frame(MdCaptureCtx *ctx, MdFrame *frame) {
@@ -1215,6 +1253,7 @@ static const MdCaptureBackend pipewire_backend = {
     .stop          = pw_stop,
     .destroy       = pw_destroy,
     .forget_authorization = pw_forget_authorization,
+    .wait_size     = pw_wait_size,
 };
 
 const MdCaptureBackend *md_capture_backend_create(void) {

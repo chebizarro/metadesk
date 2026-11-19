@@ -44,6 +44,9 @@ typedef struct {
     bool null_cpu_data;
     uint32_t width;
     uint32_t height;
+    uint32_t last_timeout_ms;
+    uint32_t last_size_timeout_ms;
+    int wait_size_calls;
 } MockState;
 
 static MockState g_mock;
@@ -51,9 +54,8 @@ static MockState g_mock;
 /* Static pixel buffer for mock frames */
 static uint8_t g_mock_pixels[640 * 480 * 4];
 
-static int mock_init(MdCaptureCtx *ctx, const MdCaptureConfig *cfg)
+static int mock_init(MdCaptureCtx *ctx)
 {
-    (void)cfg;
     MockState *ms = calloc(1, sizeof(MockState));
     if (!ms) return -1;
     ms->init_called = 1;
@@ -78,9 +80,10 @@ static int mock_start(MdCaptureCtx *ctx)
     return 0;
 }
 
-static int mock_get_frame(MdCaptureCtx *ctx, MdFrame *out)
+static int mock_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms)
 {
     MockState *ms = ctx->backend_data;
+    ms->last_timeout_ms = timeout_ms;
     ms->get_frame_count++;
     g_mock.get_frame_count++;
     if (ms->frame_result) return ms->frame_result;
@@ -130,14 +133,38 @@ static const MdCaptureBackend mock_backend = {
     .destroy       = mock_destroy,
 };
 
+/* Asynchronous-size backend: reports the size only once "negotiated". */
+static int mock_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
+                          uint32_t *width, uint32_t *height)
+{
+    MockState *ms = ctx->backend_data;
+    ms->wait_size_calls++;
+    ms->last_size_timeout_ms = timeout_ms;
+    if (!ms->active) return -1;
+    *width = ms->width;
+    *height = ms->height;
+    return 0;
+}
+
+static const MdCaptureBackend mock_async_size_backend = {
+    .init          = mock_init,
+    .start         = mock_start,
+    .get_frame     = mock_get_frame,
+    .release_frame = mock_release_frame,
+    .stop          = mock_stop,
+    .destroy       = mock_destroy,
+    .wait_size     = mock_wait_size,
+};
+
 /* ── Helper: create ctx using mock backend directly ──────────── */
 
-static MdCaptureCtx *create_mock_ctx(const MdCaptureConfig *cfg)
+static MdCaptureCtx *create_backend_ctx(const MdCaptureBackend *backend,
+                                        const MdCaptureConfig *cfg)
 {
     MdCaptureCtx *ctx = calloc(1, sizeof(MdCaptureCtx));
     if (!ctx) return NULL;
 
-    ctx->vtable = &mock_backend;
+    ctx->vtable = backend;
     if (cfg) {
         ctx->config = *cfg;
     } else {
@@ -145,11 +172,16 @@ static MdCaptureCtx *create_mock_ctx(const MdCaptureConfig *cfg)
         ctx->config.show_cursor = true;
     }
 
-    if (ctx->vtable->init(ctx, &ctx->config) != 0) {
+    if (ctx->vtable->init(ctx) != 0) {
         free(ctx);
         return NULL;
     }
     return ctx;
+}
+
+static MdCaptureCtx *create_mock_ctx(const MdCaptureConfig *cfg)
+{
+    return create_backend_ctx(&mock_backend, cfg);
 }
 
 /* ── Tests ───────────────────────────────────────────────────── */
@@ -158,10 +190,11 @@ static void test_null_safety(void)
 {
     /* All convenience functions should handle NULL without crashing */
     MD_CHECK(md_capture_start(NULL) == -1);
-    MD_CHECK(md_capture_get_frame(NULL, NULL) == -1);
+    MD_CHECK(md_capture_get_frame(NULL, NULL, 0) == -1);
     md_capture_release_frame(NULL, NULL);
     MD_CHECK(md_capture_is_active(NULL) == false);
     MD_CHECK(md_capture_get_size(NULL, NULL, NULL) == -1);
+    MD_CHECK(md_capture_wait_size(NULL, 10, NULL, NULL) == -1);
     md_capture_stop(NULL);
     md_capture_destroy(NULL); /* should not crash */
 
@@ -233,8 +266,33 @@ static void test_get_size_before_init(void)
     memset(&ctx, 0, sizeof(ctx));
     uint32_t w, h;
     MD_CHECK(md_capture_get_size(&ctx, &w, &h) == -1);
+    MD_CHECK(md_capture_wait_size(&ctx, 50, &w, &h) == -1);
 
     PASS("get_size before init (zero dimensions)");
+}
+
+static void test_wait_size_dispatch(void)
+{
+    /* Synchronous-size backend: ctx dimensions answer immediately. */
+    MdCaptureCtx *ctx = create_mock_ctx(NULL);
+    MD_CHECK(ctx != NULL);
+    uint32_t w = 0, h = 0;
+    MD_CHECK(md_capture_wait_size(ctx, 2000, &w, &h) == 0 && w == 640 && h == 480);
+    MD_CHECK(md_capture_wait_size(ctx, 2000, NULL, &h) == -1);
+    md_capture_destroy(ctx);
+
+    /* Asynchronous backend owns the wait; get_size is its zero-timeout poll. */
+    ctx = create_backend_ctx(&mock_async_size_backend, NULL);
+    MD_CHECK(ctx != NULL);
+    MockState *ms = ctx->backend_data;
+    w = h = 0;
+    MD_CHECK(md_capture_wait_size(ctx, 1234, &w, &h) == -1 && w == 0);
+    MD_CHECK(ms->wait_size_calls == 1 && ms->last_size_timeout_ms == 1234);
+    MD_CHECK(md_capture_start(ctx) == 0);
+    MD_CHECK(md_capture_get_size(ctx, &w, &h) == 0 && w == 640 && h == 480);
+    MD_CHECK(ms->wait_size_calls == 2 && ms->last_size_timeout_ms == 0);
+    md_capture_destroy(ctx);
+    PASS("wait_size: synchronous ctx size vs backend-owned negotiation wait");
 }
 
 static void test_get_frame_and_release(void)
@@ -246,7 +304,8 @@ static void test_get_frame_and_release(void)
     MD_CHECK(md_capture_start(ctx) == 0);
 
     MdFrame frame;
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == 0);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 250) == 0);
+    MD_CHECK(((MockState *)ctx->backend_data)->last_timeout_ms == 250);
     MD_CHECK(frame.width == 640);
     MD_CHECK(frame.height == 480);
     MD_CHECK(frame.stride == 640 * 4);
@@ -260,7 +319,8 @@ static void test_get_frame_and_release(void)
     MD_CHECK(g_mock.release_count == 1);
 
     /* Second frame increments seq */
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == 0);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 0) == 0);
+    MD_CHECK(((MockState *)ctx->backend_data)->last_timeout_ms == 0);
     MD_CHECK(frame.seq == 2);
     MD_CHECK(g_mock.get_frame_count == 2);
 
@@ -326,10 +386,10 @@ static void test_invalid_cpu_frame(void)
     MD_CHECK(md_capture_start(ctx) == 0);
     MdFrame frame;
     ms->null_cpu_data = true;
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == MD_CAPTURE_ERROR);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_ERROR);
     MD_CHECK(ms->release_count == 1 && frame.data == NULL && frame.data_size == 0);
     ms->null_cpu_data = false;
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == 0 && frame.data != NULL);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == 0 && frame.data != NULL);
     md_capture_release_frame(ctx, &frame);
     MD_CHECK(ms->release_count == 2);
     md_capture_destroy(ctx);
@@ -387,10 +447,10 @@ static void test_capture_policy(void)
     MD_CHECK(md_capture_start(ctx) == 0);
     MdFrame frame;
     ms->frame_result = MD_CAPTURE_IDLE;
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == MD_CAPTURE_IDLE);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_IDLE);
     MD_CHECK(md_capture_is_active(ctx));
     ms->frame_result = MD_CAPTURE_ERROR;
-    MD_CHECK(md_capture_get_frame(ctx, &frame) == MD_CAPTURE_ERROR);
+    MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_ERROR);
     md_capture_destroy(ctx);
     PASS("fail-closed start, idle vs error, unattended policy");
 }
@@ -572,7 +632,30 @@ static void mock_portal(int ready, int mode) {
             dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &request, DBUS_TYPE_INVALID);
             dbus_connection_send(bus, reply, NULL);
             dbus_message_unref(reply);
-            if (mode == 2 && seq == 2) { /* Start request never responds. */
+            if ((mode == 2 || mode == 5) && seq == 2) { /* Start never responds. */
+                /* Mode 5: steady unrelated Response chatter, from another
+                 * connection, for longer than the consent budget. The portal
+                 * itself stays responsive, so elapsed time measures only the
+                 * client's wait: a deadline neither expires early per message
+                 * (iteration counting) nor stretches past its budget. */
+                if (mode == 5 && fork() == 0) {
+                    DBusConnection *other_bus = dbus_bus_get_private(DBUS_BUS_SESSION, NULL);
+                    for (int i = 0; other_bus && i < 300; i++) {
+                        char other[600];
+                        snprintf(other, sizeof(other), "%s_other%d", path, i);
+                        DBusMessage *noise = dbus_message_new_signal(other,
+                            "org.freedesktop.portal.Request", "Response");
+                        dbus_message_set_destination(noise, source);
+                        dbus_uint32_t code = 0;
+                        dbus_message_append_args(noise, DBUS_TYPE_UINT32, &code, DBUS_TYPE_INVALID);
+                        dbus_connection_send(other_bus, noise, NULL);
+                        dbus_message_unref(noise);
+                        dbus_connection_flush(other_bus);
+                        const struct timespec pace = {.tv_nsec = 2000000}; /* producer pacing */
+                        nanosleep(&pace, NULL);
+                    }
+                    _exit(0);
+                }
                 dbus_message_unref(call);
                 dbus_connection_flush(bus);
                 continue;
@@ -618,7 +701,7 @@ static void test_portal_responses(void) {
     old = getenv("XDG_STATE_HOME");
     char *saved_state = old ? strdup(old) : NULL;
     setenv("XDG_STATE_HOME", state, 1);
-    for (int mode = 0; mode < 5; mode++) {
+    for (int mode = 0; mode < 6; mode++) {
         int output[2], ready[2];
         MD_CHECK(pipe(output) == 0 && pipe(ready) == 0);
         pid_t daemon = fork();
@@ -650,9 +733,9 @@ static void test_portal_responses(void) {
         MD_CHECK(md_capture_start(ctx) == -1);
         double elapsed = test_now() - start;
         MD_CHECK(elapsed < 1.5);
-        if (mode == 2) MD_CHECK(elapsed >= .4);
+        if (mode == 2 || mode == 5) MD_CHECK(elapsed >= .4);
         MdFrame frame;
-        MD_CHECK(md_capture_get_frame(ctx, &frame) == MD_CAPTURE_ERROR);
+        MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_ERROR);
         md_capture_destroy(ctx);
         if (mode == 4) {
             char token[16];
@@ -666,8 +749,9 @@ static void test_portal_responses(void) {
         ssize_t n = read(ready[0], events, sizeof(events)-1);
         MD_CHECK(n > 0);
         close(ready[0]);
-        const char *expected = mode == 0 ? "01X" : mode == 3 ? "012X" : mode == 4 ? "0X" : mode == 2 ? "012" : "0";
-        MD_CHECK(strcmp(events, expected) == 0 || (mode == 2 && !strcmp(events, "012X")));
+        bool start_stall = mode == 2 || mode == 5;
+        const char *expected = mode == 0 ? "01X" : mode == 3 ? "012X" : mode == 4 ? "0X" : start_stall ? "012" : "0";
+        MD_CHECK(strcmp(events, expected) == 0 || (start_stall && !strcmp(events, "012X")));
     }
     char leaf[512];
     snprintf(leaf, sizeof(leaf), "%s/metadesk", state);
@@ -676,7 +760,7 @@ static void test_portal_responses(void) {
     else unsetenv("DBUS_SESSION_BUS_ADDRESS");
     if (saved_state) { setenv("XDG_STATE_HOME", saved_state, 1); free(saved_state); }
     else unsetenv("XDG_STATE_HOME");
-    PASS("real backend: denial, malformed response/streams, bounded Start, corrupt UTF-8 retained");
+    PASS("real backend: denial, malformed response/streams, bounded Start (quiet and chatty bus), corrupt UTF-8 retained");
 }
 
 static void test_portal_required(void)
@@ -691,8 +775,14 @@ static void test_portal_required(void)
     MD_CHECK(ctx != NULL);
     for (int i = 0; i < 3; i++) {
         MD_CHECK(md_capture_start(ctx) == -1);
+        /* A broken stream answers promptly instead of waiting out a long
+         * timeout; there is no size to wait for either. */
         MdFrame frame;
-        MD_CHECK(md_capture_get_frame(ctx, &frame) == MD_CAPTURE_ERROR);
+        uint32_t w = 0, h = 0;
+        double start = test_now();
+        MD_CHECK(md_capture_get_frame(ctx, &frame, 5000) == MD_CAPTURE_ERROR);
+        MD_CHECK(md_capture_wait_size(ctx, 5000, &w, &h) == -1 && w == 0 && h == 0);
+        MD_CHECK(test_now() - start < 1.0);
         md_capture_stop(ctx);
     }
     md_capture_destroy(ctx);
@@ -713,6 +803,7 @@ int main(void)
     test_is_active();
     test_get_size();
     test_get_size_before_init();
+    test_wait_size_dispatch();
     test_get_frame_and_release();
     test_config_passthrough();
     test_default_config();

@@ -55,7 +55,8 @@ typedef enum {
 /* ── Backend vtable (spec §2.3.3) ────────────────────────────── */
 
 typedef struct MdInputBackend {
-    int   (*init)(MdInputCtx *ctx, const MdInputConfig *cfg);
+    /* ctx->config is populated (dimensions already validated) before init. */
+    int   (*init)(MdInputCtx *ctx);
     int   (*mouse_move)(MdInputCtx *ctx, int x, int y);
     int   (*mouse_button)(MdInputCtx *ctx, int button, int pressed);
     int   (*mouse_scroll)(MdInputCtx *ctx, int dx, int dy);
@@ -140,6 +141,18 @@ void md_input_destroy(MdInput *inp);
  * neutral keysym value suitable for passing to key_event().
  * Returns 0 if the name is not recognised. */
 uint32_t md_input_keysym_from_name(const char *name);
+
+/* Resolve a US-layout ASCII character (printable, tab, newline) to its
+ * keysym and whether Shift is required. O(1). Returns false otherwise. */
+bool md_input_ascii_key(char c, uint32_t *keysym, bool *shift);
+
+/* ── Event pacing ────────────────────────────────────────────── */
+
+/* One pacing policy for every backend: the gap between synthetic events
+ * (press/release, consecutive clicks, typed characters) so the target's
+ * event loop keeps up. Not a device-readiness wait. */
+#define MD_INPUT_EVENT_SETTLE_MS 5u
+void md_input_settle(void);
 
 #ifdef __cplusplus
 }
