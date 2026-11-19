@@ -59,6 +59,8 @@ a grant, and malformed or duplicate records deny.
   while every relay is disconnected or has sent CLOSED, the source denies
   everyone (401). An empty loaded list also denies. The host does not wait for
   history before serving; bearer and static-NIP-98 clients are unaffected.
+  Open SSE streams from this source are *held* meanwhile, not closed (see
+  [relay outages](#relay-outages-held-streams-md-554)).
 - **Live, never polled.** One REQ
   `{kinds:[30000], authors:[host], #d:["metadesk-allowlist"], limit:1}` is held
   open. A newer replaceable event the relay pushes takes effect on the **next
@@ -67,13 +69,16 @@ a grant, and malformed or duplicate records deny.
   event id. Reconnection and backoff are the existing bridge's (the nostrc pool);
   readiness drops to deny while history is being re-delivered.
 - **Open SSE streams** admitted by this source are rechecked on every
-  accepted list version and before every broadcast. A stream whose grant lost
-  `agent` is closed at once, with no further notifications; one whose visible
-  tool set changed gets `notifications/tools/list_changed` (see below).
+  accepted list version, every readiness transition and before every
+  broadcast. A stream whose grant lost `agent` is closed at once, with no
+  further notifications; one whose visible tool set changed gets
+  `notifications/tools/list_changed` (see below). While the list is not
+  known, the stream is held and gets nothing.
 - **Host role changes** (revocation of the binding) stop the bridge, after which
   this source denies.
 - Readiness and every accepted list version are logged to stderr, for example
-  `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent (1 also input)`.
+  `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent (1 also input)`
+  or `host[mcp]: host allowlist history unavailable; host-allowlist NIP-98 grants deny and their SSE streams are held until a relay delivers it`.
   The line is written after the SSE streams have been notified for that version.
 
 ## Per-principal tool capabilities (md-5km)
@@ -139,8 +144,10 @@ stream (`GET /mcp`) is told when its grant changes what it can see:
   re-published identical list, or `input` changes on a host with no action
   tools registered (`--no-input`). Static-npub, bearer and credential-less
   streams never get one: their tool set does not depend on the list.
-- **Revocation** (grant loses `agent`, the list becomes unavailable, or the
-  host role changes) closes the stream on the change itself.
+- **Revocation** (grant loses `agent`, or the host role changes) closes the
+  stream on the change itself. The list becoming *unavailable* is not a
+  revocation: the stream is held until the list is known again, then judged
+  against its last known grant (next section).
 - **No gaps.** A stream that becomes ready just after a change is re-checked
   as it becomes ready. The record is updated under the SSE lock, so a change
   notifies once however many wake-ups observe it.
@@ -156,6 +163,49 @@ every `tools/call` is still gated on the grant at that moment. A grant change
 between a client's last `tools/list` and its opening the SSE stream is not
 reported, so clients should list after the stream opens. Without the live
 list (static, bearer or open callers only), `listChanged` is not advertised.
+
+### Relay outages: held streams (md-554)
+
+Readiness drops whenever every relay is disconnected or has sent CLOSED. It
+also drops while *any* relay is re-delivering history after it (re)connects,
+until that relay's EOSE: a relay that is still connecting counts as pending.
+So every relay reconnect causes a short window, whether one relay or several
+are configured. In that window the source cannot say whether any live
+principal is still granted, so:
+
+- **Requests from live-list principals are refused** (401), as before. A new
+  `GET /mcp` from one is refused too.
+- **Their open SSE streams are held:** kept open, sent **nothing**. No
+  `list_changed` and no broadcast (`notifications/resources/updated`,
+  `notifications/message`, …) is written to them, and nothing is queued for
+  later. Static-npub, bearer and credential-less streams are unaffected and
+  keep receiving broadcasts.
+- **Re-evaluation is event-driven.** The bridge's next readiness transition to
+  loaded (EOSE after the reconnect, which the pool re-issues with `since` for
+  catch-up) wakes the same watcher as list versions. Each held stream is then
+  judged against the grant it last held while known:
+  - grant no longer includes `agent`: the stream is closed;
+  - visible tool set changed (for example `input` was removed while the relay
+    was away): exactly one `notifications/tools/list_changed`;
+  - otherwise: it resumes silently with the next broadcast.
+- **No timer, no grace period.** A hold lasts as long as the outage. Its only
+  bound is tied to an existing event: if the SSE client limit (`max_clients`,
+  default 4) is reached, a `GET /mcp` from a principal the live list did not
+  admit (static npub, bearer, open loopback) closes one held stream and takes
+  its slot. So a long outage cannot lock operator credentials out of
+  notifications, while held streams cost nothing else. A host role change
+  (the bridge stops) is a revocation, not an outage: held streams close.
+
+**The trade-off.** No data flows while authorization is unknown, which is the
+fail-closed rule applied to streams. The alternative (md-ht7's behaviour) was
+to close every live stream on every outage, so each single-relay reconnect
+churned every client. The cost of holding is that **notifications emitted
+during the outage are lost for held streams, not replayed**: a client that
+missed a `resources/updated` re-reads on the next one, or when it next lists or
+reads. More relays do not avoid the window: a relay that is down
+(disconnected or in backoff) does not hold readiness back while another has
+delivered EOSE, but one that is reconnecting does, until its EOSE. Most holds
+therefore last one handshake plus one history round trip.
 
 **Why static and bearer principals keep all capabilities.** They are
 deploy-time operator credentials: a 0600 token file, CLI flags, or a file the
@@ -275,6 +325,15 @@ restore), and needs no new install target or packaging.
     bearer stream; revocation closes the stream on the change; nothing after
     quiesce; `listChanged` advertised only while a feed is registered, and
     destroy unregisters;
+  - relay outages (md-554), with the same stand-in source answering
+    `MD_MCP_GRANT_UNKNOWN`: live streams stay open while a broadcast reaches
+    only the bearer stream; live POST and GET get 401, bearer does not. On
+    return with unchanged grants nothing is sent and the next frame is the
+    next broadcast, so the outage frame was withheld rather than queued. An
+    outage in which one principal loses `input` and the other loses `agent`
+    ends with exactly one `list_changed` and one close. At the SSE limit a
+    bearer newcomer takes a held stream's slot, and gets 503 while every
+    grant is known;
   - the live authorizer fails closed before it is ready;
   - grants and revocations apply on the next request;
   - invalid events never reach the authorizer;
@@ -306,7 +365,16 @@ restore), and needs no new install target or packaging.
     its live grant is `video`-only;
   - prompt exit on EOF;
   - the NIP-5F socket-signer path;
-  - exactly one allowlist-only REQ per host on the relay.
+  - relay outages (md-554), on the static-principal host with its single
+    relay: the test disconnects the relay and holds reconnects at the
+    WebSocket handshake. The live agent's stream is held, not closed, and its
+    requests get 401. The static principal's `notify` broadcast during the
+    outage never reaches it. On return with the same list it resumes with no
+    `list_changed`. When `input` was removed during the outage it gets exactly
+    one. When `agent` was revoked, the stream closes. The barriers are the
+    host's readiness and `loaded` lines;
+  - exactly one allowlist-only REQ per host connection on the relay. Each
+    reconnect re-issues the same filter with `since`.
 - `MCP server core` covers the new CLI rejections.
 - `MCP accessibility queries` (`tests/test_mcp.c`) drives the real tool set
   through a bridge with mock input. Per caller grant, it checks the listed
@@ -324,6 +392,10 @@ md-ah9.3 and md-ah9.14 close notes. The relay-backed path adds:
 - no new frame handling: EOSE, CLOSED, AUTH and OK stay in the unchanged core;
 - md-ht7: no new subscription or filter. `tools/list_changed` is driven by the
   same accepted-version wake-up, and repeat wake-ups are idempotent.
+- md-554: no new subscription, filter, timer or frame handling. Held streams
+  are released by the readiness wake-up that EOSE after the reconnect already
+  produces. "Unknown" is read under the same lock as the grant, so a stopped
+  bridge (a revocation) is never mistaken for an outage.
 
 Readiness and updates come from EOSE/CLOSED/connection boundaries and accepted
 events, delivered through a condition variable. The filter is tightly scoped:

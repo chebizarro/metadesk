@@ -1314,17 +1314,27 @@ static uint32_t entry_grant(const NostrList *list, const char *pk) {
     return members == 1 && grants == 1 ? caps : 0;
 }
 
-uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pk, uint32_t requested) {
-    if (!pk || strlen(pk) != 64 || strspn(pk, "0123456789abcdef") != 64 ||
-        !owns_host(n) || !operation_begin(n)) return 0;
-    pthread_mutex_lock(&n->allowlist_mu);
-    uint32_t grant = n->acl_state == MD_NOSTR_ACL_OPEN
-        ? MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT
-        : n->acl_state == MD_NOSTR_ACL_LOADED ? entry_grant(n->allowlist, pk) : 0;
-    pthread_mutex_unlock(&n->allowlist_mu);
-    if (is_stopped(n)) grant = 0;
-    operation_end(n);
+uint32_t md_nostr_granted_capabilities_known(MdNostr *n, const char *pk,
+                                            uint32_t requested, bool *known) {
+    bool settled = true;
+    uint32_t grant = 0;
+    if (pk && strlen(pk) == 64 && strspn(pk, "0123456789abcdef") == 64 &&
+        owns_host(n) && operation_begin(n)) {
+        pthread_mutex_lock(&n->allowlist_mu);
+        settled = n->acl_state == MD_NOSTR_ACL_OPEN || n->acl_state == MD_NOSTR_ACL_LOADED;
+        grant = n->acl_state == MD_NOSTR_ACL_OPEN
+            ? MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT
+            : n->acl_state == MD_NOSTR_ACL_LOADED ? entry_grant(n->allowlist, pk) : 0;
+        pthread_mutex_unlock(&n->allowlist_mu);
+        if (is_stopped(n)) { grant = 0; settled = true; }
+        operation_end(n);
+    }
+    if (known) *known = settled;
     return requested & grant;
+}
+
+uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pk, uint32_t requested) {
+    return md_nostr_granted_capabilities_known(n, pk, requested, NULL);
 }
 
 

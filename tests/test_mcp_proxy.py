@@ -16,11 +16,17 @@ advertises tools.listChanged; widening or narrowing a live principal's tool
 set sends exactly one notifications/tools/list_changed on its stream only (an
 unrelated live principal's stream gets nothing); a grant change that leaves
 the tool set alone sends nothing; revoking agent closes the stream at once.
+md-554: when the only relay drops (reconnects held at the handshake), the
+live agent's stream is held, not closed: its requests get 401 and a static
+principal's broadcast during the outage never reaches it. On reconnect + EOSE
+an unchanged grant resumes silently, a grant that lost input sends exactly one
+list_changed, and a grant that lost agent closes the stream.
 """
 import json
 import os
 from pathlib import Path
 import queue
+import socket
 import subprocess
 import sys
 import tempfile
@@ -175,6 +181,25 @@ def barrier(agent, rid, quiet=()):
         assert msg.get("method") == "notifications/message", (proc.name, msg)
 
 
+def drop_relay(relay):
+    """Disconnect every relay client and hold reconnects at the WebSocket
+    handshake until the test sets relay.handshake_gate (relay outage)."""
+    relay.handshake_gate.clear()
+    with relay.lock:
+        peers = list(relay.peers)
+        relay.peers.clear()  # publish() during the outage only stores
+    for peer in peers:
+        peer.request.shutdown(socket.SHUT_RDWR)
+
+
+def static_notify(static, rid):
+    """A static principal's broadcast: completes whether or not the held
+    live streams receive it."""
+    call(static, rid, "notify")
+    reply = json.loads(static.line())
+    assert reply.get("id") == rid and reply["result"]["content"][0]["text"] == "notified", reply
+
+
 def expect_401(proc, rid):
     reply = json.loads(proc.line())
     assert reply.get("id") == rid and "HTTP 401" in reply["error"]["message"], reply
@@ -201,6 +226,8 @@ def main():
         relay.RequestHandlerClass = GatedPeer
         relay.filters = []
         relay.history_seen, relay.history_release = threading.Event(), threading.Event()
+        relay.handshake_gate = threading.Event()
+        relay.handshake_gate.set()
         servers = [host_signer, client_signer, relay]
         threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
         for t in threads:
@@ -390,18 +417,82 @@ def main():
             static.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             assert tool_names(static, 2) == ["act", "echo", "notify"]
             expect_acted(static, 3)
+            print("PASS: static --allow-npub principal keeps action tools")
+
+            # 7. Relay outage with a single --relay (md-554). The live agent
+            # (agent,input) holds an SSE stream; the static principal above
+            # broadcasts. Each outage drops the relay and holds reconnects;
+            # the host's readiness line is the barrier that it has noticed.
+            publish(relay, sign(crypto, env, grants("v1:agent,input"), now + 8))
+            statp.expect_err("host allowlist updated (v2): 2 member(s), 1 with agent (1 also input)")
+            surl = f"http://[::1]:{sport}/mcp"
+            held = Proc([host, "mcp-proxy", "--key-file", keys["client"], surl], env, "held")
+            procs.append(held)
+            held.send(INIT)
+            assert json.loads(held.line())["result"]["capabilities"]["tools"] == {"listChanged": True}
+            held.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            held.expect_err("notification stream open")
+            barrier(held, 40)
+
+            # 7a. Outage, then the same list back: no close, no list_changed,
+            # and the outage broadcast was withheld (the barrier's frame is
+            # the stream's next line).
+            drop_relay(relay)
+            statp.expect_err("host allowlist history")
+            static_notify(static, 41)
+            call(held, 42, "echo", {"text": "during outage"})
+            expect_401(held, 42)
+            relay.handshake_gate.set()
+            statp.expect_err("host allowlist loaded (v2): 2 member(s), 1 with agent (1 also input)")
+            barrier(held, 43)
+            assert not any("notification stream ended" in line for line in held.log), held.log
+            expect_acted(held, 44)
+            print("PASS: relay outage holds the live stream; same grant resumes silently")
+
+            # 7b. Outage during which input is removed: exactly one
+            # list_changed on return (and no outage broadcast before it).
+            drop_relay(relay)
+            statp.expect_err("host allowlist history")
+            static_notify(static, 45)
+            publish(relay, sign(crypto, env, grants("v1:agent"), now + 9))
+            relay.handshake_gate.set()
+            statp.expect_err("host allowlist loaded (v3): 2 member(s), 1 with agent (0 also input)")
+            expect_list_changed(held)
+            barrier(held, 46)
+            assert not any("notification stream ended" in line for line in held.log), held.log
+            expect_refused(held, 47, "act")
+            print("PASS: input removed during an outage: exactly one list_changed on return")
+
+            # 7c. Outage during which agent is revoked: closed on return.
+            drop_relay(relay)
+            statp.expect_err("host allowlist history")
+            publish(relay, sign(crypto, env, grants("v1:video"), now + 10))
+            relay.handshake_gate.set()
+            statp.expect_err("host allowlist loaded (v4): 2 member(s), 0 with agent")
+            held.expect_err("notification stream ended (HTTP 200)")
+            # The only server-side close of the run (reconnect 401s follow it).
+            assert sum("notification stream ended (HTTP 200)" in line for line in held.log) == 1, held.log
+            call(held, 48, "echo", {"text": "revoked"})
+            expect_401(held, 48)
+            rc, _ = held.close()
+            assert rc == 0, held.log
+            print("PASS: agent revoked during an outage: the stream closes on return")
+
             rc, _ = static.close()
             assert rc == 0, static.log
             rc, _ = statp.close()
             assert rc == 0, statp.log
-            print("PASS: static --allow-npub principal keeps action tools")
 
             # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap REQ;
-            # one REQ/EOSE per host fixture run.
+            # one REQ/EOSE per host fixture run plus one per reconnect (7a-c),
+            # which the pool re-fires with since= for catch-up.
             with relay.lock:
-                assert relay.filters and all(f == ALLOWLIST_FILTER for f in relay.filters), relay.filters
-                assert relay.reqs == relay.eoses == 2, (relay.reqs, relay.eoses)
-            print("Private relay: 1 REQ/EOSE per host (allowlist only), live EVENT pushes; throwaway keys")
+                assert relay.filters and all(
+                    {k: v for k, v in f.items() if k != "since"} == ALLOWLIST_FILTER
+                    for f in relay.filters), relay.filters
+                assert sum("since" not in f for f in relay.filters) == 2, relay.filters
+                assert relay.reqs == relay.eoses == 5, (relay.reqs, relay.eoses)
+            print("Private relay: 1 REQ/EOSE per host connection (allowlist only), live EVENT pushes; throwaway keys")
         finally:
             relay.history_release.set()
             for proc in procs:

@@ -244,6 +244,14 @@ bool md_nostr_is_allowed(MdNostr *n, const char *pubkey_hex);
 uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pubkey_hex,
                                       uint32_t requested);
 
+/* The same grant, plus whether it is the policy's answer: *known (if
+ * non-NULL) is set, under the same lock, to false while readiness is UNKNOWN
+ * or FAILED (the zero means "not known yet", not "denied") and to true for
+ * LOADED/OPEN, an invalid key or non-host bridge, and once stopped or revoked
+ * (every grant then denies for good). */
+uint32_t md_nostr_granted_capabilities_known(MdNostr *n, const char *pubkey_hex,
+                                            uint32_t requested, bool *known);
+
 /* Strict CLI vocabulary: none or a canonical subset of video,agent,input.
  * Returns -1 for unknown/duplicate/out-of-order/empty tokens; clears *out. */
 int md_nostr_parse_caps(const char *text, uint32_t *out);
