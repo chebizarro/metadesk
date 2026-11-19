@@ -681,7 +681,19 @@ allow_sw           = false            # fail hard if HW unavailable; fall back t
 profile            = high
 ```
 
-### 9.3 Latency Budget
+### 9.3 Mid-Stream Size Changes
+
+The captured size can change during a session. Causes include a display mode change or rotation, a watchdog capture restart, DXGI access-loss re-duplication, a display rearrangement or attach/detach, or a new `--capture-output all` layout. The wire protocol does not carry a frame size. The H.264 bitstream is the only source of the size:
+
+- **Host** (`src/host/capture_sync.c`): the capture thread reconciles every frame it receives. It compares the frame's size and the capture's published output rectangle (`md_capture_get_output_rect`) with what was last applied. Any difference does two things:
+  - The input context is retargeted with `md_input_set_bounds`. This happens under `client_mu`, the lock that packet dispatch and agent actions run under.
+  - If the even-rounded size changed (an odd edge is cropped, while input keeps the true size), the encoder is re-opened with `md_encoder_resize`. The encoder keeps the current bitrate. Packets still buffered at the old size are dropped, and the next frame is an IDR whose in-band SPS carries the new size.
+
+  The capture thread is the only thread that touches the encoder. A new client's keyframe and the adaptive bitrate are posted as requests, which the capture thread applies before its next frame, so a resize never races them. If the encoder cannot open at the new size, frames are dropped and a warning is logged. That size is not retried until the geometry changes again.
+- **Client**: no protocol change is needed. The decoder takes each frame's size from the SPS. The renderer re-creates its texture (and resizes its window) when the decoded size changes. Input is mapped from window coordinates onto the latest decoded frame size.
+- **Limitation**: input events carry only frame-relative points. Points the client sent before it decoded the new IDR, at most about one RTT, are interpreted against the new frame size.
+
+### 9.4 Latency Budget
 
 | Stage | Target | Notes |
 |---|---|---|

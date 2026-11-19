@@ -186,6 +186,8 @@ static int test_encode_frames(void) {
     MD_CHECK(g_encoded_count > 0);
     printf("OK (%d packets from 10 frames)\n", g_encoded_count);
 
+    free(g_last_encoded_data);
+    g_last_encoded_data = NULL;
     free(buf);
     md_encoder_destroy(enc);
     return 0;
@@ -222,6 +224,7 @@ static int test_roundtrip(void) {
         fill_solid(buf, TEST_W, TEST_H, stride,
                    (uint8_t)((i * 8) % 256), (uint8_t)((i * 4) % 256), 100);
 
+        free(g_last_encoded_data);
         g_last_encoded_data = NULL;
         g_last_encoded_size = 0;
 
