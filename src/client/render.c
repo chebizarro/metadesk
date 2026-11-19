@@ -3,7 +3,8 @@
  * SDL2 frame display for the human video client.
  *
  * Architecture:
- *   - One SDL_Window with SDL_RENDERER_ACCELERATED
+ *   - One SDL_Window; accelerated SDL renderer chosen by a probed plan
+ *     (md-rnc), software last
  *   - One SDL_Texture in STREAMING mode (RGBA, updated per frame)
  *   - vsync disabled for lowest latency (spec §9.1: <2ms present)
  *   - Texture is recreated on resolution change
@@ -82,6 +83,133 @@ static const char *const k_headless_video_drivers[] = {
 
 static bool g_display_open;
 
+/* ── Renderer selection (md-rnc) ─────────────────────────────── */
+
+size_t md_render_driver_plan(const MdRenderDriver *drivers, size_t n,
+                             const char *hint, MdRenderDriverUsable usable,
+                             void *userdata, int *order, size_t cap) {
+    size_t count = 0;
+    int hinted = -1;
+    for (size_t i = 0; hint && *hint && i < n; i++) {
+        if (drivers[i].name && SDL_strcasecmp(drivers[i].name, hint) == 0) {
+            hinted = (int)i;
+            break;
+        }
+    }
+    /* Pass 0: the hint; pass 1: accelerated drivers; pass 2: the rest. */
+    for (int pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i < n && count < cap; i++) {
+            bool in_pass = pass == 0 ? (int)i == hinted
+                         : (int)i != hinted && drivers[i].accelerated == (pass == 1);
+            if (!in_pass || !drivers[i].name)
+                continue;
+            if (usable && !usable(drivers[i].name, userdata))
+                continue;
+            order[count++] = (int)i;
+        }
+    }
+    return count;
+}
+
+const char *md_render_framebuffer_accel(const MdRenderDriver *drivers,
+                                        const int *order, size_t planned) {
+    for (size_t k = 0; k < planned; k++) {
+        if (drivers[order[k]].accelerated)
+            return drivers[order[k]].name;
+    }
+    return "0";
+}
+
+#if !defined(__APPLE__) && !defined(_WIN32) && !defined(__ANDROID__)
+/* True if `env` (an SDL library override, used alone when set) or else `a`
+ * or `b` loads; otherwise reports what could not be loaded. */
+static bool gl_library_loads(const char *env, const char *a, const char *b,
+                             char *missing, size_t missing_len) {
+    const char *forced = SDL_getenv(env);
+    const char *names[] = { forced && *forced ? forced : a, forced && *forced ? NULL : b };
+    for (size_t i = 0; i < 2; i++) {
+        void *lib = names[i] ? SDL_LoadObject(names[i]) : NULL;
+        if (lib) {
+            SDL_UnloadObject(lib);
+            return true;
+        }
+    }
+    SDL_ClearError();
+    snprintf(missing, missing_len, "%s%s%s", names[0], names[1] ? " or " : "",
+             names[1] ? names[1] : "");
+    return false;
+}
+#endif
+
+/* SDL 2.30's GL renderers on EGL video drivers (Wayland, KMSDRM) segfault
+ * instead of failing when a library they need is absent: "opengl" without
+ * libGL.so.1/libOpenGL.so.0 or without libEGL, "opengles2" without
+ * libGLESv2 or libEGL. A crash cannot be retried, so each GL driver's
+ * libraries are probed before it is tried. X11 creates GL contexts through
+ * GLX (GLES included) and reports load failures, so there only desktop GL is
+ * required of "opengl". Apple and Windows always ship their system GL. */
+static bool render_driver_usable(const char *name, void *userdata) {
+    int *skipped = userdata;
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+    (void)name;
+    (void)skipped;
+    return true;
+#else
+    bool gl = SDL_strcasecmp(name, "opengl") == 0;
+    bool gles2 = SDL_strcasecmp(name, "opengles2") == 0;
+    bool gles1 = SDL_strcasecmp(name, "opengles") == 0;
+    const char *video = SDL_GetCurrentVideoDriver();
+    bool x11 = video && SDL_strcasecmp(video, "x11") == 0;
+    if (!gl && (x11 || (!gles2 && !gles1)))
+        return true;
+    char missing[256] = "";
+    bool ok = (gl ? gl_library_loads("SDL_VIDEO_GL_DRIVER", "libGL.so.1", "libOpenGL.so.0",
+                                     missing, sizeof(missing))
+                  : gl_library_loads("SDL_VIDEO_GL_DRIVER",
+                                     gles2 ? "libGLESv2.so.2" : "libGLESv1_CM.so.1", NULL,
+                                     missing, sizeof(missing)))
+           && (x11 || gl_library_loads("SDL_VIDEO_EGL_DRIVER", "libEGL.so.1", NULL,
+                                       missing, sizeof(missing)));
+    if (!ok) {
+        fprintf(stderr, "render: skipping SDL renderer '%s': cannot load %s\n", name, missing);
+        (*skipped)++;
+    }
+    return ok;
+#endif
+}
+
+#define MD_MAX_RENDER_DRIVERS 16
+
+static SDL_Renderer *create_sdl_renderer(SDL_Window *window) {
+    MdRenderDriver drivers[MD_MAX_RENDER_DRIVERS];
+    SDL_RendererInfo info;
+    int n = SDL_GetNumRenderDrivers();
+    size_t count = 0;
+    for (int i = 0; i < n && count < MD_MAX_RENDER_DRIVERS; i++, count++) {
+        bool ok = SDL_GetRenderDriverInfo(i, &info) == 0;
+        drivers[count].name = ok ? info.name : NULL;  /* static driver strings */
+        drivers[count].accelerated = ok && (info.flags & SDL_RENDERER_ACCELERATED);
+    }
+    int order[MD_MAX_RENDER_DRIVERS], skipped = 0;
+    size_t planned = md_render_driver_plan(drivers, count, SDL_GetHint(SDL_HINT_RENDER_DRIVER),
+                                           render_driver_usable, &skipped, order, MD_MAX_RENDER_DRIVERS);
+    /* Normal priority: an operator's SDL_FRAMEBUFFER_ACCELERATION still wins. */
+    if (skipped)
+        SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION,
+                    md_render_framebuffer_accel(drivers, order, planned));
+    for (size_t k = 0; k < planned; k++) {
+        const MdRenderDriver *d = &drivers[order[k]];
+        SDL_Renderer *ren = SDL_CreateRenderer(window, order[k],
+            d->accelerated ? SDL_RENDERER_ACCELERATED : SDL_RENDERER_SOFTWARE);
+        if (ren)
+            return ren;
+        const char *err = SDL_GetError();
+        fprintf(stderr, "render: SDL renderer '%s' failed: %s\n", d->name,
+                err && *err ? err : "no error reported");
+    }
+    return NULL;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 int md_renderer_open_display(void) {
@@ -131,17 +259,11 @@ MdRenderer *md_renderer_create(uint32_t width, uint32_t height, const char *titl
         return NULL;
     }
 
-    /* Create accelerated renderer, vsync disabled for low latency.
-     * SDL_RENDERER_PRESENTVSYNC is intentionally NOT set (spec §9.1). */
-    r->sdl_renderer = SDL_CreateRenderer(r->window, -1,
-                                          SDL_RENDERER_ACCELERATED);
+    /* vsync disabled for low latency: SDL_RENDERER_PRESENTVSYNC is
+     * intentionally NOT set (spec §9.1). */
+    r->sdl_renderer = create_sdl_renderer(r->window);
     if (!r->sdl_renderer) {
-        /* Fall back to software renderer */
-        r->sdl_renderer = SDL_CreateRenderer(r->window, -1,
-                                              SDL_RENDERER_SOFTWARE);
-    }
-    if (!r->sdl_renderer) {
-        fprintf(stderr, "render: SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        fprintf(stderr, "render: SDL_CreateRenderer failed: no SDL renderer could be created\n");
         SDL_DestroyWindow(r->window);
         free(r);
         return NULL;
