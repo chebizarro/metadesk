@@ -12,8 +12,15 @@
  * locally (ping_send_ms) and only one ping is tracked in flight; on
  * pong receipt RTT = now - ping_send_ms, fed into an EMA. The pong's
  * own header timestamp is not used (no cross-peer echo protocol).
+ *
+ * Threading: one sender and one receiver may use a stream concurrently (the
+ * host sends video from its capture thread while the main thread receives).
+ * The fields both directions touch — connected and the traffic counters — are
+ * atomics (md-9sa6); everything else belongs to one side or to the caller's
+ * lock.
  */
 #include "stream.h"
+#include "md_time.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -25,7 +32,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
-#include <time.h>
+#include <stdatomic.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,9 +49,15 @@
 
 /* ── Structures ──────────────────────────────────────────────── */
 
+/* Relaxed atomics: each is a standalone flag or counter that publishes no
+ * other data, so only the data race needs removing, not ordering added. */
+#define RLX_LOAD(field) atomic_load_explicit(&(field), memory_order_relaxed)
+#define RLX_STORE(field, v) atomic_store_explicit(&(field), (v), memory_order_relaxed)
+#define RLX_ADD(field, v) atomic_fetch_add_explicit(&(field), (v), memory_order_relaxed)
+
 struct MdStream {
     int          fd;
-    bool         connected;
+    atomic_bool  connected;      /* cleared by whichever direction fails */
     bool         session_bound;
     uint32_t     granted_caps;
     uint32_t     send_seq;       /* monotonic sequence for sent packets    */
@@ -57,11 +70,11 @@ struct MdStream {
     uint32_t     last_rtt_ms;
     uint32_t     avg_rtt_ms;     /* exponential moving average (alpha=1/8) */
 
-    /* Counters */
-    uint64_t     bytes_sent;
-    uint64_t     bytes_recv;
-    uint32_t     packets_sent;
-    uint32_t     packets_recv;
+    /* Counters: each written by one direction, read by md_stream_get_stats */
+    _Atomic uint64_t bytes_sent;
+    _Atomic uint64_t bytes_recv;
+    _Atomic uint32_t packets_sent;
+    _Atomic uint32_t packets_recv;
 };
 
 struct MdStreamServer {
@@ -73,9 +86,7 @@ struct MdStreamServer {
 /* ── Timestamp utility ───────────────────────────────────────── */
 
 uint32_t md_stream_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (uint32_t)md_now_ms();
 }
 
 /* ── Internal helpers ────────────────────────────────────────── */
@@ -230,7 +241,7 @@ static MdStream *stream_from_fd(int fd, SSL *ssl) {
     }
     s->fd = fd;
     s->ssl = ssl;
-    s->connected = true;
+    atomic_init(&s->connected, true);
     set_tcp_nodelay(fd);
 #ifdef SO_NOSIGPIPE
     int one = 1;
@@ -609,7 +620,7 @@ MdStream *md_stream_connect_fips(const char *npub, uint16_t port,
 
 int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,
                    const uint8_t *payload, uint32_t payload_len) {
-    if (!s || !s->connected)
+    if (!s || !RLX_LOAD(s->connected))
         return -1;
 
     /* Build header */
@@ -628,44 +639,44 @@ int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,
 
     /* Send header */
     if (write_exact(s, hdr_buf, MD_PACKET_HEADER_SIZE) < 0) {
-        s->connected = false;
+        RLX_STORE(s->connected, false);
         return -1;
     }
 
     /* Send payload */
     if (payload && payload_len > 0) {
         if (write_exact(s, payload, payload_len) < 0) {
-            s->connected = false;
+            RLX_STORE(s->connected, false);
             return -1;
         }
     }
 
-    s->bytes_sent += MD_PACKET_HEADER_SIZE + payload_len;
-    s->packets_sent++;
+    RLX_ADD(s->bytes_sent, (uint64_t)MD_PACKET_HEADER_SIZE + payload_len);
+    RLX_ADD(s->packets_sent, 1);
     return 0;
 }
 
 int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
                    uint8_t **payload_out, uint32_t timeout_ms) {
-    if (!s || !s->connected || !hdr)
+    if (!s || !RLX_LOAD(s->connected) || !hdr)
         return -1;
 
     /* Read header */
     uint8_t hdr_buf[MD_PACKET_HEADER_SIZE];
     int ret = read_exact(s, hdr_buf, MD_PACKET_HEADER_SIZE, timeout_ms);
     if (ret != 0) {
-        if (ret < 0) s->connected = false;
+        if (ret < 0) RLX_STORE(s->connected, false);
         return ret;  /* -1 = error, 1 = timeout */
     }
 
     if (md_packet_header_read(hdr, hdr_buf, sizeof(hdr_buf)) < 0) {
-        s->connected = false;
+        RLX_STORE(s->connected, false);
         return -1;
     }
 
     /* Sanity check payload size */
     if (hdr->payload_len > MD_STREAM_MAX_PAYLOAD) {
-        s->connected = false;
+        RLX_STORE(s->connected, false);
         return -1;
     }
 
@@ -677,14 +688,14 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
             /* The header is already consumed but payload_len bytes remain
              * unread; we cannot resync, so tear the connection down rather
              * than let the next recv read payload as a header. */
-            s->connected = false;
+            RLX_STORE(s->connected, false);
             return -1;
         }
 
         ret = read_exact(s, payload, hdr->payload_len, timeout_ms);
         if (ret != 0) {
             free(payload);
-            if (ret < 0) s->connected = false;
+            if (ret < 0) RLX_STORE(s->connected, false);
             return ret;
         }
     }
@@ -694,32 +705,31 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
     else
         free(payload);
 
-    s->bytes_recv += (size_t)MD_PACKET_HEADER_SIZE + hdr->payload_len;
-    s->packets_recv++;
+    RLX_ADD(s->bytes_recv, (uint64_t)MD_PACKET_HEADER_SIZE + hdr->payload_len);
+    RLX_ADD(s->packets_recv, 1);
     return 0;
 }
 
+/* Session binding deadlines share md_session_prepare_binding()'s clock. */
 static uint64_t stream_now_ms64(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    return (uint64_t)md_now_ms();
 }
 
 void md_stream_close(MdStream *s) {
     if (!s) return;
     s->session_bound = false;
     s->granted_caps = 0;
-    s->connected = false;
+    RLX_STORE(s->connected, false);
     if (s->fd >= 0) shutdown(s->fd, SHUT_RDWR);
 }
 
 bool md_stream_has_capability(const MdStream *s, uint32_t caps) {
-    return s && s->connected && s->session_bound &&
+    return s && RLX_LOAD(s->connected) && s->session_bound &&
         (s->granted_caps & caps) == caps;
 }
 
 int md_stream_accept_binding(MdStream *s, MdSession *session) {
-    if (!s || !s->connected || s->session_bound || !session ||
+    if (!s || !RLX_LOAD(s->connected) || s->session_bound || !session ||
         session->state != MD_SESSION_NEGOTIATING || !session->stream_token[0])
         goto reject;
     uint64_t deadline = stream_now_ms64() + MD_SESSION_BIND_TIMEOUT_MS;
@@ -790,10 +800,10 @@ void md_stream_get_stats(const MdStream *s, MdStreamStats *stats) {
     if (!s || !stats) return;
     stats->last_rtt_ms  = s->last_rtt_ms;
     stats->avg_rtt_ms   = s->avg_rtt_ms;
-    stats->bytes_sent   = s->bytes_sent;
-    stats->bytes_recv   = s->bytes_recv;
-    stats->packets_sent = s->packets_sent;
-    stats->packets_recv = s->packets_recv;
+    stats->bytes_sent   = RLX_LOAD(s->bytes_sent);
+    stats->bytes_recv   = RLX_LOAD(s->bytes_recv);
+    stats->packets_sent = RLX_LOAD(s->packets_sent);
+    stats->packets_recv = RLX_LOAD(s->packets_recv);
 }
 
 int md_stream_get_fd(const MdStream *s) {
@@ -801,7 +811,7 @@ int md_stream_get_fd(const MdStream *s) {
 }
 
 bool md_stream_is_connected(const MdStream *s) {
-    return s ? s->connected : false;
+    return s ? RLX_LOAD(s->connected) : false;
 }
 
 bool md_stream_is_tls(const MdStream *s) {

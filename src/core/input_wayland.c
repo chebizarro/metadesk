@@ -1,6 +1,7 @@
 /* Explicit, session-local wlroots virtual input. No ambient display or uinput. */
 #include "input.h"
 #include "log.h"
+#include "md_time.h"
 #define MD_LOG_TAG "input_wayland"
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
@@ -39,11 +40,6 @@ typedef struct {
     bool shifted[KEY_MAX + 1], buttons[3], removed;
 } WaylandInput;
 
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 static void sync_done(void *data, struct wl_callback *cb, uint32_t serial) {
     (void)cb; (void)serial;
     *(bool *)data = true;
@@ -58,7 +54,7 @@ static int sync_display(WaylandInput *s) {
     if (!cb) return -1;
     wl_callback_add_listener(cb, &sync_listener, &done);
     int result = -1;
-    int64_t deadline = now_ms() + IO_TIMEOUT_MS;
+    int64_t deadline = md_now_ms() + IO_TIMEOUT_MS;
     while (!done) {
         if (wl_display_dispatch_pending(s->display) < 0) break;
         if (done) { result = 0; break; }
@@ -70,7 +66,7 @@ static int sync_display(WaylandInput *s) {
         }
         struct pollfd fd = { .fd = wl_display_get_fd(s->display),
             .events = POLLIN | (flushed < 0 ? POLLOUT : 0) };
-        int64_t remaining = deadline - now_ms();
+        int64_t remaining = deadline - md_now_ms();
         int rc = remaining > 0 ? poll(&fd, 1, (int)remaining) : 0;
         if (rc < 0 && errno == EINTR) {
             wl_display_cancel_read(s->display);
@@ -151,14 +147,14 @@ static void emit_key(WaylandInput *s, uint32_t code, uint32_t sym, bool shift, i
     /* Release the character with the same synthetic modifiers as its press.
      * Only then release Shift (and update explicitly held modifier keys). */
     if (!pressed)
-        zwp_virtual_keyboard_v1_key(s->keyboard, (uint32_t)now_ms(), code,
+        zwp_virtual_keyboard_v1_key(s->keyboard, (uint32_t)md_now_ms(), code,
                                     WL_KEYBOARD_KEY_STATE_RELEASED);
     s->held[code] = pressed ? sym : 0;
     s->shifted[code] = pressed && shift;
     xkb_state_update_key(s->state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
     send_modifiers(s);
     if (pressed)
-        zwp_virtual_keyboard_v1_key(s->keyboard, (uint32_t)now_ms(), code,
+        zwp_virtual_keyboard_v1_key(s->keyboard, (uint32_t)md_now_ms(), code,
                                     WL_KEYBOARD_KEY_STATE_PRESSED);
 }
 static const uint32_t button_codes[] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
@@ -171,7 +167,7 @@ static void release_all(WaylandInput *s) {
     if (s->pointer) {
         for (unsigned i = 0; i < 3; i++)
             if (s->buttons[i]) zwlr_virtual_pointer_v1_button(s->pointer,
-                (uint32_t)now_ms(), button_codes[i], WL_POINTER_BUTTON_STATE_RELEASED);
+                (uint32_t)md_now_ms(), button_codes[i], WL_POINTER_BUTTON_STATE_RELEASED);
         zwlr_virtual_pointer_v1_frame(s->pointer);
     }
 }
@@ -287,7 +283,7 @@ static int wayland_move(MdInputCtx *ctx, int x, int y) {
         uint32_t w = ctx->config.screen_width, h = ctx->config.screen_height;
         uint32_t px = x < 0 ? 0 : (uint32_t)x >= w ? w - 1 : (uint32_t)x;
         uint32_t py = y < 0 ? 0 : (uint32_t)y >= h ? h - 1 : (uint32_t)y;
-        zwlr_virtual_pointer_v1_motion_absolute(s->pointer, (uint32_t)now_ms(), px, py, w, h);
+        zwlr_virtual_pointer_v1_motion_absolute(s->pointer, (uint32_t)md_now_ms(), px, py, w, h);
         zwlr_virtual_pointer_v1_frame(s->pointer);
         rc = finish(ctx);
     }
@@ -301,7 +297,7 @@ static int wayland_button(MdInputCtx *ctx, int button, int pressed) {
     int rc = -1;
     if (ctx->ready) {
         s->buttons[button] = pressed;
-        zwlr_virtual_pointer_v1_button(s->pointer, (uint32_t)now_ms(), button_codes[button], pressed);
+        zwlr_virtual_pointer_v1_button(s->pointer, (uint32_t)md_now_ms(), button_codes[button], pressed);
         zwlr_virtual_pointer_v1_frame(s->pointer);
         rc = finish(ctx);
     }
@@ -318,9 +314,9 @@ static int wayland_scroll(MdInputCtx *ctx, int dx, int dy) {
         zwlr_virtual_pointer_v1_axis_source(s->pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
         /* HAL uses evdev wheel detents: positive right/up. Wayland's
          * vertical axis is positive down, so invert only Y at this boundary. */
-        if (dx) zwlr_virtual_pointer_v1_axis_discrete(s->pointer, (uint32_t)now_ms(),
+        if (dx) zwlr_virtual_pointer_v1_axis_discrete(s->pointer, (uint32_t)md_now_ms(),
             WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double((double)dx * 10), dx);
-        if (dy) zwlr_virtual_pointer_v1_axis_discrete(s->pointer, (uint32_t)now_ms(),
+        if (dy) zwlr_virtual_pointer_v1_axis_discrete(s->pointer, (uint32_t)md_now_ms(),
             WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double((double)-dy * 10), -dy);
         zwlr_virtual_pointer_v1_frame(s->pointer);
         rc = finish(ctx);

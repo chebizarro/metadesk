@@ -212,12 +212,11 @@ int md_capture_get_output_rect(const MdCaptureCtx *ctx, MdCaptureRect *rect);
 
 /* ── Frame clock ─────────────────────────────────────────────── */
 
-/* Now, in nanoseconds, on the clock MdFrame.timestamp_ns uses:
- * CLOCK_MONOTONIC on Linux and macOS (includes sleep), the
- * QueryPerformanceCounter on Windows. The origin is arbitrary; compare only
- * with other frame timestamps and this function. On macOS read the clock here
- * and not via clock_gettime(): libnsync, linked into libmetadesk, exports a
- * clock_gettime that ignores the clock id and returns wall time. */
+/* Now, in nanoseconds, on the clock MdFrame.timestamp_ns uses: metadesk's
+ * monotonic clock, md_monotonic_ns() (md_time.h) — CLOCK_MONOTONIC on Linux
+ * and macOS (includes sleep there), QueryPerformanceCounter on Windows. The
+ * origin is arbitrary; compare only with other frame timestamps and this
+ * function. */
 uint64_t md_capture_clock_ns(void);
 
 /* Map src_ts from a backend's source clock onto the frame clock, given src_now

@@ -9,6 +9,7 @@
  * coverage and testing serialization.
  */
 #include "a11y.h"
+#include "md_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,14 +71,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t start_ns = md_monotonic_ns();
 
     MdA11yNode *root = md_a11y_walk(ctx);
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double walk_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
-                     (end.tv_nsec - start.tv_nsec) / 1000000.0;
+    double walk_ms = (md_monotonic_ns() - start_ns) / 1e6;
 
     if (!root) {
         fprintf(stderr, "ERROR: failed to walk accessibility tree\n");

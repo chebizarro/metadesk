@@ -2405,20 +2405,13 @@ static void test_subscribe_refuses_second_owner(void)
 
 /* Optional live host-process gate (requires an accessible desktop):
  * test_mcp --host-lifecycle /path/to/metadesk-host */
-static int64_t host_test_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static cJSON *host_test_response(int fd)
 {
     char line[32768];
     size_t used = 0;
-    int64_t deadline = host_test_now_ms() + 5000;
+    int64_t deadline = md_now_ms() + 5000;
     while (used + 1 < sizeof(line)) {
-        int64_t left = deadline - host_test_now_ms();
+        int64_t left = deadline - md_now_ms();
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         if (left <= 0 || poll(&pfd, 1, (int)left) <= 0)
             return NULL;
@@ -2550,10 +2543,10 @@ static bool in_flight_sse_headers(int fd)
 {
     char headers[2048];
     size_t used = 0;
-    int64_t deadline = host_test_now_ms() + 5000;
+    int64_t deadline = md_now_ms() + 5000;
     while (used + 1 < sizeof(headers)) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int64_t left = deadline - host_test_now_ms();
+        int64_t left = deadline - md_now_ms();
         if (left <= 0 || poll(&pfd, 1, (int)left) <= 0 || read(fd, headers + used, 1) != 1)
             return false;
         headers[++used] = 0;
@@ -2639,7 +2632,7 @@ static void test_supervised_in_flight(bool desktop_loss)
         pfd.fd = entered[0];
         MD_CHECK(poll(&pfd, 1, 5000) > 0 &&
                  read(entered[0], &marker, 1) == 1 && marker == 'E');
-        int64_t started = host_test_now_ms();
+        int64_t started = md_now_ms();
         if (!desktop_loss) MD_CHECK(kill(pid, SIGTERM) == 0);
         /* SSE closure acknowledges that the real supervisor shut down HTTP
          * while the POST is still inside the held backend call. */
@@ -2648,7 +2641,7 @@ static void test_supervised_in_flight(bool desktop_loss)
         pfd.fd = done[0];
         MD_CHECK(poll(&pfd, 1, 0) == 0);
         MD_CHECK(write(release[1], "R", 1) == 1);
-        int64_t left = 5000 - (host_test_now_ms() - started);
+        int64_t left = 5000 - (md_now_ms() - started);
         int ready = left > 0 ? poll(&pfd, 1, (int)left) : 0;
         MD_CHECK(ready > 0);
         if (ready <= 0) kill(pid, SIGKILL);
@@ -2656,10 +2649,10 @@ static void test_supervised_in_flight(bool desktop_loss)
         int status = 0;
         MD_CHECK(waitpid(pid, &status, 0) == pid);
         MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == (desktop_loss ? 1 : 0));
-        MD_CHECK(host_test_now_ms() - started < 5000);
+        MD_CHECK(md_now_ms() - started < 5000);
         printf("  in-flight HTTP %s: %lld ms, cleanup status=%d\n",
                desktop_loss ? "desktop loss" : "SIGTERM",
-               (long long)(host_test_now_ms() - started), status);
+               (long long)(md_now_ms() - started), status);
         close(sse); close(post);
     }
     close(out[0]); close(entered[0]); close(release[1]); close(done[0]);
@@ -2754,13 +2747,13 @@ static void test_live_host_lifecycle(const char *host)
             const char partial[] = "{\"jsonrpc\":";
             MD_CHECK(write(in[1], partial, sizeof(partial) - 1) == sizeof(partial) - 1);
         }
-        int64_t started = host_test_now_ms();
+        int64_t started = md_now_ms();
         if (signals[i]) MD_CHECK(kill(pid, signals[i]) == 0);
         else { close(in[1]); in[1] = -1; }
         bool exited = false;
-        while (host_test_now_ms() - started < 5000) {
+        while (md_now_ms() - started < 5000) {
             struct pollfd pfd = { .fd = out[0], .events = POLLIN };
-            int left = 5000 - (int)(host_test_now_ms() - started);
+            int left = 5000 - (int)(md_now_ms() - started);
             if (left <= 0 || poll(&pfd, 1, left) <= 0) break;
             char discard[512];
             if (read(out[0], discard, sizeof(discard)) == 0) { exited = true; break; }
@@ -2772,7 +2765,7 @@ static void test_live_host_lifecycle(const char *host)
         MD_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         printf("  live host %s%s: %lld ms, status=%d\n",
                signals[i] == SIGINT ? "SIGINT" : signals[i] ? "SIGTERM" : "EOF",
-               i == 3 ? " (partial stdin)" : "", (long long)(host_test_now_ms() - started), status);
+               i == 3 ? " (partial stdin)" : "", (long long)(md_now_ms() - started), status);
         if (in[1] >= 0) close(in[1]);
         close(out[0]);
     }

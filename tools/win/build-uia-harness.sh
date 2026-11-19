@@ -24,12 +24,12 @@ LIBS="$(pkg-config --libs libcjson) -lole32 -loleaut32 -luiautomationcore -luuid
 
 echo "== toolchain"; $CC --version | head -1; $CXX --version | head -1
 echo "== compile core"
-for f in a11y a11y_query a11y_snapshot log; do
+for f in a11y a11y_query a11y_snapshot log md_time; do
   $CC $CFLAGS -c "$ROOT/src/core/$f.c" -o "$OUT/$f.o"
 done
 echo "== compile UIA backend (first ever)"
 $CXX $CXXFLAGS -c "$ROOT/src/core/a11y_uia.cpp" -o "$OUT/a11y_uia.o"
-ar rcs "$OUT/libmd_a11y.a" "$OUT"/a11y.o "$OUT"/a11y_query.o "$OUT"/a11y_snapshot.o "$OUT"/log.o "$OUT"/a11y_uia.o
+ar rcs "$OUT/libmd_a11y.a" "$OUT"/a11y.o "$OUT"/a11y_query.o "$OUT"/a11y_snapshot.o "$OUT"/log.o "$OUT"/md_time.o "$OUT"/a11y_uia.o
 echo "== link atspi_dump.exe"
 $CXX -o "$OUT/atspi_dump.exe" $CFLAGS -x c "$ROOT/tools/atspi_dump.c" -x none "$OUT/libmd_a11y.a" $LIBS
 echo "== link test_atspi.exe"

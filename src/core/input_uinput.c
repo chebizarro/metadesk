@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <time.h>
 #include "log.h"
+#include "md_time.h"
 #define MD_LOG_TAG "input_uinput"
 
 /* ── Backend-private state ───────────────────────────────────── */
@@ -64,12 +65,6 @@ static int syn(int fd) {
 /* Bound on waiting for udev to announce a new device; normally milliseconds. */
 #define UINPUT_UDEV_SETTLE_MS 1000
 
-static int64_t uinput_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 /* True for the udev "add" of the evdev node whose parent is input device
  * @sysname (e.g. event7 under input42) — what libinput consumers open. */
 static bool uinput_is_our_event_node(struct udev_device *dev, const char *sysname) {
@@ -110,17 +105,17 @@ static int uinput_dev_create(int fd, const char *label) {
     if (rc == 0 && mon &&
         ioctl(fd, UI_GET_SYSNAME(sizeof(sysname) - 1), sysname) >= 0) {
         struct pollfd pfd = { .fd = udev_monitor_get_fd(mon), .events = POLLIN };
-        int64_t deadline = uinput_now_ms() + UINPUT_UDEV_SETTLE_MS;
+        int64_t deadline = md_now_ms() + UINPUT_UDEV_SETTLE_MS;
         bool settled = false;
         while (!settled) {
-            int64_t left = deadline - uinput_now_ms();
+            int64_t left = deadline - md_now_ms();
             if (left <= 0) break;
             int n = poll(&pfd, 1, (int)left);
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;
             struct udev_device *dev;
             /* Unrelated input hotplug traffic must not outlast the deadline. */
-            while (!settled && uinput_now_ms() < deadline &&
+            while (!settled && md_now_ms() < deadline &&
                    (dev = udev_monitor_receive_device(mon)) != NULL) {
                 settled = uinput_is_our_event_node(dev, sysname);
                 udev_device_unref(dev);

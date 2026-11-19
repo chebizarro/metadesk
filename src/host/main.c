@@ -32,6 +32,7 @@
 #include "session_log.h"
 #include "host_mcp.h"
 #include "capture_sync.h"
+#include "md_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,17 +305,14 @@ static void *capture_thread_func(void *arg) {
 
         MdPixFmt fmt = capture_fmt_to_enc(frame.format);
 
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        int64_t start_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        uint64_t start_ns = md_monotonic_ns();
 
         int ret = md_encoder_submit(ctx->sync.encoder, frame.data,
                                     frame.stride, fmt,
                                     (int64_t)frame.seq,
                                     on_encoded, ctx);
 
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        int64_t elapsed_us = (ts.tv_sec * 1000000LL + ts.tv_nsec / 1000) - start_us;
+        int64_t elapsed_us = (int64_t)((md_monotonic_ns() - start_ns) / 1000u);
 
         if (ret == 0) {
             ctx->total_encode_us += elapsed_us;
@@ -331,12 +329,11 @@ static void *capture_thread_func(void *arg) {
  * in the listen backlog while the client's bounded ACK wait expires. */
 static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     if (!g_running || (owner && !md_account_binding_is_current(owner))) return -1;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
     MdSessionAccept acc;
+    /* Same clock as md_stream_accept_binding()'s deadline checks. */
     if (!ctx->pending_req.request_id[0] ||
         md_session_prepare_binding(ctx->session, &acc,
-        (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000) != 0)
+                                   (uint64_t)md_now_ms()) != 0)
         return -1;
     /* Correlate the answer with exactly the request it grants (md-6ns). */
     memcpy(acc.request_id, ctx->pending_req.request_id, sizeof(acc.request_id));

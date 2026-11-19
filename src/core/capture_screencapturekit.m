@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "log.h"
+#include "md_time.h"
 #define MD_LOG_TAG "capture_sck"
 
 /* ── Backend-private state ───────────────────────────────────── */
@@ -212,7 +213,7 @@ static int sck_init(MdCaptureCtx *ctx) {
 
     sck->ctx = ctx;
     pthread_mutex_init(&sck->frame_lock, NULL);
-    pthread_cond_init(&sck->frame_cond, NULL);
+    md_cond_init_monotonic(&sck->frame_cond);
 
     ctx->backend_data = sck;
     return 0;
@@ -409,19 +410,11 @@ static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     SCKState *sck = ctx->backend_data;
     if (!sck) return MD_CAPTURE_ERROR;
 
-    /* macOS has no pthread_condattr_setclock: wait relative to a monotonic
-     * deadline, recomputing the remainder after every wakeup. */
-    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) +
-                        (uint64_t)timeout_ms * 1000000ULL;
+    uint64_t deadline = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&sck->frame_lock);
-    while (!sck->frame_ready && ctx->active) {
-        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        if (now >= deadline) break;
-        uint64_t left = deadline - now;
-        struct timespec rel = { .tv_sec = (time_t)(left / 1000000000ULL),
-                                .tv_nsec = (long)(left % 1000000000ULL) };
-        pthread_cond_timedwait_relative_np(&sck->frame_cond, &sck->frame_lock, &rel);
-    }
+    while (!sck->frame_ready && ctx->active &&
+           md_cond_timedwait_until(&sck->frame_cond, &sck->frame_lock,
+                                   deadline) != ETIMEDOUT) {}
 
     if (!sck->frame_ready) {
         bool active = ctx->active;

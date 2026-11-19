@@ -181,6 +181,20 @@ dep_websockets = cc.find_library('websockets', required : true, dirs : _sys_lib_
 dep_ssl = cc.find_library('ssl', required : true, dirs : _sys_lib_dirs)
 dep_crypto = cc.find_library('crypto', required : true, dirs : _sys_lib_dirs)
 dep_nsync = cc.find_library('nsync', required : true, dirs : _sys_lib_dirs)
+if host_os == 'darwin'
+  # md-5aua: Homebrew libnsync exports a clock_gettime shim that returns
+  # gettimeofday() wall time for every clock id. ld64 binds each import to the
+  # first linked dylib exporting it, so name libSystem before nsync; then
+  # libmetadesk, and the static nostrc code inside it, get the real clocks
+  # (check: nm -m build/libmetadesk.dylib | grep clock_gettime).
+  # The driver's own trailing -lSystem then draws a duplicate-library warning.
+  _nsync_link_args = ['-lSystem']
+  if cc.has_link_argument('-Wl,-no_warn_duplicate_libraries')
+    _nsync_link_args += '-Wl,-no_warn_duplicate_libraries'
+  endif
+  dep_nsync = declare_dependency(link_args : _nsync_link_args,
+                                 dependencies : [dep_nsync])
+endif
 # Current nostrc names the artifact nostr-json and its pkg-config module
 # libnostr-json. Prefer the selected build tree, just as for libnostr above;
 # installed underscore-named dylibs may still require removed Homebrew ABIs.
@@ -580,6 +594,7 @@ endif
 core_sources = files(
   'src/core/log.c',
   'src/core/io_util.c',
+  'src/core/md_time.c',
   'src/core/agent.c',
   'src/core/action.c',
   'src/core/fips_addr.c',
@@ -827,6 +842,28 @@ test_stream = executable('test_stream',
   dependencies : [dep_metadesk],
 )
 test('TCP stream transport', test_stream)
+
+# md-5aua: one monotonic clock; on macOS it must not be libnsync's wall time.
+test_time = executable('test_time',
+  files('tests/test_time.c'),
+  dependencies : [dep_metadesk],
+)
+test('monotonic clock', test_time, timeout : 30)
+if host_os == 'darwin'
+  _clock_bins = [libmetadesk, metadesk_host, test_time]
+  if enable_client
+    _clock_bins += [metadesk_client]
+  endif
+  test('clock_gettime binds to libSystem', find_program('sh'),
+    args : ['-c', '''
+      nm -m "$1" | grep -q "_clock_gettime (from libSystem)" ||
+        { echo "$1: clock_gettime is not imported from libSystem"; exit 1; }
+      for f; do
+        if nm -m "$f" | grep "_clock_gettime" | grep -q "from libnsync"; then
+          echo "$f binds clock_gettime to libnsync's wall-time shim"; exit 1
+        fi
+      done''', 'sh'] + _clock_bins)
+endif
 
 test_input = executable('test_input',
   files('tests/test_input.c') + wayland_test_sources,
