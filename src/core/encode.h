@@ -92,10 +92,20 @@ int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata);
  * immediate decodable entry point instead of waiting for the next GOP. */
 void md_encoder_force_keyframe(MdEncoder *enc);
 
+/* Re-open the encoder at a new size, e.g. when the captured display changes
+ * resolution mid-stream. The same codec cascade as md_encoder_create runs
+ * with the current bitrate and fps. Width and height must be even and
+ * non-zero. Packets the old codec still buffered are discarded: they
+ * predate the change, and the next submitted frame is an IDR whose in-band
+ * SPS carries the new size, so decoders re-initialise from it. Returns 0
+ * (also for an unchanged size), or -1 with the encoder left as it was.
+ * Same threading rule as md_encoder_submit. */
+int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
+
 /* Query whether NVENC is being used (vs software fallback). */
 bool md_encoder_is_hw(const MdEncoder *enc);
 
-/* Get encoder dimensions (as negotiated at create time). */
+/* Get the current encoder dimensions (create time, or the last resize). */
 int md_encoder_get_size(const MdEncoder *enc, uint32_t *width, uint32_t *height);
 
 /* Bitrate bounds for dynamic adjustment */

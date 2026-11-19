@@ -31,6 +31,7 @@
 #include "bitrate_ctrl.h"
 #include "session_log.h"
 #include "host_mcp.h"
+#include "capture_sync.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +67,6 @@ static void install_signal_handlers(void) {
 /* ── State shared between capture callback and main loop ─────── */
 
 typedef struct {
-    MdEncoder    *encoder;
     MdStream     *client;
     pthread_mutex_t client_mu;  /* protects client pointer lifetime */
     MdAgent      *agent;
@@ -78,7 +78,9 @@ typedef struct {
     int64_t       total_encode_us;
     uint32_t      frames_encoded;
     uint32_t      frames_sent;
-    bool          frame_size_mismatch_warned;
+    /* Encoder + input bounds follow the capture; the capture thread owns
+     * the encoder, other threads go through its request calls. */
+    HostCaptureSync sync;
 
     /* Session log for agent monitoring (M2.4) */
     MdSessionLog *session_log;
@@ -292,25 +294,10 @@ static void *capture_thread_func(void *arg) {
             continue;
         }
 
-        if (!ctx->encoder || !has_client) {
-            md_capture_release_frame(cap, &frame);
-            continue;
-        }
-
-        /* The encoder converts enc_w x enc_h pixels using the frame's
-         * stride, so a frame at most one row/column larger (odd display
-         * edge rounded down) is a safe crop; anything else is dropped. */
-        uint32_t enc_w = 0, enc_h = 0;
-        if (md_encoder_get_size(ctx->encoder, &enc_w, &enc_h) == 0 &&
-            (frame.width < enc_w || frame.height < enc_h ||
-             frame.width - enc_w > 1 || frame.height - enc_h > 1)) {
-            if (!ctx->frame_size_mismatch_warned) {
-                fprintf(stderr,
-                        "host: WARNING: dropping capture frames sized %ux%u; "
-                        "encoder is configured for %ux%u\n",
-                        frame.width, frame.height, enc_w, enc_h);
-                ctx->frame_size_mismatch_warned = true;
-            }
+        /* Every frame reconciles the encoder size and input bounds with the
+         * capture, so a restart above, an access-loss re-duplication or a
+         * mode/layout change is picked up by the first frame it produces. */
+        if (!host_capture_sync_frame(&ctx->sync, cap, &frame) || !has_client) {
             md_capture_release_frame(cap, &frame);
             continue;
         }
@@ -321,7 +308,7 @@ static void *capture_thread_func(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
         int64_t start_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
 
-        int ret = md_encoder_submit(ctx->encoder, frame.data,
+        int ret = md_encoder_submit(ctx->sync.encoder, frame.data,
                                     frame.stride, fmt,
                                     (int64_t)frame.seq,
                                     on_encoded, ctx);
@@ -1272,7 +1259,7 @@ signaling_ready:
     MdInputConfig input_cfg = input_options;
     input_cfg.screen_width = display_width;
     input_cfg.screen_height = display_height;
-    MdCaptureRect output_rect;
+    MdCaptureRect output_rect = {0};
     if (md_capture_get_output_rect(capture, &output_rect) == 0) {
         input_cfg.output_x = output_rect.x;
         input_cfg.output_y = output_rect.y;
@@ -1307,9 +1294,12 @@ signaling_ready:
     MdAgent *agent = md_agent_create(&agent_cfg);
 
     /* Set persistent host context fields */
-    ctx.encoder = encoder;
     ctx.agent   = agent;
     ctx.input   = input;  /* raw human input injection for MD_PKT_INPUT */
+    /* Packet dispatch (and the agent's actions) run under client_mu, so the
+     * capture thread retargets input under it too. */
+    host_capture_sync_init(&ctx.sync, encoder, input, &ctx.client_mu,
+                           display_width, display_height, &output_rect);
 
     /* Capture thread starts only after encoder/input are ready. */
     if (capture) {
@@ -1375,12 +1365,10 @@ signaling_ready:
         ctx.frames_sent = 0;
         ctx.total_encode_us = 0;
         ctx.frames_encoded  = 0;
-        ctx.frame_size_mismatch_warned = false;
 
         /* The encoder is persistent across connections, so a new client joins
          * mid-GOP with no decodable entry point. Force an IDR for it. */
-        if (encoder)
-            md_encoder_force_keyframe(encoder);
+        host_capture_sync_request_keyframe(&ctx.sync);
 
         /* Send initial UI tree to new client */
         host_send_initial_tree(&ctx);
@@ -1442,7 +1430,8 @@ signaling_ready:
                         uint32_t new_br = md_bitrate_ctrl_update(
                             br_ctrl, st.avg_rtt_ms, now);
                         if (new_br != last_br) {
-                            md_encoder_set_bitrate(encoder, new_br);
+                            host_capture_sync_request_bitrate(&ctx.sync,
+                                                              new_br);
                             last_br = new_br;
                             printf("host: bitrate adjusted to %u bps "
                                    "(rtt_avg=%ums, action=%s)\n",
@@ -1484,8 +1473,7 @@ signaling_ready:
         br_ctrl = NULL;
 
         /* Restore original bitrate for next connection */
-        if (encoder)
-            md_encoder_set_bitrate(encoder, bitrate);
+        host_capture_sync_request_bitrate(&ctx.sync, bitrate);
 
         /* Log disconnection */
         if (session_log) {

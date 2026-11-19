@@ -30,9 +30,17 @@
 typedef struct {
     int      kbd_fd;
     int      mouse_fd;
-    uint32_t screen_w;
+    uint32_t screen_w;   /* ABS_X/ABS_Y range, fixed at device creation */
     uint32_t screen_h;
 } UinputState;
+
+/* The device's absolute range is fixed when it is created. After
+ * md_input_set_bounds() changes the frame size, scale frame points into that
+ * range: the compositor maps the range proportionally either way. */
+static int32_t uinput_abs(int v, uint32_t frame, uint32_t range) {
+    if (frame == 0 || frame == range) return v;
+    return (int32_t)((int64_t)v * range / frame);
+}
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -261,8 +269,10 @@ static int uinput_mouse_move(MdInputCtx *ctx, int x, int y) {
     UinputState *st = ctx->backend_data;
     if (!st || st->mouse_fd < 0) return -1;
 
-    if (emit(st->mouse_fd, EV_ABS, ABS_X, x) < 0 ||
-        emit(st->mouse_fd, EV_ABS, ABS_Y, y) < 0 ||
+    const int32_t ax = uinput_abs(x, ctx->config.screen_width, st->screen_w);
+    const int32_t ay = uinput_abs(y, ctx->config.screen_height, st->screen_h);
+    if (emit(st->mouse_fd, EV_ABS, ABS_X, ax) < 0 ||
+        emit(st->mouse_fd, EV_ABS, ABS_Y, ay) < 0 ||
         syn(st->mouse_fd) < 0)
         return -1;
     return 0;

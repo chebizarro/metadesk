@@ -268,6 +268,19 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
     return inp;
 }
 
+int md_input_set_bounds(MdInput *inp, const MdInputBounds *b) {
+    if (!inp || !b ||
+        !input_dimensions_are_valid(b->screen_width, b->screen_height))
+        return -1;
+    inp->config.screen_width  = b->screen_width;
+    inp->config.screen_height = b->screen_height;
+    inp->config.output_x      = b->output_x;
+    inp->config.output_y      = b->output_y;
+    inp->config.output_width  = b->output_width;
+    inp->config.output_height = b->output_height;
+    return 0;
+}
+
 int md_input_mouse_move(MdInput *inp, int x, int y) {
     if (!inp || !inp->vtable || !inp->vtable->mouse_move) return -1;
     return inp->vtable->mouse_move(inp, x, y);

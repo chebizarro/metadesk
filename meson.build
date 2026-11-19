@@ -665,7 +665,8 @@ endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
 host_sources = files('src/host/main.c', 'src/host/account_cli.c',
-  'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c')
+  'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
+  'src/host/capture_sync.c')
 host_includes = [core_inc]
 host_c_args = []
 
@@ -813,6 +814,14 @@ test_encode = executable('test_encode',
 )
 test('encode/decode round-trip', test_encode)
 
+# md-ezto/md-pvlj: encoder size + input bounds follow capture restarts.
+test_capture_sync = executable('test_capture_sync',
+  files('tests/test_capture_sync.c', 'src/host/capture_sync.c'),
+  include_directories : [core_inc, include_directories('src/host')],
+  dependencies : [dep_metadesk],
+)
+test('capture geometry sync', test_capture_sync, timeout : 60)
+
 test_stream = executable('test_stream',
   files('tests/test_stream.c'),
   dependencies : [dep_metadesk],
@@ -886,7 +895,8 @@ test_signer = executable('test_signer',
 test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
-  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c'),
+  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
+    'src/host/capture_sync.c'),
   dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
 test('session correlation retaining private relay', find_program('python3'),

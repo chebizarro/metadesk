@@ -142,6 +142,23 @@ int md_input_type_text(MdInput *inp, const char *text);
 struct MdAction;
 int md_input_execute_action(MdInput *inp, const struct MdAction *action);
 
+/* ── Frame geometry ────────────────────────────────────────────── */
+
+/* The MdInputConfig fields that follow the captured frame. */
+typedef struct {
+    uint32_t screen_width, screen_height;
+    int32_t  output_x, output_y;
+    uint32_t output_width, output_height;
+} MdInputBounds;
+
+/* Retarget an existing context at a new frame size and output rectangle,
+ * e.g. after a capture restart or display change, without recreating its
+ * virtual devices. Later frame-relative points use the new mapping. Returns
+ * -1 and changes nothing if the screen size is below the minimum.
+ * Not synchronized: the caller must serialize it with every other call on
+ * inp (the host holds the lock its packet dispatch runs under). */
+int md_input_set_bounds(MdInput *inp, const MdInputBounds *bounds);
+
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
 bool md_input_is_ready(const MdInput *inp);

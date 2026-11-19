@@ -801,6 +801,57 @@ static int test_action_global_coordinates(void) {
     return 0;
 }
 
+/* md-ezto/md-pvlj: a capture restart retargets a live context; frame points
+ * and agent actions then use the new frame size and output rectangle. */
+static int test_set_bounds(void) {
+    printf("  test_set_bounds... ");
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
+    inp.config = (MdInputConfig){ .screen_width = 1920, .screen_height = 1080,
+        .backend = "auto",
+        .output_x = 0, .output_y = 0, .output_width = 1920, .output_height = 1080 };
+
+    const MdInputBounds moved = { .screen_width = 2560, .screen_height = 1440,
+        .output_x = -2560, .output_y = -300,
+        .output_width = 1280, .output_height = 720 };
+    MD_CHECK(md_input_set_bounds(&inp, &moved) == 0);
+    MD_CHECK(inp.config.screen_width == 2560 && inp.config.screen_height == 1440);
+    MD_CHECK(inp.config.output_x == -2560 && inp.config.output_y == -300);
+    MD_CHECK(inp.config.output_width == 1280 && inp.config.output_height == 720);
+    MD_CHECK(inp.config.backend != NULL && strcmp(inp.config.backend, "auto") == 0);
+
+    double gx = 0, gy = 0;
+    md_input_map_to_output(&inp.config, 1280, 720, &gx, &gy);
+    MD_CHECK(gx == -2560 + 640 && gy == -300 + 360);
+
+    /* Actions invert the new mapping, and refuse the old output. */
+    MdAction action;
+    memset(&action, 0, sizeof(action));
+    action.type = MD_ACTION_CLICK;
+    action.region[0] = -2560 + 640;
+    action.region[1] = -300 + 360;
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.last_x == 1280 && data.last_y == 720);
+    action.region[0] = 100;
+    action.region[1] = 100;
+    MD_CHECK(md_input_execute_action(&inp, &action) == -1);
+
+    /* Too small or NULL: rejected, mapping unchanged. */
+    const MdInputBounds tiny = { .screen_width = 8, .screen_height = 8 };
+    MD_CHECK(md_input_set_bounds(&inp, &tiny) == -1);
+    MD_CHECK(md_input_set_bounds(&inp, NULL) == -1);
+    MD_CHECK(md_input_set_bounds(NULL, &moved) == -1);
+    MD_CHECK(inp.config.screen_width == 2560 && inp.config.output_width == 1280);
+
+    /* Clearing the rectangle restores the legacy (global) mapping. */
+    const MdInputBounds legacy = { .screen_width = 800, .screen_height = 600 };
+    MD_CHECK(md_input_set_bounds(&inp, &legacy) == 0);
+    md_input_map_to_output(&inp.config, 2500, 30, &gx, &gy);
+    MD_CHECK(gx == 2500 && gy == 30);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -829,6 +880,7 @@ int main(void) {
     failures += test_lifecycle_edges();
     failures += test_map_to_output();
     failures += test_action_global_coordinates();
+    failures += test_set_bounds();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     md_test_failures += failures;
