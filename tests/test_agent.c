@@ -560,18 +560,28 @@ static int test_missing_input_never_acknowledges(void) {
 static int test_format_aware_updates(void) {
     printf("  test_format_aware_updates... ");
     const MdA11yBackend backend = { .get_tree = agent_fake_tree };
-    MdStreamServer *server = NULL;
-    uint16_t port;
-    /* Stream servers do not expose the assigned port for a port-0 bind. */
-    for (port = 17820; port < 17884; port++) {
-        server = md_stream_server_create(NULL, port);
-        if (server) break;
-    }
+    MdStreamServer *server = md_stream_server_create(NULL, 0);
     MD_CHECK(server != NULL);
+    if (!server) return 0;
+    uint16_t port = md_stream_server_port(server);
+    MD_CHECK(port != 0);
+    if (!port) {
+        md_stream_server_destroy(server);
+        return 0;
+    }
     MdStream *client = md_stream_connect("127.0.0.1", port, 3000);
     MD_CHECK(client != NULL);
+    if (!client) {
+        md_stream_server_destroy(server);
+        return 0;
+    }
     MdStream *host = md_stream_server_accept(server, 3000);
     MD_CHECK(host != NULL);
+    if (!host) {
+        md_stream_destroy(client);
+        md_stream_server_destroy(server);
+        return 0;
+    }
 
     for (int compact = 0; compact <= 1; compact++) {
         int walks = 0;

@@ -14,20 +14,54 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
 #include "md_test.h"
 
-/* Use a high ephemeral port to avoid conflicts */
-#define TEST_PORT 17700
+/* A broken setup must not cascade into stream operations or thread joins. */
+#define REQUIRE(cond) do { \
+    int ok = !!(cond); \
+    MD_CHECK_MSG(ok, #cond); \
+    if (!ok) exit(md_test_report()); \
+} while (0)
 
 /* ── Test: server create and destroy ─────────────────────────── */
 
 static int test_server_lifecycle(void) {
     printf("  test_server_lifecycle... ");
 
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     md_stream_server_destroy(srv);
+    printf("OK\n");
+    return 0;
+}
+
+static int test_bind_addresses(void) {
+    printf("  test_bind_addresses... ");
+    const char *addresses[] = { "127.0.0.1", "::1", "::ffff:127.0.0.1" };
+    for (size_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); i++) {
+        MdStreamServer *srv = md_stream_server_create(addresses[i], 0);
+        REQUIRE(srv != NULL);
+        REQUIRE(md_stream_server_port(srv) != 0);
+        MdStream *client = md_stream_connect(addresses[i],
+                                             md_stream_server_port(srv), 3000);
+        REQUIRE(client != NULL);
+        MdStream *peer = md_stream_server_accept(srv, 3000);
+        REQUIRE(peer != NULL);
+        md_stream_destroy(peer);
+        md_stream_destroy(client);
+        md_stream_server_destroy(srv);
+    }
+    const char *invalid[] = { "not-an-address", "127.0.0.999", "::gg", "" };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        errno = 0;
+        MdStreamServer *srv = md_stream_server_create(invalid[i], 0);
+        MD_CHECK(srv == NULL);
+        MD_CHECK(errno == EINVAL);
+        md_stream_server_destroy(srv);
+    }
     printf("OK\n");
     return 0;
 }
@@ -51,23 +85,22 @@ static int test_connect_and_send(void) {
     printf("  test_connect_and_send... ");
 
     /* Start server */
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 1);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
-
-    /* Give server a moment to start accepting */
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
     /* Connect client */
-    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 1, 3000);
-    MD_CHECK(client != NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 3000);
+    REQUIRE(client != NULL);
     MD_CHECK(md_stream_is_connected(client));
 
     /* Wait for server to accept */
-    pthread_join(tid, NULL);
-    MD_CHECK(st.client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
     MD_CHECK(md_stream_is_connected(st.client));
 
     /* Client sends a video frame packet */
@@ -121,17 +154,18 @@ static int test_connect_and_send(void) {
 static int test_ping_pong(void) {
     printf("  test_ping_pong... ");
 
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 2);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
-    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 2, 3000);
-    MD_CHECK(client != NULL);
-    pthread_join(tid, NULL);
-    MD_CHECK(st.client != NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 3000);
+    REQUIRE(client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
 
     /* Client sends ping */
     int ret = md_stream_send_ping(client);
@@ -177,17 +211,18 @@ static int test_ping_pong(void) {
 static int test_empty_payload(void) {
     printf("  test_empty_payload... ");
 
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 3);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
-    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 3, 3000);
-    MD_CHECK(client != NULL);
-    pthread_join(tid, NULL);
-    MD_CHECK(st.client != NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 3000);
+    REQUIRE(client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
 
     /* Send packet with no payload */
     int ret = md_stream_send(client, MD_PKT_PING, 99, NULL, 0);
@@ -214,16 +249,19 @@ static int test_empty_payload(void) {
 static int test_recv_timeout(void) {
     printf("  test_recv_timeout... ");
 
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 4);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
-    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 4, 3000);
-    MD_CHECK(client != NULL);
-    pthread_join(tid, NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 3000);
+    REQUIRE(client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+
+    REQUIRE(st.client != NULL);
 
     /* Try to recv with a short timeout — should return 1 (timeout) */
     MdPacketHeader hdr;
@@ -246,22 +284,23 @@ static int test_tls_roundtrip(void) {
 
     /* Create TLS server with ephemeral self-signed cert */
     MdStreamTlsConfig tls_cfg = { .enabled = true };
-    MdStreamServer *srv = md_stream_server_create_tls(NULL, TEST_PORT + 10, &tls_cfg);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create_tls(NULL, 0, &tls_cfg);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
     /* TLS client (no peer verification for self-signed) */
     MdStreamTlsConfig client_tls = { .enabled = true, .verify_peer = false };
-    MdStream *client = md_stream_connect_tls("127.0.0.1", TEST_PORT + 10,
+    MdStream *client = md_stream_connect_tls("127.0.0.1", md_stream_server_port(srv),
                                              5000, &client_tls);
-    MD_CHECK(client != NULL);
+    REQUIRE(client != NULL);
     MD_CHECK(md_stream_is_tls(client));
 
-    pthread_join(tid, NULL);
-    MD_CHECK(st.client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
     MD_CHECK(md_stream_is_tls(st.client));
 
     /* Send a packet through TLS and verify */
@@ -293,19 +332,20 @@ static int test_tls_roundtrip(void) {
 static int test_plaintext_no_tls(void) {
     printf("  test_plaintext_no_tls... ");
 
-    MdStreamServer *srv = md_stream_server_create(NULL, TEST_PORT + 11);
-    MD_CHECK(srv != NULL);
+    MdStreamServer *srv = md_stream_server_create(NULL, 0);
+    REQUIRE(srv != NULL);
+    REQUIRE(md_stream_server_port(srv) != 0);
 
     ServerThread st = { .srv = srv };
     pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, &st);
+    REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
 
-    MdStream *client = md_stream_connect("127.0.0.1", TEST_PORT + 11, 5000);
-    MD_CHECK(client != NULL);
+    MdStream *client = md_stream_connect("127.0.0.1", md_stream_server_port(srv), 5000);
+    REQUIRE(client != NULL);
     MD_CHECK(!md_stream_is_tls(client));
 
-    pthread_join(tid, NULL);
-    MD_CHECK(st.client != NULL);
+    REQUIRE(pthread_join(tid, NULL) == 0);
+    REQUIRE(st.client != NULL);
     MD_CHECK(!md_stream_is_tls(st.client));
 
     md_stream_destroy(client);
@@ -326,6 +366,7 @@ int main(void) {
 
     int failures = 0;
     failures += test_server_lifecycle();
+    failures += test_bind_addresses();
     failures += test_connect_and_send();
     failures += test_ping_pong();
     failures += test_empty_payload();

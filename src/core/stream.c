@@ -349,8 +349,19 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
 
     if (bind_addr) {
         if (inet_pton(AF_INET6, bind_addr, &addr.sin6_addr) != 1) {
-            close(fd);
-            return NULL;
+            struct in_addr v4_addr;
+            if (inet_pton(AF_INET, bind_addr, &v4_addr) == 1) {
+                memset(&addr.sin6_addr, 0, sizeof(addr.sin6_addr));
+                addr.sin6_addr.s6_addr[10] = 0xff;
+                addr.sin6_addr.s6_addr[11] = 0xff;
+                memcpy(&addr.sin6_addr.s6_addr[12], &v4_addr, sizeof(v4_addr));
+            } else {
+                MD_LOG_E("invalid TCP bind address '%s': expected an IPv4 or IPv6 literal",
+                         bind_addr);
+                close(fd);
+                errno = EINVAL;
+                return NULL;
+            }
         }
     } else {
         addr.sin6_addr = in6addr_any;
