@@ -84,7 +84,8 @@ typedef struct {
 } MdCaptureConfig;
 
 /* Bounds of the captured output in the platform's global desktop space
- * (Windows: physical virtual-desktop pixels;
+ * (Windows: physical virtual-desktop pixels, in the output's desktop
+ * orientation like the frames, so a rotated output maps linearly;
  * macOS: CoreGraphics global display points, origin at the main display's
  * top-left). width == 0 means the backend has not published it. */
 typedef struct {

@@ -62,6 +62,20 @@
  * Display adapter with monochrome shapes, for one), DWM draws it into the
  * desktop image itself, so it is captured with or without show_cursor.
  *
+ * Rotation: Desktop Duplication delivers the desktop image in the output's
+ * native (unrotated) orientation, the same size as DXGI_OUTDUPL_DESC.ModeDesc,
+ * and reports DXGI_OUTDUPL_DESC.Rotation. For a rotated output the mapped
+ * copy is rotated into a CPU frame in desktop orientation (ROTATE90: the
+ * image turned 90 degrees clockwise, as in Microsoft's DXGIDesktopDuplication
+ * sample and libwebrtc), so frames, ctx->width/height and ctx->output_rect
+ * are all in desktop orientation and input maps onto them linearly. The
+ * pointer needs no transform: DXGI reports its position in desktop
+ * coordinates and its shape upright (the sample draws it unrotated at that
+ * position). Unrotated outputs keep the zero-copy path (the frame is the
+ * mapped staging texture). A desktop image whose size does not match the
+ * mode is handled like a mode change: duplication is lost and restart
+ * re-reads the mode.
+ *
  * Requires Windows 8+ for Desktop Duplication API.
  * The calling thread must be on the desktop that owns the display.
  */
@@ -111,8 +125,13 @@ struct DxgiState {
     DXGI_OUTPUT_DESC         output_desc; /* the duplicated output */
     RECT                     output_rect; /* its physical desktop rectangle */
     UINT                     output_index;
-    uint32_t                 width;
+    uint32_t                 width;       /* frame size, desktop orientation */
     uint32_t                 height;
+    uint32_t                 image_w;     /* desktop image (and staging) size, */
+    uint32_t                 image_h;     /* native orientation */
+    int                      turns;       /* clockwise quarter turns image -> frame */
+    uint8_t                 *rotated;     /* the frame when turns != 0 */
+    size_t                   rotated_cap;
 
     bool                     mapped;      /* staging is borrowed by the caller */
     bool                     delivered;   /* a frame since (re)duplicating */
@@ -137,6 +156,69 @@ static void safe_release(T *&p) {
 static uint64_t qpc_to_ns(const DxgiState *st, LONGLONG ticks) {
     const uint64_t hz = (uint64_t)st->qpc_hz.QuadPart, t = (uint64_t)ticks;
     return t / hz * 1000000000ull + t % hz * 1000000000ull / hz;
+}
+
+/* ── Rotation (pure) ────────────────────────────────────────────── */
+
+/* Clockwise quarter turns from the desktop image to desktop orientation. */
+static int rotation_turns(DXGI_MODE_ROTATION r) {
+    switch (r) {
+    case DXGI_MODE_ROTATION_ROTATE90:  return 1;
+    case DXGI_MODE_ROTATION_ROTATE180: return 2;
+    case DXGI_MODE_ROTATION_ROTATE270: return 3;
+    default:                           return 0; /* IDENTITY, UNSPECIFIED */
+    }
+}
+
+static void rotated_size(int turns, uint32_t w, uint32_t h, uint32_t *rw, uint32_t *rh) {
+    *rw = turns % 2 ? h : w;
+    *rh = turns % 2 ? w : h;
+}
+
+/* The image pixel shown at frame pixel (x, y) of a w x h image turned TURNS
+ * quarter turns clockwise. */
+template <int TURNS>
+static inline void rotation_source(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                   uint32_t *sx, uint32_t *sy) {
+    if constexpr (TURNS == 1)      { *sx = y;         *sy = h - 1 - x; }
+    else if constexpr (TURNS == 2) { *sx = w - 1 - x; *sy = h - 1 - y; }
+    else                           { *sx = w - 1 - y; *sy = x; }
+}
+
+template <int TURNS>
+static void rotate_tiles(const uint8_t *src, uint32_t src_stride, uint32_t w, uint32_t h,
+                         uint8_t *dst, uint32_t dst_stride) {
+    uint32_t fw, fh;
+    rotated_size(TURNS, w, h, &fw, &fh);
+    const uint32_t tile = 32; /* keeps the column-wise source reads in cache */
+    for (uint32_t ty = 0; ty < fh; ty += tile) {
+        const uint32_t ye = ty + tile < fh ? ty + tile : fh;
+        for (uint32_t tx = 0; tx < fw; tx += tile) {
+            const uint32_t xe = tx + tile < fw ? tx + tile : fw;
+            for (uint32_t y = ty; y < ye; y++) {
+                uint8_t *d = dst + (size_t)y * dst_stride;
+                for (uint32_t x = tx; x < xe; x++) {
+                    uint32_t sx, sy;
+                    rotation_source<TURNS>(x, y, w, h, &sx, &sy);
+                    memcpy(d + (size_t)x * 4, src + (size_t)sy * src_stride + (size_t)sx * 4, 4);
+                }
+            }
+        }
+    }
+}
+
+/* Copy a w x h BGRA image into dst turned `turns` quarter turns clockwise
+ * (dst is rotated_size(turns, w, h) pixels). */
+static void rotate_image(const uint8_t *src, uint32_t src_stride, uint32_t w, uint32_t h,
+                         int turns, uint8_t *dst, uint32_t dst_stride) {
+    switch (turns) {
+    case 1: rotate_tiles<1>(src, src_stride, w, h, dst, dst_stride); break;
+    case 2: rotate_tiles<2>(src, src_stride, w, h, dst, dst_stride); break;
+    case 3: rotate_tiles<3>(src, src_stride, w, h, dst, dst_stride); break;
+    default:
+        for (uint32_t y = 0; y < h; y++)
+            memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * src_stride, (size_t)w * 4);
+    }
 }
 
 /* ── Pointer compositing (pure: frame and shape buffers only) ── */
@@ -435,17 +517,38 @@ static void release_device(DxgiState *st) {
 
 static void free_state(DxgiState *st) {
     release_device(st);
+    free(st->rotated);
     free(st->pointer.shape);
     free(st->pointer.under);
     free(st);
+}
+
+/* Size the frame for a w x h desktop image shown with `rotation`, allocating
+ * the CPU frame a rotated output needs. */
+static HRESULT frame_configure(MdCaptureCtx *ctx, DxgiState *st, uint32_t w, uint32_t h,
+                               DXGI_MODE_ROTATION rotation) {
+    st->image_w = w;
+    st->image_h = h;
+    st->turns = rotation_turns(rotation);
+    rotated_size(st->turns, w, h, &st->width, &st->height);
+    const size_t need = st->turns ? (size_t)st->width * 4 * st->height : 0;
+    if (need > st->rotated_cap) {
+        auto *grown = (uint8_t *)realloc(st->rotated, need);
+        if (!grown) return E_OUTOFMEMORY;
+        st->rotated = grown;
+        st->rotated_cap = need;
+    }
+    ctx->width  = st->width;
+    ctx->height = st->height;
+    return S_OK;
 }
 
 /* Create a CPU-accessible staging texture matching the display size; the
  * pointer is composited into it, so it is writable when show_cursor is set. */
 static HRESULT create_staging_texture(const MdCaptureCtx *ctx, DxgiState *st) {
     D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width              = st->width;
-    desc.Height             = st->height;
+    desc.Width              = st->image_w;
+    desc.Height             = st->image_h;
     desc.MipLevels          = 1;
     desc.ArraySize          = 1;
     desc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -510,11 +613,18 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
 
     DXGI_OUTDUPL_DESC dupl_desc;
     st->duplication->GetDesc(&dupl_desc);
-    if (!st->staging || dupl_desc.ModeDesc.Width != st->width ||
-        dupl_desc.ModeDesc.Height != st->height) {
+    const DXGI_MODE_ROTATION rotation = dupl_desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED
+                                      ? dupl_desc.Rotation : st->output_desc.Rotation;
+    const bool resized = !st->staging || dupl_desc.ModeDesc.Width != st->image_w ||
+                         dupl_desc.ModeDesc.Height != st->image_h;
+    hr = frame_configure(ctx, st, dupl_desc.ModeDesc.Width, dupl_desc.ModeDesc.Height, rotation);
+    if (FAILED(hr)) {
+        MD_LOG_E("out of memory for the rotated frame");
+        safe_release(st->duplication);
+        return hr;
+    }
+    if (resized) {
         safe_release(st->staging);
-        st->width  = dupl_desc.ModeDesc.Width;
-        st->height = dupl_desc.ModeDesc.Height;
         hr = create_staging_texture(ctx, st);
         if (FAILED(hr)) {
             MD_LOG_E("failed to create staging texture: 0x%08lx", hr);
@@ -525,8 +635,8 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
     char name[128];
     output_name(st->output_desc, name, (int)sizeof(name));
     const RECT &r = st->output_rect;
-    MD_LOG_I("duplicating output %u %s (%ux%u at %ld,%ld)", st->output_index, name,
-             st->width, st->height, r.left, r.top);
+    MD_LOG_I("duplicating output %u %s (%ux%u at %ld,%ld, rotated %d degrees)",
+             st->output_index, name, st->width, st->height, r.left, r.top, st->turns * 90);
     if ((uint32_t)(r.right - r.left) != st->width || (uint32_t)(r.bottom - r.top) != st->height)
         MD_LOG_I("output rectangle %ldx%ld differs from its %ux%u mode; input is scaled onto it",
                  r.right - r.left, r.bottom - r.top, st->width, st->height);
@@ -535,8 +645,6 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
     st->pointer.has_shape = false;
     st->pointer.under_rect.w = 0;
     st->delivered = false;
-    ctx->width  = st->width;
-    ctx->height = st->height;
     ctx->output_rect = { (int32_t)r.left, (int32_t)r.top, (uint32_t)(r.right - r.left),
                      (uint32_t)(r.bottom - r.top) };
     return S_OK;
@@ -622,24 +730,44 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) 
         if (wait == 0) return MD_CAPTURE_IDLE;
     }
 
-    /* A pointer-only update reuses the previous copy in the staging texture. */
+    /* A pointer-only update reuses the previous copy in the staging texture
+     * (or, rotated, the previous frame). */
+    const bool rotated = st->turns != 0;
     HRESULT hr = S_OK;
+    D3D11_TEXTURE2D_DESC image = {};
     if (desktop) {
         ID3D11Texture2D *texture = nullptr;
         hr = resource
             ? resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&texture)
             : E_POINTER;
         if (SUCCEEDED(hr)) {
-            st->context->CopyResource(st->staging, texture);
+            texture->GetDesc(&image);
+            if (image.Width == st->image_w && image.Height == st->image_h) {
+                st->context->CopyResource(st->staging, texture);
+                st->pointer.under_rect.w = 0; /* the copy replaced those pixels */
+            }
             safe_release(texture);
-            st->pointer.under_rect.w = 0; /* the copy replaced those pixels */
         }
     }
     safe_release(resource);
+    if (SUCCEEDED(hr) && desktop && (image.Width != st->image_w || image.Height != st->image_h)) {
+        st->duplication->ReleaseFrame();
+        MD_LOG_I("desktop image %ux%u does not match the %ux%u mode", image.Width,
+                 image.Height, st->image_w, st->image_h);
+        return frame_failed(ctx, st, DXGI_ERROR_ACCESS_LOST); /* restart re-reads it */
+    }
+    /* Rotated, the copy is mapped only to turn a new desktop image into the
+     * frame; the pointer is composited into that CPU frame. */
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(hr))
-        hr = st->context->Map(st->staging, 0, cursor ? D3D11_MAP_READ_WRITE : D3D11_MAP_READ,
+    if (SUCCEEDED(hr) && (!rotated || desktop))
+        hr = st->context->Map(st->staging, 0, cursor && !rotated ? D3D11_MAP_READ_WRITE
+                                                                 : D3D11_MAP_READ,
                               0, &mapped);
+    if (SUCCEEDED(hr) && rotated && desktop) {
+        rotate_image((const uint8_t *)mapped.pData, (uint32_t)mapped.RowPitch, st->image_w,
+                     st->image_h, st->turns, st->rotated, st->width * 4);
+        st->context->Unmap(st->staging, 0);
+    }
     /* Map waited for the copy, so the desktop image can go back to DWM now
      * rather than being held while the caller encodes. */
     st->duplication->ReleaseFrame();
@@ -651,9 +779,14 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) 
         MD_LOG_I("staging copy failed: 0x%08lx", hr);
         return MD_CAPTURE_ERROR;
     }
-    st->mapped = true;
-    if (cursor && !pointer_composite(&st->pointer, (uint8_t *)mapped.pData,
-                                     (uint32_t)mapped.RowPitch, st->width, st->height)) {
+    uint8_t *data = st->rotated;
+    uint32_t stride = st->width * 4;
+    if (!rotated) {
+        st->mapped = true;
+        data = (uint8_t *)mapped.pData;
+        stride = (uint32_t)mapped.RowPitch;
+    }
+    if (cursor && !pointer_composite(&st->pointer, data, stride, st->width, st->height)) {
         unmap_staging(st);
         st->delivered = false;
         MD_LOG_E("out of memory compositing the pointer");
@@ -671,13 +804,13 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) 
     st->last_ts = ts;
     out->width        = st->width;
     out->height       = st->height;
-    out->stride       = (uint32_t)mapped.RowPitch;
+    out->stride       = stride;
     out->format       = MD_PIX_CAPTURE_BGRA;
     out->buf_type     = MD_BUF_CPU;
     out->dmabuf_fd    = -1;
-    out->data         = (uint8_t *)mapped.pData;
+    out->data         = data;
     out->gpu_handle   = nullptr;
-    out->data_size    = (size_t)mapped.RowPitch * st->height;
+    out->data_size    = (size_t)stride * st->height;
     out->timestamp_ns = ts;
     out->seq          = st->seq++;
     return 0;

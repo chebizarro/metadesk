@@ -99,6 +99,86 @@ static void draw(TestFrame &f, const DXGI_OUTDUPL_POINTER_SHAPE_INFO &si,
     if (pointer_clip(si, x, y, f.w, f.h, &r)) pointer_blend(f.px.data(), f.stride, r, shape, si, x, y);
 }
 
+/* md-dbg: where the image pixel (sx, sy) of a w x h desktop image lands in
+ * the frame, per Microsoft's DXGIDesktopDuplication sample (SetDirtyVert maps
+ * dirty rects the same way): the forward direction, independent of the
+ * backend's inverse. */
+static void sample_rotation(int turns, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h,
+                            uint32_t *fx, uint32_t *fy) {
+    switch (turns) {
+    case 1:  *fx = h - 1 - sy; *fy = sx;         break; /* ROTATE90 */
+    case 2:  *fx = w - 1 - sx; *fy = h - 1 - sy; break; /* ROTATE180 */
+    case 3:  *fx = sy;         *fy = w - 1 - sx; break; /* ROTATE270 */
+    default: *fx = sx;         *fy = sy;
+    }
+}
+
+static void rotation_unit_tests() {
+    const DXGI_MODE_ROTATION rotations[] = {
+        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90,
+        DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    };
+    CHECK(rotation_turns(DXGI_MODE_ROTATION_UNSPECIFIED) == 0);
+    /* Every pixel of odd-sized images (padded strides, one larger than a
+     * 32-pixel tile) lands where the sample puts it, for all rotations. */
+    for (const uint32_t w : { 5u, 37u }) {
+        const uint32_t h = w == 5 ? 3 : 70, pad = 12;
+        const uint32_t src_stride = w * 4 + pad;
+        std::vector<uint8_t> src((size_t)src_stride * h, 0xEE);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                const uint32_t v = y * 1000 + x;
+                memcpy(&src[(size_t)y * src_stride + x * 4], &v, 4);
+            }
+        for (int i = 0; i < 4; i++) {
+            const int turns = rotation_turns(rotations[i]);
+            CHECK(turns == i);
+            uint32_t fw, fh;
+            rotated_size(turns, w, h, &fw, &fh);
+            CHECK(fw == (i % 2 ? h : w) && fh == (i % 2 ? w : h));
+            const uint32_t dst_stride = fw * 4 + pad;
+            std::vector<uint8_t> dst((size_t)dst_stride * fh, 0xEE);
+            rotate_image(src.data(), src_stride, w, h, turns, dst.data(), dst_stride);
+            for (uint32_t sy = 0; sy < h; sy++)
+                for (uint32_t sx = 0; sx < w; sx++) {
+                    uint32_t fx, fy, v;
+                    sample_rotation(turns, sx, sy, w, h, &fx, &fy);
+                    CHECK(fx < fw && fy < fh);
+                    memcpy(&v, &dst[(size_t)fy * dst_stride + fx * 4], 4);
+                    CHECK(v == sy * 1000 + sx);
+                }
+            for (uint32_t y = 0; y < fh; y++) /* padding untouched */
+                for (uint32_t b = fw * 4; b < dst_stride; b++)
+                    CHECK(dst[(size_t)y * dst_stride + b] == 0xEE);
+            /* Turning back by the remaining quarter turns restores the image. */
+            std::vector<uint8_t> back((size_t)src_stride * h, 0xEE);
+            rotate_image(dst.data(), dst_stride, fw, fh, (4 - turns) % 4, back.data(), src_stride);
+            CHECK(back == src);
+        }
+    }
+    /* ROTATE90 turns the image clockwise: its top-left is the frame's top-right. */
+    uint32_t fx, fy;
+    sample_rotation(1, 0, 0, 1920, 1080, &fx, &fy);
+    CHECK(fx == 1079 && fy == 0);
+
+    /* The frame is sized in desktop orientation; only rotated outputs get a
+     * CPU frame. */
+    MdCaptureCtx ctx = {};
+    DxgiState st = {};
+    for (const DXGI_MODE_ROTATION r : rotations) {
+        CHECK(SUCCEEDED(frame_configure(&ctx, &st, 1920, 1080, r)));
+        const bool portrait = r == DXGI_MODE_ROTATION_ROTATE90 || r == DXGI_MODE_ROTATION_ROTATE270;
+        CHECK(st.image_w == 1920 && st.image_h == 1080);
+        CHECK(ctx.width == (portrait ? 1080u : 1920u) && ctx.height == (portrait ? 1920u : 1080u));
+        CHECK(st.width == ctx.width && st.height == ctx.height);
+        CHECK(r == DXGI_MODE_ROTATION_IDENTITY ? st.turns == 0
+                                               : st.rotated && st.rotated_cap >= 1920u * 1080 * 4);
+    }
+    free(st.rotated);
+    puts("PASS rotation: all four rotations match Microsoft's sample mapping (tiles, padding, "
+         "inverse), frames sized in desktop orientation");
+}
+
 static void unit_tests() {
     const Bgr bg = { 10, 100, 200 };
 
@@ -282,6 +362,8 @@ static void unit_tests() {
         CHECK(output_choose(nullptr, d, 0) == -1 && output_choose("0", d, 0) == -1);
     }
     puts("PASS output selectors: primary default, index, device name; unknown -> none");
+
+    rotation_unit_tests();
 }
 
 /* ── Test windows ────────────────────────────────────────────── */
@@ -517,7 +599,68 @@ static void output_cells(const MdCaptureBackend *be) {
     puts("PASS unknown outputs fail init (attached outputs logged above)");
 }
 
-/* ── Interactive: real pointer shapes ────────────────────────── */
+/* ── Interactive: rotation on real frames (md-dbg) ─────────── */
+
+static Bgr frame_px(const MdFrame &f, LONG x, LONG y);
+
+/* The VM's only output cannot be rotated, so each rotation is forced onto
+ * it: the backend then turns the real desktop image into the frame, and a
+ * static window must appear exactly where the rotation puts it. */
+static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
+    auto *st = static_cast<DxgiState *>(ctx->backend_data);
+    const RECT out = st->output_rect;
+    const uint32_t w = st->image_w, h = st->image_h;
+    const RECT win = { 40, 40, 200, 120 }; /* image coordinates, not square */
+    TestWindow mark = {};
+    mark.color = RGB(20, 200, 60);
+    const Bgr green = { 60, 200, 20 };
+    mark.rect = { out.left + win.left, out.top + win.top, out.left + win.right,
+                  out.top + win.bottom };
+    TestWindow damage = {}; /* keeps frames coming */
+    damage.animate = true;
+    damage.rect = { out.left + 300, out.top + 300, out.left + 364, out.top + 364 };
+    window_start(&mark);
+    window_start(&damage);
+    const POINT probes[] = {
+        { win.left + 3, win.top + 3 }, { win.right - 4, win.top + 3 },
+        { win.left + 3, win.bottom - 4 }, { win.right - 4, win.bottom - 4 },
+        { (win.left + win.right) / 2, (win.top + win.bottom) / 2 },
+    };
+    for (const DXGI_MODE_ROTATION r : { DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
+                                        DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_IDENTITY }) {
+        CHECK(SUCCEEDED(frame_configure(ctx, st, w, h, r)));
+        st->delivered = false; /* as after re-duplicating: copy the whole desktop */
+        const int turns = rotation_turns(r);
+        uint32_t fw, fh;
+        rotated_size(turns, w, h, &fw, &fh);
+        CHECK(ctx->width == fw && ctx->height == fh);
+        const double end = now_ms() + 3000;
+        bool landed = false;
+        while (!landed && now_ms() < end) {
+            MdFrame f = {};
+            const int rc = be->get_frame(ctx, &f, 1000);
+            CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
+            if (rc != 0) continue;
+            CHECK(f.width == fw && f.height == fh && f.stride >= fw * 4 &&
+                  f.data_size == (size_t)f.stride * fh);
+            landed = true;
+            for (const POINT &p : probes) {
+                uint32_t fx, fy;
+                sample_rotation(turns, (uint32_t)p.x, (uint32_t)p.y, w, h, &fx, &fy);
+                if (!px_is(frame_px(f, (LONG)fx, (LONG)fy), green, 2)) landed = false;
+            }
+            be->release_frame(ctx, &f);
+        }
+        CHECK(landed);
+        printf("PASS forced rotation %d degrees: %ux%u frame, the window lands where "
+               "the rotation puts it\n", turns * 90, fw, fh);
+    }
+    CHECK(st->turns == 0 && ctx->width == w && ctx->height == h);
+    window_stop(&damage);
+    window_stop(&mark);
+}
+
+/* ── Interactive: real pointer shapes ──────────────────────── */
 
 enum { QUAD = 4 };
 
@@ -966,6 +1109,7 @@ int main(int argc, char **argv) {
     puts("PASS stopped: get_frame -> ERROR promptly");
     CHECK(be->start(&ctx) == 0 && ctx.active);
 
+    rotation_cells(be, &ctx);
     pointer_cells(be, &ctx);
     be->stop(&ctx);
 

@@ -195,6 +195,24 @@ pointer-only update. What was observed on the VM (Basic Display adapter):
   150 ms after each shape change. It counts an attempt only when the call
   returns IDLE and the backend consumed the pointer update in the meantime.
 
+### Rotation (md-dbg)
+
+Desktop Duplication delivers a rotated output's image in its native,
+unrotated orientation. The backend rotates it into a CPU frame in desktop
+orientation. The convention follows Microsoft's DXGIDesktopDuplication
+sample and libwebrtc: `ROTATE90` turns the image 90 degrees clockwise.
+Frames, `ctx->width/height` and the output rectangle are therefore all in
+desktop orientation, and input maps onto them linearly. The pointer is
+composited without a transform, because DXGI reports its position in
+desktop coordinates and its shape upright. Unrotated outputs keep the
+zero-copy path.
+
+The synthetic cells check every pixel of each rotation against the
+sample's forward mapping. The VM's single output cannot be rotated, so the
+console cell forces each rotation onto it. A static window must then
+appear exactly where the rotation puts it in real frames. A real rotated
+monitor, and the pointer convention on one, are not covered on the VM.
+
 ## Real lock/disconnect qualification
 
 The normal liveness test injects provider errors at the root-call boundary and
