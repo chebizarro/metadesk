@@ -69,12 +69,26 @@ typedef struct {
     bool     unattended;   /* Linux: consent budget capped at 10 seconds */
     bool     forget_authorization_on_stall; /* opt-in, ignored unattended */
     uint32_t consent_timeout_ms; /* 0 = 180s interactive / 10s unattended */
-    /* Windows (DXGI) output to capture: NULL or "" = the primary display, a
-     * decimal index into the attached outputs, or a GDI device name such as
-     * "\\.\DISPLAY2" (the "\\.\" prefix is optional). An unknown selection
-     * fails init. Other backends ignore it. Borrowed for the ctx lifetime. */
+    /* Output (display) to capture. NULL or "" = the primary display; a
+     * decimal index selects by position in the backend's display list.
+     *   Windows (DXGI): index into the attached outputs, or a GDI device name
+     *     such as "\\.\DISPLAY2" (the "\\.\" prefix is optional).
+     *   macOS (ScreenCaptureKit): index into SCShareableContent.displays,
+     *     "id:N" for a CGDirectDisplayID, or a display name (NSScreen
+     *     localizedName, case-insensitive, must be unique).
+     * An unknown selection fails (DXGI init, SCK start) and logs the
+     * available displays. Linux/PipeWire picks its source in the portal and
+     * ignores it. Borrowed for the ctx lifetime. */
     const char *output;
 } MdCaptureConfig;
+
+/* Bounds of the captured output in the platform's global desktop space
+ * (macOS: CoreGraphics global display points, origin at the main display's
+ * top-left). width == 0 means the backend has not published it. */
+typedef struct {
+    int32_t  x, y;
+    uint32_t width, height;
+} MdCaptureRect;
 
 /* ── Backend vtable (spec §2.3.1) ────────────────────────────── */
 
@@ -109,6 +123,7 @@ struct MdCaptureCtx {
     volatile bool           active;
     uint32_t                width;
     uint32_t                height;
+    MdCaptureRect           output_rect;   /* set by start where known */
 };
 
 /* ── Factory ─────────────────────────────────────────────────── */
@@ -178,6 +193,27 @@ int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
 
 /* Non-blocking md_capture_wait_size(ctx, 0, ...). */
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);
+
+/* Desktop bounds of the selected output after a successful start, so input
+ * can address the same display. Returns -1 if the backend did not publish
+ * them (Linux/PipeWire) or the arguments are invalid. */
+int md_capture_get_output_rect(const MdCaptureCtx *ctx, MdCaptureRect *rect);
+
+/* ── Display selection (platform-neutral parsing) ────────────── */
+
+typedef struct {
+    uint32_t    id;       /* platform display id (macOS: CGDirectDisplayID) */
+    const char *name;     /* human-readable name, may be NULL               */
+    bool        primary;
+} MdCaptureDisplay;
+
+/* Index into `displays` that `sel` picks, or -1 (unknown or ambiguous):
+ *   NULL / ""   the primary display (index 0 if none is flagged)
+ *   "N"         decimal index (at most 4 digits)
+ *   "id:N"      the display whose id is N (decimal or 0x hex)
+ *   otherwise   the one display whose name matches case-insensitively */
+int md_capture_display_choose(const MdCaptureDisplay *displays, size_t count,
+                              const char *sel);
 
 /* Stop capture. Release borrowed frames first. A concurrent stop waits for
  * the consumer's release before destroying its buffer storage. */

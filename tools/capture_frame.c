@@ -2,7 +2,9 @@
  * metadesk — tools/capture_frame.c
  * Milestone 1.1 verification tool: capture a single frame to disk.
  *
- * Usage: ./capture_frame [output.raw]
+ * Usage: ./capture_frame [output.raw [OUTPUT_SEL]]
+ *
+ * OUTPUT_SEL is MdCaptureConfig.output (see capture.h / --capture-output).
  *
  * Captures one frame from the platform capture backend and writes
  * the raw pixel data to disk. Reports buffer type, dimensions,
@@ -43,13 +45,16 @@ static const char *pix_fmt_str(MdCapturePixFmt fmt) {
 
 int main(int argc, char **argv) {
     const char *output_path = (argc > 1) ? argv[1] : "frame.raw";
+    const char *display = (argc > 2) ? argv[2] : NULL;
 
     printf("metadesk capture_frame — M1.1 verification tool\n");
-    printf("Output: %s\n\n", output_path);
+    printf("Output: %s\n", output_path);
+    printf("Display: %s\n\n", display ? display : "(default)");
 
     MdCaptureConfig cfg = {
         .target_fps  = 1, /* just need one frame */
         .show_cursor = true,
+        .output      = display,
     };
 
     MdCaptureCtx *cap = md_capture_create(&cfg);
@@ -88,6 +93,10 @@ int main(int argc, char **argv) {
     printf("  Buffer:     %s\n", buf_type_str(frame.buf_type));
     printf("  Seq:        %u\n", frame.seq);
     printf("  Latency:    %.2f ms\n", latency_ms);
+    MdCaptureRect rect;
+    if (md_capture_get_output_rect(cap, &rect) == 0)
+        printf("  Output:     %ux%u at (%d,%d)\n",
+               rect.width, rect.height, rect.x, rect.y);
 
     if (frame.buf_type == MD_BUF_CPU && frame.data && frame.data_size > 0) {
         FILE *f = fopen(output_path, "wb");

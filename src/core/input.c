@@ -188,6 +188,30 @@ bool md_input_ascii_key(char c, uint32_t *keysym, bool *shift) {
     return true;
 }
 
+/* ── Coordinate mapping ──────────────────────────────────────── */
+
+static int clamp_coord(int v, uint32_t extent) {
+    if (v < 0 || extent == 0) return 0;
+    return (uint32_t)v >= extent ? (int)(extent - 1) : v;
+}
+
+void md_input_map_to_output(const MdInputConfig *cfg, int x, int y,
+                            double *gx, double *gy) {
+    if (!cfg || !gx || !gy) return;
+    if (cfg->output_width == 0 || cfg->output_height == 0 ||
+        cfg->screen_width == 0 || cfg->screen_height == 0) {
+        /* Legacy: MCP mode feeds global accessibility coordinates against
+         * fallback dimensions, so never clamp here. */
+        *gx = x;
+        *gy = y;
+        return;
+    }
+    x = clamp_coord(x, cfg->screen_width);
+    y = clamp_coord(y, cfg->screen_height);
+    *gx = cfg->output_x + (double)x * cfg->output_width / cfg->screen_width;
+    *gy = cfg->output_y + (double)y * cfg->output_height / cfg->screen_height;
+}
+
 /* ── Public convenience API ──────────────────────────────────── */
 
 static bool input_dimensions_are_valid(uint32_t width, uint32_t height) {
@@ -334,20 +358,57 @@ int md_input_type_text(MdInput *inp, const char *text) {
     return inp->vtable->type_text(inp, text);
 }
 
-/* ── Action dispatch ─────────────────────────────────────────── */
+/* ── Action dispatch ───────────────────────────────────────────── */
+
+/* Action coordinates come from the accessibility tree, i.e. global desktop
+ * space, while mouse_move takes frame-relative points that backends map
+ * into the output bounds. Invert that mapping; a point off the captured
+ * output is refused rather than clamped onto its edge. */
+static int action_point_to_frame(const MdInput *inp, int gx, int gy,
+                                 int *fx, int *fy) {
+    const MdInputConfig *c = &inp->config;
+    if (c->output_width == 0 || c->output_height == 0 ||
+        c->screen_width == 0 || c->screen_height == 0) {
+        *fx = gx;
+        *fy = gy;
+        return 0;
+    }
+    const long long dx = (long long)gx - c->output_x;
+    const long long dy = (long long)gy - c->output_y;
+    if (dx < 0 || dy < 0 || dx >= c->output_width || dy >= c->output_height) {
+        MD_LOG_E("action point (%d,%d) is outside the captured output %ux%u at (%d,%d)", gx, gy, c->output_width, c->output_height, c->output_x, c->output_y);
+        return -1;
+    }
+    *fx = (int)(dx * c->screen_width / c->output_width);
+    *fy = (int)(dy * c->screen_height / c->output_height);
+    return 0;
+}
 
 int md_input_execute_action(MdInput *inp, const struct MdAction *action) {
     if (!inp || !action) return -1;
 
+    int x = 0, y = 0;
     switch (action->type) {
     case MD_ACTION_CLICK:
-        return md_input_click(inp, action->region[0], action->region[1], 0);
+    case MD_ACTION_DBL_CLICK:
+    case MD_ACTION_RIGHT_CLICK:
+        if (action_point_to_frame(inp, action->region[0], action->region[1],
+                                  &x, &y) < 0)
+            return -1;
+        break;
+    default:
+        break;
+    }
+
+    switch (action->type) {
+    case MD_ACTION_CLICK:
+        return md_input_click(inp, x, y, 0);
 
     case MD_ACTION_DBL_CLICK:
-        return md_input_dbl_click(inp, action->region[0], action->region[1]);
+        return md_input_dbl_click(inp, x, y);
 
     case MD_ACTION_RIGHT_CLICK:
-        return md_input_right_click(inp, action->region[0], action->region[1]);
+        return md_input_right_click(inp, x, y);
 
     case MD_ACTION_TYPE:
         return md_input_type_text(inp, action->text);

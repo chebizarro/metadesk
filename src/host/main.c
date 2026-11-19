@@ -494,7 +494,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
     fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
     fprintf(stderr, "  --capture-forget-on-stall  Opt in to token removal after broken capture\n");
-    fprintf(stderr, "  --capture-output SEL  Windows: output index or device name (default: primary)\n");
+    fprintf(stderr, "  --capture-output SEL  Display to capture (default: primary): index; Windows\n"
+                    "                   device name (\\\\.\\DISPLAY2); macOS id:CGDirectDisplayID or name\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
     fprintf(stderr, "  --fips-ready-timeout MS  Peer readiness timeout (default: 10000)\n");
@@ -791,10 +792,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ERROR: --capture-output requires an output index or device name\n");
                 return 1;
             }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
             capture_output = argv[i];
 #else
-            fprintf(stderr, "ERROR: --capture-output is only supported by the Windows (DXGI) capture backend\n");
+            fprintf(stderr, "ERROR: --capture-output is not supported on Linux: "
+                            "PipeWire capture picks the source in the ScreenCast portal dialog\n");
             return 1;
 #endif
         }
@@ -1270,6 +1272,13 @@ signaling_ready:
     MdInputConfig input_cfg = input_options;
     input_cfg.screen_width = display_width;
     input_cfg.screen_height = display_height;
+    MdCaptureRect output_rect;
+    if (md_capture_get_output_rect(capture, &output_rect) == 0) {
+        input_cfg.output_x = output_rect.x;
+        input_cfg.output_y = output_rect.y;
+        input_cfg.output_width = output_rect.width;
+        input_cfg.output_height = output_rect.height;
+    }
     MdInput *input = no_input ? NULL : md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
         fprintf(stderr, "WARNING: input injection unavailable\n");

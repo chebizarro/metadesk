@@ -8,8 +8,52 @@
  */
 #include "capture.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+
+static bool ascii_iequal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return false;
+    return *a == *b;
+}
+
+int md_capture_display_choose(const MdCaptureDisplay *displays, size_t count,
+                              const char *sel) {
+    if (!displays || count == 0) return -1;
+    if (!sel || !*sel) {
+        for (size_t i = 0; i < count; i++)
+            if (displays[i].primary) return (int)i;
+        return 0;
+    }
+    const size_t digits = strspn(sel, "0123456789");
+    if (sel[digits] == '\0') {
+        if (digits > 4) return -1;
+        const size_t index = (size_t)atoi(sel);
+        return index < count ? (int)index : -1;
+    }
+    if ((sel[0] == 'i' || sel[0] == 'I') && (sel[1] == 'd' || sel[1] == 'D') &&
+        sel[2] == ':') {
+        const char *num = sel + 3;
+        if (!isdigit((unsigned char)*num)) return -1;
+        char *end = NULL;
+        errno = 0;
+        const unsigned long long id = strtoull(num, &end, 0);
+        if (errno || *end || id > UINT32_MAX) return -1;
+        for (size_t i = 0; i < count; i++)
+            if (displays[i].id == (uint32_t)id) return (int)i;
+        return -1;
+    }
+    int pick = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (!displays[i].name || !ascii_iequal(sel, displays[i].name)) continue;
+        if (pick >= 0) return -1; /* ambiguous: select by index or id */
+        pick = (int)i;
+    }
+    return pick;
+}
 
 uint32_t md_capture_consent_timeout_ms(const MdCaptureConfig *cfg) {
     uint32_t timeout = cfg && cfg->consent_timeout_ms ? cfg->consent_timeout_ms :
@@ -237,6 +281,14 @@ int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
 
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height) {
     return md_capture_wait_size(ctx, 0, width, height);
+}
+
+int md_capture_get_output_rect(const MdCaptureCtx *ctx, MdCaptureRect *rect) {
+    if (!ctx || !rect || ctx->output_rect.width == 0 ||
+        ctx->output_rect.height == 0)
+        return -1;
+    *rect = ctx->output_rect;
+    return 0;
 }
 
 void md_capture_stop(MdCaptureCtx *ctx) {
