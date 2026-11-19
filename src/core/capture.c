@@ -12,6 +12,39 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
+/* ── Frame clock ─────────────────────────────────────────────── */
+
+uint64_t md_capture_clock_ns(void) {
+#if defined(_WIN32)
+    /* Same conversion as capture_dxgi.cpp's qpc_to_ns. */
+    LARGE_INTEGER hz, now;
+    QueryPerformanceFrequency(&hz);
+    QueryPerformanceCounter(&now);
+    const uint64_t f = (uint64_t)hz.QuadPart, t = (uint64_t)now.QuadPart;
+    return t / f * 1000000000ull + t % f * 1000000000ull / f;
+#elif defined(__APPLE__)
+    /* libSystem-only symbol, out of libnsync's clock_gettime's reach. */
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+uint64_t md_capture_rebase_ns(uint64_t src_ts, uint64_t src_now,
+                              uint64_t dst_now) {
+    if (src_ts >= src_now) return dst_now;
+    const uint64_t age = src_now - src_ts;
+    return age < dst_now ? dst_now - age : 0;
+}
 
 static bool ascii_iequal(const char *a, const char *b) {
     for (; *a && *b; a++, b++)

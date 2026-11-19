@@ -4,7 +4,8 @@
  *
  * Flow:
  *   1. SCShareableContent.getExcludingDesktopWindows — enumerate displays
- *   2. SCStreamConfiguration — set resolution, framerate, pixel format
+ *   2. SCStreamConfiguration — resolution (the display's backing pixels:
+ *      points x pointPixelScale), framerate, pixel format
  *   3. SCStream — create stream for the selected display (config.output:
  *      NULL/"" = main display, index into shareableContent.displays,
  *      "id:N" CGDirectDisplayID, or unique NSScreen name; see capture.h)
@@ -27,6 +28,7 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>  /* NSScreen.localizedName for name selection */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -64,11 +66,32 @@ typedef struct {
     /* Sequence counter */
     atomic_uint_least32_t   seq;
 
+    /* Last timestamp_ns handed out (capture queue only). */
+    uint64_t                last_ts;
+
     /* Back-pointer */
     MdCaptureCtx           *ctx;
 } SCKState;
 
-/* ── SCStreamOutput delegate ─────────────────────────────────── */
+/* ── Frame timestamps ──────────────────────────────────────── */
+
+/* SCK stamps a frame with its display time on the CoreMedia host clock
+ * (mach_absolute_time, which stops during sleep), at times a few ms ahead of
+ * delivery. CLOCK_MONOTONIC keeps counting through sleep, so the gap between
+ * the clocks grows with every sleep: rebase against both clocks read now
+ * instead of caching an offset. */
+static uint64_t sck_frame_clock_ns(CMTime pts) {
+    const CMTime host_now = CMClockGetTime(CMClockGetHostTimeClock());
+    const uint64_t now = md_capture_clock_ns();
+    if (!CMTIME_IS_NUMERIC(pts) || !CMTIME_IS_NUMERIC(host_now)) return now;
+    const CMTime p = CMTimeConvertScale(pts, 1000000000, kCMTimeRoundingMethod_Default);
+    const CMTime h = CMTimeConvertScale(host_now, 1000000000, kCMTimeRoundingMethod_Default);
+    if (!CMTIME_IS_NUMERIC(p) || !CMTIME_IS_NUMERIC(h) || p.value < 0 || h.value < 0)
+        return now;
+    return md_capture_rebase_ns((uint64_t)p.value, (uint64_t)h.value, now);
+}
+
+/* ── SCStreamOutput delegate ───────────────────────────────── */
 
 API_AVAILABLE(macos(12.3))
 @interface MdSCKDelegate : NSObject <SCStreamOutput>
@@ -127,13 +150,9 @@ API_AVAILABLE(macos(12.3))
         return;
     }
 
-    /* Get timestamp */
-    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    uint64_t ts_ns = 0;
-    if (CMTIME_IS_VALID(pts)) {
-        double seconds = CMTimeGetSeconds(pts);
-        ts_ns = (uint64_t)(seconds * 1e9);
-    }
+    uint64_t ts_ns = sck_frame_clock_ns(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
+    if (ts_ns < sck->last_ts) ts_ns = sck->last_ts;
+    sck->last_ts = ts_ns;
 
     MdFrame frame = {
         .width        = w,
@@ -253,6 +272,25 @@ static SCDisplay *sck_select_display(NSArray<SCDisplay *> *displays, const char 
     return pick < 0 ? nil : displays[(NSUInteger)pick];
 }
 
+/* Backing pixels per point: SCK's own figure on macOS 14+, else the current
+ * display mode's pixel/point ratio (CoreGraphics, safe off the main thread,
+ * unlike NSScreen.backingScaleFactor). 1 if neither is known. */
+API_AVAILABLE(macos(12.3))
+static double sck_backing_scale(SCDisplay *display, SCContentFilter *filter) {
+    if (@available(macOS 14.0, *)) {
+        if (filter.pointPixelScale > 0) return filter.pointPixelScale;
+    }
+    double scale = 1.0;
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display.displayID);
+    if (mode) {
+        const size_t pt = CGDisplayModeGetWidth(mode);
+        const size_t px = CGDisplayModeGetPixelWidth(mode);
+        if (pt && px) scale = (double)px / (double)pt;
+        CGDisplayModeRelease(mode);
+    }
+    return scale;
+}
+
 /* sck_start/sck_stop are reachable only through screencapturekit_backend,
  * which md_capture_backend_create gates at runtime; the annotations let the
  * compiler prove that instead of re-checking per call. */
@@ -285,10 +323,19 @@ static int sck_start(MdCaptureCtx *ctx) {
                                             ctx->config.output);
     if (!display) return -1;
 
-    /* Configure the stream */
+    /* Content filter: the selected display, all windows */
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
+                                                      excludingWindows:@[]];
+
+    /* Configure the stream at the display's native pixels. SCDisplay sizes
+     * are points; capturing at them halves a Retina display's resolution.
+     * ctx->output_rect stays in points for CGEvent (see capture.h). */
+    const double scale = sck_backing_scale(display, filter);
+    const size_t px_w = (size_t)lround((double)display.width * scale);
+    const size_t px_h = (size_t)lround((double)display.height * scale);
     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-    config.width = display.width;
-    config.height = display.height;
+    config.width = px_w;
+    config.height = px_h;
     config.showsCursor = ctx->config.show_cursor;
 
     /* Request BGRA pixel format (most compatible with our encoder) */
@@ -297,10 +344,6 @@ static int sck_start(MdCaptureCtx *ctx) {
     /* Frame rate */
     uint32_t fps = ctx->config.target_fps ? ctx->config.target_fps : 60;
     config.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
-
-    /* Content filter: the selected display, all windows */
-    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
-                                                      excludingWindows:@[]];
 
     /* Create the stream */
     SCStream *stream = [[SCStream alloc] initWithFilter:filter
@@ -353,8 +396,11 @@ static int sck_start(MdCaptureCtx *ctx) {
         .width = (uint32_t)bounds.size.width, .height = (uint32_t)bounds.size.height,
     };
     ctx->active = true;
-    ctx->width  = display.width;
-    ctx->height = display.height;
+    ctx->width  = (uint32_t)px_w;
+    ctx->height = (uint32_t)px_h;
+    MD_LOG_I("capturing display id:%u at %zux%zu pixels (%ldx%ld points, scale %.2f)",
+             display.displayID, px_w, px_h, (long)display.width,
+             (long)display.height, scale);
 
     return 0;
 }

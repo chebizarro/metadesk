@@ -46,7 +46,9 @@ typedef enum {
 
 /* Frame metadata delivered to callers.
  * The frame is borrowed until release_frame(); release before requesting
- * another frame. Concurrent stop waits for outstanding borrowed frames. */
+ * another frame. Concurrent stop waits for outstanding borrowed frames.
+ * width/height are device pixels: on a macOS Retina display, the backing
+ * pixels (points x backing scale), not the points MdCaptureRect uses. */
 typedef struct {
     uint32_t          width;
     uint32_t          height;
@@ -57,7 +59,8 @@ typedef struct {
     uint8_t          *data;          /* valid when buf_type == MD_BUF_CPU             */
     void             *gpu_handle;    /* valid when buf_type == MD_BUF_GPU             */
     size_t            data_size;     /* total mapped / accessible buffer size         */
-    uint64_t          timestamp_ns;  /* monotonic capture timestamp (nanoseconds)     */
+    uint64_t          timestamp_ns;  /* capture time on md_capture_clock_ns()'s clock;
+                                        non-decreasing, never after delivery      */
     uint32_t          seq;           /* monotonic frame sequence number               */
 } MdFrame;
 
@@ -89,7 +92,10 @@ typedef struct {
  * orientation like the frames, so a rotated output maps linearly; for
  * "all", the outputs' bounding rectangle;
  * macOS: CoreGraphics global display points, origin at the main display's
- * top-left). width == 0 means the backend has not published it. */
+ * top-left, while frames are backing pixels, so on Retina the frame is
+ * scale x this rect and frame->desktop mapping divides by that scale;
+ * md_input_map_to_output derives it from the two sizes).
+ * width == 0 means the backend has not published it. */
 typedef struct {
     int32_t  x, y;
     uint32_t width, height;
@@ -203,6 +209,24 @@ int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);
  * can address the same display. Returns -1 if the backend did not publish
  * them (Linux/PipeWire) or the arguments are invalid. */
 int md_capture_get_output_rect(const MdCaptureCtx *ctx, MdCaptureRect *rect);
+
+/* ── Frame clock ─────────────────────────────────────────────── */
+
+/* Now, in nanoseconds, on the clock MdFrame.timestamp_ns uses:
+ * CLOCK_MONOTONIC on Linux and macOS (includes sleep), the
+ * QueryPerformanceCounter on Windows. The origin is arbitrary; compare only
+ * with other frame timestamps and this function. On macOS read the clock here
+ * and not via clock_gettime(): libnsync, linked into libmetadesk, exports a
+ * clock_gettime that ignores the clock id and returns wall time. */
+uint64_t md_capture_clock_ns(void);
+
+/* Map src_ts from a backend's source clock onto the frame clock, given src_now
+ * and dst_now read back to back on the source and frame clocks:
+ * dst_now - (src_now - src_ts). A src_ts after src_now (e.g. a display time
+ * stamped ahead of delivery) maps to dst_now, because frame timestamps are
+ * never in the future. An age larger than dst_now maps to 0. Pure. */
+uint64_t md_capture_rebase_ns(uint64_t src_ts, uint64_t src_now,
+                              uint64_t dst_now);
 
 /* ── Display selection (platform-neutral parsing) ────────────── */
 

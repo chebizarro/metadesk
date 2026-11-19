@@ -8,20 +8,14 @@
  *
  * Captures one frame from the platform capture backend and writes
  * the raw pixel data to disk. Reports buffer type, dimensions,
- * format, and latency.
+ * format, latency (frame timestamp to receipt, on md_capture_clock_ns)
+ * and the frame-pixels-per-output-unit scale.
  */
 #include "capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-static uint64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
 
 static const char *buf_type_str(MdBufferType bt) {
     switch (bt) {
@@ -81,10 +75,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint64_t capture_time = now_ns();
+    /* Signed: a timestamp after now would be a backend bug worth seeing. */
+    const uint64_t received = md_capture_clock_ns();
     double latency_ms = 0.0;
     if (frame.timestamp_ns > 0)
-        latency_ms = (double)(capture_time - frame.timestamp_ns) / 1e6;
+        latency_ms = ((double)received - (double)frame.timestamp_ns) / 1e6;
 
     printf("Frame captured:\n");
     printf("  Dimensions: %ux%u (stride %u)\n",
@@ -95,8 +90,10 @@ int main(int argc, char **argv) {
     printf("  Latency:    %.2f ms\n", latency_ms);
     MdCaptureRect rect;
     if (md_capture_get_output_rect(cap, &rect) == 0)
-        printf("  Output:     %ux%u at (%d,%d)\n",
-               rect.width, rect.height, rect.x, rect.y);
+        printf("  Output:     %ux%u at (%d,%d), %.2fx%.2f frame px per unit\n",
+               rect.width, rect.height, rect.x, rect.y,
+               (double)frame.width / rect.width,
+               (double)frame.height / rect.height);
 
     if (frame.buf_type == MD_BUF_CPU && frame.data && frame.data_size > 0) {
         FILE *f = fopen(output_path, "wb");

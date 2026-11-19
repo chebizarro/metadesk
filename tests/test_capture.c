@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "md_test.h"
 #ifndef _WIN32
 #include <dirent.h>
@@ -26,6 +27,9 @@
 #include <sys/un.h>
 #endif
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <CoreMedia/CoreMedia.h>
 #endif
 
 
@@ -327,6 +331,63 @@ static void test_output_rect(void)
     MD_CHECK(r.x == -1920 && r.y == 120 && r.width == 1920 && r.height == 1080);
     md_capture_destroy(ctx);
     PASS("output_rect");
+}
+
+/* md-6c4f: frame timestamps live on md_capture_clock_ns()'s clock. */
+#ifdef __APPLE__
+static bool within_ns(uint64_t a, uint64_t b, uint64_t tol)
+{
+    return (a > b ? a - b : b - a) <= tol;
+}
+#endif
+
+static void test_frame_clock(void)
+{
+    const uint64_t S = 1000000000ull, MS = 1000000ull;
+
+    /* Rebase: same age on the destination clock. */
+    MD_CHECK(md_capture_rebase_ns(900, 1000, 5000) == 4900);
+    MD_CHECK(md_capture_rebase_ns(1000, 1000, 5000) == 5000);
+    /* SCK display times run a few ms ahead of delivery: clamp to now. */
+    MD_CHECK(md_capture_rebase_ns(1007, 1000, 5000) == 5000);
+    MD_CHECK(md_capture_rebase_ns(UINT64_MAX, 0, 1) == 1);
+    /* Older than the destination clock's origin: 0, never a wrap. */
+    MD_CHECK(md_capture_rebase_ns(0, 6000, 5000) == 0);
+    MD_CHECK(md_capture_rebase_ns(0, UINT64_MAX, UINT64_MAX) == 0);
+
+    /* The md-6c4f shape, from a real Mac: host clock (mach_absolute_time)
+     * 907293 s, CLOCK_MONOTONIC 1173717 s after 266424 s asleep. A 5 ms old
+     * PTS must come out 5 ms before monotonic now, not 74 h. */
+    const uint64_t host_now = 907293 * S, mono_now = 1173717 * S;
+    MD_CHECK(md_capture_rebase_ns(host_now - 5 * MS, host_now, mono_now) ==
+             mono_now - 5 * MS);
+
+    /* The live clock is monotonic and is not wall time. libnsync exports a
+     * clock_gettime that returns wall time for every clock id; this catches
+     * a frame clock that resolves to it. */
+    const uint64_t a = md_capture_clock_ns(), b = md_capture_clock_ns();
+    MD_CHECK(a > 0 && b >= a);
+    MD_CHECK(a < (uint64_t)time(NULL) / 2 * S);
+
+#ifdef __APPLE__
+    /* SCK's PTS clock (the CoreMedia host clock) is CLOCK_UPTIME_RAW, and
+     * a host-time stamp rebased with it lands on CLOCK_MONOTONIC (read via
+     * the libSystem-only clock_gettime_nsec_np). Generous slack: the bug
+     * is off by the machine's total sleep time or by ~1.8e18 ns. */
+    const uint64_t slack = 250 * MS;
+    const CMTime host = CMClockGetTime(CMClockGetHostTimeClock());
+    const uint64_t uptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t host_ns = (uint64_t)CMTimeConvertScale(host, (int32_t)S,
+        kCMTimeRoundingMethod_Default).value;
+    MD_CHECK(within_ns(host_ns, uptime, slack));
+
+    const uint64_t mono = md_capture_clock_ns();
+    const uint64_t ref = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    MD_CHECK(within_ns(mono, ref, slack));
+    const uint64_t ts = md_capture_rebase_ns(host_ns - 5 * MS, host_ns, mono);
+    MD_CHECK(ts <= ref && within_ns(ts, ref - 5 * MS, slack));
+#endif
+    PASS("frame clock + host-time rebase");
 }
 
 static void test_get_size_before_init(void)
@@ -875,6 +936,7 @@ int main(void)
     test_get_size_before_init();
     test_display_choose();
     test_output_rect();
+    test_frame_clock();
     test_wait_size_dispatch();
     test_get_frame_and_release();
     test_config_passthrough();
