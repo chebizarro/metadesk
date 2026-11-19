@@ -121,6 +121,26 @@ rejected injections. It never injects input, so it is safe in any session.
 Never aim real SendInput at the console: it moves the user's pointer and types
 into the user's applications.
 
+The test also replaces `GetSystemMetrics` with a synthetic virtual desktop
+(md-w65), so mouse moves are checked against layouts the VM does not have:
+a non-primary output, negative origins, mixed DPI, a portrait output, and a
+layout that changes while the backend runs. Each recorded move is decoded
+the way Windows decodes `MOUSEEVENTF_VIRTUALDESK` (pixel = left +
+n * width / 65536) and must land on the exact intended pixel. The mapping
+works in two steps:
+
+1. `md_input_map_to_output` (input.c) maps the frame point into the captured
+   output's rectangle (`MdInputConfig.output_*`, copied from
+   `md_capture_get_output_rect`).
+2. The backend aims at the centre of that desktop pixel, across the virtual
+   desktop.
+
+The DXGI backend publishes that rectangle in physical pixels:
+`GetMonitorInfo` on the output's monitor, read per-monitor DPI aware
+(`win_dpi.h`). The virtual desktop is read the same way, because
+`DXGI_OUTPUT_DESC.DesktopCoordinates` and `SM_*VIRTUALSCREEN` are
+DPI-virtualized for a process that is not DPI aware.
+
 `test_capture_dxgi_win.exe` checks the capture HAL contract. Both modes start
 with synthetic cells that need no desktop:
 
@@ -174,6 +194,59 @@ pointer-only update. What was observed on the VM (Basic Display adapter):
   blinks about every 530 ms. The `show_cursor`-off cell therefore waits
   150 ms after each shape change. It counts an attempt only when the call
   returns IDLE and the backend consumed the pointer update in the meantime.
+
+### Rotation (md-dbg)
+
+Desktop Duplication delivers a rotated output's image in its native,
+unrotated orientation. The backend rotates it into a CPU frame in desktop
+orientation. The convention follows Microsoft's DXGIDesktopDuplication
+sample and libwebrtc: `ROTATE90` turns the image 90 degrees clockwise.
+Frames, `ctx->width/height` and the output rectangle are therefore all in
+desktop orientation, and input maps onto them linearly. The pointer is
+composited without a transform, because DXGI reports its position in
+desktop coordinates and its shape upright. Unrotated outputs keep the
+zero-copy path.
+
+The synthetic cells check every pixel of each rotation against the
+sample's forward mapping. The VM's single output cannot be rotated, so the
+console cell forces each rotation onto it. A static window must then
+appear exactly where the rotation puts it in real frames. A real rotated
+monitor, and the pointer convention on one, are not covered on the VM.
+
+### All outputs as one frame (md-246)
+
+`--capture-output all` (`MdCaptureConfig.output = "all"`) duplicates every
+attached output, each on a D3D11 device for its own adapter. The outputs
+are composed into one CPU frame that covers the bounding rectangle of their
+physical desktop rectangles:
+
+- Negative origins work, and gaps between outputs are opaque black.
+- Each output keeps its own rotation and first-frame tracking.
+- `md_capture_get_output_rect` reports that bounding rectangle, so
+  frame-relative input maps onto it linearly. Agent clicks in UIA global
+  coordinates convert back exactly.
+- Pointer ownership follows Microsoft's sample. A "not visible" report only
+  counts from the output that placed the pointer last, and of two visible
+  reports the newer wins.
+
+Limits:
+
+- DXGI has no waitable handle per duplication, so `get_frame` polls the
+  other outputs and blocks on one of them in turn for at most a frame
+  interval. An update on another output can wait that long, and an idle
+  desktop costs one wake-up per interval. A single selected output still
+  blocks for the whole timeout.
+- Every update copies that output's whole image into the frame.
+- Outputs attached or detached later are picked up on the next restart, and
+  the host does not yet resize its encoder or input bounds after a restart
+  (md-pvlj).
+
+The synthetic cells cover a three-output layout (negative origin, gap,
+portrait), pixel-exact composition, the pointer save-under across outputs,
+and pointer ownership. The console cells run `all` on the VM's single
+output through the rotation and pointer cells, which exercises the composed
+path on real frames. Real multi-monitor and multi-adapter hardware is not
+covered.
 
 ## Real lock/disconnect qualification
 

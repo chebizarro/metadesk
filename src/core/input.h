@@ -44,8 +44,10 @@ typedef struct {
     const char *wayland_display;
     /* Global desktop bounds of the captured output that the client's
      * frame-relative coordinates address (md_capture_get_output_rect; macOS:
-     * CoreGraphics global points). output_width == 0 keeps the legacy
-     * mapping: frame coordinates are global, display at the origin. */
+     * CoreGraphics global points; Windows: physical virtual-desktop pixels,
+     * the outputs' bounding rectangle for DXGI "all").
+     * output_width == 0 keeps the legacy mapping: frame coordinates are
+     * global, display at the origin. */
     int32_t  output_x, output_y;
     uint32_t output_width, output_height;
 } MdInputConfig;

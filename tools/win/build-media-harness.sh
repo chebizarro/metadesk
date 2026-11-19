@@ -25,9 +25,10 @@ $CXX $CXXFLAGS -c "$ROOT/src/core/capture_dxgi.cpp" -o "$OUT/capture_dxgi.o"
 $CXX $CXXFLAGS -c "$ROOT/src/core/input_sendinput.cpp" -o "$OUT/input_sendinput.o"
 $CC $CFLAGS -c "$ROOT/src/core/log.c" -o "$OUT/log.o"
 $CC $CFLAGS -c "$ROOT/src/core/input.c" -o "$OUT/input.o"
+$CC $CFLAGS -c "$ROOT/src/core/capture.c" -o "$OUT/capture.o"
 echo "== link test_capture_dxgi_win.exe"
 $CXX $CXXFLAGS -o "$OUT/test_capture_dxgi_win.exe" "$ROOT/tests/test_capture_dxgi_win.cpp" \
-  "$OUT/log.o" -ld3d11 -ldxgi -lgdi32 -luser32
+  "$OUT/capture.o" "$OUT/log.o" -ld3d11 -ldxgi -lgdi32 -luser32
 echo "== link test_sendinput_win.exe"
 $CXX $CXXFLAGS -o "$OUT/test_sendinput_win.exe" "$ROOT/tests/test_sendinput_win.cpp" \
   "$OUT/input.o" "$OUT/log.o" -luser32
