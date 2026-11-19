@@ -71,13 +71,63 @@ a grant, and malformed or duplicate records deny.
 - **Host role changes** (revocation of the binding) stop the bridge, after which
   this source denies.
 - Readiness and every accepted list version are logged to stderr, for example
-  `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent`.
+  `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent (1 also input)`.
 
-**Scope note.** An admitted MCP principal gets the host's whole MCP tool
-surface. Action tools are present unless the host runs with `--no-input` or
-has no input backend. Unlike video sessions, `agent` without `input` does not
-yet hide action tools from MCP. Grant `agent` to MCP agents accordingly, or run
-`--no-input`. Per-principal `input` gating is tracked as a follow-up.
+## Per-principal tool capabilities (md-5km)
+
+Admission is not the whole story: each request also carries its principal's
+**effective capabilities**, computed when that request is authenticated, and
+MCP dispatch gates tools on them. The rule matches video sessions: the
+accessibility read tools (`metadesk_find`, `_subtree`, `_node`, `_focused`,
+`_windows`) and the `metadesk://` resources need `agent`, and the nine action
+tools (`metadesk_click` … `metadesk_screenshot`) need `agent` **and**
+`input`. No grant implies another one.
+
+| Principal | Effective capabilities |
+|---|---|
+| Host allowlist (NIP-98, live) | the entry's current `v1:` grant: `agent` is required to be admitted, and `input` adds actions |
+| Static npub (`--mcp-allow-npub`, `--mcp-allow-file`) | all |
+| Bearer token (`--mcp-token-file`) | all |
+| No credential configured (loopback only) | all |
+| stdio (`--mcp`) | all: host-local, with no network principal |
+
+"All" still means **subject to host policy**. Under `--no-input`, or with no
+ready input backend, action tools are not registered at all. If input is lost
+at runtime they return `isError` (md-ah9.1). Capabilities only narrow what the
+host offers; they never add tools.
+
+For a principal without `input`:
+
+- `tools/list` omits the action tools.
+- `tools/call` of an action tool (clients may call tools that were not listed)
+  returns a normal result with `isError: true` and the text
+  `Error: tool 'metadesk_click' requires the 'input' grant, which this MCP principal lacks`.
+  The tool handler never runs and no input is injected. An unknown tool name
+  is still a JSON-RPC error.
+- `metadesk://session-info` lists the effective capabilities: the host's,
+  narrowed to the principal's grant.
+
+**Grant changes apply to the next request.** Every POST is authenticated
+afresh, and the grant is read from the live list at that moment. Nothing is
+cached per connection or per MCP session. Granting `input` makes the actions
+appear on the next `tools/list` and succeed on the next call. Removing it
+refuses the very next call. An `input`-only or `video`-only grant is not
+admitted (401). Open SSE streams carry notifications only, never tool
+results. They are rechecked before every broadcast and dropped once the grant
+no longer includes `agent`. Metadesk does not send
+`notifications/tools/list_changed`, so a client that cached an earlier
+`tools/list` learns of a narrower grant from the `isError` on its next call.
+
+**Why static and bearer principals keep all capabilities.** They are
+deploy-time operator credentials: a 0600 token file, CLI flags, or a file the
+operator wrote. They have no grant vocabulary, and they predate grants.
+Narrowing them would silently remove actions from existing deployments.
+The operator who can configure them can also configure the host's
+`--no-input`, so a per-credential restriction would add no protection against
+that operator. To give an agent read-only access, grant it `agent` without `input` in
+the host allowlist and configure no static credential for it. A static
+listing wins over the live list (as above), so a key that is both statically
+listed and live-granted `agent` keeps all capabilities.
 
 ### Cost of `--mcp-allow-host-list`
 
@@ -173,6 +223,12 @@ restore), and needs no new install target or packaging.
 ## Tests
 
 - `MCP HTTP+SSE transport` (`tests/test_mcp_http.c`) covers:
+  - per-principal tool capabilities over real signed HTTP requests: a live
+    `agent`-only grant lists no action tool and gets `isError` naming `input`.
+    Adding `input` enables the actions on the next request, and removing it
+    refuses the next call. `input`/`video` without `agent` get 401. Static
+    npub, bearer and credential-less loopback callers keep all tools. A live
+    SSE stream is dropped once its grant loses `agent`;
   - the live authorizer fails closed before it is ready;
   - grants and revocations apply on the next request;
   - invalid events never reach the authorizer;
@@ -189,10 +245,20 @@ restore), and needs no new install target or packaging.
   - an `agent`-granted npub succeeds (initialize, tools, ping, SSE notification);
   - unlisted and `video`-only npubs get 401;
   - live revocation and re-grant work without a restart;
+  - an `agent`-only grant lists no action tool (`act` stands in for one) and
+    gets `isError` naming `input` on call. Publishing `v1:agent,input` enables
+    it on the next request, and publishing `v1:agent` again refuses it;
+  - a static `--allow-npub` principal keeps the full tool surface, even though
+    its live grant is `video`-only;
   - prompt exit on EOF;
   - the NIP-5F socket-signer path;
-  - exactly one allowlist-only REQ on the relay.
+  - exactly one allowlist-only REQ per host on the relay.
 - `MCP server core` covers the new CLI rejections.
+- `MCP accessibility queries` (`tests/test_mcp.c`) drives the real tool set
+  through a bridge with mock input. Per caller grant, it checks the listed
+  tools (5 for agent-only, 14 for agent+input or host-local stdio). It checks
+  `isError` naming each missing grant, that no input reaches the backend on a
+  refusal, and the caller-narrowed `session-info`.
 
 ## Diff-scoped Nostr protocol review
 

@@ -12,6 +12,7 @@
 #include <cjson/cJSON.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <pthread.h>
 
 #ifdef __cplusplus
@@ -47,7 +48,19 @@ typedef struct {
     cJSON              *input_schema; /* JSON Schema for arguments (owned) */
     MdMcpToolHandlerFn  handler;
     void               *userdata;
+    /* MD_CAP_* bits (session.h) the caller must hold; 0 = none. A caller
+     * lacking any of them does not see the tool in tools/list, and
+     * tools/call returns isError naming the missing grant. */
+    uint32_t            required_caps;
 } MdMcpTool;
+
+/* ── Caller capabilities ─────────────────────────────────────── */
+
+/* Effective MD_CAP_* grant of the principal a message is dispatched for.
+ * Host-local and operator-configured callers (stdio, bearer token, static
+ * npub allowlist, unauthenticated loopback) hold every bit: only host
+ * policy (--no-input, input readiness) restricts them. */
+#define MD_MCP_CALLER_ALL_CAPS UINT32_MAX
 
 /* ── Resource definition ─────────────────────────────────────── */
 
@@ -123,6 +136,19 @@ int md_mcp_server_handle_message(MdMcpServer *server,
 int md_mcp_server_handle_message_with_sink(MdMcpServer *server,
                                            const char *json, size_t len,
                                            MdMcpWriteFn sink, void *sink_ud);
+
+/* As md_mcp_server_handle_message_with_sink() (which dispatches with
+ * MD_MCP_CALLER_ALL_CAPS), on behalf of a caller holding `caller_caps`.
+ * Network transports pass each request's freshly authenticated grant, so
+ * a grant change applies to the next request. */
+int md_mcp_server_handle_message_as(MdMcpServer *server,
+                                    const char *json, size_t len,
+                                    MdMcpWriteFn sink, void *sink_ud,
+                                    uint32_t caller_caps);
+
+/* For handlers: the current request's caller_caps when called from the
+ * thread dispatching it; 0 (no caller) otherwise. */
+uint32_t md_mcp_server_caller_caps(MdMcpServer *server);
 
 /* ── Notifications ───────────────────────────────────────────── */
 

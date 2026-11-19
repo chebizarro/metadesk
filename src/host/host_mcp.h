@@ -10,6 +10,7 @@
 #define MD_HOST_MCP_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct HostMcpAcl HostMcpAcl;
 
@@ -21,9 +22,10 @@ typedef struct HostMcpAcl HostMcpAcl;
  * SIGINT/SIGTERM already (bridge threads inherit the mask). */
 HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count);
 
-/* MdMcpHttpConfig.nip98_authorize: true only if the live, loaded list grants
- * pubkey_hex the agent capability (md-ikr v1 format). */
-bool host_mcp_acl_authorize(const char *pubkey_hex, void *acl);
+/* MdMcpHttpConfig.nip98_grant: pubkey_hex's agent/input grant from the live,
+ * loaded list (md-ikr v1 format); 0 while not loaded or unlisted. The MCP
+ * transport admits only a grant with agent and gates actions on input. */
+uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *acl);
 
 /* Stop the bridge, join the readiness logger and release the host role. */
 void host_mcp_acl_stop(HostMcpAcl *acl);

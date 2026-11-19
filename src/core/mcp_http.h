@@ -36,15 +36,20 @@ typedef struct {
     const char *const *allow_npubs;
     size_t        allow_npub_count;
     const char   *allow_file;    /* one npub per line; blank/# lines ignored */
-    /* Optional live NIP-98 authorizer (md-ah9.3), e.g. the host role's
-     * NIP-51 metadesk-allowlist. Consulted only after the event's signature,
-     * kind, time window, u, method and payload validate, and only for a
-     * signer that the static allow_npubs/allow_file set does not contain
-     * (sources are a union). Must be thread-safe, non-blocking and fail
-     * closed: false while its source is not ready. Rechecked before every
+    /* Optional live NIP-98 grant source (md-ah9.3), e.g. the host role's
+     * NIP-51 metadesk-allowlist. Returns the signer's MD_CAP_* grant
+     * (session.h); only a grant including MD_CAP_AGENT is admitted, and
+     * that grant gates the request's tools (md-5km: actions need
+     * MD_CAP_INPUT too). Consulted only after the event's signature, kind,
+     * time window, u, method and payload validate, and only for a signer
+     * that the static allow_npubs/allow_file set does not contain (sources
+     * are a union; static, bearer and credential-less loopback callers get
+     * MD_MCP_CALLER_ALL_CAPS). Called again for every request, so a grant
+     * change applies to the next one. Must be thread-safe, non-blocking and
+     * fail closed: 0 while its source is not ready. Rechecked before every
      * SSE broadcast so a revoked stream is dropped without a restart. */
-    bool        (*nip98_authorize)(const char *pubkey_hex, void *userdata);
-    void         *nip98_authorize_userdata;
+    uint32_t    (*nip98_grant)(const char *pubkey_hex, void *userdata);
+    void         *nip98_grant_userdata;
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
     int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
     int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;

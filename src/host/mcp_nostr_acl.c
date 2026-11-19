@@ -37,7 +37,7 @@ static void acl_owner_revoked(void *userdata) {
 /* Report readiness transitions and each accepted list replacement for
  * operators (and as the e2e test's barrier). Waits on the bridge's condition
  * variable, woken by EOSE/CLOSED/connection boundaries and accepted newer
- * events; it is not a readiness gate (authorize() already denies unless
+ * events; it is not a readiness gate (host_mcp_acl_grant() already denies unless
  * LOADED) and never a timer. */
 static void *acl_ready_logger(void *arg) {
     HostMcpAcl *acl = arg;
@@ -46,17 +46,20 @@ static void *acl_ready_logger(void *arg) {
     while (md_nostr_allowlist_wait_change(acl->nostr, &state, &version) == 0) {
         if (state == MD_NOSTR_ACL_LOADED) {
             MdAllowlistEntry *entries = NULL;
-            size_t count = 0, agents = 0;
+            size_t count = 0, agents = 0, inputs = 0;
             if (md_nostr_allowlist_snapshot(acl->nostr, &entries, &count) != 0) continue;
             for (size_t i = 0; i < count; i++) {
                 uint32_t caps = 0;
-                if (!md_nostr_parse_caps(entries[i].caps, &caps) && (caps & MD_CAP_AGENT))
-                    agents++;
+                if (md_nostr_parse_caps(entries[i].caps, &caps) || !(caps & MD_CAP_AGENT))
+                    continue;
+                agents++;
+                if (caps & MD_CAP_INPUT) inputs++;
             }
             free(entries);
-            fprintf(stderr, "host[mcp]: host allowlist %s (v%llu): %zu member(s), %zu with agent\n",
+            fprintf(stderr, "host[mcp]: host allowlist %s (v%llu): %zu member(s), "
+                            "%zu with agent (%zu also input)\n",
                     logged == MD_NOSTR_ACL_LOADED ? "updated" : "loaded",
-                    (unsigned long long)version, count, agents);
+                    (unsigned long long)version, count, agents, inputs);
         } else if (state != logged) {
             fprintf(stderr, "host[mcp]: host allowlist history %s; "
                             "host-allowlist NIP-98 grants deny until a relay delivers it\n",
@@ -93,15 +96,17 @@ HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count) {
         return NULL;
     }
     acl->ready_started = pthread_create(&acl->ready_thread, NULL, acl_ready_logger, acl) == 0;
-    fprintf(stderr, "host[mcp]: NIP-98 also authorized by host allowlist (agent grant) "
-                    "for %.*s... on %d relay(s)\n", 12, md_nostr_get_npub(acl->nostr), relay_count);
+    fprintf(stderr, "host[mcp]: NIP-98 also authorized by host allowlist "
+                    "(agent grant; action tools need input) for %.*s... on %d relay(s)\n", 12, md_nostr_get_npub(acl->nostr), relay_count);
     return acl;
 }
 
-bool host_mcp_acl_authorize(const char *pubkey_hex, void *userdata) {
+uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *userdata) {
     HostMcpAcl *acl = userdata;
-    return acl && acl->nostr &&
-        md_nostr_granted_capabilities(acl->nostr, pubkey_hex, MD_CAP_AGENT) == MD_CAP_AGENT;
+    /* MCP has no video: only the agent (admission) and input (actions) bits. */
+    return acl && acl->nostr
+        ? md_nostr_granted_capabilities(acl->nostr, pubkey_hex, MD_CAP_AGENT | MD_CAP_INPUT)
+        : 0;
 }
 
 void host_mcp_acl_stop(HostMcpAcl *acl) {

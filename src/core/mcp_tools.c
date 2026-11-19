@@ -587,6 +587,9 @@ int md_mcp_register_tools(MdMcpServer *server, MdMcpToolCtx *tool_ctx)
                 : build_schema(tool_defs[i].fields, tool_defs[i].field_count),
             .handler = tool_defs[i].read_kind ? read_tool_handler : tool_handler,
             .userdata = &hctxs[i],
+            /* As for session packets: trees need agent, actions agent+input. */
+            .required_caps = tool_defs[i].read_kind
+                ? MD_CAP_AGENT : MD_CAP_AGENT | MD_CAP_INPUT,
         };
 
         hctxs[i].read_schema = tool.input_schema;

@@ -547,6 +547,7 @@ static void test_resources_with_session(void)
 
     MdMcpResourceCtx res_ctx = {
         .snapshot = NULL,  /* no real a11y in test */
+        .server = s,
         .session = &session,
         .agent = NULL,
         .tree_format = MD_TREE_FORMAT_JSON,
@@ -1370,6 +1371,171 @@ static void test_resource_tree_formats(void)
     MD_CHECK(fixture.unsubscribes == 3);
     query_a11y_fini(&a11y);
     PASS("resource formats and JSON action fallback/deltas for default/compact/JSON bridges");
+}
+
+/* ── Per-caller capability gating (md-5km) ────────────────────── */
+
+static cJSON *request_as(MdMcpServer *server, const char *request, uint32_t caps)
+{
+    clear_responses();
+    MD_CHECK(md_mcp_server_handle_message_as(server, request, strlen(request),
+                                             capture_write, NULL, caps) == 0);
+    return last_response();
+}
+
+/* tools/list as `caps`: tool count and whether any action tool is listed. */
+static int list_tools_as(MdMcpServer *server, uint32_t caps, bool *has_action)
+{
+    cJSON *resp = request_as(server, "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/list\"}", caps);
+    cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
+    *has_action = false;
+    cJSON *tool;
+    cJSON_ArrayForEach(tool, tools) {
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(tool, "name"));
+        const char *actions[] = { "metadesk_click", "metadesk_type", "metadesk_set_value",
+                                  "metadesk_key_combo", "metadesk_screenshot" };
+        for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); i++)
+            if (name && strcmp(name, actions[i]) == 0) *has_action = true;
+    }
+    int n = cJSON_GetArraySize(tools);
+    cJSON_Delete(resp);
+    return n;
+}
+
+/* tools/call as `caps`; returns the first content text (caller frees) and
+ * whether the result was a tool error. */
+static char *call_as(MdMcpServer *server, const char *name, const char *args,
+                     uint32_t caps, bool *is_error)
+{
+    char *message = NULL;
+    MD_CHECK(asprintf(&message,
+        "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"%s\",\"arguments\":%s}}", name, args) >= 0);
+    cJSON *resp = request_as(server, message, caps);
+    free(message);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    MD_CHECK(cJSON_IsObject(result)); /* a tool error, never a protocol error */
+    *is_error = cJSON_IsTrue(cJSON_GetObjectItem(result, "isError"));
+    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(
+        cJSON_GetArrayItem(cJSON_GetObjectItem(result, "content"), 0), "text"));
+    char *copy = strdup(text ? text : "");
+    cJSON_Delete(resp);
+    return copy;
+}
+
+static int session_caps_as(MdMcpServer *server, uint32_t caps, bool *has_input)
+{
+    cJSON *resp = request_as(server, "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"resources/read\","
+                             "\"params\":{\"uri\":\"metadesk://session-info\"}}", caps);
+    cJSON *contents = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "contents");
+    cJSON *info = cJSON_Parse(cJSON_GetStringValue(cJSON_GetObjectItem(
+        cJSON_GetArrayItem(contents, 0), "text")));
+    cJSON *arr = cJSON_GetObjectItem(info, "capabilities");
+    *has_input = false;
+    cJSON *cap;
+    cJSON_ArrayForEach(cap, arr)
+        if (strcmp(cJSON_GetStringValue(cap), "input") == 0) *has_input = true;
+    int n = cJSON_GetArraySize(arr);
+    cJSON_Delete(info);
+    cJSON_Delete(resp);
+    return n;
+}
+
+static void test_caller_caps_gate_tools(void)
+{
+    static const MdA11yBackend backend = {
+        .get_tree = query_get_tree, .subscribe_changes = query_subscribe,
+        .unsubscribe_changes = query_unsubscribe,
+    };
+    QueryFixture fixture = {0};
+    MdA11yCtx a11y = { .vtable = &backend, .backend_data = &fixture };
+    query_a11y_init(&a11y);
+    MdMcpBridgeConfig config = {
+        .a11y = &a11y, .input = &ready_input, .settle_ms = 1,
+        .stdio_in_fd = -1, .stdio_out_fd = -1,
+    };
+    MdMcpBridge *bridge = md_mcp_bridge_create(&config);
+    MD_CHECK(bridge != NULL);
+    if (!bridge) { query_a11y_fini(&a11y); return; }
+    MdMcpServer *server = md_mcp_bridge_get_server(bridge);
+    md_mcp_server_set_write_fn(server, capture_write, NULL);
+    do_init(server);
+    const uint32_t agent = MD_CAP_AGENT, agent_input = MD_CAP_AGENT | MD_CAP_INPUT;
+    bool action, err, input;
+
+    /* tools/list is per caller: agent-only sees only the read tools. */
+    MD_CHECK(list_tools_as(server, agent, &action) == 5 && !action);
+    MD_CHECK(list_tools_as(server, agent | MD_CAP_VIDEO, &action) == 5 && !action);
+    MD_CHECK(list_tools_as(server, agent_input, &action) == 14 && action);
+    MD_CHECK(list_tools_as(server, MD_MCP_CALLER_ALL_CAPS, &action) == 14 && action);
+    MD_CHECK(list_tools_as(server, MD_CAP_INPUT, &action) == 0 && !action);
+    MD_CHECK(list_tools_as(server, 0, &action) == 0);
+
+    /* Unlisted action tools are refused with a tool error naming the grant,
+     * before the handler (no input reaches the backend). */
+    int keys_before = input_key_calls;
+    const struct { const char *name, *args; } actions[] = {
+        { "metadesk_key_combo", "{\"keys\":[\"ctrl\",\"s\"]}" },
+        { "metadesk_click", "{\"target_id\":\"n1\"}" },
+        { "metadesk_type", "{\"target_id\":\"n1\",\"text\":\"x\"}" },
+        { "metadesk_set_value", "{\"target_id\":\"n1\",\"text\":\"x\"}" },
+        { "metadesk_screenshot", "{}" },
+    };
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); i++) {
+        char *text = call_as(server, actions[i].name, actions[i].args, agent, &err);
+        MD_CHECK(err && strstr(text, "requires the 'input' grant") && strstr(text, actions[i].name));
+        MD_CHECK(!strstr(text, "'agent'"));
+        free(text);
+    }
+    MD_CHECK(input_key_calls == keys_before);
+    char *text = call_as(server, "metadesk_key_combo", actions[0].args, 0, &err);
+    MD_CHECK(err && strstr(text, "'agent', 'input' grant"));
+    free(text);
+    text = call_as(server, "metadesk_find", "{\"role\":\"label\"}", MD_CAP_INPUT, &err);
+    MD_CHECK(err && strstr(text, "requires the 'agent' grant"));
+    free(text);
+    MD_CHECK(input_key_calls == keys_before);
+
+    /* Reads stay available to agent-only; agent+input executes actions. */
+    text = call_as(server, "metadesk_find", "{\"role\":\"label\"}", agent, &err);
+    MD_CHECK(!err && strstr(text, "LBL[label]"));
+    free(text);
+    text = call_as(server, "metadesk_key_combo", actions[0].args, agent_input, &err);
+    MD_CHECK(!err && input_key_calls == keys_before + 4);
+    free(text);
+    /* The very next request applies a narrower grant (no cached state). */
+    text = call_as(server, "metadesk_key_combo", actions[0].args, agent, &err);
+    MD_CHECK(err && input_key_calls == keys_before + 4);
+    free(text);
+
+    /* Unknown tools remain a protocol error for any caller. */
+    cJSON *resp = request_as(server, "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\","
+                             "\"params\":{\"name\":\"nope\",\"arguments\":{}}}", agent);
+    MD_CHECK(cJSON_GetObjectItem(resp, "error") != NULL);
+    cJSON_Delete(resp);
+
+    /* session-info reports the effective, caller-narrowed capabilities. */
+    MD_CHECK(session_caps_as(server, agent, &input) == 1 && !input);
+    MD_CHECK(session_caps_as(server, agent_input, &input) == 2 && input);
+    MD_CHECK(session_caps_as(server, MD_MCP_CALLER_ALL_CAPS, &input) == 2 && input);
+    /* Outside a dispatch there is no caller. */
+    MD_CHECK(md_mcp_server_caller_caps(server) == 0);
+    MD_CHECK(md_mcp_server_caller_caps(NULL) == 0);
+
+    /* Host-local dispatch (stdio) keeps the full host surface. */
+    clear_responses();
+    const char *list = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":34}";
+    md_mcp_server_handle_message(server, list, strlen(list));
+    resp = last_response();
+    MD_CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools")) == 14);
+    cJSON_Delete(resp);
+
+    md_mcp_bridge_destroy(bridge);
+    md_a11y_node_free(a11y.last_snapshot);
+    a11y.last_snapshot = NULL;
+    query_a11y_fini(&a11y);
+    clear_responses();
+    PASS("per-caller caps: agent-only hides/refuses actions naming 'input'; agent+input acts");
 }
 
 static void read_cached_resource(MdMcpServer *server)
@@ -2633,6 +2799,7 @@ int main(int argc, char **argv)
         test_snapshot_invalidation_and_time();
         test_snapshot_subscribe_failure();
         test_resource_tree_formats();
+        test_caller_caps_gate_tools();
         test_bridge_destroy_unsubscribes();
         test_unsubscribe_drains_in_flight_callback();
         test_bridge_destroy_blocked_write(0);
