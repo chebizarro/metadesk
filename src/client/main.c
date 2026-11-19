@@ -68,6 +68,8 @@ typedef struct {
 
     /* Nostr session negotiation state */
     char          expected_host_pk[128]; /* pubkey hex of host we're connecting to */
+    MdSessionRequest pending_req;     /* current request (g_negotiation_mu) */
+    int           request_pending;    /* accepting an answer to pending_req */
     char          accepted_session_id[64]; /* from session_accept DM     */
     char          stream_token[65];       /* ephemeral DM-only proof    */
     uint32_t      granted_caps;       /* from session_accept DM          */
@@ -117,10 +119,15 @@ static void client_owner_revoked(void *data) {
     if (ctx->session_ch) go_channel_close(ctx->session_ch);
 }
 
+/* Guards pending_req/request_pending and the accepted_* fields between the
+ * DM worker and the negotiating thread. */
+static pthread_mutex_t g_negotiation_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
-                          void *userdata) {
+                          const MdNostrDmInfo *info, void *userdata) {
     ClientCtx *ctx = userdata;
-    if (!ctx || !content || !sender_pubkey_hex || !client_owner_current(ctx)) return;
+    if (!ctx || !content || !sender_pubkey_hex || !info || !client_owner_current(ctx))
+        return;
 
     /* Verify the DM came from the expected host */
     if (ctx->expected_host_pk[0] != '\0' &&
@@ -130,18 +137,37 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         return;
     }
 
-    /* Try to parse as session_accept */
     MdSessionAccept acc;
-    if (!ctx->session_accepted &&
-        md_session_accept_from_json(content, &acc) == 0 && acc.stream_token[0]) {
+    if (md_session_accept_from_json(content, &acc) != 0) {
+        OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
+        return;
+    }
+
+    /* md-6ns: only the answer to this client's current request counts.
+     * Relay history (NIP-59 timestamps defeat `since`) replays acceptances
+     * for earlier requests and sessions; they are ignored, idempotently. */
+    pthread_mutex_lock(&g_negotiation_mu);
+    bool matched = ctx->request_pending && !ctx->session_accepted &&
+        md_session_accept_matches_request(&acc, &ctx->pending_req,
+                                          info->rumor_created_at);
+    if (matched) {
         memcpy(ctx->stream_token, acc.stream_token, sizeof(ctx->stream_token));
-        strncpy(ctx->accepted_session_id, acc.session_id,
-                sizeof(ctx->accepted_session_id) - 1);
+        snprintf(ctx->accepted_session_id, sizeof(ctx->accepted_session_id),
+                 "%s", acc.session_id);
         ctx->granted_caps = acc.granted;
         ctx->accepted_tree_format = acc.tree_format;
         ctx->session_accepted = 1;
+        ctx->request_pending = 0;
+    }
+    pthread_mutex_unlock(&g_negotiation_mu);
+    if (matched) {
         if (ctx->session_ch)
             go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
+    } else if (acc.stream_token[0]) {
+        fprintf(stderr, "client: ignoring session_accept not answering the current "
+                "request (request_id=%.8s%s, %s)\n",
+                acc.request_id[0] ? acc.request_id : "none",
+                acc.request_id[0] ? "..." : "", info->live ? "live" : "history");
     }
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
 }
@@ -235,8 +261,11 @@ static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
     }
 }
 
+/* Caller holds g_negotiation_mu. */
 static void reset_session_accept_state(ClientCtx *ctx) {
     if (!ctx) return;
+    ctx->request_pending = 0;
+    memset(&ctx->pending_req, 0, sizeof(ctx->pending_req));
     ctx->accepted_session_id[0] = '\0';
     OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
     ctx->granted_caps = 0;
@@ -251,8 +280,6 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
     if (!nostr || !ctx || !host_pubkey_hex || !out_req || !client_owner_current(ctx))
         return -1;
 
-    reset_session_accept_state(ctx);
-
     MdSessionRequest req = {
         .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
         .tree_format = MD_TREE_FORMAT_COMPACT,
@@ -261,31 +288,68 @@ static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
     if (our_pk)
         strncpy(req.fips_addr, our_pk, sizeof(req.fips_addr) - 1);
 
+    /* A fresh id per negotiation (including reconnects); its authenticated
+     * validity window is this client's own wait for the answer. */
+    uint64_t wait_ms = (uint64_t)timeout_ms * 2;
+    uint64_t lifetime_s = (wait_ms + 999) / 1000;
+    if (lifetime_s > MD_SESSION_REQUEST_MAX_LIFETIME_S)
+        lifetime_s = MD_SESSION_REQUEST_MAX_LIFETIME_S;
+    if (md_session_request_prepare(&req, (int64_t)time(NULL), (uint32_t)lifetime_s) != 0) {
+        fprintf(stderr, "ERROR: failed to generate session request id\n");
+        return -1;
+    }
+
     char *req_json = md_session_request_to_json(&req);
     if (!req_json) {
         fprintf(stderr, "ERROR: failed to serialize session request\n");
         return -1;
     }
 
-    printf("client: sending session request DM...\n");
+    /* Arm correlation before publishing: the answer may arrive first. */
+    pthread_mutex_lock(&g_negotiation_mu);
+    reset_session_accept_state(ctx);
+    ctx->pending_req = req;
+    ctx->request_pending = 1;
+    pthread_mutex_unlock(&g_negotiation_mu);
+
+    printf("client: sending session request DM (request_id=%.8s...)...\n", req.request_id);
     if (md_nostr_send_session_request(nostr, host_pubkey_hex, req_json) != 0) {
         fprintf(stderr, "ERROR: failed to send session request\n");
         free(req_json);
+        pthread_mutex_lock(&g_negotiation_mu);
+        reset_session_accept_state(ctx);
+        pthread_mutex_unlock(&g_negotiation_mu);
         return -1;
     }
     free(req_json);
 
+    /* Event-driven wait on the accept channel. A wakeup can be stale (an
+     * earlier negotiation's signal), so re-check state until the deadline. */
     void *dummy = NULL;
     GoSelectCase cases[] = {
         { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &dummy },
     };
-    go_select_timeout(cases, 1, (uint64_t)timeout_ms * 2);
+    int64_t deadline_us = now_us() + (int64_t)wait_ms * 1000;
+    int accepted = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_negotiation_mu);
+        accepted = ctx->session_accepted;
+        pthread_mutex_unlock(&g_negotiation_mu);
+        int64_t left_us = deadline_us - now_us();
+        if (accepted || left_us <= 0 || !client_owner_current(ctx))
+            break;
+        go_select_timeout(cases, 1, (uint64_t)(left_us + 999) / 1000);
+    }
+    pthread_mutex_lock(&g_negotiation_mu);
+    ctx->request_pending = 0; /* late answers to this request are ignored */
+    accepted = ctx->session_accepted;
+    pthread_mutex_unlock(&g_negotiation_mu);
 
     if (!client_owner_current(ctx)) {
         fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
         return -1;
     }
-    if (!ctx->session_accepted) {
+    if (!accepted) {
         fprintf(stderr, "ERROR: timed out waiting for session accept\n");
         return -1;
     }

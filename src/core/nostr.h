@@ -94,8 +94,21 @@ typedef struct {
  * admission/cancellable operations stop. Must not destroy the bridge here. */
 typedef void (*MdNostrOwnerRevokedCallback)(void *userdata);
 
+/* Delivery facts for one validated DM. NIP-59 randomizes the seal and
+ * gift-wrap timestamps, never the rumor's: rumor_created_at is the sender's
+ * authenticated send time. `live` is true only when the gift wrap arrived
+ * after its relay subscription's EOSE, in that subscription's ordered
+ * delivery (catch-up -> live boundary); stored history and post-reconnect
+ * catch-up are not live. Real-time commands such as session requests must
+ * not be answered from history. */
+typedef struct {
+    int64_t rumor_created_at;
+    bool    live;
+} MdNostrDmInfo;
+
 typedef void (*MdNostrDmCallback)(const char *sender_pubkey_hex,
                                   const char *content,
+                                  const MdNostrDmInfo *info,
                                   void *userdata);
 
 
@@ -182,6 +195,12 @@ void md_nostr_stop(MdNostr *n);
  * timer. Callers may use drain to await accepted work, not relay history. */
 MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *gift_wrap);
 void md_nostr_drain_dm(MdNostr *n);
+
+/* Wait until every relay's subscription has reached its catch-up -> live
+ * boundary (EOSE) or a terminal state. Returns 0 if at least one relay
+ * delivered EOSE, -1 on timeout, all-failed or stop. A readiness bound only:
+ * subscriptions stay open either way. */
+int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms);
 
 /* Deterministic lifecycle diagnostics for tests. Configure only while idle;
  * hooks run outside bridge locks and must not re-enter bridge APIs. NULL is

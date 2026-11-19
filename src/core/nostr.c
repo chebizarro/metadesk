@@ -106,9 +106,13 @@ struct MdNostr {
     bool               dm_started;
     bool               dm_busy;
     char              *dm_queue[MD_NOSTR_DM_QUEUE_CAPACITY];
+    bool               dm_live[MD_NOSTR_DM_QUEUE_CAPACITY];
     size_t             dm_head, dm_count, dm_reserved;
     char               wrap_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
     char               rumor_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
+    /* Whether each id has been delivered live (post-EOSE) yet. */
+    bool               wrap_live[MD_NOSTR_DM_DEDUP_CAPACITY];
+    bool               rumor_live[MD_NOSTR_DM_DEDUP_CAPACITY];
     size_t             wrap_next, rumor_next;
     void (*test_hook)(MdNostrTestPoint, void *);
     void *test_userdata;
@@ -231,14 +235,14 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
  * fails is terminal but supplies no trustworthy empty history. At least one
  * successful EOSE and no pending relays are required to authorize. */
 static void update_acl_readiness(MdNostr *n) {
-    if (n->acl_open) { n->acl_state = MD_NOSTR_ACL_OPEN; return; }
     bool pending = false, ok = false;
     for (size_t i = 0; i < n->relay_count; i++) {
         pending |= !n->relay_states[i].history_done;
         ok |= n->relay_states[i].history_ok;
     }
-    n->acl_state = pending ? MD_NOSTR_ACL_UNKNOWN :
+    n->acl_state = n->acl_open ? MD_NOSTR_ACL_OPEN : pending ? MD_NOSTR_ACL_UNKNOWN :
         ok ? MD_NOSTR_ACL_LOADED : MD_NOSTR_ACL_FAILED;
+    /* Also wakes md_nostr_wait_history(), which open ACLs still need. */
     pthread_cond_broadcast(&n->allowlist_cv);
 }
 
@@ -452,10 +456,30 @@ const char *md_nostr_dm_result_name(MdNostrDmResult result) {
     return (unsigned)result < sizeof(names) / sizeof(names[0]) ? names[result] : "unknown";
 }
 
-static bool recent_id(char ids[MD_NOSTR_DM_DEDUP_CAPACITY][65], const char *id) {
+static int recent_id(char ids[MD_NOSTR_DM_DEDUP_CAPACITY][65], const char *id) {
     for (size_t i = 0; i < MD_NOSTR_DM_DEDUP_CAPACITY; i++)
-        if (strcmp(ids[i], id) == 0) return true;
-    return false;
+        if (strcmp(ids[i], id) == 0) return (int)i;
+    return -1;
+}
+
+/* md-6ns: an id seen only as history (e.g. one relay's catch-up) is delivered
+ * again, once, when its first live copy arrives from any relay; real-time
+ * consumers ignore history. Every other repeat is a duplicate. */
+static bool seen_before(char ids[MD_NOSTR_DM_DEDUP_CAPACITY][65],
+                        const bool delivered_live[MD_NOSTR_DM_DEDUP_CAPACITY],
+                        const char *id, bool live, int *slot) {
+    *slot = recent_id(ids, id);
+    return *slot >= 0 && (delivered_live[*slot] || !live);
+}
+static void remember_id(char ids[MD_NOSTR_DM_DEDUP_CAPACITY][65],
+                        bool delivered_live[MD_NOSTR_DM_DEDUP_CAPACITY],
+                        size_t *next, int slot, const char *id, bool live) {
+    if (slot < 0) {
+        slot = (int)((*next)++ % MD_NOSTR_DM_DEDUP_CAPACITY);
+        memcpy(ids[slot], id, 65);
+        delivered_live[slot] = false;
+    }
+    delivered_live[slot] |= live;
 }
 
 static bool addressed_to(NostrEvent *ev, const char *pk) {
@@ -472,18 +496,19 @@ static bool addressed_to(NostrEvent *ev, const char *pk) {
     return recipients == 1;
 }
 
-static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap) {
+static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap, bool live) {
     MdNostrDmResult result = MD_NOSTR_DM_INVALID_WRAP;
     NostrEvent *seal = NULL, *rumor = NULL;
     char *seal_json = NULL, *rumor_json = NULL;
     char wrap_id[65], rumor_id[65];
+    int wrap_slot = -1, rumor_slot = -1;
     if (!nostr_nip17_validate_gift_wrap(wrap) ||
         nostr_event_validate(wrap, wrap_id) != NOSTR_EVENT_VALIDATION_OK)
         goto done;
     result = MD_NOSTR_DM_WRONG_RECIPIENT;
     if (!addressed_to(wrap, n->pk_hex)) goto done;
     result = MD_NOSTR_DM_DUPLICATE;
-    if (recent_id(n->wrap_ids, wrap_id)) goto done;
+    if (seen_before(n->wrap_ids, n->wrap_live, wrap_id, live, &wrap_slot)) goto done;
     result = MD_NOSTR_DM_DECRYPT_FAILED;
     if (md_signer_nip44_decrypt_cancellable(n->signer, nostr_event_get_pubkey(wrap),
                               nostr_event_get_content(wrap), &seal_json, n->signer_cancel) != 0)
@@ -515,14 +540,18 @@ static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap) {
     result = MD_NOSTR_DM_WRONG_RECIPIENT;
     if (!addressed_to(rumor, n->pk_hex)) goto done;
     result = MD_NOSTR_DM_DUPLICATE;
-    if (recent_id(n->rumor_ids, rumor_id)) goto done;
+    if (seen_before(n->rumor_ids, n->rumor_live, rumor_id, live, &rumor_slot)) goto done;
     /* Never use the randomized seal/wrap timestamps for freshness. */
-    memcpy(n->wrap_ids[n->wrap_next++ % MD_NOSTR_DM_DEDUP_CAPACITY], wrap_id, 65);
-    memcpy(n->rumor_ids[n->rumor_next++ % MD_NOSTR_DM_DEDUP_CAPACITY], rumor_id, 65);
+    remember_id(n->wrap_ids, n->wrap_live, &n->wrap_next, wrap_slot, wrap_id, live);
+    remember_id(n->rumor_ids, n->rumor_live, &n->rumor_next, rumor_slot, rumor_id, live);
     result = MD_NOSTR_DM_STOPPED;
     if (is_stopped(n)) goto done;
+    MdNostrDmInfo info = {
+        .rumor_created_at = nostr_event_get_created_at(rumor),
+        .live = live,
+    };
     n->cbs.on_dm(nostr_event_get_pubkey(rumor), nostr_event_get_content(rumor),
-                 n->cbs.dm_userdata);
+                 &info, n->cbs.dm_userdata);
     result = MD_NOSTR_DM_OK;
 done:
     free(seal_json); free(rumor_json);
@@ -547,13 +576,14 @@ static void *dm_worker(void *arg) {
             break;
         }
         char *json = n->dm_queue[n->dm_head];
+        bool live = n->dm_live[n->dm_head];
         n->dm_head = (n->dm_head + 1) % MD_NOSTR_DM_QUEUE_CAPACITY;
         n->dm_count--;
         n->dm_busy = true;
         pthread_mutex_unlock(&n->work_mu);
         NostrEvent *wrap = event_from_json(json);
         free(json);
-        MdNostrDmResult result = wrap ? unwrap_dm(n, wrap) : MD_NOSTR_DM_INVALID_WRAP;
+        MdNostrDmResult result = wrap ? unwrap_dm(n, wrap, live) : MD_NOSTR_DM_INVALID_WRAP;
         if (wrap) nostr_event_free(wrap);
         if (result != MD_NOSTR_DM_OK && !is_stopped(n)) {
             MD_LOG_W("DM rejected: %s", md_nostr_dm_result_name(result));
@@ -602,6 +632,9 @@ MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *wrap) {
     char *json = NULL;
     bool reserved = false;
     if (!wrap || !n->cbs.on_dm) goto done;
+    /* Ordered post-EOSE fact for this delivery; zero (history) outside the
+     * pool's single-event callback, e.g. for direct test ingress. */
+    bool live = nostr_simple_pool_get_callback_live_since(n->pool) > 0;
     pthread_mutex_lock(&n->work_mu);
     if (n->closing) result = MD_NOSTR_DM_STOPPED;
     else if (n->dm_count + n->dm_reserved >= MD_NOSTR_DM_QUEUE_CAPACITY)
@@ -624,7 +657,9 @@ MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *wrap) {
     else {
         n->dm_reserved--;
         reserved = false;
-        n->dm_queue[(n->dm_head + n->dm_count++) % MD_NOSTR_DM_QUEUE_CAPACITY] = json;
+        size_t slot = (n->dm_head + n->dm_count++) % MD_NOSTR_DM_QUEUE_CAPACITY;
+        n->dm_queue[slot] = json;
+        n->dm_live[slot] = live;
         json = NULL;
         result = MD_NOSTR_DM_OK;
         pthread_cond_broadcast(&n->work_cv);
@@ -649,6 +684,32 @@ void md_nostr_drain_dm(MdNostr *n) {
         pthread_cond_wait(&n->work_cv, &n->work_mu);
     pthread_mutex_unlock(&n->work_mu);
     operation_end(n);
+}
+
+int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms) {
+    if (!operation_begin(n)) return -1;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline); /* allowlist_cv's default clock */
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&n->allowlist_mu);
+    bool pending = true, ok = false, expired = false;
+    while (!is_stopped(n)) {
+        pending = ok = false;
+        for (size_t i = 0; i < n->relay_count; i++) {
+            pending |= !n->relay_states[i].history_done;
+            ok |= n->relay_states[i].history_ok;
+        }
+        if (!pending || expired) break;
+        /* EOSE/CLOSED/connection-state callbacks broadcast; no polling. */
+        expired = pthread_cond_timedwait(&n->allowlist_cv, &n->allowlist_mu,
+                                         &deadline) != 0;
+    }
+    pthread_mutex_unlock(&n->allowlist_mu);
+    int ret = !pending && ok && !is_stopped(n) ? 0 : -1;
+    operation_end(n);
+    return ret;
 }
 
 /* ── Event middleware ─────────────────────────────────────────

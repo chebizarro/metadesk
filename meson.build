@@ -880,6 +880,11 @@ test_host_binding = executable('test_host_binding',
   files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c'),
   dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
+test('session correlation retaining private relay', find_program('python3'),
+  args : [files('tests/test_session_history.py'), test_host_binding],
+  env : {'PYTHONDONTWRITEBYTECODE' : '1'},
+  timeout : 180,
+)
 if host_os == 'linux' or host_os == 'darwin'
   test('capability grants private relay', accounts_python,
     args : [files('tests/test_capability_grants.py'), test_host_binding, access_signer_fixture],
