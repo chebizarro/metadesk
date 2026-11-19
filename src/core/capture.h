@@ -69,6 +69,11 @@ typedef struct {
     bool     unattended;   /* Linux: consent budget capped at 10 seconds */
     bool     forget_authorization_on_stall; /* opt-in, ignored unattended */
     uint32_t consent_timeout_ms; /* 0 = 180s interactive / 10s unattended */
+    /* Windows (DXGI) output to capture: NULL or "" = the primary display, a
+     * decimal index into the attached outputs, or a GDI device name such as
+     * "\\.\DISPLAY2" (the "\\.\" prefix is optional). An unknown selection
+     * fails init. Other backends ignore it. Borrowed for the ctx lifetime. */
+    const char *output;
 } MdCaptureConfig;
 
 /* ── Backend vtable (spec §2.3.1) ────────────────────────────── */
