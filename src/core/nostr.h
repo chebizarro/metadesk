@@ -57,9 +57,13 @@ extern "C" {
 typedef struct MdNostr MdNostr;
 
 typedef enum {
-    MD_NOSTR_ACL_UNKNOWN = 0, /* history pending: deny */
+    MD_NOSTR_ACL_UNKNOWN = 0, /* not known yet: history pending, or no history
+                               * while a relay is disconnected/backoff,
+                               * rate-limited or awaiting NIP-42 AUTH: deny */
     MD_NOSTR_ACL_LOADED,      /* history complete; empty means deny all */
-    MD_NOSTR_ACL_FAILED,      /* no usable history: deny */
+    MD_NOSTR_ACL_FAILED,      /* definitely no history: every relay refused the
+                               * REQ with a terminal CLOSED (md-ip2k), or none
+                               * was issued: deny */
     MD_NOSTR_ACL_OPEN,        /* explicitly selected by configuration */
 } MdNostrAclState;
 
@@ -246,9 +250,10 @@ uint32_t md_nostr_granted_capabilities(MdNostr *n, const char *pubkey_hex,
 
 /* The same grant, plus whether it is the policy's answer: *known (if
  * non-NULL) is set, under the same lock, to false while readiness is UNKNOWN
- * or FAILED (the zero means "not known yet", not "denied") and to true for
- * LOADED/OPEN, an invalid key or non-host bridge, and once stopped or revoked
- * (every grant then denies for good). */
+ * (the zero means "not known yet", not "denied") and to true for
+ * LOADED/OPEN/FAILED, an invalid key or non-host bridge, and once stopped or
+ * revoked (every grant then denies for good). FAILED is known: every relay
+ * refused the subscription, so no history is coming until one serves it. */
 uint32_t md_nostr_granted_capabilities_known(MdNostr *n, const char *pubkey_hex,
                                             uint32_t requested, bool *known);
 
@@ -260,6 +265,12 @@ int md_nostr_parse_caps(const char *text, uint32_t *out);
  * LOADED with zero entries denies all. OPEN is only selected by config.
  * Authorize with md_nostr_granted_capabilities(), never has_allowlist(). */
 MdNostrAclState md_nostr_allowlist_state(MdNostr *n);
+
+/* Operator detail for relays that refused the allowlist subscription on
+ * their current connection (terminal CLOSED; FAILED once that is all of
+ * them): "<relay url>: <CLOSED reason>" each, "; "-joined, truncated to len.
+ * Returns how many relays refused; buf is "" when none. */
+size_t md_nostr_allowlist_refusals(MdNostr *n, char *buf, size_t len);
 
 /* Block until the readiness state or the accepted-list version differs from
  * the caller's state and version (start from UNKNOWN and 0), then store the

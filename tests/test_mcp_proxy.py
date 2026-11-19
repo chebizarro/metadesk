@@ -21,6 +21,12 @@ live agent's stream is held, not closed: its requests get 401 and a static
 principal's broadcast during the outage never reaches it. On reconnect + EOSE
 an unchanged grant resumes silently, a grant that lost input sends exactly one
 list_changed, and a grant that lost agent closes the stream.
+md-ip2k: when the only relay comes back but refuses the allowlist REQ with a
+terminal CLOSED (restricted:), authorization is a known deny: the held stream
+closes, requests get 401 and the host log names the relay and the reason
+(once, although the pool re-REQs); when the relay serves history again the
+list reloads. One refusing relay beside a live one stays live, and beside a
+relay that is down the stream is held, not closed.
 """
 import json
 import os
@@ -43,13 +49,31 @@ ALLOWLIST_FILTER = {"kinds": [30000], "authors": [HOST_PK],
 
 
 class GatedPeer(Peer):
-    """Holds allowlist history (EVENT+EOSE) until the test releases it."""
+    """Holds allowlist history (EVENT+EOSE) until the test releases it.
+    While server.refuse is set, answers every REQ with that CLOSED reason."""
     def dispatch(self, msg):
+        if msg[0] == "REQ" and self.server.refuse:
+            with self.server.lock:
+                self.server.refused += 1
+            self.send(["CLOSED", msg[1], self.server.refuse])
+            return
         if msg[0] == "REQ":
             with self.server.lock:
                 self.server.filters.extend(msg[2:])
             self.server.history_seen.set()
             assert self.server.history_release.wait(30), "history gate not released"
+        super().dispatch(msg)
+
+
+class RefusingPeer(Peer):
+    """A relay that refuses every REQ with a terminal CLOSED."""
+    def dispatch(self, msg):
+        if msg[0] == "REQ":
+            with self.server.lock:
+                self.server.refused += 1
+            self.server.refusal.set()
+            self.send(["CLOSED", msg[1], "restricted: private relay refuses this host"])
+            return
         super().dispatch(msg)
 
 
@@ -228,7 +252,11 @@ def main():
         relay.history_seen, relay.history_release = threading.Event(), threading.Event()
         relay.handshake_gate = threading.Event()
         relay.handshake_gate.set()
-        servers = [host_signer, client_signer, relay]
+        relay.refuse, relay.refused = None, 0
+        refuser = Relay()
+        refuser.RequestHandlerClass = RefusingPeer
+        refuser.refused, refuser.refusal = 0, threading.Event()
+        servers = [host_signer, client_signer, relay, refuser]
         threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
         for t in threads:
             t.start()
@@ -478,6 +506,45 @@ def main():
             assert rc == 0, held.log
             print("PASS: agent revoked during an outage: the stream closes on return")
 
+            # 7d. md-ip2k: the only relay returns but refuses the allowlist
+            # REQ (terminal restricted:). Held -> known deny: the stream
+            # closes and new requests get 401, while the static principal is
+            # unaffected. The host names the relay and reason.
+            publish(relay, sign(crypto, env, grants("v1:agent,input"), now + 11))
+            statp.expect_err("host allowlist updated (v5): 2 member(s), 1 with agent (1 also input)")
+            held = Proc([host, "mcp-proxy", "--key-file", keys["client"], surl], env, "refused")
+            procs.append(held)
+            held.send(INIT)
+            assert json.loads(held.line())["result"]["capabilities"]["tools"] == {"listChanged": True}
+            held.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            held.expect_err("notification stream open")
+            barrier(held, 50)
+            drop_relay(relay)
+            statp.expect_err("host allowlist history pending")
+            reason = "restricted: private relay refuses this host"
+            relay.refuse = reason
+            relay.handshake_gate.set()
+            line = statp.expect_err("host allowlist refused by every relay")
+            assert f"({url_relay}: {reason})" in line and "SSE streams closed" in line, line
+            held.expect_err("notification stream ended (HTTP 200)")
+            call(held, 51, "echo", {"text": "refused"})
+            expect_401(held, 51)
+            expect_acted(static, 52)
+            closed_line = f"subscription CLOSED on {url_relay}: {reason} (refused"
+            assert sum(closed_line in l for l in statp.log) == 1, statp.log
+            # The relay serves history again (the pool's own re-REQ): reload.
+            relay.refuse = None
+            statp.expect_err("host allowlist loaded (v5): 2 member(s), 1 with agent (1 also input)")
+            call(held, 53, "echo", {"text": "served again"})
+            reply = json.loads(held.line())
+            assert reply["id"] == 53 and reply["result"]["content"][0]["text"] == "served again", reply
+            assert sum(closed_line in l for l in statp.log) == 1, statp.log
+            with relay.lock:
+                assert relay.refused >= 1, relay.refused
+            rc, _ = held.close()
+            assert rc == 0, held.log
+            print("PASS: terminal CLOSED on the only relay: held stream closes, 401, reason logged once; recovers when served")
+
             rc, _ = static.close()
             assert rc == 0, static.log
             rc, _ = statp.close()
@@ -485,14 +552,50 @@ def main():
 
             # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap REQ;
             # one REQ/EOSE per host fixture run plus one per reconnect (7a-c),
-            # which the pool re-fires with since= for catch-up.
+            # which the pool re-fires with since= for catch-up, plus the one
+            # the relay served after refusing (7d; refusals are not counted),
+            # which the pool re-creates without since after CLOSED.
             with relay.lock:
                 assert relay.filters and all(
                     {k: v for k, v in f.items() if k != "since"} == ALLOWLIST_FILTER
                     for f in relay.filters), relay.filters
-                assert sum("since" not in f for f in relay.filters) == 2, relay.filters
-                assert relay.reqs == relay.eoses == 5, (relay.reqs, relay.eoses)
+                assert sum("since" not in f for f in relay.filters) == 3, relay.filters
+                assert relay.reqs == relay.eoses == 6, (relay.reqs, relay.eoses)
             print("Private relay: 1 REQ/EOSE per host connection (allowlist only), live EVENT pushes; throwaway keys")
+
+            # 8. md-ip2k: one relay that refuses beside one that serves: live.
+            url_refuser = f"ws://127.0.0.1:{refuser.server_address[1]}"
+            mixp = Proc([fixture, url_relay, url_refuser], env, "mixed-fixture")
+            procs.append(mixp)
+            mport = int(mixp.line().split()[1])
+            mixp.expect_err("host allowlist loaded (v1): 2 member(s), 1 with agent (1 also input)")
+            assert refuser.refusal.wait(20), "refusing relay never got the REQ"
+            mixed = Proc([host, "mcp-proxy", "--key-file", keys["client"],
+                          f"http://[::1]:{mport}/mcp"], env, "mixed")
+            procs.append(mixed)
+            mixed.send(INIT)
+            assert json.loads(mixed.line())["result"]["capabilities"]["tools"] == {"listChanged": True}
+            mixed.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            mixed.expect_err("notification stream open")
+            barrier(mixed, 60)
+            expect_acted(mixed, 61)
+            # The serving relay drops: refused + down is unknown, so held.
+            drop_relay(relay)
+            mixp.expect_err("host allowlist history pending")
+            call(mixed, 62, "echo", {"text": "during outage"})
+            expect_401(mixed, 62)
+            relay.handshake_gate.set()
+            mixp.expect_err("host allowlist loaded (v1)")
+            barrier(mixed, 63)
+            assert not any("notification stream ended" in l for l in mixed.log), mixed.log
+            assert not any("refused by every relay" in l for l in mixp.log), mixp.log
+            assert sum(f"subscription CLOSED on {url_refuser}: restricted: " in l
+                       for l in mixp.log) == 1, mixp.log
+            rc, _ = mixed.close()
+            assert rc == 0, mixed.log
+            rc, _ = mixp.close()
+            assert rc == 0, mixp.log
+            print("PASS: one refusing relay beside a live one stays live; beside a dropped one the stream is held")
         finally:
             relay.history_release.set()
             for proc in procs:

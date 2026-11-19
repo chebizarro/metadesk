@@ -25,7 +25,10 @@ extern "C" {
 /* A nip98_grant result meaning "this source cannot answer right now" (md-554):
  * e.g. its history is pending or every relay is down. Not a grant: requests
  * are refused as for 0, but open SSE streams the source admitted are held
- * (kept open, sent nothing) instead of closed, until a known answer. */
+ * (kept open, sent nothing) instead of closed, until a known answer. Only
+ * for outages the source expects to end: once it knows no answer is coming
+ * (e.g. every relay refused its subscription, md-ip2k) it must answer 0 and
+ * call on_change, so held streams close rather than wait indefinitely. */
 #define MD_MCP_GRANT_UNKNOWN 0x80000000u
 
 typedef struct MdMcpHttp MdMcpHttp;

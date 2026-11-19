@@ -8,6 +8,7 @@ Uses the existing stdlib websocket fixture, private loopback ports and test keys
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -104,8 +105,15 @@ def control(servers, command):
         elif op == "eose":
             s.emit("EOSE")
         elif op == "closed":
-            s.emit("CLOSED", "restricted: private fixture")
+            # The client's pool re-fires the REQ afterwards; the fixture then
+            # holds that subscription (no reply) until the test answers it.
+            s.emit("CLOSED", command.get("reason", "restricted: private fixture"))
             s.active.subs.clear()
+        elif op == "drop":
+            # Transient loss: disconnect, hold the reconnect at the handshake
+            # until release_connection.
+            s.handshake_gate.clear()
+            s.active.request.shutdown(socket.SHUT_RDWR)
         elif op == "event":
             s.emit("EVENT", command["event"])
         elif op == "event_eose":

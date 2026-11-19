@@ -56,11 +56,14 @@ format, see [access](access.md)). `v1:video`, `v1:none`, legacy entries without
 a grant, and malformed or duplicate records deny.
 
 - **Fail-closed readiness.** Until at least one relay has delivered EOSE, and
-  while every relay is disconnected or has sent CLOSED, the source denies
-  everyone (401). An empty loaded list also denies. The host does not wait for
-  history before serving; bearer and static-NIP-98 clients are unaffected.
-  Open SSE streams from this source are *held* meanwhile, not closed (see
-  [relay outages](#relay-outages-held-streams-md-554)).
+  while no relay can serve history (every relay disconnected, rate-limited,
+  awaiting NIP-42 AUTH or refusing), the source denies everyone (401). An
+  empty loaded list also denies. The host does not wait for history before
+  serving; bearer and static-NIP-98 clients are unaffected. Open SSE streams
+  from this source are *held* while that is expected to pass (see
+  [relay outages](#relay-outages-held-streams-md-554)), and closed once every
+  relay has refused the subscription (see
+  [refusing relays](#relays-that-refuse-the-subscription-md-ip2k)).
 - **Live, never polled.** One REQ
   `{kinds:[30000], authors:[host], #d:["metadesk-allowlist"], limit:1}` is held
   open. A newer replaceable event the relay pushes takes effect on the **next
@@ -78,7 +81,8 @@ a grant, and malformed or duplicate records deny.
   this source denies.
 - Readiness and every accepted list version are logged to stderr, for example
   `host[mcp]: host allowlist updated (v3): 2 member(s), 1 with agent (1 also input)`
-  or `host[mcp]: host allowlist history unavailable; host-allowlist NIP-98 grants deny and their SSE streams are held until a relay delivers it`.
+  or `host[mcp]: host allowlist history pending; host-allowlist NIP-98 grants deny and their SSE streams are held until a relay delivers it`
+  or `host[mcp]: host allowlist refused by every relay (ws://relay.example: restricted: not allowed); host-allowlist NIP-98 requests are refused (401) and their SSE streams closed until a relay delivers it`.
   The line is written after the SSE streams have been notified for that version.
 
 ## Per-principal tool capabilities (md-5km)
@@ -145,9 +149,10 @@ stream (`GET /mcp`) is told when its grant changes what it can see:
   tools registered (`--no-input`). Static-npub, bearer and credential-less
   streams never get one: their tool set does not depend on the list.
 - **Revocation** (grant loses `agent`, or the host role changes) closes the
-  stream on the change itself. The list becoming *unavailable* is not a
-  revocation: the stream is held until the list is known again, then judged
-  against its last known grant (next section).
+  stream on the change itself. The list becoming *temporarily unavailable*
+  is not a revocation: the stream is held until the list is known again, then
+  judged against its last known grant (next section). Every relay *refusing*
+  the subscription is treated as a known deny and closes the stream (md-ip2k).
 - **No gaps.** A stream that becomes ready just after a change is re-checked
   as it becomes ready. The record is updated under the SSE lock, so a change
   notifies once however many wake-ups observe it.
@@ -166,8 +171,12 @@ list (static, bearer or open callers only), `listChanged` is not advertised.
 
 ### Relay outages: held streams (md-554)
 
-Readiness drops whenever every relay is disconnected or has sent CLOSED. It
-also drops while *any* relay is re-delivering history after it (re)connects,
+Readiness drops whenever no relay can serve history: every relay is
+disconnected or in backoff, or has ended the subscription with a transient
+CLOSED (`rate-limited:`, or `auth-required:` while our NIP-42 AUTH is
+pending). If every relay has *refused* it, the answer is a known deny instead
+(next section). Readiness also drops while *any* relay is re-delivering
+history after it (re)connects,
 until that relay's EOSE: a relay that is still connecting counts as pending.
 So every relay reconnect causes a short window, whether one relay or several
 are configured. In that window the source cannot say whether any live
@@ -195,6 +204,59 @@ principal is still granted, so:
   its slot. So a long outage cannot lock operator credentials out of
   notifications, while held streams cost nothing else. A host role change
   (the bridge stops) is a revocation, not an outage: held streams close.
+
+### Relays that refuse the subscription (md-ip2k)
+
+A relay can answer the allowlist REQ with `["CLOSED", <sub>, <reason>]`
+instead of history. No reconnect follows a CLOSED, so if it held streams the
+way an outage does, they would stay held until shutdown, a host role change
+or SSE-slot eviction. The bridge therefore classifies each CLOSED by the
+reason's NIP-01 machine-readable prefix, per relay and per connection:
+
+| CLOSED reason | Classification |
+| --- | --- |
+| `rate-limited:` | transient: the relay asks for a later retry |
+| `auth-required:`, with an AUTH path | transient: awaiting AUTH |
+| `auth-required:`, without an AUTH path | **refused** |
+| `restricted:`, `blocked:`, `invalid:`, `pow:`, `mute:`, `duplicate:`, `error:`, any other or no prefix | **refused** |
+
+An AUTH path exists while this connection has a NIP-42 challenge and our
+answer to it has not failed (`OK false`, a signing failure or a transport
+failure). An accepted answer still counts as a path: the pool's next REQ
+then settles it with EOSE or a different CLOSED.
+
+- **Every relay refused: a definite deny.** With no history and every
+  configured relay refusing on its current connection, readiness is `FAILED`
+  and the source answers a known 0, not "unknown". The watcher's wake-up on
+  that transition closes held live-list streams, and new requests get 401. The
+  host logs each relay and its reason once, for example
+  `host[mcp]: host allowlist refused by every relay (ws://a: restricted: not allowed; ws://b: blocked: no); …`.
+  The bridge also logs each relay's CLOSED with its classification, once per
+  change rather than once per frame:
+  `subscription CLOSED on ws://a: restricted: not allowed (refused: no history from this relay until it serves the REQ again)`.
+  The nostrc pool re-issues the REQ after every CLOSED, about every 200 ms
+  (md-odg). The bridge does not change that; repeated identical answers are
+  idempotent.
+- **Any other relay that might still deliver keeps it unknown.** A relay that
+  is disconnected, in backoff, rate-limited or awaiting AUTH, beside refusing
+  ones, holds streams as in an outage. One that has delivered EOSE keeps the
+  list loaded: a refusing relay beside a live one changes nothing.
+- **A refusal belongs to the connection that answered it.** A connection
+  change (drop, reconnect) clears it, so the drop itself is a transient outage.
+  A NIP-42 (re-)challenge turns an `auth-required:` refusal back into
+  awaiting AUTH. A rejected AUTH (`OK false`) turns awaiting AUTH into a
+  refusal.
+- **Recovery is the normal path.** When a relay later serves history (the
+  pool's re-REQ after a policy change, or after a re-challenge and accepted
+  AUTH), its EOSE makes the list loaded again. New requests are admitted, and
+  the clients whose streams were closed reconnect. Nothing is timed: every
+  transition is a CLOSED, EOSE, AUTH, OK or connection-state event.
+
+Classification lives in the bridge (`src/core/nostr.c`), so every allowlist
+consumer sees the same states: `md_nostr_granted_capabilities_known()` is
+*known* for `FAILED`, and `md_nostr_allowlist_refusals()` supplies the log
+detail. Allowlist edits (`metadesk-host access`) still fail at once whenever
+no history is loaded, without waiting for an outage or refusal to end.
 
 **The trade-off.** No data flows while authorization is unknown, which is the
 fail-closed rule applied to streams. The alternative (md-ht7's behaviour) was
@@ -373,8 +435,29 @@ restore), and needs no new install target or packaging.
     `list_changed`. When `input` was removed during the outage it gets exactly
     one. When `agent` was revoked, the stream closes. The barriers are the
     host's readiness and `loaded` lines;
+  - refusing relays (md-ip2k): after an outage the only relay comes back
+    but answers the REQ with `CLOSED restricted:`. The held stream closes, the
+    next request gets 401, and the static principal is unaffected. The host
+    log names the relay and reason, and the bridge's CLOSED line appears once
+    despite the pool's re-REQs. When the relay serves history again the list
+    reloads and the same proxy's next request succeeds. A second host with one
+    serving relay and one that always refuses stays loaded and its live stream
+    stays open. When the serving relay drops, the stream is held (refusing +
+    down is unknown) and resumes when that relay returns;
   - exactly one allowlist-only REQ per host connection on the relay. Each
-    reconnect re-issues the same filter with `since`.
+    reconnect re-issues the same filter with `since`; the REQ the pool
+    re-creates after a CLOSED has none. Refused REQs are not counted.
+- `nostr ACL and AUTH private relays` (`tests/test_nostr.c` with
+  `tests/nostr_acl_fixture.py`) covers the classification (md-ip2k):
+  `rate-limited:` is unknown; `restricted:`/`blocked:` are `FAILED` and
+  *known*, with `md_nostr_allowlist_refusals()` naming relay and reason, and
+  edits fail rather than block; `auth-required:` with no challenge is refused,
+  becomes awaiting AUTH (unknown) on a late challenge, is refused again on
+  `OK false`, and recovers after a re-challenge, accepted AUTH and EOSE. With
+  two relays, a refusal beside EOSE stays loaded, a refusal beside a dropped
+  relay is unknown, and both refusing is `FAILED`. Every case recovers on the
+  next EOSE. The real NIP-42 wire test checks that `auth-required:` is unknown
+  while AUTH is pending and refused after rejection.
 - `MCP server core` covers the new CLI rejections.
 - `MCP accessibility queries` (`tests/test_mcp.c`) drives the real tool set
   through a bridge with mock input. Per caller grant, it checks the listed
@@ -396,6 +479,12 @@ md-ah9.3 and md-ah9.14 close notes. The relay-backed path adds:
   are released by the readiness wake-up that EOSE after the reconnect already
   produces. "Unknown" is read under the same lock as the grant, so a stopped
   bridge (a revocation) is never mistaken for an outage.
+- md-ip2k: no new subscription, filter, timer or publish. CLOSED reasons are
+  now classified by NIP-01 prefix instead of being treated as one case, and
+  the AUTH challenge and the AUTH `OK` result feed the same readiness
+  recomputation. A held stream ends on the refusal event itself. The pool's
+  re-REQ after CLOSED (md-odg, nostrc's) is unchanged, and repeated refusals
+  are idempotent and logged once.
 
 Readiness and updates come from EOSE/CLOSED/connection boundaries and accepted
 events, delivered through a condition variable. The filter is tightly scoped:
