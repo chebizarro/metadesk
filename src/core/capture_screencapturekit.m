@@ -5,7 +5,9 @@
  * Flow:
  *   1. SCShareableContent.getExcludingDesktopWindows — enumerate displays
  *   2. SCStreamConfiguration — set resolution, framerate, pixel format
- *   3. SCStream — create stream for main display
+ *   3. SCStream — create stream for the selected display (config.output:
+ *      NULL/"" = main display, index into shareableContent.displays,
+ *      "id:N" CGDirectDisplayID, or unique NSScreen name; see capture.h)
  *   4. addStreamOutput — receive CMSampleBuffers via delegate
  *   5. CVPixelBuffer lock/unlock — map frame data for consumer
  *
@@ -23,6 +25,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>  /* NSScreen.localizedName for name selection */
 
 #include <stdlib.h>
 #include <string.h>
@@ -196,6 +199,60 @@ static int sck_init(MdCaptureCtx *ctx) {
     return 0;
 }
 
+/* Name of each display by CGDirectDisplayID (NSScreen.localizedName). */
+static NSDictionary<NSNumber *, NSString *> *sck_display_names(void) {
+    NSMutableDictionary<NSNumber *, NSString *> *names = [NSMutableDictionary dictionary];
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+        if (num) names[num] = screen.localizedName;
+    }
+    return names;
+}
+
+API_AVAILABLE(macos(12.3))
+static void sck_log_displays(NSArray<SCDisplay *> *displays,
+                             const MdCaptureDisplay *list, const char *sel) {
+    MD_LOG_E("capture output \"%s\" not found; displays (select by index, id:N or name):%s",
+             sel, displays.count ? "" : " none");
+    for (NSUInteger i = 0; i < displays.count; i++) {
+        CGRect b = CGDisplayBounds(list[i].id);
+        MD_LOG_E("  %lu: id:%u \"%s\" %.0fx%.0f at (%.0f,%.0f)%s", (unsigned long)i,
+                 list[i].id, list[i].name ? list[i].name : "",
+                 b.size.width, b.size.height, b.origin.x, b.origin.y,
+                 list[i].primary ? " main" : "");
+    }
+}
+
+/* The display config.output selects, or nil (after logging the choices).
+ * Default, index and id selections never touch AppKit: a watchdog restart
+ * runs start on the capture thread, and NSScreen is a main-thread class.
+ * Names are only looked up for a name selection or the error listing. */
+API_AVAILABLE(macos(12.3))
+static SCDisplay *sck_select_display(NSArray<SCDisplay *> *displays, const char *sel) {
+    const NSUInteger count = displays.count;
+    MdCaptureDisplay *list = calloc(count ? count : 1, sizeof(*list));
+    if (!list) return nil;
+    const CGDirectDisplayID main_id = CGMainDisplayID();
+    for (NSUInteger i = 0; i < count; i++) {
+        list[i].id = displays[i].displayID;
+        list[i].primary = list[i].id == main_id;
+    }
+    int pick = md_capture_display_choose(list, count, sel);
+    if (pick < 0 && sel && *sel) {
+        /* Precise lifetime: list[].name borrows these strings' buffers. */
+        __attribute__((objc_precise_lifetime))
+        NSDictionary<NSNumber *, NSString *> *names = sck_display_names();
+        for (NSUInteger i = 0; i < count; i++)
+            list[i].name = names[@(list[i].id)].UTF8String;
+        pick = md_capture_display_choose(list, count, sel);
+        if (pick < 0) sck_log_displays(displays, list, sel);
+    } else if (pick < 0) {
+        MD_LOG_I("no displays found");
+    }
+    free(list);
+    return pick < 0 ? nil : displays[(NSUInteger)pick];
+}
+
 /* sck_start/sck_stop are reachable only through screencapturekit_backend,
  * which md_capture_backend_create gates at runtime; the annotations let the
  * compiler prove that instead of re-checking per call. */
@@ -224,18 +281,14 @@ static int sck_start(MdCaptureCtx *ctx) {
         return -1;
     }
 
-    /* Pick the main display (first in list) */
-    NSArray<SCDisplay *> *displays = shareableContent.displays;
-    if (displays.count == 0) {
-        MD_LOG_I("no displays found");
-        return -1;
-    }
-    SCDisplay *mainDisplay = displays[0];
+    SCDisplay *display = sck_select_display(shareableContent.displays,
+                                            ctx->config.output);
+    if (!display) return -1;
 
     /* Configure the stream */
     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-    config.width = mainDisplay.width;
-    config.height = mainDisplay.height;
+    config.width = display.width;
+    config.height = display.height;
     config.showsCursor = ctx->config.show_cursor;
 
     /* Request BGRA pixel format (most compatible with our encoder) */
@@ -245,8 +298,8 @@ static int sck_start(MdCaptureCtx *ctx) {
     uint32_t fps = ctx->config.target_fps ? ctx->config.target_fps : 60;
     config.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
 
-    /* Create content filter for the main display (all windows) */
-    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:mainDisplay
+    /* Content filter: the selected display, all windows */
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
                                                       excludingWindows:@[]];
 
     /* Create the stream */
@@ -271,7 +324,10 @@ static int sck_start(MdCaptureCtx *ctx) {
         return -1;
     }
 
-    /* Store references */
+    /* Store references, dropping a previous (stopped) start's objects. */
+    if (sck->stream)       CFRelease(sck->stream);
+    if (sck->delegate)     CFRelease(sck->delegate);
+    if (sck->captureQueue) CFRelease(sck->captureQueue);
     sck->stream       = (__bridge_retained void *)stream;
     sck->delegate     = (__bridge_retained void *)delegate;
     sck->captureQueue = (__bridge_retained void *)captureQueue;
@@ -291,9 +347,14 @@ static int sck_start(MdCaptureCtx *ctx) {
         return -1;
     }
 
+    const CGRect bounds = CGDisplayBounds(display.displayID);
+    ctx->output_rect = (MdCaptureRect){
+        .x = (int32_t)bounds.origin.x, .y = (int32_t)bounds.origin.y,
+        .width = (uint32_t)bounds.size.width, .height = (uint32_t)bounds.size.height,
+    };
     ctx->active = true;
-    ctx->width  = mainDisplay.width;
-    ctx->height = mainDisplay.height;
+    ctx->width  = display.width;
+    ctx->height = display.height;
 
     return 0;
 }

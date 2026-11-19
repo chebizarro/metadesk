@@ -9,6 +9,10 @@
  *   - CGEventKeyboardSetUnicodeString for type_text (Unicode-aware)
  *   - CGEventPost with kCGHIDEventTap for injection
  *
+ * Pointer coordinates arrive relative to the captured frame and are mapped
+ * into the selected display's CG global bounds (MdInputConfig.output_*,
+ * from md_capture_get_output_rect) by md_input_map_to_output.
+ *
  * Requires Input Monitoring permission (System Settings >
  * Privacy & Security > Input Monitoring) for synthetic events.
  *
@@ -181,7 +185,11 @@ static int cg_mouse_move(MdInputCtx *ctx, int x, int y) {
     CGEventState *st = ctx->backend_data;
     if (!st) return -1;
 
-    CGPoint point = CGPointMake((CGFloat)x, (CGFloat)y);
+    /* Client coordinates are frame-relative; CGEvent wants global points,
+     * so offset/scale them into the captured display's bounds. */
+    double gx, gy;
+    md_input_map_to_output(&ctx->config, x, y, &gx, &gy);
+    CGPoint point = CGPointMake((CGFloat)gx, (CGFloat)gy);
     st->last_mouse = point;
 
     CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,

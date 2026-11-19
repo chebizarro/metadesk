@@ -144,6 +144,16 @@ MdCaptureBackend *md_capture_backend_create(void);
 | macOS | `capture_screencapturekit.m` | ScreenCaptureKit (macOS 13+), Objective-C++ |
 | Windows | `capture_dxgi.cpp` | DXGI Desktop Duplication, Direct3D 11 |
 
+**Output selection** (`MdCaptureConfig.output`, host `--capture-output SEL`). The default (unset) is the primary display. A bare decimal is always an index into the backend's display list.
+
+| Platform | `SEL` forms |
+|---|---|
+| Windows (DXGI) | `N` (index in DXGI enumeration order) or a GDI device name such as `\\.\DISPLAY2` (prefix optional, case-insensitive) |
+| macOS (ScreenCaptureKit) | `N` (index in `SCShareableContent.displays` order), `id:N` (`CGDirectDisplayID`, decimal or `0x` hex; stable across reorders), or the display name as shown by `NSScreen.localizedName` (case-insensitive, must be unique) |
+| Linux (PipeWire) | Not supported: the ScreenCast portal dialog picks the source, so the host rejects the flag |
+
+An unknown or ambiguous selection fails capture and logs every available display with its index, id/name, size and desktop origin. After a successful start, `md_capture_get_output_rect()` reports the selected display's global desktop bounds. The host copies them into `MdInputConfig.output_*`, and `md_input_map_to_output()` maps the client's frame-relative pointer coordinates into that display. Without this mapping, clicks would land on the display at the desktop origin. Agent actions (`md_input_execute_action`) carry global accessibility coordinates instead. They are converted back to frame space, and a target that is not on the captured display is refused.
+
 #### 2.3.2 Accessibility Tree HAL
 
 ```c

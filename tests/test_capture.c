@@ -259,6 +259,76 @@ static void test_get_size(void)
     PASS("get_size");
 }
 
+/* Synthetic display list modelled on a two-monitor Mac: an external main
+ * display listed second, as SCShareableContent may order them. */
+static void test_display_choose(void)
+{
+    const MdCaptureDisplay displays[] = {
+        { .id = 1,        .name = "Built-in Retina Display", .primary = false },
+        { .id = 69732928, .name = "DELL U2720Q",             .primary = true  },
+        { .id = 4128833,  .name = NULL,                      .primary = false },
+    };
+    const size_t n = sizeof(displays) / sizeof(displays[0]);
+
+    /* Default: the flagged primary, else index 0. */
+    MD_CHECK(md_capture_display_choose(displays, n, NULL) == 1);
+    MD_CHECK(md_capture_display_choose(displays, n, "") == 1);
+    const MdCaptureDisplay unflagged[] = { { .id = 7 }, { .id = 8 } };
+    MD_CHECK(md_capture_display_choose(unflagged, 2, NULL) == 0);
+
+    /* Bare digits are always an index, never an id (id 1 is a real one). */
+    MD_CHECK(md_capture_display_choose(displays, n, "0") == 0);
+    MD_CHECK(md_capture_display_choose(displays, n, "2") == 2);
+    MD_CHECK(md_capture_display_choose(displays, n, "0002") == 2);
+    MD_CHECK(md_capture_display_choose(displays, n, "3") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "69732928") == -1);
+
+    /* id:N, decimal or hex, case-insensitive prefix. */
+    MD_CHECK(md_capture_display_choose(displays, n, "id:1") == 0);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:69732928") == 1);
+    MD_CHECK(md_capture_display_choose(displays, n, "ID:0x3F0041") == 2);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:2") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:-1") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:1x") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "id:4294967297") == -1);
+
+    /* Names: exact, case-insensitive; a nameless display never matches. */
+    MD_CHECK(md_capture_display_choose(displays, n, "dell u2720q") == 1);
+    MD_CHECK(md_capture_display_choose(displays, n, "Built-in Retina Display") == 0);
+    MD_CHECK(md_capture_display_choose(displays, n, "DELL") == -1);
+    MD_CHECK(md_capture_display_choose(displays, n, "\\\\.\\DISPLAY1") == -1);
+
+    /* Duplicate names are ambiguous; index and id still disambiguate. */
+    const MdCaptureDisplay twins[] = {
+        { .id = 10, .name = "LG UltraFine", .primary = true },
+        { .id = 11, .name = "LG UltraFine" },
+    };
+    MD_CHECK(md_capture_display_choose(twins, 2, "LG UltraFine") == -1);
+    MD_CHECK(md_capture_display_choose(twins, 2, "id:11") == 1);
+
+    /* No displays: nothing to pick, even by default. */
+    MD_CHECK(md_capture_display_choose(displays, 0, NULL) == -1);
+    MD_CHECK(md_capture_display_choose(NULL, n, "0") == -1);
+    PASS("display_choose");
+}
+
+static void test_output_rect(void)
+{
+    memset(&g_mock, 0, sizeof(g_mock));
+    MdCaptureCtx *ctx = create_mock_ctx(NULL);
+    MD_CHECK(ctx != NULL);
+    MdCaptureRect r = { 0 };
+    MD_CHECK(md_capture_get_output_rect(NULL, &r) == -1);
+    MD_CHECK(md_capture_get_output_rect(ctx, NULL) == -1);
+    MD_CHECK(md_capture_get_output_rect(ctx, &r) == -1); /* not published */
+    ctx->output_rect = (MdCaptureRect){ .x = -1920, .y = 120, .width = 1920, .height = 1080 };
+    MD_CHECK(md_capture_get_output_rect(ctx, &r) == 0);
+    MD_CHECK(r.x == -1920 && r.y == 120 && r.width == 1920 && r.height == 1080);
+    md_capture_destroy(ctx);
+    PASS("output_rect");
+}
+
 static void test_get_size_before_init(void)
 {
     /* If width/height are zero, get_size returns -1 */
@@ -803,6 +873,8 @@ int main(void)
     test_is_active();
     test_get_size();
     test_get_size_before_init();
+    test_display_choose();
+    test_output_rect();
     test_wait_size_dispatch();
     test_get_frame_and_release();
     test_config_passthrough();

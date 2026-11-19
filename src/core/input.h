@@ -42,6 +42,12 @@ typedef struct {
     /* Wayland requires an absolute socket path. Ambient WAYLAND_DISPLAY and
      * WAYLAND_SOCKET are deliberately ignored. Strings are borrowed. */
     const char *wayland_display;
+    /* Global desktop bounds of the captured output that the client's
+     * frame-relative coordinates address (md_capture_get_output_rect; macOS:
+     * CoreGraphics global points). output_width == 0 keeps the legacy
+     * mapping: frame coordinates are global, display at the origin. */
+    int32_t  output_x, output_y;
+    uint32_t output_width, output_height;
 } MdInputConfig;
 
 /* ── Mouse button identifiers ────────────────────────────────── */
@@ -127,6 +133,10 @@ int md_input_type_text(MdInput *inp, const char *text);
 
 /* ── Action dispatch ─────────────────────────────────────────── */
 
+/* Click coordinates in actions are global desktop coordinates (as reported
+ * by the accessibility tree), unlike md_input_mouse_move/click, which take
+ * frame-relative points. With output bounds configured, the point is
+ * converted to frame space and must lie on the captured output (-1 if not). */
 struct MdAction;
 int md_input_execute_action(MdInput *inp, const struct MdAction *action);
 
@@ -146,7 +156,16 @@ uint32_t md_input_keysym_from_name(const char *name);
  * keysym and whether Shift is required. O(1). Returns false otherwise. */
 bool md_input_ascii_key(char c, uint32_t *keysym, bool *shift);
 
-/* ── Event pacing ────────────────────────────────────────────── */
+/* ── Coordinate mapping ────────────────────────────────────────── */
+
+/* Map a frame-relative point, clamped to the screen_width x screen_height
+ * frame, into cfg's output bounds in global desktop space (scaled when the
+ * frame and output sizes differ). Without output bounds the point is
+ * returned unchanged and unclamped (legacy/global callers). Pure. */
+void md_input_map_to_output(const MdInputConfig *cfg, int x, int y,
+                            double *gx, double *gy);
+
+/* ── Event pacing ──────────────────────────────────────────────── */
 
 /* One pacing policy for every backend: the gap between synthetic events
  * (press/release, consecutive clicks, typed characters) so the target's

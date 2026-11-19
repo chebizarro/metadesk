@@ -678,6 +678,103 @@ static int test_wayland_protocol(void) {
 }
 #endif
 
+/* ── Test: frame → selected-output coordinate mapping ────────── */
+
+/* Pure math behind cg_mouse_move (no event is posted). Bounds follow the
+ * CG global space: the main display at the origin, others offset from it. */
+static int test_map_to_output(void) {
+    printf("  test_map_to_output... ");
+    double gx = -1, gy = -1;
+
+    /* No output bounds: legacy passthrough, deliberately unclamped (MCP mode
+     * feeds global accessibility coordinates against fallback dimensions). */
+    MdInputConfig cfg = { .screen_width = 1920, .screen_height = 1080 };
+    md_input_map_to_output(&cfg, 100, 200, &gx, &gy);
+    MD_CHECK(gx == 100 && gy == 200);
+    md_input_map_to_output(&cfg, 2500, -5, &gx, &gy);
+    MD_CHECK(gx == 2500 && gy == -5);
+
+    /* Main display, frame == bounds: identity. */
+    cfg = (MdInputConfig){ .screen_width = 1512, .screen_height = 982,
+        .output_x = 0, .output_y = 0, .output_width = 1512, .output_height = 982 };
+    md_input_map_to_output(&cfg, 756, 491, &gx, &gy);
+    MD_CHECK(gx == 756 && gy == 491);
+
+    /* Secondary display left of and above main (negative origin). */
+    cfg = (MdInputConfig){ .screen_width = 2560, .screen_height = 1440,
+        .output_x = -2560, .output_y = -300, .output_width = 2560, .output_height = 1440 };
+    md_input_map_to_output(&cfg, 0, 0, &gx, &gy);
+    MD_CHECK(gx == -2560 && gy == -300);
+    md_input_map_to_output(&cfg, 1280, 720, &gx, &gy);
+    MD_CHECK(gx == -1280 && gy == 420);
+
+    /* Display to the right; out-of-frame points clamp to its last pixel and
+     * never spill onto a neighbour. */
+    cfg = (MdInputConfig){ .screen_width = 1920, .screen_height = 1080,
+        .output_x = 1512, .output_y = 0, .output_width = 1920, .output_height = 1080 };
+    md_input_map_to_output(&cfg, -10, 5000, &gx, &gy);
+    MD_CHECK(gx == 1512 && gy == 1079);
+    md_input_map_to_output(&cfg, 99999, -1, &gx, &gy);
+    MD_CHECK(gx == 1512 + 1919 && gy == 0);
+
+    /* Frame scaled relative to the display bounds (e.g. a downscaled
+     * capture): coordinates scale into the bounds. */
+    cfg = (MdInputConfig){ .screen_width = 960, .screen_height = 540,
+        .output_x = 1512, .output_y = 100, .output_width = 1920, .output_height = 1080 };
+    md_input_map_to_output(&cfg, 480, 270, &gx, &gy);
+    MD_CHECK(gx == 1512 + 960 && gy == 100 + 540);
+    md_input_map_to_output(&cfg, 959, 539, &gx, &gy);
+    MD_CHECK(gx < 1512 + 1920 && gy < 100 + 1080);
+
+    /* NULL arguments are ignored. */
+    md_input_map_to_output(NULL, 1, 1, &gx, &gy);
+    md_input_map_to_output(&cfg, 1, 1, NULL, &gy);
+    printf("OK\n");
+    return 0;
+}
+
+/* Agent actions carry global (accessibility) coordinates: execute_action
+ * must hand the backend frame-relative points that map back to the same
+ * global point, and refuse targets on other displays. */
+static int test_action_global_coordinates(void) {
+    printf("  test_action_global_coordinates... ");
+    MockInputData data = {0};
+    MdInput inp = make_mock_input(&data, &mock_backend);
+    inp.config = (MdInputConfig){ .screen_width = 2560, .screen_height = 1440,
+        .output_x = -2560, .output_y = -300, .output_width = 2560, .output_height = 1440 };
+    MdAction action;
+    memset(&action, 0, sizeof(action));
+    action.type = MD_ACTION_CLICK;
+    action.region[0] = -1280;
+    action.region[1] = 420;
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.last_x == 1280 && data.last_y == 720);
+    double gx, gy;
+    md_input_map_to_output(&inp.config, data.last_x, data.last_y, &gx, &gy);
+    MD_CHECK(gx == -1280 && gy == 420);
+
+    /* A point on the main display is not on the captured output. */
+    data = (MockInputData){0};
+    action.type = MD_ACTION_DBL_CLICK;
+    action.region[0] = 10;
+    action.region[1] = 10;
+    MD_CHECK(md_input_execute_action(&inp, &action) == -1);
+    action.type = MD_ACTION_RIGHT_CLICK;
+    action.region[0] = -2561;
+    MD_CHECK(md_input_execute_action(&inp, &action) == -1);
+    MD_CHECK(data.mouse_move_calls == 0 && data.mouse_button_calls == 0);
+
+    /* Without output bounds, action coordinates pass through untouched. */
+    inp.config = (MdInputConfig){ .screen_width = 1920, .screen_height = 1080 };
+    action.type = MD_ACTION_CLICK;
+    action.region[0] = 2500;
+    action.region[1] = 30;
+    MD_CHECK(md_input_execute_action(&inp, &action) == 0);
+    MD_CHECK(data.last_x == 2500 && data.last_y == 30);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -704,6 +801,8 @@ int main(void) {
     failures += test_click_backend_failure_propagation();
     failures += test_key_combo_backend_failure_propagation();
     failures += test_lifecycle_edges();
+    failures += test_map_to_output();
+    failures += test_action_global_coordinates();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     md_test_failures += failures;
