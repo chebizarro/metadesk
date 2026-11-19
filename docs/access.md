@@ -96,6 +96,10 @@ from versioned scope and using zero for legacy entries preserves that direction.
 Grant changes/removal affect the **next session acceptance**, not an active
 stream. Dynamic revocation/renegotiation remains P3.8 work.
 
+The same list can also authorize NIP-98 MCP HTTP agents: run the host with
+`--mcp-http --mcp-allow-host-list`, and an `agent` grant admits that npub live,
+without a restart. See [MCP HTTP authentication](mcp-auth.md).
+
 Unknown, failed and loaded-empty lists deny admission. **No open/dev mode was
 added.** A loopback-only, loudly warned opt-in can be revisited on request; it is
 not a fallback or an option in these commands. TCP still requires the one-use

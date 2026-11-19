@@ -162,6 +162,8 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
             .allow_npubs = config->http_allow_npubs,
             .allow_npub_count = config->http_allow_npub_count,
             .allow_file = config->http_allow_file,
+            .nip98_authorize = config->http_nip98_authorize,
+            .nip98_authorize_userdata = config->http_nip98_authorize_userdata,
         };
         b->http_ctx = md_mcp_http_create(&http_cfg);
         if (!b->http_ctx)

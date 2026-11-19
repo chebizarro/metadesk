@@ -234,6 +234,15 @@ int md_nostr_parse_caps(const char *text, uint32_t *out);
  * Authorize with md_nostr_granted_capabilities(), never has_allowlist(). */
 MdNostrAclState md_nostr_allowlist_state(MdNostr *n);
 
+/* Block until the readiness state or the accepted-list version differs from
+ * the caller's state and version (start from UNKNOWN and 0), then store the
+ * current pair.
+ * Wakes on EOSE/CLOSED/connection boundaries and on each accepted newer
+ * replaceable list; never a timer. Returns -1 once stopped/revoked.
+ * Observability only: authorize with md_nostr_granted_capabilities(). */
+int md_nostr_allowlist_wait_change(MdNostr *n, MdNostrAclState *state,
+                                   uint64_t *version);
+
 /* True when history has loaded (including an empty list); not an auth check. */
 bool md_nostr_has_allowlist(const MdNostr *n);
 

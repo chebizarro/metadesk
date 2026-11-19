@@ -8,7 +8,9 @@ metadesk exposes a standard MCP server that lets AI agents interact with remote 
 
 **Transport options:**
 - **stdio** (Phase 1) — `metadesk-host --mcp` communicates via stdin/stdout
-- **HTTP+SSE** (Phase 2) — `metadesk-host --mcp-http` on port 7710
+- **HTTP+SSE** (Phase 2) — `metadesk-host --mcp-http` on port 7710. Bearer-token and
+  NIP-98 auth, the live host-allowlist source and the `metadesk-host mcp-proxy`
+  stdio signing shim are described in [MCP HTTP authentication](mcp-auth.md).
 
 ## Quick Start
 

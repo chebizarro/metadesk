@@ -30,6 +30,7 @@
 #include "mcp_http.h"
 #include "bitrate_ctrl.h"
 #include "session_log.h"
+#include "host_mcp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -455,6 +456,7 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
     fprintf(stderr, "  %s access --help  Manage saved host-role session access\n", argv0);
+    fprintf(stderr, "  %s mcp-proxy --help  stdio MCP client -> NIP-98-signed HTTP MCP\n", argv0);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --port PORT      Listen port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
@@ -480,6 +482,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-public-url URL   Accepted exact NIP-98 /mcp URL (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-npub NPUB  MCP HTTP authorized signer (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-file PATH  MCP HTTP npub allowlist (one per line)\n");
+    fprintf(stderr, "  --mcp-allow-host-list  Also authorize NIP-98 signers granted 'agent' by the saved\n"
+                    "                   host role's live metadesk-allowlist (uses --relay)\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
     fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
@@ -577,11 +581,13 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
                         const char *bind_addr, bool no_input,
                         const MdInputConfig *input_options,
                         MdMcpTreeFormat tree_format,
-                        const MdMcpBridgeConfig *http_auth) {
+                        const MdMcpBridgeConfig *http_auth,
+                        const char *const *acl_relays, int acl_relay_count) {
     int rc = 1;
     MdA11yCtx *a11y = md_a11y_create();
     MdInput *input = NULL;
     MdMcpBridge *bridge = NULL;
+    HostMcpAcl *acl = NULL;
     if (!md_a11y_is_connected(a11y)) {
         fprintf(stderr, "host[mcp]: accessibility backend unavailable\n");
         goto cleanup;
@@ -614,6 +620,13 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
         .http_allow_npub_count = http_auth->http_allow_npub_count,
         .http_allow_file = http_auth->http_allow_file,
     };
+    /* Optional live NIP-98 source; outlives the bridge's HTTP handlers. */
+    if (acl_relays) {
+        acl = host_mcp_acl_start(acl_relays, acl_relay_count);
+        if (!acl) goto cleanup;
+        cfg.http_nip98_authorize = host_mcp_acl_authorize;
+        cfg.http_nip98_authorize_userdata = acl;
+    }
     bridge = md_mcp_bridge_create(&cfg);
     if (!bridge) {
         fprintf(stderr, "host[mcp]: failed to create MCP bridge\n");
@@ -625,6 +638,7 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
 
 cleanup:
     md_mcp_bridge_destroy(bridge);
+    host_mcp_acl_stop(acl);
     if (input) md_input_destroy(input);
     if (a11y) md_a11y_destroy(a11y);
     return rc;
@@ -655,6 +669,9 @@ int main(int argc, char **argv) {
         extern int md_host_access_cli(int argc, char **argv);
         return md_host_access_cli(argc - 2, argv + 2);
     }
+    /* Agent-side shim: signer + HTTP only, no capture/a11y/input/relay. */
+    if (argc > 1 && strcmp(argv[1], "mcp-proxy") == 0)
+        return md_host_mcp_proxy_cli(argc - 2, argv + 2);
     /* Every subsequently created thread inherits this mask. MCP consumes
      * termination signals with sigwait, never an async-signal-unsafe handler. */
     sigset_t term_signals;
@@ -690,6 +707,7 @@ int main(int argc, char **argv) {
     const char *mcp_token_file = NULL, *mcp_allow_file = NULL;
     const char *mcp_public_urls[32], *mcp_allow_npubs[32];
     size_t mcp_public_url_count = 0, mcp_allow_npub_count = 0;
+    bool mcp_allow_host_list = false;
     bool no_input = false;
     MdInputConfig input_options = {0};
     bool signaling_option = false;
@@ -702,7 +720,7 @@ int main(int argc, char **argv) {
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--npub") == 0 || strcmp(argv[i], "--relay") == 0 ||
+        if (strcmp(argv[i], "--npub") == 0 ||
             strcmp(argv[i], "--bunker") == 0 || strcmp(argv[i], "--dbus-signer") == 0 ||
             strcmp(argv[i], "--socket-signer") == 0 || strcmp(argv[i], "--auto-signer") == 0 ||
             strcmp(argv[i], "--fips-control") == 0 || strcmp(argv[i], "--fips-ready-timeout") == 0)
@@ -797,6 +815,8 @@ int main(int argc, char **argv) {
             mcp_token_file = argv[++i];
         else if (strcmp(argv[i], "--mcp-allow-file") == 0 && i + 1 < argc)
             mcp_allow_file = argv[++i];
+        else if (strcmp(argv[i], "--mcp-allow-host-list") == 0)
+            mcp_allow_host_list = true;
         else if (strcmp(argv[i], "--mcp-public-url") == 0 && i + 1 < argc) {
             if (mcp_public_url_count == 32) {
                 fprintf(stderr, "Too many --mcp-public-url values (max 32)\n");
@@ -838,6 +858,13 @@ int main(int argc, char **argv) {
                         "MCP cannot use video-session Nostr/FIPS/signer options\n");
         return 1;
     }
+    /* In MCP mode a relay serves only the host-allowlist NIP-98 source. */
+    if ((mcp_allow_host_list && !mcp_http) ||
+        ((mcp_stdio || mcp_http) && relay_count && !mcp_allow_host_list)) {
+        fprintf(stderr, "ERROR: --mcp-allow-host-list requires --mcp-http; in MCP mode "
+                        "--relay requires --mcp-allow-host-list\n");
+        return 1;
+    }
 
     /* MCP does not use video session negotiation, Nostr or its session log.
      * Enter before allocating them, and reserve stdout for JSON-RPC. */
@@ -850,9 +877,12 @@ int main(int argc, char **argv) {
             .http_allow_npub_count = mcp_allow_npub_count,
             .http_allow_file = mcp_allow_file,
         };
+        if (mcp_allow_host_list && relay_count == 0)
+            relay_urls[relay_count++] = MD_DEFAULT_RELAY;
         return host_run_mcp(mcp_stdio, mcp_http, mcp_http_port,
                             mcp_http_bind, no_input, &input_options, mcp_tree_format,
-                            &http_auth);
+                            &http_auth, mcp_allow_host_list ? relay_urls : NULL,
+                            relay_count);
     }
 
     install_signal_handlers();

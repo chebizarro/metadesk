@@ -2512,6 +2512,9 @@ static void test_host_cli_rejections(const char *host)
         { "--mcp", "--socket-signer", NULL },
         { "--mcp-http", "--dbus-signer", NULL },
         { "--mcp", "--relay", "wss://example.invalid", NULL },
+        { "--mcp-http", "--relay", "wss://example.invalid", NULL },
+        { "--mcp", "--mcp-allow-host-list", NULL },
+        { "--mcp-allow-host-list", NULL },
         { "--mcp", "--auto-signer", NULL },
         { "--mcp", "--mcp-http-bind", NULL },
     };

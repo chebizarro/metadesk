@@ -664,7 +664,8 @@ if host_os == 'linux' or host_os == 'darwin'
 endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c', 'src/host/account_cli.c')
+host_sources = files('src/host/main.c', 'src/host/account_cli.c',
+  'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c')
 host_includes = [core_inc]
 host_c_args = []
 
@@ -693,6 +694,15 @@ if host_os == 'linux' or host_os == 'darwin'
   if get_option('signer_nip5f')
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
+      timeout : 120)
+    # md-ah9.14/md-ah9.3: real mcp-proxy <-> NIP-98 MCP HTTP + live host allowlist.
+    mcp_proxy_host_fixture = executable('mcp_proxy_host_fixture',
+      files('tests/mcp_proxy_host_fixture.c', 'src/host/mcp_nostr_acl.c'),
+      include_directories : [core_inc, include_directories('src/host')],
+      dependencies : [dep_metadesk])
+    test('mcp-proxy NIP-98 e2e private relay', accounts_python,
+      args : [files('tests/test_mcp_proxy.py'), metadesk_host, mcp_proxy_host_fixture,
+              access_signer_fixture],
       timeout : 120)
   endif
 endif
@@ -861,7 +871,8 @@ test_signer = executable('test_signer',
 test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
-  files('tests/test_host_binding.c'), dependencies : [dep_metadesk])
+  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c'),
+  dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
 if host_os == 'linux' or host_os == 'darwin'
   test('capability grants private relay', accounts_python,
