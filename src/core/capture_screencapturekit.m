@@ -17,6 +17,27 @@
  * synchronised with a mutex + condition variable (same pattern as
  * the PipeWire backend).
  *
+ * Display moves and mode changes without a restart (md-f1oo): every SCK
+ * frame carries the display's onscreen rect and pixel/point scale
+ * (SCStreamFrameInfoScreenRect / ScaleFactor; before macOS 13.1, which has
+ * no ScreenRect, each frame reads CGDisplayBounds). When those change, the
+ * capture queue re-reads CGDisplayBounds, the authoritative global rect
+ * input addresses, and records it with the frame; get_frame publishes it
+ * to ctx->output_rect on the consumer thread, so md_capture_get_output_rect
+ * there is never torn and always describes the frame just returned. If the
+ * pixel size changed too, the stream is reconfigured to it
+ * (updateConfiguration) and frames at the old size, which SCK letterboxes
+ * into the new aspect, are dropped until the new size arrives; a failed
+ * reconfiguration reports the stream broken so the host watchdog restarts
+ * it. CGDisplayRegisterReconfigurationCallback is not used: it fires only
+ * on a thread processing events (CGDisplayConfiguration.h), and the host
+ * runs no run loop.
+ *
+ * Size cap (md-n9p2): config.max_width/max_height shrink the configured
+ * stream size (md_capture_fit_size, aspect kept so SCK never letterboxes),
+ * and SCK scales in hardware. The rect stays in points, so input maps onto
+ * the smaller frame unchanged.
+ *
  * Requires macOS 12.3+ (ScreenCaptureKit).
  * Built as Objective-C (.m) — see meson.build darwin block.
  */
@@ -49,7 +70,19 @@ typedef struct {
     pthread_mutex_t         frame_lock;
     pthread_cond_t          frame_cond;
     MdFrame                 pending_frame;
+    MdCaptureRect           pending_rect;  /* output rect of pending_frame */
     bool                    frame_ready;
+    /* A reconfiguration failed: get_frame reports MD_CAPTURE_ERROR until a
+     * restart (frame_lock). */
+    bool                    broken;
+
+    /* Geometry, owned by the capture queue once the stream starts (sck_start
+     * sets it before startCapture, after the previous stream stopped). */
+    CGDirectDisplayID       display_id;
+    MdCaptureRect           rect;          /* CG global points */
+    uint32_t                want_w, want_h; /* configured stream size */
+    CGRect                  seen_screen;   /* last SCK ScreenRect */
+    double                  seen_scale;    /* last SCK ScaleFactor */
 
     /* Currently held sample buffer (retained until release_frame) */
     void                   *held_sample_buf;   /* CMSampleBufferRef */
@@ -97,7 +130,14 @@ static uint64_t sck_frame_clock_ns(CMTime pts) {
 API_AVAILABLE(macos(12.3))
 @interface MdSCKDelegate : NSObject <SCStreamOutput>
 @property (assign) SCKState *state;
+/* Set by an updateConfiguration completion, which may outlive the state:
+ * it only touches this (block-retained) object; the next frame reads it. */
+@property (atomic) BOOL reconfigureFailed;
 @end
+
+API_AVAILABLE(macos(12.3))
+static void sck_check_geometry(SCKState *sck, MdSCKDelegate *delegate,
+                               CMSampleBufferRef sampleBuffer);
 
 @implementation MdSCKDelegate
 
@@ -109,8 +149,18 @@ API_AVAILABLE(macos(12.3))
     if (type != SCStreamOutputTypeScreen)
         return;
 
+    SCKState *sck = self.state;
+    sck_check_geometry(sck, self, sampleBuffer);
+
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer)
+        return;
+
+    uint32_t w = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
+    uint32_t h = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
+    /* Configured for an older geometry (a reconfiguration is in flight):
+     * letterboxed relative to the published rect, so input would miss. */
+    if (w != sck->want_w || h != sck->want_h)
         return;
 
     /* Lock the pixel buffer base address for CPU access */
@@ -118,11 +168,6 @@ API_AVAILABLE(macos(12.3))
     if (lockResult != kCVReturnSuccess)
         return;
 
-    SCKState *sck = self.state;
-    MdCaptureCtx *ctx = sck->ctx;
-
-    uint32_t w = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
-    uint32_t h = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
     size_t stride = CVPixelBufferGetBytesPerRow(imageBuffer);
     uint8_t *base = CVPixelBufferGetBaseAddress(imageBuffer);
     size_t dataSize = CVPixelBufferGetDataSize(imageBuffer);
@@ -169,10 +214,6 @@ API_AVAILABLE(macos(12.3))
         .seq          = atomic_fetch_add_explicit(&sck->seq, 1, memory_order_relaxed),
     };
 
-    /* Update context dimensions */
-    ctx->width  = w;
-    ctx->height = h;
-
     pthread_mutex_lock(&sck->frame_lock);
 
     if (sck->frame_checked_out) {
@@ -197,6 +238,7 @@ API_AVAILABLE(macos(12.3))
     sck->held_sample_buf = (void *)sampleBuffer;
     sck->held_pixel_buf  = (void *)imageBuffer;
     sck->pending_frame   = frame;
+    sck->pending_rect    = sck->rect;
     sck->frame_ready     = true;
 
     pthread_cond_signal(&sck->frame_cond);
@@ -204,6 +246,107 @@ API_AVAILABLE(macos(12.3))
 }
 
 @end
+
+/* ── Stream geometry ───────────────────────────────────────────── */
+
+/* Stream size for a display of `points` at `scale` pixels per point: its
+ * native pixels, shrunk to config.max_width/max_height. */
+static void sck_stream_size(const MdCaptureCtx *ctx, CGSize points, double scale,
+                            uint32_t *w, uint32_t *h) {
+    const uint32_t px_w = (uint32_t)lround(points.width * scale);
+    const uint32_t px_h = (uint32_t)lround(points.height * scale);
+    if (md_capture_fit_size(px_w, px_h, ctx->config.max_width,
+                            ctx->config.max_height, w, h) != 0) {
+        *w = px_w;
+        *h = px_h;
+    }
+}
+
+API_AVAILABLE(macos(12.3))
+static SCStreamConfiguration *sck_stream_config(const MdCaptureCtx *ctx,
+                                                uint32_t w, uint32_t h) {
+    SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+    config.width = w;
+    config.height = h;
+    config.showsCursor = ctx->config.show_cursor;
+    /* BGRA: most compatible with our encoder */
+    config.pixelFormat = kCVPixelFormatType_32BGRA;
+    const uint32_t fps = ctx->config.target_fps ? ctx->config.target_fps : 60;
+    config.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
+    return config;
+}
+
+static MdCaptureRect sck_rect_from_cg(CGRect b) {
+    return (MdCaptureRect){
+        .x = (int32_t)b.origin.x, .y = (int32_t)b.origin.y,
+        .width = (uint32_t)b.size.width, .height = (uint32_t)b.size.height,
+    };
+}
+
+/* Capture queue, before each frame: follow a display that moved or changed
+ * mode while the stream kept running (see the file comment). */
+API_AVAILABLE(macos(12.3))
+static void sck_check_geometry(SCKState *sck, MdSCKDelegate *delegate,
+                               CMSampleBufferRef sampleBuffer) {
+    if (delegate.reconfigureFailed) {
+        delegate.reconfigureFailed = NO;
+        pthread_mutex_lock(&sck->frame_lock);
+        sck->broken = true;
+        pthread_cond_signal(&sck->frame_cond);
+        pthread_mutex_unlock(&sck->frame_lock);
+        return;
+    }
+
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+    if (!attachments || CFArrayGetCount(attachments) < 1) return;
+    NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(attachments, 0);
+
+    CGRect screen = sck->seen_screen;
+    if (@available(macOS 13.1, *)) {
+        id rep = info[SCStreamFrameInfoScreenRect];
+        if (![rep isKindOfClass:[NSDictionary class]] ||
+            !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)rep, &screen))
+            screen = sck->seen_screen;
+    } else {
+        /* No ScreenRect before 13.1: the frame's CG bounds are the trigger. */
+        screen = CGDisplayBounds(sck->display_id);
+    }
+    id scale_num = info[SCStreamFrameInfoScaleFactor];
+    double scale = sck->seen_scale;
+    if ([scale_num isKindOfClass:[NSNumber class]] && [scale_num doubleValue] > 0)
+        scale = [scale_num doubleValue];
+    if (CGRectEqualToRect(screen, sck->seen_screen) && scale == sck->seen_scale)
+        return;
+    sck->seen_screen = screen;
+    sck->seen_scale = scale;
+
+    /* ScreenRect is only the trigger; input addresses CG global points. */
+    const CGRect bounds = CGDisplayBounds(sck->display_id);
+    if (CGRectIsEmpty(bounds)) return; /* removed: SCK ends the stream */
+    const MdCaptureRect rect = sck_rect_from_cg(bounds);
+    uint32_t w = 0, h = 0;
+    sck_stream_size(sck->ctx, bounds.size, scale, &w, &h);
+    if (memcmp(&rect, &sck->rect, sizeof(rect)) != 0) {
+        MD_LOG_I("display id:%u now %ux%u points at (%d,%d), scale %.2f",
+                 sck->display_id, rect.width, rect.height, rect.x, rect.y, scale);
+        sck->rect = rect;
+    }
+    if (w == sck->want_w && h == sck->want_h) return;
+
+    MD_LOG_I("reconfiguring display id:%u stream %ux%u -> %ux%u pixels",
+             sck->display_id, sck->want_w, sck->want_h, w, h);
+    sck->want_w = w;
+    sck->want_h = h;
+    SCStream *stream = (__bridge SCStream *)sck->stream;
+    const CGDirectDisplayID display_id = sck->display_id;
+    [stream updateConfiguration:sck_stream_config(sck->ctx, w, h)
+              completionHandler:^(NSError * _Nullable error) {
+        if (!error) return;
+        MD_LOG_E("cannot reconfigure display id:%u stream to %ux%u: %s",
+                 display_id, w, h, error.localizedDescription.UTF8String);
+        delegate.reconfigureFailed = YES;
+    }];
+}
 
 /* ── Backend vtable implementation ───────────────────────────── */
 
@@ -328,27 +471,31 @@ static int sck_start(MdCaptureCtx *ctx) {
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
                                                       excludingWindows:@[]];
 
-    /* Configure the stream at the display's native pixels. SCDisplay sizes
-     * are points; capturing at them halves a Retina display's resolution.
-     * ctx->output_rect stays in points for CGEvent (see capture.h). */
+    /* Configure the stream at the display's native pixels (capped by
+     * config.max_width/max_height). SCDisplay sizes are points; capturing at
+     * them halves a Retina display's resolution. ctx->output_rect stays in
+     * points for CGEvent (see capture.h). */
     const double scale = sck_backing_scale(display, filter);
-    const size_t px_w = (size_t)lround((double)display.width * scale);
-    const size_t px_h = (size_t)lround((double)display.height * scale);
-    SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-    config.width = px_w;
-    config.height = px_h;
-    config.showsCursor = ctx->config.show_cursor;
+    /* Size, rect and the change detector all from one CG read, so a mode
+     * change since the SCDisplay snapshot cannot leave them inconsistent. */
+    const CGRect bounds = CGDisplayBounds(display.displayID);
+    uint32_t px_w = 0, px_h = 0;
+    sck_stream_size(ctx, bounds.size, scale, &px_w, &px_h);
 
-    /* Request BGRA pixel format (most compatible with our encoder) */
-    config.pixelFormat = kCVPixelFormatType_32BGRA;
-
-    /* Frame rate */
-    uint32_t fps = ctx->config.target_fps ? ctx->config.target_fps : 60;
-    config.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
+    /* The previous stream (if any) is stopped: no frame callback runs. */
+    sck->display_id  = display.displayID;
+    sck->rect        = sck_rect_from_cg(bounds);
+    sck->want_w      = px_w;
+    sck->want_h      = px_h;
+    sck->seen_screen = bounds;
+    sck->seen_scale  = scale;
+    pthread_mutex_lock(&sck->frame_lock);
+    sck->broken = false;
+    pthread_mutex_unlock(&sck->frame_lock);
 
     /* Create the stream */
     SCStream *stream = [[SCStream alloc] initWithFilter:filter
-                                          configuration:config
+                                          configuration:sck_stream_config(ctx, px_w, px_h)
                                                delegate:nil];
 
     /* Create delegate and dispatch queue */
@@ -391,17 +538,15 @@ static int sck_start(MdCaptureCtx *ctx) {
         return -1;
     }
 
-    const CGRect bounds = CGDisplayBounds(display.displayID);
-    ctx->output_rect = (MdCaptureRect){
-        .x = (int32_t)bounds.origin.x, .y = (int32_t)bounds.origin.y,
-        .width = (uint32_t)bounds.size.width, .height = (uint32_t)bounds.size.height,
-    };
+    /* Frames republish both from get_frame if the display changes. */
+    ctx->output_rect = sck_rect_from_cg(bounds);
     ctx->active = true;
-    ctx->width  = (uint32_t)px_w;
-    ctx->height = (uint32_t)px_h;
-    MD_LOG_I("capturing display id:%u at %zux%zu pixels (%ldx%ld points, scale %.2f)",
+    ctx->width  = px_w;
+    ctx->height = px_h;
+    MD_LOG_I("capturing display id:%u at %ux%u pixels (%ldx%ld points, scale %.2f%s)",
              display.displayID, px_w, px_h, (long)display.width,
-             (long)display.height, scale);
+             (long)display.height, scale,
+             ctx->config.max_width || ctx->config.max_height ? ", size capped" : "");
 
     return 0;
 }
@@ -412,10 +557,14 @@ static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
 
     uint64_t deadline = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&sck->frame_lock);
-    while (!sck->frame_ready && ctx->active &&
+    while (!sck->frame_ready && ctx->active && !sck->broken &&
            md_cond_timedwait_until(&sck->frame_cond, &sck->frame_lock,
                                    deadline) != ETIMEDOUT) {}
 
+    if (sck->broken) {
+        pthread_mutex_unlock(&sck->frame_lock);
+        return MD_CAPTURE_ERROR;
+    }
     if (!sck->frame_ready) {
         bool active = ctx->active;
         pthread_mutex_unlock(&sck->frame_lock);
@@ -423,6 +572,10 @@ static int sck_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     }
 
     *out = sck->pending_frame;
+    /* Published on the consumer thread with the frame they describe. */
+    ctx->output_rect = sck->pending_rect;
+    ctx->width  = out->width;
+    ctx->height = out->height;
     sck->frame_ready = false;
     sck->frame_checked_out = true;
     pthread_mutex_unlock(&sck->frame_lock);

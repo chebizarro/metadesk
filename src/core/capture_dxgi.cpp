@@ -921,6 +921,13 @@ static int take_update(MdCaptureCtx *ctx, DxgiState *st, UINT i, UINT wait, Swee
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int dxgi_init(MdCaptureCtx *ctx) {
+    /* Frames are the mapped staging copy of the desktop image; a size cap
+     * would need a GPU scaling pass before it (md-n9p2 follow-up). */
+    if (ctx->config.max_width || ctx->config.max_height) {
+        MD_LOG_E("a capture size cap (max %ux%u) is not supported by DXGI capture",
+                 ctx->config.max_width, ctx->config.max_height);
+        return -1;
+    }
     auto *st = (DxgiState *)calloc(1, sizeof(DxgiState));
     if (!st) return -1;
     QueryPerformanceFrequency(&st->qpc_hz);

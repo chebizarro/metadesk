@@ -7,8 +7,14 @@
  * rectangle mid-stream (a "lost" duplication that the pump restarts, as the
  * host watchdog does). The real encoder/decoder run, and a mock input
  * backend records where frame points land on the desktop.
+ *
+ * md-f1oo: a backend may also republish its rectangle (and size) from
+ * get_frame without a restart, as ScreenCaptureKit does when the captured
+ * display moves or changes mode. md-n9p2: a size-capped capture delivers
+ * frames smaller than the display; input maps onto it unchanged.
  */
 #include "capture_sync.h"
+#include "action.h"
 #include "decode.h"
 #include "input_event.h"
 #include "packet.h"
@@ -54,6 +60,9 @@ typedef struct {
     Geometry   next;         /* what the next start publishes */
     atomic_bool lose;        /* next get_frame reports a lost duplication */
     bool       lost;
+    /* Next get_frame republishes this geometry without a restart. */
+    Geometry   republish;
+    atomic_bool republish_req;
     uint32_t   seq;
     uint32_t   starts;
     uint32_t   frame_pause_us; /* emulated frame interval */
@@ -81,6 +90,13 @@ static int mc_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
         ctx->active = false;
     }
     if (m->lost || !ctx->active) return MD_CAPTURE_ERROR;
+    if (atomic_exchange(&m->republish_req, false)) {
+        /* As SCK: published on the get_frame thread with the frame. */
+        m->cur = m->republish;
+        ctx->width = m->cur.w;
+        ctx->height = m->cur.h;
+        ctx->output_rect = m->cur.rect;
+    }
     if (m->frame_pause_us) usleep(m->frame_pause_us);
     memset(out, 0, sizeof(*out));
     out->width = m->cur.w;
@@ -107,6 +123,7 @@ static void capture_open(MdCaptureCtx *cap, MockCap *m, const Geometry *g) {
     memset(cap, 0, sizeof(*cap));
     memset(m, 0, sizeof(*m));
     atomic_init(&m->lose, false);
+    atomic_init(&m->republish_req, false);
     m->next = *g;
     cap->vtable = &mock_capture;
     cap->backend_data = m;
@@ -117,6 +134,12 @@ static void capture_open(MdCaptureCtx *cap, MockCap *m, const Geometry *g) {
 static void capture_change(MockCap *m, const Geometry *g) {
     m->next = *g;
     atomic_store(&m->lose, true);
+}
+
+/* The stream keeps running; the next frame carries g. */
+static void capture_republish(MockCap *m, const Geometry *g) {
+    m->republish = *g;
+    atomic_store(&m->republish_req, true);
 }
 
 /* ── Mock input backend ───────────────────────────────────────── */
@@ -133,7 +156,14 @@ static int mi_move(MdInputCtx *ctx, int x, int y) {
     return 0;
 }
 
-static const MdInputBackend mock_input_backend = { .mouse_move = mi_move };
+static int mi_button(MdInputCtx *ctx, int button, int pressed) {
+    (void)ctx; (void)button; (void)pressed;
+    return 0;
+}
+
+static const MdInputBackend mock_input_backend = {
+    .mouse_move = mi_move, .mouse_button = mi_button,
+};
 
 static void input_open(MdInput *inp, MockInput *mi, const Geometry *g) {
     memset(inp, 0, sizeof(*inp));
@@ -397,6 +427,131 @@ static void test_resize_failure_recovers(void) {
     MD_CHECK(sync.failed_w == 65536);
 
     md_encoder_destroy(enc);
+    md_capture_stop(&cap);
+    printf("OK\n");
+}
+
+/* md-f1oo: the display moves, then changes mode, while the stream keeps
+ * running. Nothing restarts; the next frame's reconciliation follows both. */
+static void test_republish_without_restart(void) {
+    printf("  test_republish_without_restart... ");
+    md_test_name = "republish";
+    MdCaptureCtx cap; MockCap mc;
+    capture_open(&cap, &mc, &G0);
+    MdInput inp; MockInput mi;
+    input_open(&inp, &mi, &G0);
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    MdEncoder *enc = encoder_for(&G0);
+    Sink sink = {0};
+    HostCaptureSync sync;
+    host_capture_sync_init(&sync, enc, &inp, &mu, G0.w, G0.h, &G0.rect);
+    MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
+
+    /* Rearranged: same frame size, the display now right of main. */
+    const Geometry moved = { G0.w, G0.h, { 1512, -100, 320, 180 } };
+    capture_republish(&mc, &moved);
+    MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
+    MD_CHECK(mc.starts == 1);
+    MD_CHECK(sync.bounds_updates == 1 && sync.resizes == 0);
+    MD_CHECK(md_input_mouse_move(&inp, 320, 180) == 0);
+    MD_CHECK(mi.gx == 1512 + 160 && mi.gy == -100 + 90);
+
+    /* Mode change in place: a new size and rect on the same stream. */
+    capture_republish(&mc, &G1);
+    MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
+    MD_CHECK(mc.starts == 1);
+    MD_CHECK(sync.bounds_updates == 2 && sync.resizes == 1);
+    uint32_t ew = 0, eh = 0;
+    MD_CHECK(md_encoder_get_size(enc, &ew, &eh) == 0 && ew == 480 && eh == 270);
+    MD_CHECK(md_input_mouse_move(&inp, 240, 135) == 0);
+    MD_CHECK(mi.gx == -960 && mi.gy == 660);
+
+    md_encoder_destroy(enc);
+    md_capture_stop(&cap);
+    printf("OK\n");
+}
+
+static double abs_d(double v) { return v < 0 ? -v : v; }
+
+/* md-n9p2: a size-capped capture of a Retina display (3024x1964 pixels,
+ * 1512x982 points) left of and above main, as --capture-max-size 1280x0
+ * delivers it. The host wires input exactly as for a native capture (frame
+ * size as screen_*, the output rect as output_*), and input lands where the
+ * same spot of the native frame would: within one capped pixel. */
+static void test_capped_capture_maps_input(void) {
+    printf("  test_capped_capture_maps_input... ");
+    md_test_name = "capped";
+    const MdCaptureRect display = { -1512, -200, 1512, 982 };
+    uint32_t w = 0, h = 0;
+    REQUIRE(md_capture_fit_size(3024, 1964, 1280, 0, &w, &h) == 0);
+    REQUIRE(w == 1280 && h == 831);
+    const Geometry capped = { w, h, display };
+    MdCaptureCtx cap; MockCap mc;
+    capture_open(&cap, &mc, &capped);
+
+    /* As host main.c: input from the capture's size and rect, nothing else. */
+    uint32_t cw = 0, ch = 0;
+    MdCaptureRect r = {0};
+    REQUIRE(md_capture_get_size(&cap, &cw, &ch) == 0);
+    REQUIRE(md_capture_get_output_rect(&cap, &r) == 0);
+    const Geometry from_host = { cw, ch, r };
+    MdInput inp; MockInput mi;
+    input_open(&inp, &mi, &from_host);
+    HostCaptureSync sync;
+    host_capture_sync_init(&sync, NULL, &inp, NULL, cw, ch, &r);
+    MD_CHECK(pump(&sync, &cap, NULL, 1) == 0); /* no encoder: never submits */
+    MD_CHECK(sync.bounds_updates == 0);        /* nothing to reconcile */
+
+    const MdInputConfig native = {
+        .screen_width = 3024, .screen_height = 1964,
+        .output_x = display.x, .output_y = display.y,
+        .output_width = display.width, .output_height = display.height,
+    };
+    const double tol_x = (double)display.width / w;   /* one capped pixel */
+    const double tol_y = (double)display.height / h;
+    static const int pts[][2] = {
+        { 0, 0 }, { 640, 415 }, { 1279, 830 }, { 100, 700 }, { 1000, 50 },
+    };
+    for (size_t i = 0; i < sizeof(pts) / sizeof(pts[0]); i++) {
+        const int x = pts[i][0], y = pts[i][1];
+        MD_CHECK(md_input_mouse_move(&inp, x, y) == 0);
+        double nx = 0, ny = 0;
+        md_input_map_to_output(&native, (int)(x * 3024.0 / w + 0.5),
+                               (int)(y * 1964.0 / h + 0.5), &nx, &ny);
+        MD_CHECK(abs_d(mi.gx - nx) <= tol_x && abs_d(mi.gy - ny) <= tol_y);
+        MD_CHECK(mi.gx >= display.x && mi.gx < display.x + (int)display.width);
+        MD_CHECK(mi.gy >= display.y && mi.gy < display.y + (int)display.height);
+    }
+    MD_CHECK(md_input_mouse_move(&inp, 0, 0) == 0);
+    MD_CHECK(mi.gx == -1512 && mi.gy == -200);
+    MD_CHECK(md_input_mouse_move(&inp, 640, 0) == 0);
+    MD_CHECK(mi.gx == -756);                    /* exact half-way */
+
+    /* Agent actions carry global points: the inverse mapping lands the
+     * click back on that point, within one capped pixel. */
+    MdAction act;
+    memset(&act, 0, sizeof(act));
+    act.type = MD_ACTION_CLICK;
+    act.region[0] = -756;
+    act.region[1] = 291;
+    MD_CHECK(md_input_execute_action(&inp, &act) == 0);
+    MD_CHECK(abs_d(mi.gx - -756) <= tol_x && abs_d(mi.gy - 291) <= tol_y);
+    const int moves = mi.moves;
+    act.region[0] = 100;                        /* on main, not captured */
+    act.region[1] = 100;
+    MD_CHECK(md_input_execute_action(&inp, &act) == -1);
+    MD_CHECK(mi.moves == moves);
+
+    /* md-f1oo while capped: the display moves right of main; the frame
+     * keeps its capped size and only the rect is republished. */
+    const Geometry moved = { w, h, { 3024, 0, 1512, 982 } };
+    capture_republish(&mc, &moved);
+    MD_CHECK(pump(&sync, &cap, NULL, 1) == 0);
+    MD_CHECK(sync.bounds_updates == 1 && mc.starts == 1);
+    MD_CHECK(inp.config.screen_width == w && inp.config.screen_height == h);
+    MD_CHECK(md_input_mouse_move(&inp, 640, 0) == 0);
+    MD_CHECK(mi.gx == 3024 + 756 && mi.gy == 0);
+
     md_capture_stop(&cap);
     printf("OK\n");
 }
@@ -672,6 +827,8 @@ int main(void) {
     test_requests_apply_on_capture_thread();
     test_degenerate_frames();
     test_resize_failure_recovers();
+    test_republish_without_restart();
+    test_capped_capture_maps_input();
     test_concurrent_dispatch();
     test_end_to_end_stream();
     return md_test_report();

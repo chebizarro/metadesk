@@ -2,9 +2,11 @@
  * metadesk — tools/capture_frame.c
  * Milestone 1.1 verification tool: capture a single frame to disk.
  *
- * Usage: ./capture_frame [output.raw [OUTPUT_SEL]]
+ * Usage: ./capture_frame [output.raw [OUTPUT_SEL [MAX_WxH]]]
  *
- * OUTPUT_SEL is MdCaptureConfig.output (see capture.h / --capture-output).
+ * OUTPUT_SEL is MdCaptureConfig.output (see capture.h / --capture-output);
+ * "" selects the default. MAX_WxH is MdCaptureConfig.max_width/max_height
+ * (host --capture-max-size; 0 = unbounded side).
  *
  * Captures one frame from the platform capture backend and writes
  * the raw pixel data to disk. Reports buffer type, dimensions,
@@ -39,16 +41,27 @@ static const char *pix_fmt_str(MdCapturePixFmt fmt) {
 
 int main(int argc, char **argv) {
     const char *output_path = (argc > 1) ? argv[1] : "frame.raw";
-    const char *display = (argc > 2) ? argv[2] : NULL;
+    const char *display = (argc > 2 && argv[2][0]) ? argv[2] : NULL;
+    unsigned max_w = 0, max_h = 0;
+    char trailing;
+    if (argc > 3 && sscanf(argv[3], "%ux%u%c", &max_w, &max_h, &trailing) != 2) {
+        fprintf(stderr, "ERROR: MAX_WxH must look like 1512x982 (0 = unbounded side)\n");
+        return 1;
+    }
 
     printf("metadesk capture_frame — M1.1 verification tool\n");
     printf("Output: %s\n", output_path);
-    printf("Display: %s\n\n", display ? display : "(default)");
+    printf("Display: %s\n", display ? display : "(default)");
+    if (max_w || max_h)
+        printf("Max size: %ux%u\n", max_w, max_h);
+    printf("\n");
 
     MdCaptureConfig cfg = {
         .target_fps  = 1, /* just need one frame */
         .show_cursor = true,
         .output      = display,
+        .max_width   = max_w,
+        .max_height  = max_h,
     };
 
     MdCaptureCtx *cap = md_capture_create(&cfg);

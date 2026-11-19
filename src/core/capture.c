@@ -293,6 +293,27 @@ int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
     return 0;
 }
 
+int md_capture_fit_size(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
+                        uint32_t *out_w, uint32_t *out_h) {
+    if (!out_w || !out_h || w == 0 || h == 0) return -1;
+    /* The tighter cap binds: w/h > max_w/max_h, cross-multiplied in 64 bits. */
+    const bool by_w = max_w && w > max_w &&
+                      (!max_h || (uint64_t)w * max_h >= (uint64_t)h * max_w);
+    const bool by_h = !by_w && max_h && h > max_h;
+    *out_w = w;
+    *out_h = h;
+    if (by_w) {
+        *out_w = max_w;
+        *out_h = (uint32_t)(((uint64_t)h * max_w + w / 2) / w);
+    } else if (by_h) {
+        *out_h = max_h;
+        *out_w = (uint32_t)(((uint64_t)w * max_h + h / 2) / h);
+    }
+    if (*out_w == 0) *out_w = 1;
+    if (*out_h == 0) *out_h = 1;
+    return 0;
+}
+
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height) {
     return md_capture_wait_size(ctx, 0, width, height);
 }
