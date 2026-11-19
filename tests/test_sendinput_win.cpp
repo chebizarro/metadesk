@@ -114,7 +114,8 @@ static bool moves_to(MdInputCtx *ctx, int x, int y, LONG want_x, LONG want_y) {
 static void test_normalize() {
     int widths = 0;
     for (int64_t len : { 64, 100, 768, 1024, 1080, 1366, 1920, 2560, 3000, 3840, 4480,
-                         5120, 5760, 7680, 10240, 16384, 32767 }) {
+                         5120, 5760, 7680, 10240, 16384, 32767, 32768, 38400, 49152,
+                         65535, 65536 }) {
         for (int64_t lo : { (int64_t)0, (int64_t)-1920, (int64_t)-7, (int64_t)1366 }) {
             const Span desk = { lo, len };
             for (int64_t p = lo; p < lo + len; p++) {
@@ -132,8 +133,14 @@ static void test_normalize() {
         }
         widths++;
     }
-    printf("PASS normalisation: every pixel of %d virtual-desktop widths x 4 origins "
-           "round-trips exactly\n", widths);
+    /* Wider than 65536 pixels not every pixel is representable: a
+     * neighbouring one is used. */
+    for (int64_t p = 0; p < 100000; p++) {
+        const LONG got = decode(si_normalize(p, { 0, 100000 }), 0, 100000);
+        CHECK(got >= p - 1 && got <= p + 1);
+    }
+    printf("PASS normalisation: every pixel of %d virtual-desktop widths (to 65536) x 4 "
+           "origins round-trips exactly; wider, within a pixel\n", widths);
 }
 
 /* md-w65: moves land on the configured output in the synthetic layout. */

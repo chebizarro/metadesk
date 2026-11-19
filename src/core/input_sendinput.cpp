@@ -18,8 +18,8 @@
  * (win_dpi.h), so mixed-DPI layouts map exactly. Windows turns a normalised
  * value n back into the pixel n * width / 65536, rounded down (Microsoft's
  * UI Automation client, Input.cs, relies on the same rule), so the backend
- * aims at the centre of the pixel: the result is that pixel whichever way
- * the system rounds, never its neighbour.
+ * sends the middle of the values that decode to the target pixel: exact for
+ * every pixel of virtual desktops up to 65536 pixels wide.
  *
  * Key events translate Linux KEY_* scan codes to Windows virtual
  * key codes (VK_*) via a mapping table.
@@ -61,10 +61,15 @@ struct Span {
 };
 
 /* Desktop pixel p (clamped into the virtual desktop) to the 0-65535 value
- * Windows maps back onto p: the centre of p's n * len / 65536 block. */
+ * Windows maps back onto p: the middle of the integers n whose
+ * n * len / 65536 is p. Every pixel has one while len <= 65536; past that
+ * a neighbouring representable pixel is used. */
 static LONG si_normalize(int64_t p, Span desk) {
     const int64_t q = p < desk.lo ? 0 : p >= desk.lo + desk.len ? desk.len - 1 : p - desk.lo;
-    const int64_t n = (2 * q + 1) * 65536 / (2 * desk.len);
+    const int64_t first = (q * 65536 + desk.len - 1) / desk.len;
+    int64_t last = ((q + 1) * 65536 + desk.len - 1) / desk.len - 1;
+    if (last < first) last = first;
+    const int64_t n = (first + last) / 2;
     return (LONG)(n > 65535 ? 65535 : n);
 }
 
