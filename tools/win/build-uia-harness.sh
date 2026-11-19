@@ -6,6 +6,8 @@
 # platform-neutral a11y core + a11y_uia.cpp into a static lib, then links:
 #   - atspi_dump.exe  : walks the real Windows desktop via UIA (--json/--compact)
 #   - test_uia_liveness.exe : session/provider loss and teardown races
+#   - test_uia_walk_equiv.exe : cached walk == uncached reference walk,
+#                       with before/after timings (md-cw8)
 #   - test_atspi.exe  : the generic a11y serialisation/vocab tests
 #                       (live UIA tests when MD_A11Y_LIVE_TESTS=1)
 # This is deliberately NOT the full meson product build (ffmpeg/libb2/curl/
@@ -34,6 +36,9 @@ echo "== link test_atspi.exe"
 $CXX -o "$OUT/test_atspi.exe" $CFLAGS -I"$ROOT/tests" -x c "$ROOT/tests/test_atspi.c" -x none "$OUT/libmd_a11y.a" $LIBS
 echo "== link test_uia_liveness.exe (private test seams, no production backend object)"
 $CXX $CXXFLAGS -o "$OUT/test_uia_liveness.exe" "$ROOT/tests/test_uia_liveness.cpp" \
+  "$OUT/a11y.o" "$OUT/a11y_query.o" "$OUT/a11y_snapshot.o" "$OUT/log.o" $LIBS
+echo "== link test_uia_walk_equiv.exe (uncached reference walker lives only in the test)"
+$CXX $CXXFLAGS -o "$OUT/test_uia_walk_equiv.exe" "$ROOT/tests/test_uia_walk_equiv.cpp" \
   "$OUT/a11y.o" "$OUT/a11y_query.o" "$OUT/a11y_snapshot.o" "$OUT/log.o" $LIBS
 echo "== done: $OUT"
 ls -la "$OUT"/*.exe
