@@ -12,6 +12,10 @@
  * get_frame without a restart, as ScreenCaptureKit does when the captured
  * display moves or changes mode. md-n9p2: a size-capped capture delivers
  * frames smaller than the display; input maps onto it unchanged.
+ *
+ * md-383x: input the client mapped onto a frame it was still showing when
+ * the host changed geometry lands where that frame showed, or is dropped,
+ * never interpreted against the new frame.
  */
 #include "capture_sync.h"
 #include "action.h"
@@ -50,6 +54,10 @@ typedef struct {
 static const Geometry G0 = { 640, 360, { 0, 0, 320, 180 } };
 static const Geometry G1 = { 480, 271, { -1920, 120, 1920, 1084 } };
 static const Geometry G2 = { 480, 271, { 3000, 0, 1920, 1084 } };
+/* GS: G0's display at 1x (the same output rectangle at half the size).
+ * GB: another display in G0's mode: the same frame size, elsewhere. */
+static const Geometry GS = { 320, 180, { 0, 0, 320, 180 } };
+static const Geometry GB = { 640, 360, { 320, 0, 320, 180 } };
 
 static uint8_t g_pixels[640 * 360 * 4];
 
@@ -145,7 +153,7 @@ static void capture_republish(MockCap *m, const Geometry *g) {
 /* ── Mock input backend ───────────────────────────────────────── */
 
 typedef struct {
-    int moves;
+    int moves, clicks;
     double gx, gy;
 } MockInput;
 
@@ -157,7 +165,9 @@ static int mi_move(MdInputCtx *ctx, int x, int y) {
 }
 
 static int mi_button(MdInputCtx *ctx, int button, int pressed) {
-    (void)ctx; (void)button; (void)pressed;
+    MockInput *mi = ctx->backend_data;
+    (void)button;
+    if (!pressed) mi->clicks++;
     return 0;
 }
 
@@ -179,14 +189,20 @@ static void input_open(MdInput *inp, MockInput *mi, const Geometry *g) {
     inp->config.output_height = g->rect.height;
 }
 
-/* Desktop point that the frame centre of g maps to. */
-static void expect_center(const Geometry *g, double *gx, double *gy) {
+/* Desktop point that frame point (x, y) of g maps to. */
+static void desktop_point(const Geometry *g, int x, int y,
+                          double *gx, double *gy) {
     MdInputConfig c = {
         .screen_width = g->w, .screen_height = g->h,
         .output_x = g->rect.x, .output_y = g->rect.y,
         .output_width = g->rect.width, .output_height = g->rect.height,
     };
-    md_input_map_to_output(&c, (int)g->w / 2, (int)g->h / 2, gx, gy);
+    md_input_map_to_output(&c, x, y, gx, gy);
+}
+
+/* Desktop point that the frame centre of g maps to. */
+static void expect_center(const Geometry *g, double *gx, double *gy) {
+    desktop_point(g, (int)g->w / 2, (int)g->h / 2, gx, gy);
 }
 
 /* ── Packet sink: what the client would decode ────────────────── */
@@ -284,7 +300,7 @@ static void test_restart_reconfigures(void) {
     REQUIRE(sink.dec != NULL);
 
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, enc, &inp, &mu, G0.w, G0.h, &G0.rect);
+    host_capture_sync_init(&sync, enc, &inp, &mu, NULL, G0.w, G0.h, &G0.rect);
 
     /* Steady state: nothing to reconcile. */
     MD_CHECK(pump(&sync, &cap, &sink, 4) == 4);
@@ -341,7 +357,7 @@ static void test_requests_apply_on_capture_thread(void) {
     MdEncoder *enc = encoder_for(&G0);
     Sink sink = {0};
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, enc, NULL, NULL, G0.w, G0.h, &G0.rect);
+    host_capture_sync_init(&sync, enc, NULL, NULL, NULL, G0.w, G0.h, &G0.rect);
 
     MD_CHECK(pump(&sync, &cap, &sink, 3) == 3);
     host_capture_sync_request_bitrate(&sync, 1500000);
@@ -373,7 +389,7 @@ static void test_degenerate_frames(void) {
     MdCaptureCtx cap; MockCap mc;
     capture_open(&cap, &mc, &G0);
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, NULL, &inp, NULL, G0.w, G0.h, &G0.rect);
+    host_capture_sync_init(&sync, NULL, &inp, NULL, NULL, G0.w, G0.h, &G0.rect);
 
     MdFrame tiny = { .width = 16, .height = 16 };
     MD_CHECK(!host_capture_sync_frame(&sync, &cap, &tiny));
@@ -406,7 +422,7 @@ static void test_resize_failure_recovers(void) {
     cap.output_rect = (MdCaptureRect){0};
     MdEncoder *enc = encoder_for(&G0);
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, enc, NULL, NULL, G0.w, G0.h, NULL);
+    host_capture_sync_init(&sync, enc, NULL, NULL, NULL, G0.w, G0.h, NULL);
 
     /* Beyond FFmpeg's image size limit: every codec in the cascade refuses. */
     const MdFrame a = { .width = G0.w, .height = G0.h };
@@ -431,8 +447,35 @@ static void test_resize_failure_recovers(void) {
     printf("OK\n");
 }
 
-/* md-f1oo: the display moves, then changes mode, while the stream keeps
- * running. Nothing restarts; the next frame's reconciliation follows both. */
+/* ── Helpers for input across geometry changes (md-383x) ──────── */
+
+static bool rect_eq(const MdCaptureRect *a, const MdCaptureRect *b) {
+    return a->x == b->x && a->y == b->y &&
+           a->width == b->width && a->height == b->height;
+}
+
+/* The capture thread's first frame at g (no encoder: input still follows). */
+static void apply_geometry(HostCaptureSync *sync, MdCaptureCtx *cap,
+                           const Geometry *g) {
+    cap->output_rect = g->rect;
+    MdFrame f = { .width = g->w, .height = g->h };
+    (void)host_capture_sync_frame(sync, cap, &f);
+}
+
+static HostPointMap map_on(HostCaptureSync *sync, const Geometry *shown,
+                           uint32_t seq, int x, int y, int *ox, int *oy) {
+    return host_capture_sync_map_point(sync, (uint16_t)(shown->w & ~1u),
+                                       (uint16_t)(shown->h & ~1u), seq,
+                                       x, y, ox, oy);
+}
+
+static double abs_d(double v) { return v < 0 ? -v : v; }
+
+/* md-f1oo: the display moves, then changes mode, then rescales, while the
+ * stream keeps running. Nothing restarts; the next frame's reconciliation
+ * follows each, and records it in the packet-sequence history (md-383x):
+ * points on frames sent before a republish are attributed to the geometry
+ * they were sent under. */
 static void test_republish_without_restart(void) {
     printf("  test_republish_without_restart... ");
     md_test_name = "republish";
@@ -443,9 +486,11 @@ static void test_republish_without_restart(void) {
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     MdEncoder *enc = encoder_for(&G0);
     Sink sink = {0};
+    uint32_t seq = 0;
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, enc, &inp, &mu, G0.w, G0.h, &G0.rect);
+    host_capture_sync_init(&sync, enc, &inp, &mu, &seq, G0.w, G0.h, &G0.rect);
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
+    seq += 2;                                  /* G0 frames: packets 0..1 */
 
     /* Rearranged: same frame size, the display now right of main. */
     const Geometry moved = { G0.w, G0.h, { 1512, -100, 320, 180 } };
@@ -453,7 +498,13 @@ static void test_republish_without_restart(void) {
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
     MD_CHECK(mc.starts == 1);
     MD_CHECK(sync.bounds_updates == 1 && sync.resizes == 0);
-    MD_CHECK(md_input_mouse_move(&inp, 320, 180) == 0);
+    MD_CHECK(sync.first_seq == 2 && sync.prev_first_seq == 0);
+    seq += 2;                                  /* moved frames: 2..3 */
+    int ox = -1, oy = -1;
+    /* Same size, another rectangle: a G0-frame point cannot be placed. */
+    MD_CHECK(map_on(&sync, &G0, 1, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&sync, &moved, 2, 320, 180, &ox, &oy) == HOST_POINT_CURRENT);
+    MD_CHECK(md_input_mouse_move(&inp, ox, oy) == 0);
     MD_CHECK(mi.gx == 1512 + 160 && mi.gy == -100 + 90);
 
     /* Mode change in place: a new size and rect on the same stream. */
@@ -461,17 +512,31 @@ static void test_republish_without_restart(void) {
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
     MD_CHECK(mc.starts == 1);
     MD_CHECK(sync.bounds_updates == 2 && sync.resizes == 1);
+    MD_CHECK(sync.first_seq == 4 && sync.prev_first_seq == 2);
+    seq += 2;                                  /* G1 frames: 4..5 */
     uint32_t ew = 0, eh = 0;
     MD_CHECK(md_encoder_get_size(enc, &ew, &eh) == 0 && ew == 480 && eh == 270);
-    MD_CHECK(md_input_mouse_move(&inp, 240, 135) == 0);
-    MD_CHECK(mi.gx == -960 && mi.gy == 660);
+    MD_CHECK(map_on(&sync, &moved, 3, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&sync, &G1, 5, 240, 135, &ox, &oy) == HOST_POINT_CURRENT);
+    MD_CHECK(md_input_click(&inp, ox, oy, 0) == 0);
+    MD_CHECK(mi.gx == -960 && mi.gy == 660 && mi.clicks == 1);
+
+    /* Rescaled in place (as a cap or HiDPI change): the same rectangle at
+     * half the size, so G1-frame points still land where they showed. */
+    const Geometry half = { 240, 136, G1.rect };
+    capture_republish(&mc, &half);
+    MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
+    MD_CHECK(mc.starts == 1 && sync.resizes == 2 && sync.first_seq == 6);
+    MD_CHECK(map_on(&sync, &G1, 4, 240, 135, &ox, &oy) == HOST_POINT_TRANSLATED);
+    MD_CHECK(md_input_click(&inp, ox, oy, 0) == 0);
+    MD_CHECK(abs_d(mi.gx - -960) <= 0.5 * 1920 / 240 &&
+             abs_d(mi.gy - 660) <= 0.5 * 1084 / 136);
+    MD_CHECK(map_on(&sync, &moved, 3, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
 
     md_encoder_destroy(enc);
     md_capture_stop(&cap);
     printf("OK\n");
 }
-
-static double abs_d(double v) { return v < 0 ? -v : v; }
 
 /* md-n9p2: a size-capped capture of a Retina display (3024x1964 pixels,
  * 1512x982 points) left of and above main, as --capture-max-size 1280x0
@@ -497,10 +562,19 @@ static void test_capped_capture_maps_input(void) {
     const Geometry from_host = { cw, ch, r };
     MdInput inp; MockInput mi;
     input_open(&inp, &mi, &from_host);
+    uint32_t seq = 0;
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, NULL, &inp, NULL, cw, ch, &r);
+    host_capture_sync_init(&sync, NULL, &inp, NULL, &seq, cw, ch, &r);
     MD_CHECK(pump(&sync, &cap, NULL, 1) == 0); /* no encoder: never submits */
     MD_CHECK(sync.bounds_updates == 0);        /* nothing to reconcile */
+    seq += 3;                                  /* capped frames: 0..2 */
+
+    /* md-383x: the client decodes the capped frame cropped to even (831 ->
+     * 830 rows) and tags its points with that; they map as-is. */
+    int ox = -1, oy = -1;
+    MD_CHECK(map_on(&sync, &capped, 1, 640, 415, &ox, &oy) ==
+             HOST_POINT_CURRENT);
+    MD_CHECK(ox == 640 && oy == 415);
 
     const MdInputConfig native = {
         .screen_width = 3024, .screen_height = 1964,
@@ -551,7 +625,172 @@ static void test_capped_capture_maps_input(void) {
     MD_CHECK(inp.config.screen_width == w && inp.config.screen_height == h);
     MD_CHECK(md_input_mouse_move(&inp, 640, 0) == 0);
     MD_CHECK(mi.gx == 3024 + 756 && mi.gy == 0);
+    MD_CHECK(sync.first_seq == 3 && sync.prev_first_seq == 0);
+    seq += 3;                                  /* moved frames: 3..5 */
+    /* A point on a frame from before the move cannot be placed. */
+    MD_CHECK(map_on(&sync, &capped, 2, 640, 0, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&sync, &moved, 3, 640, 0, &ox, &oy) == HOST_POINT_CURRENT);
 
+    /* The cap lifted in place: native pixels of the same rectangle. A point
+     * on a capped frame is rescaled and lands where the capped frame showed
+     * it, within half a native pixel. */
+    const Geometry native_moved = { 3024, 1964, moved.rect };
+    capture_republish(&mc, &native_moved);
+    MD_CHECK(pump(&sync, &cap, NULL, 1) == 0);
+    MD_CHECK(sync.bounds_updates == 2 && sync.first_seq == 6);
+    for (size_t i = 0; i < sizeof(pts) / sizeof(pts[0]); i++) {
+        const int x = pts[i][0], y = pts[i][1] > 829 ? 829 : pts[i][1];
+        double wx = 0, wy = 0;
+        desktop_point(&moved, x, y, &wx, &wy);
+        MD_CHECK(map_on(&sync, &moved, 5, x, y, &ox, &oy) ==
+                 HOST_POINT_TRANSLATED);
+        MD_CHECK(md_input_mouse_move(&inp, ox, oy) == 0);
+        MD_CHECK(abs_d(mi.gx - wx) <= 0.5 * 1512 / 3024 + 1e-9 &&
+                 abs_d(mi.gy - wy) <= 0.5 * 982 / 1964 + 1e-9);
+    }
+
+    md_capture_stop(&cap);
+    printf("OK\n");
+}
+
+/* ── Input across a resize (md-383x) ──────────────────────────── */
+
+/* Every point of every frame the host ever sent, mapped after each change
+ * in a series: it is used as-is only on the current geometry's frames,
+ * rescaled only from the previous geometry showing the same output
+ * rectangle, landing within half a current pixel of where the shown frame
+ * put it, and otherwise dropped. */
+static void test_points_follow_shown_frame(void) {
+    printf("  test_points_follow_shown_frame... ");
+    md_test_name = "points_follow_shown_frame";
+    MdCaptureCtx cap; MockCap mc;
+    capture_open(&cap, &mc, &G0);
+    MdInput inp; MockInput mi;
+    input_open(&inp, &mi, &G0);
+    uint32_t seq = 0;
+    HostCaptureSync sync;
+    host_capture_sync_init(&sync, NULL, &inp, NULL, &seq, G0.w, G0.h, &G0.rect);
+
+    /* Rescale, rescale back, another display of the same size, a mode
+     * change, a rearrangement of the same size. */
+    const Geometry *series[] = { &G0, &GS, &G0, &GB, &G1, &G2 };
+    enum { N = sizeof(series) / sizeof(series[0]) };
+    uint32_t first[N], end[N];
+    int translated = 0, current = 0, dropped = 0;
+    for (int step = 0; step < N; step++) {
+        if (step) apply_geometry(&sync, &cap, series[step]);
+        first[step] = seq;
+        seq += 7;                        /* frames sent at this geometry */
+        end[step] = seq;
+        MD_CHECK(sync.width == series[step]->w && sync.first_seq == first[step]);
+        const Geometry *cur = series[step];
+        for (int h = 0; h <= step; h++) {
+            const Geometry *shown = series[h];
+            const uint32_t seqs[2] = { first[h], end[h] - 1 };
+            const int xs[] = { 0, 1, (int)(shown->w & ~1u) / 3,
+                               (int)shown->w / 2, (int)(shown->w & ~1u) - 1 };
+            const int ys[] = { 0, (int)shown->h / 2, (int)(shown->h & ~1u) - 1 };
+            for (int si = 0; si < 2; si++)
+            for (size_t xi = 0; xi < sizeof(xs) / sizeof(xs[0]); xi++)
+            for (size_t yi = 0; yi < sizeof(ys) / sizeof(ys[0]); yi++) {
+                int ox = -1, oy = -1;
+                HostPointMap m = map_on(&sync, shown, seqs[si], xs[xi], ys[yi],
+                                        &ox, &oy);
+                const bool rescalable = h == step - 1 &&
+                                        rect_eq(&shown->rect, &cur->rect);
+                if (h == step) {
+                    MD_CHECK(m == HOST_POINT_CURRENT);
+                    MD_CHECK(ox == xs[xi] && oy == ys[yi]);
+                    current++;
+                } else if (rescalable) {
+                    MD_CHECK(m == HOST_POINT_TRANSLATED);
+                    MD_CHECK(ox >= 0 && ox < (int)cur->w);
+                    MD_CHECK(oy >= 0 && oy < (int)cur->h);
+                    /* Injected through the retargeted input, it lands where
+                     * the shown frame put it. */
+                    double wx, wy;
+                    desktop_point(shown, xs[xi], ys[yi], &wx, &wy);
+                    MD_CHECK(md_input_mouse_move(&inp, ox, oy) == 0);
+                    const double tol_x = 0.5 * cur->rect.width / cur->w + 1e-9;
+                    const double tol_y = 0.5 * cur->rect.height / cur->h + 1e-9;
+                    MD_CHECK(mi.gx >= wx - tol_x && mi.gx <= wx + tol_x);
+                    MD_CHECK(mi.gy >= wy - tol_y && mi.gy <= wy + tol_y);
+                    translated++;
+                } else {
+                    MD_CHECK(m == HOST_POINT_DROPPED);
+                    dropped++;
+                }
+            }
+        }
+    }
+    /* G0->GS and GS->G0 rescale; GB, G1 and G2 change the rectangle. */
+    MD_CHECK(translated == 2 * 2 * 5 * 3);
+    MD_CHECK(sync.points_translated == (uint32_t)translated);
+    MD_CHECK(sync.points_dropped == (uint32_t)dropped);
+    MD_CHECK(current > 0 && dropped > 0);
+
+    /* G2 has G1's size: only the sequence tells their frames apart. */
+    int ox, oy;
+    MD_CHECK(map_on(&sync, &G1, end[4] - 1, 240, 135, &ox, &oy) ==
+             HOST_POINT_DROPPED);                     /* G1 -> G2 moved */
+    MD_CHECK(map_on(&sync, &G2, first[5], 240, 135, &ox, &oy) ==
+             HOST_POINT_CURRENT);
+
+    /* Malformed or unknown tags. */
+    MD_CHECK(host_capture_sync_map_point(&sync, 0, 0, first[5], 0, 0,
+                                         &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(host_capture_sync_map_point(&sync, 480, 271, first[5], 0, 0,
+                                         &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&sync, &G2, seq, 0, 0, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&sync, &G2, seq + 1000, 0, 0, &ox, &oy) ==
+             HOST_POINT_DROPPED);                     /* not sent yet */
+    MD_CHECK(map_on(&sync, &G2, first[5], 480, 0, &ox, &oy) ==
+             HOST_POINT_DROPPED);                     /* outside the frame */
+    MD_CHECK(map_on(&sync, &G2, first[5], -1, 0, &ox, &oy) ==
+             HOST_POINT_DROPPED);
+    MD_CHECK(host_capture_sync_map_point(NULL, 480, 270, 0, 0, 0, &ox, &oy) ==
+             HOST_POINT_DROPPED);
+
+    /* A new stream restarts the counter: all it sees is the current
+     * geometry, and nothing from the old stream is attributable. */
+    seq = 0;
+    host_capture_sync_reset_sequence(&sync);
+    seq = 3;
+    MD_CHECK(map_on(&sync, &G2, 0, 240, 135, &ox, &oy) == HOST_POINT_CURRENT);
+    MD_CHECK(map_on(&sync, &GS, 1, 160, 90, &ox, &oy) == HOST_POINT_DROPPED);
+    md_capture_stop(&cap);
+    printf("OK (%d current, %d rescaled, %d dropped)\n",
+           current, translated, dropped);
+}
+
+/* Sequences compare modulo 2^32; without a sequence counter nothing is
+ * attributable. */
+static void test_point_sequence_edges(void) {
+    printf("  test_point_sequence_edges... ");
+    md_test_name = "point_sequence_edges";
+    MdCaptureCtx cap; MockCap mc;
+    capture_open(&cap, &mc, &G0);
+    uint32_t seq = UINT32_MAX - 3;
+    HostCaptureSync sync;
+    host_capture_sync_init(&sync, NULL, NULL, NULL, &seq, G0.w, G0.h, &G0.rect);
+    seq += 10;                                  /* wraps to 6 */
+    apply_geometry(&sync, &cap, &GS);
+    seq += 4;
+    int ox, oy;
+    MD_CHECK(map_on(&sync, &G0, UINT32_MAX - 1, 100, 50, &ox, &oy) ==
+             HOST_POINT_TRANSLATED);
+    MD_CHECK(ox == 50 && oy == 25);
+    MD_CHECK(map_on(&sync, &GS, 7, 10, 10, &ox, &oy) == HOST_POINT_CURRENT);
+    MD_CHECK(map_on(&sync, &G0, UINT32_MAX - 5, 100, 50, &ox, &oy) ==
+             HOST_POINT_DROPPED);               /* before G0's first frame */
+    MD_CHECK(map_on(&sync, &GS, 10, 10, 10, &ox, &oy) == HOST_POINT_DROPPED);
+
+    /* Without a counter no frame is attributable: every point drops. */
+    HostCaptureSync bare;
+    host_capture_sync_init(&bare, NULL, NULL, NULL, NULL, G0.w, G0.h, &G0.rect);
+    MD_CHECK(map_on(&bare, &G0, 0, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+    apply_geometry(&bare, &cap, &GS);
+    MD_CHECK(map_on(&bare, &GS, 0, 10, 10, &ox, &oy) == HOST_POINT_DROPPED);
     md_capture_stop(&cap);
     printf("OK\n");
 }
@@ -586,7 +825,7 @@ static void test_concurrent_dispatch(void) {
     input_open(&inp, &mi, &G0);
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, NULL, &inp, &mu, G0.w, G0.h, &G0.rect);
+    host_capture_sync_init(&sync, NULL, &inp, &mu, NULL, G0.w, G0.h, &G0.rect);
     Flipper fl = { .sync = &sync, .cap = &cap, .mc = &mc };
     atomic_init(&fl.stop, false);
 
@@ -618,9 +857,13 @@ static void test_concurrent_dispatch(void) {
 
 /* ── End to end over a TCP stream ─────────────────────────────── *
  * Host side: a capture thread (mock capture -> sync -> encoder -> stream)
- * and a packet thread (stream -> MD_PKT_INPUT -> input, under the lock).
- * Client side (this thread): decode, follow the size change, click the
- * centre of the new frame, and check where it landed on the desktop. */
+ * and a packet thread (stream -> MD_PKT_INPUT -> input, under the lock, as
+ * handle_client_packet). Client side (this thread): decode, follow two
+ * size changes, and click on the frame it shows, including in each window
+ * where the host has changed geometry but the client still shows the old
+ * frame (md-383x). Each click is checked where it landed on the desktop. */
+
+#define E2E_MAX_CLICKS 8
 
 typedef struct {
     HostCaptureSync *sync;
@@ -629,18 +872,20 @@ typedef struct {
     pthread_mutex_t *mu;        /* client_mu: sends + input dispatch */
     MdInput         *input;
     atomic_bool      stop;
-    uint32_t         seq;
-    int              keys_after_resize;
+    uint32_t         seq;       /* frame-channel sequence, under mu */
+    int              resizes_checked, resize_keys;
     bool             armed;
-    bool             first_after_resize_key;
-    double           gx, gy;    /* where the client's click landed */
+    /* Per dispatched click, under mu. */
     int              inputs;
+    HostPointMap     result[E2E_MAX_CLICKS];
+    double           gx[E2E_MAX_CLICKS], gy[E2E_MAX_CLICKS];
 } E2E;
 
 static void e2e_on_encoded(const MdEncodedPacket *pkt, void *ud) {
     E2E *e = ud;
     if (e->armed) {
-        e->first_after_resize_key = pkt->is_key;
+        e->resizes_checked++;
+        if (pkt->is_key) e->resize_keys++;
         e->armed = false;
     }
     pthread_mutex_lock(e->mu);
@@ -683,15 +928,24 @@ static void *e2e_packet_thread(void *arg) {
             uint8_t kind = 0, button = 0;
             int16_t x = 0, y = 0;
             const char *text = NULL;
-            uint16_t tlen = 0;
+            uint16_t tlen = 0, fw = 0, fh = 0;
+            uint32_t fseq = 0;
             pthread_mutex_lock(e->mu);
             if (md_input_event_unpack(payload, hdr.payload_len, &kind, &button,
-                                      &x, &y, &text, &tlen) == 0 &&
-                kind == MD_INPUT_EV_MOVE) {
-                md_input_mouse_move(e->input, x, y);
+                                      &x, &y, &text, &tlen,
+                                      &fw, &fh, &fseq) == 0 &&
+                kind == MD_INPUT_EV_BUTTON && e->inputs < E2E_MAX_CLICKS) {
+                int px = 0, py = 0;
+                HostPointMap m = host_capture_sync_map_point(e->sync, fw, fh,
+                                                             fseq, x, y,
+                                                             &px, &py);
                 MockInput *mi = e->input->backend_data;
-                e->gx = mi->gx;
-                e->gy = mi->gy;
+                mi->gx = mi->gy = 1e9;
+                if (m != HOST_POINT_DROPPED)
+                    md_input_click(e->input, px, py, 0);
+                e->result[e->inputs] = m;
+                e->gx[e->inputs] = mi->gx;
+                e->gy[e->inputs] = mi->gy;
                 e->inputs++;
             }
             pthread_mutex_unlock(e->mu);
@@ -702,18 +956,50 @@ static void *e2e_packet_thread(void *arg) {
 }
 
 typedef struct {
-    uint32_t w, h;
-    int frames_at_first, frames_at_new;
-    uint32_t first_w, first_h;
+    uint32_t w, h, seq;          /* the frame on screen */
+    uint32_t sizes_w[MAX_SIZES], sizes_h[MAX_SIZES];
+    int n_sizes;
 } ClientView;
 
 static void e2e_on_decoded(const MdDecodedFrame *f, void *ud) {
     ClientView *v = ud;
-    if (!v->first_w) { v->first_w = f->width; v->first_h = f->height; }
     v->w = f->width;
     v->h = f->height;
-    if (f->width == v->first_w && f->height == v->first_h) v->frames_at_first++;
-    else v->frames_at_new++;
+    v->seq = (uint32_t)f->pts;   /* submitted as the packet sequence */
+    if ((v->n_sizes == 0 || v->sizes_w[v->n_sizes - 1] != f->width ||
+         v->sizes_h[v->n_sizes - 1] != f->height) && v->n_sizes < MAX_SIZES) {
+        v->sizes_w[v->n_sizes] = f->width;
+        v->sizes_h[v->n_sizes] = f->height;
+        v->n_sizes++;
+    }
+}
+
+static bool shows(const ClientView *v, const Geometry *g) {
+    return v->w == (g->w & ~1u) && v->h == (g->h & ~1u);
+}
+
+/* As the client's send_input: a click tagged with the frame on screen. */
+static void client_click(MdStream *client, const ClientView *v, int x, int y) {
+    uint8_t buf[MD_INPUT_EVENT_MAX_LEN];
+    size_t n = md_input_event_pack(buf, sizeof(buf), MD_INPUT_EV_BUTTON, 1,
+                                   (int16_t)x, (int16_t)y, NULL, 0,
+                                   (uint16_t)v->w, (uint16_t)v->h, v->seq);
+    MD_CHECK(n > 0);
+    MD_CHECK(md_stream_send(client, MD_PKT_INPUT, 1, buf, (uint32_t)n) == 0);
+}
+
+static int locked_int(pthread_mutex_t *mu, const int *p) {
+    pthread_mutex_lock(mu);
+    int v = *p;
+    pthread_mutex_unlock(mu);
+    return v;
+}
+
+static uint32_t locked_u32(pthread_mutex_t *mu, const uint32_t *p) {
+    pthread_mutex_lock(mu);
+    uint32_t v = *p;
+    pthread_mutex_unlock(mu);
+    return v;
 }
 
 static void test_end_to_end_stream(void) {
@@ -734,9 +1020,9 @@ static void test_end_to_end_stream(void) {
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     MdEncoder *enc = encoder_for(&G0);
     HostCaptureSync sync;
-    host_capture_sync_init(&sync, enc, &inp, &mu, G0.w, G0.h, &G0.rect);
     E2E e = { .sync = &sync, .cap = &cap, .peer = peer, .mu = &mu, .input = &inp };
     atomic_init(&e.stop, false);
+    host_capture_sync_init(&sync, enc, &inp, &mu, &e.seq, G0.w, G0.h, &G0.rect);
 
     pthread_t tc, tp;
     REQUIRE(pthread_create(&tc, NULL, e2e_capture_thread, &e) == 0);
@@ -745,47 +1031,53 @@ static void test_end_to_end_stream(void) {
     MdDecoder *dec = md_decoder_create();
     REQUIRE(dec != NULL);
     ClientView v = {0};
-    bool changed_requested = false, clicked = false;
-    /* Event-driven: each step reacts to what the client decoded. The
-     * packet budget only bounds a broken run. */
-    for (int budget = 0; budget < 2000 && !clicked; budget++) {
+    /* Clicks, in order:
+     *   0  on G0 (100,50), sent once the host shows GS (a pure rescale,
+     *      republished without a restart): rescaled onto GS, landing
+     *      where G0 showed it;
+     *   1  on GS (160,90), sent once the host shows G1 (a mode change):
+     *      dropped;
+     *   2  on G1's centre, once the client shows G1: as-is. */
+    int phase = 0;
+    /* Event-driven: each step reacts to what the client received or
+     * decoded. The packet budget only bounds a broken run. */
+    for (int budget = 0; budget < 4000 && phase < 6; budget++) {
         MdPacketHeader hdr;
         uint8_t *payload = NULL;
         int rc = md_stream_recv(client, &hdr, &payload, 5000);
         if (rc != 0) { free(payload); break; }
         if (hdr.type == MD_PKT_VIDEO_FRAME) {
-            md_decoder_submit(dec, payload, hdr.payload_len, 0);
+            /* Before decoding: a packet sent after a change can be the new
+             * IDR, so the old frame is still on screen. */
+            const uint32_t applied = locked_u32(&mu, &sync.bounds_updates);
+            if (phase == 1 && applied >= 1 && shows(&v, &G0)) {
+                client_click(client, &v, 100, 50);
+                phase = 2;
+            } else if (phase == 3 && applied >= 2 && shows(&v, &GS)) {
+                client_click(client, &v, 160, 90);
+                phase = 4;
+            }
+            md_decoder_submit(dec, payload, hdr.payload_len, hdr.sequence);
             md_decoder_poll(dec, e2e_on_decoded, &v);
         }
         free(payload);
-        if (!changed_requested && v.frames_at_first > 0) {
-            capture_change(&mc, &G1);   /* host display changes mode */
-            changed_requested = true;
-        }
-        if (v.frames_at_new > 0 && !clicked) {
-            /* As the client's map_to_remote: the decoded frame's centre. */
-            uint8_t buf[16];
-            size_t n = md_input_event_pack(buf, sizeof(buf), MD_INPUT_EV_MOVE, 0,
-                                           (int16_t)(v.w / 2), (int16_t)(v.h / 2),
-                                           NULL, 0);
-            MD_CHECK(md_stream_send(client, MD_PKT_INPUT, 1, buf, (uint32_t)n) == 0);
-            clicked = true;
+        const int inputs = locked_int(&mu, &e.inputs);
+        if (phase == 0 && shows(&v, &G0)) {
+            /* The display rescales in place: republished without a
+             * restart, as ScreenCaptureKit does (md-f1oo). */
+            capture_republish(&mc, &GS);
+            phase = 1;
+        } else if (phase == 2 && inputs >= 1 && shows(&v, &GS)) {
+            capture_change(&mc, &G1);          /* host display changes mode */
+            phase = 3;
+        } else if (phase == 4 && inputs >= 2 && shows(&v, &G1)) {
+            client_click(client, &v, (int)v.w / 2, (int)v.h / 2);
+            phase = 5;
+        } else if (phase == 5 && inputs >= 3) {
+            phase = 6;
         }
     }
-    MD_CHECK(clicked);
-
-    /* Wait for the host to dispatch that click: its reply is the next
-     * video packet after it, so drain until the packet thread counted it. */
-    for (int budget = 0; budget < 2000; budget++) {
-        pthread_mutex_lock(&mu);
-        int inputs = e.inputs;
-        pthread_mutex_unlock(&mu);
-        if (inputs > 0) break;
-        MdPacketHeader hdr;
-        uint8_t *payload = NULL;
-        if (md_stream_recv(client, &hdr, &payload, 5000) != 0) { free(payload); break; }
-        free(payload);
-    }
+    MD_CHECK(phase == 6);
 
     /* The packet thread polls the stop flag between bounded recvs, so it
      * exits on a live connection. Only then shut the client end: a capture
@@ -797,13 +1089,26 @@ static void test_end_to_end_stream(void) {
     md_stream_close(client);
     pthread_join(tc, NULL);
 
-    MD_CHECK(v.first_w == 640 && v.first_h == 360);
-    MD_CHECK(v.w == 480 && v.h == 270);
-    MD_CHECK(sync.resizes == 1);
-    MD_CHECK(e.first_after_resize_key);
-    MD_CHECK(e.inputs == 1);
+    MD_CHECK(sync.resizes == 2);
+    MD_CHECK(mc.starts == 2);                  /* only G1 restarted */
+    MD_CHECK(e.resizes_checked == 2 && e.resize_keys == 2);
+    MD_CHECK(e.inputs == 3);
+    MD_CHECK(mi.clicks == 2);
+    /* G0 (100,50) is desktop (50,25); GS shows the same rectangle 1:1. */
+    MD_CHECK(e.result[0] == HOST_POINT_TRANSLATED);
+    MD_CHECK(e.gx[0] == 50 && e.gy[0] == 25);
+    MD_CHECK(e.result[1] == HOST_POINT_DROPPED);
     /* Decoded 480x270 centre (240,135) -> new display's centre. */
-    MD_CHECK(e.gx == -960 && e.gy == 660);
+    MD_CHECK(e.result[2] == HOST_POINT_CURRENT);
+    MD_CHECK(e.gx[2] == -960 && e.gy[2] == 660);
+    MD_CHECK(sync.points_translated == 1 && sync.points_dropped == 1);
+
+    /* The decoder followed both size changes mid-stream. */
+    md_decoder_flush(dec, e2e_on_decoded, &v);
+    MD_CHECK(v.n_sizes == 3);
+    MD_CHECK(v.sizes_w[0] == 640 && v.sizes_h[0] == 360);
+    MD_CHECK(v.sizes_w[1] == 320 && v.sizes_h[1] == 180);
+    MD_CHECK(v.sizes_w[2] == 480 && v.sizes_h[2] == 270);
 
     md_decoder_destroy(dec);
     md_encoder_destroy(enc);
@@ -811,7 +1116,7 @@ static void test_end_to_end_stream(void) {
     md_stream_destroy(client);
     md_stream_destroy(peer);
     md_stream_server_destroy(srv);
-    printf("OK (%d frames before, %d after)\n", v.frames_at_first, v.frames_at_new);
+    printf("OK (%d clicks)\n", e.inputs);
 }
 
 int main(void) {
@@ -829,6 +1134,8 @@ int main(void) {
     test_resize_failure_recovers();
     test_republish_without_restart();
     test_capped_capture_maps_input();
+    test_points_follow_shown_frame();
+    test_point_sequence_edges();
     test_concurrent_dispatch();
     test_end_to_end_stream();
     return md_test_report();

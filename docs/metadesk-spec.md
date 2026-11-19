@@ -261,11 +261,39 @@ typedef enum {
     MD_PKT_UI_TREE       = 0x03,
     MD_PKT_UI_TREE_DELTA = 0x04,
     MD_PKT_SCREENSHOT    = 0x05,
+    MD_PKT_INPUT         = 0x06,  // raw human input, client → host (§3.1.1)
     MD_PKT_PING          = 0x10,
     MD_PKT_PONG          = 0x11,
     MD_PKT_SESSION_INFO  = 0x20,
 } MdPacketType;
 ```
+
+The `sequence` of every host → client packet comes from one per-stream counter, which restarts at 0 for each bound client.
+
+#### 3.1.1 Raw Input Format (Client → Host) — `MD_PKT_INPUT`
+
+The human video client forwards mouse and keyboard input as a little-endian binary payload (`src/core/input_event.h`):
+
+```
+offset 0   u8   kind        1 MOVE, 2 BUTTON (press + release), 3 WHEEL, 4 KEY, 5 TEXT
+offset 1   u8   button      BUTTON: 1 left, 2 middle, 3 right; KEY: modifier mask
+offset 2   i16  x           MOVE/BUTTON: frame x; WHEEL: dx
+offset 4   i16  y           MOVE/BUTTON: frame y; WHEEL: dy
+offset 6   u16  text_len    KEY name or TEXT bytes that follow (at most 256)
+offset 8   text_len bytes of UTF-8
+then       u16  frame_w     the decoded frame the point was mapped onto:
+           u16  frame_h     its size (0x0 when no frame is shown) and the
+           u32  frame_seq   sequence of the video packet it was decoded from
+```
+
+MOVE/BUTTON points are pixels of the decoded frame that is on screen. The 8-byte frame tag after the text lets the host interpret a point against that frame, even when the host has changed geometry since (§9.3, md-383x). The host ignores bytes after the tag; they are reserved for later fields.
+
+Compatibility: the tag was appended without a header `version` bump. The payload length tells the two forms apart, and a version bump would also break video for a mixed pair.
+
+- A host built before the tag parses the 8-byte header and the text, then ignores the trailing tag. It maps points as it always did.
+- A current host rejects a payload without the tag (`8 + text_len` bytes) and drops it, keys included. It does not guess the geometry of an untagged point.
+
+As with the stream binding (md-mrw, md-6ns), upgrade host and client together.
 
 ### 3.2 Action Format (Agent → Host)
 
@@ -699,7 +727,7 @@ profile            = high
 
 ### 9.3 Mid-Stream Size Changes
 
-The captured size can change during a session. Causes include a display mode change or rotation, a watchdog capture restart, DXGI access-loss re-duplication, a display rearrangement or attach/detach, or a new `--capture-output all` layout. The wire protocol does not carry a frame size. The H.264 bitstream is the only source of the size:
+The captured size can change during a session. Causes include a display mode change or rotation, a watchdog capture restart, DXGI access-loss re-duplication, a display rearrangement or attach/detach, or a new `--capture-output all` layout. Video packets do not carry a frame size: the H.264 bitstream (SPS) is the only source of it. Client input echoes back the size and packet `sequence` of the frame it was mapped onto (§3.1.1):
 
 - **Capture** (macOS): ScreenCaptureKit keeps its stream running when the captured display moves or changes mode. Each SCK frame carries the display's onscreen rect and pixel/point scale, and the backend follows those per-frame attachments:
   - When they change, the backend re-reads `CGDisplayBounds`.
@@ -714,8 +742,20 @@ The captured size can change during a session. Causes include a display mode cha
   - If the even-rounded size changed (an odd edge is cropped, while input keeps the true size), the encoder is re-opened with `md_encoder_resize`. The encoder keeps the current bitrate. Packets still buffered at the old size are dropped, and the next frame is an IDR whose in-band SPS carries the new size.
 
   The capture thread is the only thread that touches the encoder. A new client's keyframe and the adaptive bitrate are posted as requests, which the capture thread applies before its next frame, so a resize never races them. If the encoder cannot open at the new size, frames are dropped and a warning is logged. That size is not retried until the geometry changes again.
-- **Client**: no protocol change is needed. The decoder takes each frame's size from the SPS. The renderer re-creates its texture (and resizes its window) when the decoded size changes. Input is mapped from window coordinates onto the latest decoded frame size.
-- **Limitation**: input events carry only frame-relative points. Points the client sent before it decoded the new IDR, at most about one RTT, are interpreted against the new frame size.
+- **Client**: the decoder takes each frame's size from the SPS. The renderer re-creates its texture (and resizes its window) when the decoded size changes. Pointer input is mapped from window coordinates onto the last presented frame. Each `MD_PKT_INPUT` is tagged with that frame's size and the `sequence` of its video packet (§3.1.1). Before decoding each video packet, the client pumps queued input. That input is then mapped and tagged while its frame, window size and tag are still the ones on screen; uploading the new frame can resize the window. On reconnect the tag is cleared until a frame of the new stream is presented.
+- **Input across a change** (md-383x): the client keeps showing the old frame until it decodes the new IDR, at most about one RTT. Under `client_mu`, each geometry change records the host's packet sequence counter (`first_seq`), and `host_capture_sync_map_point` attributes a tagged point to the geometry its frame was sent under:
+  - **Current geometry** (`frame_seq` ≥ `first_seq`): the point is used as-is.
+  - **Previous geometry**: the point is rescaled onto the current frame only when the previous frame showed the same published output rectangle at another size, a pure rescale such as a HiDPI or downscale change. It then lands within half a current pixel of the desktop point the old frame showed.
+  - **Dropped**: a previous geometry with another rectangle or none (a mode change, rotation, rearrangement, other display or new layout), where the content under the old point may have moved. Also dropped: anything older, a sequence not sent yet, a tagged size that does not match the attributed geometry's even-rounded size, a point outside the tagged frame, or an untagged event.
+
+  Every geometry change is recorded the same way, whether it came from a restart or a ScreenCaptureKit republish without one (md-f1oo). A size cap needs no special case: a capped frame is just a smaller frame of the same rectangle, so changing the cap is a pure rescale (md-n9p2).
+
+  A point is never interpreted against a frame the client did not show. The sequence, not just the size, picks the geometry. It distinguishes two geometries with the same frame size, such as a rearrangement or another display of the same mode. The host logs the first drop for each geometry.
+
+  The capture thread re-opens the encoder before it submits a frame at the new size, and packets still buffered at the old size are dropped. So every video packet sent at or after `first_seq` is at the new geometry. Two residual windows remain:
+  - An asynchronous encoder (VideoToolbox, AMF) is not re-opened on a rectangle-only change (same size). It can still emit a frame captured just before the change, and that frame counts as current (md-f7uc).
+  - Input that arrives while the client decodes and presents a frame, a few milliseconds plus scanout, is tagged with the new frame. A new client restarts the counter, and the history is reset with it (`host_capture_sync_reset_sequence`).
+- **Agent actions** (MCP and `MD_PKT_ACTION`) are not affected. They carry global accessibility coordinates, which `md_input_execute_action` converts to frame space and back under one set of current bounds.
 
 ### 9.4 Latency Budget
 

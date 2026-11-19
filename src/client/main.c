@@ -50,6 +50,12 @@ static void signal_handler(int sig) {
 
 /* ── State ───────────────────────────────────────────────────── */
 
+/* A decoded frame as input names it to the host (md-383x): its size and
+ * the sequence of the video packet it was decoded from. */
+typedef struct {
+    uint32_t w, h, pkt_seq;
+} FrameTag;
+
 typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
@@ -58,6 +64,9 @@ typedef struct {
     int64_t       total_decode_us;
     uint32_t      frame_w;              /* last decoded frame width  (remote px) */
     uint32_t      frame_h;              /* last decoded frame height (remote px) */
+    FrameTag      uploaded;             /* last frame uploaded to the texture */
+    FrameTag      shown;                /* last frame presented: input is mapped
+                                         * onto and tagged with it            */
     MdStream     *stream;               /* active stream, for input forwarding    */
     uint32_t      input_seq;            /* seq counter for MD_PKT_INPUT packets    */
 
@@ -101,8 +110,12 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
         /* Upload only; the composite (video + overlay + single present) is
          * driven from the main loop via render_client_overlay(). */
         if (md_renderer_update_frame(ctx->renderer, frame->data,
-                                     frame->width, frame->height) == 0)
+                                     frame->width, frame->height) == 0) {
             ctx->frames_displayed++;
+            /* pts was submitted as the packet sequence. */
+            ctx->uploaded = (FrameTag){ frame->width, frame->height,
+                                        (uint32_t)frame->pts };
+        }
     }
 
     /* Overlay stats/rendering are driven from the main loop. */
@@ -500,12 +513,19 @@ static const char *sdl_key_name(SDL_Keycode k) {
     }
 }
 
-/* Serialize and send one input event to the host. */
+/* Serialize and send one input event to the host, tagged with the frame on
+ * screen: the host interprets points against that frame, not one it
+ * captured since (md-383x). Events are pumped before each video packet is
+ * decoded, so queued input is mapped while its frame is still shown. */
 static void send_input(ClientCtx *ctx, uint8_t kind, uint8_t button,
                        int16_t x, int16_t y, const char *text, uint16_t tlen) {
     if (!ctx->stream) return;
-    uint8_t buf[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_MAX_TEXT];
-    size_t n = md_input_event_pack(buf, sizeof(buf), kind, button, x, y, text, tlen);
+    uint8_t buf[MD_INPUT_EVENT_MAX_LEN];
+    const FrameTag *t = &ctx->shown;
+    const bool fits = t->w <= UINT16_MAX && t->h <= UINT16_MAX;
+    size_t n = md_input_event_pack(buf, sizeof(buf), kind, button, x, y,
+                                   text, tlen, fits ? (uint16_t)t->w : 0,
+                                   fits ? (uint16_t)t->h : 0, t->pkt_seq);
     if (n == 0) return;
     md_stream_send(ctx->stream, MD_PKT_INPUT, ctx->input_seq++, buf, (uint32_t)n);
 }
@@ -513,7 +533,8 @@ static void send_input(ClientCtx *ctx, uint8_t kind, uint8_t button,
 /* Map window-point coordinates to remote frame pixels. */
 static bool map_to_remote(ClientCtx *ctx, int wx, int wy,
                           int16_t *rx, int16_t *ry) {
-    if (!ctx->renderer || ctx->frame_w == 0 || ctx->frame_h == 0)
+    const uint32_t fw = ctx->shown.w, fh = ctx->shown.h;
+    if (!ctx->renderer || fw == 0 || fh == 0)
         return false;
     /* Use the LIVE window size, not the renderer's stored value: the OS may
      * keep the window at a different size than we requested (e.g. zoomed to
@@ -525,12 +546,12 @@ static bool map_to_remote(ClientCtx *ctx, int wx, int wy,
         SDL_GetWindowSize(win, &ww, &wh);
     if (ww <= 0 || wh <= 0)
         return false;
-    long mx = (long)wx * (long)ctx->frame_w / (long)ww;
-    long my = (long)wy * (long)ctx->frame_h / (long)wh;
+    long mx = (long)wx * (long)fw / (long)ww;
+    long my = (long)wy * (long)fh / (long)wh;
     if (mx < 0) mx = 0;
-    if (mx > (long)ctx->frame_w - 1) mx = (long)ctx->frame_w - 1;
+    if (mx > (long)fw - 1) mx = (long)fw - 1;
     if (my < 0) my = 0;
-    if (my > (long)ctx->frame_h - 1) my = (long)ctx->frame_h - 1;
+    if (my > (long)fh - 1) my = (long)fh - 1;
     *rx = (int16_t)mx;
     *ry = (int16_t)my;
     return true;
@@ -631,6 +652,7 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
     md_overlay_new_frame(ctx->overlay);
     md_overlay_render(ctx->overlay, &overlay_stats);
     md_renderer_end_frame(ctx->renderer);
+    ctx->shown = ctx->uploaded;
 }
 
 static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
@@ -1010,6 +1032,9 @@ int main(int argc, char **argv) {
             md_stream_destroy(stream);
             stream = NULL;
             md_session_reset(&session);
+            /* The next stream's frames are numbered afresh: map no point
+             * until one of them is shown. */
+            ctx.uploaded = ctx.shown = (FrameTag){ 0 };
             ctx.reconnecting = 1;
             ctx.connection_status = "Disconnected — reconnecting...";
             ctx.reconnect_delay_ms = reconnect_delay_ms;
@@ -1020,6 +1045,17 @@ int main(int argc, char **argv) {
         switch (hdr.type) {
         case MD_PKT_VIDEO_FRAME: {
             video_packets++;
+
+            /* Forward input queued while the current frame is on screen
+             * before this one is decoded, uploaded (which may resize the
+             * window) and presented: it is mapped and tagged against the
+             * frame the user saw (md-383x). */
+            if (ctx.renderer && md_renderer_poll_events(ctx.renderer) < 0) {
+                printf("client: window closed\n");
+                deliberate_exit = true;
+                g_running = 0;
+                break;
+            }
 
             int64_t dec_start = now_us();
 

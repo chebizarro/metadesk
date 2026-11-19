@@ -406,20 +406,30 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
             break;
         uint8_t kind = 0, button = 0;
         int16_t x = 0, y = 0;
-        uint16_t tlen = 0;
+        uint16_t tlen = 0, frame_w = 0, frame_h = 0;
+        uint32_t frame_pkt_seq = 0;
         const char *text = NULL;
         if (md_input_event_unpack(payload, hdr->payload_len, &kind, &button,
-                                  &x, &y, &text, &tlen) != 0)
+                                  &x, &y, &text, &tlen,
+                                  &frame_w, &frame_h, &frame_pkt_seq) != 0)
+            break;
+        /* Points are interpreted against the frame the client showed, which
+         * lags a resize by about one RTT (md-383x). */
+        int px = 0, py = 0;
+        if ((kind == MD_INPUT_EV_MOVE || kind == MD_INPUT_EV_BUTTON) &&
+            host_capture_sync_map_point(&ctx->sync, frame_w, frame_h,
+                                        frame_pkt_seq, x, y, &px, &py) ==
+                HOST_POINT_DROPPED)
             break;
         switch (kind) {
         case MD_INPUT_EV_MOVE:
-            md_input_mouse_move(ctx->input, x, y);
+            md_input_mouse_move(ctx->input, px, py);
             break;
         case MD_INPUT_EV_BUTTON: {
             /* Wire buttons are 1=left, 2=middle, 3=right; md_input_click()
              * uses 0=left, 1=right, 2=middle. */
             int mb = (button == 2) ? 2 : (button == 3) ? 1 : 0;
-            md_input_click(ctx->input, x, y, mb);
+            md_input_click(ctx->input, px, py, mb);
             break;
         }
         case MD_INPUT_EV_WHEEL:
@@ -1351,6 +1361,7 @@ signaling_ready:
     /* Packet dispatch (and the agent's actions) run under client_mu, so the
      * capture thread retargets input under it too. */
     host_capture_sync_init(&ctx.sync, encoder, input, &ctx.client_mu,
+                           &ctx.pkt_seq,
                            display_width, display_height, &output_rect);
 
     /* Capture thread starts only after encoder/input are ready. */
@@ -1414,6 +1425,7 @@ signaling_ready:
         pthread_mutex_lock(&ctx.client_mu);
         ctx.client     = client;
         ctx.pkt_seq    = 0;
+        host_capture_sync_reset_sequence(&ctx.sync);
         ctx.frames_sent = 0;
         ctx.total_encode_us = 0;
         ctx.frames_encoded  = 0;
