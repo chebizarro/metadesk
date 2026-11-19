@@ -48,33 +48,95 @@ and creates the done file last. Delete temporary scripts and outputs when
 finished. SSH itself runs in session 0 even when `quser` reports an active
 console.
 
-## Walk equivalence and timing (md-cw8)
+## Walk equivalence and timing (md-cw8, md-0by)
 
 The backend walks each top-level window with one `TreeScope_Subtree`
-cache-request round trip. `test_uia_walk_equiv.exe` keeps a verbatim copy of
-the old uncached TreeWalker walk and requires identical output: the same node
-structure plus byte-identical JSON and compact serialisation at a fixed
-timestamp. It runs these cells:
+cache-request round trip. UIA cannot bound that fetch, so items past the
+256-child cap are fetched and then dropped. For the in-process Win32 proxies
+(list box, list view, tree view, combo box) each dropped item costs window
+messages. So before each walk the backend checks the visible Win32
+descendants of every top-level window for those classes and asks for their
+item counts. This takes about 0.3 ms on the desktop and makes no UIA call.
+A window holding a container with more than 1024 items is walked by bounded
+`BuildCache` navigation instead, with the uncached walk's exact semantics.
+While such a window is on screen, the other windows cost one extra round trip
+each.
+
+`test_uia_walk_equiv.exe` keeps a verbatim copy of the old uncached
+TreeWalker walk and requires identical output: the same node structure plus
+byte-identical JSON and compact serialisation at a fixed timestamp. It runs
+these cells:
 
 - A Win32 fixture window: buttons (one disabled), a checkbox, an edit, a
   label, a 300-item list (the 256-child cap) and nested group boxes deeper than
-  the 32-level depth cap. Both the subtree cache and the per-level fallback
-  are compared.
+  the 32-level depth cap. The subtree cache, the per-level fallback and the
+  bounded navigation walk are all compared.
 - The production top-level enumeration over fixture elements. This covers the
-  subtree tier, a forced fallback to element navigation plus a per-level walk,
-  a forced leaf fallback (enumeration must continue) and the top-level cap.
-  The failures are forced through the test-only `uia_test_rejected` seam.
+  subtree tier and the two-step tier, which uses a test-only lowered
+  wide-list threshold (`uia_test_wide_items`) so the 300-item list takes the
+  bounded path. It also covers a forced fallback to element navigation plus a
+  per-level walk, a forced leaf fallback (enumeration must continue) and the
+  top-level cap. The failures are forced through the test-only
+  `uia_test_rejected` seam.
+- The fixture timed as production walks a top-level window, next to the
+  md-cw8 subtree-only fetch.
 - With `--interactive`, the real desktop: the production `uia_get_tree` versus
   the uncached reference, retried up to 5 times if the desktop changes between
-  walks. It prints uncached and cached medians.
+  walks. It prints uncached and cached medians and the wide-list scan cost.
+  When the fixture is wide, the same cell also runs with the fixture open.
 
 In session 0 both cells SKIP. Windows on that non-interactive window station
 are never visible, so UIA exposes no fixture children, and the backend rejects
 desktop walks there by design.
 
-To measure the known overfetch cost on wide lists, compile with
-`-DFIXTURE_LIST_ITEMS=5000`. UIA cannot bound a subtree cache fetch, so nodes
-beyond the caps are fetched and then dropped.
+To measure wide lists, compile with `-DFIXTURE_LIST_ITEMS=5000`. Or add a
+virtual list view with `-DFIXTURE_VLIST_ITEMS=100000 -DFIXTURE_TIMING_RUNS=1`
+and link with `-lcomctl32`.
+
+Reference numbers on the Win11 ARM64 VM (console session, medians):
+
+| Cell | Uncached | Subtree only (md-cw8) | Production |
+|---|---|---|---|
+| Fixture, 300-item list | 645-880 ms | 200-240 ms | 210-240 ms (subtree) |
+| Fixture, 5000-item list | 760 ms | 1370 ms | 400 ms (bounded) |
+| Fixture, 100k virtual list view | 1310 ms | 20.6 s | 650 ms (bounded) |
+| Desktop, 281 nodes | 570-790 ms | 2.8-3.0x | 2.7-2.9x |
+| Desktop plus the 5000-item fixture | 1420 ms | | 660 ms (2.1x) |
+
+## DXGI capture and SendInput (md-7yc)
+
+```sh
+bash tools/win/build-media-harness.sh
+./build-win-media/test_sendinput_win.exe
+./build-win-media/test_capture_dxgi_win.exe                 # session 0 cell
+./build-win-media/test_capture_dxgi_win.exe --interactive   # console only
+```
+
+The script compiles `capture_dxgi.cpp` and `input_sendinput.cpp` with
+`-Wall -Wextra -Werror`.
+
+`test_sendinput_win.exe` replaces `SendInput` with a recorder in its own
+translation unit. It checks the INPUT records and the propagation of
+rejected injections. It never injects input, so it is safe in any session.
+Never aim real SendInput at the console: it moves the user's pointer and types
+into the user's applications.
+
+`test_capture_dxgi_win.exe` checks the capture HAL contract. In session 0,
+`init` fails cleanly (`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`). With
+`--interactive` it covers:
+
+- ERROR before start and after stop, returned promptly
+- IDLE versus frames within the timeout
+- frame fields and QPC-nanosecond timestamps
+- an unreleased frame reclaimed by the next call
+- access loss, then recovery through stop + start
+
+Desktop Duplication delivers no frames while the console display is powered
+off, which is the VM console's usual state. It also delivers none on a static
+desktop. The test therefore shows a 64x64 non-activating window that repaints
+on a timer. That window turns the display on (`SC_MONITORPOWER` sent to
+itself, plus `ES_DISPLAY_REQUIRED` while it lives). It then waits for
+`GUID_CONSOLE_DISPLAY_STATE` to report the display on.
 
 ## Real lock/disconnect qualification
 
@@ -107,7 +169,8 @@ probe detects a silent provider failure while idle. Loss is terminal: unlock or
 reconnect requires a new context. Owners must stop starting new API calls before
 destroy; admitted tree calls and late callback dispatch are drained internally.
 
-Also compile `src/core/a11y_uia.cpp` with MSVC ARM64 `/std:c++17 /W4 /WX /EHsc
-/permissive-`. Use real dependency headers or the VM's documented type-only
-pthread/cJSON stubs for this compile-only check. Do not define
-`WIN32_LEAN_AND_MEAN` (it breaks UIAutomationCore headers).
+Also compile `src/core/a11y_uia.cpp`, `capture_dxgi.cpp`, `input_sendinput.cpp`
+and the three Windows test translation units with MSVC ARM64
+`/std:c++17 /W4 /WX /EHsc /permissive-`. Use real dependency headers or the
+VM's type-only pthread/cJSON stubs for this compile-only check. Do not define
+`WIN32_LEAN_AND_MEAN` for the UIA files (it breaks UIAutomationCore headers).

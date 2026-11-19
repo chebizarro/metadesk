@@ -115,12 +115,16 @@ static const MdKeyMapEntry key_map[] = {
     { 0, 0 } /* sentinel */
 };
 
-static uint16_t linux_key_to_mac_vk(uint32_t keysym) {
+/* "Not found" is the return value, never an in-band keycode: 0 is
+ * kVK_ANSI_A here (same convention as input_sendinput.cpp). */
+static bool linux_key_to_mac_vk(uint32_t keysym, uint16_t *vk) {
     for (const MdKeyMapEntry *m = key_map; m->linux_key != 0; m++) {
-        if (m->linux_key == keysym)
-            return m->mac_vk;
+        if (m->linux_key == keysym) {
+            *vk = m->mac_vk;
+            return true;
+        }
     }
-    return UINT16_MAX; /* not found */
+    return false;
 }
 
 /* Determine CGEventFlags for modifier keysyms */
@@ -240,8 +244,8 @@ static int cg_mouse_scroll(MdInputCtx *ctx, int dx, int dy) {
 static int cg_key_event(MdInputCtx *ctx, uint32_t keysym, int pressed) {
     (void)ctx;
 
-    uint16_t vk = linux_key_to_mac_vk(keysym);
-    if (vk == UINT16_MAX) {
+    uint16_t vk = 0;
+    if (!linux_key_to_mac_vk(keysym, &vk)) {
         MD_LOG_I("unknown keysym 0x%04x", keysym);
         return -1;
     }
