@@ -18,6 +18,14 @@
  * The fields both directions touch — connected and the traffic counters — are
  * atomics (md-9sa6); everything else belongs to one side or to the caller's
  * lock.
+ *
+ * TLS (md-z6nw): OpenSSL forbids two threads in one SSL object, and both
+ * directions drive the same one. After the handshake a TLS stream's socket is
+ * non-blocking, and ssl_mu covers each SSL_read/SSL_write together with its
+ * SSL_get_error, nothing more: on SSL_ERROR_WANT_READ/WANT_WRITE the lock is
+ * dropped before poll(), so a receiver waiting for data never holds off a
+ * sender, and a sender waiting for socket space never holds off a receiver.
+ * Plain TCP stays blocking and never takes the lock.
  */
 #include "stream.h"
 #include "md_time.h"
@@ -32,6 +40,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 
 #include <stdlib.h>
@@ -62,8 +72,10 @@ struct MdStream {
     uint32_t     granted_caps;
     uint32_t     send_seq;       /* monotonic sequence for sent packets    */
 
-    /* TLS (NULL when plaintext) */
+    /* TLS (NULL when plaintext). ssl_mu serialises every call into ssl and
+     * is never held across a wait (md-z6nw). */
     SSL         *ssl;
+    pthread_mutex_t ssl_mu;
 
     /* Latency tracking */
     uint32_t     ping_send_ms;   /* timestamp when last ping was sent      */
@@ -91,6 +103,8 @@ uint32_t md_stream_now_ms(void) {
 
 /* ── Internal helpers ────────────────────────────────────────── */
 
+/* Wait, without ssl_mu, until the socket can satisfy an SSL_ERROR_WANT_*.
+ * Returns 0 when ready, 1 on timeout, -1 on error or another SSL error. */
 static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
     short events;
 
@@ -107,17 +121,34 @@ static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
         int pr = poll(&pfd, 1, timeout_ms);
         if (pr == 0) return 1;   /* timeout */
         if (pr < 0) {
-            if (errno == EINTR) continue;
+            /* Not a restart with the full budget: the caller retries the
+             * SSL call and recomputes what is left of its deadline. */
+            if (errno == EINTR) return 0;
             return -1;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-            return -1;
-        return 0;
+        /* Readable-at-hangup still holds the peer's last records (and its
+         * close_notify); the next SSL call reports the end. */
+        if (!(pfd.revents & POLLNVAL) && (pfd.revents & events))
+            return 0;
+        return -1;
     }
 }
 
+/* One SSL_read or SSL_write on a TLS stream, holding ssl_mu only for the
+ * call and its SSL_get_error. The socket is non-blocking, so neither blocks.
+ * Returns the bytes moved, or <= 0 with *ssl_err set. */
+static int ssl_io(MdStream *s, bool write, void *buf, size_t len, int *ssl_err) {
+    const int n = len > INT_MAX ? INT_MAX : (int)len;
+    pthread_mutex_lock(&s->ssl_mu);
+    ERR_clear_error(); /* SSL_get_error reads this thread's error queue */
+    const int r = write ? SSL_write(s->ssl, buf, n) : SSL_read(s->ssl, buf, n);
+    if (r <= 0) *ssl_err = SSL_get_error(s->ssl, r);
+    pthread_mutex_unlock(&s->ssl_mu);
+    return r;
+}
+
 /* Read exactly n bytes, handling partial reads.
- * Uses SSL_read when TLS is active, raw read() otherwise.
+ * Uses SSL_read when TLS is active (see ssl_io), raw read() otherwise.
  * timeout_ms is a deadline for the whole read, not a per-syscall
  * budget — a peer dribbling bytes cannot extend it.
  * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
@@ -136,19 +167,19 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
             wait_ms = (int)(deadline - now);
         }
 
-        /* For TLS streams, check SSL_pending before polling.
-         * OpenSSL may have buffered data internally. */
-        if (s->ssl && SSL_pending(s->ssl) > 0) {
-            int r = SSL_read(s->ssl, buf + total, (int)(n - total));
-            if (r <= 0) {
-                int err = SSL_get_error(s->ssl, r);
-                if (err == SSL_ERROR_ZERO_RETURN)
-                    return -1;  /* clean TLS close */
-                int wr = ssl_retry_wait(fd, err, wait_ms);
-                if (wr != 0) return wr;
+        /* TLS: try first (OpenSSL may hold buffered records), then wait for
+         * whatever the record layer asked for, with ssl_mu released. */
+        if (s->ssl) {
+            int err = SSL_ERROR_NONE;
+            int r = ssl_io(s, false, buf + total, n - total, &err);
+            if (r > 0) {
+                total += (size_t)r;
                 continue;
             }
-            total += (size_t)r;
+            if (err == SSL_ERROR_ZERO_RETURN)
+                return -1;  /* clean TLS close */
+            int wr = ssl_retry_wait(fd, err, wait_ms);
+            if (wr != 0) return wr;
             continue;
         }
 
@@ -164,43 +195,39 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
                 return -1;
         }
 
-        if (s->ssl) {
-            int r = SSL_read(s->ssl, buf + total, (int)(n - total));
-            if (r <= 0) {
-                int err = SSL_get_error(s->ssl, r);
-                if (err == SSL_ERROR_ZERO_RETURN)
-                    return -1;  /* clean TLS close */
-                int wr = ssl_retry_wait(fd, err, wait_ms);
-                if (wr != 0) return wr;
-                continue;
-            }
-            total += (size_t)r;
-        } else {
-            ssize_t r = read(fd, buf + total, n - total);
-            if (r <= 0) {
-                if (r < 0 && errno == EINTR) continue;
-                return -1;
-            }
-            total += (size_t)r;
+        ssize_t r = read(fd, buf + total, n - total);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return -1;
         }
+        total += (size_t)r;
     }
     return 0;
 }
 
+/* A TLS 1.3 write (every context here pins 1.3) never waits on a read once
+ * the handshake is done. If one ever does, the receiver may consume the
+ * bytes it waits for, so it re-tries the write after this slice rather
+ * than wait on POLLIN for good. */
+#define SSL_WRITE_WANT_READ_SLICE_MS 50
+
 /* Write exactly n bytes, handling partial writes.
- * Uses SSL_write when TLS is active, raw write() otherwise. */
+ * Uses SSL_write when TLS is active (see ssl_io), raw write() otherwise. */
 static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
     size_t total = 0;
 
     while (total < n) {
         if (s->ssl) {
-            int w = SSL_write(s->ssl, buf + total, (int)(n - total));
+            /* A retry after WANT_WRITE passes the same buf + total and length,
+             * as SSL_write requires: total only moves on success. */
+            int err = SSL_ERROR_NONE;
+            int w = ssl_io(s, true, (void *)(buf + total), n - total, &err);
             if (w <= 0) {
-                int err = SSL_get_error(s->ssl, w);
                 if (err == SSL_ERROR_ZERO_RETURN)
                     return -1;  /* clean TLS close */
-                int wr = ssl_retry_wait(s->fd, err, -1);
-                if (wr != 0) return -1;
+                const int slice = err == SSL_ERROR_WANT_READ
+                    ? SSL_WRITE_WANT_READ_SLICE_MS : -1;
+                if (ssl_retry_wait(s->fd, err, slice) < 0) return -1;
                 continue;
             }
             total += (size_t)w;
@@ -231,10 +258,19 @@ static void set_tcp_nodelay(int fd) {
     }
 }
 
-/* Create an MdStream from a connected fd (optionally with TLS). */
+/* After a blocking handshake, a TLS socket goes non-blocking so that
+ * ssl_io never blocks while holding ssl_mu (see the note at the top). */
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ? -1 : 0;
+}
+
+/* Create an MdStream from a connected fd (optionally with TLS, its handshake
+ * done and fd already non-blocking). */
 static MdStream *stream_from_fd(int fd, SSL *ssl) {
     MdStream *s = calloc(1, sizeof(MdStream));
-    if (!s) {
+    if (!s || pthread_mutex_init(&s->ssl_mu, NULL) != 0) {
+        free(s);
         if (ssl) SSL_free(ssl);
         close(fd);
         return NULL;
@@ -454,7 +490,7 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
             return NULL;
         }
         SSL_set_fd(ssl, client_fd);
-        if (SSL_accept(ssl) != 1) {
+        if (SSL_accept(ssl) != 1 || set_nonblocking(client_fd) != 0) {
             MD_LOG_E("TLS handshake failed for %s", addr_str);
             SSL_free(ssl);
             close(client_fd);
@@ -582,7 +618,7 @@ MdStream *md_stream_connect_tls(const char *host, uint16_t port,
     if (tls->verify_peer)
         SSL_set1_host(ssl, host);
 
-    if (SSL_connect(ssl) != 1) {
+    if (SSL_connect(ssl) != 1 || set_nonblocking(s->fd) != 0) {
         MD_LOG_E("TLS handshake failed connecting to %s:%u", host, port);
         SSL_free(ssl);
         md_stream_destroy(s);
@@ -826,5 +862,6 @@ void md_stream_destroy(MdStream *s) {
     }
     if (s->fd >= 0)
         close(s->fd);
+    pthread_mutex_destroy(&s->ssl_mu);
     free(s);
 }
