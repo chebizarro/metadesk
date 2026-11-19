@@ -1,6 +1,11 @@
-# Rootless Podman reference: namespace and keep-ID mapping owned by netns.
+# Rootless Podman reference: namespace and keep-ID mapping owned by the
+# ah9-5-netns holder, which mesh-netns.sh (Podman) creates; Compose never does.
 # Not a Docker-qualified manifest (Docker cannot join a sibling user namespace).
 # See reference/mesh-validation.md for exact versions, setup and evidence.
+# md-ba4: Podman <5.4 compat API reports a container's NetworkID as the network
+# name, so Compose always saw a holder attached through `networks:` as diverged.
+# It stopped the holder, failed removal (dependents) and left consumers without
+# an underlay. With no service on a Compose network, plain `up -d` is a no-op.
 name: ah9-5
 x-sandbox: &sandbox
   read_only: true
@@ -10,24 +15,13 @@ x-sandbox: &sandbox
   stop_grace_period: 5s
 
 services:
-  netns:
-    <<: *sandbox
-    container_name: ah9-5-netns
-    image: ${MD_BASE:?pinned Ubuntu digest}
-    userns_mode: keep-id
-    user: "1000:1000"
-    command: [sleep, infinity]
-    networks:
-      default:
-        ipv4_address: 10.89.95.2
-    # No host ports. Only the holder owns the underlay namespace.
-
+  # No holder service: run `mesh-netns.sh up` first. A missing holder fails
+  # container creation; Podman refuses to remove it while consumers exist.
   mesh:
     <<: *sandbox
     image: ${FIPS_IMAGE:?locally built pinned fipsd image}
     container_name: ah9-5-mesh
-    depends_on: [netns]
-    network_mode: service:netns
+    network_mode: container:ah9-5-netns
     userns_mode: container:ah9-5-netns
     user: "0:777"
     cap_add: [NET_ADMIN]
@@ -44,8 +38,7 @@ services:
     <<: *sandbox
     image: ${MD_AGENT_IMAGE:?Tier A runtime image}
     container_name: ah9-5-agent
-    depends_on: [netns]
-    network_mode: service:netns
+    network_mode: container:ah9-5-netns
     userns_mode: container:ah9-5-netns
     user: "1000:1000"
     tmpfs:
@@ -92,7 +85,7 @@ services:
     image: ${FIPS_IMAGE:?locally built pinned fipsd image}
     container_name: ah9-5-proxy
     depends_on: [mesh, agent]
-    network_mode: service:netns
+    network_mode: container:ah9-5-netns
     userns_mode: container:ah9-5-netns
     user: "1000:1000"
     environment:
@@ -104,10 +97,5 @@ services:
         read_only: true
     command: [haproxy, -W, -db, -f, /etc/haproxy/mesh.cfg]
     # If mesh has not assigned its address yet, bind fails and restart retries.
-    # Never recreate the holder alone: stop/recreate its namespace consumers too.
-networks:
-  default:
-    name: ah9-5-underlay
-    ipam:
-      config:
-        - subnet: 10.89.95.0/24
+    # Never stop/restart the holder under consumers: Podman allows it and they
+    # lose the underlay. Replace it only after `down` (see mesh-validation.md).

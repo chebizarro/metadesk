@@ -1,0 +1,22 @@
+# md-ba4 reconciliation qualification only: replaces the Tier A agent with a
+# loopback HTTP stand-in so lifecycle runs never mount the live desktop bus.
+# Namespace, user and sandbox settings are inherited unchanged from
+# compose.mesh.yaml. The agent variables still need (unused) values.
+services:
+  agent:
+    image: ${FIPS_IMAGE:?locally built pinned fipsd image}
+    tmpfs: !reset []
+    volumes: !reset []
+    command:
+      - python3
+      - -c
+      - |
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"md-ba4 stand-in\n"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        HTTPServer(("127.0.0.1", 7710), H).serve_forever()
