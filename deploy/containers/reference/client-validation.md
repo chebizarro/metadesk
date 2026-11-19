@@ -131,6 +131,8 @@ adding `libopengl0=1.7.0-1build1` fixed the default path, which then picks
   from relay history. On a retained-history relay, the second negotiation
   accepted the previous session's ID, and the host correctly failed it
   closed (`rejected unproven client #1`). Fresh relays per cell avoid it.
+  *Fixed by md-6ns* (request_id correlation and a host live/EOSE gate; see
+  `docs/stream-binding.md`). A same-relay repeat cell is md-cdz.
 - **md-33e (P3, bug, fixed):** GUI display authorization failed open and was
   unobservable. GUI mode now fails closed (above) and logs the SDL video
   driver, the renderer and the decoded frame size. The SDL `opengl` crash
@@ -201,7 +203,7 @@ EOSE/OK in the unchanged nostrc/metadesk layers.
 
 `nostr-protocol-smells` skill pass (report-only):
 - **Medium F:** fresh relays per cell keep this suite from catching md-6ns.
-  After md-6ns, add a same-relay repeat-negotiation cell.
+  After md-6ns, add a same-relay repeat-negotiation cell (md-cdz).
 - **Low F:** the bunker accepts a reused `connect` secret (test-only).
 - **Low J:** no `OK false`/`CLOSED`/`AUTH` negatives in these cells; md-pss/md-ikr
   cover them.

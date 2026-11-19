@@ -121,9 +121,9 @@ static void host_owner_revoked(void *data) {
 
 
 static void host_on_dm(const char *sender_pubkey_hex, const char *content,
-                       void *userdata) {
+                       const MdNostrDmInfo *info, void *userdata) {
     HostCtx *ctx = userdata;
-    if (!ctx || !content || ctx->session_requested) return;
+    if (!ctx || !content || !info || ctx->session_requested) return;
 
     /* Try to parse as session_request */
     MdSessionRequest req;
@@ -132,6 +132,24 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
             strcmp(sender_pubkey_hex, ctx->expected_client_pk) != 0) {
             fprintf(stderr, "host: REJECTED session request from unexpected FIPS client %.*s...\n",
                     8, sender_pubkey_hex);
+            return;
+        }
+
+        /* md-6ns: a request stored before this host subscribed was addressed
+         * to an earlier host instance (NIP-59 timestamps defeat `since`).
+         * Ignore history and stale/uncorrelated requests without latching,
+         * so the client's live request can still be answered. */
+        if (!info->live) {
+            fprintf(stderr, "host: ignoring session request from relay history "
+                    "(%.*s..., request_id=%.8s)\n", 8, sender_pubkey_hex,
+                    req.request_id[0] ? req.request_id : "none");
+            return;
+        }
+        MdSessionRequestFreshness fresh = md_session_request_freshness(
+            &req, (int64_t)time(NULL), info->rumor_created_at);
+        if (fresh != MD_SESSION_REQUEST_FRESH) {
+            fprintf(stderr, "host: ignoring %s session request from %.*s...\n",
+                    md_session_request_freshness_name(fresh), 8, sender_pubkey_hex);
             return;
         }
 
@@ -329,9 +347,12 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     MdSessionAccept acc;
-    if (md_session_prepare_binding(ctx->session, &acc,
+    if (!ctx->pending_req.request_id[0] ||
+        md_session_prepare_binding(ctx->session, &acc,
         (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000) != 0)
         return -1;
+    /* Correlate the answer with exactly the request it grants (md-6ns). */
+    memcpy(acc.request_id, ctx->pending_req.request_id, sizeof(acc.request_id));
     char *json = md_session_accept_to_json(&acc);
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
     if (!json) return -1;
@@ -1055,6 +1076,12 @@ int main(int argc, char **argv) {
 
             /* Subscribe to allowlist updates */
             md_nostr_refresh_allowlist(nostr);
+
+            /* Only live (post-EOSE) requests are answered; announce readiness
+             * at the catch-up -> live boundary, not before it. */
+            if (md_nostr_wait_history(nostr, 10000) != 0)
+                fprintf(stderr, "host: WARNING: relay history catch-up (EOSE) not "
+                        "confirmed; answering live session requests only\n");
 
             printf("host: nostr bridge ready, waiting for session requests...\n");
 

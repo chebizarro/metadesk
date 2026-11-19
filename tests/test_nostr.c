@@ -460,8 +460,11 @@ static const MdSignerOps dm_test_ops = {
     .nip44_encrypt = dm_test_encrypt, .sign_event = dm_test_sign,
     .destroy = dm_test_destroy,
 };
-static void dm_received(const char *pk, const char *content, void *ud) {
+static void dm_received(const char *pk, const char *content,
+                        const MdNostrDmInfo *info, void *ud) {
     DmState *st = ud;
+    /* Direct ingress is outside a pool callback: never live (md-6ns). */
+    MD_CHECK(info && !info->live && info->rumor_created_at > 0);
     char *expected = md_nostr_get_pubkey(dm_sender_sk);
     MD_CHECK(strcmp(pk, expected) == 0); free(expected);
     MD_CHECK(strcmp(content, "session-control") == 0);
@@ -843,8 +846,9 @@ static int acl_pk(MdSigner *signer, char **out) {
     return md_signer_get_pubkey(((AclTest *)signer->backend)->direct, out);
 }
 static const MdSignerOps acl_ops = { .get_pubkey = acl_pk, .sign_event = acl_sign };
-static void acl_unused_dm(const char *pk, const char *content, void *data) {
-    (void)pk; (void)content; (void)data;
+static void acl_unused_dm(const char *pk, const char *content,
+                          const MdNostrDmInfo *info, void *data) {
+    (void)pk; (void)content; (void)info; (void)data;
     MD_CHECK(false); /* The AUTH fixture must not leak protected DMs. */
 }
 static void acl_bridge_start(AclTest *s, const char **urls, int count, bool open, bool dm) {

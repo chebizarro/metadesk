@@ -91,19 +91,35 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
  * negotiation, and the MD_PKT_SESSION_INFO wire payloads.
  *
  * Request (client → host DM):
- *   {"type":"session_request","v":1,"capabilities":["video","agent","input"],
+ *   {"type":"session_request","v":1,"request_id":"<32 hex>",
+ *    "issued_at":<unix s>,"expires_at":<unix s>,
+ *    "capabilities":["video","agent","input"],
  *    "tree_format":"compact","fips_addr":"npub1..."}
  *
  * Accept (host → client DM):
- *   {"type":"session_accept","v":1,"session_id":"<uuid>",
- *    "granted":["video","agent"]}
+ *   {"type":"session_accept","v":1,"request_id":"<32 hex>",
+ *    "session_id":"<uuid>","stream_token":"<64 hex>",
+ *    "granted":["video","agent"],"tree_format":"compact"}
+ *
+ * request_id/issued_at/expires_at are the request-correlation extension
+ * (md-6ns, docs/stream-binding.md). Names and shapes match session-v2
+ * (P3.8a) so that version can adopt them unchanged.
  */
+
+/* Request correlation (md-6ns). A random 128-bit id per negotiation, as
+ * 32 lowercase hex characters, bounded by authenticated wall-clock times. */
+#define MD_SESSION_REQUEST_ID_LEN 32
+#define MD_SESSION_REQUEST_MAX_LIFETIME_S 180
+#define MD_SESSION_CLOCK_SKEW_S 30
 
 /* Parsed session request from client */
 typedef struct {
     uint32_t    capabilities;      /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;
     char         fips_addr[128];   /* client's npub / FIPS addr  */
+    char         request_id[MD_SESSION_REQUEST_ID_LEN + 1]; /* "" if absent */
+    int64_t      issued_at;        /* unix seconds; 0 if absent  */
+    int64_t      expires_at;       /* unix seconds; 0 if absent  */
 } MdSessionRequest;
 
 /* Parsed session accept from host */
@@ -112,6 +128,7 @@ typedef struct {
     uint32_t     granted;          /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;      /* confirmed tree format       */
     char         stream_token[65]; /* DM-only 256-bit binding secret */
+    char         request_id[MD_SESSION_REQUEST_ID_LEN + 1]; /* echoed; "" if absent */
 } MdSessionAccept;
 
 /* Serialize a session request to a newly-allocated JSON string. Caller frees. */
@@ -140,6 +157,43 @@ char *md_session_bind_to_json(const MdSessionAccept *acc);
  * access to the reservation. Failure never activates or grants capabilities. */
 int md_session_consume_binding(MdSession *s, const uint8_t *payload, size_t len,
                                uint64_t now_ms);
+
+/* ── Request correlation (md-6ns) ──────────────────────────────
+ * NIP-59 randomizes gift-wrap timestamps up to two days in the past, so a
+ * relay `since` filter cannot separate a live negotiation from history.
+ * Each negotiation instead carries a fresh CSPRNG request_id and an
+ * authenticated validity window inside the encrypted rumor. */
+
+/* Fill a fresh request_id and issued_at/expires_at window for `req`.
+ * lifetime_s is clamped to [1, MD_SESSION_REQUEST_MAX_LIFETIME_S].
+ * Returns -1 (and leaves no id) if the CSPRNG fails; never falls back. */
+int md_session_request_prepare(MdSessionRequest *req, int64_t now_unix,
+                               uint32_t lifetime_s);
+
+typedef enum {
+    MD_SESSION_REQUEST_FRESH = 0,
+    MD_SESSION_REQUEST_UNCORRELATED, /* no request_id/window (legacy client) */
+    MD_SESSION_REQUEST_BAD_WINDOW,   /* expires <= issued or lifetime > max  */
+    MD_SESSION_REQUEST_FUTURE,       /* issued beyond the allowed clock skew */
+    MD_SESSION_REQUEST_EXPIRED,      /* past expires_at (plus clock skew)    */
+    MD_SESSION_REQUEST_RUMOR_SKEW,   /* rumor created_at disagrees with issued_at */
+} MdSessionRequestFreshness;
+
+const char *md_session_request_freshness_name(MdSessionRequestFreshness f);
+
+/* Host-side check of a parsed request against the host's wall clock and the
+ * NIP-17 rumor's own (non-randomized) created_at. Relay history delivery is
+ * a separate, transport-level check (see MdNostrDmInfo.live). */
+MdSessionRequestFreshness md_session_request_freshness(const MdSessionRequest *req,
+                                                       int64_t now_unix,
+                                                       int64_t rumor_created_at);
+
+/* Client-side: true only for an acceptance answering exactly `req` — same
+ * request_id, a stream token, a non-zero grant within the requested
+ * capabilities, and a rumor not older than the request (minus skew). */
+bool md_session_accept_matches_request(const MdSessionAccept *acc,
+                                       const MdSessionRequest *req,
+                                       int64_t rumor_created_at);
 
 /* Helper: convert capability bitfield to/from JSON array of strings. */
 uint32_t md_caps_from_strings(const char **strs, int count);

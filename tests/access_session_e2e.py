@@ -124,6 +124,30 @@ def inside(host, client, bunker, root):
         assert hp.poll() is None and cp.poll() is None, logs
         assert any("client #1 connected" in line for line in logs["host"]), logs
         print("PASS: account add/credentials-stdin/bind-role -> access add/list -> real host/client NIP-17 negotiation -> one-use TCP session_bind ACK")
+        # md-6ns: a second negotiation by new host/client processes on the same
+        # relay, which retains the first session's request and acceptance.
+        for p in (cp, hp):
+            p.terminate()
+            p.wait(timeout=10)
+        with socket.socket(socket.AF_INET6) as port_socket:
+            port_socket.bind(("::1", 0))
+            port = str(port_socket.getsockname()[1])
+        env["XDG_CONFIG_HOME"] = str(root / "host-config")
+        hp, host_ready = launch("host2", [host, "--bind", addresses["host"], "--port", port,
+                                "--relay", url, "--no-capture", "--no-input"],
+                                "nostr bridge ready, waiting for session requests")
+        assert host_ready.wait(30), "".join(logs["host2"])
+        env["XDG_CONFIG_HOME"] = str(root / "client-config")
+        cp, connected = launch("client2", [client, "--npub", HOST_NPUB, "--fips-control", str(root / "control.sock"),
+                                 "--relay", url, "--port", port, "--no-display", "--timeout", "15000"],
+                                 "receiving stream...")
+        assert connected.wait(45), "".join(logs["host2"] + logs["client2"])
+        assert hp.poll() is None and cp.poll() is None, logs
+        assert any("client #1 connected" in line for line in logs["host2"]), logs
+        assert any("ignoring session request from relay history" in line for line in logs["host2"]), logs["host2"]
+        assert any("ignoring session_accept not answering the current request" in line
+                   for line in logs["client2"]), logs["client2"]
+        print("PASS: second negotiation on the same retaining relay; replayed request/acceptance ignored (md-6ns)")
         print(f"Private relay: {relay.reqs} REQ, {relay.eoses} EOSE, {relay.oks} OK; no video/input/desktop or real FIPS daemon exercised")
     finally:
         for p in reversed(children):

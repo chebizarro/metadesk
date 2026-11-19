@@ -6,15 +6,19 @@
 #define md_nostr_send_session_accept test_publish
 #include "../src/host/main.c"
 #undef main
+#undef md_nostr_send_session_accept
 #include "md_test.h"
+/* nostr.h's prototype was renamed by the macro above; restore the real one. */
+int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
+                                 const char *json_payload);
 
 static unsigned tree_calls, action_calls, input_calls, publish_calls;
 static MdSessionAccept published;
+/* Records the acceptance; with a real bridge (relay fixture) also publishes. */
 int test_publish(MdNostr *n, const char *peer, const char *json) {
-    (void)n; (void)peer;
     publish_calls++;
     MD_CHECK(md_session_accept_from_json(json, &published) == 0);
-    return 0;
+    return n ? md_nostr_send_session_accept(n, peer, json) : 0;
 }
 int md_host_account_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
 int md_host_access_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
@@ -235,8 +239,13 @@ static void test_late_publication(void) {
     Pair p = pair(); /* Listener ready before acceptance. */
     unsigned before = publish_calls;
     MD_CHECK(!s.stream_token[0]); /* Backend startup cannot spend token lifetime. */
+    /* An uncorrelated request cannot be answered or mint a token (md-6ns). */
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) < 0);
+    MD_CHECK(publish_calls == before && !s.stream_token[0]);
+    MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
     MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
     MD_CHECK(publish_calls == before + 1 && s.stream_token[0]);
+    MD_CHECK(strcmp(published.request_id, ctx.pending_req.request_id) == 0);
     send_proof(p, &published);
     MD_CHECK(host_bind_candidate(&ctx, p.host) == 0); ack(p, MD_CAP_VIDEO);
     destroy_pair(p);
@@ -328,12 +337,283 @@ static void test_relay_grant(const char *url, uint32_t expected) {
     }
     md_nostr_destroy(n);
 }
+/* ── md-6ns: request correlation over a history-retaining private relay ──
+ * Real host_on_dm/host_accept_request/host_publish_session_accept and real
+ * NIP-17 bridges. The client probe applies the managed client's acceptance
+ * rule (md_session_accept_matches_request). Waits are on DM callbacks; the
+ * timed waits are deadlock bounds only. Throwaway keys 2 (host), 3 (client). */
+#define HIST_HOST_SK "0000000000000000000000000000000000000000000000000000000000000002"
+#define HIST_CLIENT_SK "0000000000000000000000000000000000000000000000000000000000000003"
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    HostCtx *host;               /* host probe: forward to the real gate */
+    MdSessionRequest req;        /* client probe: its current request */
+    bool armed;
+    MdSessionAccept accepted;
+    unsigned matched, ignored_history, ignored_live, host_history, host_live;
+} HistProbe;
+
+static void hist_init(HistProbe *p, HostCtx *host) {
+    memset(p, 0, sizeof(*p));
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    p->host = host;
+}
+static void hist_free(HistProbe *p) {
+    OPENSSL_cleanse(p->accepted.stream_token, sizeof(p->accepted.stream_token));
+    pthread_cond_destroy(&p->cv);
+    pthread_mutex_destroy(&p->mu);
+}
+static void hist_host_dm(const char *pk, const char *content,
+                         const MdNostrDmInfo *info, void *ud) {
+    HistProbe *p = ud;
+    host_on_dm(pk, content, info, p->host);
+    pthread_mutex_lock(&p->mu);
+    if (info->live) p->host_live++; else p->host_history++;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+}
+static void hist_client_dm(const char *pk, const char *content,
+                           const MdNostrDmInfo *info, void *ud) {
+    HistProbe *p = ud;
+    MdSessionAccept acc;
+    (void)pk;
+    if (md_session_accept_from_json(content, &acc) != 0) return;
+    pthread_mutex_lock(&p->mu);
+    if (p->armed && md_session_accept_matches_request(&acc, &p->req, info->rumor_created_at)) {
+        p->accepted = acc;
+        p->armed = false;
+        p->matched++;
+    } else if (info->live) {
+        p->ignored_live++;
+    } else {
+        p->ignored_history++;
+    }
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
+}
+static bool hist_wait(HistProbe *p, const unsigned *counter, unsigned target) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 20; /* deadlock bound, not a delivery timer */
+    pthread_mutex_lock(&p->mu);
+    int rc = 0;
+    while (*counter < target && rc == 0)
+        rc = pthread_cond_timedwait(&p->cv, &p->mu, &deadline);
+    bool ok = *counter >= target;
+    pthread_mutex_unlock(&p->mu);
+    return ok;
+}
+static MdNostr *hist_bridge_n(const char **urls, int count, const char *sk,
+                              MdNostrDmCallback cb, HistProbe *p) {
+    MdNostrConfig cfg = { .sk_hex = sk, .relay_urls = urls, .relay_count = count,
+                          .allowlist_open = true };
+    MdNostrCallbacks cbs = { .on_dm = cb, .dm_userdata = p };
+    MdNostr *n = md_nostr_create(&cfg, &cbs);
+    MD_CHECK(n);
+    /* The catch-up -> live boundary, as the host waits before announcing. */
+    MD_CHECK(n && md_nostr_wait_history(n, 10000) == 0);
+    return n;
+}
+static MdNostr *hist_bridge(const char *url, const char *sk, MdNostrDmCallback cb,
+                            HistProbe *p) {
+    const char *urls[] = {url};
+    return hist_bridge_n(urls, 1, sk, cb, p);
+}
+static void hist_decoy(MdNostr *host, const char *client_pk, bool correlated) {
+    MdSessionAccept other = { .granted = MD_CAP_VIDEO, .tree_format = MD_TREE_FORMAT_COMPACT };
+    snprintf(other.session_id, sizeof(other.session_id), "%s",
+             correlated ? "other-request" : "uncorrelated");
+    memset(other.stream_token, 'a', 64);
+    if (correlated) {
+        MdSessionRequest elsewhere = {0};
+        MD_CHECK(md_session_request_prepare(&elsewhere, (int64_t)time(NULL), 30) == 0);
+        memcpy(other.request_id, elsewhere.request_id, sizeof(other.request_id));
+    }
+    char *json = md_session_accept_to_json(&other);
+    MD_CHECK(json && md_nostr_send_session_accept(host, client_pk, json) == 0);
+    free(json);
+}
+
+/* One negotiation by a new host and new client process pair on the same
+ * relay. `host_history`/`client_history` are the stale DMs each must ignore. */
+static void hist_session(const char *url, const char *session_id,
+                         unsigned host_history, unsigned client_history, bool decoys) {
+    MdSession s; md_session_init(&s);
+    HostCtx ctx = context(&s);
+    ctx.session_req_ch = go_channel_create(1);
+    HistProbe hp, cp;
+    hist_init(&hp, &ctx);
+    hist_init(&cp, NULL);
+    MdNostr *host = hist_bridge(url, HIST_HOST_SK, hist_host_dm, &hp);
+    ctx.nostr = host;
+    /* Earlier sessions' requests replay as history and never latch. */
+    MD_CHECK(hist_wait(&hp, &hp.host_history, host_history));
+    md_nostr_drain_dm(host);
+    MD_CHECK(!ctx.session_requested && hp.host_live == 0);
+
+    /* Arm before the client bridge exists, so replayed acceptances are
+     * judged against this request rather than an idle client. */
+    MdSessionRequest req = { .capabilities = MD_CAP_VIDEO,
+                             .tree_format = MD_TREE_FORMAT_COMPACT };
+    MD_CHECK(md_session_request_prepare(&req, (int64_t)time(NULL), 30) == 0);
+    pthread_mutex_lock(&cp.mu);
+    cp.req = req;
+    cp.armed = true;
+    pthread_mutex_unlock(&cp.mu);
+    MdNostr *client = hist_bridge(url, HIST_CLIENT_SK, hist_client_dm, &cp);
+    const char *host_pk = md_nostr_get_npub(host), *client_pk = md_nostr_get_npub(client);
+    MD_CHECK(hist_wait(&cp, &cp.ignored_history, client_history));
+    md_nostr_drain_dm(client);
+    MD_CHECK(cp.matched == 0 && cp.ignored_history == client_history);
+
+    if (decoys) {
+        /* Live, authentic host acceptances answering some other request. */
+        hist_decoy(host, client_pk, true);
+        hist_decoy(host, client_pk, false);
+        MD_CHECK(hist_wait(&cp, &cp.ignored_live, 2));
+        MD_CHECK(cp.matched == 0);
+    }
+
+    char *json = md_session_request_to_json(&req);
+    MD_CHECK(json && md_nostr_send_session_request(client, host_pk, json) == 0);
+    free(json);
+    void *dummy = NULL;
+    GoSelectCase cases[] = {
+        { .op = GO_SELECT_RECEIVE, .chan = ctx.session_req_ch, .recv_buf = &dummy },
+    };
+    go_select_timeout(cases, 1, 20000); /* deadlock bound */
+    MD_CHECK(ctx.session_requested);
+    MD_CHECK(strcmp(ctx.pending_req.request_id, req.request_id) == 0);
+    MD_CHECK(strcmp(ctx.pending_client_pk, client_pk) == 0);
+    MD_CHECK(host_accept_request(&ctx, host, session_id, false) == 0);
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
+    MD_CHECK(hist_wait(&cp, &cp.matched, 1));
+    MD_CHECK(cp.matched == 1 && strcmp(cp.accepted.session_id, session_id) == 0);
+    MD_CHECK(strcmp(cp.accepted.request_id, req.request_id) == 0);
+    MD_CHECK(CRYPTO_memcmp(cp.accepted.stream_token, s.stream_token, 64) == 0);
+
+    md_nostr_destroy(client);
+    md_nostr_destroy(host);
+    go_channel_close(ctx.session_req_ch);
+    go_channel_unref(ctx.session_req_ch);
+    hist_free(&hp);
+    hist_free(&cp);
+    md_session_reset(&s);
+}
+
+static void test_relay_history(const char *url) {
+    /* 1: empty relay. 2: request A and accept(A) replay; live decoys too.
+     * 3: requests A, B and accepts A, B plus both decoys replay. */
+    hist_session(url, "session-one", 0, 0, false);
+    hist_session(url, "session-two", 1, 1, true);
+    hist_session(url, "session-three", 2, 4, false);
+}
+
+/* A multi-relay race: the client's live request reaches relay 1 before the
+ * host subscribes (history there), and the identical gift wrap reaches relay 2
+ * only after the host's EOSE (live there). Dedup must not let the history copy
+ * suppress the live one. The driver replicates the wrap on "inject". */
+static void test_two_relay_upgrade(const char *url1, const char *url2) {
+    MdSession s; md_session_init(&s);
+    HostCtx ctx = context(&s);
+    ctx.session_req_ch = go_channel_create(1);
+    HistProbe hp, cp;
+    hist_init(&hp, &ctx);
+    hist_init(&cp, NULL);
+    MdSessionRequest req = { .capabilities = MD_CAP_VIDEO,
+                             .tree_format = MD_TREE_FORMAT_COMPACT };
+    MD_CHECK(md_session_request_prepare(&req, (int64_t)time(NULL), 30) == 0);
+    cp.req = req;
+    cp.armed = true;
+    MdNostr *client = hist_bridge(url1, HIST_CLIENT_SK, hist_client_dm, &cp);
+    char host_pk[65];
+    char *derived = md_nostr_get_pubkey(HIST_HOST_SK);
+    MD_CHECK(derived);
+    snprintf(host_pk, sizeof(host_pk), "%s", derived ? derived : "");
+    free(derived);
+    char *json = md_session_request_to_json(&req);
+    MD_CHECK(json && md_nostr_send_session_request(client, host_pk, json) == 0);
+    free(json);
+
+    const char *urls[] = {url1, url2};
+    MdNostr *host = hist_bridge_n(urls, 2, HIST_HOST_SK, hist_host_dm, &hp);
+    ctx.nostr = host;
+    MD_CHECK(hist_wait(&hp, &hp.host_history, 1));
+    md_nostr_drain_dm(host);
+    MD_CHECK(!ctx.session_requested && hp.host_live == 0);
+
+    printf("md6ns: inject\n");
+    fflush(stdout);
+    void *dummy = NULL;
+    GoSelectCase cases[] = {
+        { .op = GO_SELECT_RECEIVE, .chan = ctx.session_req_ch, .recv_buf = &dummy },
+    };
+    go_select_timeout(cases, 1, 20000); /* deadlock bound */
+    MD_CHECK(hist_wait(&hp, &hp.host_live, 1)); /* probe counts after the gate */
+    MD_CHECK(ctx.session_requested && hp.host_live == 1 && hp.host_history == 1);
+    MD_CHECK(strcmp(ctx.pending_req.request_id, req.request_id) == 0);
+    MD_CHECK(host_accept_request(&ctx, host, "two-relay", false) == 0);
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
+    MD_CHECK(hist_wait(&cp, &cp.matched, 1));
+    MD_CHECK(strcmp(cp.accepted.session_id, "two-relay") == 0);
+
+    md_nostr_destroy(client);
+    md_nostr_destroy(host);
+    /* Exactly one live delivery: no repeat after the upgrade. */
+    MD_CHECK(hp.host_live == 1 && hp.host_history == 1);
+    go_channel_close(ctx.session_req_ch);
+    go_channel_unref(ctx.session_req_ch);
+    hist_free(&hp);
+    hist_free(&cp);
+    md_session_reset(&s);
+}
+
+/* Host gate without a relay: history and stale/uncorrelated requests never
+ * latch. (A fresh live request reaches the allowlist; none here.) */
+static void test_request_gate(void) {
+    MdSession s; md_session_init(&s);
+    HostCtx ctx = context(&s);
+    const char *pk = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    int64_t now = (int64_t)time(NULL);
+    MdSessionRequest req = { .capabilities = MD_CAP_VIDEO };
+    MD_CHECK(md_session_request_prepare(&req, now, 30) == 0);
+    char *json = md_session_request_to_json(&req);
+    MD_CHECK(json);
+    MdNostrDmInfo history = { .rumor_created_at = now, .live = false };
+    host_on_dm(pk, json, &history, &ctx);
+    MdNostrDmInfo skewed = { .rumor_created_at = now - 3600, .live = true };
+    host_on_dm(pk, json, &skewed, &ctx);
+    free(json);
+    MdSessionRequest stale = req;
+    stale.issued_at = now - 120; stale.expires_at = now - 90;
+    json = md_session_request_to_json(&stale);
+    MdNostrDmInfo live_old = { .rumor_created_at = stale.issued_at, .live = true };
+    host_on_dm(pk, json, &live_old, &ctx);
+    free(json);
+    host_on_dm(pk, "{\"type\":\"session_request\",\"v\":1,\"capabilities\":[\"video\"]}",
+               &(MdNostrDmInfo){ .rumor_created_at = now, .live = true }, &ctx);
+    MD_CHECK(!ctx.session_requested && !ctx.pending_req.request_id[0]);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc == 4 && !strcmp(argv[1], "--grant-fixture")) {
         test_relay_grant(argv[2], (uint32_t)strtoul(argv[3], NULL, 10));
         return md_test_report();
     }
+    if (argc == 4 && !strcmp(argv[1], "--two-relay-fixture")) {
+        test_two_relay_upgrade(argv[2], argv[3]);
+        return md_test_report();
+    }
+    if (argc == 3 && !strcmp(argv[1], "--history-fixture")) {
+        test_relay_history(argv[2]);
+        return md_test_report();
+    }
+    test_request_gate();
     test_candidate_and_second_client(); test_unbound_dispatch(); test_bad_proofs();
     test_denied_capabilities(); test_late_publication(); test_expiry_and_strict_json();
     return md_test_report();

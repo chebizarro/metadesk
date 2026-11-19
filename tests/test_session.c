@@ -489,6 +489,123 @@ static void test_accept_tree_format_negotiation(void) {
     printf("  PASS: accept tree format negotiation\n");
 }
 
+/* ── Request correlation (md-6ns) ─────────────────────────────── */
+
+static void test_request_correlation_roundtrip(void) {
+    MdSessionRequest a = { .capabilities = MD_CAP_VIDEO }, b = a;
+    MD_CHECK(md_session_request_prepare(&a, 1000000, 10) == 0);
+    MD_CHECK(md_session_request_prepare(&b, 1000000, 10) == 0);
+    MD_CHECK(strlen(a.request_id) == MD_SESSION_REQUEST_ID_LEN);
+    MD_CHECK(strspn(a.request_id, "0123456789abcdef") == MD_SESSION_REQUEST_ID_LEN);
+    MD_CHECK(strcmp(a.request_id, b.request_id) != 0); /* fresh per request */
+    MD_CHECK(a.issued_at == 1000000 && a.expires_at == 1000010);
+    MdSessionRequest c = {0};
+    MD_CHECK(md_session_request_prepare(&c, 1000000, 0) == 0 && c.expires_at == 1000001);
+    MD_CHECK(md_session_request_prepare(&c, 1000000, 100000) == 0 &&
+             c.expires_at == 1000000 + MD_SESSION_REQUEST_MAX_LIFETIME_S);
+    MD_CHECK(md_session_request_prepare(NULL, 1000000, 10) == -1);
+    MD_CHECK(md_session_request_prepare(&c, 0, 10) == -1);
+
+    char *json = md_session_request_to_json(&a);
+    MD_CHECK(json && strstr(json, "\"request_id\"") && strstr(json, "\"expires_at\":1000010"));
+    MdSessionRequest parsed;
+    MD_CHECK(md_session_request_from_json(json, &parsed) == 0);
+    MD_CHECK(strcmp(parsed.request_id, a.request_id) == 0);
+    MD_CHECK(parsed.issued_at == a.issued_at && parsed.expires_at == a.expires_at);
+    free(json);
+
+    MdSessionAccept acc = { .granted = MD_CAP_VIDEO };
+    strcpy(acc.session_id, "sid");
+    memcpy(acc.request_id, a.request_id, sizeof(acc.request_id));
+    json = md_session_accept_to_json(&acc);
+    MdSessionAccept pacc;
+    MD_CHECK(json && md_session_accept_from_json(json, &pacc) == 0);
+    MD_CHECK(strcmp(pacc.request_id, a.request_id) == 0);
+    free(json);
+    /* Token-free stream ACK keeps its shape: no request_id unless set. */
+    acc.request_id[0] = '\0';
+    json = md_session_accept_to_json(&acc);
+    MD_CHECK(json && !strstr(json, "request_id"));
+    free(json);
+}
+
+static void test_request_correlation_strict_parse(void) {
+    static const char *bad_requests[] = {
+        "{\"type\":\"session_request\",\"request_id\":\"ABCDEF0123456789abcdef0123456789\"}",
+        "{\"type\":\"session_request\",\"request_id\":\"abc\"}",
+        "{\"type\":\"session_request\",\"request_id\":7}",
+        "{\"type\":\"session_request\",\"issued_at\":\"1\"}",
+        "{\"type\":\"session_request\",\"issued_at\":1.5}",
+        "{\"type\":\"session_request\",\"expires_at\":-4}",
+        "{\"type\":\"session_request\",\"expires_at\":1e300}",
+    };
+    MdSessionRequest req;
+    for (size_t i = 0; i < sizeof(bad_requests) / sizeof(bad_requests[0]); i++)
+        MD_CHECK(md_session_request_from_json(bad_requests[i], &req) == -1);
+    MdSessionAccept acc;
+    MD_CHECK(md_session_accept_from_json(
+        "{\"type\":\"session_accept\",\"session_id\":\"x\",\"request_id\":\"zz\"}", &acc) == -1);
+    /* Legacy (uncorrelated) messages still parse, so callers can report them. */
+    MD_CHECK(md_session_request_from_json("{\"type\":\"session_request\"}", &req) == 0);
+    MD_CHECK(!req.request_id[0] && req.issued_at == 0 && req.expires_at == 0);
+}
+
+static void test_request_freshness(void) {
+    const int64_t now = 2000000;
+    MdSessionRequest req = {0};
+    MD_CHECK(md_session_request_freshness(&req, now, now) == MD_SESSION_REQUEST_UNCORRELATED);
+    MD_CHECK(md_session_request_freshness(NULL, now, now) == MD_SESSION_REQUEST_UNCORRELATED);
+    MD_CHECK(md_session_request_prepare(&req, now, 10) == 0);
+    MD_CHECK(md_session_request_freshness(&req, now, now) == MD_SESSION_REQUEST_FRESH);
+    MD_CHECK(md_session_request_freshness(&req, now + 10 + MD_SESSION_CLOCK_SKEW_S, now) ==
+             MD_SESSION_REQUEST_FRESH);
+    MD_CHECK(md_session_request_freshness(&req, now + 11 + MD_SESSION_CLOCK_SKEW_S, now) ==
+             MD_SESSION_REQUEST_EXPIRED);
+    MD_CHECK(md_session_request_freshness(&req, now - MD_SESSION_CLOCK_SKEW_S - 1, now) ==
+             MD_SESSION_REQUEST_FUTURE);
+    MD_CHECK(md_session_request_freshness(&req, now, now - MD_SESSION_CLOCK_SKEW_S - 1) ==
+             MD_SESSION_REQUEST_RUMOR_SKEW);
+    MD_CHECK(md_session_request_freshness(&req, now, now + MD_SESSION_CLOCK_SKEW_S + 1) ==
+             MD_SESSION_REQUEST_RUMOR_SKEW);
+    MdSessionRequest w = req;
+    w.expires_at = w.issued_at;
+    MD_CHECK(md_session_request_freshness(&w, now, now) == MD_SESSION_REQUEST_BAD_WINDOW);
+    w.expires_at = w.issued_at + MD_SESSION_REQUEST_MAX_LIFETIME_S + 1;
+    MD_CHECK(md_session_request_freshness(&w, now, now) == MD_SESSION_REQUEST_BAD_WINDOW);
+    MD_CHECK(strcmp(md_session_request_freshness_name(MD_SESSION_REQUEST_EXPIRED), "expired") == 0);
+}
+
+static void test_accept_matches_request(void) {
+    const int64_t now = 3000000;
+    MdSessionRequest req = { .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT };
+    MD_CHECK(md_session_request_prepare(&req, now, 10) == 0);
+    MdSessionAccept acc = { .granted = MD_CAP_VIDEO };
+    strcpy(acc.session_id, "sid");
+    memset(acc.stream_token, 'b', 64);
+    memcpy(acc.request_id, req.request_id, sizeof(acc.request_id));
+    MD_CHECK(md_session_accept_matches_request(&acc, &req, now + 1));
+
+    MdSessionAccept x = acc; /* another request's answer */
+    x.request_id[0] = x.request_id[0] == 'a' ? 'b' : 'a';
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    x = acc; x.request_id[0] = '\0'; /* legacy host / uncorrelated */
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    x = acc; x.stream_token[0] = '\0'; /* token-free ACK is not an acceptance */
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    x = acc; x.session_id[0] = '\0';
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    x = acc; x.granted = 0;
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    x = acc; x.granted = MD_CAP_INPUT; /* beyond the request */
+    MD_CHECK(!md_session_accept_matches_request(&x, &req, now + 1));
+    /* Rumor predating the request (beyond skew) is a replay. */
+    MD_CHECK(!md_session_accept_matches_request(&acc, &req, now - MD_SESSION_CLOCK_SKEW_S - 1));
+    MD_CHECK(md_session_accept_matches_request(&acc, &req, now - MD_SESSION_CLOCK_SKEW_S));
+    MdSessionRequest idle = {0};
+    MD_CHECK(!md_session_accept_matches_request(&acc, &idle, now));
+    MD_CHECK(!md_session_accept_matches_request(NULL, &req, now));
+}
+
 int main(void) {
     printf("test_session (JSON + state machine):\n");
 
@@ -503,6 +620,10 @@ int main(void) {
     test_wrong_type_rejected();
     test_null_args();
     test_caps_helpers();
+    test_request_correlation_roundtrip();
+    test_request_correlation_strict_parse();
+    test_request_freshness();
+    test_accept_matches_request();
 
     /* State machine tests */
     test_state_machine();

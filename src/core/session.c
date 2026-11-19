@@ -238,6 +238,100 @@ int md_caps_to_strings(uint32_t caps, const char **out, int max_out) {
     return n;
 }
 
+/* ── Request correlation fields (md-6ns) ─────────────────────── */
+
+static bool is_request_id(const char *s) {
+    if (!s || strlen(s) != MD_SESSION_REQUEST_ID_LEN) return false;
+    for (const char *p = s; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return false;
+    return true;
+}
+
+/* Absent: 0. Present and valid: 1. Present and invalid: -1. */
+static int parse_request_id(cJSON *root, char out[MD_SESSION_REQUEST_ID_LEN + 1]) {
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+    if (!id) return 0;
+    if (!cJSON_IsString(id) || !is_request_id(id->valuestring)) return -1;
+    memcpy(out, id->valuestring, MD_SESSION_REQUEST_ID_LEN + 1);
+    return 1;
+}
+
+/* Integral unix seconds within the exactly representable JSON range. */
+static int parse_unix_time(cJSON *root, const char *key, int64_t *out) {
+    cJSON *t = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!t) return 0;
+    if (!cJSON_IsNumber(t) || t->valuedouble < 1 ||
+        t->valuedouble > 9007199254740991.0 ||
+        t->valuedouble != (double)(int64_t)t->valuedouble)
+        return -1;
+    *out = (int64_t)t->valuedouble;
+    return 1;
+}
+
+int md_session_request_prepare(MdSessionRequest *req, int64_t now_unix,
+                               uint32_t lifetime_s) {
+    if (!req || now_unix <= 0) return -1;
+    req->request_id[0] = '\0';
+    req->issued_at = req->expires_at = 0;
+    if (lifetime_s < 1) lifetime_s = 1;
+    if (lifetime_s > MD_SESSION_REQUEST_MAX_LIFETIME_S)
+        lifetime_s = MD_SESSION_REQUEST_MAX_LIFETIME_S;
+    uint8_t random[MD_SESSION_REQUEST_ID_LEN / 2];
+    if (RAND_bytes(random, sizeof(random)) != 1)
+        return -1; /* No predictable fallback: a guessable id is not a nonce. */
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        req->request_id[i * 2] = hex[random[i] >> 4];
+        req->request_id[i * 2 + 1] = hex[random[i] & 15];
+    }
+    req->request_id[MD_SESSION_REQUEST_ID_LEN] = '\0';
+    req->issued_at = now_unix;
+    req->expires_at = now_unix + (int64_t)lifetime_s;
+    return 0;
+}
+
+const char *md_session_request_freshness_name(MdSessionRequestFreshness f) {
+    switch (f) {
+    case MD_SESSION_REQUEST_FRESH: return "fresh";
+    case MD_SESSION_REQUEST_UNCORRELATED: return "uncorrelated";
+    case MD_SESSION_REQUEST_BAD_WINDOW: return "bad_window";
+    case MD_SESSION_REQUEST_FUTURE: return "future";
+    case MD_SESSION_REQUEST_EXPIRED: return "expired";
+    case MD_SESSION_REQUEST_RUMOR_SKEW: return "rumor_skew";
+    }
+    return "unknown";
+}
+
+MdSessionRequestFreshness md_session_request_freshness(const MdSessionRequest *req,
+                                                       int64_t now_unix,
+                                                       int64_t rumor_created_at) {
+    if (!req || !is_request_id(req->request_id) ||
+        req->issued_at <= 0 || req->expires_at <= 0)
+        return MD_SESSION_REQUEST_UNCORRELATED;
+    if (req->expires_at <= req->issued_at ||
+        req->expires_at - req->issued_at > MD_SESSION_REQUEST_MAX_LIFETIME_S)
+        return MD_SESSION_REQUEST_BAD_WINDOW;
+    if (req->issued_at > now_unix + MD_SESSION_CLOCK_SKEW_S)
+        return MD_SESSION_REQUEST_FUTURE;
+    if (now_unix > req->expires_at + MD_SESSION_CLOCK_SKEW_S)
+        return MD_SESSION_REQUEST_EXPIRED;
+    if (rumor_created_at < req->issued_at - MD_SESSION_CLOCK_SKEW_S ||
+        rumor_created_at > req->issued_at + MD_SESSION_CLOCK_SKEW_S)
+        return MD_SESSION_REQUEST_RUMOR_SKEW;
+    return MD_SESSION_REQUEST_FRESH;
+}
+
+bool md_session_accept_matches_request(const MdSessionAccept *acc,
+                                       const MdSessionRequest *req,
+                                       int64_t rumor_created_at) {
+    return acc && req && is_request_id(req->request_id) &&
+        strcmp(acc->request_id, req->request_id) == 0 &&
+        acc->session_id[0] && strlen(acc->stream_token) == 64 &&
+        acc->granted != 0 && (acc->granted & ~req->capabilities) == 0 &&
+        req->issued_at > 0 &&
+        rumor_created_at >= req->issued_at - MD_SESSION_CLOCK_SKEW_S;
+}
+
 /* ── Session request JSON ────────────────────────────────────── */
 
 char *md_session_request_to_json(const MdSessionRequest *req) {
@@ -251,6 +345,12 @@ char *md_session_request_to_json(const MdSessionRequest *req) {
 
     if (!cJSON_AddStringToObject(root, "type", "session_request") ||
         !cJSON_AddNumberToObject(root, "v", 1))
+        goto fail;
+    if (req->request_id[0] &&
+        (!is_request_id(req->request_id) ||
+         !cJSON_AddStringToObject(root, "request_id", req->request_id) ||
+         !cJSON_AddNumberToObject(root, "issued_at", (double)req->issued_at) ||
+         !cJSON_AddNumberToObject(root, "expires_at", (double)req->expires_at)))
         goto fail;
 
     /* capabilities array */
@@ -302,6 +402,16 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
         return -1;
     }
 
+    /* Correlation fields are optional on the wire (so a legacy request
+     * parses and can be reported) but strictly typed when present. */
+    if (parse_request_id(root, out->request_id) < 0 ||
+        parse_unix_time(root, "issued_at", &out->issued_at) < 0 ||
+        parse_unix_time(root, "expires_at", &out->expires_at) < 0) {
+        cJSON_Delete(root);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+
     /* capabilities */
     cJSON *caps = cJSON_GetObjectItem(root, "capabilities");
     if (parse_capability_array(caps, &out->capabilities) < 0) {
@@ -341,6 +451,11 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
     if (!cJSON_AddStringToObject(root, "type", "session_accept") ||
         !cJSON_AddNumberToObject(root, "v", 1) ||
         !cJSON_AddStringToObject(root, "session_id", acc->session_id))
+        goto fail;
+
+    if (acc->request_id[0] &&
+        (!is_request_id(acc->request_id) ||
+         !cJSON_AddStringToObject(root, "request_id", acc->request_id)))
         goto fail;
 
     if (acc->stream_token[0] &&
@@ -403,6 +518,12 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
     if (cJSON_IsString(sid)) {
         strncpy(out->session_id, sid->valuestring, sizeof(out->session_id) - 1);
         out->session_id[sizeof(out->session_id) - 1] = '\0';
+    }
+
+    if (parse_request_id(root, out->request_id) < 0) {
+        cJSON_Delete(root);
+        memset(out, 0, sizeof(*out));
+        return -1;
     }
 
     cJSON *token = cJSON_GetObjectItemCaseSensitive(root, "stream_token");
