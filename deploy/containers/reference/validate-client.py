@@ -3,7 +3,9 @@
 Updated by md-rk4 (no stdbuf: both binaries line-buffer stdout) and md-33e (GUI
 mode without a granted display must refuse before any signer or session work),
 md-cdz (one retaining relay for every cell; repeat negotiations must succeed)
-and md-rnc (GUI renderer choice is logged; no libopengl0 needed).
+and md-rnc (GUI renderer choice is logged; no libopengl0 needed). md-817x: each
+negotiation's history checks run once, after its host and client logs drained to
+EOF, and require every earlier request_id to be ignored exactly once.
 
 Every negotiation starts a fresh Tier B Sway/xdpw host container (it captures
 only its own isolated output; the host has a single startup negotiation) and a
@@ -90,9 +92,27 @@ class Logs:
                     return None
                 self.cond.wait(left)
 
+    def drain(self, timeout):
+        """Block until `podman logs -f` reaches EOF (the container exited and
+        every line was delivered); False if it did not within timeout."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while not self.done:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.cond.wait(left)
+            return True
+
     def has(self, pattern):
         with self.cond:
             return any(re.search(pattern, line) for line in self.lines)
+
+    def findall(self, pattern):
+        """Every matching line, in order (meaningful once drained)."""
+        rx = re.compile(pattern)
+        with self.cond:
+            return [m for line in self.lines if (m := rx.search(line))]
 
     def close(self):
         self.proc.terminate()
@@ -165,7 +185,7 @@ class Run:
         podman("stop", "-t", str(grace), name)
         elapsed = time.monotonic() - t0
         code = int(podman("inspect", "-f", "{{.State.ExitCode}}", name).stdout)
-        self.logs[name].wait(r"$^", 5)  # drain: returns once `logs -f` reaches EOF
+        self.logs[name].drain(30)  # EOF barrier: every line of the stopped container is in
         return code, elapsed
 
     def bunker(self, role):
@@ -240,31 +260,58 @@ class Run:
         return stats
 
     def correlated(self, cell, hlogs, clogs):
-        """md-6ns on a retaining relay: this negotiation answered only its own
-        request, and every earlier session's request (host) and acceptance
-        (client) was replayed as history and ignored."""
+        """Start of md-6ns on a retaining relay: record this negotiation's
+        request_id and session id. Returns the record for correlated_final(),
+        which judges it only after both logs have drained."""
         sent = clogs.wait(r"client: sending session request DM \(request_id=([0-9a-f]{8})\.\.\.\)", 5)
         acc = clogs.wait(r"client: session accepted \(id=(\S+)\)", 5)
         if not check(f"{cell}: client request_id and session id logged", bool(sent and acc)):
+            return None
+        rec = {"cell": cell, "request_id": sent[1], "session_id": acc[1], "prior": list(self.sessions),
+               "hlogs": hlogs, "clogs": clogs}
+        self.sessions.append({k: rec[k] for k in ("cell", "request_id", "session_id")})
+        return rec
+
+    def correlated_final(self, rec):
+        """md-6ns/md-817x, after finish_client and finish_host drained both logs
+        to EOF (no late line can follow): this negotiation answered only its own
+        request, exactly once, and every earlier session's request (host) and
+        acceptance (client) was replayed as history and ignored exactly once,
+        matched by request_id, with nothing else ignored or rejected."""
+        if rec is None:
             return
-        rid, sid, prior = sent[1], acc[1], list(self.sessions)
-        self.sessions.append({"cell": cell, "request_id": rid, "session_id": sid})
-        if not prior:
+        cell, rid, sid, hlogs, clogs = rec["cell"], rec["request_id"], rec["session_id"], rec["hlogs"], rec["clogs"]
+        if not check(f"{cell}: host and client logs drained to EOF before the exactly-once checks",
+                     hlogs.done and clogs.done, f"host done={hlogs.done}, client done={clogs.done}"):
             return
+        want = [s["request_id"] for s in rec["prior"]]
         cpk8 = self.ids["client"]["pubkey"][:8]
-        want = [s["request_id"] for s in prior]
-        host_seen = [m for r in want if (m := hlogs.wait(
-            rf"host: ignoring session request from relay history \({cpk8}\.\.\., request_id={r}\)", 5))]
-        cli_seen = [m for r in want if (m := clogs.wait(
-            rf"client: ignoring session_accept not answering the current request \(request_id={r}\.\.\., history\)", 5))]
-        check(f"{cell}: host ignored all {len(want)} earlier requests as relay history",
-              len(host_seen) == len(want) and not hlogs.has(rf"request_id={rid}\)")
-              and not hlogs.has(r"REJECTED session request"),
-              f"history request_ids {want}; answered {rid}")
-        check(f"{cell}: client ignored all {len(want)} earlier acceptances as history",
-              len(cli_seen) == len(want) and not clogs.has(rf"ignoring session_accept .*request_id={rid}")
-              and sid not in {s["session_id"] for s in prior},
-              f"history request_ids {want}; accepted {rid}, new session id")
+        # request_id is the logged 8-hex prefix, or "none" for a request/accept without one.
+        h_hist = [m[1] for m in hlogs.findall(
+            rf"host: ignoring session request from relay history \({cpk8}\.\.\., request_id=(\S+?)\)")]
+        c_ign = [(m[1], m[2]) for m in clogs.findall(
+            r"client: ignoring session_accept not answering the current request "
+            r"\(request_id=(\S+?)(?:\.\.\.)?, (history|live)\)")]
+        c_hist = [r for r, tag in c_ign if tag == "history"]
+        c_live = [r for r, tag in c_ign if tag == "live"]
+        # The request ids are unique, so sorted equality is "each exactly once".
+        host_ok = sorted(h_hist) == sorted(want)
+        cli_ok = sorted(c_hist) == sorted(want)
+        answered = len(hlogs.findall(rf"host: received session request from {cpk8}\.\.\."))
+        accepted = len(clogs.findall(r"client: session accepted \("))
+        check(f"{cell}: host answered its own request exactly once, client accepted exactly once",
+              answered == 1 and accepted == 1, f"host received {answered}, client accepted {accepted}; {rid}")
+        check(f"{cell}: host ignored each of {len(want)} earlier requests exactly once as relay history",
+              host_ok and rid not in h_hist, f"expected {sorted(want)}; ignored {sorted(h_hist)}; answered {rid}")
+        check(f"{cell}: client ignored each of {len(want)} earlier acceptances exactly once as history",
+              cli_ok and rid not in {r for r, _ in c_ign} and sid not in {s["session_id"] for s in rec["prior"]},
+              f"expected {sorted(want)}; ignored {sorted(c_hist)}; accepted {rid}, new session id")
+        check(f"{cell}: no live or late duplicate answer reached the client",
+              not c_live and len(c_ign) == len(want), f"live ignores {c_live}; all ignores {c_ign}")
+        if want:  # the decode host legitimately rejects the stranger
+            check(f"{cell}: host rejected nothing and ignored nothing as stale",
+                  not hlogs.has(r"REJECTED session request") and not hlogs.has(r"host: ignoring \w+ session request"),
+                  "no REJECTED / stale-request line after drain")
 
     def host_media(self, cell, logs):
         cap = logs.wait(r"host: capture started \((\d+)x(\d+)\)", 30)
@@ -341,7 +388,7 @@ def main():
         dec, dlogs = run.client("decode", "client", a.decode_image, [], [*run.npub_args(), "--no-display"])
         run.host_media("decode", hlogs)
         run.stream("decode", dlogs, display_expected=False)
-        run.correlated("decode", hlogs, dlogs)
+        corr = run.correlated("decode", hlogs, dlogs)
         size = dlogs.wait(r"client: decoded frame size (\d+)x(\d+)", 5)
         check("decode: client logged decoded frame size", bool(size), size[0] if size else "")
         try:
@@ -369,6 +416,7 @@ def main():
               f"host: {unproven[0] if unproven else 'no rejection'}; "
               f"legacy: {summary[0] if summary else 'no summary'}, exit={lcode}")
         run.finish_host("decode", host)
+        run.correlated_final(corr)
 
         # ── Cell 2: repeat negotiations on the same retaining relay (md-cdz) ─
         # Each is a new host and client process pair; history only grows.
@@ -377,9 +425,10 @@ def main():
             cli, rlogs = run.client(cell, "client", a.decode_image, [], [*run.npub_args(), "--no-display"])
             run.host_media(cell, hlogs)
             run.stream(cell, rlogs, display_expected=False)
-            run.correlated(cell, hlogs, rlogs)
+            corr = run.correlated(cell, hlogs, rlogs)
             run.finish_client(cell, cli, display_expected=False)
             run.finish_host(cell, host)
+            run.correlated_final(corr)
 
         # ── Cell 3: GUI, display authorization ──────────────────────────────
         display, xlogs = run.start("display", ["--network", "none", *SANDBOX, "--memory", "384m",
@@ -399,7 +448,7 @@ def main():
                                  "-e", "LIBGL_ALWAYS_SOFTWARE=1"], run.npub_args())
         run.host_media("gui", hlogs)
         run.stream("gui", glogs, display_expected=True)
-        run.correlated("gui", hlogs, glogs)
+        corr = run.correlated("gui", hlogs, glogs)
         check("gui: client logged wayland video driver, SDL renderer and frame size",
               glogs.has(r"client: receiving stream") and glogs.has(r"^render: SDL video driver 'wayland'$")
               and glogs.has(r"^render: SDL renderer '\w+'") and glogs.has(r"client: decoded frame size \d+x\d+")
@@ -433,6 +482,7 @@ def main():
                   "rect": [win[0]["rect"]["width"], win[0]["rect"]["height"]]}) if win else "no metadesk view")
         run.finish_client("gui", gui, display_expected=True)
         run.finish_host("gui", host)
+        run.correlated_final(corr)
 
         # No display granted: GUI mode refuses before any signer, relay or
         # session work (md-33e); it never falls back to offscreen or decode-only.
@@ -446,10 +496,10 @@ def main():
             # The refusal is the client's last line, and `logs -f` can deliver it
             # seconds after the container exits: wait for it, then drain to EOF.
             refused = logs.wait(r"ERROR: no usable display for the GUI client", 30)
-            logs.wait(r"$^", 5)  # drain: returns once `logs -f` reaches EOF
+            drained = logs.drain(30)  # EOF barrier
             why = logs.wait(refusal, 0)
             check(f"{cell}: no display granted -> GUI refused, exit 1",
-                  code == 1 and bool(why) and bool(refused),
+                  code == 1 and bool(why) and bool(refused) and drained,
                   f"exit={code}; {why[0] if why else 'no refusal reason'}")
             check(f"{cell}: refused before signer, relay or session work",
                   not logs.has(r"NIP-46 bunker|signer ready|session request|connecting|"

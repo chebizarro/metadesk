@@ -23,6 +23,14 @@ later session must succeed while ignoring all earlier ones (md-cdz, below).
 The GUI image no longer installs `libopengl0`; the client skips SDL's `opengl`
 renderer and presents through `opengles2` (md-rnc, below).
 
+**Re-run for md-817x** (2026-11-19, same VM and pins, master `7cb7ab5` plus
+the driver change only, `t817-*` tags): **90/90 checks** (86 PASS + 4 INFO), exit
+0, ~140 s wall on the shared VM. The repeat cell's assertions are hardened (Cell
+2, below): each earlier request/acceptance must be ignored **exactly once** per
+later session, matched by `request_id`, and the "never answered" negatives are
+judged only after both logs have drained to EOF. A mutation check shows the old
+assertions miss, and the new ones catch, a duplicate or late answer.
+
 Scope boundary: the FIPS control endpoint is a **fixture** and TCP crosses a
 TUN-less IPv6 container bridge to the host's npub-derived address. This is not
 a FIPS daemon, mesh or encrypted-transport receipt; that is **md-ah9.6**.
@@ -118,11 +126,25 @@ fourth negotiation. The driver records each client's logged `request_id`
 decoded frames, SIGTERM exit 0), and:
 
 - the new host logs `ignoring session request from relay history` for
-  **every** earlier client request_id, never for the one it answers, and
-  never `REJECTED` anything (the stranger's old request is history too);
+  **each** earlier client request_id **exactly once**, never for the one it
+  answers, nothing for any other client request_id, and never `REJECTED` or
+  ignores a request as stale (the stranger's old request is history too);
 - the new client logs `ignoring session_accept not answering the current
-  request (request_id=…, history)` for **every** earlier acceptance, never
-  for its own, and accepts a session id that no earlier session used.
+  request (request_id=…, history)` for **each** earlier acceptance **exactly
+  once**, never for its own, never with the tag `live` (a live ignore is a
+  duplicate or late answer), and accepts a session id that no earlier session
+  used;
+- the host logs `received session request` from the client exactly once and
+  the client logs `session accepted` exactly once.
+
+These are judged in `Run.correlated_final`, which runs only after
+`finish_client` and `finish_host` stopped both containers and drained both
+`podman logs -f` streams to EOF (`Logs.drain`; the driver fails if either
+stream did not reach EOF). Earlier versions checked once, right after the
+stream reached 60 frames, so a line arriving later could not fail them.
+Comparison is by sorted request_id lists: the ids are unique, so equality means
+"each earlier id exactly once, nothing else". Waits stay event barriers (log
+lines, process exit, EOF); there are no sleeps.
 
 Final run, all PASS:
 
@@ -137,6 +159,53 @@ Fixture totals for the run: 23 REQ, 23 EOSE, 229 events and 229 OK on one
 relay; `show_peers` 5 for 5 `--npub` clients. Before md-6ns this cell failed
 at the second negotiation (stale acceptance, host `rejected unproven
 client #1`).
+
+### md-817x: the hardened assertions catch regressions (mutation check)
+
+The final run is all PASS: every later session ignored each earlier request_id
+exactly once on the host and on the client, answered once, no live ignore:
+
+| Negotiation | Host ignored once each | Client ignored once each | Answered |
+|---|---|---|---|
+| decode | none | none | `a6203cf5` |
+| repeat-1 | `a6203cf5` | `a6203cf5` | `71e2fcd4` |
+| repeat-2 | `a6203cf5 71e2fcd4` | both | `b9838643` |
+| gui | all three | all three | `3e9d2eda` |
+
+To prove the new checks can fail, scratch copies of the old (`7cb7ab5`) and new
+driver were mutated and run on the VM with the same images (the mutation was
+**never committed**). The mutated driver runs the host/client under a `sh`
+wrapper and, once the negotiation's `request_id` is known, makes the container
+print one extra line to its real stdout, so it goes through `podman logs -f`
+and the EOF drain like any product line:
+
+- **duplicate**: a second `ignoring … from relay history` /
+  `ignoring session_accept … history` line for the first earlier request_id,
+  printed by the host while it runs and by the client after it exits;
+- **late answer**: after the client process exited, `client: ignoring
+  session_accept not answering the current request (request_id=<own>…, live)`.
+
+| Mutation | Old driver (`7cb7ab5`) | New driver |
+|---|---|---|
+| duplicate history ignore | **PASS**, 73/73, exit 0 | **FAIL**, 11 failing (repeat-1/2/gui: host and client "exactly once", live/late), exit 1 |
+| late own-request answer after exit | **PASS**, 73/73, exit 0 | **FAIL**, 8 of 90 failing (every cell: client "exactly once" and "no live or late duplicate answer", `live ignores [<own request_id>]`), exit 1 |
+
+The dup run's other failures (a 5.2 s client stop, `show_peers=0`) came from
+the `sh` wrapper in the mutation harness, not from the new checks. The late
+answer run had only the intended failures. In an earlier late-answer run, the
+new checks also caught an unrecorded request: a client whose stream dropped
+(the wrapper delayed its stop) sent a second request, and later hosts ignored
+it as history. The sorted-equality check reports it.
+
+The relay itself was also mutated once (scratch copy of `tests/`
+`account_startup_fixture.py`): every kind-1059 event re-broadcast verbatim 9 s
+after storing (a late duplicate of the same event id). Neither side logged a
+second ignore, so the stack suppresses repeats of one event id; the new
+checks passed on those cells. That run's GUI cell failed its frame threshold
+for an unrelated reason (12 decoded frames, 12 s SIGTERM on the loaded shared
+VM; the unmutated final run decoded 107 frames in that cell). A relay replaying a *new*
+event id for an old answer cannot be forged without signing keys, so the
+product-level duplicate case is covered only by the log-level mutation above.
 
 ## Cell 3 — GUI: display authorization results (separate)
 
@@ -312,12 +381,12 @@ EOSE/OK in the unchanged nostrc/metadesk layers.
   cover them.
 - **md-cdz pass (diff-scoped):** the repeat cell waits only on log lines, and
   each client starts after its host's post-EOSE readiness line, so the
-  live/history split is the EOSE boundary, not timing. Low J: the "never
-  answered history / never REJECTED" negatives are checked once, after the
-  session streams; history precedes EOSE, so this is complete in practice.
-  Low F: each earlier request_id must be ignored at least once, not exactly
-  once (one relay per host makes duplicates unlikely). Both are optional test
-  hardening.
+  live/history split is the EOSE boundary, not timing. Low J ("never answered
+  history / never REJECTED" checked once, after the session streams) and Low F
+  (each earlier request_id ignored at least once, not exactly once) were
+  optional test hardening, **resolved by md-817x**: the negatives now run after
+  both logs drained to EOF, and each earlier request_id must be ignored exactly
+  once on each side.
 - **Out of diff, needs review:** the reused `tests/` relay closes idle sockets
   after 45 s, a timer-driven close. Cells finish well inside it.
 
@@ -343,3 +412,10 @@ containers and network. Only the shared Ubuntu base image remained. VM free
 disk was 9.0 GB at start, 5.5 GB lowest and 8.9 GB at the end; the VM is
 shared with other agents. GNOME was never touched: every SDL probe ran inside
 a container against the private Sway socket.
+
+md-817x re-run: the `t817-*` images (removed by exact tag), dangling layers, the
+bundle/build trees, scratch mutation drivers, throwaway keys and `~/wt-817x`
+were removed; the driver removed its containers and network on every run (none
+named `t817*` remained). Only the shared Ubuntu base image remained. VM free
+disk was 8.9 GB at start, 6.3 GB lowest and 8.7 GB at the end. GNOME was never
+touched.
