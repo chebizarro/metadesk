@@ -36,6 +36,7 @@ struct MdMcpServer {
     pthread_mutex_t  dispatch_mu; /* serializes request dispatch */
     pthread_mutex_t  sink_mu;     /* short-lived sink/owner metadata lock */
     bool            quiesced;    /* protected by sink_mu */
+    atomic_bool     tools_list_changed; /* advertise tools.listChanged */
     bool            dispatch_active;
     pthread_t       dispatch_owner;
 
@@ -116,8 +117,12 @@ static int handle_initialize(MdMcpServer *s, const MdJsonRpcId *id,
 
     /* Capabilities */
     cJSON *caps = cJSON_CreateObject();
-    if (s->tool_count > 0)
-        cJSON_AddItemToObject(caps, "tools", cJSON_CreateObject());
+    if (s->tool_count > 0) {
+        cJSON *tool_caps = cJSON_CreateObject();
+        if (atomic_load(&s->tools_list_changed))
+            cJSON_AddBoolToObject(tool_caps, "listChanged", true);
+        cJSON_AddItemToObject(caps, "tools", tool_caps);
+    }
     if (s->resource_count > 0) {
         cJSON *res_caps = cJSON_CreateObject();
         cJSON_AddBoolToObject(res_caps, "subscribe", true);
@@ -440,6 +445,17 @@ uint32_t md_mcp_server_caller_caps(MdMcpServer *server)
     return caps;
 }
 
+bool md_mcp_server_same_tools(const MdMcpServer *server, uint32_t a, uint32_t b)
+{
+    if (!server) return true;
+    for (int i = 0; i < server->tool_count; i++) {
+        uint32_t need = server->tools[i].required_caps;
+        if (!(need & ~a) != !(need & ~b))
+            return false;
+    }
+    return true;
+}
+
 int md_mcp_server_handle_message(MdMcpServer *server,
                                  const char *json, size_t len)
 {
@@ -577,6 +593,23 @@ int md_mcp_server_notify_resource_updated(MdMcpServer *server,
     return rc;
 }
 
+void md_mcp_server_set_tools_list_changed(MdMcpServer *server, bool enabled)
+{
+    if (server) atomic_store(&server->tools_list_changed, enabled);
+}
+
+const char *md_mcp_server_tools_list_changed(MdMcpServer *server)
+{
+    if (!server ||
+        atomic_load(&server->init_state) != MD_MCP_INIT_STATE_INITIALIZED)
+        return NULL;
+    pthread_mutex_lock(&server->sink_mu);
+    bool quiesced = server->quiesced;
+    pthread_mutex_unlock(&server->sink_mu);
+    return quiesced ? NULL
+        : "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+}
+
 void md_mcp_server_quiesce(MdMcpServer *server)
 {
     if (!server) return;
@@ -603,6 +636,7 @@ MdMcpServer *md_mcp_server_create(const MdMcpServerConfig *config)
     s->write_fn = config->write_fn;
     s->write_userdata = config->write_userdata;
     atomic_store(&s->init_state, MD_MCP_INIT_STATE_NEW);
+    atomic_init(&s->tools_list_changed, false);
     pthread_mutex_init(&s->sub_mu, NULL);
     /* Nested request dispatch remains unsupported (non-recursive). */
     pthread_mutex_init(&s->dispatch_mu, NULL);

@@ -27,7 +27,16 @@ HostMcpAcl *host_mcp_acl_start(const char *const *relay_urls, int relay_count);
  * transport admits only a grant with agent and gates actions on input. */
 uint32_t host_mcp_acl_grant(const char *pubkey_hex, void *acl);
 
-/* Stop the bridge, join the readiness logger and release the host role. */
+/* MdMcpHttpConfig.nip98_grant_watch: register on_change (one listener;
+ * -1 if one is already registered) or, with NULL, unregister after any
+ * in-flight call returns. on_change runs on the bridge's watcher thread after
+ * each readiness transition or accepted list replacement, before that change
+ * is logged, and once more when the bridge stops (every grant then denies).
+ * Event-driven via md_nostr_allowlist_wait_change(); never a timer. */
+int host_mcp_acl_watch(void *acl, void (*on_change)(void *), void *on_change_ud);
+
+/* Stop the bridge, join the watcher and release the host role. Unregister
+ * the listener first, or keep it valid until this returns. */
 void host_mcp_acl_stop(HostMcpAcl *acl);
 
 /* `metadesk-host mcp-proxy ...`; argv excludes the subcommand name. */

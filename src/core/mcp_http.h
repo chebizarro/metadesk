@@ -50,6 +50,20 @@ typedef struct {
      * SSE broadcast so a revoked stream is dropped without a restart. */
     uint32_t    (*nip98_grant)(const char *pubkey_hex, void *userdata);
     void         *nip98_grant_userdata;
+    /* Optional change feed for nip98_grant (md-ht7). With both set, create
+     * registers watch(nip98_grant_userdata, on_change, on_change_ud) and
+     * destroy unregisters with watch(nip98_grant_userdata, NULL, NULL)
+     * before freeing anything; unregistering must wait out an in-flight
+     * on_change. watch returns 0 on success (create fails otherwise). The
+     * source calls on_change once per accepted grant change, event-driven
+     * (never a timer), from a thread it owns and not under its grant lock.
+     * The transport then re-reads every live SSE stream's grant: a stream
+     * that lost agent is closed, and one whose visible tool set changed gets
+     * one notifications/tools/list_changed. initialize then advertises
+     * capabilities.tools.listChanged. */
+    int         (*nip98_grant_watch)(void *userdata,
+                                     void (*on_change)(void *on_change_ud),
+                                     void *on_change_ud);
     int           max_clients;   /* max concurrent SSE clients (default: 4) */
     int           sse_write_timeout_ms; /* response/whole-broadcast budget; <=0: 2000ms */
     int           sse_sndbuf;     /* test/diagnostic SO_SNDBUF limit for SSE only;
@@ -73,8 +87,8 @@ int md_mcp_http_run(MdMcpHttp *http);
 /* Signal the server to shut down (thread-safe). */
 void md_mcp_http_shutdown(MdMcpHttp *http);
 
-/* Send an SSE event to all connected clients.
- * Used internally by the MCP server's write callback. */
+/* Send an SSE event to all connected clients (live-admitted clients whose
+ * grant lost agent are closed instead). Used by the server's write_fn. */
 int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
                          const char *data, size_t data_len);
 

@@ -68,6 +68,8 @@ typedef struct {
     /* Admitted only by the live authorizer: recheck before each broadcast. */
     bool live_auth;
     bool revoked;
+    bool target;    /* receives the frame being delivered */
+    uint32_t caps;  /* live grant the stream's tool set was last checked at */
     char pubkey[65];
 } SseClient;
 
@@ -100,6 +102,8 @@ struct MdMcpHttp {
     size_t          allowed_key_count;
     uint32_t      (*grant)(const char *pubkey_hex, void *userdata);
     void           *grant_ud;
+    /* Registered grant change feed (md-ht7); NULL when not watching. */
+    int           (*grant_watch)(void *userdata, void (*fn)(void *), void *fn_ud);
     AuthReplay      replay[AUTH_REPLAY_CAPACITY];
     pthread_mutex_t auth_mu;
 
@@ -684,6 +688,8 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 
 /* ── Handle a client connection ──────────────────────────────── */
 
+static void sse_regrant_locked(MdMcpHttp *h, int only_fd);
+
 static void handle_client(MdMcpHttp *h, int client_fd)
 {
     /* Bound read waits so idle connections cannot park a handler */
@@ -851,7 +857,8 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         }
         /* Reserve capacity, but broadcasts skip this fd until headers finish.
          * The handler owns it while unready; shutdown must not close/reuse it. */
-        SseClient reserved = { .fd = client_fd, .live_auth = who.live_auth };
+        SseClient reserved = { .fd = client_fd, .live_auth = who.live_auth,
+                               .caps = who.caps };
         memcpy(reserved.pubkey, who.pubkey, sizeof(reserved.pubkey));
         h->sse_clients[h->sse_count++] = reserved;
         pthread_mutex_unlock(&h->sse_mu);
@@ -868,6 +875,10 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             if (h->sse_clients[i].fd != client_fd) continue;
             if (ready && !atomic_load(&h->shutdown)) {
                 h->sse_clients[i].ready = true;
+                /* The change feed skips unready streams: catch a grant change
+                 * between authentication and now (may close this stream). */
+                if (h->sse_clients[i].live_auth && h->grant_watch)
+                    sse_regrant_locked(h, client_fd);
             } else {
                 close(client_fd);
                 h->sse_clients[i] = h->sse_clients[--h->sse_count];
@@ -935,45 +946,38 @@ static char *make_sse_frame(const char *event, const char *data, size_t len,
     return frame;
 }
 
-int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
-                         const char *data, size_t data_len)
+/* Deliver one frame to every ready client marked target, all within one
+ * write budget, then close those marked revoked and those whose write failed
+ * or timed out. Caller holds sse_mu and sets target/revoked on every client
+ * (revoked only on ready ones); both are cleared on the clients kept. A
+ * target that cannot be served (NULL frame: the caller's allocation failed,
+ * or no poll set) is closed like a failed write, so no client silently
+ * misses a frame; returns -1 then. */
+static int sse_deliver_locked(MdMcpHttp *h, const char *frame, size_t frame_len)
 {
-    if (!http || !data) return -1;
-
-    size_t frame_len;
-    char *frame = make_sse_frame(event, data, data_len, &frame_len);
-    if (!frame) return -1;
-    pthread_mutex_lock(&http->sse_mu);
-    int64_t deadline = md_now_ms() + http->sse_write_timeout_ms;
-    struct pollfd *fds = calloc((size_t)http->sse_max_clients, sizeof(*fds));
-    if (!fds) {
-        pthread_mutex_unlock(&http->sse_mu);
-        free(frame);
-        return -1;
-    }
-    int pending = 0, revoked = 0;
-    for (int i = 0; i < http->sse_count; i++) {
-        SseClient *c = &http->sse_clients[i];
+    struct pollfd *fds = frame ? calloc((size_t)h->sse_max_clients, sizeof(*fds)) : NULL;
+    int64_t deadline = md_now_ms() + h->sse_write_timeout_ms;
+    int pending = 0, revoked = 0, unserved = 0;
+    for (int i = 0; i < h->sse_count; i++) {
+        SseClient *c = &h->sse_clients[i];
         c->sent = 0;
-        /* A live-list grant can be revoked while the stream is open: the
-         * next notification is withheld and the stream closed. */
-        c->revoked = c->ready && c->live_auth && !live_grant(http, c->pubkey);
-        c->failed = c->revoked;
+        if (c->ready && c->target && !c->revoked && !fds) unserved++;
+        c->failed = c->revoked || (c->ready && c->target && !fds);
         if (c->revoked) revoked++;
-        bool deliver = c->ready && !c->failed;
-        fds[i] = (struct pollfd){ .fd = deliver ? c->fd : -1, .events = POLLOUT };
+        bool deliver = c->ready && c->target && !c->failed;
+        if (fds) fds[i] = (struct pollfd){ .fd = deliver ? c->fd : -1, .events = POLLOUT };
         if (deliver) pending++;
     }
     if (revoked) MD_LOG_W("dropping %d SSE client(s) no longer authorized by the live allowlist", revoked);
     while (pending > 0) {
         int64_t remaining = deadline - md_now_ms();
         if (remaining <= 0) break;
-        int rc = poll(fds, (nfds_t)http->sse_count, (int)remaining);
+        int rc = poll(fds, (nfds_t)h->sse_count, (int)remaining);
         if (rc < 0 && errno == EINTR) continue;
         if (rc <= 0) break;
-        for (int i = 0; i < http->sse_count; i++) {
+        for (int i = 0; i < h->sse_count; i++) {
             if (fds[i].fd < 0 || !fds[i].revents) continue;
-            SseClient *c = &http->sse_clients[i];
+            SseClient *c = &h->sse_clients[i];
             ssize_t n = md_socket_write(c->fd, frame + c->sent, frame_len - c->sent);
             if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
                 continue;
@@ -985,20 +989,86 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
             }
         }
     }
-    for (int i = 0; i < http->sse_count; ) {
-        SseClient *c = &http->sse_clients[i];
-        if (c->ready && (c->failed || c->sent != frame_len)) {
+    for (int i = 0; i < h->sse_count; ) {
+        SseClient *c = &h->sse_clients[i];
+        if (c->ready && (c->failed || (c->target && c->sent != frame_len))) {
             if (!c->revoked) MD_LOG_W("dropping SSE client after failed or timed-out write");
             close(c->fd);
-            *c = http->sse_clients[--http->sse_count];
+            *c = h->sse_clients[--h->sse_count];
         } else {
+            c->target = c->revoked = false;
             i++;
         }
     }
     free(fds);
+    return unserved ? -1 : 0;
+}
+
+int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
+                         const char *data, size_t data_len)
+{
+    if (!http || !data) return -1;
+
+    size_t frame_len;
+    char *frame = make_sse_frame(event, data, data_len, &frame_len);
+    if (!frame) return -1;
+    pthread_mutex_lock(&http->sse_mu);
+    for (int i = 0; i < http->sse_count; i++) {
+        SseClient *c = &http->sse_clients[i];
+        c->target = c->ready;
+        /* A live-list grant can be revoked while the stream is open: the
+         * next notification is withheld and the stream closed. */
+        c->revoked = c->ready && c->live_auth && !live_grant(http, c->pubkey);
+    }
+    int rc = sse_deliver_locked(http, frame, frame_len);
     pthread_mutex_unlock(&http->sse_mu);
     free(frame);
-    return 0;
+    return rc;
+}
+
+/* md-ht7: re-read the live grant of each ready live-admitted stream (only
+ * only_fd's when >= 0). A grant without agent closes the stream; otherwise
+ * a visible tool set that differs from the one recorded at the previous
+ * check gets one notifications/tools/list_changed. The grant is recorded
+ * here under sse_mu, so each tool-set change notifies exactly once however
+ * often this runs, and other streams are untouched. */
+static void sse_regrant_locked(MdMcpHttp *h, int only_fd)
+{
+    int changed = 0, revoked = 0;
+    for (int i = 0; i < h->sse_count; i++) {
+        SseClient *c = &h->sse_clients[i];
+        c->target = c->revoked = false;
+        if (!c->ready || !c->live_auth || (only_fd >= 0 && c->fd != only_fd)) continue;
+        uint32_t caps = live_grant(h, c->pubkey);
+        if (!caps) {
+            c->revoked = true;
+            revoked++;
+            continue;
+        }
+        c->target = !md_mcp_server_same_tools(h->mcp_server, c->caps, caps);
+        c->caps = caps;
+        if (c->target) changed++;
+    }
+    if (!changed && !revoked) return;
+    /* NULL once the server is quiesced (teardown) or not yet initialized:
+     * nothing to say, but revocations still close. A frame that cannot be
+     * built closes its targets instead (their record already moved on). */
+    const char *note = changed ? md_mcp_server_tools_list_changed(h->mcp_server) : NULL;
+    if (!note)
+        for (int i = 0; i < h->sse_count; i++) h->sse_clients[i].target = false;
+    size_t frame_len = 0;
+    char *frame = note ? make_sse_frame("message", note, strlen(note), &frame_len) : NULL;
+    if (note || revoked) sse_deliver_locked(h, frame, frame_len);
+    free(frame);
+}
+
+/* The grant source's on_change: runs on its thread, never under its lock. */
+static void sse_grants_changed(void *userdata)
+{
+    MdMcpHttp *h = userdata;
+    pthread_mutex_lock(&h->sse_mu);
+    if (!atomic_load(&h->shutdown)) sse_regrant_locked(h, -1);
+    pthread_mutex_unlock(&h->sse_mu);
 }
 
 int md_mcp_http_sse_client_count(MdMcpHttp *http)
@@ -1047,6 +1117,19 @@ static void close_sse_clients(MdMcpHttp *http)
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
+/* Free a transport whose locks exist but nothing else references it. */
+static void http_free(MdMcpHttp *h)
+{
+    if (h->listen_fd >= 0)
+        close(h->listen_fd);
+    go_wait_group_destroy(&h->handler_wg);
+    pthread_mutex_destroy(&h->sse_mu);
+    pthread_mutex_destroy(&h->auth_mu);
+    auth_free(h);
+    free(h->sse_clients);
+    free(h);
+}
+
 MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
 {
     if (!config || !config->server) return NULL;
@@ -1083,12 +1166,7 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     /* Create listening socket */
     h->listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (h->listen_fd < 0) {
-        go_wait_group_destroy(&h->handler_wg);
-        pthread_mutex_destroy(&h->sse_mu);
-        pthread_mutex_destroy(&h->auth_mu);
-        auth_free(h);
-        free(h->sse_clients);
-        free(h);
+        http_free(h);
         return NULL;
     }
 
@@ -1112,13 +1190,7 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
                 addr.sin6_addr.s6_addr[11] = 0xff;
                 memcpy(&addr.sin6_addr.s6_addr[12], &v4_addr, sizeof(v4_addr));
             } else {
-                close(h->listen_fd);
-                go_wait_group_destroy(&h->handler_wg);
-                pthread_mutex_destroy(&h->sse_mu);
-                pthread_mutex_destroy(&h->auth_mu);
-                auth_free(h);
-                free(h->sse_clients);
-                free(h);
+                http_free(h);
                 return NULL;
             }
         }
@@ -1127,13 +1199,7 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     }
 
     if (bind(h->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(h->listen_fd);
-        go_wait_group_destroy(&h->handler_wg);
-        pthread_mutex_destroy(&h->sse_mu);
-        pthread_mutex_destroy(&h->auth_mu);
-        auth_free(h);
-        free(h->sse_clients);
-        free(h);
+        http_free(h);
         return NULL;
     }
 
@@ -1141,18 +1207,23 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     if ((config->ephemeral_port &&
          getsockname(h->listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) ||
         listen(h->listen_fd, 8) < 0) {
-        close(h->listen_fd);
-        go_wait_group_destroy(&h->handler_wg);
-        pthread_mutex_destroy(&h->sse_mu);
-        pthread_mutex_destroy(&h->auth_mu);
-        auth_free(h);
-        free(h->sse_clients);
-        free(h);
+        http_free(h);
         return NULL;
     }
 
     if (config->ephemeral_port)
         h->port = ntohs(addr.sin6_port);
+
+    /* Last: on_change may run on the source's thread from here on. */
+    if (h->grant && config->nip98_grant_watch) {
+        h->grant_watch = config->nip98_grant_watch;
+        if (h->grant_watch(h->grant_ud, sse_grants_changed, h) != 0) {
+            MD_LOG_E("could not watch the live NIP-98 grant source");
+            http_free(h);
+            return NULL;
+        }
+        md_mcp_server_set_tools_list_changed(h->mcp_server, true);
+    }
     return h;
 }
 
@@ -1221,19 +1292,17 @@ void md_mcp_http_destroy(MdMcpHttp *http)
 {
     if (!http) return;
 
+    /* First: returns only once no on_change is running or can start, so
+     * nothing below races the grant notifier. */
+    if (http->grant_watch) {
+        http->grant_watch(http->grant_ud, NULL, NULL);
+        md_mcp_server_set_tools_list_changed(http->mcp_server, false);
+    }
+
     /* Wait for in-flight handler goroutines to finish */
     go_wait_group_wait(&http->handler_wg);
-    go_wait_group_destroy(&http->handler_wg);
 
     /* Close SSE clients */
     close_sse_clients(http);
-
-    if (http->listen_fd >= 0)
-        close(http->listen_fd);
-
-    pthread_mutex_destroy(&http->sse_mu);
-    pthread_mutex_destroy(&http->auth_mu);
-    auth_free(http);
-    free(http->sse_clients);
-    free(http);
+    http_free(http);
 }

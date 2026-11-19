@@ -164,6 +164,7 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
             .allow_file = config->http_allow_file,
             .nip98_grant = config->http_nip98_grant,
             .nip98_grant_userdata = config->http_nip98_grant_userdata,
+            .nip98_grant_watch = config->http_nip98_grant_watch,
         };
         b->http_ctx = md_mcp_http_create(&http_cfg);
         if (!b->http_ctx)

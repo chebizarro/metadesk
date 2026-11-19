@@ -67,6 +67,9 @@ typedef struct {
     /* Live NIP-98 grant source; see MdMcpHttpConfig.nip98_grant. */
     uint32_t    (*http_nip98_grant)(const char *pubkey_hex, void *userdata);
     void         *http_nip98_grant_userdata;
+    /* Its change feed; see MdMcpHttpConfig.nip98_grant_watch. */
+    int         (*http_nip98_grant_watch)(void *userdata, void (*on_change)(void *),
+                                          void *on_change_ud);
 } MdMcpBridgeConfig;
 
 /* Create the full MCP bridge: MdSession + MdAgent + MdMcpServer +

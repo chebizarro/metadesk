@@ -654,6 +654,7 @@ static int host_run_mcp(bool stdio_mode, bool http_mode, uint16_t port,
         if (!acl) goto cleanup;
         cfg.http_nip98_grant = host_mcp_acl_grant;
         cfg.http_nip98_grant_userdata = acl;
+        cfg.http_nip98_grant_watch = host_mcp_acl_watch;
     }
     bridge = md_mcp_bridge_create(&cfg);
     if (!bridge) {
