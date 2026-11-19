@@ -271,11 +271,84 @@ pointer-only update. What was observed on the VM (Basic Display adapter):
 - Monochrome and masked-color shapes are software cursors. DWM draws them into
   the desktop image itself and DXGI reports no pointer, so the backend draws
   nothing. Such cursors are captured even with `show_cursor` off.
+- DWM reduces a masked-color software cursor to monochrome. The masked
+  quadrants stay exact (transparent, XOR), and opaque colours become black
+  or white: the test's green quadrant is drawn black and its blue one white.
 - The desktop is never quiet for long. There is a full redraw after each
   display wake, the taskbar updates, and the scheduled task's console caret
-  blinks about every 530 ms. The `show_cursor`-off cell therefore waits
-  150 ms after each shape change. It counts an attempt only when the call
-  returns IDLE and the backend consumed the pointer update in the meantime.
+  blinks about every 530 ms.
+
+#### Pointer cells against the display cycle (md-v9wt)
+
+Pristine master failed these cells about 6 runs in 30 on the console. Tracing
+every `AcquireNextFrame` result against the display watch showed what
+happens. This is VM rendering plus a weak test check, not a backend bug:
+
+1. A shape change reaches DXGI as a pointer-only update about 1 ms after
+   `SetCursor`, before DWM repaints. When the previous shape was a software
+   cursor, the desktop image still contains it until DWM's next present
+   erases it. That present arrives 2-47 ms later (52 of 56 traced switches).
+   So the color pointer is first composited over the old monochrome cursor,
+   which shows white in its transparent quadrant.
+2. `drain_to_idle` returns once the wake redraw has settled. That puts each
+   change about 100 ms before the console's next power-off. If the power-off
+   comes first (4 of 56), DWM presents nothing until the wake redraw, and
+   DXGI reports the pointer hidden at 0,0 in the meantime.
+3. The old cell classified a frame as a software cursor whenever DXGI
+   reported no pointer and any sample differed from the window colour. The
+   stale monochrome cursor satisfied that, so the color shape was taken for
+   a software cursor and `CHECK(hardware)` failed. The `show_cursor`-off
+   cell used a single 150 ms wait, which the wake redraw spoiled for every
+   color change.
+
+The cells now need positive evidence:
+
+- **Composited:** DXGI reports this shape and the pixels match exactly.
+- **Software:** DXGI reports no pointer, the backend drew nothing, and the
+  pixels match DWM's rendering of this shape (exact, or the monochrome
+  reduction above).
+
+Frames that match neither, such as the stale image or the hidden-at-0,0
+interval, are skipped until DWM's repaint arrives. The 3 s limit only bounds
+a failure.
+
+Pointer-only delivery is also proved exactly. A frame was delivered for a
+pointer update alone when its timestamp is that update's
+`LastMouseUpdateTime`, because the backend stamps frames with
+`LastPresentTime` when the desktop image changed. This replaces "the first
+answer after a quiet desktop was a frame".
+
+The two stateful cells use display-change barriers:
+
+- **Show and hide:** the color pointer is shown from hidden, then hidden
+  again. The frame delivered for each update alone must already show the
+  exact pointer, then the restored pixels. A hide across a power change, or
+  an update that shared its frame with a present, is repeated, at most 5
+  times. A shape change can share its update with DWM's erase of the
+  previous software cursor when the test is descheduled for about 15-30 ms.
+  That happened to 1 of 80 color changes in qualification, so the
+  pointer-only proof comes from this cell, where no repaint is involved.
+- **`show_cursor` off:** an attempt counts when `get_frame` consumed the
+  update (`skipped`) and answered IDLE while the display held one state.
+  Each attempt is reported as one of: delivered a frame, power change, or
+  no update. There are at most 40 attempts.
+
+If a driver showed every shape, color included, as a positively identified
+software cursor, the compositing cells SKIP with that reason instead of
+failing.
+
+Mutations in the backend, enabled only once the pointer cells start, all
+fail on the console:
+
+- no blend
+- pointer updates never damage
+- pointer-only frames with `show_cursor` off
+- a hide is not damage
+- the pointer is never visible
+- the pointer misplaced by its hotspot
+- no save-under restore
+- a shape-only change missed
+- a desktop copy dropped
 
 ### Rotation (md-dbg)
 

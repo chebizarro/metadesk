@@ -28,6 +28,14 @@
  * its thread), so each change is a pointer-only update. The windows never
  * take focus, send input or touch other windows.
  *
+ * md-v9wt: such an update arrives before DWM repaints, so a frame can show
+ * the previous software cursor still in the desktop image, or (when the
+ * console powers the display off first) a pointer DXGI reports hidden at
+ * 0,0. The pointer cells accept only positive evidence (the composited
+ * shape exactly, or DWM's own rendering of this shape), prove pointer-only
+ * delivery by the frame timestamp, and repeat stateful cells that span a
+ * display power change.
+ *
  * md-4dsa: while the VM console display changes power state, Desktop
  * Duplication stalls: AcquireNextFrame overruns its timeout by hundreds of
  * milliseconds and the staging Map can stall too. The test windows keep
@@ -1111,6 +1119,13 @@ struct TestCursor {
     HCURSOR cursor;
     Bgr expect[QUAD];        /* TL, TR, BL, BR quadrant centres */
     int tol;
+    /* DWM's own rendering when the driver shows the shape as a software
+     * cursor, if it differs from `expect`: DWM reduces a masked-color shape
+     * to monochrome (md-v9wt, Basic Display adapter): the masked quadrants
+     * stay exact (transparent, XOR) and opaque colours become black or
+     * white. Unset quadrants mean `expect`. */
+    Bgr soft[QUAD];
+    bool has_soft;
 };
 
 static const int CUR = 32;
@@ -1203,19 +1218,23 @@ static void samples_dump(const char *label, const MdFrame &f, const Samples &s,
     }
 }
 
+static bool pointer_only_frame(const DxgiState *st, const MdFrame &f, LONGLONG since);
+
 /* Get frames for up to 3 s until the cursor quadrants show `expect`. Returns
- * the still-borrowed frame, and whether the first answer was a frame. */
+ * the still-borrowed frame, and in `pointer_frames` how many frames were
+ * delivered for a pointer update newer than QPC tick `since` alone. */
 static bool wait_pixels(const MdCaptureBackend *be, MdCaptureCtx *ctx, LONG left, LONG top,
-                        const RECT &win, const Bgr expect[QUAD], int tol, MdFrame *f,
-                        bool *first_was_frame) {
+                        const RECT &win, const Bgr expect[QUAD], int tol, LONGLONG since,
+                        MdFrame *f, int *pointer_frames) {
+    const auto *st = static_cast<const DxgiState *>(ctx->backend_data);
     const double end = now_ms() + 3000;
-    *first_was_frame = false;
+    *pointer_frames = 0;
     int misses = 0;
-    for (bool first = true; now_ms() < end; first = false) {
+    while (now_ms() < end) {
         const int rc = be->get_frame(ctx, f, 1000);
         CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
         if (rc != 0) continue;
-        if (first) *first_was_frame = true;
+        if (pointer_only_frame(st, *f, since)) ++*pointer_frames;
         const Samples s = samples(left, top, win, *f);
         if (samples_match(*f, s, expect, tol)) return true;
         if (misses++ < 3) { /* transient misses are normal; these explain a failure */
@@ -1231,32 +1250,59 @@ static bool wait_pixels(const MdCaptureBackend *be, MdCaptureCtx *ctx, LONG left
 
 enum class Seen { none, composited, software };
 
+static LONGLONG qpc_now() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+/* Whether frame f was delivered for a pointer update alone, one newer than
+ * QPC tick `since`. The backend stamps a frame with the update's
+ * LastPresentTime when the desktop image changed and with its
+ * LastMouseUpdateTime when only the pointer did, and a single output's
+ * frame carries one AcquireNextFrame update. This is exact evidence, unlike
+ * "the first answer after a quiet desktop was a frame": DWM repaints when it
+ * likes (md-v9wt). */
+static bool pointer_only_frame(const DxgiState *st, const MdFrame &f, LONGLONG since) {
+    return st->count == 1 && st->pointer.updated > since &&
+           f.timestamp_ns == qpc_to_ns(st, st->pointer.updated);
+}
+
 /* Get frames for up to 3 s until cursor c shows up, either composited by the
  * backend from DXGI's shape (which must then match exactly) or, when the
  * driver cannot show it as a hardware pointer, drawn into the desktop image
- * by DWM with DXGI reporting no pointer (the backend must draw nothing). */
+ * by DWM with DXGI reporting no pointer (the backend must draw nothing).
+ * Both need positive evidence in the pixels (md-v9wt). A shape change is a
+ * pointer-only update that arrives before DWM repaints: after a software
+ * cursor the image still holds it until DWM's next present erases it (2-47
+ * ms later on the VM), and when the display powers off first, DXGI reports
+ * the pointer hidden at 0,0 while DWM presents nothing until the wake
+ * redraw. Such frames match neither rendering and are skipped; the 3 s is
+ * only a failure bound. `pointer_frames` counts frames delivered for a
+ * pointer update newer than `since` alone (pointer_only_frame) while this
+ * shape was drawn. */
 static Seen wait_cursor(const MdCaptureBackend *be, MdCaptureCtx *ctx, const TestCursor &c,
-                        LONG left, LONG top, const RECT &win, Bgr bg, MdFrame *f,
-                        bool *first_was_frame, bool *exact) {
-    const PointerState &p = static_cast<DxgiState *>(ctx->backend_data)->pointer;
+                        LONG left, LONG top, const RECT &win, LONGLONG since, MdFrame *f,
+                        int *pointer_frames, bool *exact) {
+    const auto *st = static_cast<const DxgiState *>(ctx->backend_data);
+    const PointerState &p = st->pointer;
     const double end = now_ms() + 3000;
-    *first_was_frame = false;
+    *pointer_frames = 0;
     int misses = 0;
-    for (bool first = true; now_ms() < end; first = false) {
+    while (now_ms() < end) {
         const int rc = be->get_frame(ctx, f, 1000);
         CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
         if (rc != 0) continue;
-        if (first) *first_was_frame = true;
         const Samples s = samples(left, top, win, *f);
         *exact = samples_match(*f, s, c.expect, c.tol);
-        if (p.visible && p.has_shape && p.shape_info.Type == c.type &&
-            p.shape_info.HotSpot.x == c.hotspot.x && p.shape_info.HotSpot.y == c.hotspot.y &&
-            *exact)
-            return Seen::composited;
-        if (!p.visible && p.under_rect.w == 0) {
-            for (int q = 0; q < QUAD; q++)
-                if (s.in[q] && !px_is(frame_px(*f, s.x[q], s.y[q]), bg)) return Seen::software;
-        }
+        const bool shape = p.visible && p.has_shape && p.shape_info.Type == c.type &&
+                           p.shape_info.HotSpot.x == c.hotspot.x &&
+                           p.shape_info.HotSpot.y == c.hotspot.y;
+        if (shape && pointer_only_frame(st, *f, since)) ++*pointer_frames;
+        if (shape && *exact) return Seen::composited;
+        if (!p.visible && p.under_rect.w == 0 &&
+            (*exact || (c.has_soft && samples_match(*f, s, c.soft, c.tol))))
+            return Seen::software;
         if (misses++ < 3) { /* transient misses are normal; these explain a failure */
             fprintf(stderr, "  %s: no match in frame %u (DXGI pointer visible %d at %ld,%ld)\n",
                     c.label, f->seq, p.visible, p.x, p.y);
@@ -1300,11 +1346,12 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     const bool masked_mask[QUAD] = { false, true, true, false };
     TestCursor cursors[] = {
         { "monochrome", DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, { 5, 7 }, nullptr,
-          { { 0, 0, 0 }, { 255, 255, 255 }, bg, inverted(bg) }, 0 },
+          { { 0, 0, 0 }, { 255, 255, 255 }, bg, inverted(bg) }, 0, {}, false },
         { "color", DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, { 3, 4 }, nullptr,
-          { { 0, 0, 255 }, bg, blended({ 0, 0, 255 }, 0x80, bg), { 255, 0, 0 } }, 2 },
+          { { 0, 0, 255 }, bg, blended({ 0, 0, 255 }, 0x80, bg), { 255, 0, 0 } }, 2, {}, false },
         { "masked color", DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, { 9, 2 }, nullptr,
-          { { 0, 255, 0 }, bg, inverted(bg), { 255, 0, 0 } }, 0 },
+          { { 0, 255, 0 }, bg, inverted(bg), { 255, 0, 0 } }, 0,
+          { { 0, 0, 0 }, bg, inverted(bg), { 255, 255, 255 } }, true },
     };
     cursors[0].cursor = make_mono_cursor(cursors[0].hotspot);
     cursors[1].cursor = make_color_cursor(cursors[1].hotspot, color_quads, no_mask);
@@ -1319,11 +1366,13 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     int pointer_only = 0;
     const TestCursor *hardware = nullptr; /* a shape DXGI reports as a pointer */
     for (const TestCursor &c : cursors) {
-        const bool idle = drain_to_idle(be, ctx, 300, 3000);
+        drain_to_idle(be, ctx, 300, 3000); /* the previous change's repaints */
+        const LONGLONG since = qpc_now();
         SendMessageW(tw.window, WM_SET_TEST_CURSOR, (WPARAM)c.cursor, 0);
         const LONG sx = at.x - c.hotspot.x, sy = at.y - c.hotspot.y;
-        bool first = false, exact = false;
-        const Seen seen = wait_cursor(be, ctx, c, sx, sy, win, bg, &f, &first, &exact);
+        int pointer_frames = 0;
+        bool exact = false;
+        const Seen seen = wait_cursor(be, ctx, c, sx, sy, win, since, &f, &pointer_frames, &exact);
         if (seen == Seen::none) {
             const PointerState &p = st->pointer;
             fprintf(stderr, "FAIL %s pointer never appeared in a frame (DXGI pointer: visible "
@@ -1341,7 +1390,7 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
              * pointer, and the pixels matched at pointer - hotspot. */
             CHECK(p.shape_info.Width == (UINT)CUR && pointer_shape_height(p.shape_info) == (UINT)CUR);
             if (!moved) CHECK(p.x == sx && p.y == sy);
-            if (idle && first) pointer_only++;
+            pointer_only += pointer_frames;
             hardware = hardware ? hardware : &c;
         }
         char raw[64] = "";
@@ -1351,19 +1400,20 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
             snprintf(raw, sizeof(raw), "; 50%% red shape pixel BGRA %u,%u,%u,%u",
                      s[0], s[1], s[2], s[3]);
         }
+        char only[64] = "";
+        if (pointer_frames)
+            snprintf(only, sizeof(only), "; %d pointer-only update(s) delivered", pointer_frames);
         printf("PASS %s pointer in the frame at %ld,%ld (hotspot %ld,%ld): %s%s%s\n", c.label,
                sx, sy, c.hotspot.x, c.hotspot.y,
                seen == Seen::composited ? "composited from the DXGI shape"
                : exact ? "software cursor: DWM drew it into the desktop image and DXGI "
                          "reports no pointer, so the backend drew nothing"
-                       : "software cursor: DWM drew it into the desktop image (its own "
-                         "rendering) and DXGI reports no pointer, so the backend drew nothing",
-               p.visible && idle && first ? "; pointer-only update delivered" : "", raw);
+                       : "software cursor: DWM drew it into the desktop image reduced to "
+                         "monochrome and DXGI reports no pointer, so the backend drew nothing",
+               only, raw);
         be->release_frame(ctx, &f);
     }
     if (moved) puts("note: the user moved the pointer; positions were not compared");
-    CHECK(hardware); /* color shapes are hardware pointers on every driver seen */
-    CHECK(pointer_only > 0);
 
     /* Hide: the pixels under the last pointer go back to the window colour. */
     {
@@ -1371,56 +1421,122 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
         const LONG sx = at.x - c.hotspot.x, sy = at.y - c.hotspot.y;
         const Bgr plain[QUAD] = { bg, bg, bg, bg };
         drain_to_idle(be, ctx, 300, 3000);
+        const LONGLONG since = qpc_now();
         SendMessageW(tw.window, WM_SET_TEST_CURSOR, 0, 0);
-        bool first = false;
-        CHECK(wait_pixels(be, ctx, sx, sy, win, plain, 0, &f, &first));
+        int pointer_frames = 0;
+        CHECK(wait_pixels(be, ctx, sx, sy, win, plain, 0, since, &f, &pointer_frames));
         CHECK(!st->pointer.visible);
         be->release_frame(ctx, &f);
         puts("PASS hidden pointer: frame delivered, pixels under it restored");
     }
-    /* Hide a composited pointer: removed by a pointer-only update. */
+
+    if (!hardware) {
+        /* Every shape, color included, was seen positively drawn by DWM
+         * while DXGI reported no pointer (a pointer DXGI reports must
+         * composite, or wait_cursor fails): this driver has no hardware
+         * pointer, so the backend has nothing to composite. */
+        puts("SKIP pointer compositing cells: the display driver shows every test shape, "
+             "color included, as a software cursor (DWM draws it into the desktop image "
+             "and DXGI reports no pointer), so there is no DXGI pointer to composite");
+        window_stop(&tw);
+        for (const TestCursor &c : cursors) DestroyCursor(c.cursor);
+        return;
+    }
+    /* Show, then hide, a composited pointer, each by a pointer-only update:
+     * the frame delivered for that update alone already shows the pointer
+     * exactly, then the pixels under it restored (a later desktop copy
+     * would restore them anyway, proving nothing). Shown from hidden, no
+     * DWM repaint is involved; the shape changes above can share their
+     * update with DWM's erase of the previous software cursor when the
+     * test is descheduled for its ~15-30 ms (1 of 80 color changes in
+     * qualification). A display power change hides the pointer by itself
+     * (DXGI reports it hidden at 0,0 until the wake), so only a hide while
+     * the display held one state counts, and an update shared with a
+     * desktop present is not pointer-only. Either repeats the cell. */
     {
         const TestCursor &c = *hardware;
         const LONG sx = at.x - c.hotspot.x, sy = at.y - c.hotspot.y;
         const Bgr plain[QUAD] = { bg, bg, bg, bg };
-        bool first = false;
-        SendMessageW(tw.window, WM_SET_TEST_CURSOR, (WPARAM)c.cursor, 0);
-        CHECK(wait_pixels(be, ctx, sx, sy, win, c.expect, c.tol, &f, &first));
-        be->release_frame(ctx, &f);
-        const bool idle = drain_to_idle(be, ctx, 300, 3000);
-        SendMessageW(tw.window, WM_SET_TEST_CURSOR, 0, 0);
-        CHECK(wait_pixels(be, ctx, sx, sy, win, plain, 0, &f, &first));
-        CHECK(!st->pointer.visible);
-        be->release_frame(ctx, &f);
-        printf("PASS hidden %s pointer removed from the composited frame%s\n", c.label,
-               idle && first ? " by a pointer-only update" : "");
+        int attempt = 0, removals = 0;
+        for (; attempt < 5 && (!removals || !pointer_only); attempt++) {
+            LONGLONG since = qpc_now();
+            SendMessageW(tw.window, WM_SET_TEST_CURSOR, (WPARAM)c.cursor, 0);
+            int pointer_frames = 0;
+            CHECK(wait_pixels(be, ctx, sx, sy, win, c.expect, c.tol, since, &f, &pointer_frames));
+            if (pointer_only_frame(st, f, since)) pointer_only++;
+            else if (!pointer_only)
+                puts("  the shown pointer shared its update with a desktop present; repeated");
+            be->release_frame(ctx, &f);
+            drain_to_idle(be, ctx, 300, 3000);
+            const LONG changes = display_changes_settled();
+            const bool on = WaitForSingleObject(display_is_on, 0) == WAIT_OBJECT_0;
+            since = qpc_now();
+            SendMessageW(tw.window, WM_SET_TEST_CURSOR, 0, 0);
+            CHECK(wait_pixels(be, ctx, sx, sy, win, plain, 0, since, &f, &pointer_frames));
+            CHECK(!st->pointer.visible);
+            const bool by_pointer = pointer_only_frame(st, f, since);
+            be->release_frame(ctx, &f);
+            if (!on || display_changes_settled() != changes)
+                puts("  hide across a display power change; repeated");
+            else if (by_pointer)
+                removals++;
+            else if (pointer_frames)
+                puts("  the hide's pointer-only frame still showed the pointer; repeated");
+            else
+                puts("  removal shared its update with a desktop present; repeated");
+        }
+        CHECK(pointer_only > 0); /* a shape change alone is a frame */
+        CHECK(removals > 0);
+        printf("PASS hidden %s pointer removed from the composited frame by a pointer-only "
+               "update (attempt %d)\n", c.label, attempt);
     }
     printf("PASS pointer-only shape changes delivered as frames: %d\n", pointer_only);
 
     /* show_cursor off: the same pointer-only updates are consumed as no
-     * damage. The pointer update arrives within milliseconds of the change,
-     * but the VM desktop is never quiet for long (a full redraw after each
-     * display wake, the taskbar, the task's console caret blinking every
-     * ~530 ms), so wait briefly and count an attempt only when the call
-     * returned IDLE and the backend consumed an update meanwhile. */
+     * damage. An attempt is evidence when get_frame consumed the update
+     * (skipped counts it) and answered IDLE, with the display holding one
+     * state (a power change sends its own pointer updates and a full
+     * redraw). The update arrives within milliseconds of the change; the
+     * call then waits out its 50 ms, and other desktop damage meanwhile (the
+     * taskbar, a console caret blinking every ~530 ms) is a frame that
+     * spoils the attempt. A backend that delivered pointer-only updates as
+     * frames spoils every attempt and fails. Power changes are frequent
+     * here, not rare: drain_to_idle ends after the wake redraw settles, so
+     * each change lands ~100 ms before the console's next power-off (with
+     * the old single 150 ms wait, the wake redraw then spoiled every color
+     * attempt, md-v9wt). */
     MdCaptureConfig saved = ctx->config;
     be->destroy(ctx);
     *ctx = make_ctx(be, false, saved.output);
     CHECK(be->init(ctx) == 0 && be->start(ctx) == 0);
     st = static_cast<DxgiState *>(ctx->backend_data);
-    int idle_cells = 0;
-    for (int attempt = 0; attempt < 12 && idle_cells < 2; attempt++) {
-        if (!drain_to_idle(be, ctx, 300, 3000)) continue;
+    int idle_cells = 0, framed = 0, unsteady = 0, unconsumed = 0, attempt = 0;
+    for (; attempt < 40 && idle_cells < 2; attempt++) {
+        drain_to_idle(be, ctx, 300, 3000);
+        const LONG changes = display_changes_settled();
+        const bool on = WaitForSingleObject(display_is_on, 0) == WAIT_OBJECT_0;
+        const uint32_t skipped = st->skipped;
         SendMessageW(tw.window, WM_SET_TEST_CURSOR,
                      (WPARAM)(attempt % 2 ? arrow : hardware->cursor), 0);
-        const uint32_t skipped = st->skipped;
-        const int rc = be->get_frame(ctx, &f, 150);
-        CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
-        if (rc == 0) be->release_frame(ctx, &f); /* unrelated desktop damage */
-        else if (st->skipped > skipped) idle_cells++;
+        const double end = now_ms() + 3000;
+        int rc;
+        do {
+            rc = be->get_frame(ctx, &f, 50);
+            CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
+        } while (rc == MD_CAPTURE_IDLE && st->skipped == skipped && now_ms() < end);
+        if (rc == 0) be->release_frame(ctx, &f);
+        if (!on || display_changes_settled() != changes) unsteady++;
+        else if (rc == 0) framed++;
+        else if (st->skipped == skipped) unconsumed++;
+        else idle_cells++;
     }
+    if (idle_cells < 2)
+        fprintf(stderr, "FAIL show_cursor off: %d of %d attempts consumed a pointer-only update "
+                "as IDLE (%d delivered a frame, %d across a display power change, %d saw no "
+                "update in 3 s)\n", idle_cells, attempt, framed, unsteady, unconsumed);
     CHECK(idle_cells == 2);
-    puts("PASS show_cursor off: pointer-only updates stay IDLE");
+    printf("PASS show_cursor off: pointer-only updates stay IDLE (%d attempts: %d spoiled by "
+           "desktop damage, %d by a display power change)\n", attempt, framed, unsteady);
 
     window_stop(&tw);
     for (const TestCursor &c : cursors) DestroyCursor(c.cursor);
