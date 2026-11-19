@@ -726,6 +726,32 @@ static int test_map_to_output(void) {
     md_input_map_to_output(&cfg, 959, 539, &gx, &gy);
     MD_CHECK(gx < 1512 + 1920 && gy < 100 + 1080);
 
+    /* macOS Retina (md-txsc): SCK frames are backing pixels, the output rect
+     * is CG points. A 3024x1964 frame of the 1512x982-point main display maps
+     * every pixel to half a point, so the frame's centre and far corner land
+     * on the display's, not twice as far out. */
+    cfg = (MdInputConfig){ .screen_width = 3024, .screen_height = 1964,
+        .output_x = 0, .output_y = 0, .output_width = 1512, .output_height = 982 };
+    md_input_map_to_output(&cfg, 1512, 982, &gx, &gy);
+    MD_CHECK(gx == 756 && gy == 491);
+    md_input_map_to_output(&cfg, 3023, 1963, &gx, &gy);
+    MD_CHECK(gx == 1511.5 && gy == 981.5);
+    md_input_map_to_output(&cfg, 1, 1, &gx, &gy);
+    MD_CHECK(gx == 0.5 && gy == 0.5); /* sub-point precision survives */
+    md_input_map_to_output(&cfg, 5000, 5000, &gx, &gy);
+    MD_CHECK(gx < 1512 && gy < 982);  /* clamped inside the display */
+
+    /* A 2x external display to the left of and above main: 5120x2880 pixels,
+     * 2560x1440 points at (-2560,-300). */
+    cfg = (MdInputConfig){ .screen_width = 5120, .screen_height = 2880,
+        .output_x = -2560, .output_y = -300, .output_width = 2560, .output_height = 1440 };
+    md_input_map_to_output(&cfg, 0, 0, &gx, &gy);
+    MD_CHECK(gx == -2560 && gy == -300);
+    md_input_map_to_output(&cfg, 2560, 1440, &gx, &gy);
+    MD_CHECK(gx == -1280 && gy == 420);
+    md_input_map_to_output(&cfg, 5119, 2879, &gx, &gy);
+    MD_CHECK(gx == -0.5 && gy == 1139.5);
+
     /* NULL arguments are ignored. */
     md_input_map_to_output(NULL, 1, 1, &gx, &gy);
     md_input_map_to_output(&cfg, 1, 1, NULL, &gy);

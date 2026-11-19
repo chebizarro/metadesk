@@ -11,7 +11,9 @@
  *
  * Pointer coordinates arrive relative to the captured frame and are mapped
  * into the selected display's CG global bounds (MdInputConfig.output_*,
- * from md_capture_get_output_rect) by md_input_map_to_output.
+ * from md_capture_get_output_rect) by md_input_map_to_output. Frames are
+ * backing pixels and the bounds are points, so on Retina that mapping also
+ * divides by the backing scale (screen_* = frame size, output_* = points).
  *
  * Requires Input Monitoring permission (System Settings >
  * Privacy & Security > Input Monitoring) for synthetic events.
