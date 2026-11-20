@@ -403,6 +403,68 @@ output through the rotation and pointer cells, which exercises the composed
 path on real frames. Real multi-monitor and multi-adapter hardware is not
 covered.
 
+### Size cap (md-jie5)
+
+`--capture-max-size WxH` (`MdCaptureConfig.max_width/max_height`) fits the
+frame within WxH, keeping its aspect and never scaling up
+(`md_capture_fit_size`). For "all" the cap applies to the bounding frame.
+Each output's desktop image is scaled on its own D3D11 device before the
+staging copy, so only the scaled image is read back. The scaling pass:
+
+- is an area-averaging pixel shader. Each frame pixel is the
+  coverage-weighted mean of the image pixels under it, so text and fine
+  patterns do not alias at any ratio. Bilinear sampling skips pixels above
+  2:1, and mips blur between powers of two.
+- costs about (1 + 1/ratio)^2 image reads per image pixel, in one pass.
+- runs in the image's native orientation. Rotation and "all" composition
+  then run on the CPU over the smaller copies.
+- is compiled at init by `d3dcompiler_47.dll` (System32) and needs feature
+  level 10_0.
+
+An unrotated single output stays zero-copy: the frame is the mapped,
+scaled staging texture. A cap the frame already fits creates no scaler.
+
+The pointer state stays in unscaled frame coordinates. The pointer is
+composited at its scaled position, with its shape scaled like the desktop:
+
+- Color shapes are area averaged.
+- Monochrome and masked-color shapes are point sampled, because their
+  AND/XOR operations cannot be averaged.
+
+The output rectangle stays physical, so input mapping is unchanged.
+
+Synthetic cells (session 0 too):
+
+- rounding, including negative pointer coordinates
+- abutting and thin regions
+- the area filter's weights
+- capped layouts, including rotated layouts and the three-output "all"
+  layout
+- 300 random multi-output layouts: regions stay inside the frame and abut
+  where their outputs do
+- scaled pointer shapes per type
+- scaled compositing with an exact save-under
+
+`gpu_scale_tests` runs the shader on a real device (the Basic Render Driver
+also exists in session 0). It checks the result against the CPU filter
+within 1/255 for eight size pairs, sampling both the image directly and the
+copy an unbindable image needs. It also prints the cost per frame. On the
+VM's software-rasterized adapter that is about 3 ms for 1024x768 to 640x480
+and 9 ms for 3840x2160 to 1920x1080, against 0.3 and 2.4 ms for an uncapped
+copy. A hardware GPU scales in well under a millisecond.
+
+The console cells:
+
+1. A cap the frame fits (native width, 16384x16384) changes nothing.
+2. 640x0, 0x300 and 700x700 each deliver `md_capture_fit_size` frames. Each
+   is zero-copy, keeps the physical output rectangle, and shows a static
+   window where the scale puts it.
+3. Under 640x0, the forced rotations and the pointer cells run on the
+   capped frame. The composited color pointer must be drawn at its scaled
+   position and size, for example 20x20 at (5,200) of 640x480.
+4. "all" under 0x300 runs the rotation and pointer cells on the capped
+   canvas.
+
 ## Real lock/disconnect qualification
 
 The normal liveness test injects provider errors at the root-call boundary and

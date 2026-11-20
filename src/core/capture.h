@@ -90,8 +90,8 @@ typedef struct {
      * The native frame is scaled down to md_capture_fit_size() of it: aspect
      * kept, never scaled up. The output rect is unchanged, so input mapping
      * (md_input_map_to_output) follows the smaller frame with no change.
-     * Only macOS (ScreenCaptureKit, scaled in hardware) supports it; DXGI
-     * and PipeWire fail init when it is set. */
+     * macOS (ScreenCaptureKit) scales in hardware, Windows (DXGI) on the
+     * GPU before the staging copy; PipeWire fails init when it is set. */
     uint32_t max_width, max_height;
 } MdCaptureConfig;
 
