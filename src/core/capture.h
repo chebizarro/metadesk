@@ -91,7 +91,8 @@ typedef struct {
      * kept, never scaled up. The output rect is unchanged, so input mapping
      * (md_input_map_to_output) follows the smaller frame with no change.
      * macOS (ScreenCaptureKit) scales in hardware, Windows (DXGI) on the
-     * GPU before the staging copy; PipeWire fails init when it is set. */
+     * GPU before the staging copy, Linux (PipeWire) on the CPU in get_frame
+     * (md_capture_scale_frame: xdpw/mutter offer one fixed stream size). */
     uint32_t max_width, max_height;
 } MdCaptureConfig;
 
@@ -221,6 +222,18 @@ int md_capture_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
  * Pure; returns -1 for a zero source size or NULL outputs. */
 int md_capture_fit_size(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
                         uint32_t *out_w, uint32_t *out_h);
+
+/* Downscale a 4-byte/pixel frame (any MD_PIX_CAPTURE_*X/A order: every byte
+ * is averaged independently) from sw x sh into dw x dh with a box filter:
+ * the source is partitioned into dw x dh boxes of whole pixels, each output
+ * pixel is the rounded mean of its box, so uniform areas keep their exact
+ * value. Strides are bytes per row; dst padding bytes are not written.
+ * Any downscale ratio works, down to 1x1.
+ * Returns -1 for NULL buffers, a zero size, an upscale (dw > sw or dh > sh),
+ * or a stride shorter than its row. Pure. */
+int md_capture_scale_frame(const uint8_t *src, uint32_t sw, uint32_t sh,
+                           size_t src_stride, uint8_t *dst, uint32_t dw,
+                           uint32_t dh, size_t dst_stride);
 
 /* Non-blocking md_capture_wait_size(ctx, 0, ...). */
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height);

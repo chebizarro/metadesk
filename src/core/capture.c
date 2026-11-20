@@ -314,6 +314,67 @@ int md_capture_fit_size(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
     return 0;
 }
 
+/* Box downscale. Column spans come from an incremental floor((x+1)*sw/dw), so
+ * a box is xlo or xlo+1 pixels wide (likewise rows), which needs only two
+ * reciprocals per output row. q = (s + n/2) * ceil(2^40/n) >> 40 equals
+ * (s + n/2) / n exactly while 256 * n^2 < 2^40, i.e. n < 65536, and the
+ * product stays below 2^49. Larger boxes (caps far below the source, e.g.
+ * 1x1) divide exactly instead; 64-bit sums cannot overflow either way. */
+#define MD_SCALE_SHIFT 40
+int md_capture_scale_frame(const uint8_t *src, uint32_t sw, uint32_t sh,
+                           size_t src_stride, uint8_t *dst, uint32_t dw,
+                           uint32_t dh, size_t dst_stride) {
+    if (!src || !dst || !sw || !sh || !dw || !dh || dw > sw || dh > sh ||
+        src_stride < (size_t)sw * 4 || dst_stride < (size_t)dw * 4)
+        return -1;
+    const uint32_t xlo = sw / dw, xrem = sw % dw;
+    const uint32_t xhi = xlo + (xrem != 0);
+    const uint32_t yhi = sh / dh + (sh % dh != 0);
+    const bool divide = (uint64_t)xhi * yhi >= 65536;
+
+    uint32_t y0 = 0;
+    for (uint32_t y = 0; y < dh; y++) {
+        const uint32_t y1 = (uint32_t)((uint64_t)(y + 1) * sh / dh);
+        const uint32_t yc = y1 - y0;
+        const uint64_t n_lo = (uint64_t)xlo * yc, n_hi = (uint64_t)xhi * yc;
+        const uint64_t m_lo = divide ? 0 : ((1ull << MD_SCALE_SHIFT) + n_lo - 1) / n_lo;
+        const uint64_t m_hi = divide ? 0 : ((1ull << MD_SCALE_SHIFT) + n_hi - 1) / n_hi;
+        const uint8_t *rows = src + (size_t)y0 * src_stride;
+        uint8_t *out = dst + (size_t)y * dst_stride;
+        uint32_t x0 = 0, x1 = 0, acc = 0;
+        for (uint32_t x = 0; x < dw; x++, out += 4) {
+            x1 += xlo;
+            acc += xrem;
+            if (acc >= dw) { acc -= dw; x1++; }
+            const uint32_t xc = x1 - x0;
+            uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            const uint8_t *row = rows + (size_t)x0 * 4;
+            for (uint32_t r = 0; r < yc; r++, row += src_stride) {
+                const uint8_t *p = row;
+                for (uint32_t i = 0; i < xc; i++, p += 4) {
+                    s0 += p[0]; s1 += p[1]; s2 += p[2]; s3 += p[3];
+                }
+            }
+            const uint64_t n = (uint64_t)xc * yc, half = n / 2;
+            if (divide) {
+                out[0] = (uint8_t)((s0 + half) / n);
+                out[1] = (uint8_t)((s1 + half) / n);
+                out[2] = (uint8_t)((s2 + half) / n);
+                out[3] = (uint8_t)((s3 + half) / n);
+            } else {
+                const uint64_t m = xc == xlo ? m_lo : m_hi;
+                out[0] = (uint8_t)(((s0 + half) * m) >> MD_SCALE_SHIFT);
+                out[1] = (uint8_t)(((s1 + half) * m) >> MD_SCALE_SHIFT);
+                out[2] = (uint8_t)(((s2 + half) * m) >> MD_SCALE_SHIFT);
+                out[3] = (uint8_t)(((s3 + half) * m) >> MD_SCALE_SHIFT);
+            }
+            x0 = x1;
+        }
+        y0 = y1;
+    }
+    return 0;
+}
+
 int md_capture_get_size(MdCaptureCtx *ctx, uint32_t *width, uint32_t *height) {
     return md_capture_wait_size(ctx, 0, width, height);
 }

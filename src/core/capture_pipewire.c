@@ -642,9 +642,17 @@ typedef struct {
     pthread_t               thread;
     bool                    thread_started;
 
-    /* Negotiated format */
+    /* Negotiated format. src_* is the stream's (native) size; ctx->width/
+     * height publish md_capture_fit_size() of it under config's cap. */
     uint32_t                stride;
     uint32_t                spa_format;
+    uint32_t                src_width, src_height;
+
+    /* Size cap (md-awgm): the consumer-thread target of the box scale.
+     * Touched only by get_frame/release's caller, which releases a frame
+     * before requesting the next, so one buffer suffices; freed in destroy. */
+    uint8_t                *scaled;
+    size_t                  scaled_size;
 
     /* Frame delivery (pw thread → consumer) */
     pthread_mutex_t         frame_lock;
@@ -723,14 +731,29 @@ static void on_param_changed(void *userdata, uint32_t id,
     if (spa_format_video_raw_parse(param, &info) < 0)
         return;
 
+    /* xdpw and mutter offer monitor streams at one fixed size, so a cap is
+     * met by scaling on the consumer side (pw_get_frame), not negotiation:
+     * offering only sizes within the cap fails xdpw 0.7.1's link with "no
+     * more input formats" (md-awgm, video-validation.md). */
+    uint32_t out_w = 0, out_h = 0;
+    if (md_capture_fit_size(info.size.width, info.size.height, ctx->config.max_width,
+                            ctx->config.max_height, &out_w, &out_h) != 0)
+        out_w = out_h = 0;
+    if (out_w != info.size.width || out_h != info.size.height)
+        MD_LOG_I("stream %ux%u, size cap %ux%u: delivering %ux%u (CPU box scale)",
+                 info.size.width, info.size.height, ctx->config.max_width,
+                 ctx->config.max_height, out_w, out_h);
+
     /* Published under the frame lock: md_capture_wait_size() waits on it. */
     pthread_mutex_lock(&pw->frame_lock);
-    ctx->width     = info.size.width;
-    ctx->height    = info.size.height;
+    pw->src_width  = info.size.width;
+    pw->src_height = info.size.height;
+    ctx->width     = out_w;
+    ctx->height    = out_h;
     pw->spa_format = info.format;
     /* Every negotiated format is 4 bytes/pixel. on_process prefers the
      * producer's chunk->stride; this is only the fallback when it is 0. */
-    pw->stride = ctx->width * 4;
+    pw->stride = pw->src_width * 4;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
 
@@ -785,11 +808,14 @@ static void on_process(void *userdata) {
     /* MAP_BUFFERS does not guarantee every producer buffer is readable.
      * Reject invalid mappings/chunks while PW still owns the dequeued buffer;
      * never advertise a CPU frame whose backing pointer is NULL. */
+    /* The source buffer is the stream's size; any cap is applied when the
+     * consumer acquires the frame. */
+    const uint32_t width = pw->src_width, height = pw->src_height;
     uint32_t stride = d->chunk->stride > 0 ? (uint32_t)d->chunk->stride : pw->stride;
-    uint64_t needed = ctx->height ? (uint64_t)(ctx->height - 1) * stride + (uint64_t)ctx->width * 4 : 0;
+    uint64_t needed = height ? (uint64_t)(height - 1) * stride + (uint64_t)width * 4 : 0;
     MdCapturePixFmt format;
     if (!spa_to_capture_fmt(pw->spa_format, &format) ||
-        !ctx->width || !ctx->height || stride < (uint64_t)ctx->width * 4 ||
+        !width || !height || !ctx->width || !ctx->height || stride < (uint64_t)width * 4 ||
         /* xdpw/PW 1.0.5 supplies flags=0 even for readable MAP_BUFFERS.
          * Reject an explicit write-only descriptor, not that legacy default. */
         d->chunk->stride < 0 || (d->flags && !(d->flags & SPA_DATA_FLAG_READABLE)) ||
@@ -815,8 +841,8 @@ static void on_process(void *userdata) {
 
     /* Build MdFrame */
     MdFrame frame = {
-        .width        = ctx->width,
-        .height       = ctx->height,
+        .width        = width,
+        .height       = height,
         .stride       = stride,
         .format       = format,
         .seq          = atomic_fetch_add_explicit(&pw->seq, 1, memory_order_relaxed),
@@ -933,13 +959,6 @@ static void *pw_thread_func(void *arg) {
 /* ── Backend vtable implementation ───────────────────────────── */
 
 static int pw_backend_init(MdCaptureCtx *ctx) {
-    /* The compositor picks the monitor stream's size; a cap would need a
-     * scaler before the encoder (md-n9p2 follow-up). */
-    if (ctx->config.max_width || ctx->config.max_height) {
-        MD_LOG_E("a capture size cap (max %ux%u) is not supported by PipeWire capture",
-                 ctx->config.max_width, ctx->config.max_height);
-        return -1;
-    }
     /* Initialize PipeWire (idempotent, safe to call multiple times) */
     pw_init(NULL, NULL);
     if (!dbus_threads_init_default()) return -1;
@@ -950,7 +969,9 @@ static int pw_backend_init(MdCaptureCtx *ctx) {
     pw->ctx = ctx;
     const char *trace = getenv("MD_CAPTURE_TRACE_BUFFERS");
     pw->trace_buffers = trace && strcmp(trace, "1") == 0;
-    pw->prefer_dmabuf = false; /* SHM default; backends may expose knob later */
+    /* SHM default; backends may expose knob later. A size cap needs CPU
+     * frames (pw_scale_frame), so such a knob must stay off under a cap. */
+    pw->prefer_dmabuf = false;
     pw->portal.pw_fd = -1;
     pw->broken = true;
     pthread_mutex_init(&pw->frame_lock, NULL);
@@ -991,6 +1012,7 @@ static void pw_cleanup_start_resources(PipewireState *pw) {
     pw->frame_ready = false;
     memset(&pw->pending_frame, 0, sizeof(pw->pending_frame));
     pw->ctx->width = pw->ctx->height = 0;
+    pw->src_width = pw->src_height = 0;
     pw->connected = false;
     pw->broken = true;
     pthread_mutex_unlock(&pw->frame_lock);
@@ -1107,6 +1129,47 @@ static int pw_start(MdCaptureCtx *ctx) {
     return 0;
 }
 
+static void pw_release_frame(MdCaptureCtx *ctx, MdFrame *frame);
+
+/* Size cap: box-scale an acquired frame into pw->scaled. The PipeWire buffer
+ * stays held (and stop keeps waiting for it) until release_frame, exactly as
+ * for an unscaled frame; this runs outside the lock because a held buffer is
+ * consumer-owned. Only consumed frames pay for the scale. Fails closed: a
+ * frame that cannot be scaled is released, never delivered at the wrong size. */
+static int pw_scale_frame(MdCaptureCtx *ctx, PipewireState *pw, MdFrame *frame) {
+    uint32_t w = 0, h = 0;
+    if (md_capture_fit_size(frame->width, frame->height, ctx->config.max_width,
+                            ctx->config.max_height, &w, &h) != 0)
+        goto fail;
+    if (w == frame->width && h == frame->height) return 0;
+    /* DMA-BUF is never negotiated (prefer_dmabuf is off), so a frame to scale
+     * is a validated CPU mapping; anything else cannot be scaled here. */
+    if (frame->buf_type != MD_BUF_CPU || !frame->data) goto fail;
+    const size_t stride = (size_t)w * 4, size = stride * h;
+    if (size > pw->scaled_size) {
+        uint8_t *grown = realloc(pw->scaled, size);
+        if (!grown) goto fail;
+        pw->scaled = grown;
+        pw->scaled_size = size;
+    }
+    if (md_capture_scale_frame(frame->data, frame->width, frame->height, frame->stride,
+                               pw->scaled, w, h, stride) != 0)
+        goto fail;
+    frame->width     = w;
+    frame->height    = h;
+    frame->stride    = (uint32_t)stride;
+    frame->data      = pw->scaled;
+    frame->data_size = size;
+    return 0;
+
+fail:
+    MD_LOG_E("cannot scale a %ux%u frame to the size cap", frame->width, frame->height);
+    pw_release_frame(ctx, frame);
+    memset(frame, 0, sizeof(*frame));
+    frame->dmabuf_fd = -1;
+    return MD_CAPTURE_ERROR;
+}
+
 static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     PipewireState *pw = ctx->backend_data;
     if (!pw) return MD_CAPTURE_ERROR;
@@ -1138,7 +1201,7 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     *out = pw->pending_frame;
     pw->frame_ready = false;
     pthread_mutex_unlock(&pw->frame_lock);
-    return 0;
+    return pw_scale_frame(ctx, pw, out);
 }
 
 /* Format negotiation (on_param_changed) publishes the size asynchronously. */
@@ -1241,6 +1304,7 @@ static void pw_destroy(MdCaptureCtx *ctx) {
     pthread_mutex_destroy(&pw->frame_lock);
     pthread_cond_destroy(&pw->frame_cond);
 
+    free(pw->scaled);
     free(pw);
     ctx->backend_data = NULL;
 }

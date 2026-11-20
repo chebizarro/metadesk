@@ -154,7 +154,7 @@ MdCaptureBackend *md_capture_backend_create(void);
 
 An unknown or ambiguous selection fails capture and logs every available display with its index, id/name, size and desktop origin. After a successful start, `md_capture_get_output_rect()` reports the selected display's global desktop bounds. The host copies them into `MdInputConfig.output_*`, and `md_input_map_to_output()` maps the client's frame-relative pointer coordinates into that display. Without this mapping, clicks would land on the display at the desktop origin. Agent actions (`md_input_execute_action`) carry global accessibility coordinates instead. They are converted back to frame space, and a target that is not on the captured display is refused.
 
-**Size cap** (`MdCaptureConfig.max_width`/`max_height`, host `--capture-max-size WxH`). This is for bandwidth-limited sessions. Frames are captured at the display's native pixels by default: backing pixels on macOS Retina, physical pixels on Windows. A cap scales the frame down to fit inside `WxH`:
+**Size cap** (`MdCaptureConfig.max_width`/`max_height`, host `--capture-max-size WxH`). This is for bandwidth-limited sessions. Frames are captured at the display's native pixels by default: backing pixels on macOS Retina, physical pixels on Windows, the compositor's monitor stream size on Linux. A cap scales the frame down to fit inside `WxH`:
 
 - Aspect is kept (`md_capture_fit_size`): the binding side equals its cap and the other side is rounded.
 - A frame is never scaled up.
@@ -168,7 +168,7 @@ The output rectangle does not change. `md_input_map_to_output` already scales be
 |---|---|
 | macOS (ScreenCaptureKit) | Supported. Scaled in hardware through `SCStreamConfiguration` width/height, and re-applied when the display changes mode |
 | Windows (DXGI) | Supported (md-jie5). Each output's desktop image is scaled on the GPU before the staging copy by an area-averaging pixel shader (no aliasing at any ratio), so only the scaled image is read back. Rotation, "all" (the cap bounds the composed frame) and the composited pointer (drawn at its scaled position, shape scaled) follow. An unrotated single output stays zero-copy |
-| Linux (PipeWire) | Not supported. The compositor sets the monitor stream's size. The host rejects the flag and init fails |
+| Linux (PipeWire) | Supported (md-awgm). xdpw and mutter offer monitor streams at one fixed size, so format negotiation cannot shrink them. Each acquired SHM frame is box-filtered on the CPU (`md_capture_scale_frame`) into a backend-owned buffer, and `wait_size` publishes the fitted size. The PipeWire buffer stays borrowed until `release_frame`, as for an unscaled frame. Only frames the consumer takes are scaled. On the aarch64 reference VM, 1920×1080 to 1280×720 adds about 2 ms of delivery latency |
 
 #### 2.3.2 Accessibility Tree HAL
 
