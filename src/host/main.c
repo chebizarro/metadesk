@@ -106,6 +106,9 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
         return;
     }
 
+    /* Attributed to the geometry its frame was captured under, which an
+     * asynchronous encoder may have left behind by now (md-f7uc). */
+    host_capture_sync_packet_sent(&ctx->sync, pkt->tag, ctx->pkt_seq);
     int ret = md_stream_send(client, MD_PKT_VIDEO_FRAME,
                              ctx->pkt_seq++,
                              pkt->data, (uint32_t)pkt->size);
@@ -307,9 +310,10 @@ static void *capture_thread_func(void *arg) {
 
         uint64_t start_ns = md_monotonic_ns();
 
-        int ret = md_encoder_submit(ctx->sync.encoder, frame.data,
+        int ret = md_encoder_submit_tagged(ctx->sync.encoder, frame.data,
                                     frame.stride, fmt,
                                     (int64_t)frame.seq,
+                                    host_capture_sync_frame_tag(&ctx->sync),
                                     on_encoded, ctx);
 
         int64_t elapsed_us = (int64_t)((md_monotonic_ns() - start_ns) / 1000u);

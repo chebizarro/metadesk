@@ -16,6 +16,10 @@
  * md-383x: input the client mapped onto a frame it was still showing when
  * the host changed geometry lands where that frame showed, or is dropped,
  * never interpreted against the new frame.
+ *
+ * md-f7uc: a packet is attributed to the geometry its frame was captured
+ * under, also when an asynchronous encoder emits it after the change (a
+ * mock delay line here, and VideoToolbox itself on macOS).
  */
 #include "capture_sync.h"
 #include "action.h"
@@ -212,6 +216,12 @@ static void expect_center(const Geometry *g, double *gx, double *gy) {
 typedef struct {
     MdDecoder *dec;
     int packets;
+    /* Each frame's tag by pts (the mock's frame seq), as pump submitted it,
+     * and the tag of the frame being submitted now. */
+    uint64_t frame_tag[64];
+    uint64_t submit_tag;
+    int untagged;         /* packets without their frame's tag */
+    int late;             /* emitted while a later generation submitted */
     int keys;
     bool want_key;        /* armed by a resize/request */
     bool key_ok;          /* the first packet after arming was a keyframe */
@@ -237,6 +247,8 @@ static void on_decoded(const MdDecodedFrame *f, void *ud) {
 static void on_encoded(const MdEncodedPacket *pkt, void *ud) {
     Sink *s = ud;
     s->packets++;
+    if (!pkt->tag || pkt->tag != s->frame_tag[pkt->pts % 64]) s->untagged++;
+    if (pkt->tag != s->submit_tag) s->late++;
     if (pkt->is_key) s->keys++;
     if (s->want_key) {
         s->key_ok = pkt->is_key;
@@ -264,9 +276,14 @@ static int pump(HostCaptureSync *sync, MdCaptureCtx *cap, Sink *sink, int frames
         if (rc != 0) continue;
         uint32_t before = sync->resizes;
         if (host_capture_sync_frame(sync, cap, &f) && sync->encoder) {
-            if (sink && sync->resizes != before) sink->want_key = true;
-            MD_CHECK(md_encoder_submit(sync->encoder, f.data, f.stride,
-                                       MD_PIX_FMT_BGRA, (int64_t)f.seq,
+            const uint64_t tag = host_capture_sync_frame_tag(sync);
+            if (sink) {
+                if (sync->resizes != before) sink->want_key = true;
+                sink->frame_tag[f.seq % 64] = tag;
+                sink->submit_tag = tag;
+            }
+            MD_CHECK(md_encoder_submit_tagged(sync->encoder, f.data, f.stride,
+                                       MD_PIX_FMT_BGRA, (int64_t)f.seq, tag,
                                        on_encoded, sink) == 0);
             encoded++;
         }
@@ -341,10 +358,15 @@ static void test_restart_reconfigures(void) {
     MD_CHECK(sink.sizes_w[sink.n_sizes - 1] == 480 &&
              sink.sizes_h[sink.n_sizes - 1] == 270);
 
+    /* Each packet carried its own frame's generation, including any the
+     * encoder emitted after the rearrangement (md-f7uc). */
+    MD_CHECK(sink.untagged == 0);
+
     md_decoder_destroy(sink.dec);
     md_encoder_destroy(enc);
     md_capture_stop(&cap);
-    printf("OK (%d packets, %d keyframes)\n", sink.packets, sink.keys);
+    printf("OK (%d packets, %d keyframes, %d emitted after a change)\n",
+           sink.packets, sink.keys, sink.late);
 }
 
 /* Keyframe and bitrate requests from other threads are applied by the
@@ -462,6 +484,20 @@ static void apply_geometry(HostCaptureSync *sync, MdCaptureCtx *cap,
     (void)host_capture_sync_frame(sync, cap, &f);
 }
 
+/* As host on_encoded, for n video packets of frames captured at the current
+ * geometry (a synchronous encoder): each takes the next sequence. */
+static void send_packets(HostCaptureSync *sync, uint32_t *seq, int n) {
+    for (int i = 0; i < n; i++)
+        host_capture_sync_packet_sent(sync, host_capture_sync_frame_tag(sync),
+                                      (*seq)++);
+}
+
+/* The first sequence of the newest run of packets. */
+static uint32_t run_start(const HostCaptureSync *sync) {
+    REQUIRE(sync->runs_total > 0);
+    return sync->runs[(sync->runs_total - 1) % HOST_CAPTURE_SYNC_RUNS].first_seq;
+}
+
 static HostPointMap map_on(HostCaptureSync *sync, const Geometry *shown,
                            uint32_t seq, int x, int y, int *ox, int *oy) {
     return host_capture_sync_map_point(sync, (uint16_t)(shown->w & ~1u),
@@ -490,7 +526,7 @@ static void test_republish_without_restart(void) {
     HostCaptureSync sync;
     host_capture_sync_init(&sync, enc, &inp, &mu, &seq, G0.w, G0.h, &G0.rect);
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
-    seq += 2;                                  /* G0 frames: packets 0..1 */
+    send_packets(&sync, &seq, 2);              /* G0 frames: packets 0..1 */
 
     /* Rearranged: same frame size, the display now right of main. */
     const Geometry moved = { G0.w, G0.h, { 1512, -100, 320, 180 } };
@@ -498,8 +534,8 @@ static void test_republish_without_restart(void) {
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
     MD_CHECK(mc.starts == 1);
     MD_CHECK(sync.bounds_updates == 1 && sync.resizes == 0);
-    MD_CHECK(sync.first_seq == 2 && sync.prev_first_seq == 0);
-    seq += 2;                                  /* moved frames: 2..3 */
+    send_packets(&sync, &seq, 2);              /* moved frames: 2..3 */
+    MD_CHECK(run_start(&sync) == 2 && sync.runs_total == 2);
     int ox = -1, oy = -1;
     /* Same size, another rectangle: a G0-frame point cannot be placed. */
     MD_CHECK(map_on(&sync, &G0, 1, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
@@ -512,8 +548,8 @@ static void test_republish_without_restart(void) {
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
     MD_CHECK(mc.starts == 1);
     MD_CHECK(sync.bounds_updates == 2 && sync.resizes == 1);
-    MD_CHECK(sync.first_seq == 4 && sync.prev_first_seq == 2);
-    seq += 2;                                  /* G1 frames: 4..5 */
+    send_packets(&sync, &seq, 2);              /* G1 frames: 4..5 */
+    MD_CHECK(run_start(&sync) == 4 && sync.runs_total == 3);
     uint32_t ew = 0, eh = 0;
     MD_CHECK(md_encoder_get_size(enc, &ew, &eh) == 0 && ew == 480 && eh == 270);
     MD_CHECK(map_on(&sync, &moved, 3, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
@@ -526,12 +562,14 @@ static void test_republish_without_restart(void) {
     const Geometry half = { 240, 136, G1.rect };
     capture_republish(&mc, &half);
     MD_CHECK(pump(&sync, &cap, &sink, 2) == 2);
-    MD_CHECK(mc.starts == 1 && sync.resizes == 2 && sync.first_seq == 6);
+    MD_CHECK(mc.starts == 1 && sync.resizes == 2);
+    /* No half-size packet yet: the client can only show a G1 frame. */
     MD_CHECK(map_on(&sync, &G1, 4, 240, 135, &ox, &oy) == HOST_POINT_TRANSLATED);
     MD_CHECK(md_input_click(&inp, ox, oy, 0) == 0);
     MD_CHECK(abs_d(mi.gx - -960) <= 0.5 * 1920 / 240 &&
              abs_d(mi.gy - 660) <= 0.5 * 1084 / 136);
     MD_CHECK(map_on(&sync, &moved, 3, 320, 180, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(sink.packets > 0 && sink.untagged == 0);
 
     md_encoder_destroy(enc);
     md_capture_stop(&cap);
@@ -567,7 +605,7 @@ static void test_capped_capture_maps_input(void) {
     host_capture_sync_init(&sync, NULL, &inp, NULL, &seq, cw, ch, &r);
     MD_CHECK(pump(&sync, &cap, NULL, 1) == 0); /* no encoder: never submits */
     MD_CHECK(sync.bounds_updates == 0);        /* nothing to reconcile */
-    seq += 3;                                  /* capped frames: 0..2 */
+    send_packets(&sync, &seq, 3);              /* capped frames: 0..2 */
 
     /* md-383x: the client decodes the capped frame cropped to even (831 ->
      * 830 rows) and tags its points with that; they map as-is. */
@@ -625,8 +663,8 @@ static void test_capped_capture_maps_input(void) {
     MD_CHECK(inp.config.screen_width == w && inp.config.screen_height == h);
     MD_CHECK(md_input_mouse_move(&inp, 640, 0) == 0);
     MD_CHECK(mi.gx == 3024 + 756 && mi.gy == 0);
-    MD_CHECK(sync.first_seq == 3 && sync.prev_first_seq == 0);
-    seq += 3;                                  /* moved frames: 3..5 */
+    send_packets(&sync, &seq, 3);              /* moved frames: 3..5 */
+    MD_CHECK(run_start(&sync) == 3 && sync.runs_total == 2);
     /* A point on a frame from before the move cannot be placed. */
     MD_CHECK(map_on(&sync, &capped, 2, 640, 0, &ox, &oy) == HOST_POINT_DROPPED);
     MD_CHECK(map_on(&sync, &moved, 3, 640, 0, &ox, &oy) == HOST_POINT_CURRENT);
@@ -637,7 +675,7 @@ static void test_capped_capture_maps_input(void) {
     const Geometry native_moved = { 3024, 1964, moved.rect };
     capture_republish(&mc, &native_moved);
     MD_CHECK(pump(&sync, &cap, NULL, 1) == 0);
-    MD_CHECK(sync.bounds_updates == 2 && sync.first_seq == 6);
+    MD_CHECK(sync.bounds_updates == 2 && sync.runs_total == 2);
     for (size_t i = 0; i < sizeof(pts) / sizeof(pts[0]); i++) {
         const int x = pts[i][0], y = pts[i][1] > 829 ? 829 : pts[i][1];
         double wx = 0, wy = 0;
@@ -657,9 +695,9 @@ static void test_capped_capture_maps_input(void) {
 
 /* Every point of every frame the host ever sent, mapped after each change
  * in a series: it is used as-is only on the current geometry's frames,
- * rescaled only from the previous geometry showing the same output
- * rectangle, landing within half a current pixel of where the shown frame
- * put it, and otherwise dropped. */
+ * rescaled from any earlier geometry showing the same output rectangle,
+ * landing within half a current pixel of where the shown frame put it, and
+ * otherwise dropped. */
 static void test_points_follow_shown_frame(void) {
     printf("  test_points_follow_shown_frame... ");
     md_test_name = "points_follow_shown_frame";
@@ -680,9 +718,9 @@ static void test_points_follow_shown_frame(void) {
     for (int step = 0; step < N; step++) {
         if (step) apply_geometry(&sync, &cap, series[step]);
         first[step] = seq;
-        seq += 7;                        /* frames sent at this geometry */
+        send_packets(&sync, &seq, 7);    /* frames sent at this geometry */
         end[step] = seq;
-        MD_CHECK(sync.width == series[step]->w && sync.first_seq == first[step]);
+        MD_CHECK(sync.width == series[step]->w && run_start(&sync) == first[step]);
         const Geometry *cur = series[step];
         for (int h = 0; h <= step; h++) {
             const Geometry *shown = series[h];
@@ -696,8 +734,7 @@ static void test_points_follow_shown_frame(void) {
                 int ox = -1, oy = -1;
                 HostPointMap m = map_on(&sync, shown, seqs[si], xs[xi], ys[yi],
                                         &ox, &oy);
-                const bool rescalable = h == step - 1 &&
-                                        rect_eq(&shown->rect, &cur->rect);
+                const bool rescalable = rect_eq(&shown->rect, &cur->rect);
                 if (h == step) {
                     MD_CHECK(m == HOST_POINT_CURRENT);
                     MD_CHECK(ox == xs[xi] && oy == ys[yi]);
@@ -723,8 +760,9 @@ static void test_points_follow_shown_frame(void) {
             }
         }
     }
-    /* G0->GS and GS->G0 rescale; GB, G1 and G2 change the rectangle. */
-    MD_CHECK(translated == 2 * 2 * 5 * 3);
+    /* G0->GS, GS->G0 and G0->G0 rescale; GB, G1 and G2 change the
+     * rectangle. */
+    MD_CHECK(translated == 3 * 2 * 5 * 3);
     MD_CHECK(sync.points_translated == (uint32_t)translated);
     MD_CHECK(sync.points_dropped == (uint32_t)dropped);
     MD_CHECK(current > 0 && dropped > 0);
@@ -755,7 +793,8 @@ static void test_points_follow_shown_frame(void) {
      * geometry, and nothing from the old stream is attributable. */
     seq = 0;
     host_capture_sync_reset_sequence(&sync);
-    seq = 3;
+    MD_CHECK(sync.runs_total == 0);
+    send_packets(&sync, &seq, 3);
     MD_CHECK(map_on(&sync, &G2, 0, 240, 135, &ox, &oy) == HOST_POINT_CURRENT);
     MD_CHECK(map_on(&sync, &GS, 1, 160, 90, &ox, &oy) == HOST_POINT_DROPPED);
     md_capture_stop(&cap);
@@ -773,9 +812,9 @@ static void test_point_sequence_edges(void) {
     uint32_t seq = UINT32_MAX - 3;
     HostCaptureSync sync;
     host_capture_sync_init(&sync, NULL, NULL, NULL, &seq, G0.w, G0.h, &G0.rect);
-    seq += 10;                                  /* wraps to 6 */
+    send_packets(&sync, &seq, 10);              /* wraps to 6 */
     apply_geometry(&sync, &cap, &GS);
-    seq += 4;
+    send_packets(&sync, &seq, 4);
     int ox, oy;
     MD_CHECK(map_on(&sync, &G0, UINT32_MAX - 1, 100, 50, &ox, &oy) ==
              HOST_POINT_TRANSLATED);
@@ -791,8 +830,221 @@ static void test_point_sequence_edges(void) {
     MD_CHECK(map_on(&bare, &G0, 0, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
     apply_geometry(&bare, &cap, &GS);
     MD_CHECK(map_on(&bare, &GS, 0, 10, 10, &ox, &oy) == HOST_POINT_DROPPED);
+
+    /* Only the newest runs are held: a frame older than all of them is
+     * dropped, even on the same rectangle. */
+    uint32_t s2 = 0;
+    HostCaptureSync h;
+    host_capture_sync_init(&h, NULL, NULL, NULL, &s2, G0.w, G0.h, &G0.rect);
+    send_packets(&h, &s2, 1);                   /* G0 at packet 0 */
+    for (uint32_t i = 0; i < HOST_CAPTURE_SYNC_RUNS; i++) {
+        apply_geometry(&h, &cap, (i % 2) ? &G0 : &GS);
+        send_packets(&h, &s2, 1);               /* GS at 1, G0 at 2, ... */
+    }
+    MD_CHECK(h.width == G0.w && s2 == HOST_CAPTURE_SYNC_RUNS + 1);
+    MD_CHECK(map_on(&h, &G0, 0, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(map_on(&h, &GS, 1, 50, 25, &ox, &oy) == HOST_POINT_TRANSLATED);
+    MD_CHECK(ox == 100 && oy == 50);
+    /* An earlier generation of the very same geometry: an exact rescale. */
+    MD_CHECK(map_on(&h, &G0, 2, 100, 50, &ox, &oy) == HOST_POINT_TRANSLATED);
+    MD_CHECK(ox == 100 && oy == 50);
+    MD_CHECK(map_on(&h, &G0, s2 - 1, 100, 50, &ox, &oy) == HOST_POINT_CURRENT);
+
+    /* A tag the sync no longer holds, or none, names no geometry: its
+     * packets are attributable to nothing, though they match the frame. */
+    const uint64_t stale = host_capture_sync_frame_tag(&h);
+    for (uint32_t i = 0; i < HOST_CAPTURE_SYNC_GEOMETRIES; i++)
+        apply_geometry(&h, &cap, (i % 2) ? &G0 : &GS);
+    MD_CHECK(h.width == G0.w);
+    host_capture_sync_packet_sent(&h, stale, s2++);
+    MD_CHECK(map_on(&h, &G0, s2 - 1, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+    send_packets(&h, &s2, 1);
+    MD_CHECK(map_on(&h, &G0, s2 - 1, 100, 50, &ox, &oy) == HOST_POINT_CURRENT);
+    host_capture_sync_packet_sent(&h, 0, s2++);
+    MD_CHECK(map_on(&h, &G0, s2 - 1, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+    MD_CHECK(host_capture_sync_frame_tag(NULL) == 0);
+    host_capture_sync_packet_sent(NULL, 1, 0);  /* no sync: ignored */
     md_capture_stop(&cap);
     printf("OK\n");
+}
+
+/* ── An asynchronous encoder across geometry changes (md-f7uc) ── *
+ * As VideoToolbox or AMF: a packet comes out after later frames went in, so
+ * frames captured before a change are sent after the host applied it. A
+ * delay line behind the real encoder holds each packet for ASYNC_DELAY more
+ * submits and, across the rectangle-only change, releases neighbours out of
+ * order; the flush drains it. Each packet is then sent as on_encoded does.
+ * The truth is the capture side's: the geometry the mock delivered each
+ * frame at, by pts. */
+
+#define ASYNC_DELAY   2
+#define ASYNC_PHASES  4
+#define ASYNC_FRAMES  64        /* by pts, which is the mock's frame seq */
+#define ASYNC_PACKETS 64
+
+typedef struct {
+    HostCaptureSync *sync;
+    uint32_t        *seq;                     /* the host's counter */
+    struct { int64_t pts; uint64_t tag; } held[16];
+    int              n_held;
+    bool             reorder;                 /* armed for one swap */
+    /* Capture-side truth, per frame. */
+    int              frame_phase[ASYNC_FRAMES];
+    uint64_t         frame_tag[ASYNC_FRAMES];
+    /* Per sent packet sequence: its frame. */
+    int64_t          sent_pts[ASYNC_PACKETS];
+    int              swapped;
+} AsyncPipe;
+
+static void async_on_encoded(const MdEncodedPacket *pkt, void *ud) {
+    AsyncPipe *p = ud;
+    REQUIRE(p->n_held < (int)(sizeof(p->held) / sizeof(p->held[0])));
+    p->held[p->n_held].pts = pkt->pts;
+    p->held[p->n_held].tag = pkt->tag;
+    p->n_held++;
+}
+
+/* Send the held packet at index i, as host on_encoded would. */
+static void async_send(AsyncPipe *p, int i) {
+    const int64_t pts = p->held[i].pts;
+    const uint64_t tag = p->held[i].tag;
+    REQUIRE(pts >= 0 && pts < ASYNC_FRAMES && *p->seq < ASYNC_PACKETS);
+    /* The encoder returned the tag of exactly the frame it encoded. */
+    MD_CHECK(tag != 0 && tag == p->frame_tag[pts]);
+    p->sent_pts[*p->seq] = pts;
+    host_capture_sync_packet_sent(p->sync, tag, (*p->seq)++);
+    memmove(&p->held[i], &p->held[i + 1],
+            (size_t)(p->n_held - i - 1) * sizeof(p->held[0]));
+    p->n_held--;
+}
+
+static void async_release(AsyncPipe *p, int keep) {
+    while (p->n_held > keep) {
+        /* Out of order, once: the first new-geometry packet overtakes the
+         * old one ahead of it. */
+        const bool swap = p->reorder && p->n_held >= 2 &&
+            p->frame_phase[p->held[0].pts] != p->frame_phase[p->held[1].pts];
+        if (swap) {
+            p->swapped++;
+            p->reorder = false;
+        }
+        async_send(p, swap ? 1 : 0);
+    }
+}
+
+typedef struct {
+    int current, translated, dropped;
+} AsyncTally;
+
+/* Every point of every packet sent so far, mapped now that phase `now`
+ * (geometry phases[now]) is current: as-is on its own frames, rescaled from
+ * any frame of the same output rectangle, dropped otherwise. */
+static void async_check_all(AsyncPipe *p, MdInput *inp, MockInput *mi,
+                            const Geometry *const *phases, int now,
+                            AsyncTally *t) {
+    const Geometry *cur = phases[now];
+    for (uint32_t seq = 0; seq < *p->seq; seq++) {
+        const int64_t pts = p->sent_pts[seq];
+        const int ph = p->frame_phase[pts];
+        const Geometry *shown = phases[ph];
+        const int xs[] = { 0, (int)shown->w / 3, (int)(shown->w & ~1u) - 1 };
+        const int ys[] = { 0, (int)shown->h / 2, (int)(shown->h & ~1u) - 1 };
+        for (size_t xi = 0; xi < 3; xi++)
+        for (size_t yi = 0; yi < 3; yi++) {
+            int ox = -1, oy = -1;
+            const HostPointMap m = map_on(p->sync, shown, seq, xs[xi], ys[yi],
+                                          &ox, &oy);
+            if (ph == now) {
+                MD_CHECK(m == HOST_POINT_CURRENT);
+                MD_CHECK(ox == xs[xi] && oy == ys[yi]);
+                t->current++;
+            } else if (cur->rect.width && rect_eq(&shown->rect, &cur->rect)) {
+                MD_CHECK(m == HOST_POINT_TRANSLATED);
+                double wx, wy;
+                desktop_point(shown, xs[xi], ys[yi], &wx, &wy);
+                MD_CHECK(md_input_mouse_move(inp, ox, oy) == 0);
+                const double tol_x = 0.5 * cur->rect.width / cur->w + 1e-9;
+                const double tol_y = 0.5 * cur->rect.height / cur->h + 1e-9;
+                MD_CHECK(abs_d(mi->gx - wx) <= tol_x &&
+                         abs_d(mi->gy - wy) <= tol_y);
+                t->translated++;
+            } else {
+                MD_CHECK(m == HOST_POINT_DROPPED);
+                t->dropped++;
+            }
+        }
+    }
+}
+
+static void test_async_encoder_attribution(void) {
+    printf("  test_async_encoder_attribution... ");
+    md_test_name = "async_encoder";
+    /* GB at half the size: the same rectangle, a pure rescale. */
+    static const Geometry GBs = { 320, 180, { 320, 0, 320, 180 } };
+    /* G0, then rearranged (same size: the encoder is not re-opened), then
+     * rescaled (re-opened), then a mode change elsewhere (re-opened). */
+    const Geometry *const phases[ASYNC_PHASES] = { &G0, &GB, &GBs, &G1 };
+    MdCaptureCtx cap; MockCap mc;
+    capture_open(&cap, &mc, &G0);
+    MdInput inp; MockInput mi;
+    input_open(&inp, &mi, &G0);
+    MdEncoder *enc = encoder_for(&G0);
+    uint32_t seq = 0;
+    HostCaptureSync sync;
+    host_capture_sync_init(&sync, enc, &inp, NULL, &seq, G0.w, G0.h, &G0.rect);
+    AsyncPipe p = { .sync = &sync, .seq = &seq };
+    AsyncTally t = {0};
+    uint32_t seq_at_change[ASYNC_PHASES] = {0};
+    int stragglers[ASYNC_PHASES] = {0};
+
+    for (int ph = 0; ph < ASYNC_PHASES; ph++) {
+        if (ph) capture_republish(&mc, phases[ph]);
+        p.reorder = ph == 1;
+        for (int i = 0; i < 6; i++) {
+            MdFrame f;
+            REQUIRE(md_capture_get_frame(&cap, &f, 100) == 0);
+            REQUIRE(f.seq < ASYNC_FRAMES);
+            REQUIRE(host_capture_sync_frame(&sync, &cap, &f));
+            if (i == 0) seq_at_change[ph] = seq;  /* applied, as md-383x saw it */
+            p.frame_phase[f.seq] = ph;
+            p.frame_tag[f.seq] = host_capture_sync_frame_tag(&sync);
+            MD_CHECK(md_encoder_submit_tagged(enc, f.data, f.stride,
+                                              MD_PIX_FMT_BGRA, (int64_t)f.seq,
+                                              p.frame_tag[f.seq],
+                                              async_on_encoded, &p) == 0);
+            md_capture_release_frame(&cap, &f);
+            async_release(&p, ASYNC_DELAY);
+        }
+        if (ph == ASYNC_PHASES - 1) {
+            MD_CHECK(md_encoder_flush(enc, async_on_encoded, &p) >= 0);
+            async_release(&p, 0);
+        }
+        /* Earlier frames sent after this change was applied. */
+        for (uint32_t s = seq_at_change[ph]; s < seq; s++)
+            if (p.frame_phase[p.sent_pts[s]] < ph) stragglers[ph]++;
+        /* Every packet's run must still be held for the expectation. */
+        REQUIRE(sync.runs_total <= HOST_CAPTURE_SYNC_RUNS);
+        async_check_all(&p, &inp, &mi, phases, ph, &t);
+    }
+    MD_CHECK(sync.resizes == 2 && sync.bounds_updates == 3);
+    /* The window md-383x mis-mapped: G0 frames sent after the rearrangement
+     * was applied, interleaved with GB ones. Each was checked dropped while
+     * GB was current, as was every G0 point since. */
+    MD_CHECK(stragglers[1] >= ASYNC_DELAY && p.swapped > 0);
+    MD_CHECK(sync.runs_total > ASYNC_PHASES);  /* the reorder split runs */
+    /* GB frames sent after the rescale were rescaled onto GBs; G0 ones,
+     * on another rectangle, were dropped. */
+    MD_CHECK(stragglers[2] >= 1 && t.translated > 0);
+    MD_CHECK(t.current > 0 && t.dropped > 0);
+    uint32_t sent_at[ASYNC_PHASES] = {0};
+    for (uint32_t s = 0; s < seq; s++) sent_at[p.frame_phase[p.sent_pts[s]]]++;
+    for (int ph = 0; ph < ASYNC_PHASES; ph++) MD_CHECK(sent_at[ph] > 0);
+
+    md_encoder_destroy(enc);
+    md_capture_stop(&cap);
+    printf("OK (%u packets, %d/%d/%d stragglers, %d swapped; %d current, "
+           "%d rescaled, %d dropped)\n", seq, stragglers[1], stragglers[2],
+           stragglers[3], p.swapped, t.current, t.translated, t.dropped);
 }
 
 /* ── Concurrency: geometry flips while input is dispatched ────── */
@@ -864,6 +1116,7 @@ static void test_concurrent_dispatch(void) {
  * frame (md-383x). Each click is checked where it landed on the desktop. */
 
 #define E2E_MAX_CLICKS 8
+#define E2E_RING       8192      /* frames / packets, beyond any run */
 
 typedef struct {
     HostCaptureSync *sync;
@@ -879,6 +1132,10 @@ typedef struct {
     int              inputs;
     HostPointMap     result[E2E_MAX_CLICKS];
     double           gx[E2E_MAX_CLICKS], gy[E2E_MAX_CLICKS];
+    /* Capture-side truth: the geometry each frame was delivered at, by pts
+     * (capture thread only), and each sent packet's, by sequence (mu). */
+    Geometry        *frame_geom;
+    Geometry        *sent_geom;
 } E2E;
 
 static void e2e_on_encoded(const MdEncodedPacket *pkt, void *ud) {
@@ -889,6 +1146,8 @@ static void e2e_on_encoded(const MdEncodedPacket *pkt, void *ud) {
         e->armed = false;
     }
     pthread_mutex_lock(e->mu);
+    e->sent_geom[e->seq % E2E_RING] = e->frame_geom[pkt->pts % E2E_RING];
+    host_capture_sync_packet_sent(e->sync, pkt->tag, e->seq);
     md_stream_send(e->peer, MD_PKT_VIDEO_FRAME, e->seq++, pkt->data,
                    (uint32_t)pkt->size);
     pthread_mutex_unlock(e->mu);
@@ -908,9 +1167,12 @@ static void *e2e_capture_thread(void *arg) {
         uint32_t before = e->sync->resizes;
         if (host_capture_sync_frame(e->sync, e->cap, &f)) {
             if (e->sync->resizes != before) e->armed = true;
-            md_encoder_submit(e->sync->encoder, f.data, f.stride,
-                              MD_PIX_FMT_BGRA, (int64_t)f.seq,
-                              e2e_on_encoded, e);
+            e->frame_geom[f.seq % E2E_RING] =
+                (Geometry){ f.width, f.height, e->cap->output_rect };
+            md_encoder_submit_tagged(e->sync->encoder, f.data, f.stride,
+                                     MD_PIX_FMT_BGRA, (int64_t)f.seq,
+                                     host_capture_sync_frame_tag(e->sync),
+                                     e2e_on_encoded, e);
         }
         md_capture_release_frame(e->cap, &f);
     }
@@ -1020,7 +1282,10 @@ static void test_end_to_end_stream(void) {
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     MdEncoder *enc = encoder_for(&G0);
     HostCaptureSync sync;
-    E2E e = { .sync = &sync, .cap = &cap, .peer = peer, .mu = &mu, .input = &inp };
+    E2E e = { .sync = &sync, .cap = &cap, .peer = peer, .mu = &mu, .input = &inp,
+              .frame_geom = calloc(E2E_RING, sizeof(Geometry)),
+              .sent_geom = calloc(E2E_RING, sizeof(Geometry)) };
+    REQUIRE(e.frame_geom && e.sent_geom);
     atomic_init(&e.stop, false);
     host_capture_sync_init(&sync, enc, &inp, &mu, &e.seq, G0.w, G0.h, &G0.rect);
 
@@ -1037,11 +1302,16 @@ static void test_end_to_end_stream(void) {
      *      where G0 showed it;
      *   1  on GS (160,90), sent once the host shows G1 (a mode change):
      *      dropped;
-     *   2  on G1's centre, once the client shows G1: as-is. */
+     *   2  on G1's centre, once the client shows G1: as-is;
+     *   3  on the centre of the frame on screen once the host has applied
+     *      G2 (G1's mode, rearranged: the encoder is not re-opened): as-is
+     *      if that frame was captured at G2, dropped if at G1, which an
+     *      asynchronous encoder can send after the change (md-f7uc). */
     int phase = 0;
+    uint32_t clicked_seq = 0;
     /* Event-driven: each step reacts to what the client received or
      * decoded. The packet budget only bounds a broken run. */
-    for (int budget = 0; budget < 4000 && phase < 6; budget++) {
+    for (int budget = 0; budget < 4000 && phase < 8; budget++) {
         MdPacketHeader hdr;
         uint8_t *payload = NULL;
         int rc = md_stream_recv(client, &hdr, &payload, 5000);
@@ -1056,6 +1326,10 @@ static void test_end_to_end_stream(void) {
             } else if (phase == 3 && applied >= 2 && shows(&v, &GS)) {
                 client_click(client, &v, 160, 90);
                 phase = 4;
+            } else if (phase == 6 && applied >= 3) {
+                client_click(client, &v, (int)v.w / 2, (int)v.h / 2);
+                clicked_seq = v.seq;
+                phase = 7;
             }
             md_decoder_submit(dec, payload, hdr.payload_len, hdr.sequence);
             md_decoder_poll(dec, e2e_on_decoded, &v);
@@ -1074,10 +1348,13 @@ static void test_end_to_end_stream(void) {
             client_click(client, &v, (int)v.w / 2, (int)v.h / 2);
             phase = 5;
         } else if (phase == 5 && inputs >= 3) {
+            capture_republish(&mc, &G2);       /* rearranged, same mode */
             phase = 6;
+        } else if (phase == 7 && inputs >= 4) {
+            phase = 8;
         }
     }
-    MD_CHECK(phase == 6);
+    MD_CHECK(phase == 8);
 
     /* The packet thread polls the stop flag between bounded recvs, so it
      * exits on a live connection. Only then shut the client end: a capture
@@ -1092,8 +1369,21 @@ static void test_end_to_end_stream(void) {
     MD_CHECK(sync.resizes == 2);
     MD_CHECK(mc.starts == 2);                  /* only G1 restarted */
     MD_CHECK(e.resizes_checked == 2 && e.resize_keys == 2);
-    MD_CHECK(e.inputs == 3);
-    MD_CHECK(mi.clicks == 2);
+    MD_CHECK(e.inputs == 4);
+    /* Click 3 follows the frame's capture geometry, not the send time. */
+    const Geometry shown = e.sent_geom[clicked_seq % E2E_RING];
+    const bool shown_g2 = rect_eq(&shown.rect, &G2.rect);
+    MD_CHECK(shown_g2 || rect_eq(&shown.rect, &G1.rect));
+    MD_CHECK(shown.w == G1.w && shown.h == G1.h);
+    if (shown_g2) {
+        double wx, wy;
+        desktop_point(&G2, 240, 135, &wx, &wy);
+        MD_CHECK(e.result[3] == HOST_POINT_CURRENT);
+        MD_CHECK(e.gx[3] == wx && e.gy[3] == wy);
+    } else {
+        MD_CHECK(e.result[3] == HOST_POINT_DROPPED);
+    }
+    MD_CHECK(mi.clicks == 2 + shown_g2);
     /* G0 (100,50) is desktop (50,25); GS shows the same rectangle 1:1. */
     MD_CHECK(e.result[0] == HOST_POINT_TRANSLATED);
     MD_CHECK(e.gx[0] == 50 && e.gy[0] == 25);
@@ -1101,7 +1391,8 @@ static void test_end_to_end_stream(void) {
     /* Decoded 480x270 centre (240,135) -> new display's centre. */
     MD_CHECK(e.result[2] == HOST_POINT_CURRENT);
     MD_CHECK(e.gx[2] == -960 && e.gy[2] == 660);
-    MD_CHECK(sync.points_translated == 1 && sync.points_dropped == 1);
+    MD_CHECK(sync.points_translated == 1 &&
+             sync.points_dropped == 1u + !shown_g2);
 
     /* The decoder followed both size changes mid-stream. */
     md_decoder_flush(dec, e2e_on_decoded, &v);
@@ -1116,7 +1407,10 @@ static void test_end_to_end_stream(void) {
     md_stream_destroy(client);
     md_stream_destroy(peer);
     md_stream_server_destroy(srv);
-    printf("OK (%d clicks)\n", e.inputs);
+    free(e.frame_geom);
+    free(e.sent_geom);
+    printf("OK (%d clicks; the rearranged click was on a %s frame)\n",
+           e.inputs, shown_g2 ? "G2" : "G1");
 }
 
 int main(void) {
@@ -1136,6 +1430,7 @@ int main(void) {
     test_capped_capture_maps_input();
     test_points_follow_shown_frame();
     test_point_sequence_edges();
+    test_async_encoder_attribution();
     test_concurrent_dispatch();
     test_end_to_end_stream();
     return md_test_report();
