@@ -87,24 +87,27 @@ fs = import('fs')
 # nostrc headers: prefer the source tree (it is ahead of the installed
 # libnostr: publish_and_wait, event_middleware_ex, nostr_event_validate),
 # fall back to the installed headers.
+# Every NIP library linked below needs its own source include dir:
+# <nostr/nip51/nip51.h> must not fall through to an installed, older copy
+# under the Homebrew prefix (md-r4ia: nostrc 5b3c987c8 changed nip51.h).
+_nostrc_nip_dirs = ['nip11', 'nip17', 'nip19', 'nip44', 'nip51', 'nip98']
 _nostrc_inc_paths = []
 if _nostrc_root != ''
-  _nostrc_inc_paths += _nostrc_root / 'libnostr' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'libgo' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip11' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip17' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip98' / 'include'
-  _nostrc_inc_paths += _nostrc_root / 'nips' / 'nip19' / 'include'
-  _nostrc_inc_paths += _nostrc_build / 'nips' / 'nip98' / 'include'
-  _nostrc_inc_paths += _nostrc_build / 'nips' / 'nip19' / 'include'
+  foreach d : ['libnostr', 'libgo'] + _nostrc_nip_dirs
+    _src_inc = _nostrc_root / (d.startswith('nip') ? 'nips' / d : d) / 'include'
+    if fs.is_dir(_src_inc)
+      _nostrc_inc_paths += _src_inc
+    endif
+  endforeach
 endif
-# nostrc generates export-macro headers (nostr-export.h, libgo-export.h,
-# nostr-json-export.h) into the CMake build tree; the source headers include
-# them unqualified.
+# nostrc generates export-macro and version headers (nostr-export.h,
+# libgo-export.h, nostr-json-export.h, nipXX version headers) into the CMake
+# build tree; the source headers include them unqualified.
 if _nostrc_build != ''
-  foreach d : ['libnostr', 'libgo', 'libjson']
-    if fs.is_dir(_nostrc_build / d / 'include')
-      _nostrc_inc_paths += _nostrc_build / d / 'include'
+  foreach d : ['libnostr', 'libgo', 'libjson'] + _nostrc_nip_dirs
+    _gen_inc = _nostrc_build / (d.startswith('nip') ? 'nips' / d : d) / 'include'
+    if fs.is_dir(_gen_inc)
+      _nostrc_inc_paths += _gen_inc
     endif
   endforeach
 endif
@@ -113,44 +116,135 @@ foreach d : _sys_inc_dirs
 endforeach
 nostrc_inc = include_directories(_nostrc_inc_paths)
 
-# libnostr: prefer the build-tree static lib (matches the headers above)
-_nostrc_core = _nostrc_build / 'libnostr' / 'libnostr.a'
-if _nostrc_build != '' and fs.exists(_nostrc_core)
-  dep_nostr_lib = declare_dependency(link_args : [_nostrc_core])
-  message('nostr: using build-tree libnostr: ' + _nostrc_core)
-else
+# libnostr: prefer the build-tree library (it matches the headers above).
+# Archives are linked by path; shared libraries go through cc.find_library so
+# Meson manages the build rpath. Probing file names first means a build tree
+# without libnostr is never silently replaced by a system copy.
+dep_nostr_lib = dependency('', required : false)
+if _nostrc_build != ''
+  foreach _file : ['libnostr.a', 'libnostr.so', 'libnostr.dylib']
+    _path = _nostrc_build / 'libnostr' / _file
+    if dep_nostr_lib.found()
+    elif fs.exists(_path) and _file.endswith('.a')
+      dep_nostr_lib = declare_dependency(link_args : [_path])
+      message('nostr: using build-tree library ' + _path)
+    elif fs.exists(_path)
+      dep_nostr_lib = cc.find_library('nostr', dirs : [_nostrc_build / 'libnostr'],
+                                      static : false, required : true)
+      message('nostr: using build-tree library ' + _path)
+    endif
+  endforeach
+endif
+if not dep_nostr_lib.found()
   dep_nostr_lib = cc.find_library('nostr', required : true, dirs : _sys_lib_dirs)
 endif
 dep_nostr = declare_dependency(
   dependencies : dep_nostr_lib,
   include_directories : nostrc_inc,
 )
-dep_nip44 = cc.find_library('nostr_nip44_core', required : true, dirs : _sys_lib_dirs)
-
-# nip51 — try installed library first, fallback to build-tree object
-dep_nip51_lib = cc.find_library('nostr_nip51_core', required : false, dirs : _sys_lib_dirs)
-if dep_nip51_lib.found()
-  dep_nip51 = dep_nip51_lib
-elif _nostrc_build != ''
-  _nip51_obj = _nostrc_build / 'nips' / 'nip51' / 'CMakeFiles' / 'nostr_nip51_core.dir' / 'src' / 'nip51.c.o'
-  dep_nip51 = declare_dependency(link_args : [_nip51_obj])
-  message('nip51: using build-tree object: ' + _nip51_obj)
-else
-  error('nostr_nip51_core not found. Install nostrc or set -Dnostrc_root=<path>')
-endif
-
-# NIP-98 HTTP auth and NIP-19 npub allowlist decoding.
-dep_nip98_lib = cc.find_library('nostr_nip98', required : false, dirs : _sys_lib_dirs)
-if dep_nip98_lib.found()
-  dep_nip98 = dep_nip98_lib
-elif _nostrc_build != ''
-  _nip98_obj = _nostrc_build / 'nips' / 'nip98' / 'CMakeFiles' / 'nostr_nip98.dir' / 'src' / 'nip98.c.o'
-  dep_nip98 = declare_dependency(link_args : [_nip98_obj])
-  message('nip98: using build-tree object: ' + _nip98_obj)
-else
-  error('nostr_nip98 not found. Install nostrc or set -Dnostrc_build_dir=<path>')
-endif
-dep_nip19 = cc.find_library('nip19', required : true, dirs : _sys_lib_dirs)
+# nostrc NIP libraries (md-r4ia). For each one, in order:
+#   1. An installed library (cc.find_library on the system dirs).
+#   2. The library CMake built for the target, by file name in the target's
+#      build directory: lib<target>.a (linked by path), .so/.dylib (through
+#      cc.find_library, so Meson manages the build rpath), or <target>.lib.
+#   3. For CMake OBJECT libraries, which never produce an archive (nip51 and
+#      nip17), the objects that the CMake generator's own manifest lists for
+#      the target: <subdir>/CMakeFiles/<target>.dir/build.make for Unix
+#      Makefiles, or the top-level build.ninja for Ninja.
+# The manifest is rewritten whenever CMake regenerates the target, so it
+# names exactly the target's current sources. For example, nip51 is one
+# object in nostrc da2e4d62b and older, and three objects since 5b3c987c8. A
+# glob of CMakeFiles/ would also link objects of renamed or deleted sources
+# that older builds leave behind. fs.read() makes Meson reconfigure when the
+# manifest changes. The link fails at configure time, naming the target, if
+# a listed object has not been built.
+_nostrc_components = {
+  # component : [CMake target / library name, build-tree subdir]
+  'nip44' : ['nostr_nip44_core', 'nips/nip44'],
+  'nip51' : ['nostr_nip51_core', 'nips/nip51'],
+  'nip98' : ['nostr_nip98', 'nips/nip98'],     # NIP-98 HTTP auth
+  'nip19' : ['nip19', 'nips/nip19'],           # npub allowlist decoding
+  'nip17' : ['nostr_nip17_core', 'nips/nip17'],
+  'nip11' : ['nip11', 'nips/nip11'],
+}
+_nostrc_ninja_lines = []
+_nostrc_ninja_read = false
+_nostrc_deps = {}
+foreach _component, _spec : _nostrc_components
+  _target = _spec[0]
+  _dir = _nostrc_build / _spec[1]
+  _dep = cc.find_library(_target, required : false, dirs : _sys_lib_dirs)
+  _how = 'installed library'
+  if not _dep.found() and _nostrc_build != ''
+    foreach _file : ['lib' + _target + '.a', _target + '.lib',
+                     'lib' + _target + '.so', 'lib' + _target + '.dylib']
+      if _dep.found() or not fs.exists(_dir / _file)
+      elif _file.endswith('.a') or _file.endswith('.lib')
+        _dep = declare_dependency(link_args : [_dir / _file])
+        _how = 'build-tree library ' + (_dir / _file)
+      else
+        _dep = cc.find_library(_target, dirs : [_dir], static : false, required : true)
+        _how = 'build-tree library ' + (_dir / _file)
+      endif
+    endforeach
+  endif
+  if not _dep.found() and _nostrc_build != ''
+    _objs = []
+    _manifest = _dir / 'CMakeFiles' / (_target + '.dir') / 'build.make'
+    if fs.exists(_manifest)
+      # Makefile rule lines: "<target>: <subdir>/CMakeFiles/<target>.dir/<src>.o"
+      foreach _line : fs.read(_manifest).split('\n')
+        _line = _line.strip()
+        if _line.startswith(_target + ': ') and (_line.endswith('.o') or _line.endswith('.obj'))
+          _objs += _nostrc_build / _line.split(_target + ': ')[1].strip()
+        endif
+      endforeach
+    elif fs.exists(_nostrc_build / 'build.ninja')
+      # Ninja edges: "build <subdir>/CMakeFiles/<target>.dir/<src>.o: <rule> ..."
+      if not _nostrc_ninja_read
+        _nostrc_ninja_lines = fs.read(_nostrc_build / 'build.ninja').split('\n')
+        _nostrc_ninja_read = true
+      endif
+      _edge = 'build ' + _spec[1] + '/CMakeFiles/' + _target + '.dir/'
+      foreach _line : _nostrc_ninja_lines
+        if _line.startswith(_edge)
+          _out = _line.substring(6).split(':')[0]
+          if _out.endswith('.o') or _out.endswith('.obj')
+            _objs += _nostrc_build / _out
+          endif
+        endif
+      endforeach
+    endif
+    foreach _obj : _objs
+      if not fs.exists(_obj)
+        error('nostrc target ' + _target + ' is configured in ' + _nostrc_build +
+              ' but not built (missing ' + _obj + '). Run: cmake --build ' +
+              _nostrc_build + ' --target ' + _target)
+      endif
+    endforeach
+    if _objs.length() > 0
+      _dep = declare_dependency(link_args : _objs)
+      _names = []
+      foreach _obj : _objs
+        _names += fs.name(_obj)
+      endforeach
+      _how = 'build-tree objects of CMake target ' + _target + ': ' + ', '.join(_names)
+    endif
+  endif
+  if not _dep.found()
+    error(_target + ' not found. Install nostrc, or build the nostrc ' + _target +
+          ' target and set -Dnostrc_build_dir=<path> (looked for an installed library, ' +
+          'a library in ' + _dir + ', and a Makefile/Ninja object manifest).')
+  endif
+  message(_component + ': using ' + _how)
+  _nostrc_deps += {_component : _dep}
+endforeach
+dep_nip44 = _nostrc_deps['nip44']
+dep_nip51 = _nostrc_deps['nip51']
+dep_nip98 = _nostrc_deps['nip98']
+dep_nip19 = _nostrc_deps['nip19']
+dep_nip17 = _nostrc_deps['nip17']
+dep_nip11 = _nostrc_deps['nip11']
 
 # nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
 # libgo — try installed library first, fallback to build-tree static libs
@@ -159,19 +253,37 @@ _go_fiber_lib = cc.find_library('go_fiber', required : false, dirs : _sys_lib_di
 if _libgo_lib.found() and _go_fiber_lib.found()
   dep_libgo = declare_dependency(dependencies : [_libgo_lib, _go_fiber_lib])
 elif _nostrc_build != ''
-  # nostrc renamed the libgo target to `nostrgo` (libnostrgo.a); older build
-  # trees still have liblibgo.a.
-  _libgo_a = _nostrc_build / 'libgo' / 'libnostrgo.a'
-  if not fs.exists(_libgo_a)
-    _libgo_a = _nostrc_build / 'libgo' / 'liblibgo.a'
-  endif
-  dep_libgo = declare_dependency(
-    link_args : [
-      _libgo_a,
-      _nostrc_build / 'libgo' / 'libgo_fiber.a',
-    ],
-  )
-  message('libgo: using build-tree static libs ' + _libgo_a + ' + libgo_fiber.a')
+  # nostrc renamed the libgo target to `nostrgo` (libnostrgo); older build
+  # trees still have liblibgo. nostrgo follows BUILD_SHARED_LIBS; go_fiber is
+  # always static. Archives are linked by path, shared libraries through
+  # cc.find_library (build rpath).
+  _libgo_parts = []
+  _libgo_names = []
+  foreach _candidates : [['nostrgo', 'libgo'], ['go_fiber']]
+    _part = dependency('', required : false)
+    foreach _name : _candidates
+      foreach _file : ['lib' + _name + '.a', 'lib' + _name + '.so', 'lib' + _name + '.dylib']
+        _path = _nostrc_build / 'libgo' / _file
+        if _part.found() or not fs.exists(_path)
+        elif _file.endswith('.a')
+          _part = declare_dependency(link_args : [_path])
+          _libgo_names += _file
+        else
+          _part = cc.find_library(_name, dirs : [_nostrc_build / 'libgo'],
+                                  static : false, required : true)
+          _libgo_names += _file
+        endif
+      endforeach
+    endforeach
+    if not _part.found()
+      error('libgo: ' + ' or '.join(_candidates) + ' not found in ' +
+            (_nostrc_build / 'libgo') + '. Build the nostrc nostrgo and go_fiber targets.')
+    endif
+    _libgo_parts += _part
+  endforeach
+  dep_libgo = declare_dependency(dependencies : _libgo_parts)
+  message('libgo: using build-tree libraries ' + ' + '.join(_libgo_names) +
+          ' from ' + (_nostrc_build / 'libgo'))
 else
   error('libgo/go_fiber not found. Install nostrc or set -Dnostrc_root=<path>')
 endif
@@ -244,28 +356,6 @@ endif
 
 # NIP-11 relay information document (requires libcurl for HTTP fetch)
 dep_curl = dependency('libcurl', version : '>=7.80', required : true)
-# nip17 — try installed library first, fallback to build-tree object
-dep_nip17_lib = cc.find_library('nostr_nip17_core', required : false, dirs : _sys_lib_dirs)
-if dep_nip17_lib.found()
-  dep_nip17 = dep_nip17_lib
-elif _nostrc_build != ''
-  _nip17_obj = _nostrc_build / 'nips' / 'nip17' / 'CMakeFiles' / 'nostr_nip17_core.dir' / 'src' / 'nip17.c.o'
-  dep_nip17 = declare_dependency(link_args : [_nip17_obj])
-  message('nip17: using build-tree object: ' + _nip17_obj)
-else
-  error('nostr_nip17_core not found. Install nostrc or set -Dnostrc_root=<path>')
-endif
-
-dep_nip11_lib = cc.find_library('nip11', required : false, dirs : _sys_lib_dirs)
-if dep_nip11_lib.found()
-  dep_nip11 = dep_nip11_lib
-elif _nostrc_build != ''
-  _nip11_obj = _nostrc_build / 'nips' / 'nip11' / 'CMakeFiles' / 'nip11.dir' / 'src' / 'nip11.c.o'
-  dep_nip11 = declare_dependency(link_args : [_nip11_obj])
-  message('nip11: using build-tree object: ' + _nip11_obj)
-else
-  error('nip11 not found. Install nostrc or set -Dnostrc_root=<path>')
-endif
 
 # ── Platform HAL backend selection (spec §5.3) ──────────────────────────────
 # Each platform provides: capture, a11y, and input backend source files + deps.
@@ -485,7 +575,7 @@ endif
 
 # nostrc does not ship pkg-config metadata for these adapters. Discover the
 # installed archive/shared library first, then the CMake build-tree library.
-# Unlike nip51/nip98, the adapters contain multiple objects: link the archive.
+# The adapters are regular (archive) CMake targets, not OBJECT libraries.
 _signer_inc_paths = []
 _signer_libraries = {}
 foreach _component, _libraries : _signer_components
@@ -552,8 +642,14 @@ endforeach
 foreach _name, _dep : _signer_libraries
   core_deps += _dep
 endforeach
+# nostrc headers are target include dirs, not only dependency include dirs.
+# Meson emits a target's include_directories before any dependency's, so the
+# headers that match the selected nostrc build come before the bare Homebrew
+# prefix that the libyuv fallback (and pkg-config deps) add. Otherwise
+# <nostr/nipXX/...> resolves to installed headers from an older nostrc.
+core_inc = [core_inc, nostrc_inc]
 if enable_nip46 or enable_nip55l or enable_nip5f
-  core_deps += declare_dependency(include_directories : include_directories(_signer_inc_paths))
+  core_inc += include_directories(_signer_inc_paths)
 endif
 # Also consumed by the backend-specific integration tests below.
 if enable_nip46
