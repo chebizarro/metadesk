@@ -13,7 +13,8 @@
  *   2. D3D11CreateDevice on each output's adapter (DuplicateOutput needs it)
  *   3. DuplicateOutput → IDXGIOutputDuplication per output
  *   4. AcquireNextFrame → ID3D11Texture2D (GPU), pointer position and shape
- *   5. CopyResource to staging texture → Map for CPU access → ReleaseFrame;
+ *   5. CopyResource to staging texture (with a size cap, first scaled on
+ *      the GPU: see below) → Map for CPU access → ReleaseFrame;
  *      in canvas mode ("all" or a rotated output) the mapped copy is
  *      copied, rotated as needed, into the CPU frame and unmapped
  *   6. With config.show_cursor, composite the pointer into the frame
@@ -99,6 +100,35 @@
  * mode is handled like a mode change: duplication is lost and restart
  * re-reads the mode.
  *
+ * Size cap (md-jie5): config.max_width/max_height bound the delivered frame
+ * to md_capture_fit_size() of the unscaled one (the output's mode in desktop
+ * orientation, or the "all" bounding rectangle): aspect kept, never scaled
+ * up. The layout (output regions, pointer position) stays in unscaled frame
+ * coordinates and FrameScale maps it onto the delivered frame, each region
+ * edge rounded on its own so outputs that abut still abut. Each output's
+ * desktop image is scaled on its own device before the staging copy: an
+ * area-averaging pixel shader (each frame pixel is the coverage-weighted
+ * mean of the image pixels under it) renders it, in the image's native
+ * orientation, into a render target the size of its region, which is
+ * copied to a staging texture of that size, so only the scaled image is
+ * read back. Area averaging is a box filter matched to the ratio: no
+ * aliasing or moire on text and fine patterns at any ratio, where bilinear
+ * sampling (and ID3D11VideoProcessor's driver-defined filter, typically
+ * bilinear) skips pixels above 2:1 and a mip chain blurs between powers of
+ * two. It costs about (1 + 1/ratio)^2 image reads per image pixel (at most
+ * 4, near 1 at large ratios) in one pass. Rotation and "all" composition
+ * then run on the CPU over the smaller copies as without a cap. The
+ * pointer is composited into the CPU frame at its scaled position with its
+ * shape scaled like the desktop: colour shapes are area averaged
+ * (premultiplied alpha averages linearly), monochrome and masked-colour
+ * shapes are point sampled since their AND/XOR operations cannot be
+ * averaged. A cap the frame already fits changes nothing (no scaler), and an
+ * unrotated single output stays zero-copy either way: the frame is the
+ * mapped staging texture, scaled or not. The shaders are compiled at init
+ * by d3dcompiler_47.dll (in System32 since Windows 8.1) and need feature
+ * level 10_0. ctx->output_rect stays the physical rectangle, so input maps
+ * onto the smaller frame unchanged (md_input_map_to_output scales).
+ *
  * Requires Windows 8+ for Desktop Duplication API.
  * The calling thread must be on the desktop that owns the display.
  */
@@ -109,6 +139,7 @@ extern "C" {
 #ifdef _WIN32
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 
 #include <climits>
@@ -139,6 +170,32 @@ struct PointerState {
     uint8_t    *under;
     size_t      under_cap;
     PointerRect under_rect;
+    /* The shape as drawn on a scaled frame (md-jie5), made on first use. */
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO drawn_info;
+    uint8_t    *drawn;
+    size_t      drawn_cap;
+    bool        drawn_valid;
+};
+
+/* The delivered frame against the unscaled one (md-jie5); the identity
+ * without a size cap. */
+struct FrameScale {
+    uint32_t from_w, from_h;   /* unscaled: the outputs' bounding size */
+    uint32_t to_w, to_h;       /* delivered: md_capture_fit_size of it */
+};
+
+/* GPU downscale of one output's desktop image (md-jie5): the area-averaging
+ * shader renders it into `target`, which is then copied to staging. */
+struct Scaler {
+    ID3D11VertexShader       *vs;          /* compiled once per device */
+    ID3D11PixelShader        *ps;
+    ID3D11Buffer             *params;      /* ScaleParams of this size pair */
+    ID3D11Texture2D          *target;      /* dst_w x dst_h render target */
+    ID3D11RenderTargetView   *target_rtv;
+    ID3D11Texture2D          *source;      /* src-size copy of an image the */
+    ID3D11ShaderResourceView *source_srv;  /* shader cannot bind directly */
+    uint32_t                  src_w, src_h, dst_w, dst_h;
+    bool                      copy_source; /* always sample `source` */
 };
 
 enum { MAX_OUTPUTS = 16 };
@@ -148,7 +205,7 @@ struct OutputDup {
     ID3D11Device            *device;
     ID3D11DeviceContext     *context;
     IDXGIOutputDuplication  *duplication; /* nullptr after loss until start() */
-    ID3D11Texture2D         *staging;     /* CPU copy of its desktop image */
+    ID3D11Texture2D         *staging;     /* CPU copy of its (scaled) desktop image */
     LUID                     adapter_luid; /* the device's adapter */
 
     DXGI_OUTPUT_DESC         desc;
@@ -157,10 +214,15 @@ struct OutputDup {
     uint32_t                 image_w;     /* desktop image (and staging) size, */
     uint32_t                 image_h;     /* native orientation */
     int                      turns;       /* clockwise quarter turns image -> frame */
-    uint32_t                 width;       /* its frame region, desktop orientation */
-    uint32_t                 height;
-    uint32_t                 frame_x;     /* the region's top-left in the frame */
-    uint32_t                 frame_y;
+    uint32_t                 width;       /* its unscaled frame region, desktop */
+    uint32_t                 height;      /* orientation */
+    uint32_t                 frame_x;     /* that region's top-left in the */
+    uint32_t                 frame_y;     /* unscaled frame */
+    uint32_t                 copy_w;      /* staging size: the image scaled to its */
+    uint32_t                 copy_h;      /* delivered region, native orientation */
+    uint32_t                 dst_x;       /* the delivered region's top-left */
+    uint32_t                 dst_y;
+    Scaler                   scaler;      /* used while copy and image sizes differ */
 
     bool                     mapped;      /* staging is mapped */
     bool                     delivered;   /* its image reached the frame since (re)duplicating */
@@ -171,8 +233,9 @@ struct DxgiState {
     UINT                     count;       /* duplicated outputs: 1, or all of them */
     bool                     all;         /* config.output "all" */
     UINT                     next;        /* output the next sweep starts with */
-    uint32_t                 width;       /* frame size */
+    uint32_t                 width;       /* delivered frame size (scale.to_w/h) */
     uint32_t                 height;
+    FrameScale               scale;
     /* Canvas mode ("all", or a rotated output): the frame is a CPU buffer
      * each output's image is copied into. Otherwise it is out[0]'s mapped
      * staging texture (zero-copy), at map_data/map_pitch. */
@@ -266,6 +329,73 @@ static void rotate_image(const uint8_t *src, uint32_t src_stride, uint32_t w, ui
     default:
         for (uint32_t y = 0; y < h; y++)
             memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * src_stride, (size_t)w * 4);
+    }
+}
+
+/* ── Size cap (pure) ─────────────────────────────────────────── */
+
+static bool scale_is_identity(const FrameScale &s) {
+    return s.from_w == s.to_w && s.from_h == s.to_h;
+}
+
+/* Unscaled frame coordinate v (an edge; may lie off the frame, as a
+ * pointer can) on the delivered frame: v * to / from rounded half up. */
+static LONG scale_coord(LONG v, uint32_t from, uint32_t to) {
+    const int64_t n = 2 * (int64_t)v * to + from, d = 2 * (int64_t)from;
+    return (LONG)(n >= 0 ? n / d : -((-n + d - 1) / d));
+}
+
+/* A length (a pointer shape side) scaled, at least 1. */
+static uint32_t scale_length(uint32_t n, uint32_t from, uint32_t to) {
+    const LONG v = scale_coord((LONG)n, from, to);
+    return v > 0 ? (uint32_t)v : 1;
+}
+
+/* The unscaled span [a, b) on the delivered frame (0..to): both edges
+ * scaled, so spans that abut still abut; one thinner than a delivered
+ * pixel still gets one. */
+static void scale_span(uint32_t a, uint32_t b, uint32_t from, uint32_t to,
+                       uint32_t *start, uint32_t *len) {
+    uint32_t s = (uint32_t)scale_coord((LONG)a, from, to);
+    uint32_t e = (uint32_t)scale_coord((LONG)b, from, to);
+    if (e == s) {
+        if (e < to) e++;
+        else s--;
+    }
+    *start = s;
+    *len = e - s;
+}
+
+/* The source pixel under the centre of pixel i when n pixels are point
+ * sampled onto m. */
+static uint32_t point_source(uint32_t i, uint32_t m, uint32_t n) {
+    return (uint32_t)((2 * (uint64_t)i + 1) * n / (2 * (uint64_t)m));
+}
+
+/* Area-average a sw x sh BGRA image into dw x dh: destination pixel (x, y)
+ * covers source [x, x + 1) * sw / dw by [y, y + 1) * sh / dh, and is the
+ * mean of the source pixels there weighted by how much of each it covers.
+ * The GPU pass (scale_hlsl) runs the same filter. */
+static void area_scale(const uint8_t *src, uint32_t src_pitch, uint32_t sw, uint32_t sh,
+                       uint8_t *dst, uint32_t dst_pitch, uint32_t dw, uint32_t dh) {
+    const double rx = (double)sw / dw, ry = (double)sh / dh;
+    for (uint32_t y = 0; y < dh; y++) {
+        const double y0 = y * ry, y1 = y + 1 == dh ? sh : (y + 1) * ry;
+        uint8_t *d = dst + (size_t)y * dst_pitch;
+        for (uint32_t x = 0; x < dw; x++, d += 4) {
+            const double x0 = x * rx, x1 = x + 1 == dw ? sw : (x + 1) * rx;
+            double sum[4] = {}, total = 0;
+            for (uint32_t sy = (uint32_t)y0; sy < sh && sy < y1; sy++) {
+                const double wy = (sy + 1 < y1 ? sy + 1 : y1) - (sy > y0 ? sy : y0);
+                const uint8_t *s = src + (size_t)sy * src_pitch;
+                for (uint32_t sx = (uint32_t)x0; sx < sw && sx < x1; sx++) {
+                    const double w = wy * ((sx + 1 < x1 ? sx + 1 : x1) - (sx > x0 ? sx : x0));
+                    for (int c = 0; c < 4; c++) sum[c] += s[(size_t)sx * 4 + c] * w;
+                    total += w;
+                }
+            }
+            for (int c = 0; c < 4; c++) d[c] = (uint8_t)(sum[c] / total + 0.5);
+        }
     }
 }
 
@@ -377,17 +507,79 @@ static bool pointer_drawn(const PointerState *p, uint32_t fw, uint32_t fh, Point
            pointer_clip(p->shape_info, p->x, p->y, fw, fh, r);
 }
 
-/* Repaint the pointer into a frame that holds either a fresh desktop copy
- * (under_rect empty) or the previous composited copy. Fails only when the
- * pixels under the pointer cannot be saved (out of memory). */
+/* Scale the validated shape like the frame into p->drawn (md-jie5). Colour
+ * shapes are area averaged: premultiplied alpha averages linearly.
+ * Monochrome and masked-colour pixels are AND/XOR operations on the frame,
+ * which cannot be averaged, so they are point sampled. Fails only when out
+ * of memory. */
+static bool pointer_scale_shape(PointerState *p, const FrameScale &s) {
+    const DXGI_OUTDUPL_POINTER_SHAPE_INFO &si = p->shape_info;
+    const bool mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
+    const uint32_t sw = si.Width, sh = pointer_shape_height(si);
+    const uint32_t dw = scale_length(sw, s.from_w, s.to_w), dh = scale_length(sh, s.from_h, s.to_h);
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO di = si;
+    di.Width = dw;
+    di.Height = mono ? dh * 2 : dh;
+    di.Pitch = mono ? (dw + 7) / 8 : dw * 4;
+    di.HotSpot = { scale_coord(si.HotSpot.x, s.from_w, s.to_w),
+                   scale_coord(si.HotSpot.y, s.from_h, s.to_h) };
+    const size_t need = (size_t)di.Pitch * di.Height;
+    if (need > p->drawn_cap) {
+        auto *grown = (uint8_t *)realloc(p->drawn, need);
+        if (!grown) return false;
+        p->drawn = grown;
+        p->drawn_cap = need;
+    }
+    if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+        area_scale(p->shape, si.Pitch, sw, sh, p->drawn, di.Pitch, dw, dh);
+    } else if (mono) {
+        memset(p->drawn, 0, need);
+        for (uint32_t plane = 0; plane < 2; plane++) /* AND mask, then XOR mask */
+            for (uint32_t y = 0; y < dh; y++) {
+                const uint8_t *row = p->shape + (size_t)(plane * sh + point_source(y, dh, sh)) * si.Pitch;
+                uint8_t *out = p->drawn + (size_t)(plane * dh + y) * di.Pitch;
+                for (uint32_t x = 0; x < dw; x++) {
+                    const uint32_t sx = point_source(x, dw, sw);
+                    if (row[sx / 8] & (0x80u >> (sx % 8))) out[x / 8] |= (uint8_t)(0x80u >> (x % 8));
+                }
+            }
+    } else {
+        for (uint32_t y = 0; y < dh; y++) {
+            const uint8_t *row = p->shape + (size_t)point_source(y, dh, sh) * si.Pitch;
+            for (uint32_t x = 0; x < dw; x++)
+                memcpy(p->drawn + (size_t)y * di.Pitch + (size_t)x * 4,
+                       row + (size_t)point_source(x, dw, sw) * 4, 4);
+        }
+    }
+    p->drawn_info = di;
+    p->drawn_valid = true;
+    return true;
+}
+
+/* Repaint the pointer into a frame of s.to_w x s.to_h pixels that holds
+ * either a fresh desktop copy (under_rect empty) or the previous composited
+ * copy; p->x/y are unscaled frame coordinates, mapped (with the shape)
+ * through s. Fails only when out of memory (the pixels under the pointer or
+ * the scaled shape). */
 static bool pointer_composite(PointerState *p, uint8_t *frame, uint32_t stride,
-                              uint32_t fw, uint32_t fh) {
+                              const FrameScale &s) {
     pointer_restore_under(p, frame, stride);
+    if (!p->visible || !p->has_shape) return true;
+    const uint8_t *shape = p->shape;
+    const DXGI_OUTDUPL_POINTER_SHAPE_INFO *si = &p->shape_info;
+    LONG x = p->x, y = p->y;
+    if (!scale_is_identity(s)) {
+        if (!p->drawn_valid && !pointer_scale_shape(p, s)) return false;
+        shape = p->drawn;
+        si = &p->drawn_info;
+        x = scale_coord(x, s.from_w, s.to_w);
+        y = scale_coord(y, s.from_h, s.to_h);
+    }
     PointerRect r;
-    if (!pointer_drawn(p, fw, fh, &r)) return true;
+    if (!pointer_clip(*si, x, y, s.to_w, s.to_h, &r)) return true;
     /* Without saved pixels the pointer could not be removed again. */
     if (!pointer_save_under(p, frame, stride, r)) return false;
-    pointer_blend(frame, stride, r, p->shape, p->shape_info, p->x, p->y);
+    pointer_blend(frame, stride, r, shape, *si, x, y);
     return true;
 }
 
@@ -427,6 +619,7 @@ static bool pointer_apply(PointerState *p, const DXGI_OUTDUPL_FRAME_INFO &info, 
  * An unusable shape is not drawn until the next valid one arrives. */
 static void pointer_fetch_shape(PointerState *p, IDXGIOutputDuplication *dup, UINT size) {
     p->has_shape = false;
+    p->drawn_valid = false;
     if (size > p->shape_cap) {
         auto *grown = (uint8_t *)realloc(p->shape, size);
         if (!grown) return;
@@ -593,13 +786,37 @@ static RECT frame_place(OutputDup *outs, UINT n) {
     return { (LONG)l, (LONG)t, (LONG)r, (LONG)b };
 }
 
-/* Lay the frame out over the duplicated outputs (frame_place) and allocate
- * the CPU frame canvas mode needs; gaps between outputs are opaque black.
- * Publishes the frame size and its desktop rectangle on ctx. */
+/* Output o's region on the delivered frame (md-jie5), and its copy: the
+ * image scaled to that region, in native orientation. Without a cap the
+ * region is the unscaled one and the copy is the image. */
+static void frame_region(const FrameScale &s, OutputDup *o) {
+    uint32_t w, h;
+    scale_span(o->frame_x, o->frame_x + o->width, s.from_w, s.to_w, &o->dst_x, &w);
+    scale_span(o->frame_y, o->frame_y + o->height, s.from_h, s.to_h, &o->dst_y, &h);
+    rotated_size(o->turns, w, h, &o->copy_w, &o->copy_h);
+}
+
+static bool output_scaled(const OutputDup &o) {
+    return o.copy_w != o.image_w || o.copy_h != o.image_h;
+}
+
+/* Lay the frame out over the duplicated outputs (frame_place), fit it to
+ * the size cap (frame_region) and allocate the CPU frame canvas mode needs;
+ * gaps between outputs are opaque black. Publishes the delivered frame size
+ * and the unscaled frame's desktop rectangle on ctx. */
 static HRESULT frame_layout(MdCaptureCtx *ctx, DxgiState *st) {
     const RECT b = frame_place(st->out, st->count);
-    st->width = (uint32_t)(b.right - b.left);
-    st->height = (uint32_t)(b.bottom - b.top);
+    const uint32_t full_w = (uint32_t)(b.right - b.left), full_h = (uint32_t)(b.bottom - b.top);
+    st->scale = { full_w, full_h, full_w, full_h };
+    if (md_capture_fit_size(full_w, full_h, ctx->config.max_width, ctx->config.max_height,
+                            &st->scale.to_w, &st->scale.to_h) != 0)
+        st->scale = { full_w, full_h, full_w, full_h }; /* an empty frame: nothing to fit */
+    st->width = st->scale.to_w;
+    st->height = st->scale.to_h;
+    for (UINT i = 0; i < st->count; i++) frame_region(st->scale, &st->out[i]);
+    /* The pointer's saved pixels and scaled shape belong to the old layout. */
+    st->pointer.under_rect.w = 0;
+    st->pointer.drawn_valid = false;
     st->canvas_mode = st->all || st->out[0].turns != 0;
     st->pending = false;
     if (st->canvas_mode) {
@@ -617,24 +834,216 @@ static HRESULT frame_layout(MdCaptureCtx *ctx, DxgiState *st) {
     ctx->width = st->width;
     ctx->height = st->height;
     /* One output: its physical rectangle (the frame is scaled onto it if its
-     * mode differs). "all": the frame's own bounds. */
+     * mode differs or the frame is capped). "all": the unscaled frame's own
+     * bounds. */
     const RECT &r = st->all ? b : st->out[0].rect;
     ctx->output_rect = { (int32_t)r.left, (int32_t)r.top, (uint32_t)(r.right - r.left),
                          (uint32_t)(r.bottom - r.top) };
     return S_OK;
 }
 
-/* Copy output o's mapped desktop image into its frame region (canvas mode),
+/* Copy output o's mapped (scaled) desktop image into its frame region (canvas mode),
  * first taking the pointer off the frame: the copy replaces the pixels its
  * save-under describes. */
 static void output_blit(DxgiState *st, const OutputDup &o, const uint8_t *image, uint32_t pitch) {
     const uint32_t stride = st->width * 4;
     if (st->pointer.under_rect.w) pointer_restore_under(&st->pointer, st->canvas, stride);
-    rotate_image(image, pitch, o.image_w, o.image_h, o.turns,
-                 st->canvas + (size_t)o.frame_y * stride + (size_t)o.frame_x * 4, stride);
+    rotate_image(image, pitch, o.copy_w, o.copy_h, o.turns,
+                 st->canvas + (size_t)o.dst_y * stride + (size_t)o.dst_x * 4, stride);
 }
 
-/* ── Device and duplication ──────────────────────────────────── */
+/* ── GPU downscale (md-jie5) ─────────────────────────────────── */
+
+/* area_scale on the GPU: target pixel (x, y) covers image pixels
+ * [x, x + 1) * ratio, and is their mean weighted by coverage. One triangle
+ * covers the target, so there is no vertex buffer. */
+static const char scale_hlsl[] = R"(
+Texture2D<float4> image : register(t0);
+cbuffer ScaleParams : register(b0) {
+    float2 ratio; /* image pixels per target pixel */
+    int2   last;  /* image size - 1 */
+};
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2); /* (0,0) (2,0) (0,2) */
+    return float4(t.x * 2 - 1, 1 - t.y * 2, 0, 1);
+}
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    float2 lo = floor(pos.xy) * ratio, hi = lo + ratio;
+    int2 first = (int2)lo, end = min((int2)ceil(hi) - 1, last);
+    float4 sum = 0;
+    float total = 0;
+    [loop] for (int y = first.y; y <= end.y; y++) {
+        float wy = min(hi.y, (float)(y + 1)) - max(lo.y, (float)y);
+        [loop] for (int x = first.x; x <= end.x; x++) {
+            float w = wy * (min(hi.x, (float)(x + 1)) - max(lo.x, (float)x));
+            sum += image.Load(int3(x, y, 0)) * w;
+            total += w;
+        }
+    }
+    return sum / total;
+}
+)";
+
+struct ScaleParams {
+    float   ratio[2];
+    int32_t last[2];
+};
+
+static HRESULT compile_shader(const char *entry, const char *target, ID3DBlob **code) {
+    /* In System32 since Windows 8.1; resolved at run time, so linking needs
+     * no import library for it. */
+    static const auto compile =
+        (pD3DCompile)md_win_dpi_proc(L"d3dcompiler_47.dll", "D3DCompile");
+    if (!compile) {
+        MD_LOG_E("a capture size cap needs D3DCompile from d3dcompiler_47.dll");
+        return E_NOINTERFACE;
+    }
+    ID3DBlob *errors = nullptr;
+    const HRESULT hr = compile(scale_hlsl, sizeof(scale_hlsl) - 1, "md_scale", nullptr, nullptr,
+                               entry, target,
+                               D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                               code, &errors);
+    if (FAILED(hr))
+        MD_LOG_E("scale shader %s does not compile (0x%08lx): %s", entry, hr,
+                 errors ? (const char *)errors->GetBufferPointer() : "");
+    safe_release(errors);
+    return hr;
+}
+
+/* What scaler_prepare sizes for one image/target size pair. */
+static void scaler_release_sized(Scaler *s) {
+    safe_release(s->source_srv);
+    safe_release(s->source);
+    safe_release(s->target_rtv);
+    safe_release(s->target);
+    safe_release(s->params);
+}
+
+static void scaler_release(Scaler *s) {
+    scaler_release_sized(s);
+    safe_release(s->ps);
+    safe_release(s->vs);
+}
+
+/* Make s scale a src_w x src_h image to dst_w x dst_h on `device`: shaders
+ * once per device, target and parameters per size pair. */
+static HRESULT scaler_prepare(Scaler *s, ID3D11Device *device, uint32_t src_w, uint32_t src_h,
+                              uint32_t dst_w, uint32_t dst_h) {
+    HRESULT hr = S_OK;
+    if (!s->vs) {
+        const D3D_FEATURE_LEVEL level = device->GetFeatureLevel();
+        if (level < D3D_FEATURE_LEVEL_10_0) {
+            MD_LOG_E("a capture size cap needs Direct3D feature level 10_0 (the adapter has "
+                     "0x%x)", (unsigned)level);
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+        ID3DBlob *vs = nullptr, *ps = nullptr;
+        hr = compile_shader("vs_main", "vs_4_0", &vs);
+        if (SUCCEEDED(hr)) hr = compile_shader("ps_main", "ps_4_0", &ps);
+        if (SUCCEEDED(hr))
+            hr = device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
+                                            &s->vs);
+        if (SUCCEEDED(hr))
+            hr = device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
+                                           &s->ps);
+        safe_release(vs);
+        safe_release(ps);
+        if (FAILED(hr)) {
+            MD_LOG_E("failed to create the scale shaders: 0x%08lx", hr);
+            scaler_release(s);
+            return hr;
+        }
+    }
+    if (s->target && s->src_w == src_w && s->src_h == src_h && s->dst_w == dst_w &&
+        s->dst_h == dst_h)
+        return S_OK;
+    scaler_release_sized(s);
+    s->src_w = src_w;
+    s->src_h = src_h;
+    s->dst_w = dst_w;
+    s->dst_h = dst_h;
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = dst_w;
+    td.Height           = dst_h;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_RENDER_TARGET;
+    hr = device->CreateTexture2D(&td, nullptr, &s->target);
+    if (SUCCEEDED(hr)) hr = device->CreateRenderTargetView(s->target, nullptr, &s->target_rtv);
+    const ScaleParams params = { { (float)((double)src_w / dst_w), (float)((double)src_h / dst_h) },
+                                 { (int32_t)src_w - 1, (int32_t)src_h - 1 } };
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = sizeof(params);
+    bd.Usage     = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = &params;
+    if (SUCCEEDED(hr)) hr = device->CreateBuffer(&bd, &init, &s->params);
+    if (FAILED(hr)) {
+        MD_LOG_E("failed to create the %ux%u scale target: 0x%08lx", dst_w, dst_h, hr);
+        scaler_release_sized(s);
+    }
+    return hr;
+}
+
+/* Render `image` (src_w x src_h) scaled into s->target. The shader samples
+ * the image itself when it is bindable as a shader resource, else a copy. */
+static HRESULT scaler_run(Scaler *s, ID3D11Device *device, ID3D11DeviceContext *dc,
+                          ID3D11Texture2D *image) {
+    D3D11_TEXTURE2D_DESC d = {};
+    image->GetDesc(&d);
+    ID3D11ShaderResourceView *srv = nullptr;
+    HRESULT hr = S_OK;
+    if (!s->copy_source && (d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        hr = device->CreateShaderResourceView(image, nullptr, &srv);
+        if (FAILED(hr)) MD_LOG_I("desktop image not bindable (0x%08lx); scaling a copy", hr);
+    }
+    if (!srv) {
+        s->copy_source = true;
+        hr = S_OK;
+        if (!s->source) {
+            D3D11_TEXTURE2D_DESC sd = {};
+            sd.Width            = s->src_w;
+            sd.Height           = s->src_h;
+            sd.MipLevels        = 1;
+            sd.ArraySize        = 1;
+            sd.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+            sd.SampleDesc.Count = 1;
+            sd.Usage            = D3D11_USAGE_DEFAULT;
+            sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+            hr = device->CreateTexture2D(&sd, nullptr, &s->source);
+            if (SUCCEEDED(hr)) hr = device->CreateShaderResourceView(s->source, nullptr, &s->source_srv);
+            if (FAILED(hr)) {
+                safe_release(s->source);
+                return hr;
+            }
+        }
+        dc->CopyResource(s->source, image);
+        srv = s->source_srv;
+        srv->AddRef();
+    }
+    const D3D11_VIEWPORT viewport = { 0, 0, (float)s->dst_w, (float)s->dst_h, 0, 1 };
+    dc->IASetInputLayout(nullptr);
+    dc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    dc->VSSetShader(s->vs, nullptr, 0);
+    dc->PSSetShader(s->ps, nullptr, 0);
+    dc->PSSetConstantBuffers(0, 1, &s->params);
+    dc->PSSetShaderResources(0, 1, &srv);
+    dc->RSSetViewports(1, &viewport);
+    dc->OMSetRenderTargets(1, &s->target_rtv, nullptr);
+    dc->Draw(3, 0);
+    /* Unbind the image: it goes back to DWM at ReleaseFrame. */
+    ID3D11ShaderResourceView *none = nullptr;
+    dc->PSSetShaderResources(0, 1, &none);
+    dc->OMSetRenderTargets(0, nullptr, nullptr);
+    srv->Release();
+    return hr;
+}
+
+/* ── Device and duplication ──────────────────────────────────────────── */
 
 static void output_unmap(OutputDup *o) {
     if (o->mapped) {
@@ -649,6 +1058,8 @@ static void unmap_all(DxgiState *st) {
 
 static void output_release(OutputDup *o) {
     output_unmap(o);
+    scaler_release(&o->scaler);
+    o->scaler.copy_source = false;
     safe_release(o->staging);
     safe_release(o->duplication);
     safe_release(o->context);
@@ -666,16 +1077,17 @@ static void free_state(DxgiState *st) {
     free(st->canvas);
     free(st->pointer.shape);
     free(st->pointer.under);
+    free(st->pointer.drawn);
     free(st);
 }
 
-/* Create a CPU-accessible staging texture the size of the output's desktop
- * image; the pointer is composited into it in zero-copy mode, so it is
- * writable when show_cursor is set. */
+/* Create a CPU-accessible staging texture the size of the output's copy
+ * (its desktop image, scaled under a size cap); the pointer is composited
+ * into it in zero-copy mode, so it is writable when show_cursor is set. */
 static HRESULT create_staging_texture(const MdCaptureCtx *ctx, OutputDup *o) {
     D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width              = o->image_w;
-    desc.Height             = o->image_h;
+    desc.Width              = o->copy_w;
+    desc.Height             = o->copy_h;
     desc.MipLevels          = 1;
     desc.ArraySize          = 1;
     desc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -687,10 +1099,39 @@ static HRESULT create_staging_texture(const MdCaptureCtx *ctx, OutputDup *o) {
     return o->device->CreateTexture2D(&desc, nullptr, &o->staging);
 }
 
+/* Size output o's staging texture, and its scaler while the copy is scaled,
+ * to the copy frame_layout chose. */
+static HRESULT output_prepare(const MdCaptureCtx *ctx, OutputDup *o) {
+    D3D11_TEXTURE2D_DESC d = {};
+    if (o->staging) o->staging->GetDesc(&d);
+    if (!o->staging || d.Width != o->copy_w || d.Height != o->copy_h) {
+        output_unmap(o);
+        safe_release(o->staging);
+        const HRESULT hr = create_staging_texture(ctx, o);
+        if (FAILED(hr)) {
+            MD_LOG_E("failed to create staging texture: 0x%08lx", hr);
+            return hr;
+        }
+    }
+    if (!output_scaled(*o)) {
+        scaler_release(&o->scaler);
+        return S_OK;
+    }
+    return scaler_prepare(&o->scaler, o->device, o->image_w, o->image_h, o->copy_w, o->copy_h);
+}
+
+/* frame_layout, then size every output's copy to it (output_prepare). */
+static HRESULT frame_setup(MdCaptureCtx *ctx, DxgiState *st) {
+    HRESULT hr = frame_layout(ctx, st);
+    if (FAILED(hr)) MD_LOG_E("out of memory for the %ux%u frame", st->width, st->height);
+    for (UINT k = 0; k < st->count && SUCCEEDED(hr); k++) hr = output_prepare(ctx, &st->out[k]);
+    return hr;
+}
+
 /* Duplicate entry i of `outs` into o: create the D3D11 device on its adapter
- * if needed (DuplicateOutput requires it), and size the staging texture and
- * frame region to its current mode and rotation. */
-static HRESULT output_open(const MdCaptureCtx *ctx, OutputDup *o, const OutputList &outs, UINT i) {
+ * if needed (DuplicateOutput requires it), and size its image and frame
+ * region to its current mode and rotation (frame_setup sizes its copy). */
+static HRESULT output_open(OutputDup *o, const OutputList &outs, UINT i) {
     DXGI_ADAPTER_DESC1 adapter_desc = {};
     HRESULT hr = outs.adapter[i]->GetDesc1(&adapter_desc);
     if (SUCCEEDED(hr) && o->device &&
@@ -729,18 +1170,7 @@ static HRESULT output_open(const MdCaptureCtx *ctx, OutputDup *o, const OutputLi
     o->duplication->GetDesc(&dupl_desc);
     const DXGI_MODE_ROTATION rotation = dupl_desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED
                                       ? dupl_desc.Rotation : o->desc.Rotation;
-    const bool resized = !o->staging || dupl_desc.ModeDesc.Width != o->image_w ||
-                         dupl_desc.ModeDesc.Height != o->image_h;
     output_configure(o, dupl_desc.ModeDesc.Width, dupl_desc.ModeDesc.Height, rotation);
-    if (resized) {
-        safe_release(o->staging);
-        hr = create_staging_texture(ctx, o);
-        if (FAILED(hr)) {
-            MD_LOG_E("failed to create staging texture: 0x%08lx", hr);
-            safe_release(o->duplication);
-            return hr;
-        }
-    }
     char name[128];
     output_name(o->desc, name, (int)sizeof(name));
     const RECT &r = o->rect;
@@ -777,21 +1207,22 @@ static HRESULT open_duplication(MdCaptureCtx *ctx, DxgiState *st) {
         return DXGI_ERROR_NOT_FOUND;
     }
     for (UINT k = n; k < MAX_OUTPUTS; k++) output_release(&st->out[k]); /* gone since */
-    for (UINT k = 0; k < n && SUCCEEDED(hr); k++) hr = output_open(ctx, &st->out[k], outs, picks[k]);
+    for (UINT k = 0; k < n && SUCCEEDED(hr); k++) hr = output_open(&st->out[k], outs, picks[k]);
     outputs_release(&outs);
     st->count = n;
     st->all = all;
-    if (SUCCEEDED(hr)) {
-        hr = frame_layout(ctx, st);
-        if (FAILED(hr)) MD_LOG_E("out of memory for the %ux%u frame", st->width, st->height);
-    }
+    if (SUCCEEDED(hr)) hr = frame_setup(ctx, st);
     if (FAILED(hr)) {
         for (UINT k = 0; k < n; k++) safe_release(st->out[k].duplication);
         return hr;
     }
     if (all)
-        MD_LOG_I("capturing %u output(s) as one %ux%u frame at %d,%d", n, st->width, st->height,
-                 ctx->output_rect.x, ctx->output_rect.y);
+        MD_LOG_I("capturing %u output(s) as one %ux%u frame at %d,%d", n, st->scale.from_w,
+                 st->scale.from_h, ctx->output_rect.x, ctx->output_rect.y);
+    if (!scale_is_identity(st->scale))
+        MD_LOG_I("frames scaled on the GPU from %ux%u to %ux%u (capture size cap %ux%u)",
+                 st->scale.from_w, st->scale.from_h, st->width, st->height,
+                 ctx->config.max_width, ctx->config.max_height);
     /* A new duplication resends the pointer; the frame is stale. */
     st->pointer.visible = false;
     st->pointer.has_shape = false;
@@ -844,12 +1275,14 @@ static int take_update(MdCaptureCtx *ctx, DxgiState *st, UINT i, UINT wait, Swee
     const bool desktop = info.LastPresentTime.QuadPart != 0 || !o.delivered;
     bool pointer = false;
     if (cursor) {
+        /* In unscaled frame coordinates; pointer_composite scales them. */
+        const uint32_t fw = st->scale.from_w, fh = st->scale.from_h;
         PointerRect r;
-        const bool drawn = pointer_drawn(&st->pointer, st->width, st->height, &r);
+        const bool drawn = pointer_drawn(&st->pointer, fw, fh, &r);
         if (info.PointerShapeBufferSize)
             pointer_fetch_shape(&st->pointer, o.duplication, info.PointerShapeBufferSize);
         pointer = pointer_apply(&st->pointer, info, i, (LONG)o.frame_x, (LONG)o.frame_y, drawn,
-                                info.PointerShapeBufferSize != 0, st->width, st->height);
+                                info.PointerShapeBufferSize != 0, fw, fh);
     }
     if (!desktop && !pointer) {
         st->skipped++;
@@ -869,8 +1302,14 @@ static int take_update(MdCaptureCtx *ctx, DxgiState *st, UINT i, UINT wait, Swee
         if (SUCCEEDED(hr)) {
             texture->GetDesc(&image);
             if (image.Width == o.image_w && image.Height == o.image_h) {
-                o.context->CopyResource(o.staging, texture);
-                if (!st->canvas_mode) st->pointer.under_rect.w = 0; /* copy replaced them */
+                if (output_scaled(o)) {
+                    hr = scaler_run(&o.scaler, o.device, o.context, texture);
+                    if (SUCCEEDED(hr)) o.context->CopyResource(o.staging, o.scaler.target);
+                } else {
+                    o.context->CopyResource(o.staging, texture);
+                }
+                /* The copy replaced the pixels the save-under describes. */
+                if (SUCCEEDED(hr) && !st->canvas_mode) st->pointer.under_rect.w = 0;
             }
             safe_release(texture);
         }
@@ -921,13 +1360,6 @@ static int take_update(MdCaptureCtx *ctx, DxgiState *st, UINT i, UINT wait, Swee
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int dxgi_init(MdCaptureCtx *ctx) {
-    /* Frames are the mapped staging copy of the desktop image; a size cap
-     * would need a GPU scaling pass before it (md-n9p2 follow-up). */
-    if (ctx->config.max_width || ctx->config.max_height) {
-        MD_LOG_E("a capture size cap (max %ux%u) is not supported by DXGI capture",
-                 ctx->config.max_width, ctx->config.max_height);
-        return -1;
-    }
     auto *st = (DxgiState *)calloc(1, sizeof(DxgiState));
     if (!st) return -1;
     QueryPerformanceFrequency(&st->qpc_hz);
@@ -1003,7 +1435,7 @@ static int dxgi_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) 
         data = st->map_data;
         stride = st->map_pitch;
     }
-    if (cursor && !pointer_composite(&st->pointer, data, stride, st->width, st->height)) {
+    if (cursor && !pointer_composite(&st->pointer, data, stride, st->scale)) {
         unmap_all(st);
         for (UINT i = 0; i < st->count; i++) st->out[i].delivered = false;
         MD_LOG_E("out of memory compositing the pointer");

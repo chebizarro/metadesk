@@ -167,7 +167,7 @@ The output rectangle does not change. `md_input_map_to_output` already scales be
 | Platform | Size cap |
 |---|---|
 | macOS (ScreenCaptureKit) | Supported. Scaled in hardware through `SCStreamConfiguration` width/height, and re-applied when the display changes mode |
-| Windows (DXGI) | Not supported. Frames are the mapped staging copy of the desktop image, so a GPU scaling pass would be needed. The host rejects the flag and init fails |
+| Windows (DXGI) | Supported (md-jie5). Each output's desktop image is scaled on the GPU before the staging copy by an area-averaging pixel shader (no aliasing at any ratio), so only the scaled image is read back. Rotation, "all" (the cap bounds the composed frame) and the composited pointer (drawn at its scaled position, shape scaled) follow. An unrotated single output stays zero-copy |
 | Linux (PipeWire) | Not supported. The compositor sets the monitor stream's size. The host rejects the flag and init fails |
 
 #### 2.3.2 Accessibility Tree HAL

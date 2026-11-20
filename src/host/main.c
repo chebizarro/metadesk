@@ -490,7 +490,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --capture-forget-on-stall  Opt in to token removal after broken capture\n");
     fprintf(stderr, "  --capture-output SEL  Display to capture (default: primary): index; Windows\n"
                     "                   device name (\\\\.\\DISPLAY2); macOS id:CGDirectDisplayID or name\n");
-    fprintf(stderr, "  --capture-max-size WxH  macOS: scale frames down to fit WxH (aspect kept;\n"
+    fprintf(stderr, "  --capture-max-size WxH  macOS, Windows: scale frames down to fit WxH (aspect kept;\n"
                     "                   0 = unbounded, e.g. 1920x0), e.g. the display's point size\n");
     fprintf(stderr, "  --npub NPUB      Require FIPS client npub for auth\n");
     fprintf(stderr, "  --fips-control PATH  FIPS daemon control socket override\n");
@@ -832,15 +832,11 @@ int main(int argc, char **argv) {
                                 "or %u..16384, not both 0\n", MD_INPUT_MIN_SCREEN_DIMENSION);
                 return 1;
             }
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
             capture_max_w = (uint32_t)mw;
             capture_max_h = (uint32_t)mh;
 #else
-#  ifdef _WIN32
-            const char *platform = "Windows (DXGI)";
-#  else
             const char *platform = "Linux (PipeWire)";
-#  endif
             fprintf(stderr, "ERROR: --capture-max-size is not supported on %s: frames are "
                             "captured at the display's pixels (only macOS scales in capture)\n",
                     platform);

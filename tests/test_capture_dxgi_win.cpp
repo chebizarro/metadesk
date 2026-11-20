@@ -48,6 +48,10 @@
  * fake that DPI-virtualizes a synthetic mixed-DPI layout for threads that
  * are not per-monitor aware, as Windows does, and forwards real monitors.
  * The VM has one output at 100%, so mixed DPI is covered synthetically only.
+ *
+ * md-jie5: the size cap's math, layouts and scaled pointer are synthetic
+ * cells; the GPU scaler runs on a real device in both modes against the CPU
+ * filter; the console runs capped frames, rotation, pointer and "all" cells.
  */
 #include <windows.h>
 #include "../src/core/win_dpi.h"
@@ -98,6 +102,7 @@ static BOOL WINAPI dpi_monitor_info(HMONITOR monitor, LPMONITORINFO mi) {
 #undef GetMonitorInfoW
 
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -328,7 +333,7 @@ static void all_outputs_unit_tests() {
         p.has_shape = p.visible = true;
         p.x = 0;
         p.y = 0;
-        CHECK(pointer_composite(&p, st.canvas, 11 * 4, 11, 4) && p.under_rect.w == 2);
+        CHECK(pointer_composite(&p, st.canvas, 11 * 4, st.scale) && p.under_rect.w == 2);
         CHECK(memcmp(st.canvas, expect.data(), expect.size() * 4) != 0);
         output_blit(&st, st.out[0], first.data(), iw[0] * 4 + 8);
         CHECK(p.under_rect.w == 0 && memcmp(st.canvas, expect.data(), expect.size() * 4) == 0);
@@ -437,6 +442,425 @@ static void dpi_unit_tests() {
          "'all' regions abut, UIA physical points map to frame pixels");
 }
 
+/* ── Size cap (md-jie5) ──────────────────────────────────────── */
+
+/* Deterministic pseudo-random bytes. */
+static uint32_t lcg(uint32_t *s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+/* A single-output layout: an image of w x h shown with rotation r at the
+ * desktop origin, laid out under a max_w x max_h cap. */
+static void layout_one(MdCaptureCtx *ctx, DxgiState *st, uint32_t w, uint32_t h,
+                       DXGI_MODE_ROTATION r, uint32_t max_w, uint32_t max_h) {
+    ctx->config.max_width = max_w;
+    ctx->config.max_height = max_h;
+    st->count = 1;
+    st->all = false;
+    output_configure(&st->out[0], w, h, r);
+    st->out[0].rect = { 0, 0, (LONG)st->out[0].width, (LONG)st->out[0].height };
+    CHECK(SUCCEEDED(frame_layout(ctx, st)));
+}
+
+static void size_cap_unit_tests() {
+    /* Coordinates: round half up, negatives too (a pointer left of the
+     * frame); identity without a cap. */
+    CHECK(scale_coord(0, 1000, 500) == 0 && scale_coord(1000, 1000, 500) == 500);
+    CHECK(scale_coord(3, 2, 1) == 2 && scale_coord(1, 2, 1) == 1 && scale_coord(-1, 2, 1) == 0);
+    CHECK(scale_coord(-3, 2, 1) == -1 && scale_coord(-4, 2, 1) == -2);
+    CHECK(scale_coord(-3, 1000, 500) == -1 && scale_coord(-1, 1000, 500) == 0);
+    for (LONG v : { -40L, -1L, 0L, 1L, 767L, 768L, 5000L }) CHECK(scale_coord(v, 768, 768) == v);
+    CHECK(scale_length(32, 1024, 640) == 20 && scale_length(32, 768, 300) == 13);
+    CHECK(scale_length(1, 1000, 1) == 1); /* never 0 */
+    uint32_t s0, n0, s1, n1;
+    scale_span(0, 2560, 5640, 2820, &s0, &n0);
+    scale_span(2560, 4480, 5640, 2820, &s1, &n1);
+    CHECK(s0 == 0 && n0 == 1280 && s1 == 1280 && n1 == 960 && s0 + n0 == s1); /* abut */
+    scale_span(10, 11, 1000, 10, &s0, &n0);  /* thinner than a pixel */
+    CHECK(s0 == 0 && n0 == 1);
+    scale_span(999, 1000, 1000, 10, &s0, &n0); /* ... at the far edge */
+    CHECK(s0 == 9 && n0 == 1);
+    CHECK(point_source(0, 2, 4) == 1 && point_source(1, 2, 4) == 3);
+    CHECK(point_source(0, 13, 32) == 1 && point_source(12, 13, 32) == 30);
+    for (uint32_t i = 0; i < 7; i++) CHECK(point_source(i, 7, 7) == i);
+
+    /* Area averaging: 3x1 -> 2x1 weighs the middle pixel half to each side;
+     * 2x2 -> 1x1 is the mean; uniform stays uniform; same size is a copy. */
+    {
+        const uint8_t row[3 * 4] = { 0, 30, 90, 255,  60, 60, 60, 255,  120, 90, 30, 255 };
+        uint8_t out[2 * 4];
+        area_scale(row, sizeof(row), 3, 1, out, sizeof(out), 2, 1);
+        CHECK(out[0] == 20 && out[1] == 40 && out[2] == 80 && out[3] == 255);
+        CHECK(out[4] == 100 && out[5] == 80 && out[6] == 40);
+        const uint8_t quad[2 * 2 * 4] = { 0, 0, 0, 0,  100, 0, 0, 0,  0, 200, 0, 0,  3, 0, 255, 255 };
+        uint8_t one[4];
+        area_scale(quad, 8, 2, 2, one, 4, 1, 1);
+        CHECK(one[0] == 26 && one[1] == 50 && one[2] == 64 && one[3] == 64);
+        std::vector<uint8_t> flat(37 * 23 * 4), reduced(16 * 10 * 4);
+        for (size_t i = 0; i < flat.size(); i += 4) {
+            flat[i] = 10; flat[i + 1] = 100; flat[i + 2] = 200; flat[i + 3] = 255;
+        }
+        area_scale(flat.data(), 37 * 4, 37, 23, reduced.data(), 16 * 4, 16, 10);
+        for (size_t i = 0; i < reduced.size(); i += 4)
+            CHECK(reduced[i] == 10 && reduced[i + 1] == 100 && reduced[i + 2] == 200 && reduced[i + 3] == 255);
+        uint32_t seed = 7;
+        std::vector<uint8_t> noise(9 * 5 * 4 + 5 * 12), copy(9 * 5 * 4);
+        for (uint8_t &b : noise) b = (uint8_t)lcg(&seed);
+        area_scale(noise.data(), 9 * 4 + 12, 9, 5, copy.data(), 9 * 4, 9, 5);
+        for (uint32_t y = 0; y < 5; y++)
+            CHECK(memcmp(&copy[y * 9 * 4], &noise[y * (9 * 4 + 12)], 9 * 4) == 0);
+    }
+    puts("PASS size cap math: rounding (negatives), abutting and thin spans, point and area "
+         "sampling (weights, mean, uniform, identity)");
+
+    /* Layout: the cap fits the frame (aspect kept) and the copy is the
+     * image scaled to its region; the output rectangle stays physical. */
+    {
+        MdCaptureCtx ctx = {};
+        DxgiState st = {};
+        layout_one(&ctx, &st, 1920, 1080, DXGI_MODE_ROTATION_IDENTITY, 1280, 0);
+        CHECK(ctx.width == 1280 && ctx.height == 720 && st.width == 1280 && st.height == 720);
+        CHECK(st.scale.from_w == 1920 && st.scale.from_h == 1080 && !scale_is_identity(st.scale));
+        CHECK(st.out[0].copy_w == 1280 && st.out[0].copy_h == 720 && output_scaled(st.out[0]));
+        CHECK(st.out[0].dst_x == 0 && st.out[0].dst_y == 0 && !st.canvas_mode);
+        CHECK(ctx.output_rect.width == 1920 && ctx.output_rect.height == 1080);
+        /* A cap the frame fits, or none: nothing is scaled. */
+        for (const uint32_t cap : { 0u, 1920u, 4000u }) {
+            layout_one(&ctx, &st, 1920, 1080, DXGI_MODE_ROTATION_IDENTITY, cap, cap);
+            CHECK(scale_is_identity(st.scale) && !output_scaled(st.out[0]));
+            CHECK(ctx.width == 1920 && ctx.height == 1080 && st.out[0].copy_w == 1920);
+        }
+        layout_one(&ctx, &st, 1920, 1080, DXGI_MODE_ROTATION_IDENTITY, 0, 1080);
+        CHECK(scale_is_identity(st.scale));
+        /* Odd ratio: 1024x768 into 700x700 is 700x525 (aspect 4:3 kept). */
+        layout_one(&ctx, &st, 1024, 768, DXGI_MODE_ROTATION_IDENTITY, 700, 700);
+        CHECK(ctx.width == 700 && ctx.height == 525 && st.out[0].copy_w == 700);
+        /* Rotated: the cap applies in desktop orientation, the copy stays in
+         * the image's native orientation (CPU-rotated into the frame). */
+        layout_one(&ctx, &st, 1920, 1080, DXGI_MODE_ROTATION_ROTATE90, 0, 960);
+        CHECK(ctx.width == 540 && ctx.height == 960 && st.canvas_mode);
+        CHECK(st.out[0].copy_w == 960 && st.out[0].copy_h == 540);
+        CHECK(st.canvas_cap >= 540u * 960 * 4);
+        layout_one(&ctx, &st, 1024, 768, DXGI_MODE_ROTATION_ROTATE270, 640, 0);
+        CHECK(ctx.width == 640 && ctx.height == 853 && st.out[0].copy_w == 853 &&
+              st.out[0].copy_h == 640);
+        free(st.canvas);
+    }
+    /* "all": the bounding frame is capped and every region follows it, the
+     * edges shared by abutting outputs staying shared. */
+    {
+        MdCaptureCtx ctx = {};
+        ctx.config.max_width = 2820;
+        DxgiState st = {};
+        st.count = 3;
+        st.all = true;
+        st.out[0].rect = { 0, 0, 1920, 1080 };
+        output_configure(&st.out[0], 1920, 1080, DXGI_MODE_ROTATION_IDENTITY);
+        st.out[1].rect = { -2560, -200, 0, 1240 };
+        output_configure(&st.out[1], 2560, 1440, DXGI_MODE_ROTATION_IDENTITY);
+        st.out[2].rect = { 2000, 100, 3080, 2020 };
+        output_configure(&st.out[2], 1920, 1080, DXGI_MODE_ROTATION_ROTATE90);
+        CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+        CHECK(ctx.width == 2820 && ctx.height == 1110 && st.canvas_mode);
+        CHECK(ctx.output_rect.x == -2560 && ctx.output_rect.width == 5640 &&
+              ctx.output_rect.height == 2220);
+        CHECK(st.out[1].dst_x == 0 && st.out[1].dst_y == 0 && st.out[1].copy_w == 1280 &&
+              st.out[1].copy_h == 720);
+        CHECK(st.out[0].dst_x == 1280 && st.out[0].dst_y == 100 && st.out[0].copy_w == 960 &&
+              st.out[0].copy_h == 540);
+        CHECK(st.out[2].dst_x == 2280 && st.out[2].dst_y == 150 && st.out[2].copy_w == 960 &&
+              st.out[2].copy_h == 540); /* a 540x960 region, native 960x540 */
+        free(st.canvas);
+    }
+    /* Random rows of abutting outputs (some rotated, with gaps) under random
+     * caps: regions are never empty, stay inside the frame, and abut where
+     * the outputs do. */
+    {
+        uint32_t seed = 12345;
+        for (int round = 0; round < 300; round++) {
+            MdCaptureCtx ctx = {};
+            DxgiState st = {};
+            st.all = true;
+            st.count = 1 + lcg(&seed) % 4;
+            LONG x = -(LONG)(lcg(&seed) % 2000);
+            bool abut[MAX_OUTPUTS] = {};
+            for (UINT i = 0; i < st.count; i++) {
+                const DXGI_MODE_ROTATION r = lcg(&seed) % 3 ? DXGI_MODE_ROTATION_IDENTITY
+                                                            : DXGI_MODE_ROTATION_ROTATE90;
+                output_configure(&st.out[i], 1 + lcg(&seed) % 700, 1 + lcg(&seed) % 500, r);
+                abut[i] = i > 0 && lcg(&seed) % 2;
+                if (i > 0 && !abut[i]) x += 1 + lcg(&seed) % 200;
+                const LONG y = (LONG)(lcg(&seed) % 300) - 150;
+                st.out[i].rect = { x, y, x + (LONG)st.out[i].width, y + (LONG)st.out[i].height };
+                x += (LONG)st.out[i].width;
+            }
+            ctx.config.max_width = lcg(&seed) % 2 ? 1 + lcg(&seed) % 2000 : 0;
+            ctx.config.max_height = !ctx.config.max_width || lcg(&seed) % 2 ? 1 + lcg(&seed) % 1000 : 0;
+            CHECK(SUCCEEDED(frame_layout(&ctx, &st)));
+            uint32_t fit_w, fit_h;
+            CHECK(md_capture_fit_size(st.scale.from_w, st.scale.from_h, ctx.config.max_width,
+                                      ctx.config.max_height, &fit_w, &fit_h) == 0);
+            CHECK(ctx.width == fit_w && ctx.height == fit_h);
+            CHECK(ctx.width <= st.scale.from_w && ctx.height <= st.scale.from_h);
+            for (UINT i = 0; i < st.count; i++) {
+                const OutputDup &o = st.out[i];
+                uint32_t rw, rh;
+                rotated_size(o.turns, o.copy_w, o.copy_h, &rw, &rh);
+                CHECK(rw >= 1 && rh >= 1 && rw <= o.width && rh <= o.height);
+                CHECK(o.dst_x + rw <= ctx.width && o.dst_y + rh <= ctx.height);
+                if (abut[i]) {
+                    const OutputDup &l = st.out[i - 1];
+                    uint32_t lw, lh;
+                    rotated_size(l.turns, l.copy_w, l.copy_h, &lw, &lh);
+                    CHECK(l.dst_x + lw == o.dst_x || (lw == 1 && l.dst_x == o.dst_x) ||
+                          (rw == 1 && l.dst_x + lw == o.dst_x + 1)); /* thin regions */
+                }
+            }
+            free(st.canvas);
+        }
+    }
+    puts("PASS size cap layout: fit (aspect, never up), copies in native orientation, "
+         "rotation, 'all' regions abut and stay inside the frame (300 random layouts)");
+
+    /* Pointer shapes scaled like the frame: colour area averaged, monochrome
+     * and masked colour point sampled, each keeping its type. */
+    {
+        PointerState p = {};
+        const FrameScale half = { 100, 100, 50, 50 };
+        /* Colour 4x4: quadrants red, clear, 50% blue, white. */
+        uint8_t color[4 * 4 * 4];
+        for (uint32_t y = 0; y < 4; y++)
+            for (uint32_t x = 0; x < 4; x++) {
+                const int q = (y >= 2) * 2 + (x >= 2);
+                const uint8_t px[4][4] = { { 0, 0, 255, 255 }, { 0, 0, 0, 0 },
+                                           { 128, 0, 0, 128 }, { 255, 255, 255, 255 } };
+                memcpy(&color[(y * 4 + x) * 4], px[q], 4);
+            }
+        p.shape = color;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, 4, 4, 16);
+        p.shape_info.HotSpot = { 3, 1 };
+        CHECK(pointer_scale_shape(&p, half) && p.drawn_valid);
+        CHECK(p.drawn_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR && p.drawn_info.Width == 2 &&
+              p.drawn_info.Height == 2 && p.drawn_info.Pitch == 8);
+        CHECK(p.drawn_info.HotSpot.x == 2 && p.drawn_info.HotSpot.y == 1);
+        const uint8_t want[2 * 2 * 4] = { 0, 0, 255, 255,  0, 0, 0, 0,  128, 0, 0, 128,  255, 255, 255, 255 };
+        CHECK(memcmp(p.drawn, want, sizeof(want)) == 0);
+        /* Monochrome 8x8 (AND rows 0-7, XOR rows 8-15) to 4x4: every other
+         * column and row, from the pixel under each centre. */
+        uint8_t mono[16];
+        for (int y = 0; y < 8; y++) {
+            mono[y] = (uint8_t)(y % 2 ? 0x55 : 0x0F);       /* AND */
+            mono[8 + y] = (uint8_t)(y < 4 ? 0xF0 : 0x33);   /* XOR */
+        }
+        p.shape = mono;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, 8, 16, 1);
+        CHECK(pointer_scale_shape(&p, half));
+        CHECK(p.drawn_info.Width == 4 && p.drawn_info.Height == 8 && p.drawn_info.Pitch == 1 &&
+              pointer_shape_height(p.drawn_info) == 4);
+        CHECK(pointer_shape_valid(p.drawn_info, 8));
+        /* Rows 1, 3, 5, 7 and columns 1, 3, 5, 7: AND 0x55 -> 1111, XOR rows
+         * 1, 3 of 0xF0 -> 1100, rows 5, 7 of 0x33 -> 0101. */
+        for (int y = 0; y < 4; y++) CHECK(p.drawn[y] == 0xF0);
+        CHECK(p.drawn[4] == 0xC0 && p.drawn[5] == 0xC0 && p.drawn[6] == 0x50 && p.drawn[7] == 0x50);
+        /* Masked colour 4x2 to 2x1: point sampled, alpha (the operation) kept. */
+        uint8_t masked[4 * 2 * 4] = {
+            1, 1, 1, 0,  2, 2, 2, 0xFF,  3, 3, 3, 0,  4, 4, 4, 0xFF,
+            5, 5, 5, 0,  6, 6, 6, 0xFF,  7, 7, 7, 0,  8, 8, 8, 0xFF };
+        p.shape = masked;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, 4, 2, 16);
+        CHECK(pointer_scale_shape(&p, half));
+        CHECK(p.drawn_info.Width == 2 && p.drawn_info.Height == 1);
+        CHECK(memcmp(p.drawn, &masked[(4 + 1) * 4], 4) == 0 && memcmp(p.drawn + 4, &masked[(4 + 3) * 4], 4) == 0);
+        free(p.drawn);
+    }
+    /* Composited at the scaled position on a half-size frame; hiding it
+     * restores the frame exactly, also partly off its left edge. */
+    {
+        const Bgr bg = { 10, 100, 200 };
+        TestFrame f(50, 50, 4, bg, 255);
+        const std::vector<uint8_t> original = f.px;
+        uint8_t shape[4 * 4 * 4];
+        for (size_t i = 0; i < sizeof(shape); i += 4) {
+            shape[i] = 1; shape[i + 1] = 2; shape[i + 2] = 3; shape[i + 3] = 0xFF;
+        }
+        PointerState p = {};
+        p.visible = p.has_shape = true;
+        p.shape = shape;
+        p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, 4, 4, 16);
+        const FrameScale half = { 100, 100, 50, 50 };
+        p.x = 21; p.y = 30;                    /* -> (11, 15), 2x2 */
+        CHECK(pointer_composite(&p, f.px.data(), f.stride, half));
+        CHECK(p.under_rect.x == 11 && p.under_rect.y == 15 && p.under_rect.w == 2 && p.under_rect.h == 2);
+        for (uint32_t y = 14; y < 18; y++)
+            for (uint32_t x = 10; x < 14; x++)
+                CHECK(px_is(f.at(x, y), x >= 11 && x < 13 && y >= 15 && y < 17 ? Bgr{ 1, 2, 3 } : bg));
+        p.x = -3; p.y = 0;                     /* -> (-1, 0): one column on the frame */
+        CHECK(pointer_composite(&p, f.px.data(), f.stride, half));
+        CHECK(p.under_rect.x == 0 && p.under_rect.w == 1 && px_is(f.at(0, 1), { 1, 2, 3 }) &&
+              px_is(f.at(1, 1), bg) && px_is(f.at(11, 15), bg));
+        p.visible = false;
+        CHECK(pointer_composite(&p, f.px.data(), f.stride, half));
+        CHECK(f.px == original && p.under_rect.w == 0);
+        /* A new layout drops the scaled shape and the save-under. */
+        MdCaptureCtx ctx = {};
+        DxgiState st = {};
+        st.pointer.drawn_valid = true;
+        st.pointer.under_rect = { 1, 1, 1, 1 };
+        layout_one(&ctx, &st, 64, 64, DXGI_MODE_ROTATION_IDENTITY, 32, 0);
+        CHECK(!st.pointer.drawn_valid && st.pointer.under_rect.w == 0);
+        free(p.under);
+        free(p.drawn);
+    }
+    puts("PASS size cap pointer: shapes scaled per type (area / point sampled), composited at "
+         "the scaled position, save-under exact, reset on a new layout");
+}
+
+/* The GPU pass against area_scale on a real D3D11 device (session 0 has
+ * one too: the render-only Basic Render Driver), sampling the image directly
+ * and through the copy an unbindable image needs; then its cost. */
+static void gpu_scale_tests() {
+    ID3D11Device *device = nullptr;
+    ID3D11DeviceContext *dc = nullptr;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                   D3D11_SDK_VERSION, &device, nullptr, &dc);
+    if (FAILED(hr))
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+                               D3D11_SDK_VERSION, &device, nullptr, &dc);
+    CHECK(SUCCEEDED(hr));
+    IDXGIDevice *dxgi = nullptr;
+    IDXGIAdapter *adapter = nullptr;
+    DXGI_ADAPTER_DESC ad = {};
+    if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) &&
+        SUCCEEDED(dxgi->GetAdapter(&adapter)))
+        adapter->GetDesc(&ad);
+    safe_release(adapter);
+    safe_release(dxgi);
+    printf("GPU scaler on \"%ls\", feature level 0x%x\n", ad.Description,
+           (unsigned)device->GetFeatureLevel());
+
+    auto texture = [&](uint32_t w, uint32_t h, UINT bind, D3D11_USAGE usage, UINT cpu,
+                       const uint8_t *data) {
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = w;
+        d.Height = h;
+        d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.Usage = usage;
+        d.BindFlags = bind;
+        d.CPUAccessFlags = cpu;
+        D3D11_SUBRESOURCE_DATA init = { data, w * 4, 0 };
+        ID3D11Texture2D *t = nullptr;
+        CHECK(SUCCEEDED(device->CreateTexture2D(&d, data ? &init : nullptr, &t)));
+        return t;
+    };
+    /* Read a texture back through a staging copy. */
+    auto read = [&](ID3D11Texture2D *t, uint32_t w, uint32_t h, std::vector<uint8_t> *out) {
+        ID3D11Texture2D *staging = texture(w, h, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, nullptr);
+        dc->CopyResource(staging, t);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        CHECK(SUCCEEDED(dc->Map(staging, 0, D3D11_MAP_READ, 0, &m)));
+        out->resize((size_t)w * h * 4);
+        for (uint32_t y = 0; y < h; y++)
+            memcpy(out->data() + (size_t)y * w * 4, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+        dc->Unmap(staging, 0);
+        staging->Release();
+    };
+
+    struct Case { uint32_t sw, sh, dw, dh; };
+    const Case cases[] = {
+        { 37, 23, 16, 10 }, { 1024, 768, 640, 480 }, { 1024, 768, 400, 300 },
+        { 1024, 768, 333, 250 }, { 768, 1024, 480, 640 }, { 300, 200, 1, 1 },
+        { 64, 48, 63, 47 }, { 1000, 3, 500, 2 },
+    };
+    Scaler s = {};
+    int worst = 0;
+    uint32_t seed = 99;
+    for (const bool bindable : { true, false }) {
+        for (const Case &c : cases) {
+            /* Noise in some cells, sharp black/white edges in others. */
+            std::vector<uint8_t> src((size_t)c.sw * c.sh * 4);
+            for (uint32_t y = 0; y < c.sh; y++)
+                for (uint32_t x = 0; x < c.sw; x++) {
+                    uint8_t *p = &src[((size_t)y * c.sw + x) * 4];
+                    if ((x / 16 + y / 16) % 3 == 0) {
+                        p[0] = p[1] = p[2] = (x + y) % 2 ? 255 : 0;
+                        p[3] = 255;
+                    } else {
+                        for (int k = 0; k < 4; k++) p[k] = (uint8_t)lcg(&seed);
+                    }
+                }
+            ID3D11Texture2D *image = texture(c.sw, c.sh,
+                bindable ? D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
+                         : D3D11_BIND_RENDER_TARGET, D3D11_USAGE_DEFAULT, 0, src.data());
+            ID3D11VertexShader *vs_before = s.vs;
+            CHECK(SUCCEEDED(scaler_prepare(&s, device, c.sw, c.sh, c.dw, c.dh)));
+            CHECK(!vs_before || s.vs == vs_before); /* shaders compiled once */
+            CHECK(SUCCEEDED(scaler_run(&s, device, dc, image)));
+            CHECK(s.copy_source == !bindable);
+            std::vector<uint8_t> gpu, cpu((size_t)c.dw * c.dh * 4);
+            read(s.target, c.dw, c.dh, &gpu);
+            area_scale(src.data(), c.sw * 4, c.sw, c.sh, cpu.data(), c.dw * 4, c.dw, c.dh);
+            for (size_t i = 0; i < cpu.size(); i++) {
+                const int d = abs((int)gpu[i] - (int)cpu[i]);
+                if (d > 1)
+                    fprintf(stderr, "  %ux%u -> %ux%u: byte %zu (pixel %zu,%zu) gpu %u cpu %u\n",
+                            c.sw, c.sh, c.dw, c.dh, i, i / 4 % c.dw, i / 4 / c.dw, gpu[i], cpu[i]);
+                CHECK(d <= 1);
+                worst = d > worst ? d : worst;
+            }
+            image->Release();
+        }
+        scaler_release(&s);
+        s.copy_source = false;
+    }
+    printf("PASS GPU area scaling matches the CPU filter within %d/255 (%zu size pairs, "
+           "direct and copied source)\n", worst, sizeof(cases) / sizeof(cases[0]));
+
+    /* Cost per frame, as take_update pays it: scale + copy to staging + Map,
+     * against the uncapped copy + Map of the full image. */
+    for (const Case &c : { Case{ 1024, 768, 640, 480 }, Case{ 1920, 1080, 1280, 720 },
+                           Case{ 3840, 2160, 1920, 1080 } }) {
+        std::vector<uint8_t> src((size_t)c.sw * c.sh * 4);
+        for (uint8_t &b : src) b = (uint8_t)lcg(&seed);
+        ID3D11Texture2D *image = texture(c.sw, c.sh, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                                         D3D11_USAGE_DEFAULT, 0, src.data());
+        ID3D11Texture2D *full = texture(c.sw, c.sh, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, nullptr);
+        ID3D11Texture2D *reduced = texture(c.dw, c.dh, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, nullptr);
+        CHECK(SUCCEEDED(scaler_prepare(&s, device, c.sw, c.sh, c.dw, c.dh)));
+        auto timed = [&](bool scaled) {
+            const int n = 10;
+            double best = 1e9;
+            for (int i = 0; i < n; i++) {
+                const double t0 = now_ms();
+                if (scaled) {
+                    CHECK(SUCCEEDED(scaler_run(&s, device, dc, image)));
+                    dc->CopyResource(reduced, s.target);
+                } else {
+                    dc->CopyResource(full, image);
+                }
+                D3D11_MAPPED_SUBRESOURCE m = {};
+                ID3D11Texture2D *staging = scaled ? reduced : full;
+                CHECK(SUCCEEDED(dc->Map(staging, 0, D3D11_MAP_READ, 0, &m)));
+                dc->Unmap(staging, 0);
+                const double took = now_ms() - t0;
+                best = took < best ? took : best;
+            }
+            return best;
+        };
+        const double plain = timed(false), scaled = timed(true);
+        printf("  %ux%u: copy + map %.2f ms; scaled to %ux%u + copy + map %.2f ms (best of 10)\n",
+               c.sw, c.sh, plain, c.dw, c.dh, scaled);
+        reduced->Release();
+        full->Release();
+        image->Release();
+    }
+    scaler_release(&s);
+    dc->Release();
+    device->Release();
+    puts("PASS GPU scaler timing reported");
+}
+
 static void unit_tests() {
     const Bgr bg = { 10, 100, 200 };
 
@@ -534,14 +958,15 @@ static void unit_tests() {
         p.has_shape = true;
         p.shape = shape;
         p.shape_info = shape_info(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, 3, 3, 12);
+        const FrameScale unscaled = { f.w, f.h, f.w, f.h };
         p.x = 2; p.y = 3;
-        pointer_composite(&p, f.px.data(), f.stride, f.w, f.h);
+        pointer_composite(&p, f.px.data(), f.stride, unscaled);
         CHECK(px_is(f.at(2, 3), { 1, 2, 3 }) && px_is(f.at(4, 5), { 1, 2, 3 }));
         p.x = 14; p.y = -1;                   /* move, partly off-frame */
-        pointer_composite(&p, f.px.data(), f.stride, f.w, f.h);
+        pointer_composite(&p, f.px.data(), f.stride, unscaled);
         CHECK(px_is(f.at(2, 3), bg) && px_is(f.at(15, 1), { 1, 2, 3 }));
         p.visible = false;
-        pointer_composite(&p, f.px.data(), f.stride, f.w, f.h);
+        pointer_composite(&p, f.px.data(), f.stride, unscaled);
         CHECK(f.px == original && p.under_rect.w == 0);
         free(p.under);
     }
@@ -624,6 +1049,7 @@ static void unit_tests() {
     rotation_unit_tests();
     all_outputs_unit_tests();
     dpi_unit_tests();
+    size_cap_unit_tests();
 }
 
 /* ── Test windows ────────────────────────────────────────────── */
@@ -1008,11 +1434,17 @@ static void output_cells(const MdCaptureBackend *be) {
 
 /* ── Interactive: rotation on real frames (md-dbg) ─────────── */
 
-static Bgr frame_px(const MdFrame &f, LONG x, LONG y);
+static Bgr frame_px(const DxgiState *st, const MdFrame &f, LONG x, LONG y);
+
+/* The frame size ctx delivers for an unscaled w x h frame under its cap. */
+static void capped(const MdCaptureCtx *ctx, uint32_t w, uint32_t h, uint32_t *fw, uint32_t *fh) {
+    CHECK(md_capture_fit_size(w, h, ctx->config.max_width, ctx->config.max_height, fw, fh) == 0);
+}
 
 /* The VM's only output cannot be rotated, so each rotation is forced onto
  * it: the backend then turns the real desktop image into the frame, and a
- * static window must appear exactly where the rotation puts it. */
+ * static window must appear exactly where the rotation puts it (under a
+ * size cap, where the rotation and then the scale put it: md-jie5). */
 static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     auto *st = static_cast<DxgiState *>(ctx->backend_data);
     OutputDup &o = st->out[0];
@@ -1029,20 +1461,23 @@ static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     damage.rect = { out.left + 300, out.top + 300, out.left + 364, out.top + 364 };
     window_start(&mark);
     window_start(&damage);
+    /* Inset so a scaled pixel there only covers the window. */
     const POINT probes[] = {
-        { win.left + 3, win.top + 3 }, { win.right - 4, win.top + 3 },
-        { win.left + 3, win.bottom - 4 }, { win.right - 4, win.bottom - 4 },
+        { win.left + 8, win.top + 8 }, { win.right - 9, win.top + 8 },
+        { win.left + 8, win.bottom - 9 }, { win.right - 9, win.bottom - 9 },
         { (win.left + win.right) / 2, (win.top + win.bottom) / 2 },
     };
     for (const DXGI_MODE_ROTATION r : { DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
                                         DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_IDENTITY }) {
         output_configure(&o, w, h, r);
-        CHECK(SUCCEEDED(frame_layout(ctx, st)));
+        CHECK(SUCCEEDED(frame_setup(ctx, st)));
         o.delivered = false; /* as after re-duplicating: copy the whole desktop */
         const int turns = rotation_turns(r);
-        uint32_t fw, fh;
-        rotated_size(turns, w, h, &fw, &fh);
+        uint32_t rw, rh, fw, fh;
+        rotated_size(turns, w, h, &rw, &rh);
+        capped(ctx, rw, rh, &fw, &fh);
         CHECK(ctx->width == fw && ctx->height == fh);
+        CHECK(st->scale.from_w == rw && st->scale.from_h == rh);
         const double end = now_ms() + 3000;
         bool landed = false;
         while (!landed && now_ms() < end) {
@@ -1056,15 +1491,18 @@ static void rotation_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
             for (const POINT &p : probes) {
                 uint32_t fx, fy;
                 sample_rotation(turns, (uint32_t)p.x, (uint32_t)p.y, w, h, &fx, &fy);
-                if (!px_is(frame_px(f, (LONG)fx, (LONG)fy), green, 2)) landed = false;
+                if (!px_is(frame_px(st, f, (LONG)fx, (LONG)fy), green, 2)) landed = false;
             }
             be->release_frame(ctx, &f);
         }
         CHECK(landed);
-        printf("PASS forced rotation %d degrees: %ux%u frame, the window lands where "
-               "the rotation puts it\n", turns * 90, fw, fh);
+        printf("PASS forced rotation %d degrees: %ux%u frame%s, the window lands where "
+               "the rotation puts it\n", turns * 90, fw, fh,
+               scale_is_identity(st->scale) ? "" : " (size cap: scaled on the GPU)");
     }
-    CHECK(o.turns == 0 && ctx->width == w && ctx->height == h);
+    uint32_t fw, fh;
+    capped(ctx, w, h, &fw, &fh);
+    CHECK(o.turns == 0 && ctx->width == fw && ctx->height == fh);
     window_stop(&damage);
     window_stop(&mark);
 }
@@ -1077,7 +1515,7 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx);
  * composed path (canvas frame, layout, per-output copies, the pointer in
  * frame coordinates) on real frames rather than several outputs; those are
  * the synthetic cells. */
-static void all_cells(const MdCaptureBackend *be) {
+static void all_cells(const MdCaptureBackend *be, uint32_t max_w = 0, uint32_t max_h = 0) {
     OutputList outs = {};
     CHECK(SUCCEEDED(outputs_enum(&outs)) && outs.count > 0);
     LONG l = LONG_MAX, t = LONG_MAX, r = LONG_MIN, b = LONG_MIN;
@@ -1089,14 +1527,20 @@ static void all_cells(const MdCaptureBackend *be) {
         b = o.bottom > b ? o.bottom : b;
     }
     MdCaptureCtx ctx = make_ctx(be, true, "ALL");
+    ctx.config.max_width = max_w;
+    ctx.config.max_height = max_h;
     CHECK(be->init(&ctx) == 0);
     auto *st = static_cast<DxgiState *>(ctx.backend_data);
     CHECK(st->all && st->canvas_mode && st->count == outs.count);
     CHECK(ctx.output_rect.x == l && ctx.output_rect.y == t &&
           ctx.output_rect.width == (uint32_t)(r - l) && ctx.output_rect.height == (uint32_t)(b - t));
-    CHECK(ctx.width == ctx.output_rect.width && ctx.height == ctx.output_rect.height);
-    printf("PASS \"all\": %u output(s) as one %ux%u frame at (%d,%d)\n", st->count, ctx.width,
-           ctx.height, ctx.output_rect.x, ctx.output_rect.y);
+    uint32_t fw, fh;
+    capped(&ctx, ctx.output_rect.width, ctx.output_rect.height, &fw, &fh);
+    CHECK(ctx.width == fw && ctx.height == fh);
+    char cap[48] = "";
+    if (max_w || max_h) snprintf(cap, sizeof(cap), " (size cap %ux%u)", max_w, max_h);
+    printf("PASS \"all\"%s: %u output(s) as one %ux%u frame at (%d,%d)\n", cap, st->count,
+           ctx.width, ctx.height, ctx.output_rect.x, ctx.output_rect.y);
     outputs_release(&outs);
 
     CHECK(be->start(&ctx) == 0);
@@ -1105,7 +1549,106 @@ static void all_cells(const MdCaptureBackend *be) {
     be->stop(&ctx);
     be->destroy(&ctx);
     CHECK(!ctx.backend_data);
-    puts("PASS \"all\": frames, rotation and pointer cells on the composed frame");
+    printf("PASS \"all\"%s: frames, rotation and pointer cells on the composed frame\n", cap);
+}
+
+/* ── Interactive: size cap (md-jie5) ─────────────────────────────── */
+
+/* One output under caps: a cap the frame fits changes nothing (no scaler,
+ * zero-copy); a binding cap delivers md_capture_fit_size frames, still
+ * zero-copy, with a static window where the scale puts it and the output
+ * rectangle physical, then rotation and the pointer on the capped frame. */
+static void cap_cells(const MdCaptureBackend *be) {
+    MdCaptureCtx ctx = make_ctx(be, true, nullptr);
+    CHECK(be->init(&ctx) == 0);
+    const MdCaptureRect native = ctx.output_rect;
+    const uint32_t nw = ctx.width, nh = ctx.height;
+    be->destroy(&ctx);
+
+    for (const uint32_t cap : { nw, 16384u }) {
+        ctx = make_ctx(be, true, nullptr);
+        ctx.config.max_width = cap;
+        ctx.config.max_height = cap == nw ? 0 : cap;
+        CHECK(be->init(&ctx) == 0);
+        auto *st = static_cast<DxgiState *>(ctx.backend_data);
+        CHECK(ctx.width == nw && ctx.height == nh && scale_is_identity(st->scale));
+        CHECK(!output_scaled(st->out[0]) && !st->out[0].scaler.vs && !st->canvas_mode);
+        be->destroy(&ctx);
+    }
+    printf("PASS size cap the frame fits (%ux0, 16384x16384): native %ux%u, no scaler, "
+           "zero-copy\n", nw, nw, nh);
+
+    struct Cap { uint32_t w, h; };
+    for (const Cap cap : { Cap{ 640, 0 }, Cap{ 0, 300 }, Cap{ 700, 700 } }) {
+        ctx = make_ctx(be, true, nullptr);
+        ctx.config.max_width = cap.w;
+        ctx.config.max_height = cap.h;
+        CHECK(be->init(&ctx) == 0);
+        auto *st = static_cast<DxgiState *>(ctx.backend_data);
+        uint32_t fw, fh;
+        CHECK(md_capture_fit_size(nw, nh, cap.w, cap.h, &fw, &fh) == 0);
+        CHECK(ctx.width == fw && ctx.height == fh && fw < nw);
+        /* Aspect kept to within the rounding of one side. */
+        CHECK(fabs((double)fw / fh - (double)nw / nh) <= (double)nw / nh / fh + 1e-9);
+        CHECK(ctx.output_rect.x == native.x && ctx.output_rect.y == native.y &&
+              ctx.output_rect.width == native.width && ctx.output_rect.height == native.height);
+        CHECK(output_scaled(st->out[0]) && st->out[0].scaler.vs && !st->canvas_mode);
+        CHECK(be->start(&ctx) == 0);
+
+        /* A static window and its scaled image: inner probes match its
+         * colour, outer ones (just outside it, on the desktop) are never
+         * required. The frame is the mapped staging texture (zero-copy). */
+        const RECT out = st->out[0].rect;
+        const RECT win = { 100, 80, 300, 220 }; /* frame coordinates */
+        TestWindow mark = {};
+        mark.color = RGB(200, 40, 120);
+        const Bgr magenta = { 120, 40, 200 };
+        mark.rect = { out.left + win.left, out.top + win.top, out.left + win.right,
+                      out.top + win.bottom };
+        TestWindow damage = {};
+        damage.animate = true;
+        damage.rect = { out.left + 400, out.top + 300, out.left + 464, out.top + 364 };
+        window_start(&mark);
+        window_start(&damage);
+        const POINT probes[] = {
+            { win.left + 6, win.top + 6 }, { win.right - 7, win.top + 6 },
+            { win.left + 6, win.bottom - 7 }, { win.right - 7, win.bottom - 7 },
+            { (win.left + win.right) / 2, (win.top + win.bottom) / 2 },
+        };
+        const double end = now_ms() + 3000;
+        bool landed = false;
+        int frames = 0;
+        while (!landed && now_ms() < end) {
+            MdFrame f = {};
+            const int rc = be->get_frame(&ctx, &f, 1000);
+            CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
+            if (rc != 0) continue;
+            frames++;
+            CHECK(f.width == fw && f.height == fh && f.stride >= fw * 4 &&
+                  f.data_size == (size_t)f.stride * fh);
+            CHECK(st->out[0].mapped && f.data == st->map_data); /* zero-copy */
+            landed = true;
+            for (const POINT &p : probes)
+                if (!px_is(frame_px(st, f, p.x, p.y), magenta, 2)) landed = false;
+            be->release_frame(&ctx, &f);
+        }
+        CHECK(landed);
+        window_stop(&damage);
+        window_stop(&mark);
+        printf("PASS size cap %ux%u: %ux%u frames from %ux%u (aspect kept, zero-copy, output "
+               "rect physical %ux%u at %d,%d), the window where the scale puts it (%d frame(s))\n",
+               cap.w, cap.h, fw, fh, nw, nh, ctx.output_rect.width, ctx.output_rect.height,
+               ctx.output_rect.x, ctx.output_rect.y, frames);
+
+        if (cap.w == 640) {
+            rotation_cells(be, &ctx); /* forced rotations, CPU-rotated scaled copies */
+            pointer_cells(be, &ctx);  /* the pointer on the capped zero-copy frame */
+        }
+        be->stop(&ctx);
+        be->destroy(&ctx);
+    }
+    all_cells(be, 0, 300); /* "all" + cap: rotation and pointer on the capped canvas */
+    puts("PASS size cap: frames, rotation, pointer and \"all\" under a cap");
 }
 
 /* ── Interactive: real pointer shapes ──────────────────────── */
@@ -1177,42 +1720,52 @@ static HCURSOR make_color_cursor(POINT hot, const uint32_t quad_bgra[QUAD], cons
     return cursor;
 }
 
-static Bgr frame_px(const MdFrame &f, LONG x, LONG y) {
+/* The delivered frame's pixel at unscaled frame pixel (x, y): the one whose
+ * area holds that pixel's centre (itself without a size cap). */
+static Bgr frame_px(const DxgiState *st, const MdFrame &f, LONG x, LONG y) {
+    const FrameScale &s = st->scale;
+    x = (LONG)((2 * (int64_t)x + 1) * s.to_w / (2 * (int64_t)s.from_w));
+    y = (LONG)((2 * (int64_t)y + 1) * s.to_h / (2 * (int64_t)s.from_h));
+    CHECK(x >= 0 && y >= 0 && (uint32_t)x < f.width && (uint32_t)y < f.height);
     const uint8_t *p = f.data + (size_t)y * f.stride + (size_t)x * 4;
     return { p[0], p[1], p[2] };
 }
 
-/* Where a test cursor's quadrant centres land, in frame coordinates. */
+/* Where a test cursor's quadrant centres land, in unscaled frame
+ * coordinates (frame_px maps them onto a capped frame). */
 struct Samples {
     LONG x[QUAD], y[QUAD];
-    bool in[QUAD];   /* on the frame and over the test window */
+    bool in[QUAD];   /* on the frame and well inside the test window */
     int count;
 };
 
-static Samples samples(LONG left, LONG top, const RECT &win, const MdFrame &f) {
+static Samples samples(const DxgiState *st, LONG left, LONG top, const RECT &win) {
     Samples s = {};
+    const LONG inset = 4; /* a scaled pixel there only covers the window */
     for (int q = 0; q < QUAD; q++) {
         s.x[q] = left + CUR / 4 + (q % 2) * CUR / 2;
         s.y[q] = top + CUR / 4 + (q / 2) * CUR / 2;
-        s.in[q] = s.x[q] >= win.left && s.x[q] < win.right && s.y[q] >= win.top &&
-                  s.y[q] < win.bottom && s.x[q] >= 0 && s.y[q] >= 0 &&
-                  s.x[q] < (LONG)f.width && s.y[q] < (LONG)f.height;
+        s.in[q] = s.x[q] >= win.left + inset && s.x[q] < win.right - inset &&
+                  s.y[q] >= win.top + inset && s.y[q] < win.bottom - inset &&
+                  s.x[q] >= 0 && s.y[q] >= 0 && s.x[q] < (LONG)st->scale.from_w &&
+                  s.y[q] < (LONG)st->scale.from_h;
         s.count += s.in[q] ? 1 : 0;
     }
     return s;
 }
 
-static bool samples_match(const MdFrame &f, const Samples &s, const Bgr expect[QUAD], int tol) {
+static bool samples_match(const DxgiState *st, const MdFrame &f, const Samples &s,
+                          const Bgr expect[QUAD], int tol) {
     for (int q = 0; q < QUAD; q++)
-        if (s.in[q] && !px_is(frame_px(f, s.x[q], s.y[q]), expect[q], tol)) return false;
+        if (s.in[q] && !px_is(frame_px(st, f, s.x[q], s.y[q]), expect[q], tol)) return false;
     return s.count > 0;
 }
 
-static void samples_dump(const char *label, const MdFrame &f, const Samples &s,
-                         const Bgr expect[QUAD]) {
+static void samples_dump(const char *label, const DxgiState *st, const MdFrame &f,
+                         const Samples &s, const Bgr expect[QUAD]) {
     for (int q = 0; q < QUAD; q++) {
         if (!s.in[q]) continue;
-        const Bgr got = frame_px(f, s.x[q], s.y[q]);
+        const Bgr got = frame_px(st, f, s.x[q], s.y[q]);
         fprintf(stderr, "  %s quadrant %d at (%ld,%ld): got %u,%u,%u want %u,%u,%u\n", label, q,
                 s.x[q], s.y[q], got.b, got.g, got.r, expect[q].b, expect[q].g, expect[q].r);
     }
@@ -1235,13 +1788,13 @@ static bool wait_pixels(const MdCaptureBackend *be, MdCaptureCtx *ctx, LONG left
         CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
         if (rc != 0) continue;
         if (pointer_only_frame(st, *f, since)) ++*pointer_frames;
-        const Samples s = samples(left, top, win, *f);
-        if (samples_match(*f, s, expect, tol)) return true;
+        const Samples s = samples(st, left, top, win);
+        if (samples_match(st, *f, s, expect, tol)) return true;
         if (misses++ < 3) { /* transient misses are normal; these explain a failure */
-            const PointerState &p = static_cast<DxgiState *>(ctx->backend_data)->pointer;
+            const PointerState &p = st->pointer;
             fprintf(stderr, "  no match in frame %u (DXGI pointer visible %d at %ld,%ld)\n",
                     f->seq, p.visible, p.x, p.y);
-            samples_dump("   ", *f, s, expect);
+            samples_dump("   ", st, *f, s, expect);
         }
         be->release_frame(ctx, f);
     }
@@ -1293,20 +1846,20 @@ static Seen wait_cursor(const MdCaptureBackend *be, MdCaptureCtx *ctx, const Tes
         const int rc = be->get_frame(ctx, f, 1000);
         CHECK(rc == 0 || rc == MD_CAPTURE_IDLE);
         if (rc != 0) continue;
-        const Samples s = samples(left, top, win, *f);
-        *exact = samples_match(*f, s, c.expect, c.tol);
+        const Samples s = samples(st, left, top, win);
+        *exact = samples_match(st, *f, s, c.expect, c.tol);
         const bool shape = p.visible && p.has_shape && p.shape_info.Type == c.type &&
                            p.shape_info.HotSpot.x == c.hotspot.x &&
                            p.shape_info.HotSpot.y == c.hotspot.y;
         if (shape && pointer_only_frame(st, *f, since)) ++*pointer_frames;
         if (shape && *exact) return Seen::composited;
         if (!p.visible && p.under_rect.w == 0 &&
-            (*exact || (c.has_soft && samples_match(*f, s, c.soft, c.tol))))
+            (*exact || (c.has_soft && samples_match(st, *f, s, c.soft, c.tol))))
             return Seen::software;
         if (misses++ < 3) { /* transient misses are normal; these explain a failure */
             fprintf(stderr, "  %s: no match in frame %u (DXGI pointer visible %d at %ld,%ld)\n",
                     c.label, f->seq, p.visible, p.x, p.y);
-            samples_dump("   ", *f, s, c.expect);
+            samples_dump("   ", st, *f, s, c.expect);
         }
         be->release_frame(ctx, f);
     }
@@ -1385,6 +1938,7 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
         CHECK(GetCursorPos(&now));
         moved = moved || now.x != pt.x || now.y != pt.y;
         const PointerState &p = st->pointer;
+        char scaled[96] = "";
         if (seen == Seen::composited) {
             /* Position is the shape's top-left: Position + HotSpot is the
              * pointer, and the pixels matched at pointer - hotspot. */
@@ -1392,6 +1946,21 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
             if (!moved) CHECK(p.x == sx && p.y == sy);
             pointer_only += pointer_frames;
             hardware = hardware ? hardware : &c;
+            if (!scale_is_identity(st->scale)) {
+                /* md-jie5: drawn scaled, at the scaled position (the frame's
+                 * pixels under it were saved there). */
+                const FrameScale &s = st->scale;
+                const LONG dx = scale_coord(p.x, s.from_w, s.to_w), dy = scale_coord(p.y, s.from_h, s.to_h);
+                const DXGI_OUTDUPL_POINTER_SHAPE_INFO &d = p.drawn_info;
+                CHECK(p.drawn_valid && d.Width == scale_length(CUR, s.from_w, s.to_w) &&
+                      pointer_shape_height(d) == scale_length(CUR, s.from_h, s.to_h));
+                if (dx >= 0 && dy >= 0 && dx + (LONG)d.Width <= (LONG)s.to_w &&
+                    dy + (LONG)pointer_shape_height(d) <= (LONG)s.to_h)
+                    CHECK((LONG)p.under_rect.x == dx && (LONG)p.under_rect.y == dy &&
+                          p.under_rect.w == d.Width);
+                snprintf(scaled, sizeof(scaled), "; drawn %ux%u at %ld,%ld of the %ux%u frame",
+                         d.Width, pointer_shape_height(d), dx, dy, s.to_w, s.to_h);
+            }
         }
         char raw[64] = "";
         if (p.visible && c.type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
@@ -1403,14 +1972,14 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
         char only[64] = "";
         if (pointer_frames)
             snprintf(only, sizeof(only), "; %d pointer-only update(s) delivered", pointer_frames);
-        printf("PASS %s pointer in the frame at %ld,%ld (hotspot %ld,%ld): %s%s%s\n", c.label,
+        printf("PASS %s pointer in the frame at %ld,%ld (hotspot %ld,%ld): %s%s%s%s\n", c.label,
                sx, sy, c.hotspot.x, c.hotspot.y,
                seen == Seen::composited ? "composited from the DXGI shape"
                : exact ? "software cursor: DWM drew it into the desktop image and DXGI "
                          "reports no pointer, so the backend drew nothing"
                        : "software cursor: DWM drew it into the desktop image reduced to "
                          "monochrome and DXGI reports no pointer, so the backend drew nothing",
-               only, raw);
+               scaled, only, raw);
         be->release_frame(ctx, &f);
     }
     if (moved) puts("note: the user moved the pointer; positions were not compared");
@@ -1508,6 +2077,8 @@ static void pointer_cells(const MdCaptureBackend *be, MdCaptureCtx *ctx) {
     MdCaptureConfig saved = ctx->config;
     be->destroy(ctx);
     *ctx = make_ctx(be, false, saved.output);
+    ctx->config.max_width = saved.max_width; /* the same size cap */
+    ctx->config.max_height = saved.max_height;
     CHECK(be->init(ctx) == 0 && be->start(ctx) == 0);
     st = static_cast<DxgiState *>(ctx->backend_data);
     int idle_cells = 0, framed = 0, unsteady = 0, unconsumed = 0, attempt = 0;
@@ -1549,6 +2120,7 @@ int main(int argc, char **argv) {
      * rectangles then agree with DXGI's physical pixels on any DPI. */
     CHECK(md_win_dpi_process_init() != MD_DPI_PROCESS_NOT_PER_MONITOR);
     unit_tests();
+    gpu_scale_tests();
 
     const MdCaptureBackend *be = md_capture_backend_create();
     CHECK(be == &dxgi_backend && !be->wait_size && !be->forget_authorization);
@@ -1560,6 +2132,9 @@ int main(int argc, char **argv) {
         ctx = make_ctx(be, true, "99");
         CHECK(be->init(&ctx) == -1 && !ctx.backend_data);
         ctx = make_ctx(be, true, "all");
+        CHECK(be->init(&ctx) == -1 && !ctx.backend_data);
+        ctx = make_ctx(be, true, nullptr);
+        ctx.config.max_width = 640;
         CHECK(be->init(&ctx) == -1 && !ctx.backend_data);
         puts("PASS session 0: init fails cleanly without an interactive desktop");
         puts("ALL DXGI CAPTURE TESTS PASSED (session 0)");
@@ -1687,6 +2262,7 @@ int main(int argc, char **argv) {
     be->destroy(&ctx);
     CHECK(!ctx.backend_data);
     all_cells(be);
+    cap_cells(be);
     puts("ALL DXGI CAPTURE TESTS PASSED (interactive)");
     return 0;
 }
