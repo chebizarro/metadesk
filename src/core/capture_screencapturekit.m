@@ -33,6 +33,14 @@
  * on a thread processing events (CGDisplayConfiguration.h), and the host
  * runs no run loop.
  *
+ * System stops (md-2p10): the stream's SCStreamDelegate is the per-start
+ * MdSCKDelegate. stream:didStopWithError: (display removed, Screen Recording
+ * revoked, capture service lost, ...) logs the error and marks the stream
+ * broken, so get_frame returns MD_CAPTURE_ERROR at once and the host
+ * watchdog restarts capture. That callback can arrive on any queue, also
+ * after a restart or sck_destroy, so the delegate reaches SCKState only
+ * through a back-pointer it guards and that restart and destroy detach.
+ *
  * Size cap (md-n9p2): config.max_width/max_height shrink the configured
  * stream size (md_capture_fit_size, aspect kept so SCK never letterboxes),
  * and SCK scales in hardware. The rect stays in points, so input maps onto
@@ -72,8 +80,8 @@ typedef struct {
     MdFrame                 pending_frame;
     MdCaptureRect           pending_rect;  /* output rect of pending_frame */
     bool                    frame_ready;
-    /* A reconfiguration failed: get_frame reports MD_CAPTURE_ERROR until a
-     * restart (frame_lock). */
+    /* A reconfiguration failed or the system stopped the stream: get_frame
+     * reports MD_CAPTURE_ERROR until a restart (frame_lock). */
     bool                    broken;
 
     /* Geometry, owned by the capture queue once the stream starts (sck_start
@@ -128,12 +136,21 @@ static uint64_t sck_frame_clock_ns(CMTime pts) {
 /* ── SCStreamOutput delegate ───────────────────────────────── */
 
 API_AVAILABLE(macos(12.3))
-@interface MdSCKDelegate : NSObject <SCStreamOutput>
+@interface MdSCKDelegate : NSObject <SCStreamOutput, SCStreamDelegate>
+/* Frame callbacks read it unlocked: they run only while this delegate's
+ * stream does, and the state outlives that. Everything else goes through
+ * -detach and the @synchronized block in -stream:didStopWithError:. */
 @property (assign) SCKState *state;
 /* Set by an updateConfiguration completion, which may outlive the state:
  * it only touches this (block-retained) object; the next frame reads it. */
 @property (atomic) BOOL reconfigureFailed;
+/* The stream has ended: stopped by the system, or by sck_stop. */
+@property (atomic) BOOL streamStopped;
+- (void)detach;
 @end
+
+API_AVAILABLE(macos(12.3))
+static void sck_log_system_stop(CGDirectDisplayID display_id, NSError *error);
 
 API_AVAILABLE(macos(12.3))
 static void sck_check_geometry(SCKState *sck, MdSCKDelegate *delegate,
@@ -150,6 +167,7 @@ static void sck_check_geometry(SCKState *sck, MdSCKDelegate *delegate,
         return;
 
     SCKState *sck = self.state;
+    if (!sck) return;
     sck_check_geometry(sck, self, sampleBuffer);
 
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -245,7 +263,71 @@ static void sck_check_geometry(SCKState *sck, MdSCKDelegate *delegate,
     pthread_mutex_unlock(&sck->frame_lock);
 }
 
+/* SCK's queue, any time after startCapture: the stream is over. */
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error
+    API_AVAILABLE(macos(12.3))
+{
+    (void)stream;
+    self.streamStopped = YES;
+    @synchronized (self) {
+        SCKState *sck = self.state;
+        if (!sck) return; /* restarted or destroyed since: nothing to report */
+        sck_log_system_stop(sck->display_id, error);
+        pthread_mutex_lock(&sck->frame_lock);
+        sck->broken = true;
+        pthread_cond_signal(&sck->frame_cond);
+        pthread_mutex_unlock(&sck->frame_lock);
+    }
+}
+
+/* Never touch the state again; waits out a -stream:didStopWithError: that is
+ * using it. Call without frame_lock held. */
+- (void)detach {
+    @synchronized (self) {
+        self.state = NULL;
+    }
+}
+
 @end
+
+/* ── System stops ────────────────────────────────────────────── */
+
+/* SCStreamErrorCode values (SCError.h), by number: several are newer than
+ * the 12.3 deployment floor, and these are only names for a log line. */
+static const struct { long code; const char *name, *meaning; } sck_stop_errors[] = {
+    { -3801, "UserDeclined", "Screen Recording permission was denied or revoked" },
+    { -3804, "FailedApplicationConnectionInvalid", "lost the connection to the capture service" },
+    { -3805, "FailedApplicationConnectionInterrupted", "lost the connection to the capture service" },
+    { -3811, "InternalError", "the capture service failed" },
+    { -3814, "NoDisplayList", "no displays are available" },
+    { -3815, "NoCaptureSource", "the captured display is gone" },
+    { -3817, "UserStopped", "stopped by the user" },
+    { -3821, "SystemStoppedStream", "stopped by the system" },
+};
+
+API_AVAILABLE(macos(12.3))
+static void sck_log_system_stop(CGDirectDisplayID display_id, NSError *error) {
+    const char *domain = error.domain.UTF8String;
+    const long code = (long)error.code;
+    const bool sck_domain = [error.domain isEqualToString:SCStreamErrorDomain];
+    const char *name = "", *meaning = NULL;
+    for (size_t i = 0; sck_domain && i < sizeof(sck_stop_errors) / sizeof(sck_stop_errors[0]); i++) {
+        if (sck_stop_errors[i].code == code) {
+            name = sck_stop_errors[i].name;
+            meaning = sck_stop_errors[i].meaning;
+        }
+    }
+    if (!meaning) meaning = error ? error.localizedDescription.UTF8String : NULL;
+    MD_LOG_E("display id:%u capture stream ended by ScreenCaptureKit (%s %ld%s%s): %s",
+             display_id, domain ? domain : "no error", error ? code : 0L,
+             *name ? " " : "", name, meaning ? meaning : "no reason given");
+    /* Revocation can also surface as another code; the preflight does not
+     * prompt. */
+    if ((sck_domain && code == -3801) || !CGPreflightScreenCaptureAccess())
+        MD_LOG_E("Screen Recording permission revoked: capture cannot resume until it is "
+                 "granted again in System Settings > Privacy & Security > Screen & "
+                 "System Audio Recording (macOS may require restarting metadesk-host)");
+}
 
 /* ── Stream geometry ───────────────────────────────────────────── */
 
@@ -435,6 +517,37 @@ static double sck_backing_scale(SCDisplay *display, SCContentFilter *filter) {
     return scale;
 }
 
+/* A fresh delegate for the stream about to start, installed as
+ * sck->delegate. The previous start's delegate is detached first, so a late
+ * stop report from its stream cannot mark this one broken. */
+API_AVAILABLE(macos(12.3))
+static MdSCKDelegate *sck_bind_delegate(SCKState *sck) {
+    if (sck->delegate) {
+        [(__bridge MdSCKDelegate *)sck->delegate detach];
+        CFRelease(sck->delegate);
+        sck->delegate = NULL;
+    }
+    pthread_mutex_lock(&sck->frame_lock);
+    sck->broken = false;
+    pthread_mutex_unlock(&sck->frame_lock);
+    MdSCKDelegate *delegate = [[MdSCKDelegate alloc] init];
+    delegate.state = sck;
+    sck->delegate = (__bridge_retained void *)delegate;
+    return delegate;
+}
+
+/* Test seam (tests/test_capture_sck.m): bind a delegate to an initialised,
+ * unstarted context the way sck_start does, and return it (borrowed), so a
+ * test can call its SCStreamDelegate methods directly. */
+void *md_capture_sck_test_bind_delegate(MdCaptureCtx *ctx);
+void *md_capture_sck_test_bind_delegate(MdCaptureCtx *ctx) {
+    if (@available(macOS 12.3, *)) {
+        if (!ctx || !ctx->backend_data) return NULL;
+        return (__bridge void *)sck_bind_delegate(ctx->backend_data);
+    }
+    return NULL;
+}
+
 /* sck_start/sck_stop are reachable only through screencapturekit_backend,
  * which md_capture_backend_create gates at runtime; the annotations let the
  * compiler prove that instead of re-checking per call. */
@@ -482,25 +595,20 @@ static int sck_start(MdCaptureCtx *ctx) {
     uint32_t px_w = 0, px_h = 0;
     sck_stream_size(ctx, bounds.size, scale, &px_w, &px_h);
 
-    /* The previous stream (if any) is stopped: no frame callback runs. */
+    /* The previous stream (if any) is stopped: no frame callback runs, and
+     * after this no stop report from it reaches the state either. */
+    MdSCKDelegate *delegate = sck_bind_delegate(sck);
     sck->display_id  = display.displayID;
     sck->rect        = sck_rect_from_cg(bounds);
     sck->want_w      = px_w;
     sck->want_h      = px_h;
     sck->seen_screen = bounds;
     sck->seen_scale  = scale;
-    pthread_mutex_lock(&sck->frame_lock);
-    sck->broken = false;
-    pthread_mutex_unlock(&sck->frame_lock);
 
     /* Create the stream */
     SCStream *stream = [[SCStream alloc] initWithFilter:filter
                                           configuration:sck_stream_config(ctx, px_w, px_h)
-                                               delegate:nil];
-
-    /* Create delegate and dispatch queue */
-    MdSCKDelegate *delegate = [[MdSCKDelegate alloc] init];
-    delegate.state = sck;
+                                               delegate:delegate];
 
     dispatch_queue_t captureQueue = dispatch_queue_create("com.metadesk.capture.sck",
                                                           DISPATCH_QUEUE_SERIAL);
@@ -511,16 +619,15 @@ static int sck_start(MdCaptureCtx *ctx) {
              sampleHandlerQueue:captureQueue
                       error:&addOutputError];
     if (addOutputError) {
+        delegate.streamStopped = YES; /* sck->stream is the stopped previous one */
         MD_LOG_E("failed to add stream output: %s", [[addOutputError localizedDescription] UTF8String]);
         return -1;
     }
 
     /* Store references, dropping a previous (stopped) start's objects. */
     if (sck->stream)       CFRelease(sck->stream);
-    if (sck->delegate)     CFRelease(sck->delegate);
     if (sck->captureQueue) CFRelease(sck->captureQueue);
     sck->stream       = (__bridge_retained void *)stream;
-    sck->delegate     = (__bridge_retained void *)delegate;
     sck->captureQueue = (__bridge_retained void *)captureQueue;
 
     /* Start capture (async, wait for completion) */
@@ -534,6 +641,7 @@ static int sck_start(MdCaptureCtx *ctx) {
     dispatch_semaphore_wait(startSem, DISPATCH_TIME_FOREVER);
 
     if (startError) {
+        delegate.streamStopped = YES;
         MD_LOG_E("failed to start capture: %s", [[startError localizedDescription] UTF8String]);
         return -1;
     }
@@ -613,7 +721,10 @@ static void sck_stop(MdCaptureCtx *ctx) {
     pthread_cond_signal(&sck->frame_cond);
     pthread_mutex_unlock(&sck->frame_lock);
 
-    if (sck->stream) {
+    /* A stream the system ended (or an earlier stop did) is not running. */
+    MdSCKDelegate *delegate = (__bridge MdSCKDelegate *)sck->delegate;
+    if (sck->stream && !delegate.streamStopped) {
+        delegate.streamStopped = YES;
         SCStream *stream = (__bridge SCStream *)sck->stream;
         dispatch_semaphore_t stopSem = dispatch_semaphore_create(0);
         [stream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
@@ -624,6 +735,7 @@ static void sck_stop(MdCaptureCtx *ctx) {
     }
 }
 
+API_AVAILABLE(macos(12.3))
 static void sck_destroy(MdCaptureCtx *ctx) {
     SCKState *sck = ctx->backend_data;
     if (!sck) return;
@@ -637,9 +749,13 @@ static void sck_destroy(MdCaptureCtx *ctx) {
         CFRelease(sck->held_sample_buf);
     }
 
-    /* Release ObjC objects */
+    /* Release ObjC objects. The stream may still report a stop to its
+     * delegate: detach it from the state about to be freed. */
+    if (sck->delegate) {
+        [(__bridge MdSCKDelegate *)sck->delegate detach];
+        CFRelease(sck->delegate);
+    }
     if (sck->stream)       { CFRelease(sck->stream); }
-    if (sck->delegate)     { CFRelease(sck->delegate); }
     if (sck->captureQueue) { CFRelease(sck->captureQueue); }
 
     pthread_mutex_destroy(&sck->frame_lock);

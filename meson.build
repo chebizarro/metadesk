@@ -977,6 +977,15 @@ test_capture = executable('test_capture',
 )
 test('capture convenience API', test_capture)
 
+# md-2p10: ScreenCaptureKit reports a stream the system stopped as broken.
+if host_os == 'darwin'
+  test_capture_sck = executable('test_capture_sck',
+    files('tests/test_capture_sck.m'),
+    dependencies : [dep_metadesk],
+  )
+  test('ScreenCaptureKit system stop', test_capture_sck, timeout : 30)
+endif
+
 test_ipc = executable('test_ipc',
   files('tests/test_ipc.c'),
   dependencies : [dep_metadesk],
