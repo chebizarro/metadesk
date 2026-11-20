@@ -94,9 +94,10 @@ static const uint32_t test_pkt_seq = 1;
 static HostCtx context(MdSession *s) {
     HostCtx ctx = { .session = s, .agent = (MdAgent *)(uintptr_t)1,
                     .input = (MdInput *)(uintptr_t)1 };
-    ctx.sync.packet_seq = &test_pkt_seq;
-    ctx.sync.width = TEST_FRAME_W;
-    ctx.sync.height = TEST_FRAME_H;
+    host_capture_sync_init(&ctx.sync, NULL, NULL, NULL, &test_pkt_seq,
+                           TEST_FRAME_W, TEST_FRAME_H, NULL);
+    host_capture_sync_packet_sent(&ctx.sync,
+                                  host_capture_sync_frame_tag(&ctx.sync), 0);
     return ctx;
 }
 /* Dispatch one MOVE to (x, y) on the frame_w x frame_h frame of video
@@ -115,18 +116,30 @@ static bool dispatch_move(HostCtx *ctx, int16_t x, int16_t y, uint16_t frame_w,
     return input_calls == before + 1;
 }
 /* The real dispatch interprets points against the frame the client showed:
- * packets 10.. went out at half the size on the same output, 50.. at the
- * current size, and 100 is the next to be sent. */
+ * packets 5.. went out at half the size on another output, 10.. at half the
+ * size on this one, 50.. at the current size, and 100 is the next to be
+ * sent. */
+static void sync_geometry(HostCtx *ctx, uint32_t w, uint32_t h,
+                          const MdCaptureRect *r, uint32_t first_seq) {
+    MdCaptureCtx cap = { .output_rect = *r };
+    const MdFrame f = { .width = w, .height = h };
+    (void)host_capture_sync_frame(&ctx->sync, &cap, &f); /* no encoder */
+    MD_CHECK(ctx->sync.width == w && ctx->sync.rect.x == r->x);
+    host_capture_sync_packet_sent(&ctx->sync,
+                                  host_capture_sync_frame_tag(&ctx->sync),
+                                  first_seq);
+}
 static void check_frame_tags(HostCtx *ctx) {
-    const MdCaptureRect r = { 0, 0, 1280, 720 };
-    ctx->pkt_seq = 100;
-    ctx->sync.packet_seq = &ctx->pkt_seq;
-    ctx->sync.first_seq = 50;
-    ctx->sync.rect = ctx->sync.prev_rect = r;
-    ctx->sync.prev_first_seq = 10;
-    ctx->sync.prev_width = TEST_FRAME_W / 2;
-    ctx->sync.prev_height = TEST_FRAME_H / 2;
+    const MdCaptureRect r = { 0, 0, 1280, 720 }, other = { 1280, 0, 1280, 720 };
     const uint16_t W = TEST_FRAME_W, H = TEST_FRAME_H;
+    ctx->pkt_seq = 0;
+    host_capture_sync_init(&ctx->sync, NULL, NULL, NULL, &ctx->pkt_seq,
+                           W / 2, H / 2, &other);
+    host_capture_sync_packet_sent(&ctx->sync,
+                                  host_capture_sync_frame_tag(&ctx->sync), 5);
+    sync_geometry(ctx, W / 2, H / 2, &r, 10);
+    sync_geometry(ctx, W, H, &r, 50);
+    ctx->pkt_seq = 100;
     MD_CHECK(dispatch_move(ctx, 320, 180, W, H, 60, false));
     MD_CHECK(move_x == 320 && move_y == 180);
     MD_CHECK(!dispatch_move(ctx, 320, 180, W, H, 60, true));   /* untagged */
@@ -137,9 +150,9 @@ static void check_frame_tags(HostCtx *ctx) {
     MD_CHECK(!dispatch_move(ctx, 320, 180, W, H, 20, false));  /* wrong size */
     MD_CHECK(dispatch_move(ctx, 160, 90, W / 2, H / 2, 20, false));
     MD_CHECK(move_x == 320 && move_y == 180);                  /* rescaled */
-    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 5, false)); /* older */
-    ctx->sync.prev_rect.x = 1280; /* another output: not translatable */
-    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 20, false));
+    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 4, false)); /* older */
+    /* Another output at the same size: not translatable. */
+    MD_CHECK(!dispatch_move(ctx, 160, 90, W / 2, H / 2, 7, false));
     MD_CHECK(ctx->sync.points_translated == 1);
     MdSession *session = ctx->session;
     const HostCtx fresh = context(session);

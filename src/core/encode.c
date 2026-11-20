@@ -30,6 +30,10 @@
 #include "log.h"
 #define MD_LOG_TAG "encode"
 
+/* Far deeper than any low-latency pipeline (0-3 frames): a frame the codec
+ * holds longer has its tag forgotten, never misattributed. */
+#define MD_ENCODER_INFLIGHT 32u
+
 struct MdEncoder {
     MdEncoderConfig      config;
     const AVCodec       *codec;
@@ -40,7 +44,12 @@ struct MdEncoder {
     int                  nv12_size;  /* total NV12 buffer size                 */
     bool                 is_hw;      /* true if using NVENC                    */
     bool                 force_keyframe; /* emit an IDR on the next frame       */
-    int64_t              frame_idx;  /* monotonic frame counter for pts        */
+    int64_t              frame_idx;  /* the next frame's lowest codec pts      */
+
+    /* Frames the codec may still hold, oldest first, by codec pts: the tag
+     * each was submitted with, for its packet (md-f7uc). */
+    struct { int64_t pts; uint64_t tag; } inflight[MD_ENCODER_INFLIGHT];
+    uint32_t             inflight_head, inflight_count;
 
     /* Encode callback — set during submit, used in receive loop */
     MdEncodeCallback     cb;
@@ -115,6 +124,37 @@ static int convert_to_nv12(const uint8_t *src, uint32_t stride,
     return -1;
 }
 
+/* ── Per-frame tags across the codec ─────────────────────────── */
+
+static void inflight_push(MdEncoder *enc, int64_t pts, uint64_t tag) {
+    if (enc->inflight_count == MD_ENCODER_INFLIGHT) {
+        enc->inflight_head = (enc->inflight_head + 1u) % MD_ENCODER_INFLIGHT;
+        enc->inflight_count--;
+    }
+    const uint32_t i = (enc->inflight_head + enc->inflight_count) %
+                       MD_ENCODER_INFLIGHT;
+    enc->inflight[i].pts = pts;
+    enc->inflight[i].tag = tag;
+    enc->inflight_count++;
+}
+
+/* The tag of the frame with codec timestamp pts. Codec timestamps strictly
+ * increase, so frames held before it were dropped by the codec and are
+ * forgotten with it. */
+static uint64_t inflight_take(MdEncoder *enc, int64_t pts) {
+    for (uint32_t n = 0; n < enc->inflight_count; n++) {
+        const uint32_t i = (enc->inflight_head + n) % MD_ENCODER_INFLIGHT;
+        if (enc->inflight[i].pts > pts)
+            break;
+        if (enc->inflight[i].pts == pts) {
+            enc->inflight_head = (i + 1u) % MD_ENCODER_INFLIGHT;
+            enc->inflight_count -= n + 1u;
+            return enc->inflight[i].tag;
+        }
+    }
+    return 0;
+}
+
 /* ── Receive encoded packets from the codec ──────────────────── */
 
 static int receive_packets(MdEncoder *enc) {
@@ -135,8 +175,11 @@ static int receive_packets(MdEncoder *enc) {
                 .pts    = enc->pkt->pts,
                 .dts    = enc->pkt->dts,
                 .is_key = (enc->pkt->flags & AV_PKT_FLAG_KEY) != 0,
+                .tag    = inflight_take(enc, enc->pkt->pts),
             };
             enc->cb(&out, enc->cb_userdata);
+        } else {
+            (void)inflight_take(enc, enc->pkt->pts);
         }
         count++;
         av_packet_unref(enc->pkt);
@@ -336,6 +379,14 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
                       uint32_t stride, MdPixFmt input_fmt,
                       int64_t pts,
                       MdEncodeCallback cb, void *userdata) {
+    return md_encoder_submit_tagged(enc, data, stride, input_fmt, pts, 0,
+                                    cb, userdata);
+}
+
+int md_encoder_submit_tagged(MdEncoder *enc, const uint8_t *data,
+                             uint32_t stride, MdPixFmt input_fmt,
+                             int64_t pts, uint64_t tag,
+                             MdEncodeCallback cb, void *userdata) {
     if (!enc || !data || !enc->ctx)
         return -1;
 
@@ -355,10 +406,14 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
     }
 
     /* Set PTS. FFmpeg expects PTS in the codec's time_base; use the
-     * caller's timestamp when provided, else fall back to frame count. */
-    enc->frame->pts = (pts >= 0) ? pts : (int64_t)enc->frame_idx++;
-    if (pts >= 0)
-        enc->frame_idx = pts + 1;
+     * caller's timestamp when provided, else fall back to frame count.
+     * Strictly increasing, so each held frame's packet finds its tag (a
+     * capture restart can restart the caller's count). */
+    int64_t codec_pts = (pts >= 0) ? pts : enc->frame_idx;
+    if (codec_pts < enc->frame_idx)
+        codec_pts = enc->frame_idx;
+    enc->frame->pts = codec_pts;
+    enc->frame_idx = codec_pts + 1;
 
     /* Force an IDR when requested (e.g. a new client connected and needs a
      * decodable entry point); otherwise let the encoder pick the type. */
@@ -373,6 +428,7 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
         enc->cb_userdata = NULL;
         return -1;
     }
+    inflight_push(enc, codec_pts, tag);
 
     /* Receive any available encoded packets */
     ret = receive_packets(enc);

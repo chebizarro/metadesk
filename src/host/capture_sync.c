@@ -7,6 +7,14 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Make (width, height, rect) the current geometry, as a new generation. */
+static void enter_generation(HostCaptureSync *s) {
+    if (++s->generation == 0) s->generation = 1;
+    s->geometries[s->generation % HOST_CAPTURE_SYNC_GEOMETRIES] =
+        (HostGeometry){ .gen = s->generation, .width = s->width,
+                        .height = s->height, .rect = s->rect };
+}
+
 void host_capture_sync_init(HostCaptureSync *s, MdEncoder *encoder,
                             MdInput *input, pthread_mutex_t *input_mu,
                             const uint32_t *packet_seq,
@@ -17,19 +25,16 @@ void host_capture_sync_init(HostCaptureSync *s, MdEncoder *encoder,
     s->input      = input;
     s->input_mu   = input_mu;
     s->packet_seq = packet_seq;
-    s->first_seq  = packet_seq ? *packet_seq : 0;
     s->width    = width;
     s->height   = height;
     if (rect) s->rect = *rect;
+    enter_generation(s);
     atomic_init(&s->bitrate_req, 0u);
     atomic_init(&s->keyframe_req, false);
 }
 
 void host_capture_sync_reset_sequence(HostCaptureSync *s) {
-    s->first_seq = s->packet_seq ? *s->packet_seq : 0;
-    s->prev_width = s->prev_height = 0;
-    memset(&s->prev_rect, 0, sizeof(s->prev_rect));
-    s->prev_first_seq = 0;
+    s->runs_total = 0;
     s->drop_logged = false;
 }
 
@@ -46,12 +51,14 @@ static bool rect_equal(const MdCaptureRect *a, const MdCaptureRect *b) {
            a->width == b->width && a->height == b->height;
 }
 
-/* Returns true when the geometry changed. The bounds and the geometry that
- * host_capture_sync_map_point reads change together under input_mu. */
-static bool sync_input(HostCaptureSync *s, uint32_t w, uint32_t h,
-                       const MdCaptureRect *rect) {
+/* Returns 1 when the geometry changed, 0 when it did not, -1 when the input
+ * could not follow it: the frame then has no generation to go out under.
+ * The bounds and the geometry that host_capture_sync_map_point reads change
+ * together under input_mu. */
+static int sync_input(HostCaptureSync *s, uint32_t w, uint32_t h,
+                      const MdCaptureRect *rect) {
     if (w == s->width && h == s->height && rect_equal(rect, &s->rect))
-        return false;
+        return 0;
     const uint32_t old_w = s->width, old_h = s->height;
     if (s->input_mu) pthread_mutex_lock(s->input_mu);
     if (s->input) {
@@ -62,18 +69,14 @@ static bool sync_input(HostCaptureSync *s, uint32_t w, uint32_t h,
         };
         if (md_input_set_bounds(s->input, &b) != 0) {
             if (s->input_mu) pthread_mutex_unlock(s->input_mu);
-            return false;
+            return -1;
         }
         s->bounds_updates++;
     }
-    s->prev_width  = s->width;
-    s->prev_height = s->height;
-    s->prev_rect   = s->rect;
-    s->prev_first_seq = s->first_seq;
-    s->first_seq   = s->packet_seq ? *s->packet_seq : 0;
     s->width  = w;
     s->height = h;
     s->rect   = *rect;
+    enter_generation(s);
     s->drop_logged = false;
     if (s->input_mu) pthread_mutex_unlock(s->input_mu);
 
@@ -84,7 +87,7 @@ static bool sync_input(HostCaptureSync *s, uint32_t w, uint32_t h,
     else
         fprintf(stderr, "host: capture geometry %ux%u -> %ux%u\n",
                 old_w, old_h, w, h);
-    return true;
+    return 1;
 }
 
 /* NV12/H.264 need even sizes: an odd edge is cropped by one row/column at
@@ -127,8 +130,12 @@ bool host_capture_sync_frame(HostCaptureSync *s, const MdCaptureCtx *cap,
     MdCaptureRect rect = {0};
     if (md_capture_get_output_rect(cap, &rect) != 0)
         memset(&rect, 0, sizeof(rect));
-    /* A failed size is retried once the geometry changes again. */
-    if (sync_input(s, frame->width, frame->height, &rect))
+    /* A failed size is retried once the geometry changes again. A frame the
+     * input cannot follow would go out tagged with the old geometry. */
+    const int changed = sync_input(s, frame->width, frame->height, &rect);
+    if (changed < 0)
+        return false;
+    if (changed)
         s->failed_w = s->failed_h = 0;
 
     if (!s->encoder)
@@ -140,6 +147,29 @@ bool host_capture_sync_frame(HostCaptureSync *s, const MdCaptureCtx *cap,
     if (atomic_exchange(&s->keyframe_req, false))
         md_encoder_force_keyframe(s->encoder);
     return ok;
+}
+
+uint64_t host_capture_sync_frame_tag(const HostCaptureSync *s) {
+    return s ? s->generation : 0;
+}
+
+static const HostPacketRun *newest_run(const HostCaptureSync *s) {
+    return s->runs_total
+        ? &s->runs[(s->runs_total - 1u) % HOST_CAPTURE_SYNC_RUNS] : NULL;
+}
+
+void host_capture_sync_packet_sent(HostCaptureSync *s, uint64_t frame_tag,
+                                   uint32_t seq) {
+    if (!s) return;
+    HostGeometry g = {0};
+    const HostGeometry *held =
+        &s->geometries[frame_tag % HOST_CAPTURE_SYNC_GEOMETRIES];
+    if (frame_tag && held->gen == frame_tag) g = *held;
+    const HostPacketRun *last = newest_run(s);
+    if (last && last->geometry.gen == g.gen)
+        return;                     /* continues the run */
+    s->runs[s->runs_total++ % HOST_CAPTURE_SYNC_RUNS] =
+        (HostPacketRun){ .first_seq = seq, .geometry = g };
 }
 
 /* The decoded size of a geometry: the encoder's even-rounded size. */
@@ -161,6 +191,20 @@ static int rescale(int p, uint32_t n, uint32_t m) {
     return (int)(q < m ? q : m - 1u);
 }
 
+/* The run packet seq belongs to: the newest that started at or before it.
+ * NULL when it predates every run held. */
+static const HostPacketRun *run_of(const HostCaptureSync *s, uint32_t seq) {
+    const uint32_t held = s->runs_total < HOST_CAPTURE_SYNC_RUNS
+                        ? s->runs_total : HOST_CAPTURE_SYNC_RUNS;
+    for (uint32_t i = 1; i <= held; i++) {
+        const HostPacketRun *r =
+            &s->runs[(s->runs_total - i) % HOST_CAPTURE_SYNC_RUNS];
+        if (seq_at_or_after(seq, r->first_seq))
+            return r;
+    }
+    return NULL;
+}
+
 static HostPointMap map_point(const HostCaptureSync *s,
                               uint16_t frame_w, uint16_t frame_h,
                               uint32_t frame_pkt_seq, int x, int y,
@@ -171,23 +215,23 @@ static HostPointMap map_point(const HostCaptureSync *s,
     /* A frame not sent yet is no frame the client showed. */
     if (seq_at_or_after(frame_pkt_seq, *s->packet_seq))
         return HOST_POINT_DROPPED;
-    if (seq_at_or_after(frame_pkt_seq, s->first_seq)) {
-        if (!size_matches(s->width, s->height, frame_w, frame_h))
-            return HOST_POINT_DROPPED;
+    const HostPacketRun *run = run_of(s, frame_pkt_seq);
+    if (!run)
+        return HOST_POINT_DROPPED;
+    const HostGeometry *g = &run->geometry;
+    if (!g->gen || !size_matches(g->width, g->height, frame_w, frame_h))
+        return HOST_POINT_DROPPED;
+    if (g->gen == s->generation) {
         *out_x = x;
         *out_y = y;
         return HOST_POINT_CURRENT;
     }
-    if (!s->prev_width || !seq_at_or_after(frame_pkt_seq, s->prev_first_seq) ||
-        !size_matches(s->prev_width, s->prev_height, frame_w, frame_h))
-        return HOST_POINT_DROPPED;
     /* Same output rectangle at another size: both frames show the same
      * desktop region, so a rescale lands on the same desktop point. */
-    if (!s->rect.width || !s->rect.height ||
-        !rect_equal(&s->rect, &s->prev_rect))
+    if (!s->rect.width || !s->rect.height || !rect_equal(&s->rect, &g->rect))
         return HOST_POINT_DROPPED;
-    *out_x = rescale(x, s->prev_width, s->width);
-    *out_y = rescale(y, s->prev_height, s->height);
+    *out_x = rescale(x, g->width, s->width);
+    *out_y = rescale(y, g->height, s->height);
     return HOST_POINT_TRANSLATED;
 }
 
@@ -206,9 +250,9 @@ HostPointMap host_capture_sync_map_point(HostCaptureSync *s,
         if (!s->drop_logged) {
             s->drop_logged = true;
             fprintf(stderr, "host: dropping pointer input on a %ux%u frame "
-                    "(packet %u; frame now %ux%u from packet %u): stale or "
+                    "(packet %u; frame now %ux%u, geometry %u): stale or "
                     "unknown geometry\n", frame_w, frame_h, frame_pkt_seq,
-                    s->width & ~1u, s->height & ~1u, s->first_seq);
+                    s->width & ~1u, s->height & ~1u, s->generation);
         }
     }
     return m;

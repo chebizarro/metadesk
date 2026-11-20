@@ -657,6 +657,106 @@ static int test_bitrate_rapid_changes(void) {
     return 0;
 }
 
+/* ── Test: per-frame tags through the codec pipeline (md-f7uc) ── */
+
+/* Every packet carries the tag of the frame it encodes, whenever the codec
+ * emits it: an asynchronous codec (VideoToolbox here on macOS) emits frames
+ * from later submits or the flush. Timestamps that restart (a capture
+ * restart) are advanced so frames stay distinguishable, and a resize
+ * discards the frames the old codec held, with their tags. */
+
+#define TAG_FRAMES  24
+#define TAG_RESIZE  16   /* frames from here on are 320x240 */
+#define TAG_BASE    1000u
+
+typedef struct {
+    int      submitted;           /* frames handed to the encoder */
+    int64_t  pts[TAG_FRAMES];     /* each frame's expected codec pts */
+    bool     seen[TAG_FRAMES];
+    uint64_t last_tag;
+    int      packets, late, untagged;
+} TagLog;
+
+static void on_tagged(const MdEncodedPacket *pkt, void *userdata) {
+    TagLog *t = userdata;
+    t->packets++;
+    if (pkt->tag < TAG_BASE || pkt->tag >= TAG_BASE + (uint64_t)t->submitted) {
+        t->untagged++;
+        return;
+    }
+    const int frame = (int)(pkt->tag - TAG_BASE);
+    MD_CHECK(pkt->pts == t->pts[frame]);  /* it encodes that frame */
+    MD_CHECK(pkt->tag > t->last_tag);     /* in order, each once */
+    MD_CHECK(!t->seen[frame]);
+    t->seen[frame] = true;
+    t->last_tag = pkt->tag;
+    if (frame < t->submitted - 1)
+        t->late++;                        /* emitted after later frames */
+}
+
+static int test_tags_follow_frames(void) {
+    printf("  test_tags_follow_frames... ");
+    MdEncoderConfig cfg = {
+        .width = TEST_W, .height = TEST_H, .bitrate = 4000000, .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    MD_CHECK(enc != NULL);
+    if (!enc) return 1;
+    uint8_t *buf = malloc((size_t)TEST_W * 4u * TEST_H);
+    MD_CHECK(buf != NULL);
+    if (!buf) { md_encoder_destroy(enc); return 1; }
+
+    TagLog t = { .last_tag = 0 };
+    int64_t next = 0;                     /* the codec's next lowest pts */
+    for (int i = 0; i < TAG_FRAMES; i++) {
+        uint32_t w = TEST_W, h = TEST_H;
+        if (i == TAG_RESIZE) {
+            MD_CHECK(md_encoder_resize(enc, 320, 240) == 0);
+        }
+        if (i >= TAG_RESIZE) { w = 320; h = 240; }
+        /* Gaps of two, then a restart of the caller's count at frame 10. */
+        const int64_t caller = i < 10 ? 2 * i : i - 10;
+        t.pts[i] = caller < next ? next : caller;
+        next = t.pts[i] + 1;
+        fill_solid(buf, w, h, w * 4u, (uint8_t)(i * 10), 80, (uint8_t)(255 - i * 10));
+        t.submitted = i + 1;
+        MD_CHECK(md_encoder_submit_tagged(enc, buf, w * 4u, MD_PIX_FMT_BGRX,
+                                          caller, TAG_BASE + (uint64_t)i,
+                                          on_tagged, &t) == 0);
+    }
+    MD_CHECK(md_encoder_flush(enc, on_tagged, &t) >= 0);
+
+    MD_CHECK(t.untagged == 0);
+    /* What the old codec held at the resize is gone; nothing else is. */
+    int before = 0;
+    while (before < TAG_RESIZE && t.seen[before]) before++;
+    for (int i = before; i < TAG_RESIZE; i++) MD_CHECK(!t.seen[i]);
+    MD_CHECK(before >= TAG_RESIZE - 4);
+    for (int i = TAG_RESIZE; i < TAG_FRAMES; i++) MD_CHECK(t.seen[i]);
+    MD_CHECK(t.packets == before + (TAG_FRAMES - TAG_RESIZE));
+
+    /* md_encoder_submit is the untagged path. */
+    g_encoded_count = 0;
+    MdEncoder *plain = md_encoder_create(&cfg);
+    MD_CHECK(plain != NULL);
+    if (plain) {
+        TagLog u = { .submitted = 0 };
+        fill_solid(buf, TEST_W, TEST_H, TEST_W * 4u, 1, 2, 3);
+        MD_CHECK(md_encoder_submit(plain, buf, TEST_W * 4u, MD_PIX_FMT_BGRX,
+                                   0, on_tagged, &u) == 0);
+        MD_CHECK(md_encoder_flush(plain, on_tagged, &u) >= 0);
+        MD_CHECK(u.packets == 1 && u.untagged == 1);
+        md_encoder_destroy(plain);
+    }
+
+    printf("OK (%s: %d packets, %d emitted after later frames, %d "
+           "discarded at the resize)\n", md_encoder_is_hw(enc) ? "hardware"
+           : "x264", t.packets, t.late, TAG_RESIZE - before);
+    free(buf);
+    md_encoder_destroy(enc);
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -681,6 +781,7 @@ int main(void) {
     failures += test_encoder_set_bitrate_clamp();
     failures += test_encode_after_bitrate_change();
     failures += test_bitrate_rapid_changes();
+    failures += test_tags_follow_frames();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     md_test_failures += failures;

@@ -56,6 +56,7 @@ typedef struct {
     int64_t        pts;     /* presentation timestamp (encoder timebase)               */
     int64_t        dts;     /* decode timestamp                                        */
     bool           is_key;  /* true if IDR / keyframe                                  */
+    uint64_t       tag;     /* the tag its frame was submitted with; 0 if unknown      */
 } MdEncodedPacket;
 
 /* Callback invoked for each encoded packet. */
@@ -74,7 +75,9 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg);
  * data: pixel data in the format specified by input_fmt
  * stride: bytes per row (typically width * 4 for BGRX/RGBX)
  * input_fmt: pixel format of the input data
- * pts: presentation timestamp in microseconds
+ * pts: presentation timestamp in the codec timebase (1/fps), or < 0 for the
+ *      frame count. The codec sees strictly increasing timestamps: a pts
+ *      not after the previous frame's is advanced to the next one.
  * cb/userdata: callback invoked synchronously for each encoded packet
  *
  * The encoder converts to NV12 internally via libyuv.
@@ -83,6 +86,18 @@ int md_encoder_submit(MdEncoder *enc, const uint8_t *data,
                       uint32_t stride, MdPixFmt input_fmt,
                       int64_t pts,
                       MdEncodeCallback cb, void *userdata);
+
+/* md_encoder_submit, with per-frame metadata: the packet that encodes this
+ * frame carries tag (MdEncodedPacket.tag) whenever the codec emits it. An
+ * asynchronous codec (VideoToolbox, AMF) can emit it from a later submit or
+ * the flush, after the caller has moved on; the tag still names this frame.
+ * Packets are matched to frames by timestamp, and the codec holds only a
+ * few frames, so a packet whose frame is no longer held carries tag 0.
+ * md_encoder_submit submits with tag 0. */
+int md_encoder_submit_tagged(MdEncoder *enc, const uint8_t *data,
+                             uint32_t stride, MdPixFmt input_fmt,
+                             int64_t pts, uint64_t tag,
+                             MdEncodeCallback cb, void *userdata);
 
 /* Flush encoder — signal end of stream and retrieve remaining packets. */
 int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata);
@@ -95,9 +110,9 @@ void md_encoder_force_keyframe(MdEncoder *enc);
 /* Re-open the encoder at a new size, e.g. when the captured display changes
  * resolution mid-stream. The same codec cascade as md_encoder_create runs
  * with the current bitrate and fps. Width and height must be even and
- * non-zero. Packets the old codec still buffered are discarded: they
- * predate the change, and the next submitted frame is an IDR whose in-band
- * SPS carries the new size, so decoders re-initialise from it. Returns 0
+ * non-zero. Packets the old codec still buffered are discarded (with their
+ * tags): they predate the change, and the next submitted frame is an IDR
+ * whose in-band SPS carries the new size, so decoders re-initialise from it. Returns 0
  * (also for an unchanged size), or -1 with the encoder left as it was.
  * Same threading rule as md_encoder_submit. */
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
