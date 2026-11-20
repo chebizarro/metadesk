@@ -822,6 +822,87 @@ int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms) {
     return ret;
 }
 
+/* ── Allowlist decoding ───────────────────────────────────────── */
+
+/* Append a copy, leaving the list intact on failure. Deliberately not
+ * nostr_nip51_list_add_entry(): its failure contract differs by nostrc version
+ * (legacy keeps the list and leaks the entry; >= 5d1283a7c frees the entry
+ * and empties the list), so no caller can clean up correctly for both. The
+ * NostrList layout and its free() ownership are identical in both. */
+static bool list_append_copy(NostrList *list, const char *tag,
+                             const char *value, const char *extra) {
+    if (!list || (!list->entries && list->capacity)) return false;
+    if (list->count >= list->capacity) {
+        size_t cap = list->capacity ? list->capacity * 2 : 8;
+        if (cap > SIZE_MAX / sizeof(*list->entries)) return false;
+        NostrListEntry **next = realloc(list->entries, cap * sizeof(*next));
+        if (!next) return false;
+        list->entries = next;
+        list->capacity = cap;
+    }
+    NostrListEntry *entry = nostr_nip51_entry_new(tag, value, extra, false);
+    if (!entry) return false;
+    list->entries[list->count++] = entry;
+    return true;
+}
+
+/* Decode our kind:30000 allowlist from the raw tags (md-jqnz). This is access
+ * control, so it does not inherit nostr_nip51_parse_list()'s tag policy, which
+ * changed in nostrc 5d1283a7c from "drop application tags" to "keep every tag,
+ * reject the whole list on any tag of more than three fields". Rules:
+ *  - The first d tag is the address (NIP-01). Not metadesk-allowlist: not ours.
+ *  - ["p", pk, ...]: one membership. Field 2 is an opaque relay hint, never
+ *    policy; fields 3+ (e.g. a NIP-02 petname) are ignored.
+ *  - ["metadesk-caps", pk, ...]: one grant record. Exactly three fields keeps
+ *    the payload; any other arity that names a pk is retained as "" so it
+ *    stays an invalid record for pk (deny) and an edit cannot normalize it
+ *    into a grant. A tag that names no pk has no principal to affect.
+ *  - Every other tag is ignored and not republished by edits: the address is
+ *    ours and its schema is d/p/metadesk-caps, and event-level tags (NIP-40
+ *    expiration, NIP-70 "-", client, ...) must not be copied from a stale
+ *    event into a new one.
+ * So no single tag can reject the list or affect another principal.
+ * Encrypted content is not decoded: the policy is public. Returns false and
+ * leaves *out NULL if the event is not our allowlist or memory runs out. */
+static bool allowlist_from_event(NostrEvent *ev, NostrList **out) {
+    *out = NULL;
+    NostrTags *tags = nostr_event_get_tags(ev);
+    size_t count = tags ? nostr_tags_size(tags) : 0;
+    const char *identifier = NULL;
+    for (size_t i = 0; i < count; i++) {
+        NostrTag *tag = nostr_tags_get(tags, i);
+        const char *name = tag && nostr_tag_size(tag) >= 2 ? nostr_tag_get(tag, 0) : NULL;
+        if (name && !strcmp(name, "d")) { identifier = nostr_tag_get(tag, 1); break; }
+    }
+    if (!identifier || strcmp(identifier, "metadesk-allowlist")) return false;
+
+    NostrList *list = nostr_nip51_list_new();
+    bool ok = list != NULL;
+    if (ok) {
+        nostr_nip51_list_set_identifier(list, identifier);
+        ok = list->identifier != NULL;
+    }
+    for (size_t i = 0; ok && i < count; i++) {
+        NostrTag *tag = nostr_tags_get(tags, i);
+        size_t arity = tag ? nostr_tag_size(tag) : 0;
+        const char *name = arity >= 2 ? nostr_tag_get(tag, 0) : NULL;
+        const char *value = name ? nostr_tag_get(tag, 1) : NULL;
+        const char *third = arity >= 3 ? nostr_tag_get(tag, 2) : NULL;
+        if (!name || !value) continue;
+        if (!strcmp(name, "p"))
+            ok = list_append_copy(list, name, value, third);
+        else if (!strcmp(name, "metadesk-caps"))
+            ok = list_append_copy(list, name, value, arity == 3 && third ? third : "");
+    }
+    if (!ok) {
+        MD_LOG_W("allowlist event dropped: out of memory while decoding");
+        nostr_nip51_list_free(list);
+        return false;
+    }
+    *out = list;
+    return true;
+}
+
 /* ── Event middleware ─────────────────────────────────────────
  * nostrc's NostrSimplePool invokes the event_middleware callback
  * for every incoming event across all subscriptions. We route
@@ -861,24 +942,8 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             return;
         }
 
-        NostrList *list = nostr_nip51_parse_list(ev, NULL);
-        /* NIP-51's generic parser ignores application tags. Retain grant
-         * records separately from p's opaque relay-hint field. A malformed
-         * arity remains invalid even after an unrelated edit republishes it. */
-        NostrTags *tags = nostr_event_get_tags(ev);
-        for (size_t i = 0; list && tags && i < nostr_tags_size(tags); i++) {
-            NostrTag *tag = nostr_tags_get(tags, i);
-            const char *name = tag ? nostr_tag_get(tag, 0) : NULL;
-            if (!name || strcmp(name, "metadesk-caps")) continue;
-            const char *pk = nostr_tag_get(tag, 1);
-            const char *grant = nostr_tag_size(tag) == 3 ? nostr_tag_get(tag, 2) : "";
-            if (!list_append_copy(list, name, pk ? pk : "", grant ? grant : "")) {
-                nostr_nip51_list_free(list);
-                list = NULL;
-            }
-        }
-        if (list && list->identifier &&
-            strcmp(list->identifier, "metadesk-allowlist") == 0) {
+        NostrList *list = NULL;
+        if (allowlist_from_event(ev, &list)) {
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_PROCESSING);
             pthread_mutex_lock(&n->allowlist_mu);
             bool pending = false;
@@ -899,8 +964,6 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             pthread_mutex_unlock(&n->allowlist_mu);
             nostr_nip51_list_free(list);
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_RECEIVED);
-        } else {
-            nostr_nip51_list_free(list);
         }
     }
 }
@@ -1534,19 +1597,6 @@ static NostrEvent *build_allowlist_event(const MdNostr *n, const NostrList *list
 
     nostr_event_set_tags(list_event, tags); /* takes ownership */
     return list_event;
-}
-
-static bool list_append_copy(NostrList *list, const char *tag,
-                             const char *value, const char *extra) {
-    NostrListEntry *entry = nostr_nip51_entry_new(tag, value, extra, false);
-    if (!entry) return false;
-    size_t before = list->count;
-    nostr_nip51_list_add_entry(list, entry);
-    if (list->count == before) {
-        nostr_nip51_entry_free(entry);
-        return false;
-    }
-    return true;
 }
 
 static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add) {

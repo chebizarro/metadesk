@@ -75,6 +75,33 @@ wrong-arity scope records grant **zero**, as do duplicate memberships and orphan
 grant records. Invalid records cannot combine with a valid duplicate to escalate
 privileges. No numeric masks or implicit capability dependencies are accepted.
 
+Metadesk decodes this event from its raw tags (md-jqnz). It does not use nostrc's
+generic NIP-51 parser, because that parser's tag policy depends on the nostrc
+version:
+
+- Before nostrc 5d1283a7c it drops application tags.
+- From 5d1283a7c it keeps every tag, and rejects the whole list if any tag has
+  more than three fields.
+
+Metadesk's rules are fixed:
+
+- **Address.** The first `d` tag is the address, as in NIP-01. If the first `d`
+  is not `metadesk-allowlist`, the event is ignored, even when a later `d` tag
+  matches.
+- **Membership.** A `p` tag counts whatever its length. The third field is an
+  opaque relay hint. Later fields, such as a NIP-02 petname, are ignored.
+- **Grants.** A `metadesk-caps` record that does not have exactly three fields
+  is an invalid grant for its principal, so that principal gets zero. The record
+  is kept rather than dropped, so a valid duplicate cannot override it.
+- **Other tags.** No other tag affects access, and edits do not republish
+  them. Edits publish only `d`, `p` and `metadesk-caps`. This keeps event-level
+  tags from a stale event, such as NIP-40 `expiration` or NIP-70 `-`, out of
+  the replacement. Older metadesk builds carried forward `e`, `t`, `word`, `a`
+  and `r` tags.
+
+A malformed or unknown tag never rejects or opens the list as a whole. At most,
+it denies the one principal it names.
+
 **Legacy entries default to deny (zero capabilities)**, even if their old `p`
 extra says `video,agent,input`: that field remains opaque metadata/relay hint,
 never enforced policy. Deny is deliberate: upgrading must not silently authorize

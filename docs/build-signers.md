@@ -166,6 +166,12 @@ application tags such as `metadesk-caps`, so `src/core/nostr.c` counts each
 grant twice and denies it (md-jqnz). A throwaway copy with that double-append
 removed passed 42/42 against macOS master.
 
+md-jqnz fixed this. The allowlist is now decoded from raw event tags and no
+longer calls `nostr_nip51_parse_list()` (rules in
+[access.md](access.md#public-allowlist-grant-format-v1-md-ikr)). The
+`nostr ACL and AUTH private relays` test prints which nip51 tag policy
+(`legacy` or `lossless`) the build links.
+
 The md-0732 TSan wiring still configures correctly.
 
 - **Uninstrumented tree:** `-Db_sanitize=thread` against the uninstrumented

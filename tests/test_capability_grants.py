@@ -39,6 +39,17 @@ def main():
             ("duplicate membership", [member, member, grant], 0),
             ("missing payload", [member, grant[:2]], 0),
             ("trailing payload", [member, [*grant, "ignored?"]], 0),
+            ("trailing payload beside a valid duplicate", [member, [*grant, "x"], grant], 0),
+            # md-jqnz: shapes on which nostrc's nip51 tag policies disagree.
+            # The grant is decoded from raw tags, so none may reject the list.
+            ("unknown >3-field tag", [member, grant, ["x", "1", "2", "3"]], 1),
+            ("unknown 1-field tag", [["x"], member, grant], 1),
+            ("NIP-02 p with relay and petname",
+             [[*member, "wss://relay.example", "alice"], grant], 1),
+            ("other principal's trailing payload", [member, grant, ["p", HOST_PK],
+                                                    ["metadesk-caps", HOST_PK, "v1:video", "x"]], 1),
+            ("repeated title and a second d tag",
+             [["title", "a"], ["title", "b"], ["d", "other"], member, grant], 1),
         ]
         for text in ("video", "v2:video", "v1:", "v1:all", "v1:video,video",
                      "v1:input,video", "v1:video, agent", "v1:video,", "v1:none,input"):
