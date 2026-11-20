@@ -793,3 +793,78 @@ restart, push or merge was performed. The repository's pre-commit hook exported
 shared Beads metadata to the main checkout's `.beads/issues.jsonl`; that
 project-managed export was not staged in the task commit or reverted. The local
 branch/worktree and small private macOS evidence cache are retained for review.
+
+## md-awgm: PipeWire capture size cap (2026-11-19)
+
+`MdCaptureConfig.max_width`/`max_height` (host `--capture-max-size WxH`) are now
+supported by the PipeWire backend. These results come from the same pinned image
+recipe (`localhost/awgm-video:base`, ID `2c09370f3a4f…`) with the task library
+overlaid via `--library`. The final library, rebased onto `ad1fcf5`, is `65d1bb4f…` and the probe is `4c3be139…`.
+
+### Negotiation vs consumer-side scale
+
+- **Negotiation is not available on the reference.** A throwaway library offered
+  `SPA_FORMAT_VIDEO_size` only as `1x1..1280x720`. xdpw 0.7.1 advertises its
+  EnumFormat at the fixed output size (1920×1080), so the link failed:
+  `paused -> error error=no more input formats`, zero frames, probe 6. This
+  matches mutter, which also offers monitor streams at one fixed size. That
+  experiment was never committed.
+- **Shipped: a CPU box filter on the consumer side.**
+  - `pw_get_frame` scales the acquired SHM frame into a backend-owned buffer
+    (`md_capture_scale_frame`), outside the frame lock.
+  - The PipeWire buffer stays borrowed until `release_frame`, so stop still waits
+    for it (md-ah9.10). md-atg's validation and NULL-frame rejection run on the
+    native buffer before any scale.
+  - Only frames the consumer takes are scaled; dropped frames cost nothing.
+  - `wait_size` publishes `md_capture_fit_size` of the negotiated size.
+- **Why a box filter and not bilinear.** Each output pixel is the exact rounded
+  mean of a box of whole source pixels, so uniform areas keep their value. The
+  probe's background-pixel check stays exact. It is also cheaper. Micro-benchmark
+  on the VM, `-O2`, single thread, 1920×1080 source:
+
+| Target | Box (shipped) | Bilinear (baseline) | Full-frame memcpy |
+|---|---|---|---|
+| 1600×900 | 2.6–3.2 ms | 6.2–8.3 ms | 0.15 ms |
+| 1280×720 | 1.9–3.0 ms | 4.0–5.9 ms | 0.15 ms |
+| 1000×563 | 1.5–1.8 ms | 2.5–2.9 ms | 0.15 ms |
+| 960×540 | 1.4–1.7 ms | 2.3–3.0 ms | 0.15 ms |
+| 640×360 | 1.0–1.5 ms | 1.0–1.2 ms | 0.15 ms |
+
+The ranges span four runs on the shared VM. Other agents' compiles were running
+during the later runs, so absolute times are noisy. The box/bilinear ratio holds
+in every run.
+
+### Real-backend matrices (`--reopens 10`, normal idle checks)
+
+| Cell | Uncapped (regression) | `--max-size 1280x0` |
+|---|---|---|
+| Published / delivered size | 1920×1080 / 1920×1080 | **1280×720 / 1280×720** (aspect 1.7778 kept) |
+| Fresh, reuse, stale, cleared, 10 reopens, broken | all pass | all pass |
+| Changing-pixel receipts (5,5 each) / frames observed | 15 / 152 | 15 / 152 (exact `204060`/`a08020`) |
+| Outstanding-borrow stop receipts | 14 | 14 (the scaled pixels stay intact while held) |
+| Pixman / denied / stalled chooser / malformed | expected negatives | expected negatives |
+| Delivery latency p50 / p95 / max, 102 reopen frames | 0.05 / 0.12 / 1.2 ms | 2.2 / 4.2 / 11.7 ms |
+| Delivery latency p50 / p95, fresh | 0.06 / 0.13 ms | 2.0 / 3.1 ms |
+| Gate failures | **0** | **0** |
+
+These runs use the final rebased library. The VM is shared, so the latency
+tails vary between runs. Before the rebase, two earlier runs measured capped
+reopen p50 2.0 ms and 2.5 ms, with p95 3.0 ms and 7.2 ms; the second was taken
+during a concurrent compile. The Linux suite passed **36/36** both with
+`--num-processes 2` and serially.
+
+Single render cells with other caps also passed. Each matched pixels 5,5 and
+passed the held-buffer receipt:
+- `MD_CAPTURE_MAX_SIZE=1000x1000` published and delivered 1000×563 (aspect
+  1.7762 against 1.7778 native, rounded per `md_capture_fit_size`). Latency
+  p50 was 1.82 ms.
+- `64x0` (the host's smallest cap) delivered 64×36. Latency p50 was 1.57 ms.
+
+Latency is the time from `get_frame` returning back to the frame's receipt
+timestamp, so for capped frames it includes the scale. The validator now
+records it in `summary.json`. With `--max-size`, it requires one
+`published_size` receipt per cycle equal to the probe's expected size.
+
+Reproduce: run the existing commands, adding `--max-size 1280x0` to
+`validate-video.py`. The probe reads `MD_CAPTURE_MAX_SIZE` and expects
+`md_capture_fit_size(1920, 1080, cap)`.

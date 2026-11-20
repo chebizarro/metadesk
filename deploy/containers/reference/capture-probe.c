@@ -19,6 +19,19 @@ static double now(void) {
 }
 
 static uint64_t last_timestamp;
+/* The reference Sway headless output is 1920x1080; MD_CAPTURE_MAX_SIZE=WxH
+ * (md-awgm) caps it, and every frame must then be fit_size of the native. */
+static uint32_t expect_w = 1920, expect_h = 1080;
+/* Delivery latency: get_frame return minus the frame's receipt timestamp,
+ * i.e. queueing plus any size-cap scale, in microseconds. */
+static double latency_sum, latency_max;
+static unsigned latency_count;
+
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+static double latencies[4096];
 
 static void resources(const char *stage) {
     const char *trace = getenv("MD_CAPTURE_TRACE_BUFFERS");
@@ -61,6 +74,9 @@ static int probe(MdCaptureCtx *ctx) {
     int rc = md_capture_start(ctx);
     printf("start_rc=%d elapsed=%.3f\n", rc, now() - start);
     if (rc) { printf("frames=0 start_failed=1\n"); return 3; }
+    uint32_t pub_w = 0, pub_h = 0;
+    if (md_capture_wait_size(ctx, 3000, &pub_w, &pub_h) == 0)
+        printf("published_size=%ux%u expected=%ux%u\n", pub_w, pub_h, expect_w, expect_h);
     /* Two distinct rendered backgrounds: verify pixels, not just callbacks.
      * No input injection, no encoder, no network, no mock capture backend. */
     const char *commands[] = {
@@ -79,7 +95,9 @@ static int probe(MdCaptureCtx *ctx) {
                 redraw = now() + .25;
             }
             MdFrame f = {0};
-            if (md_capture_get_frame(ctx, &f, 1000)) {
+            int got = md_capture_get_frame(ctx, &f, 1000);
+            double returned = now();
+            if (got) {
                 timeouts++;
                 /* The backend can return immediately before STREAMING. This
                  * is retry pacing, never a success criterion or consent wait. */
@@ -88,6 +106,12 @@ static int probe(MdCaptureCtx *ctx) {
                 continue;
             }
             frames++;
+            double latency_us = (returned * 1e9 - (double)f.timestamp_ns) / 1e3;
+            latency_sum += latency_us;
+            if (latency_us > latency_max) latency_max = latency_us;
+            if (latency_count < sizeof(latencies) / sizeof(latencies[0]))
+                latencies[latency_count] = latency_us;
+            latency_count++;
             if (!f.timestamp_ns || f.timestamp_ns <= last_timestamp ||
                 f.timestamp_ns > (uint64_t)(now() * 1e9)) {
                 fprintf(stderr, "invalid/nonprogressing monotonic timestamp\n");
@@ -96,8 +120,10 @@ static int probe(MdCaptureCtx *ctx) {
             }
             last_timestamp = f.timestamp_ns;
             size_t offset = (size_t)(f.height / 2) * f.stride + (f.width / 2) * 4;
-            if (f.width != 1920 || f.height != 1080 || f.buf_type != MD_BUF_CPU ||
-                !f.data || offset + 4 > f.data_size) {
+            if (f.width != expect_w || f.height != expect_h || f.buf_type != MD_BUF_CPU ||
+                (pub_w && (f.width != pub_w || f.height != pub_h)) ||
+                f.stride < f.width * 4 || !f.data || offset + 4 > f.data_size ||
+                (size_t)(f.height - 1) * f.stride + f.width * 4 > f.data_size) {
                 fprintf(stderr, "unexpected frame width=%u height=%u stride=%u "
                         "type=%d format=%d data_present=%d bytes=%zu seq=%u\n",
                         f.width, f.height, f.stride, f.buf_type, f.format,
@@ -110,9 +136,9 @@ static int probe(MdCaptureCtx *ctx) {
             if (p[bgr ? 2 : 0] == rgb[phase][0] && p[1] == rgb[phase][1] &&
                 p[bgr ? 0 : 2] == rgb[phase][2]) matches[phase]++;
             printf("phase=%u seq=%u size=%ux%u stride=%u format=%d bytes=%zu "
-                   "pixel=%02x%02x%02x%02x timestamp=%" PRIu64 "\n",
+                   "pixel=%02x%02x%02x%02x timestamp=%" PRIu64 " latency_us=%.0f\n",
                    phase, f.seq, f.width, f.height, f.stride, f.format, f.data_size,
-                   p[0], p[1], p[2], p[3], f.timestamp_ns);
+                   p[0], p[1], p[2], p[3], f.timestamp_ns, latency_us);
             md_capture_release_frame(ctx, &f);
         }
         if (matches[phase] == before) break;
@@ -192,11 +218,19 @@ static int probe(MdCaptureCtx *ctx) {
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     MdCaptureConfig cfg = {.target_fps = 15, .show_cursor = true, .unattended = true};
+    const char *cap = getenv("MD_CAPTURE_MAX_SIZE");
+    if (cap && (sscanf(cap, "%ux%u", &cfg.max_width, &cfg.max_height) != 2 ||
+                md_capture_fit_size(1920, 1080, cfg.max_width, cfg.max_height,
+                                    &expect_w, &expect_h) != 0))
+        return 2;
     const char *timeout = getenv("MD_CAPTURE_CONSENT_TIMEOUT_MS");
     if (timeout) cfg.consent_timeout_ms = (uint32_t)strtoul(timeout, NULL, 10);
     resources("before-create");
     MdCaptureCtx *ctx = md_capture_create(&cfg);
     if (!ctx) return 2;
+    printf("max_size=%ux%u expect=%ux%u aspect_native=%.4f aspect_expect=%.4f\n",
+           cfg.max_width, cfg.max_height, expect_w, expect_h, 1920.0 / 1080.0,
+           (double)expect_w / expect_h);
     const char *repeat = getenv("MD_CAPTURE_REOPENS");
     unsigned count = repeat ? (unsigned)strtoul(repeat, NULL, 10) : 1;
     if (!count || count > 100) { md_capture_destroy(ctx); return 2; }
@@ -211,5 +245,12 @@ int main(void) {
     }
     md_capture_destroy(ctx);
     resources("after-destroy");
+    if (latency_count) {
+        unsigned n = latency_count < sizeof(latencies) / sizeof(latencies[0])
+                     ? latency_count : (unsigned)(sizeof(latencies) / sizeof(latencies[0]));
+        qsort(latencies, n, sizeof(latencies[0]), cmp_double);
+        printf("latency_us frames=%u mean=%.0f p50=%.0f p95=%.0f max=%.0f\n", latency_count,
+               latency_sum / latency_count, latencies[n / 2], latencies[n * 95 / 100], latency_max);
+    }
     return rc;
 }

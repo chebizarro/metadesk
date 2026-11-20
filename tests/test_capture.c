@@ -372,6 +372,154 @@ static void test_fit_size(void)
     PASS("fit_size");
 }
 
+/* md-awgm: the box scaler, against a naive exact-division reference. */
+static void scale_reference(const uint8_t *src, uint32_t sw, uint32_t sh,
+                            size_t ss, uint8_t *dst, uint32_t dw, uint32_t dh,
+                            size_t ds)
+{
+    for (uint32_t y = 0; y < dh; y++) {
+        uint32_t y0 = (uint32_t)((uint64_t)y * sh / dh);
+        uint32_t y1 = (uint32_t)((uint64_t)(y + 1) * sh / dh);
+        for (uint32_t x = 0; x < dw; x++) {
+            uint32_t x0 = (uint32_t)((uint64_t)x * sw / dw);
+            uint32_t x1 = (uint32_t)((uint64_t)(x + 1) * sw / dw);
+            uint32_t n = (x1 - x0) * (y1 - y0);
+            for (int c = 0; c < 4; c++) {
+                uint32_t s = 0;
+                for (uint32_t yy = y0; yy < y1; yy++)
+                    for (uint32_t xx = x0; xx < x1; xx++)
+                        s += src[yy * ss + xx * 4 + c];
+                dst[y * ds + x * 4 + c] = (uint8_t)((s + n / 2) / n);
+            }
+        }
+    }
+}
+
+static void test_scale_frame(void)
+{
+    /* Random content, padded strides, every ratio class: exact, 1.5x, odd
+     * remainders, a single output pixel, identity, and a wide 64:1 box. */
+    static const uint32_t sizes[][4] = {
+        {8, 8, 4, 4},     {9, 7, 6, 5},     {1920, 4, 1280, 3},
+        {17, 13, 1, 1},   {5, 5, 5, 5},     {640, 3, 10, 2},
+        {37, 29, 11, 23}, {300, 2, 299, 1}, {255, 255, 1, 1},
+    };
+    uint32_t seed = 12345;
+    for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
+        uint32_t sw = sizes[t][0], sh = sizes[t][1];
+        uint32_t dw = sizes[t][2], dh = sizes[t][3];
+        size_t ss = (size_t)sw * 4 + 12, ds = (size_t)dw * 4 + 8;
+        uint8_t *src = malloc(ss * sh), *got = malloc(ds * dh), *want = malloc(ds * dh);
+        MD_CHECK(src && got && want);
+        for (size_t i = 0; i < ss * sh; i++) {
+            seed = seed * 1103515245u + 12345u;
+            src[i] = (uint8_t)(seed >> 16);
+        }
+        memset(got, 0xEE, ds * dh);
+        memset(want, 0xEE, ds * dh);
+        scale_reference(src, sw, sh, ss, want, dw, dh, ds);
+        MD_CHECK(md_capture_scale_frame(src, sw, sh, ss, got, dw, dh, ds) == 0);
+        MD_CHECK(memcmp(got, want, ds * dh) == 0);   /* incl. untouched padding */
+        free(src); free(got); free(want);
+    }
+
+    /* A uniform colour survives any ratio exactly (the live probe checks the
+     * rendered background pixel of the capped frame), padding stays intact. */
+    {
+        uint32_t sw = 1920, sh = 1080, dw = 1280, dh = 720;
+        size_t ss = (size_t)sw * 4, ds = (size_t)dw * 4 + 4;
+        uint8_t *src = malloc(ss * sh), *dst = malloc(ds * dh);
+        MD_CHECK(src && dst);
+        for (size_t i = 0; i < ss * sh; i += 4) {
+            src[i] = 0x60; src[i + 1] = 0x40; src[i + 2] = 0x20; src[i + 3] = 0xff;
+        }
+        memset(dst, 0xAB, ds * dh);
+        MD_CHECK(md_capture_scale_frame(src, sw, sh, ss, dst, dw, dh, ds) == 0);
+        bool uniform = true;
+        for (uint32_t y = 0; y < dh; y++) {
+            for (uint32_t x = 0; x < dw; x++) {
+                const uint8_t *p = dst + y * ds + x * 4;
+                uniform &= p[0] == 0x60 && p[1] == 0x40 && p[2] == 0x20 && p[3] == 0xff;
+            }
+            uniform &= dst[y * ds + dw * 4] == 0xAB;
+        }
+        MD_CHECK(uniform);
+        free(src); free(dst);
+    }
+
+    /* 2x2 boxes average; a black/white checkerboard halves to mid grey. */
+    {
+        uint8_t src[4 * 4 * 4], dst[2 * 2 * 4];
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++)
+                memset(src + (y * 4 + x) * 4, ((x + y) & 1) ? 255 : 0, 4);
+        MD_CHECK(md_capture_scale_frame(src, 4, 4, 16, dst, 2, 2, 8) == 0);
+        for (int i = 0; i < 16; i++) MD_CHECK(dst[i] == 128);  /* 510/4 rounds up */
+    }
+
+    /* An impulse lands in the output pixel whose box contains it. */
+    {
+        uint8_t src[6 * 3 * 4] = {0}, dst[4 * 2 * 4];
+        /* Columns split 1,2,1,2 and rows 1,2: source (5,2) is in the 2x2
+         * box of output (3,1). */
+        src[(2 * 6 + 5) * 4 + 1] = 240;
+        MD_CHECK(md_capture_scale_frame(src, 6, 3, 24, dst, 4, 2, 16) == 0);
+        for (int i = 0; i < 32; i++)
+            MD_CHECK(dst[i] == (i == (1 * 4 + 3) * 4 + 1 ? 60 : 0));
+    }
+
+    /* Boxes of 65536+ pixels take the exact-division path: 256x256 and a
+     * whole 1920x1080 frame into one pixel, as a 1x0 cap would ask for. */
+    {
+        uint8_t one[4], want1[4];
+        uint8_t *src = malloc((size_t)1920 * 4 * 1080);
+        MD_CHECK(src != NULL);
+        for (size_t i = 0; i < (size_t)256 * 4 * 256; i++) {
+            seed = seed * 1103515245u + 12345u;
+            src[i] = (uint8_t)(seed >> 16);
+        }
+        scale_reference(src, 256, 256, 1024, want1, 1, 1, 4);
+        MD_CHECK(md_capture_scale_frame(src, 256, 256, 1024, one, 1, 1, 4) == 0);
+        MD_CHECK(memcmp(one, want1, 4) == 0);
+        for (size_t i = 0; i < (size_t)1920 * 4 * 1080; i += 4) {
+            src[i] = 0xff; src[i + 1] = 0x10; src[i + 2] = (i / 4) & 1 ? 0 : 255; src[i + 3] = 7;
+        }
+        uint32_t w = 0, h = 0;
+        MD_CHECK(md_capture_fit_size(1920, 1080, 1, 0, &w, &h) == 0 && w == 1 && h == 1);
+        MD_CHECK(md_capture_scale_frame(src, 1920, 1080, 1920 * 4, one, w, h, 4) == 0);
+        MD_CHECK(one[0] == 0xff && one[1] == 0x10 && one[2] == 128 && one[3] == 7);
+        free(src);
+    }
+
+    /* Invalid: NULLs, zero sizes, upscales, short strides. */
+    uint8_t px[16] = {0};
+    MD_CHECK(md_capture_scale_frame(NULL, 1, 1, 4, px, 1, 1, 4) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 1, 1, 4, NULL, 1, 1, 4) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 0, 1, 4, px, 1, 1, 4) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 2, 2, 8, px, 0, 1, 4) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 2, 1, 8, px, 3, 1, 12) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 2, 1, 8, px, 2, 2, 8) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 2, 1, 7, px, 1, 1, 4) == -1);
+    MD_CHECK(md_capture_scale_frame(px, 2, 1, 8, px, 1, 1, 3) == -1);
+    PASS("scale_frame");
+}
+
+/* The cap end to end: fit the native size, then scale into that frame. */
+static void test_fit_and_scale(void)
+{
+    uint32_t w = 0, h = 0;
+    MD_CHECK(md_capture_fit_size(1920, 1080, 1280, 0, &w, &h) == 0);
+    MD_CHECK(w == 1280 && h == 720);
+    /* xdpw's 1920x1080 SHM stride, capped to fit 1000x1000: 1000x563. */
+    MD_CHECK(md_capture_fit_size(1920, 1080, 1000, 1000, &w, &h) == 0);
+    MD_CHECK(w == 1000 && h == 563);
+    uint8_t *src = calloc((size_t)1920 * 4, 1080), *dst = malloc((size_t)w * 4 * h);
+    MD_CHECK(src && dst);
+    MD_CHECK(md_capture_scale_frame(src, 1920, 1080, 1920 * 4, dst, w, h, (size_t)w * 4) == 0);
+    free(src); free(dst);
+    PASS("fit_size + scale_frame");
+}
+
 /* md-6c4f: frame timestamps live on md_capture_clock_ns()'s clock. */
 #ifdef __APPLE__
 static bool within_ns(uint64_t a, uint64_t b, uint64_t tol)
@@ -962,15 +1110,23 @@ static void test_portal_required(void)
     PASS("real PipeWire backend fails closed without portal (repeated start/stop)");
 }
 
-/* md-n9p2: PipeWire cannot scale its stream, so it refuses a size cap up
- * front instead of silently capturing at full size. */
-static void test_pipewire_rejects_size_cap(void)
+/* md-awgm: PipeWire accepts a size cap (it box-scales acquired frames); the
+ * size it publishes is fit_size of the negotiated stream, so nothing is
+ * known before negotiation. The scaled delivery itself is validated on the
+ * Sway/xdpw reference (deploy/containers/reference/video-validation.md). */
+static void test_pipewire_accepts_size_cap(void)
 {
     MdCaptureConfig cfg = {.unattended = true, .max_width = 1280};
-    MD_CHECK(md_capture_create(&cfg) == NULL);
-    cfg = (MdCaptureConfig){.unattended = true, .max_height = 720};
-    MD_CHECK(md_capture_create(&cfg) == NULL);
-    PASS("real PipeWire backend rejects a capture size cap");
+    MdCaptureCtx *ctx = md_capture_create(&cfg);
+    MD_CHECK(ctx != NULL);
+    uint32_t w = 0, h = 0;
+    MD_CHECK(md_capture_get_size(ctx, &w, &h) == -1 && w == 0 && h == 0);
+    md_capture_destroy(ctx);
+    cfg = (MdCaptureConfig){.unattended = true, .max_width = 1280, .max_height = 720};
+    ctx = md_capture_create(&cfg);
+    MD_CHECK(ctx != NULL && ctx->config.max_width == 1280 && ctx->config.max_height == 720);
+    md_capture_destroy(ctx);
+    PASS("real PipeWire backend accepts a capture size cap");
 }
 #endif
 
@@ -988,6 +1144,8 @@ int main(void)
     test_display_choose();
     test_output_rect();
     test_fit_size();
+    test_scale_frame();
+    test_fit_and_scale();
     test_frame_clock();
     test_wait_size_dispatch();
     test_get_frame_and_release();
@@ -1004,7 +1162,7 @@ int main(void)
     test_portal_required();
     test_stalled_bus();
     test_portal_responses();
-    test_pipewire_rejects_size_cap();
+    test_pipewire_accepts_size_cap();
 #endif
 
     printf("\nAll capture tests passed.\n");

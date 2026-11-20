@@ -23,9 +23,12 @@ p.add_argument('--skip-idle', action='store_true', help='burst diagnostic: skip 
 p.add_argument('--reopens', type=int, default=6, help='same-context start/stop cycles')
 p.add_argument('--pipewire-debug', help='optional upstream PipeWire log level/topic rules')
 p.add_argument('--trace-buffers', action='store_true', help='log private PipeWire buffer metadata')
+p.add_argument('--max-size', help='md-awgm capture size cap WxH (0 = unbounded side) for every probe')
 a = p.parse_args()
 if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', a.prefix) or not 1 <= a.reopens <= 100:
     p.error('invalid prefix or reopen count')
+if a.max_size and not re.fullmatch(r'\d{1,5}x\d{1,5}', a.max_size):
+    p.error('--max-size requires WxH')
 if a.render_node and not str(a.render_node).startswith('/dev/dri/renderD'):
     p.error('only an explicit /dev/dri/renderD* node is accepted')
 if a.asan_runtime and not a.library:
@@ -35,7 +38,8 @@ a.evidence.mkdir(mode=0o700, parents=False)
 probe = a.probe.resolve(strict=True)
 inputs = {'image_tag': a.image, 'image': subprocess.check_output(['podman', 'image', 'inspect', a.image,
                                           '--format', '{{.Id}}'], text=True).strip(),
-          'reopens': a.reopens, 'skip_idle': a.skip_idle, 'trace_buffers': a.trace_buffers, 'pipewire_debug': a.pipewire_debug}
+          'reopens': a.reopens, 'skip_idle': a.skip_idle, 'trace_buffers': a.trace_buffers, 'pipewire_debug': a.pipewire_debug,
+          'max_size': a.max_size}
 for key, path in [('probe', probe), ('library', a.library), ('asan_runtime', a.asan_runtime)]:
     if path:
         inputs[key + '_sha256'] = hashlib.sha256(path.resolve(strict=True).read_bytes()).hexdigest()
@@ -113,6 +117,8 @@ exit "$rc"
             '-e', f'MD_CAPTURE_TRACE_BUFFERS={int(a.trace_buffers)}']
     if a.skip_idle:
         args += ['-e', 'MD_CAPTURE_SKIP_IDLE=1']
+    if a.max_size:
+        args += ['-e', f'MD_CAPTURE_MAX_SIZE={a.max_size}']
     if a.library:
         args += ['-v', f'{a.library.resolve(strict=True)}:/opt/metadesk/lib/libmetadesk.so.0:ro']
     if a.asan_runtime:
@@ -185,6 +191,16 @@ if a.render_node:
                 failures.append(f'render.{run}: expected {cycles} outstanding-borrow stop receipts, got {len(held)}')
         if 'reject buffer:' in content or 'ERROR: AddressSanitizer' in content or 'ERROR: LeakSanitizer' in content:
             failures.append(f'render.{run}: rejected descriptor or sanitizer diagnostic')
+        # The negotiated size, published before frames, is the delivered size.
+        published = re.findall(r'^published_size=(\d+x\d+) expected=(\d+x\d+)$', content, re.MULTILINE)
+        if len(published) != cycles or any(got != want for got, want in published):
+            failures.append(f'render.{run}: published size receipts {published} for {cycles} cycles')
+        latency = re.search(r'^latency_us frames=(\d+) mean=(\d+) p50=(\d+) p95=(\d+) max=(\d+)$', content, re.MULTILINE)
+        if latency:
+            summary['render'].setdefault('latency_us', {})[run] = dict(zip(
+                ['frames', 'mean', 'p50', 'p95', 'max'], map(int, latency.groups())))
+    print('latency_us', json.dumps(summary['render'].get('latency_us')), flush=True)
+    (a.evidence / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     log = a.evidence / 'timeout' / 'fresh.log'
     timing = re.search(r'start_rc=-1 elapsed=([0-9.]+)', log.read_text()) if log.exists() else None
     if not timing or not 0.4 <= float(timing[1]) < 2:
