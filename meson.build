@@ -817,10 +817,33 @@ test_nostr = executable('test_nostr',
   files('tests/test_nostr.c'),
   dependencies : [dep_metadesk],
 )
-test('nostr NIP-44', test_nostr)
+# md-0732: under TSan, nostrc's nsync synchronisation is only visible when
+# nostrc (and nsync) are instrumented too; against stock nostrc every report
+# is a missing-edge false positive. tests/tsan-nostrc.supp has the recipe.
+nostr_test_env = environment({'PYTHONDONTWRITEBYTECODE' : '1'})
+if '@0@'.format(get_option('b_sanitize')).contains('thread')
+  _nostrc_tsan = false
+  if _nostrc_build != '' and fs.exists(_nostrc_build / 'CMakeCache.txt')
+    foreach _line : fs.read(_nostrc_build / 'CMakeCache.txt').split('\n')
+      if _line.startswith('CMAKE_C_FLAGS') and _line.contains('-fsanitize=thread')
+        _nostrc_tsan = true
+      endif
+    endforeach
+  endif
+  if _nostrc_tsan
+    nostr_test_env.prepend('TSAN_OPTIONS', 'halt_on_error=1',
+      'suppressions=' + (meson.current_source_dir() / 'tests' / 'tsan-nostrc.supp'),
+      separator : ':')
+  else
+    warning('TSan: the nostrc build is not instrumented, so test_nostr reports ' +
+      'are false positives from invisible nsync synchronisation. Build nostrc ' +
+      'and nsync with -fsanitize=thread as described in tests/tsan-nostrc.supp.')
+  endif
+endif
+test('nostr NIP-44', test_nostr, env : nostr_test_env)
 test('nostr ACL and AUTH private relays', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr],
-  env : {'PYTHONDONTWRITEBYTECODE' : '1'}, timeout : 120,
+  env : nostr_test_env, timeout : 120,
 )
 
 test_encode = executable('test_encode',
