@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include "md_test.h"
 #include <nostr-kinds.h>
+#include <nostr/nip51/nip51.h>
 #include <json.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -1206,6 +1207,156 @@ static void test_acl_edits(const char **urls, const char *a, const char *b) {
     printf("  PASS: staged edits, signer/all-relay failure, echo, duplicate add, replacement conflict and history-wait cancellation\n");
 }
 
+/* md-jqnz: the allowlist is decoded from the raw tags by metadesk, not by
+ * nostr_nip51_parse_list(), whose tag policy differs between nostrc builds:
+ * legacy drops application tags; >= 5d1283a7c keeps them (so metadesk-caps
+ * would be seen twice) and rejects the whole list for any >3-field tag. Every
+ * shape below is one where the two policies disagree; the expected grants are
+ * the same whichever nostrc is linked. @A/@B stand for the two principals. */
+static char *acl_event_json(AclTest *s, int64_t created, const char *tmpl,
+                            const char *a, const char *b) {
+    char tags[2048] = "", *out = tags;
+    for (const char *p = tmpl; *p && out < tags + sizeof(tags) - 66; p++) {
+        if (p[0] == '@' && (p[1] == 'A' || p[1] == 'B')) {
+            out += sprintf(out, "%s", p[1] == 'A' ? a : b);
+            p++;
+        } else *out++ = *p;
+    }
+    *out = '\0';
+    char json[2400];
+    snprintf(json, sizeof(json), "{\"kind\":%d,\"pubkey\":\"%s\",\"created_at\":%lld,"
+             "\"content\":\"\",\"tags\":[%s]}", NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,
+             md_nostr_get_npub(s->bridge), (long long)created, tags);
+    char *signed_json = NULL;
+    MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
+    return signed_json;
+}
+#define ACL_D "[\"d\",\"metadesk-allowlist\"],"
+#define ACL_GRANT_A "[\"p\",\"@A\"],[\"metadesk-caps\",\"@A\",\"v1:video\"]"
+
+/* Report, not assert: which nip51 policy this build links (gate evidence). */
+static void acl_report_linked_policy(AclTest *s, const char *a) {
+    const char *probes[2] = { ACL_D "[\"metadesk-caps\",\"@A\",\"v1:video\"]",
+                              ACL_D "[\"x\",\"1\",\"2\",\"3\"]" };
+    int result[2];
+    for (int i = 0; i < 2; i++) {
+        char *json = acl_event_json(s, 1, probes[i], a, a);
+        NostrEvent *ev = nostr_event_new();
+        MD_CHECK(json && nostr_event_deserialize(ev, json) == 0);
+        NostrList *list = nostr_nip51_parse_list(ev, NULL);
+        result[i] = list ? (int)list->count : -1;
+        nostr_nip51_list_free(list); nostr_event_free(ev); free(json);
+    }
+    printf("  INFO: linked nostrc nip51 parse_list is %s (application tag -> %d entries, "
+           ">3-field tag -> %s); the allowlist uses neither\n",
+           result[0] == 1 || result[1] < 0 ? "lossless (>= 5d1283a7c)" : "legacy",
+           result[0], result[1] < 0 ? "list rejected" : "list kept");
+}
+
+static bool acl_has_tag(const NostrEvent *ev, size_t arity, const char *f0,
+                        const char *f1, const char *f2) {
+    NostrTags *tags = nostr_event_get_tags((NostrEvent *)ev);
+    for (size_t i = 0; tags && i < nostr_tags_size(tags); i++) {
+        NostrTag *t = nostr_tags_get(tags, i);
+        if (nostr_tag_size(t) == arity && !strcmp(nostr_tag_get(t, 0), f0) &&
+            !strcmp(nostr_tag_get(t, 1), f1) && (arity < 3 || !strcmp(nostr_tag_get(t, 2), f2)))
+            return true;
+    }
+    return false;
+}
+
+static void test_acl_tag_shapes(const char **urls, const char *a, const char *b) {
+    const uint32_t V = MD_CAP_VIDEO, VA = MD_CAP_VIDEO | MD_CAP_AGENT;
+    static const struct { const char *label, *tags; uint32_t a, b; } cases[] = {
+        { "application grant tag counted once", ACL_D ACL_GRANT_A, MD_CAP_VIDEO, 0 },
+        { "duplicate grant", ACL_D ACL_GRANT_A ",[\"metadesk-caps\",\"@A\",\"v1:video\"]", 0, 0 },
+        { "missing payload", ACL_D "[\"p\",\"@A\"],[\"metadesk-caps\",\"@A\"]", 0, 0 },
+        { "trailing payload denies only its principal", ACL_D
+          "[\"p\",\"@A\"],[\"metadesk-caps\",\"@A\",\"v1:video\",\"x\"],"
+          "[\"p\",\"@B\"],[\"metadesk-caps\",\"@B\",\"v1:video,agent\"]", 0,
+          MD_CAP_VIDEO | MD_CAP_AGENT },
+        { "trailing payload is not repaired by a valid duplicate", ACL_D
+          "[\"p\",\"@A\"],[\"metadesk-caps\",\"@A\",\"v1:video\",\"x\"],"
+          "[\"metadesk-caps\",\"@A\",\"v1:video\"]", 0, 0 },
+        { "unknown >3-field tag neither rejects nor opens the list",
+          ACL_D "[\"x\",\"1\",\"2\",\"3\"]," ACL_GRANT_A, MD_CAP_VIDEO, 0 },
+        { "unknown 1-field tag", ACL_D "[\"x\"]," ACL_GRANT_A, MD_CAP_VIDEO, 0 },
+        { "NIP-02 p with relay and petname", ACL_D
+          "[\"p\",\"@A\",\"wss://relay.example\",\"alice\"],"
+          "[\"metadesk-caps\",\"@A\",\"v1:video\"]", MD_CAP_VIDEO, 0 },
+        { "repeated title and a second d tag", ACL_D
+          "[\"title\",\"x\"],[\"title\",\"y\"],[\"d\",\"other\"]," ACL_GRANT_A, MD_CAP_VIDEO, 0 },
+    };
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    acl_report_linked_policy(&s, a);
+    int64_t t = time(NULL) - 1000;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *json = acl_event_json(&s, t + (int64_t)i, cases[i].tags, a, b);
+        acl_deliver(&s, 0, json); free(json);
+        uint32_t ga = 0, gb = 0;
+        bool known = acl_known(&s, a, &ga) && acl_known(&s, b, &gb);
+        MD_CHECK(known && md_nostr_is_allowed(s.bridge, a));
+        if (ga != cases[i].a || gb != cases[i].b)
+            fprintf(stderr, "  FAIL: %s: a=%u b=%u\n", cases[i].label, ga, gb);
+        MD_CHECK(ga == cases[i].a && gb == cases[i].b);
+    }
+
+    /* The first d tag is the address (NIP-01): a newer event addressed
+     * elsewhere is not ours, even if a later d tag says metadesk-allowlist.
+     * Same relay, so it is handled before the older event that follows. */
+    char *foreign = acl_event_json(&s, t + 200, "[\"d\",\"other\"]," ACL_D
+                                   "[\"p\",\"@B\"],[\"metadesk-caps\",\"@B\",\"v1:video\"]", a, b);
+    acl_control("{\"op\":\"event\",\"relay\":0,\"event\":%s}", foreign); free(foreign);
+    char *base = acl_event_json(&s, t + 100, ACL_D ACL_GRANT_A ","
+        "[\"p\",\"@B\"],[\"metadesk-caps\",\"@B\",\"v1:video\",\"x\"],"
+        "[\"t\",\"topic\"],[\"r\",\"wss://r.example\",\"read\"],[\"x\",\"1\",\"2\",\"3\"],"
+        "[\"expiration\",\"4102444800\"]", a, b);
+    acl_deliver(&s, 0, base); free(base);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == V);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, b, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 2);
+
+    /* md-30w round trip: an ack-gated edit republishes only d/p/metadesk-caps
+     * (never stale event-level tags such as expiration), keeps b's invalid
+     * record invalid, and both nostrc parsers accept the result. */
+    acl_mode("accept");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video,agent") == 0);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == VA);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, b, UINT32_MAX) == 0);
+    acl_control("{\"op\":\"published\"}");
+    acl_reply[strcspn(acl_reply, "\n")] = '\0';
+    char *published = strdup(acl_reply);
+    NostrEvent *ev = nostr_event_new();
+    MD_CHECK(published && nostr_event_deserialize(ev, published) == 0);
+    MD_CHECK(nostr_event_validate(ev, NULL) == NOSTR_EVENT_VALIDATION_OK);
+    MD_CHECK(acl_has_tag(ev, 2, "d", "metadesk-allowlist", NULL));
+    MD_CHECK(acl_has_tag(ev, 2, "p", a, NULL) && acl_has_tag(ev, 2, "p", b, NULL));
+    MD_CHECK(acl_has_tag(ev, 3, "metadesk-caps", a, "v1:video,agent"));
+    MD_CHECK(acl_has_tag(ev, 3, "metadesk-caps", b, ""));
+    NostrTags *tags = nostr_event_get_tags(ev);
+    size_t ds = 0, others = 0;
+    for (size_t i = 0; i < nostr_tags_size(tags); i++) {
+        const char *name = nostr_tag_get(nostr_tags_get(tags, i), 0);
+        if (!strcmp(name, "d")) ds++;
+        else if (strcmp(name, "p") && strcmp(name, "metadesk-caps")) others++;
+    }
+    MD_CHECK(ds == 1 && others == 0 && nostr_tags_size(tags) == 5);
+    NostrList *third_party = nostr_nip51_parse_list(ev, NULL);
+    MD_CHECK(third_party != NULL); /* readable by either nostrc tag policy */
+    nostr_nip51_list_free(third_party); nostr_event_free(ev);
+    acl_finish(&s);
+
+    acl_reset(); acl_bridge(&s, urls, 1, false, false);
+    acl_deliver(&s, 0, published); acl_eose(&s, 0);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == VA);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, b, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_count(s.bridge) == 2);
+    free(published); acl_finish(&s);
+    printf("  PASS: raw-tag allowlist decoding (application/duplicate/trailing/>3-field/"
+           "1-field/NIP-02 p/second d/foreign address) and edit round trip\n");
+}
+
 static void test_auth_wire(const char **urls, const char *a) {
     AclTest s;
     acl_reset(); acl_control("{\"op\":\"reset\",\"auth\":true}");
@@ -1321,6 +1472,7 @@ static int acl_fixture_tests(const char **urls) {
     test_acl_history(urls, a, b);
     test_acl_refusals(urls, a);
     test_acl_edits(urls, a, b);
+    test_acl_tag_shapes(urls, a, b);
     test_history_wait(urls);
     test_auth_wire(urls, a);
     free(a); free(b);

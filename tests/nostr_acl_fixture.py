@@ -29,6 +29,7 @@ class AclRelay(Relay):
         self.reqs = self.publishes = self.auths = self.protected = 0
         self.mode = "hold"
         self.held = []
+        self.published = []
         self.auth_required = auth
         self.challenge = "challenge-one"
         self.authenticated = False
@@ -70,6 +71,7 @@ class AclPeer(Peer):
             elif msg[0] == "EVENT":
                 assert msg[1]["kind"] != 22242, "AUTH sent over EVENT"
                 s.publishes += 1
+                s.published.append(msg[1])
                 if s.mode == "reject":
                     self.send(["OK", msg[1]["id"], False, "blocked: fixture rejection"])
                 elif s.mode == "accept":
@@ -145,6 +147,9 @@ def control(servers, command):
             s.authenticated = command["ok"]
             peer, event = s.last_auth
             peer.send(["OK", event["id"], command["ok"], "" if command["ok"] else "restricted: fixture"])
+        elif op == "published":
+            assert s.published
+            return s.published[-1]
         elif op == "protected":
             assert s.protected == command["count"]
         else:
