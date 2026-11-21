@@ -37,7 +37,11 @@ class Signer(socketserver.StreamRequestHandler):
                 continue
             result = subprocess.run([self.server.crypto, self.server.role], input=json.dumps(rpc),
                                     capture_output=True, text=True, timeout=10, check=True)
-            send({"id": rpc["id"], "error": None, "result": json.loads(result.stdout)})
+            value = json.loads(result.stdout)
+            observer = getattr(self.server, "observe_result", None)
+            if observer:
+                observer(rpc, value)
+            send({"id": rpc["id"], "error": None, "result": value})
 
 
 class AccessPeer(Peer):

@@ -269,7 +269,9 @@ static void test_null_safety(void)
 {
     MD_CHECK(md_jsonrpc_parse_request(NULL, "{}", 2) == -1);
     MD_CHECK(md_jsonrpc_parse_request(&(MdJsonRpcRequest){0}, NULL, 0) == -1);
-    MD_CHECK(md_jsonrpc_make_response(NULL, NULL) != NULL);  /* null id → "id":null */
+    char *response = md_jsonrpc_make_response(NULL, NULL);  /* null id → "id":null */
+    MD_CHECK(response != NULL);
+    free(response);
     MD_CHECK(md_jsonrpc_make_notification(NULL, NULL) == NULL);
 
     /* Free with NULL should not crash */

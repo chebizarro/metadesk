@@ -143,14 +143,16 @@ dep_nostr = declare_dependency(
   include_directories : nostrc_inc,
 )
 # nostrc NIP libraries (md-r4ia). For each one, in order:
-#   1. An installed library (cc.find_library on the system dirs).
-#   2. The library CMake built for the target, by file name in the target's
+#   1. The library CMake built for the target, by file name in the target's
 #      build directory: lib<target>.a (linked by path), .so/.dylib (through
 #      cc.find_library, so Meson manages the build rpath), or <target>.lib.
-#   3. For CMake OBJECT libraries, which never produce an archive (nip51 and
+#   2. For CMake OBJECT libraries, which never produce an archive (nip51 and
 #      nip17), the objects that the CMake generator's own manifest lists for
 #      the target: <subdir>/CMakeFiles/<target>.dir/build.make for Unix
 #      Makefiles, or the top-level build.ninja for Ninja.
+#   3. An installed library, only when absent from the selected build tree.
+# This prevents installed, ABI-compatible old code from masking upstream fixes
+# (in particular md-ebm's NIP-5F JSON unescaping).
 # The manifest is rewritten whenever CMake regenerates the target, so it
 # names exactly the target's current sources. For example, nip51 is one
 # object in nostrc da2e4d62b and older, and three objects since 5b3c987c8. A
@@ -173,7 +175,7 @@ _nostrc_deps = {}
 foreach _component, _spec : _nostrc_components
   _target = _spec[0]
   _dir = _nostrc_build / _spec[1]
-  _dep = cc.find_library(_target, required : false, dirs : _sys_lib_dirs)
+  _dep = dependency('', required : false)
   _how = 'installed library'
   if not _dep.found() and _nostrc_build != ''
     foreach _file : ['lib' + _target + '.a', _target + '.lib',
@@ -232,6 +234,9 @@ foreach _component, _spec : _nostrc_components
     endif
   endif
   if not _dep.found()
+    _dep = cc.find_library(_target, required : false, dirs : _sys_lib_dirs)
+  endif
+  if not _dep.found()
     error(_target + ' not found. Install nostrc, or build the nostrc ' + _target +
           ' target and set -Dnostrc_build_dir=<path> (looked for an installed library, ' +
           'a library in ' + _dir + ', and a Makefile/Ninja object manifest).')
@@ -247,10 +252,10 @@ dep_nip17 = _nostrc_deps['nip17']
 dep_nip11 = _nostrc_deps['nip11']
 
 # nostrc transitive deps: libgo runtime, libwebsockets, openssl, secp256k1, nsync, nostr_json
-# libgo — try installed library first, fallback to build-tree static libs
+# libgo — the selected build tree owns the runtime as well as libnostr.
 _libgo_lib = cc.find_library('libgo', required : false, dirs : _sys_lib_dirs)
 _go_fiber_lib = cc.find_library('go_fiber', required : false, dirs : _sys_lib_dirs)
-if _libgo_lib.found() and _go_fiber_lib.found()
+if _nostrc_build == '' and _libgo_lib.found() and _go_fiber_lib.found()
   dep_libgo = declare_dependency(dependencies : [_libgo_lib, _go_fiber_lib])
 elif _nostrc_build != ''
   # nostrc renamed the libgo target to `nostrgo` (libnostrgo); older build
@@ -592,10 +597,13 @@ foreach _component, _libraries : _signer_components
     endif
   endforeach
   foreach _library : _libraries
-    _signer_lib = cc.find_library(_library, dirs : _sys_lib_dirs, required : false)
-    if not _signer_lib.found() and _nostrc_build != ''
+    _signer_lib = dependency('', required : false)
+    if _nostrc_build != ''
       _signer_lib = cc.find_library(_library,
         dirs : [_nostrc_build / 'nips' / _component], required : false)
+    endif
+    if not _signer_lib.found()
+      _signer_lib = cc.find_library(_library, dirs : _sys_lib_dirs, required : false)
     endif
     if not _signer_lib.found()
       error(_library + ' not found. Build the nostrc ' + _library +
@@ -606,6 +614,14 @@ foreach _component, _libraries : _signer_components
 endforeach
 # Installed archives can lag behind the source headers. Check the entry points
 # used by Metadesk with the full transitive link set before accepting them.
+# Compiler feature probes do not inherit b_sanitize automatically. They
+# must link the sanitizer runtime when testing instrumented nostrc archives.
+_signer_check_args = []
+foreach _sanitizer : ['address', 'thread', 'undefined', 'memory', 'leak']
+  if '@0@'.format(get_option('b_sanitize')).contains(_sanitizer)
+    _signer_check_args += '-fsanitize=' + _sanitizer
+  endif
+endforeach
 _signer_apis = {
   'nip04' : ['nip04', ['nostr_nip04_legacy_decrypt_enabled']],
   'nip46' : ['nostr_nip46_core', ['nostr_nip46_client_sign_event',
@@ -625,12 +641,14 @@ foreach _component, _api : _signer_apis
     endforeach
     _signer_lib = _signer_libraries[_library]
     foreach _function : _api[1]
-      if not cc.has_function(_function, dependencies : [_signer_lib] + _other_signer_deps + core_deps)
+      if not cc.has_function(_function, args : _signer_check_args,
+          dependencies : [_signer_lib] + _other_signer_deps + core_deps)
         if _nostrc_build != ''
           _signer_lib = cc.find_library(_library,
             dirs : [_nostrc_build / 'nips' / _component], required : true)
         endif
-        if not cc.has_function(_function, dependencies : [_signer_lib] + _other_signer_deps + core_deps)
+        if not cc.has_function(_function, args : _signer_check_args,
+          dependencies : [_signer_lib] + _other_signer_deps + core_deps)
           error(_library + ' cannot link ' + _function + '. Rebuild the nostrc target against current headers and dependencies.')
         endif
         message(_library + ': using compatible build-tree library')
@@ -913,9 +931,8 @@ test_nostr = executable('test_nostr',
   files('tests/test_nostr.c'),
   dependencies : [dep_metadesk],
 )
-# md-0732: under TSan, nostrc's nsync synchronisation is only visible when
-# nostrc (and nsync) are instrumented too; against stock nostrc every report
-# is a missing-edge false positive. tests/tsan-nostrc.supp has the recipe.
+# TSan needs instrumented nostrc + nsync to see their synchronization.
+# No race suppressions: see docs/testing-sanitizers.md (md-d9tj).
 nostr_test_env = environment({'PYTHONDONTWRITEBYTECODE' : '1'})
 if '@0@'.format(get_option('b_sanitize')).contains('thread')
   _nostrc_tsan = false
@@ -927,13 +944,11 @@ if '@0@'.format(get_option('b_sanitize')).contains('thread')
     endforeach
   endif
   if _nostrc_tsan
-    nostr_test_env.prepend('TSAN_OPTIONS', 'halt_on_error=1',
-      'suppressions=' + (meson.current_source_dir() / 'tests' / 'tsan-nostrc.supp'),
-      separator : ':')
+    nostr_test_env.prepend('TSAN_OPTIONS', 'halt_on_error=1', separator : ':')
   else
-    warning('TSan: the nostrc build is not instrumented, so test_nostr reports ' +
-      'are false positives from invisible nsync synchronisation. Build nostrc ' +
-      'and nsync with -fsanitize=thread as described in tests/tsan-nostrc.supp.')
+    warning('TSan: nostrc is not instrumented; missing nsync synchronization ' +
+      'can produce false positives. Instrument nostrc and nsync as described ' +
+      'in docs/testing-sanitizers.md before interpreting race reports.')
   endif
 endif
 test('nostr NIP-44', test_nostr, env : nostr_test_env)
@@ -1055,6 +1070,11 @@ test_host_binding = executable('test_host_binding',
     'src/host/capture_sync.c'),
   dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
+if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
+  test('NIP-5F host session quoted seal', accounts_python,
+    args : [files('tests/test_nip5f_session.py'), test_host_binding, access_signer_fixture],
+    timeout : 90)
+endif
 test('session correlation retaining private relay', find_program('python3'),
   args : [files('tests/test_session_history.py'), test_host_binding],
   env : {'PYTHONDONTWRITEBYTECODE' : '1'},

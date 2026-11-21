@@ -4,6 +4,11 @@ All backends default to off. Enable any combination with
 `-Dsigner_nip46=true`, `-Dsigner_nip55l=true`, and `-Dsigner_nip5f=true`.
 No local pkg-config descriptors are needed for signer discovery.
 
+The bridge requires nostrc's library-owned NIP-42 session API (master
+`cfcb86296` or later). Use a dedicated master build, not the retired shared
+build tree. Older trees may still configure, but are not supported build/test
+targets for this bridge.
+
 ```sh
 meson setup build-signers \
   -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build \
@@ -19,11 +24,12 @@ nostrc's key-store fallback from consulting the user's store.
 
 ## Dependency discovery
 
-For signer adapters, Meson tries installed libraries first (including the Homebrew
-prefix on macOS), then libraries under `nostrc_build_dir/nips/<component>`. Adapters
-are regular CMake library targets, so the fallback links their archive. A link
-check rejects installed backend archives missing the entry
-points Metadesk uses and tries their build-tree counterpart. Source include paths,
+When a nostrc build tree is selected, Meson prefers its signer libraries under
+`nostrc_build_dir/nips/<component>` over installed libraries, even when their
+symbols are ABI-compatible. Otherwise an old installed NIP-5F adapter can mask
+the upstream JSON-unescaping fix. Installed libraries are a fallback when no
+build-tree library exists. Link checks verify the entry points Metadesk uses
+and include the selected sanitizer runtime for instrumented builds. Source include paths,
 generated export-header paths, and nested installed adapter include paths are
 added only for enabled backends. Like the core nostrc headers, they are target
 include directories, so they win over installed headers (see
@@ -42,8 +48,7 @@ naming the nostrc target to build. Build missing targets with
 
 ### Common JSON library
 
-JSON follows the core libnostr build-tree preference, not the signer adapter
-installed-first order. Meson selects, in order:
+JSON follows the same build-tree preference as libnostr and the signer adapters. Meson selects, in order:
 
 1. `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a}`, when present. The typed
    library dependency includes Jansson and lets Meson manage the build rpath, so
@@ -87,19 +92,20 @@ libnostr and libgo prefer `nostrc_build_dir` (they must match the source
 headers). libnostr falls back to an installed copy. Each NIP component is
 discovered in this order:
 
-1. An installed library (the Homebrew prefix on macOS, the linker's default
-   path elsewhere).
-2. The library CMake built for the target, by file name under
+1. The library CMake built for the target, by file name under
    `nostrc_build_dir/nips/<component>`. `lib<target>.a` is linked by path;
    `.so`/`.dylib` go through `cc.find_library()`, so Meson manages the build
    rpath. A file-name probe never silently substitutes a system copy.
-3. For CMake `OBJECT` libraries, every object that the CMake generator lists
+2. For CMake `OBJECT` libraries, every object that the CMake generator lists
    for the target. Unix Makefiles lists them as `<target>: <object>` rules in
    `nips/<component>/CMakeFiles/<target>.dir/build.make`. Ninja lists them as
    `build nips/<component>/CMakeFiles/<target>.dir/...o:` edges in the
    top-level `build.ninja`.
 
-Why step 3 reads the generator's manifest:
+3. An installed library (the Homebrew prefix on macOS, the linker's default
+   path elsewhere), only if the selected build tree has no library or objects.
+
+Why step 2 reads the generator's manifest:
 
 - **A fixed object path broke.** The earlier fallback linked
   `CMakeFiles/nostr_nip51_core.dir/src/nip51.c.o` only. nostrc 5b3c987c8 split
@@ -122,7 +128,7 @@ Configure prints one line per component naming what it chose, for example:
 
 ```text
 Message: nip51: using build-tree objects of CMake target nostr_nip51_core: nip51.c.o, nip51-document.c.o, nip51-schema.c.o
-Message: nip98: using installed library
+Message: nip98: using build-tree library /path/to/nostrc/_build/nips/nip98/libnostr_nip98.a
 Message: libgo: using build-tree libraries libnostrgo.a + libgo_fiber.a from /path/to/nostrc/_build/libgo
 ```
 
