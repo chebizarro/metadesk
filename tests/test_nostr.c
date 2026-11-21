@@ -780,7 +780,8 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     unsigned received, boundaries, signed_count, auth_results, processing, admitted;
-    unsigned sign_entered, draining, history_waiting;
+    unsigned sign_entered, draining, history_waiting, queued;
+    bool hold_boundary, release_boundary;
     bool hold_signed, release_signed, hold_processing, release_processing;
     bool hold_backend_sign, release_backend_sign;
     atomic_bool fail_sign;
@@ -804,17 +805,21 @@ static void acl_hook(MdNostrTestPoint point, void *data) {
         point != MD_NOSTR_TEST_ALLOWLIST_RECEIVED &&
         point != MD_NOSTR_TEST_ALLOWLIST_BOUNDARY &&
         point != MD_NOSTR_TEST_ALLOWLIST_SIGNED &&
-        point != MD_NOSTR_TEST_AUTH_RESULT) return;
+        point != MD_NOSTR_TEST_AUTH_RESULT &&
+        point != MD_NOSTR_TEST_SUBSCRIPTION_QUEUED) return;
     MdNostrAclState state = md_nostr_allowlist_state(s->bridge);
     pthread_mutex_lock(&s->mu);
     s->state = state;
     if (point == MD_NOSTR_TEST_DRAINING) s->draining++;
+    if (point == MD_NOSTR_TEST_SUBSCRIPTION_QUEUED) s->queued++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_PROCESSING) s->processing++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_RECEIVED) s->received++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_BOUNDARY) s->boundaries++;
     if (point == MD_NOSTR_TEST_AUTH_RESULT) s->auth_results++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_SIGNED) s->signed_count++;
     pthread_cond_broadcast(&s->cv);
+    while (point == MD_NOSTR_TEST_SUBSCRIPTION_QUEUED && s->hold_boundary && !s->release_boundary)
+        pthread_cond_wait(&s->cv, &s->mu);
     while (point == MD_NOSTR_TEST_ALLOWLIST_PROCESSING && s->hold_processing && !s->release_processing)
         pthread_cond_wait(&s->cv, &s->mu);
     while (point == MD_NOSTR_TEST_ALLOWLIST_SIGNED && s->hold_signed && !s->release_signed)
@@ -1053,16 +1058,19 @@ static void test_acl_refusals(const char **urls, const char *a) {
     MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 1);
     MD_CHECK(strstr(why, urls[0]) && strstr(why, ": restricted: private fixture"));
     MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video") == -1); /* fails, never blocks */
+    acl_control("{\"op\":\"drop\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN);
+    acl_control("{\"op\":\"release_connection\"}");
     acl_control("{\"op\":\"req\",\"count\":3}");
-    acl_deliver(&s, 0, list); acl_eose(&s, 0); /* served again: recovery */
+    acl_deliver(&s, 0, list); acl_eose(&s, 0); /* reconnect reissues a held REQ */
     MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
     MD_CHECK(md_nostr_is_allowed(s.bridge, a) && acl_known(&s, a, &grant));
 
-    /* auth-required with no challenge on this connection: no AUTH path. */
+    /* CLOSED may precede the challenge: the library holds AWAIT_AUTH and
+     * the registered identity keeps readiness pending, never a false deny. */
     acl_closed(&s, 0, "auth-required: private fixture");
-    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
-    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 1 &&
-             strstr(why, "auth-required: private fixture"));
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 0);
     acl_control("{\"op\":\"challenge\",\"value\":\"challenge-late\"}");
     acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN); /* awaiting our AUTH */
     MD_CHECK(!acl_known(&s, a, &grant) && grant == 0);
@@ -1099,11 +1107,14 @@ static void test_acl_refusals(const char **urls, const char *a) {
     MD_CHECK(acl_known(&s, a, &grant) && grant == 0);
     MD_CHECK(md_nostr_allowlist_refusals(s.bridge, why, sizeof(why)) == 2 &&
              strstr(why, "blocked: private fixture") && strstr(why, "; "));
+    acl_control("{\"op\":\"drop\",\"relay\":0}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN);
+    acl_control("{\"op\":\"release_connection\",\"relay\":0}");
     acl_control("{\"op\":\"req\",\"relay\":0,\"count\":3}");
     acl_eose(&s, 0);
     MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
     free(list); acl_finish(&s);
-    printf("  PASS: CLOSED prefixes: restricted/blocked/auth-required without AUTH refuse (known deny), rate-limited/awaiting AUTH/relay down unknown, mixed relays, recovery\n");
+    printf("  PASS: CLOSED prefixes: restricted/blocked refuse (known deny), rate-limited/awaiting AUTH/relay down unknown, mixed relays, recovery\n");
 }
 
 typedef struct { MdNostr *n; const char *pk; bool remove; int result; } AclEdit;
@@ -1389,9 +1400,45 @@ static void test_auth_wire(const char **urls, const char *a) {
     MD_CHECK(!md_nostr_is_allowed(s.bridge, a)); /* authenticated != authorized */
     acl_control("{\"op\":\"challenge\",\"value\":\"challenge-three\"}");
     acl_control("{\"op\":\"auth\",\"count\":3}");
-    results = acl_counter(&s, &s.auth_results);
-    acl_control("{\"op\":\"auth_result\",\"ok\":true}");
-    acl_wait(&s, &s.auth_results, results + 1);
+    /* Deliver a pre-acceptance CLOSED after the OK callback: it is stale
+     * AUTH work, not a post-AUTH refusal. The pool worker is held while the
+     * reader processes the OK; no scheduler sleeps make this ordering. */
+    pthread_mutex_lock(&s.mu);
+    s.hold_boundary = true;
+    unsigned queued = s.queued;
+    pthread_mutex_unlock(&s.mu);
+    acl_control("{\"op\":\"closed\",\"reason\":\"auth-required: stale\"}");
+    acl_wait(&s, &s.queued, queued + 1);
+    acl_auth_result(&s, true);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) != MD_NOSTR_ACL_FAILED);
+    pthread_mutex_lock(&s.mu); s.hold_boundary = false; s.release_boundary = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    acl_control("{\"op\":\"req\",\"count\":3}");
+    acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
+
+    /* The same reason received AFTER acceptance is a definite deny. */
+    acl_closed(&s, 0, "auth-required: accepted identity refused");
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_FAILED);
+    bool known = false;
+    MD_CHECK(md_nostr_granted_capabilities_known(s.bridge, a, UINT32_MAX, &known) == 0 && known);
+    acl_control("{\"op\":\"challenge\",\"value\":\"challenge-four\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN);
+    acl_control("{\"op\":\"auth\",\"count\":4}");
+    acl_auth_result(&s, true);
+    acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
+
+    /* A CLOSED queued on a lost connection must not fail the next one. */
+    pthread_mutex_lock(&s.mu); s.hold_boundary = true; s.release_boundary = false;
+    queued = s.queued; pthread_mutex_unlock(&s.mu);
+    acl_control("{\"op\":\"closed\",\"reason\":\"restricted: lost connection\"}");
+    acl_wait(&s, &s.queued, queued + 1);
+    acl_control("{\"op\":\"drop\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_UNKNOWN);
+    pthread_mutex_lock(&s.mu); s.hold_boundary = false; s.release_boundary = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    acl_control("{\"op\":\"release_connection\"}");
+    acl_control("{\"op\":\"req_after_drop\"}");
+    acl_wait_state(&s, MD_NOSTR_ACL_LOADED);
     /* A slow signer must not block the relay reader or escape destroy. */
     pthread_mutex_lock(&s.mu); s.hold_backend_sign = true;
     unsigned entered = s.sign_entered; pthread_mutex_unlock(&s.mu);
@@ -1403,10 +1450,10 @@ static void test_auth_wire(const char **urls, const char *a) {
     pthread_mutex_lock(&s.mu); s.release_backend_sign = true;
     pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
     pthread_join(destroyer, NULL); s.bridge = NULL;
-    acl_control("{\"op\":\"auth_count\",\"count\":3}");
+    acl_control("{\"op\":\"auth_count\",\"count\":4}");
     acl_finish(&s);
     printf("  PASS: private AUTH wire, real signatures, rejection, re-auth, protected REQ gating and blocked-signer teardown\n");
-    printf("  NOTE: protected REQ recovery still uses nostrc pool reconciliation (md-1be); md-xcy remains open\n");
+    printf("  PASS: AUTH-OK recovery; stale CLOSED/old connection ignored; post-AUTH CLOSED is known deny\n");
 }
 
 /* md-l4f4: md_nostr_wait_history waits on md_monotonic_ns(). */
@@ -1466,6 +1513,75 @@ static void test_history_wait(const char **urls) {
     printf("  PASS: history wait: bounded on the monotonic clock (wall-clock step on Linux), blocked waiter woken by EOSE and by stop\n");
 }
 
+typedef struct {
+    MdNostrConfig config;
+    MdNostrCallbacks callbacks;
+    MdNostr *result;
+    unsigned revoked;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered, release;
+} Constructor;
+static void hold_constructor(void *data) {
+    Constructor *c = data;
+    pthread_mutex_lock(&c->mu);
+    c->entered = true;
+    pthread_cond_broadcast(&c->cv);
+    while (!c->release) pthread_cond_wait(&c->cv, &c->mu);
+    pthread_mutex_unlock(&c->mu);
+}
+static void constructor_revoked(void *data) { ((Constructor *)data)->revoked++; }
+static void *construct_bridge(void *data) {
+    Constructor *c = data;
+    c->result = md_nostr_create(&c->config, &c->callbacks);
+    return NULL;
+}
+static void test_constructor_revocation(const char **urls) {
+    acl_reset();
+    char directory[1024];
+    snprintf(directory, sizeof(directory), "%s/md-create-XXXXXX", getenv("HOME"));
+    MD_CHECK(mkdtemp(directory));
+    MdAccounts *accounts = NULL;
+    char *resolved = realpath(directory, NULL); /* macOS /var is a symlink */
+    MD_CHECK(resolved && md_accounts_open(resolved, NULL, &accounts) == 0);
+    free(resolved);
+    MdSigner *signer = md_signer_create_direct(dm_recipient_sk);
+    char *pk = NULL;
+    MD_CHECK(md_signer_get_pubkey(signer, &pk) == 0);
+    MD_CHECK(md_accounts_add(accounts, MD_SIGNER_DIRECT_KEY, pk, "private constructor") == 0);
+    MD_CHECK(md_accounts_bind_role(accounts, MD_ACCOUNT_HOST, MD_SIGNER_DIRECT_KEY, pk, signer) == 0);
+    MdAccountBinding *owner = md_accounts_acquire_role(accounts, MD_ACCOUNT_HOST);
+    Constructor c = { .config = { .owner = owner, .relay_urls = urls, .relay_count = 1 } };
+    c.callbacks = (MdNostrCallbacks){ .on_owner_revoked = constructor_revoked, .owner_userdata = &c };
+    pthread_mutex_init(&c.mu, NULL); pthread_cond_init(&c.cv, NULL);
+    md_signer_set_test_hook(signer, hold_constructor, &c);
+    pthread_t thread;
+    MD_CHECK(pthread_create(&thread, NULL, construct_bridge, &c) == 0);
+    /* md_nostr_create has admitted the owner and is fetching its pinned
+     * key, before it has built the relay snapshot or AUTH registrations. */
+    pthread_mutex_lock(&c.mu);
+    while (!c.entered) pthread_cond_wait(&c.cv, &c.mu);
+    pthread_mutex_unlock(&c.mu);
+    MD_CHECK(md_accounts_unbind_role(accounts, MD_ACCOUNT_HOST) == 0);
+    MD_CHECK(!md_account_binding_is_current(owner));
+    pthread_mutex_lock(&c.mu); c.release = true;
+    pthread_cond_broadcast(&c.cv); pthread_mutex_unlock(&c.mu);
+    pthread_join(thread, NULL);
+    md_signer_set_test_hook(signer, NULL, NULL);
+    pthread_cond_destroy(&c.cv); pthread_mutex_destroy(&c.mu);
+    if (c.result || c.revoked != 1)
+        fprintf(stderr, "constructor result=%p revoked=%u current=%d\n", (void *)c.result,
+                c.revoked, md_account_binding_is_current(owner));
+    MD_CHECK(c.result == NULL && c.revoked == 1);
+    md_nostr_destroy(c.result);
+    MD_CHECK(md_signer_is_ready(signer)); /* no shutdown of a shared backend */
+    md_account_binding_release(owner);
+    md_accounts_destroy(accounts);
+    md_signer_destroy(signer);
+    free(pk);
+    printf("  PASS: role revoked during construction unwinds all AUTH registrations\n");
+}
+
 static int acl_fixture_tests(const char **urls) {
     char *a = md_nostr_get_pubkey(dm_sender_sk);
     char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -1475,6 +1591,7 @@ static int acl_fixture_tests(const char **urls) {
     test_acl_tag_shapes(urls, a, b);
     test_history_wait(urls);
     test_auth_wire(urls, a);
+    test_constructor_revocation(urls);
     free(a); free(b);
     return md_test_report();
 }

@@ -72,10 +72,8 @@ typedef struct {
     MdRelayClosed closed;          /* allowlist_mu */
     char closed_reason[160];       /* allowlist_mu, for operator logs */
     NostrRelayConnectionState connection_state;
-    char *challenge;              /* work_mu, one queued challenge per relay */
-    uint64_t auth_generation;
-    bool auth_failed;             /* work_mu: our answer to auth_generation failed */
-    char auth_id[65];
+    uint64_t connection_generation; /* allowlist_mu */
+    NostrPoolCallbackInfo boundary; /* allowlist_mu: last EOSE/CLOSED in wire order */
 } MdRelayState;
 
 /* Failed/conflicting local publications must not become grants via an echo.
@@ -109,8 +107,7 @@ struct MdNostr {
     NostrRelay       **relays;       /* borrowed relay pointers (not owned) */
     size_t             relay_count;
     MdRelayState      *relay_states;
-    pthread_t          auth_thread;
-    bool               auth_started;
+    unsigned           auth_signers; /* work_mu: registrations/attempts retaining n */
     char             **relay_urls;   /* owned copies of URL strings         */
 
     pthread_mutex_t    work_mu;
@@ -246,30 +243,33 @@ static int publish_all(MdNostr *n, NostrEvent *ev) {
     return 0;
 }
 
-/* NIP-01 CLOSED reasons start with a machine-readable "prefix:". Only two
- * say that the same REQ may succeed on this connection: rate-limited (later)
- * and auth-required (after NIP-42 AUTH). Everything else, including an
- * unprefixed reason, is the relay's answer for this connection. */
+/* Match nostrc's reason-specific recovery: rate-limited/error back off,
+ * auth-required waits for AUTH, everything else waits for reconnect. */
 static MdRelayClosed classify_closed(const char *reason) {
     if (reason && !strncmp(reason, "auth-required:", 14)) return MD_RELAY_CLOSED_AUTH;
-    if (reason && !strncmp(reason, "rate-limited:", 13)) return MD_RELAY_CLOSED_RETRY;
+    if (reason && (!strncmp(reason, "rate-limited:", 13) ||
+                   !strncmp(reason, "error:", 6))) return MD_RELAY_CLOSED_RETRY;
     return MD_RELAY_CLOSED_REFUSED;
 }
 
-/* An AUTH path exists while this connection has a NIP-42 challenge and our
- * answer to it has not failed (OK false, signing or transport failure). An
- * accepted answer stays a path: the pool's next REQ settles it. Caller holds
- * allowlist_mu (lock order: allowlist_mu, then work_mu). */
+/* The library owns challenge/identity/OK correlation. An accepted AUTH is
+ * only a path for a CLOSED received before that acceptance. A post-AUTH
+ * refusal is terminal until a new challenge (or connection) opens a path. */
 static bool auth_path_open(MdNostr *n, MdRelayState *rs) {
-    uint64_t generation = 0;
-    char *challenge = nostr_relay_get_auth_challenge(n->relays[rs->index], &generation);
-    bool open = challenge != NULL;
-    free(challenge);
-    pthread_mutex_lock(&n->work_mu);
-    open = open && n->signer && !n->closing &&
-           !(rs->auth_failed && generation == rs->auth_generation);
-    pthread_mutex_unlock(&n->work_mu);
-    return open;
+    NostrRelayAuthStatus status;
+    if (!nostr_relay_get_auth_status(n->relays[rs->index], &status) || is_stopped(n))
+        return false;
+    if (rs->boundary.recovery == NOSTR_POOL_RECOVERY_AUTH_REFUSED &&
+        status.auth_generation == rs->boundary.frame.auth_generation)
+        return false;
+    /* AWAIT_AUTH may precede the challenge on the wire. With a registered
+     * identity it is pending, not a refusal: closing held streams here would
+     * race every relay that sends CLOSED before AUTH on reconnect. */
+    return status.state == NOSTR_RELAY_AUTH_STATE_NONE ||
+           status.state == NOSTR_RELAY_AUTH_STATE_CHALLENGED ||
+           status.state == NOSTR_RELAY_AUTH_STATE_SIGNING ||
+           status.state == NOSTR_RELAY_AUTH_STATE_SENT ||
+           status.state == NOSTR_RELAY_AUTH_STATE_ACCEPTED;
 }
 
 /* The relay definitely will not deliver history on this connection: its last
@@ -322,17 +322,30 @@ static void md_nostr_subscription_handler(NostrRelay *relay, const char *state,
                                          const char *reason, void *data) {
     MdNostr *n = data;
     if (is_stopped(n)) return;
+    NostrPoolCallbackInfo info;
+    /* Queued boundaries from a lost connection must not settle the new one.
+     * The receive stamp, not callback delivery order, defines AUTH refusal. */
+    if (!nostr_simple_pool_get_callback_info(n->pool, &info)) return;
+    test_point(n, MD_NOSTR_TEST_SUBSCRIPTION_QUEUED);
     bool closed = !strcmp(state, "CLOSED"), report = false, refused = false;
     MdRelayClosed kind = closed ? classify_closed(reason) : MD_RELAY_CLOSED_NONE;
     char text[sizeof(((MdRelayState *)0)->closed_reason)];
     snprintf(text, sizeof(text), "%s", !closed ? "" : reason && *reason ? reason : "(no reason)");
     pthread_mutex_lock(&n->allowlist_mu);
+    if (info.frame.connection_generation != nostr_relay_get_connection_generation(relay) ||
+        nostr_relay_get_connection_state(relay) != NOSTR_RELAY_STATE_CONNECTED) {
+        pthread_mutex_unlock(&n->allowlist_mu);
+        return;
+    }
     for (size_t i = 0; i < n->relay_count; i++) if (n->relays[i] == relay) {
         MdRelayState *rs = &n->relay_states[i];
+        if (info.frame.sequence <= rs->boundary.frame.sequence) continue;
+        rs->boundary = info;
+        rs->connection_generation = info.frame.connection_generation;
+        rs->connection_state = NOSTR_RELAY_STATE_CONNECTED;
         rs->history_done = true;
         rs->history_ok = !strcmp(state, "EOSE");
-        /* The pool re-fires the REQ after every CLOSED (md-odg): report a
-         * relay's answer when it changes, not once per identical frame. */
+        /* Repeated reasons on this connection need only one operator log. */
         report = closed && (rs->closed != kind || strcmp(rs->closed_reason, text));
         rs->closed = kind;
         memcpy(rs->closed_reason, text, sizeof(text));
@@ -358,11 +371,14 @@ static void md_nostr_relay_state_handler(NostrRelay *relay,
     pthread_mutex_lock(&n->allowlist_mu);
     /* Read the current state, not a possibly superseded notification. */
     NostrRelayConnectionState current = nostr_relay_get_connection_state(relay);
-    if (current == rs->connection_state) {
+    uint64_t generation = nostr_relay_get_connection_generation(relay);
+    if (current == rs->connection_state && generation == rs->connection_generation) {
         pthread_mutex_unlock(&n->allowlist_mu);
         return;
     }
     rs->connection_state = current;
+    rs->connection_generation = generation;
+    memset(&rs->boundary, 0, sizeof(rs->boundary));
     rs->history_done = current == NOSTR_RELAY_STATE_DISCONNECTED ||
                        current == NOSTR_RELAY_STATE_BACKOFF;
     rs->history_ok = false;
@@ -374,150 +390,60 @@ static void md_nostr_relay_state_handler(NostrRelay *relay,
     test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
 }
 
-/* ── NIP-42 AUTH callback ──────────────────────────────────────
- * Fires on the relay worker thread when a relay sends an AUTH
- * challenge.  We respond by building a kind:22242 event with the
- * relay URL and challenge string, signing it via the signer
- * abstraction, and writing an AUTH envelope back to the relay.
- * Reader callbacks only enqueue work; signing happens on auth_worker.
- *
- * This is required for relays that gate subscriptions or event
- * storage behind authentication.
- */
-/* Our answer to the challenge of generation failed: an "auth-required:"
- * CLOSED on this connection is now a refusal (md-ip2k). */
-static void auth_answer_failed(MdNostr *n, MdRelayState *rs, uint64_t generation) {
-    pthread_mutex_lock(&n->work_mu);
-    bool current = !n->closing && generation == rs->auth_generation;
-    if (current) rs->auth_failed = true;
-    pthread_mutex_unlock(&n->work_mu);
-    if (current) readiness_changed(n);
+/* nostrc runs this on an attempt-owned signer thread, never the reader.
+ * The registration retains the bridge until every attempt has returned.
+ * Bridge/role cancellation discards non-abortable signer IPC; nostrc also
+ * cancels attempts on challenge/connection/identity changes and verifies the
+ * signed template (including its nonce) before admission to the writer. */
+static void md_nostr_auth_sign(NostrRelayAuthRequest *request, void *data) {
+    MdNostr *n = data;
+    if (is_stopped(n) || nostr_relay_auth_request_is_cancelled(request)) {
+        nostr_relay_auth_request_complete(request, NULL, "host role stopped");
+        return;
+    }
+    char *json = nostr_event_serialize(nostr_relay_auth_request_get_event(request));
+    char *signed_json = NULL;
+    int result = json ? md_signer_sign_event_cancellable(n->signer, json,
+                            &signed_json, n->signer_cancel) : MD_SIGNER_ERR_DENIED;
+    free(json);
+    nostr_relay_auth_request_complete_json(request,
+        result == MD_SIGNER_OK && !is_stopped(n) ? signed_json : NULL,
+        "host AUTH signing failed or cancelled");
+    free(signed_json);
 }
 
-static void send_auth(MdNostr *n, MdRelayState *rs, const char *challenge,
-                      uint64_t generation) {
-    NostrRelay *relay = n->relays[rs->index];
-    if (!n || !n->signer || !relay || !challenge || is_stopped(n))
-        return;
-
-    const char *relay_url = nostr_relay_get_url_const(relay);
-    MD_LOG_I("NIP-42 AUTH challenge from %s", relay_url ? relay_url : "(unknown)");
-
-    /* Build kind:22242 auth event with relay + challenge tags */
-    NostrEvent *ev = nostr_event_new();
-    if (!ev) return;
-
-    nostr_event_set_kind(ev, NOSTR_KIND_CLIENT_AUTHENTICATION);
-    nostr_event_set_content(ev, "");
-    nostr_event_set_pubkey(ev, n->pk_hex);
-    nostr_event_set_created_at(ev, (int64_t)time(NULL));
-
-    NostrTag *challenge_tag = nostr_tag_new("challenge", challenge, NULL);
-    NostrTag *relay_tag = nostr_tag_new("relay", relay_url ? relay_url : "", NULL);
-    if (!challenge_tag || !relay_tag) {
-        if (challenge_tag) nostr_tag_free(challenge_tag);
-        if (relay_tag) nostr_tag_free(relay_tag);
-        nostr_event_free(ev);
-        return;
-    }
-    NostrTags *tags = nostr_tags_new(2, relay_tag, challenge_tag);
-    if (!tags) {
-        nostr_tag_free(challenge_tag);
-        nostr_tag_free(relay_tag);
-        nostr_event_free(ev);
-        return;
-    }
-    nostr_event_set_tags(ev, tags); /* takes ownership */
-
-    /* Sign via signer abstraction (may block for remote signers) */
-    NostrEvent *signed_ev = sign_event_cancellable(n->signer, ev, n->signer_cancel);
-    nostr_event_free(ev);
-    if (!signed_ev) {
-        MD_LOG_E("AUTH sign failed for %s", relay_url ? relay_url : "(unknown)");
-        auth_answer_failed(n, rs, generation);
-        return;
-    }
-
-    /* nostr_relay_auth() currently calls publish(EVENT), and its signing
-     * callback has no userdata. Use nostrc's AUTH envelope serializer/write
-     * API instead, never hand-roll frames or sign on the reader thread. */
-    NostrAuthEnvelope auth = { .base.type = NOSTR_ENVELOPE_AUTH, .event = signed_ev };
-    char *wire = nostr_envelope_serialize((NostrEnvelope *)&auth);
-    uint64_t current_generation = 0;
-    char *current = nostr_relay_get_auth_challenge(relay, &current_generation);
-    bool fresh = current && generation == current_generation && !strcmp(challenge, current);
-    free(current);
-    pthread_mutex_lock(&n->work_mu);
-    fresh = fresh && !n->closing && generation == rs->auth_generation;
-    if (fresh && wire)
-        fresh = nostr_event_compute_id(signed_ev, rs->auth_id) == NOSTR_EVENT_VALIDATION_OK;
-    pthread_mutex_unlock(&n->work_mu);
-    if (fresh && wire) {
-        GoChannel *done = nostr_relay_write(relay, wire);
-        Error *error = NULL;
-        if (done) {
-            go_channel_receive(done, (void **)&error);
-            go_channel_unref(done);
-        }
-        if (!done || error) {
-            MD_LOG_W("AUTH transport failed on %s: %s", relay_url,
-                     error ? error->message : "no write result");
-            if (error) free_error(error);
-            auth_answer_failed(n, rs, generation);
-        }
-        /* Only md_nostr_ok_handler may report relay authentication success. */
-    }
-    free(wire);
-    nostr_event_free(signed_ev);
-}
-
-static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge, void *data) {
-    MdRelayState *rs = data;
-    MdNostr *n = rs->bridge;
-    if (!challenge || strlen(challenge) > 4096 || is_stopped(n)) return;
-    uint64_t generation = 0;
-    char *current = nostr_relay_get_auth_challenge(relay, &generation);
-    bool fresh = current && !strcmp(current, challenge);
-    free(current);
-    if (!fresh) return;
-    char *copy = strdup(challenge);
-    if (!copy) return;
-    pthread_mutex_lock(&n->work_mu);
-    bool queued = !n->closing && generation != rs->auth_generation;
-    if (queued) {
-        free(rs->challenge);
-        rs->challenge = copy;
-        copy = NULL;
-        rs->auth_generation = generation;
-        rs->auth_failed = false;
-        rs->auth_id[0] = '\0';
-        pthread_cond_broadcast(&n->work_cv);
-    }
-    pthread_mutex_unlock(&n->work_mu);
-    free(copy);
-    /* A (re-)challenge opens an AUTH path: an "auth-required:" refusal on
-     * this connection becomes transient again. */
-    if (queued) readiness_changed(n);
-}
-
-static void *auth_worker(void *data) {
+static void md_nostr_auth_signer_release(void *data) {
     MdNostr *n = data;
     pthread_mutex_lock(&n->work_mu);
-    while (!n->closing) {
-        MdRelayState *rs = NULL;
-        for (size_t i = 0; i < n->relay_count; i++)
-            if (n->relay_states[i].challenge) { rs = &n->relay_states[i]; break; }
-        if (!rs) { pthread_cond_wait(&n->work_cv, &n->work_mu); continue; }
-        char *challenge = rs->challenge;
-        uint64_t generation = rs->auth_generation;
-        rs->challenge = NULL;
-        pthread_mutex_unlock(&n->work_mu);
-        send_auth(n, rs, challenge, generation);
-        free(challenge);
-        pthread_mutex_lock(&n->work_mu);
-    }
+    n->auth_signers--;
+    pthread_cond_broadcast(&n->work_cv);
     pthread_mutex_unlock(&n->work_mu);
-    return NULL;
+}
+
+/* Challenge observation only: signing and recovery belong to nostrc. */
+static void md_nostr_auth_handler(NostrRelay *relay, const char *challenge, void *data) {
+    (void)relay; (void)challenge;
+    readiness_changed(((MdRelayState *)data)->bridge);
+}
+
+static void md_nostr_auth_result(NostrRelay *relay,
+                                 const NostrRelayAuthResult *result, void *data) {
+    MdRelayState *rs = data;
+    MdNostr *n = rs->bridge;
+    uint64_t identity = n->owner ? md_account_binding_generation(n->owner) : 1;
+    NostrRelayAuthStatus status;
+    if (is_stopped(n) || result->identity_generation != identity ||
+        !nostr_relay_get_auth_status(relay, &status) ||
+        result->frame.connection_generation != status.connection_generation ||
+        result->frame.auth_generation != status.auth_generation)
+        return;
+    if (result->state == NOSTR_RELAY_AUTH_STATE_ACCEPTED)
+        MD_LOG_I("AUTH accepted by %s", n->relay_urls[rs->index]);
+    else
+        MD_LOG_W("AUTH %s by %s: %s", nostr_relay_auth_state_name(result->state),
+                 n->relay_urls[rs->index], result->reason);
+    readiness_changed(n);
+    test_point(n, MD_NOSTR_TEST_AUTH_RESULT);
 }
 
 /* ── Relay OK callback ─────────────────────────────────────────
@@ -531,20 +457,6 @@ static void md_nostr_ok_handler(const char *event_id, bool ok,
     MdRelayState *rs = user_data;
     MdNostr *n = rs->bridge;
     if (!n || is_stopped(n)) return;
-    pthread_mutex_lock(&n->work_mu);
-    bool auth_result = event_id && rs->auth_id[0] && !strcmp(event_id, rs->auth_id);
-    if (auth_result) {
-        rs->auth_id[0] = '\0';
-        if (!ok) rs->auth_failed = true; /* for rs->auth_generation */
-    }
-    pthread_mutex_unlock(&n->work_mu);
-    if (auth_result) {
-        if (ok) MD_LOG_I("AUTH accepted by %s", n->relay_urls[rs->index]);
-        else MD_LOG_W("AUTH rejected by %s: %s", n->relay_urls[rs->index], reason ? reason : "");
-        if (!ok) readiness_changed(n);
-        test_point(n, MD_NOSTR_TEST_AUTH_RESULT);
-    }
-
     if (!ok) {
         MD_LOG_W("relay REJECTED event %.16s%s — %s", event_id ? event_id : "(null)", event_id && strlen(event_id) > 16 ? "..." : "", reason ? reason : "(no reason)");
     }
@@ -1088,11 +1000,6 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     if (cbs)
         n->cbs = *cbs;
 
-    if (n->owner) {
-        n->owner_watch = md_account_binding_watch(n->owner, owner_revoked, n);
-        if (!n->owner_watch || is_stopped(n)) { md_nostr_destroy(n); return NULL; }
-    }
-
     /* Create relay pool — persistent WebSocket connections */
     n->pool = nostr_simple_pool_new();
     if (!n->pool) {
@@ -1160,6 +1067,10 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
                                             state == NOSTR_RELAY_STATE_BACKOFF;
             nostr_relay_set_ok_callback(n->relays[i],
                                         md_nostr_ok_handler, &n->relay_states[i]);
+            nostr_relay_set_auth_result_callback_full(n->relays[i],
+                md_nostr_auth_result, &n->relay_states[i], NULL);
+            n->relay_states[i].connection_generation =
+                nostr_relay_get_connection_generation(n->relays[i]);
             nostr_relay_set_auth_callback(n->relays[i],
                                           md_nostr_auth_handler, &n->relay_states[i]);
         }
@@ -1182,16 +1093,17 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         n->dm_started = true;
     }
 
-    if (pthread_create(&n->auth_thread, NULL, auth_worker, n) != 0) {
-        md_nostr_destroy(n);
-        return NULL;
-    }
-    n->auth_started = true;
-    /* Cover a challenge received during ensure_relay(), before callbacks. */
     for (size_t i = 0; i < n->relay_count; i++) {
-        char *challenge = nostr_relay_get_auth_challenge(n->relays[i], NULL);
-        if (challenge) md_nostr_auth_handler(n->relays[i], challenge, &n->relay_states[i]);
-        free(challenge);
+        pthread_mutex_lock(&n->work_mu);
+        n->auth_signers++;
+        pthread_mutex_unlock(&n->work_mu);
+        if (!nostr_relay_set_auth_signer_full(n->relays[i],
+                NOSTR_RELAY_AUTH_ON_CHALLENGE,
+                n->owner ? md_account_binding_generation(n->owner) : 1,
+                n->pk_hex, md_nostr_auth_sign, n, md_nostr_auth_signer_release)) {
+            md_nostr_destroy(n);
+            return NULL;
+        }
     }
 
     /* Start pool worker threads */
@@ -1206,6 +1118,15 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         n->acl_sub_failed = true; /* no REQ: no boundary will ever arrive */
         update_acl_readiness(n);
         pthread_mutex_unlock(&n->allowlist_mu);
+    }
+
+    /* Publish the revocation watch only after the immutable relay snapshot
+     * and every AUTH registration exist. A role revoked during construction
+     * calls back synchronously here and we unwind; stop can never race the
+     * snapshot or be followed by installing another AUTH signer. */
+    if (n->owner) {
+        n->owner_watch = md_account_binding_watch(n->owner, owner_revoked, n);
+        if (!n->owner_watch || is_stopped(n)) { md_nostr_destroy(n); return NULL; }
     }
 
     MD_LOG_I("bridge ready (signer=%s, pk=%.*s..., relays=%zu)", md_signer_type_name(md_signer_get_type(n->signer)), 8, n->pk_hex, n->relay_count);
@@ -1228,6 +1149,9 @@ void md_nostr_stop(MdNostr *n) {
     md_signer_cancel(n->signer_cancel);
     pthread_cond_broadcast(&n->work_cv);
     pthread_mutex_unlock(&n->work_mu);
+    for (size_t i = 0; i < n->relay_count; i++)
+        nostr_relay_set_auth_signer_full(n->relays[i], NOSTR_RELAY_AUTH_ON_CHALLENGE,
+                                        0, NULL, NULL, NULL, NULL);
     pthread_mutex_lock(&n->allowlist_mu);
     pthread_cond_broadcast(&n->allowlist_cv);
     pthread_mutex_unlock(&n->allowlist_mu);
@@ -1242,10 +1166,10 @@ void md_nostr_destroy(MdNostr *n) {
      * allowlist and callbacks alive while accepted work still uses them. */
     if (n->pool) nostr_simple_pool_stop(n->pool);
     test_point(n, MD_NOSTR_TEST_DRAINING);
-    if (n->auth_started) pthread_join(n->auth_thread, NULL);
+
     if (n->dm_started) pthread_join(n->dm_thread, NULL);
     pthread_mutex_lock(&n->work_mu);
-    while (n->active_ops) pthread_cond_wait(&n->work_cv, &n->work_mu);
+    while (n->active_ops || n->auth_signers) pthread_cond_wait(&n->work_cv, &n->work_mu);
     pthread_mutex_unlock(&n->work_mu);
     if (n->pool) nostr_simple_pool_free(n->pool);
     if (n->allowlist)
@@ -1258,10 +1182,7 @@ void md_nostr_destroy(MdNostr *n) {
         free(n->relay_urls);
     }
     free(n->relays);
-    if (n->relay_states) {
-        for (size_t i = 0; i < n->relay_count; i++) free(n->relay_states[i].challenge);
-        free(n->relay_states);
-    }
+    free(n->relay_states);
 
     pthread_cond_destroy(&n->allowlist_cv);
     pthread_mutex_destroy(&n->allowlist_mu);

@@ -107,11 +107,13 @@ def control(servers, command):
         elif op == "eose":
             s.emit("EOSE")
         elif op == "closed":
-            # The client's pool re-fires the REQ afterwards; the fixture then
-            # holds that subscription (no reply) until the test answers it.
+            # Recovery is reason-specific: AUTH OK, backoff or reconnect.
             s.emit("CLOSED", command.get("reason", "restricted: private fixture"))
             s.active.subs.clear()
+        elif op == "req_after_drop":
+            s.wait(lambda: s.reqs >= s.after_drop_reqs)
         elif op == "drop":
+            s.after_drop_reqs = s.reqs + 1
             # Transient loss: disconnect, hold the reconnect at the handshake
             # until release_connection.
             s.handshake_gate.clear()

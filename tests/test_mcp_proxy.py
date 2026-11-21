@@ -24,7 +24,7 @@ list_changed, and a grant that lost agent closes the stream.
 md-ip2k: when the only relay comes back but refuses the allowlist REQ with a
 terminal CLOSED (restricted:), authorization is a known deny: the held stream
 closes, requests get 401 and the host log names the relay and the reason
-(once, although the pool re-REQs); when the relay serves history again the
+(once); when the relay reconnects and serves history again the
 list reloads. One refusing relay beside a live one stays live, and beside a
 relay that is down the stream is held, not closed.
 """
@@ -52,6 +52,21 @@ class GatedPeer(Peer):
     """Holds allowlist history (EVENT+EOSE) until the test releases it.
     While server.refuse is set, answers every REQ with that CLOSED reason."""
     def dispatch(self, msg):
+        if msg[0] == "AUTH":
+            event = msg[1]
+            assert event["kind"] == 22242 and event["pubkey"] == HOST_PK
+            assert ["challenge", "private-mcp-auth"] in event["tags"]
+            self.authenticated = True
+            self.send(["OK", event["id"], True, ""])
+            return
+        if msg[0] == "REQ" and self.server.auth_required:
+            if not getattr(self, "authenticated", False):
+                self.send(["CLOSED", msg[1], "auth-required: authenticate first"])
+                self.send(["AUTH", "private-mcp-auth"])
+                return
+            if self.server.refuse_after_auth:
+                self.send(["CLOSED", msg[1], "auth-required: accepted identity refused"])
+                return
         if msg[0] == "REQ" and self.server.refuse:
             with self.server.lock:
                 self.server.refused += 1
@@ -253,6 +268,7 @@ def main():
         relay.handshake_gate = threading.Event()
         relay.handshake_gate.set()
         relay.refuse, relay.refused = None, 0
+        relay.auth_required = relay.refuse_after_auth = False
         refuser = Relay()
         refuser.RequestHandlerClass = RefusingPeer
         refuser.refused, refuser.refusal = 0, threading.Event()
@@ -532,8 +548,11 @@ def main():
             expect_acted(static, 52)
             closed_line = f"subscription CLOSED on {url_relay}: {reason} (refused"
             assert sum(closed_line in l for l in statp.log) == 1, statp.log
-            # The relay serves history again (the pool's own re-REQ): reload.
+            # A terminal CLOSED is held until reconnect, never blindly retried.
             relay.refuse = None
+            drop_relay(relay)
+            statp.expect_err("host allowlist history pending")
+            relay.handshake_gate.set()
             statp.expect_err("host allowlist loaded (v5): 2 member(s), 1 with agent (1 also input)")
             call(held, 53, "echo", {"text": "served again"})
             reply = json.loads(held.line())
@@ -545,22 +564,52 @@ def main():
             assert rc == 0, held.log
             print("PASS: terminal CLOSED on the only relay: held stream closes, 401, reason logged once; recovers when served")
 
+            # md-quhj: accepted AUTH recovers an initial auth-required CLOSED
+            # without closing a held stream; a subsequent refusal is terminal.
+            held = Proc([host, "mcp-proxy", "--key-file", keys["client"], surl], env, "auth-refused")
+            procs.append(held)
+            held.send(INIT)
+            assert "result" in json.loads(held.line())
+            held.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            held.expect_err("notification stream open")
+            barrier(held, 54)
+            drop_relay(relay)
+            statp.expect_err("host allowlist history pending")
+            relay.auth_required = True
+            relay.handshake_gate.set()
+            statp.expect_err("AUTH accepted by")
+            statp.expect_err("host allowlist loaded (v5)")
+            barrier(held, 55)
+            assert not any("notification stream ended" in l for l in held.log), held.log
+            drop_relay(relay)
+            statp.expect_err("host allowlist history pending")
+            relay.refuse_after_auth = True
+            relay.handshake_gate.set()
+            statp.expect_err("AUTH accepted by")
+            line = statp.expect_err("host allowlist refused by every relay")
+            assert "auth-required: accepted identity refused" in line and "SSE streams closed" in line, line
+            held.expect_err("notification stream ended (HTTP 200)")
+            call(held, 56, "echo", {"text": "AUTH is not authorization"})
+            expect_401(held, 56)
+            rc, _ = held.close()
+            assert rc == 0, held.log
+            print("PASS: AUTH reconnect keeps held SSE; post-AUTH auth-required CLOSED closes it with known deny")
+            relay.auth_required = relay.refuse_after_auth = False
+
             rc, _ = static.close()
             assert rc == 0, static.log
             rc, _ = statp.close()
             assert rc == 0, statp.log
 
-            # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap REQ;
-            # one REQ/EOSE per host fixture run plus one per reconnect (7a-c),
-            # which the pool re-fires with since= for catch-up, plus the one
-            # the relay served after refusing (7d; refusals are not counted),
-            # which the pool re-creates without since after CLOSED.
+            # Minimal bridge: exactly the allowlist filter, no DM/gift-wrap
+            # REQ. Recovery follows reconnect/AUTH, never blind retry timers.
             with relay.lock:
                 assert relay.filters and all(
                     {k: v for k, v in f.items() if k != "since"} == ALLOWLIST_FILTER
                     for f in relay.filters), relay.filters
-                assert sum("since" not in f for f in relay.filters) == 3, relay.filters
-                assert relay.reqs == relay.eoses == 6, (relay.reqs, relay.eoses)
+                # Filter shape and EOSE, not timer-dependent REQ totals, are
+                # the contract. Every served subscription reached catch-up.
+                assert relay.reqs == relay.eoses, (relay.reqs, relay.eoses)
             print("Private relay: 1 REQ/EOSE per host connection (allowlist only), live EVENT pushes; throwaway keys")
 
             # 8. md-ip2k: one relay that refuses beside one that serves: live.

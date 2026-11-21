@@ -413,6 +413,7 @@ static void test_relay_grant(const char *url, uint32_t expected) {
  * timed waits are deadlock bounds only. Throwaway keys 2 (host), 3 (client). */
 #define HIST_HOST_SK "0000000000000000000000000000000000000000000000000000000000000002"
 #define HIST_CLIENT_SK "0000000000000000000000000000000000000000000000000000000000000003"
+static const char *hist_nip5f_socket;
 
 typedef struct {
     pthread_mutex_t mu;
@@ -478,10 +479,17 @@ static bool hist_wait(HistProbe *p, const unsigned *counter, unsigned target) {
 }
 static MdNostr *hist_bridge_n(const char **urls, int count, const char *sk,
                               MdNostrDmCallback cb, HistProbe *p) {
-    MdNostrConfig cfg = { .sk_hex = sk, .relay_urls = urls, .relay_count = count,
+    MdSigner *signer = NULL;
+    if (hist_nip5f_socket && !strcmp(sk, HIST_HOST_SK)) {
+        signer = md_signer_create_nip5f(hist_nip5f_socket);
+        MD_CHECK(signer);
+    }
+    MdNostrConfig cfg = { .sk_hex = signer ? NULL : sk, .signer = signer,
+                          .relay_urls = urls, .relay_count = count,
                           .allowlist_open = true };
     MdNostrCallbacks cbs = { .on_dm = cb, .dm_userdata = p };
     MdNostr *n = md_nostr_create(&cfg, &cbs);
+    md_signer_destroy(signer);
     MD_CHECK(n);
     /* The catch-up -> live boundary, as the host waits before announcing. */
     MD_CHECK(n && md_nostr_wait_history(n, 10000) == 0);
@@ -670,6 +678,11 @@ static void test_request_gate(void) {
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 4 && !strcmp(argv[1], "--nip5f-fixture")) {
+        hist_nip5f_socket = argv[3];
+        hist_session(argv[2], "nip5f-quoted-seal", 0, 0, false);
+        return md_test_report();
+    }
     if (argc == 4 && !strcmp(argv[1], "--grant-fixture")) {
         test_relay_grant(argv[2], (uint32_t)strtoul(argv[3], NULL, 10));
         return md_test_report();
