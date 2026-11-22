@@ -158,6 +158,7 @@ typedef struct {
     uint32_t      granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
     volatile int  session_accepted;   /* 1 accepted, -1 refused; under mutex */
+    int64_t        request_started_us; /* conservative token lifetime anchor */
     GoChannel      *session_ch;       /* signaled on session accepted    */
     MdAccountWatch *owner_watch;      /* also guards direct-IP sessions  */
     MdAccountBinding *owner;          /* borrowed from startup until drain */
@@ -402,6 +403,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         return -1;
     }
 
+    ctx->request_started_us = now_us();
     char *req_json = md_session_request_to_json(&req);
     if (!req_json) {
         fprintf(stderr, "ERROR: failed to serialize session request\n");
@@ -514,6 +516,63 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
     return valid && client_owner_current(ctx) ? 0 : -1;
 }
 
+static int wait_client_backoff(ClientCtx *ctx, uint32_t delay_ms) {
+    void *value;
+    GoSelectCase cases[] = {
+        { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &value },
+        { .op = GO_SELECT_RECEIVE, .chan = g_shutdown_ch, .recv_buf = &value },
+    };
+    int64_t deadline = now_us() + (int64_t)delay_ms * 1000;
+    while (client_owner_current(ctx)) {
+        int64_t left = deadline - now_us();
+        if (left <= 0) return 0;
+        go_select_timeout(cases, g_shutdown_ch ? 2 : 1, (left + 999) / 1000);
+    }
+    return -1;
+}
+
+/* No readiness-event command exists in the FIPS control protocol. Use actual
+ * dial outcomes and fresh control snapshots, with cancellable exponential
+ * retry backoff, never a sleep-based path gate or a new session request. */
+static MdStream *dial_fips_session(const char *npub, const char *control,
+                                   uint16_t port, uint32_t timeout_ms,
+                                   ClientCtx *ctx) {
+    int64_t deadline = ctx->request_started_us +
+        (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000;
+    uint32_t backoff = 100;
+    while (client_owner_current(ctx)) {
+        int64_t left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        uint32_t budget = (uint32_t)left_ms;
+        if (budget > 1000) budget = 1000;
+        if (timeout_ms && budget > timeout_ms) budget = timeout_ms;
+        MdFipsPeerReadiness ready;
+        MdFipsPeerReadinessState state = md_fips_control_check_peer_ready(
+            control, npub, budget, &ready);
+        if (!client_owner_current(ctx)) break;
+        left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        if (budget > (uint32_t)left_ms) budget = (uint32_t)left_ms;
+        if (state == MD_FIPS_PEER_READY) {
+            MdStream *stream = md_stream_connect_fips(npub, port, budget);
+            if (stream) {
+                if (now_us() < deadline && client_owner_current(ctx)) return stream;
+                md_stream_destroy(stream);
+                break;
+            }
+        } else if (state == MD_FIPS_PEER_ERROR &&
+                   ready.control_result != MD_FIPS_CONTROL_DAEMON_UNAVAILABLE) {
+            break; /* malformed/unsupported control state is not transient */
+        }
+        left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        uint32_t delay = backoff < (uint32_t)left_ms ? backoff : (uint32_t)left_ms;
+        if (wait_client_backoff(ctx, delay) != 0) break;
+        if (backoff < 2000) backoff = backoff * 2 > 2000 ? 2000 : backoff * 2;
+    }
+    return NULL;
+}
+
 static MdStream *connect_client_stream(const char *host, const char *npub,
                                        const char *fips_control_socket,
                                        uint16_t port, uint32_t timeout_ms,
@@ -562,7 +621,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         stream = md_stream_connect(host, port, timeout_ms);
     } else {
         printf("client: connecting via FIPS to %.*s...\n", 12, npub);
-        stream = md_stream_connect_fips(npub, port, timeout_ms);
+        stream = dial_fips_session(npub, fips_control_socket, port, timeout_ms, ctx);
     }
     if (!stream) {
         fprintf(stderr, "ERROR: %s connect failed\n", host ? "direct TCP" : "FIPS");

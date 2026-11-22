@@ -1,5 +1,6 @@
 /* Real client DM gate and negotiation wait; no renderer, signer or desktop. */
 #define main md_client_main_not_run
+#define md_stream_connect_fips test_fips_dial
 #define md_nostr_send_session_request test_request_publish
 #define md_nostr_get_npub test_client_pubkey
 #include "../src/client/main.c"
@@ -78,6 +79,76 @@ static void test_pending_shutdown(void) {
 }
 #endif
 
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+static unsigned dial_calls;
+static bool dial_succeeds;
+MdStream *test_fips_dial(const char *npub, uint16_t port, uint32_t timeout) {
+    MD_CHECK(!strcmp(npub, "npub1peer") && port == 1234);
+    MD_CHECK(timeout > 0 && timeout <= 1000);
+    dial_calls++;
+    return dial_succeeds && dial_calls == 2 ? (MdStream *)(uintptr_t)1 : NULL;
+}
+
+typedef struct { int fd; unsigned count; } RetryControl;
+static void *retry_control(void *data) {
+    RetryControl *srv = data;
+    for (unsigned i = 0; i < srv->count; i++) {
+        struct pollfd pfd = {.fd = srv->fd, .events = POLLIN};
+        MD_CHECK(poll(&pfd, 1, 5000) > 0);
+        int fd = accept(srv->fd, NULL, NULL);
+        MD_CHECK(fd >= 0);
+        char request[1024] = {0};
+        size_t n = 0;
+        while (n + 1 < sizeof(request)) {
+            MD_CHECK(read(fd, request + n, 1) == 1);
+            if (request[n++] == '\n') break;
+        }
+        MD_CHECK(strstr(request, "show_peers"));
+        /* Link disappears between dial attempts, then returns. */
+        const char *reply = i == 1
+            ? "{\"status\":\"ok\",\"data\":{\"peers\":[{\"npub\":\"npub1peer\",\"connectivity\":\"disconnected\"}]}}\n"
+            : "{\"status\":\"ok\",\"data\":{\"peers\":[{\"npub\":\"npub1peer\",\"connectivity\":\"connected\",\"link_id\":7}]}}\n";
+        MD_CHECK(write(fd, reply, strlen(reply)) == (ssize_t)strlen(reply));
+        close(fd);
+    }
+    return NULL;
+}
+static void test_fips_retry(void) {
+    char path[108];
+    snprintf(path, sizeof(path), "/tmp/md-w6-retry-%d.sock", getpid());
+    RetryControl srv = {.fd = socket(AF_UNIX, SOCK_STREAM, 0), .count = 3};
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    MD_CHECK(bind(srv.fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    MD_CHECK(listen(srv.fd, 3) == 0);
+    pthread_t thread;
+    MD_CHECK(pthread_create(&thread, NULL, retry_control, &srv) == 0);
+    ClientCtx ctx = {.session_ch = go_channel_create(1), .request_started_us = now_us()};
+    dial_calls = 0; dial_succeeds = true;
+    MD_CHECK(dial_fips_session("npub1peer", path, 1234, 5000, &ctx) == (MdStream *)(uintptr_t)1);
+    MD_CHECK(dial_calls == 2); /* no renegotiation or dial without a link */
+    pthread_join(thread, NULL);
+    ctx.request_started_us = now_us() - (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000;
+    MD_CHECK(!dial_fips_session("npub1peer", path, 1234, 5000, &ctx));
+    MD_CHECK(dial_calls == 2); /* expired proof never dials */
+    srv.count = 1; dial_calls = 0; dial_succeeds = false;
+    MD_CHECK(pthread_create(&thread, NULL, retry_control, &srv) == 0);
+    ctx.request_started_us = now_us() - (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000 + 80000;
+    MD_CHECK(!dial_fips_session("npub1peer", path, 1234, 5000, &ctx));
+    MD_CHECK(dial_calls == 1); /* backoff clipped to token deadline */
+    pthread_join(thread, NULL);
+    go_channel_unref(ctx.session_ch);
+    close(srv.fd); unlink(path);
+}
+#else
+MdStream *test_fips_dial(const char *npub, uint16_t port, uint32_t timeout) {
+    (void)npub; (void)port; (void)timeout; return NULL;
+}
+#endif
+
 int main(void) {
     const char *reasons[] = {"capture_unavailable", "request_refused"};
     for (unsigned i = 0; i < 2; i++) {
@@ -100,6 +171,7 @@ int main(void) {
     }
 #ifndef _WIN32
     test_pending_shutdown();
+    test_fips_retry();
 #endif
     return md_test_report();
 }

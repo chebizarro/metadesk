@@ -335,6 +335,30 @@ static void test_peer_ready_from_show_peers(void)
     unlink(path);
     PASS("peer readiness from show_peers");
 }
+static void *stale_session_server(void *data) {
+    FakeServer *srv = data;
+    fake_server_thread(srv);
+    srv->response = "{\"status\":\"ok\",\"data\":{\"sessions\":[{\"npub\":\"npub1peer\",\"state\":\"established\"}]}}\n";
+    fake_server_thread(srv);
+    return NULL;
+}
+static void test_stale_session_not_ready(void) {
+    char path[108];
+    snprintf(path, sizeof(path), "/tmp/md-w6-stale-%d.sock", getpid());
+    FakeServer srv = {
+        .srv_fd = make_fake_listener(path),
+        .response = "{\"status\":\"ok\",\"data\":{\"peers\":[{\"npub\":\"npub1peer\",\"connectivity\":\"disconnected\"}]}}\n",
+    };
+    pthread_t tid;
+    MD_CHECK(pthread_create(&tid, NULL, stale_session_server, &srv) == 0);
+    MdFipsPeerReadiness ready;
+    MD_CHECK(md_fips_control_wait_peer_ready(path, "npub1peer", 100, 100, &ready)
+             == MD_FIPS_PEER_CONVERGING);
+    MD_CHECK(strstr(ready.detail, "route unverified"));
+    pthread_join(tid, NULL);
+    close(srv.srv_fd); unlink(path);
+    PASS("stale established session without link is not ready");
+}
 #else
 static void test_one_shot_request(void) { PASS("one-shot request skipped on Windows"); }
 static void test_daemon_unavailable(void) { PASS("daemon unavailable skipped on Windows"); }
@@ -356,5 +380,8 @@ int main(void)
     test_one_shot_request();
     test_daemon_unavailable();
     test_peer_ready_from_show_peers();
+#ifndef _WIN32
+    test_stale_session_not_ready();
+#endif
     return md_test_report();
 }
