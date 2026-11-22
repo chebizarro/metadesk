@@ -1,0 +1,29 @@
+(Reading database ... 7571 files and directories currently installed.)
+Removing metadesk (0.1.0-1) ...
+Selecting previously unselected package metadesk.
+(Reading database ... 7555 files and directories currently installed.)
+Preparing to unpack .../metadesk_0.1.0-1_arm64.deb ...
+Unpacking metadesk (0.1.0-1) ...
+Setting up metadesk (0.1.0-1) ...
+[Unit]
+Description=Metadesk desktop host
+Documentation=https://github.com/chebizarro/metadesk
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/metadesk-host
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target
+missing     /usr/share/doc/metadesk/THIRD_PARTY_NOTICES.md
+missing     /usr/share/doc/metadesk/imgui-LICENSE.txt
+missing     /usr/share/doc/metadesk/nostrc-LICENSE
+missing     /usr/share/doc/metadesk/nsync-LICENSE
+missing     /usr/share/man/man1/metadesk-client.1.gz
+missing     /usr/share/man/man1/metadesk-host.1.gz

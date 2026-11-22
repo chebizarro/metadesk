@@ -1,0 +1,23 @@
+# Build with a context containing src/, nostrc/ (complete source + submodules),
+# ffmpeg-prefix/ (W3 container-profile install), legal/ (curated licenses/sources).
+# Export /output/tree with podman cp; runtime images NEVER compile source.
+ARG BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+FROM ${BASE}
+ARG BASE
+RUN apt-get update && apt-get install -y --no-install-recommends \
+ build-essential cmake meson ninja-build python3 pkg-config patchelf binutils \
+ libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev libpipewire-0.3-dev \
+ libatspi2.0-dev libglib2.0-dev libsecret-1-dev libudev-dev libdbus-1-dev uuid-dev \
+ libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev libjansson-dev \
+ libcjson-dev libb2-dev libnsync-dev libsodium-dev libevent-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY src/ /src/
+COPY nostrc/ /nostrc/
+COPY ffmpeg-prefix/ /ffmpeg-prefix/
+COPY legal/ /legal/
+ENV MD_FFMPEG_PREFIX=/ffmpeg-prefix
+RUN /src/packaging/linux/build-nostrc.sh /nostrc /nostrc-build \
+ && /src/packaging/linux/static-json.py /nostrc-build /nostrc-static \
+ && /src/packaging/linux/build.sh oci /src /nostrc /nostrc-static /build \
+ && /src/packaging/linux/produce.py oci /src /build /nostrc /output \
+      --base "$BASE" --ffmpeg-prefix /ffmpeg-prefix --legal /legal

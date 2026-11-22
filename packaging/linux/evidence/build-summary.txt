@@ -1,0 +1,42 @@
+Clean source rpmbuild -ba exit 0 (Fedora 44 aarch64)
++ /usr/bin/find-debuginfo -j2 --strict-build-id -m -i --build-id-seed 0.1.0-1.fc44 --unique-debug-suffix -0.1.0-1.fc44.aarch64 --unique-debug-src-base metadesk-0.1.0-1.fc44.aarch64 --run-dwz --dwz-low-mem-die-limit 10000000 --dwz-max-die-limit 50000000 --remove-section .gnu.build.attributes -S debugsourcefiles.list /work/rpmbuild/BUILD/metadesk-0.1.0-build/metadesk-0.1.0
+find-debuginfo: starting
+Extracting debug info from 3 files
+find-debuginfo: done
+Wrote: /work/rpmbuild/SRPMS/metadesk-0.1.0-1.fc44.src.rpm
+Wrote: /work/rpmbuild/RPMS/aarch64/metadesk-0.1.0-1.fc44.aarch64.rpm
+Wrote: /work/rpmbuild/RPMS/aarch64/metadesk-debugsource-0.1.0-1.fc44.aarch64.rpm
+Wrote: /work/rpmbuild/RPMS/aarch64/metadesk-debuginfo-0.1.0-1.fc44.aarch64.rpm
+Cosign binary and ephemeral public key SHA256
+ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2  /home/bizarro/md-w9/tools/cosign
+892fa6028dfb6b00bc05c2fe189fdf9f9781bb2867c4540c189c44c9b920a6d6  /home/bizarro/md-w9/signing/cosign.pub
+Native installed runpath
+ 0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN/../lib/metadesk]
+Native package file list
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/bin/
+-rwxr-xr-x root/root    789240 2026-11-22 01:23 ./usr/bin/metadesk-client
+-rwxr-xr-x root/root    133112 2026-11-22 01:23 ./usr/bin/metadesk-host
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/lib/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/lib/metadesk/
+-rw-r--r-- root/root    863528 2026-11-22 01:23 ./usr/lib/metadesk/libmetadesk.so.0.1.0
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/lib/systemd/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/lib/systemd/user/
+-rw-r--r-- root/root       326 2026-11-22 01:20 ./usr/lib/systemd/user/metadesk-host.service
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/doc/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/doc/metadesk/
+-rw-r--r-- root/root     18138 2026-11-22 00:53 ./usr/share/doc/metadesk/THIRD_PARTY_NOTICES.md
+-rw-r--r-- root/root       152 2026-11-22 01:23 ./usr/share/doc/metadesk/changelog.Debian.gz
+-rw-r--r-- root/root      1068 2026-11-22 01:23 ./usr/share/doc/metadesk/copyright
+-rw-r--r-- root/root      1083 2026-11-22 00:53 ./usr/share/doc/metadesk/imgui-LICENSE.txt
+-rw-r--r-- root/root      1059 2026-11-20 15:51 ./usr/share/doc/metadesk/nostrc-LICENSE
+-rw-r--r-- root/root     11358 2026-11-20 15:52 ./usr/share/doc/metadesk/nsync-LICENSE
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/man/
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/man/man1/
+-rw-r--r-- root/root       537 2026-11-22 01:01 ./usr/share/man/man1/metadesk-client.1.gz
+-rw-r--r-- root/root       541 2026-11-22 01:01 ./usr/share/man/man1/metadesk-host.1.gz
+drwxr-xr-x root/root         0 2026-11-22 01:23 ./usr/share/metadesk/
+-rw-r--r-- root/root      2635 2026-11-22 01:23 ./usr/share/metadesk/metadesk-bundle.json
+lrwxrwxrwx root/root         0 2026-11-22 01:23 ./usr/lib/metadesk/libmetadesk.so.0 -> libmetadesk.so.0.1.0

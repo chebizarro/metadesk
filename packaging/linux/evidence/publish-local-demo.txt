@@ -1,0 +1,23 @@
+podman push --tls-verify=false --digestfile /tmp/md-w9-publish-n7a8hzcq/digest localhost/md-w9-native-smoke:noble docker://127.0.0.1:15009/md-w9-metadesk:demo
+Getting image source signatures
+Copying blob sha256:badac985de747410f0d2f1550e8347bd6b57c11520f6cb8970925a51e3d85112
+Copying blob sha256:d367816f799f33f5cbdd0a4cdb59a8c432f8d63bfcead9b880672c404202007a
+Copying config sha256:4e979af790ebf66fe3636be0fc55ad658a5a5152c9126ce98ea3006d72fbfe59
+Writing manifest to image destination
+cosign sign --yes --key /home/bizarro/md-w9/signing/cosign.key --allow-insecure-registry --use-signing-config=false --new-bundle-format=false --tlog-upload=false 127.0.0.1:15009/md-w9-metadesk@sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be
+Flag --use-signing-config has been deprecated, an offline signing flag will be added in the future; TUF will continue to provide a signing config by default if one is not provided manually
+Flag --new-bundle-format has been deprecated, this will be the only supported format in future versions
+Flag --tlog-upload has been deprecated, prefer using a --signing-config file with no transparency log services
+Signing artifact...
+Pushing signature to: 127.0.0.1:15009/md-w9-metadesk
+cosign verify --key /home/bizarro/md-w9/signing/cosign.pub --allow-insecure-registry --new-bundle-format=false --insecure-ignore-tlog=true 127.0.0.1:15009/md-w9-metadesk@sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be
+Flag --new-bundle-format has been deprecated, this will be the only supported format in future versions
+WARNING: Skipping tlog verification is an insecure practice that lacks transparency and auditability verification for the signature.
+
+Verification for 127.0.0.1:15009/md-w9-metadesk@sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - The signatures were verified against the specified public key
+
+[{"critical":{"identity":{"docker-reference":"127.0.0.1:15009/md-w9-metadesk"},"image":{"docker-manifest-digest":"sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be"},"type":"cosign container image signature"},"optional":null}]
+VERIFIED 127.0.0.1:15009/md-w9-metadesk@sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be

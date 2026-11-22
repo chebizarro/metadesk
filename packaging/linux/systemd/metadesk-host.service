@@ -1,0 +1,16 @@
+[Unit]
+Description=Metadesk desktop host
+Documentation=https://github.com/chebizarro/metadesk
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/metadesk-host
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

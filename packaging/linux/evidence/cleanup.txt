@@ -1,0 +1,21 @@
+W9 cleanup 2026-11-22T09:35:28Z
+md-w9-fedora
+md-w9-registry
+md-w9-no-mounts
+md-w9-fedora-install
+Untagged: localhost/md-w9-fedora:44
+Deleted: ff918341dfc920e8694e2079a68792627b0d2b3cf883fd3bce9f409a8a1289cc
+Untagged: localhost/md-w9-native-smoke:noble
+Deleted: 4e979af790ebf66fe3636be0fc55ad658a5a5152c9126ce98ea3006d72fbfe59
+Untagged: localhost/md-w9-registry:3
+Deleted: 4f303374c1a09ef0f84555981da3b20cf9dd1530de5d86d58ac850f509ae57c8
+PASS: ~/md-w9 absent; ephemeral private key removed
+Remaining W9 containers/images/volumes/networks (must be empty):
+PASS: task-owned registry anonymous volume absent; no global prune; unrelated resources retained
+PASS: /private/tmp/md-w9-* absent; retained only assigned-worktree artifacts/evidence.
+Independent verification: containers = 0 W9 resources
+Independent verification: images = 0 W9 resources
+Independent verification: volumes = 0 W9 resources
+Independent verification: networks = 0 W9 resources
+Independent verification: VM tree and registry-owned anonymous volume absent
+Cleanup detail: idle sleep-infinity build/install container PID 1 processes did not stop on SIGTERM; podman rm -f escalated to SIGKILL after 10 seconds for md-w9-fedora and md-w9-fedora-install. These were not product-host SIGTERM tests.

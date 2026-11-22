@@ -1,0 +1,4 @@
+podman push --digestfile DIGEST_RECEIPT localhost/md-w9-native-smoke:noble docker://ghcr.io/owner/metadesk:w9
+cosign sign --yes --key OWNER_KEY_REFERENCE ghcr.io/owner/metadesk@sha256:RESOLVED_AFTER_PUSH
+cosign verify --key OWNER_PUBLIC_KEY ghcr.io/owner/metadesk@sha256:RESOLVED_AFTER_PUSH
+DRY RUN; no push, keys or signature access: ghcr.io/owner/metadesk@sha256:RESOLVED_AFTER_PUSH

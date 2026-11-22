@@ -1,0 +1,19 @@
+# LOCAL QUALIFICATION ONLY, NOT the minimal-LGPL production OCI channel.
+# Context is private work dir with deb/*.deb and src/.
+ARG BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+FROM ${BASE}
+COPY deb/*.deb /tmp/
+RUN apt-get update && apt-get install -y --no-install-recommends /tmp/*.deb python3 libglib2.0-bin \
+ && rm -rf /tmp/*.deb /var/lib/apt/lists/* \
+ && metadesk-host --help && metadesk-client --help \
+ && ldd /usr/bin/metadesk-host > /tmp/closure && ! grep -q 'not found' /tmp/closure && rm /tmp/closure
+COPY src/deploy/containers/entrypoint.sh /opt/metadesk/entrypoint.sh
+COPY src/deploy/containers/reference/probe.py /opt/metadesk/reference/probe.py
+RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi \
+ && if getent group ubuntu >/dev/null; then groupdel ubuntu; fi \
+ && groupadd -g 1000 metadesk && useradd -u 1000 -g 1000 -m metadesk \
+ && mkdir -p /run/user/1000 && chown 1000:1000 /run/user/1000 && chmod 0700 /run/user/1000
+ENV HOME=/home/metadesk MD_UID=1000 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+USER 1000:1000
+ENTRYPOINT ["/opt/metadesk/entrypoint.sh"]
+CMD ["/usr/bin/metadesk-host", "--mcp", "--no-input"]
