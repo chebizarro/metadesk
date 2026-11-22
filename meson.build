@@ -925,6 +925,9 @@ test_atspi = executable('test_atspi',
 )
 test('a11y tree serialisation', test_atspi)
 if host_machine.system() == 'linux'
+  test_atspi_hit = executable('test_atspi_hit', files('tests/test_atspi_hit.c'),
+    dependencies : [dep_metadesk])
+  test('AT-SPI native hit adapter', test_atspi_hit)
   test('a11y private bus loss', test_atspi,
     args : ['--private-bus-loss', metadesk_host.full_path()],
     depends : metadesk_host,
@@ -1152,6 +1155,9 @@ if host_os == 'darwin'
     dependencies : [dep_metadesk],
   )
   test('ScreenCaptureKit system stop', test_capture_sck, timeout : 30)
+  test_axui_hit = executable('test_axui_hit', files('tests/test_axui_hit.m'),
+    dependencies : [dep_metadesk])
+  test('AX native hit adapter', test_axui_hit)
 endif
 
 test_ipc = executable('test_ipc',

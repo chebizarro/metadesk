@@ -122,6 +122,33 @@ static void test_root_errors(MdA11yCtx *ctx) {
     puts("PASS root-provider errors latch loss; resource failure does not");
 }
 
+static bool hit_occluded, hit_failed;
+static HRESULT fake_point_runtime(IUIAutomation *, POINT point, SAFEARRAY **out) {
+    CHECK(point.x == 140 && point.y == 220);
+    if (hit_failed) return UIA_E_ELEMENTNOTAVAILABLE;
+    *out = SafeArrayCreateVector(VT_I4, 0, 2);
+    LONG index = 0; int value = 42;
+    CHECK(SUCCEEDED(SafeArrayPutElement(*out, &index, &value)));
+    index = 1; value = hit_occluded ? 8 : 7;
+    CHECK(SUCCEEDED(SafeArrayPutElement(*out, &index, &value)));
+    return S_OK;
+}
+
+static void test_hit_identity(MdA11yCtx *ctx) {
+    auto *st = static_cast<UIAState *>(ctx->backend_data);
+    InterlockedExchange(&st->connected, 1);
+    uia_test_point_runtime = fake_point_runtime;
+    hit_occluded = true;
+    CHECK(!md_a11y_target_at_point(ctx, "u:2a.7", 140, 220));
+    hit_occluded = false;
+    CHECK(md_a11y_target_at_point(ctx, "u:2a.7", 140, 220));
+    hit_failed = true;
+    CHECK(!md_a11y_target_at_point(ctx, "u:2a.7", 140, 220));
+    hit_failed = false;
+    uia_test_point_runtime = nullptr;
+    puts("PASS native point RuntimeId rejects occluder and provider failure");
+}
+
 static void test_session_messages(MdA11yCtx *ctx) {
     auto *st = static_cast<UIAState *>(ctx->backend_data);
     const WPARAM reasons[] = { WTS_SESSION_LOCK, WTS_CONSOLE_DISCONNECT,
@@ -197,6 +224,7 @@ int main(int argc, char **argv) {
         uia_test_loss_event = nullptr;
         puts("PASS real OS session loss");
     } else {
+        test_hit_identity(ctx);
         test_root_errors(ctx);
         test_session_messages(ctx);
     }

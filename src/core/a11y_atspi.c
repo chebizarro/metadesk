@@ -51,10 +51,11 @@ typedef struct {
 
 /* ── Internal: convert AtspiAccessible to MdA11yNode ─────────── */
 
-static char *make_node_id(AtspiState *st) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "n%lu", (unsigned long)st->next_id++);
-    return strdup(buf);
+static char *atspi_element_id(AtspiAccessible *acc) {
+    AtspiObject *object = ATSPI_OBJECT(acc);
+    if (!object || !object->app || !object->app->bus_name || !object->path)
+        return NULL;
+    return g_strdup_printf("atspi:%s:%s", object->app->bus_name, object->path);
 }
 
 /* Map one AT-SPI state to its canonical wire name, or NULL if metadesk has
@@ -137,21 +138,7 @@ static MdA11yNode *walk_accessible(AtspiState *st, AtspiAccessible *acc,
     MdA11yNode *node = calloc(1, sizeof(MdA11yNode));
     if (!node) return NULL;
 
-    node->id = make_node_id(st);
-
-    /* Prefer the toolkit-provided accessible id over DFS position —
-     * it survives across walks where the DFS counter does not. */
-    {
-        gchar *acc_id = atspi_accessible_get_accessible_id(acc, &error);
-        if (error) { g_error_free(error); error = NULL; }
-        if (acc_id) {
-            if (*acc_id) {
-                free(node->id);
-                node->id = g_strdup_printf("a:%s", acc_id);
-            }
-            g_free(acc_id);
-        }
-    }
+    node->id = atspi_element_id(acc);
 
     /* Role */
     gchar *role_name = atspi_accessible_get_role_name(acc, &error);
@@ -563,6 +550,36 @@ static int atspi_get_tree(MdA11yCtx *ctx, MdA11yNode **out_root) {
     return op.result;
 }
 
+typedef struct { int x, y; char *id; } AtspiHitOp;
+
+static gboolean atspi_hit_on_context(gpointer data) {
+    AtspiHitOp *op = data;
+    AtspiAccessible *desktop = atspi_get_desktop(0);
+    if (!desktop) return G_SOURCE_REMOVE;
+    AtspiComponent *component = atspi_accessible_get_component_iface(desktop);
+    if (component) {
+        GError *error = NULL;
+        AtspiAccessible *hit = atspi_component_get_accessible_at_point(
+            component, op->x, op->y, ATSPI_COORD_TYPE_SCREEN, &error);
+        if (hit && !error) op->id = atspi_element_id(hit);
+        if (hit) g_object_unref(hit);
+        if (error) g_error_free(error);
+        g_object_unref(component);
+    }
+    g_object_unref(desktop);
+    /* A desktop without a global Component hit test is unsupported, not
+     * permission to search apps in arbitrary order and click an occluder. */
+    return G_SOURCE_REMOVE;
+}
+
+static char *atspi_hit_test(MdA11yCtx *ctx, int x, int y) {
+    AtspiState *st = ctx ? ctx->backend_data : NULL;
+    if (!st || !atomic_load(&st->connected)) return NULL;
+    AtspiHitOp op = { .x = x, .y = y };
+    atspi_invoke_sync(atspi_hit_on_context, &op);
+    return op.id;
+}
+
 static int atspi_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
                                    void *userdata) {
     AtspiState *st = ctx ? ctx->backend_data : NULL;
@@ -635,6 +652,7 @@ static bool atspi_is_connected(const MdA11yCtx *ctx) {
 
 static const MdA11yBackend atspi_backend = {
     .is_connected      = atspi_is_connected,
+    .hit_test          = atspi_hit_test,
     .init              = atspi_init_backend,
     .get_tree          = atspi_get_tree,
     .subscribe_changes   = atspi_subscribe_changes,
