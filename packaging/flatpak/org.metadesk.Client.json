@@ -1,0 +1,72 @@
+{
+  "app-id": "org.metadesk.Client",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "49",
+  "sdk": "org.gnome.Sdk",
+  "command": "metadesk-client",
+  "finish-args": [
+    "--share=network",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--share=ipc",
+    "--device=dri",
+    "--talk-name=org.freedesktop.secrets"
+  ],
+  "build-options": {
+    "env": {
+      "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+      "MAKEFLAGS": "-j2"
+    }
+  },
+  "cleanup": [
+    "/include",
+    "/lib/pkgconfig",
+    "/lib/*.a",
+    "/lib/cmake",
+    "/lib/metadesk-nostrc",
+    "/share/man",
+    "/share/aclocal",
+    "/lib/*.la",
+    "/bin/patchelf",
+    "/bin/yuvconvert",
+    "/COPYING.LGPLv2.1"
+  ],
+  "modules": [
+    "modules.json",
+    {
+      "name": "metadesk-client",
+      "buildsystem": "simple",
+      "build-commands": [
+        "sh packaging/flatpak/build-product.sh \"$PWD\" /app/lib/metadesk-nostrc/source /app/lib/metadesk-nostrc/build \"$PWD/_build\" /app client",
+        "sh packaging/flatpak/wrap-runtime.sh client",
+        "install -Dm644 packaging/flatpak/assets/org.metadesk.Client.desktop /app/share/applications/org.metadesk.Client.desktop",
+        "install -Dm644 packaging/flatpak/assets/org.metadesk.Client.metainfo.xml /app/share/metainfo/org.metadesk.Client.metainfo.xml",
+        "install -Dm644 packaging/flatpak/assets/org.metadesk.Client.svg /app/share/icons/hicolor/scalable/apps/org.metadesk.Client.svg",
+        "install -Dm644 packaging/appimage/tests/frame.h264 /app/share/metadesk/frame.h264"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "../..",
+          "skip": [
+            ".git",
+            ".beads",
+            "build",
+            "artifacts",
+            "packaging/appimage/output",
+            "packaging/flatpak/output",
+            ".flatpak-builder"
+          ]
+        }
+      ],
+      "build-options": {
+        "cflags": "-I/app/include",
+        "cxxflags": "-I/app/include",
+        "ldflags": "-L/app/lib",
+        "env": {
+          "LIBRARY_PATH": "/app/lib"
+        }
+      }
+    }
+  ]
+}

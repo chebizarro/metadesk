@@ -1,0 +1,10 @@
+[
+  {
+    "url": "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-aarch64.AppImage",
+    "sha256": "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+  },
+  {
+    "url": "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-aarch64",
+    "sha256": "00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444"
+  }
+]
