@@ -15,6 +15,8 @@ COPY src/ /src/
 COPY nostrc/ /nostrc/
 COPY ffmpeg-prefix/ /ffmpeg-prefix/
 COPY legal/ /legal/
+# FFmpeg installs absolute pkg-config prefixes; relocate metadata, not ELFs.
+RUN find /ffmpeg-prefix/lib/pkgconfig -name '*.pc' -exec sed -i 's|^prefix=.*|prefix=/ffmpeg-prefix|' {} +
 ENV MD_FFMPEG_PREFIX=/ffmpeg-prefix
 RUN /src/packaging/linux/build-nostrc.sh /nostrc /nostrc-build \
  && /src/packaging/linux/static-json.py /nostrc-build /nostrc-static \

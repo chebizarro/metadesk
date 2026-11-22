@@ -147,6 +147,10 @@ in-image `ldd`. Runtime helper verifies hashes/closure and fail-closed
 no-desktop behavior without any desktop mount. **Gate 5 and authenticated-session
 SIGTERM still require a separately authorized matching-UID desktop run.**
 Do not treat `verify-image.sh`'s explicit NOT RUN output as release acceptance.
+Runtime probe expectations use the same target-architecture encoder selector as
+the FFmpeg builder; QSV/libvpl are x86/x86_64-only. `verify-image.sh` writes
+receipts under ignored `packaging/linux/output/receipts/`, or `MD_RECEIPT_DIR`.
+Keep build/test command captures in that ignored output tree, not in Git.
 Run both x86_64 and aarch64 matrices in owner CI; this lane cannot invent
 ARM-incompatible SDK profiles or override W3's requested encoder gates.
 `reference/throwaway-bundle.sh` remains historical fixture tooling, **not a
@@ -179,5 +183,5 @@ selects the deprecated legacy offline format and disables TUF service selection.
 These offline compatibility flags are NEVER passed in release mode. It proves crypto/publishing plumbing, not
 release trust, hosted CI or owner key policy. See
 [cosign signing documentation](https://docs.sigstore.dev/cosign/signing/signing_with_containers/)
-and the local receipt in VALIDATION.md. Debian packaging conventions follow the
+and the result summary in VALIDATION.md. Debian packaging conventions follow the
 [Debian maintainer guide](https://www.debian.org/doc/manuals/debmake-doc/).

@@ -1,171 +1,92 @@
-# W9 local Linux packaging evidence — 2026-11-22
+# W9 Linux packaging qualification
 
-**Not a release qualification. Neither md-x7wk nor md-xs90 can close.**
-No push, merge, Beads closure, hosted CI, public repository publication or real
-signing key was used. Main and sibling checkouts were not edited/built.
+Worktree: `md/w9-linux-packages`. No push, merge into master, public publication,
+real signing keys, Beads closure, host desktop/session access or uinput activity.
+Raw receipts belong in ignored `packaging/linux/output/`, not Git.
+Only this summary and `evidence/artifact-sha256.txt` are retained as evidence.
 
-## Environment and provenance
+## Original native-package qualification (2026-11-22)
 
-Assigned branch `md/w9-linux-packages`, application baseline
-`0e91e463b2baff1fca2ff6daca1262bdaa1d5858`; W9 packaging/install changes are
-identified by per-script hashes in the manifests and the retained source RPM.
-Artifacts are local development snapshots, not artifacts built from a release
-tag. The later test/docs/help-wording edits are not a claim to have rebuilt the
-recorded snapshots. Rebuild from the committed source before any promotion.
+Application baseline `0e91e463b2baff1fca2ff6daca1262bdaa1d5858`, nostrc
+`cfcb86296068c1e4090bc5ce8a486392dc74eb11`. Ubuntu 24.04 and Fedora 44 aarch64.
 
-Ubuntu 24.04 aarch64 VM, rootless Podman 4.9.3, private `~/md-w9` tree. Read the
-three requested bd memories first; only read the dedicated nostrc-master input,
-never modified/rebuilt it. nostrc full pin:
-`cfcb86296068c1e4090bc5ce8a486392dc74eb11`. Source archives include submodules.
-Native system FFmpeg: Ubuntu libavcodec 60; Fedora 44 libavcodec 62. Both packages
-have static nostrc/JSON. Fedora lacks nsync-devel and builds pinned nsync 1.30.0
-statically; Ubuntu uses its system nsync. Builds used -j2; final Fedora LTO and
-find-debuginfo workers also explicitly limited to 2.
+- Built Ubuntu `.deb`, unsigned noble/arm64 apt layout, Fedora runtime RPM,
+  SRPM, debuginfo and debugsource packages. Five package SHA256 values are in
+  `evidence/artifact-sha256.txt`; artifacts remain ignored under `artifacts/`.
+- Clean-container installs, host/client help and dependency closure passed.
+  A network-disabled local `file:` apt repository install passed, with
+  `trusted=yes` solely for that unsigned local fixture, not release trust.
+- Fedora `rpm -V` and installed systemd user-unit static verification passed;
+  unit never enabled/started. Ubuntu slim-container dpkg exclusions omit docs,
+  so its documentation-file integrity check is not claimed as a pass.
+- lintian: exit 0, **0 errors / 1 first-upload warning**. rpmlint 2.8: exit 0,
+  **0 errors / 5 warnings**: four local source-URL diagnostics and one
+  `SSL_CTX_set_cipher_list` crypto-policy warning requiring dependency review.
+  No warning suppression or fully lint-clean claim.
+- Native packages link system FFmpeg, static pinned nostrc/JSON; Fedora builds
+  pinned nsync 1.30.0 (`5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4`) statically.
+  Cisco OpenH264 is never bundled. Native-only Meson install RUNPATH avoids
+  patchelf rewriting that damaged Fedora ELF build IDs; RPM owns debug splitting.
+- AUR template syntax passed; no Arch ARM build root available. makepkg/namcap,
+  Debian 13 and x86_64 native-package matrices remain unrun.
 
-Ubuntu base digest:
-`sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8`.
-Fedora image pulled locally, renamed to the W9 prefix, base image ID
-`ff918341dfc920e8694e2079a68792627b0d2b3cf883fd3bce9f409a8a1289cc`.
-No desktop, host session bus/AT-SPI socket, display/PipeWire socket or uinput
-mount was used. No live input/capture or GUI qualification is claimed.
+## Original signing demonstration
 
-## Built artifacts
+Default publish was verified inert (empty PATH, no file creation). A real
+native-package smoke image was pushed to a loopback registry, signed using a
+new ephemeral key and verified with cosign 3.1.4 by digest:
 
-Retained locally, **ignored, not committed**, under `packaging/linux/artifacts/`:
+`sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be`.
 
-- `metadesk_0.1.0-1_arm64.deb` — SHA256
-  `417cd5fe019c848e4e2fcab3aa650e6c0bfb52e46a986428ecebd84700f71b15`.
-- `metadesk-0.1.0-1.fc44.aarch64.rpm` — SHA256
-  `e67808d7b37d01a8e1e5c0767fb86b15c1271e6fc8d8ac0a9ab8af07f397ca3c`.
-- Matching `.src.rpm`, `-debuginfo` and `-debugsource` RPMs.
-- `apt-repo/` pool + noble/arm64 Packages, Packages.gz and unsigned Release.
+That image was **not** the production minimal-LGPL OCI channel. Offline legacy
+compatibility/TLS/transparency exceptions were confined to `--local-demo`;
+release defaults remain intact. Registry, anonymous task-owned volume, private
+key, all W9 Podman resources, `~/md-w9` and `/private/tmp/md-w9-*` were removed
+and independently verified absent. Idle builder/install sleep containers needed
+Podman's SIGKILL escalation; this was not a product SIGTERM qualification.
 
-All five native package hashes were checked after copying from the VM; see
-[evidence/artifact-sha256.txt](evidence/artifact-sha256.txt). The runtime tree,
-VM build outputs, local registry/key and all W9 images are disposable and are
-removed, not promoted. Native binaries contain no Cisco OpenH264 library.
+## Architecture-profile follow-up
 
-## Tests and lint
+- Fixed the original Intel-only libvpl/QSV blocker. The unchanged three-argument
+  builder uses `MD_FFMPEG_ARCH`, otherwise the CC/cross-prefix compiler target.
+  Windows/container/Flatpak request QSV only on x86/x86_64 (including i686).
+  ARM64 retains NVENC/AMF plus VAAPI or Media Foundation as appropriate.
+  Both Linux runtime inventory gates use the same encoder selector.
+- Fixture matrix covers 3 profiles × 5 architectures, retaining exact inventory,
+  Windows MF patch drift/already-applied guards and LGPL checks. Fixtures are
+  wiring evidence, not cross-platform FFmpeg compilation.
+- Real ARM64 FFmpeg 8.1.2 build: LGPL-2.1-or-later; H.264 decoder/parser;
+  **h264_nvenc, h264_amf, h264_vaapi**, no QSV/libvpl, x264 or OpenH264.
+  FFmpeg tar SHA256:
+  `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`.
+  nv-codec-headers n13.0.19.0 tar SHA256:
+  `86d15d1a7c0ac73a0eafdfc57bebfeba7da8264595bf531cf4d8db1c22940116`.
+  AMF v1.4.36 headers only, commit
+  `16f7d73e0b45c473e903e46981ed0b91efc4c091` (sparse source checkout).
+  VAAPI headers 2.20.0-2ubuntu0.2 extracted into the private tree; no host
+  packages installed. No hardware encoder/GPU success is inferred.
+- Master `1a3cc8e` (W3 and subsequent owner integrations) merged into W9 via
+  `3a385db`, after profile fix `ef367e9`; no application changes by W9.
+- Fresh macOS client/tools build against the dedicated nostrc pin: **51 pass,
+  0 fail, 1 opt-in AX owned-clicks/native-video skip (77)**. Homebrew dependency
+  deployment-target linker warnings remain; this is not a signed Mac release.
+- Linux safety tests: pending follow-up VM run. macOS: **7 pass, 1 ELF-fixture
+  skip**. FFmpeg packaging fixtures: **5 pass**, including 15 profile/arch cells.
 
-| Check | Actual result |
-|---|---|
-| Ubuntu native host/client build | PASS, including final Meson-native RUNPATH relink |
-| Ubuntu `.deb` assembly | PASS with real dpkg-shlibdeps dependency metadata |
-| Clean Ubuntu image dependency install + host/client `--help`, ldd | PASS |
-| Final `.deb` remove/reinstall in that disposable Ubuntu root | PASS; same runtime dependencies; help/closure pass |
-| Local apt layout, network disabled, file: repo | PASS update + install + both help commands; explicit trusted=yes only for this **unsigned local fixture**, not release trust |
-| lintian | exit 0, **0 errors, 1 warning**: initial-upload-closes-no-bugs; no bogus Debian bug number or suppression added |
-| Fedora 44 source `rpmbuild -ba` | PASS, clean final rebuild; runtime, source, debuginfo and debugsource RPMs generated |
-| Clean Fedora 44 image install | PASS, DNF resolved the runtime dependencies; no development dependencies installed there |
-| Final RPM replace/reinstall + `rpm -V`, both help, ldd | PASS |
-| Installed systemd user unit static verify in Fedora container | PASS using systemd-analyze --user; unit never enabled/started |
-| rpmlint 2.8.0, four packages + spec | exit 0, **0 errors, 5 warnings**, 0 badness; see below |
-| Packaging safety tests | Linux **8 pass**; macOS 7 pass / 1 ELF-only fixture skip |
-| Shell syntax/ShellCheck, PKGBUILD bash syntax, Python compile, git diff --check | PASS |
-| Arch makepkg/namcap | **NOT RUN**: official Arch image manifest advertises amd64 only, no native aarch64 root provided |
-| Debian 13 / x86_64 package matrices | **NOT RUN**; Ubuntu binaries are not passed off as Debian/Arch/Fedora binaries |
+Production OCI build and contract results will be recorded after qualification.
+The producer relocates copied FFmpeg pkg-config metadata before compiling;
+it never substitutes system FFmpeg for the private profile. Build/test receipts
+are ignored; `verify-image.sh` uses ignored `output/receipts/` by default or
+`MD_RECEIPT_DIR`, without writing into a caller's tracked working directory.
 
-The Ubuntu slim image intentionally excludes documentation/man pages through
-its dpkg configuration. Its `dpkg --verify` reports those excluded files; this
-is **not** claimed as a complete payload-integrity pass. The package archive
-contains the docs/man pages (build-summary receipt); Fedora `rpm -V` passed.
-Early static unit verification on the VM lacked an installed executable, and
---user/--root verification was unsupported there; those attempts are not passes.
-The installed Fedora unit static check above is the qualifying syntax result.
+## Closure / owner prerequisites
 
-RPM warnings: Source0/Source1 local filenames each reported twice because both
-SRPM and explicit spec were linted (**four URL warnings**); immutable hosted
-source URLs are owner input, not invented. **One OpenSSL crypto-policy warning**
-flags `SSL_CTX_set_cipher_list` in libmetadesk. This needs review of the pinned
-static dependency's Fedora crypto-policy behavior; it is neither suppressed nor
-claimed to prove an exploitable defect. No fully lint-clean result is claimed.
+Neither bead is closed. md-x7wk still requires actual production-image results,
+the x86_64+aarch64 CI matrix, authorized authenticated desktop gates 5/6, and
+owner registry/signing/promotion policy. Native md-xs90 additionally retains its
+cross-distro/architecture, Arch artifact/checksum and lint-review gates.
 
-Meaningful packaging fixes during qualification:
-
-- Removed global ldconfig configuration; use a private relative RUNPATH.
-- Put nostrc/dependency build inputs outside the Meson source directory.
-- Let RPM own debug splitting; do not pre-strip RPM input.
-- Fedora patchelf 0.18.0 rewrites damaged executable ELF notes/build IDs. Native
-  staging now does **no patchelf rewriting**. One opt-in Meson install option
-  emits `$ORIGIN/../lib/metadesk`; normal Linux/OCI and Darwin defaults preserved.
-  Final installed Fedora ELF retains its build ID and expected RUNPATH.
-- Corrected RPM metadata lint errors rather than suppressing them.
-
-## OCI producer and signing
-
-The unchanged W3 container-profile FFmpeg builder was actually attempted using
-FFmpeg 8.1.2, verified tar SHA256
-`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`.
-It **fails closed**: `ERROR: libvpl >= 2.6 not found` on this aarch64 build root.
-No encoder flag removed, FFmpeg source/profile edited, or system codec closure
-substituted. Therefore **the production minimal-LGPL runtime tree and agent
-image were NOT built/qualified**. The pinned producer Containerfile and new
-production-input consumer gates remain unqualified until W3/owner supplies a
-working matching-architecture SDK/profile and curated dependency legal/source
-payload. No successful full producer/consumer matrix is claimed.
-
-A real **native-package smoke image**, not that production channel, was built
-locally: `localhost/md-w9-native-smoke:noble`, image ID
-`4e979af790ebf66fe3636be0fc55ad658a5a5152c9126ce98ea3006d72fbfe59`.
-It installed the actual Ubuntu native package and runtime dependency closure.
-Direct no-desktop MCP failed exit 1 with `accessibility backend unavailable`;
-entrypoint failed exit 1 with `missing session bus socket`, rather than starting
-a substitute service. No host desktop mounts or devices were involved.
-
-Default publish dry run printed podman/cosign commands without executing them.
-An offline regression test uses an empty PATH and checks no file creation;
-release dry-run output contains no insecure demo flags.
-
-Practical local demo: cosign **3.1.4**, downloaded binary SHA checked against its
-upstream checksum list; new password-protected **throwaway** key pair;
-loopback registry at `127.0.0.1:15009`, W9 image/repository/container prefix.
-Push, sign and verification succeeded for:
-
-`127.0.0.1:15009/md-w9-metadesk@sha256:e3e074c9210754c0603078fe26031cf19ab41fc7e046f70854ec3dc4ee06b3be`
-
-Actual cosign receipt validated claims and signature against the specified
-public key. Demo uses explicitly deprecated legacy/offline compatibility flags
-for cosign 3.1.4, no TUF public service selection or transparency upload; normal
-TLS/transparency defaults remain intact outside `--local-demo`. The first v3
-attempt exposed its changed signing-config default; the explicit offline demo
-configuration fixed that mismatch, not a retry-to-green or release-policy bypass.
-This tests publishing/crypto plumbing only, **not** production image legality,
-owner identity, public registry credentials, public transparency, or promotion.
-
-Contract coverage: static RPATH rejection fixture passes; native smoke exercises
-closure/no-desktop failure only. **Production gates 1–6 as a whole do not pass**.
-Gate 5 (authenticated HTTP/stdio real application tree) was prohibited by lane
-isolation. Gate 6 authenticated-session/no-listener/tool-surface/SIGTERM behavior
-was not qualified. No live/cross-architecture/hosted evidence is inherited from
-the earlier container spike.
-
-## Owner prerequisites / remaining work
-
-- W3-approved working minimal LGPL FFmpeg SDK/profile for each architecture,
-  exact private dependency licenses/corresponding sources/replacement material,
-  then real pinned producer + production image build and all contract gates.
-- Authorized isolated desktop gate 5/6 session; x86_64 + aarch64 hosted matrix.
-- Registry/repository + credentials, cosign signing/verification policy/keys,
-  tag/digest and multiarch promotion policy. No real keys used by W9.
-- Apt origin/domain/suites + repository key/public-key distribution and signed
-  InRelease/Release.gpg; Copr project/chroots/source uploads/immutable URLs and
-  maintainer approval. Reconcile the Fedora crypto-policy lint warning.
-- Arch-native release tarballs, authenticated immutable URLs and real per-arch
-  SHA256 values in PKGBUILD, an Arch/Arch Linux ARM build root, makepkg/namcap
-  qualification; Debian 13 and x86_64 package/install/lint matrix.
-- Service start/device grants, actual capture/encode/GPU and live desktop
-  acceptance remain separate, explicitly authorized runtime work.
-
-## Review and tool scope
-
-Oracle reviewed **only supplied actual code excerpts**, not the unbound tree or
-main checkout. Three findings fixed: disallow all unexpected FFmpeg components,
-remove any stale JSON archive before constructing it, require explicit registry
-qualification. Regression coverage includes archive-member removal and inert
-publish behavior. No full-tree Oracle approval is claimed.
-
-Jev: 3 find-lines calls / 8 requests, 66,651 input tokens, about USD 0.00280;
-answered probabilities .99/.97/.93 narrowed plan/notices/Meson context. No
-judgment was used to authorize deletion, publication or a security exception.
-
-Cleanup receipt is recorded in [evidence/cleanup.txt](evidence/cleanup.txt).
+Owners must provide apt/Copr hosting and signing keys, immutable source/release
+URLs, Arch-native binaries/checksums, a reviewed private-dependency legal/source
+and replacement-rights corpus, and the isolated authorized desktop needed for
+remaining runtime tests. No synthetic or local-only result replaces these gates.

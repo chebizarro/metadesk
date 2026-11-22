@@ -175,6 +175,7 @@ def main():
         'nostrc_revision': nostrc_rev, 'base': a.base, 'private_origins': origins,
         'packaging_sha256': {str(f.relative_to(src)): digest(f) for f in sorted((src / 'packaging/linux').rglob('*')) if f.is_file() and not {'__pycache__', 'artifacts', 'evidence'}.intersection(f.relative_to(src / 'packaging/linux').parts)},
         'ffmpeg': 'system' if a.mode == 'native' else 'private-minimal-LGPL',
+        'ffmpeg_encoders': encoders if a.mode == 'oci' else None,
         'openh264': 'runtime-only; never bundled',
         'dlopen': ['OpenH264: separately obtained exact vetted ABI', 'NSS: base-owned',
                    'PipeWire/SPA, portal, GPU/VAAPI/QSV: system; not Tier A qualified'],
