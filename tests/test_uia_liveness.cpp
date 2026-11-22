@@ -182,6 +182,7 @@ int main(int argc, char **argv) {
     bool interactive = argc > 1 && strcmp(argv[1], "--interactive") == 0;
     bool wait_loss = argc > 1 && strcmp(argv[1], "--wait-for-loss") == 0;
     bool unavailable = argc > 1 && strcmp(argv[1], "--expect-unavailable") == 0;
+    bool hit_only = argc > 1 && strcmp(argv[1], "--hit-test-only") == 0;
     MdA11yCtx *ctx = md_a11y_create();
     CHECK(ctx);
     auto *st = static_cast<UIAState *>(ctx->backend_data);
@@ -192,6 +193,13 @@ int main(int argc, char **argv) {
         printf("PASS unavailable console startup: session=%lu connected=0\n", st->session_id);
         md_a11y_destroy(ctx);
         CoUninitialize();
+        return 0;
+    }
+    if (hit_only) {
+        test_hit_identity(ctx);
+        md_a11y_destroy(ctx);
+        CoUninitialize();
+        puts("ALL UIA HIT-TEST FAKE TESTS PASSED");
         return 0;
     }
     printf("session=%lu connected=%d registered=%d\n", st->session_id,
