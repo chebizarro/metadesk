@@ -278,6 +278,48 @@ sessions may fall back to a chooser or reject creation. Read-only session/journa
 checks are appropriate; never unlock, replace services or restart the bus to turn
 a failure green. A token file is not proof of unattended first-frame restoration.
 
+### Windows native attended helper
+
+Follow [windows-build.md](windows-build.md) in the assigned Windows directory.
+For real NIP-46 sessions, additionally build nostrc targets `nostr_nip46_core`
+and `nip04`, and configure metadesk with `-Dsigner_nip46=true`. Reuse installed
+MSYS2 packages, not a sibling lane's source/build. Include the selected nostrc
+`build/libjson`, product build directory and native CLANGARM64 bin directory in
+PATH. Use a private bunker and the same pinned host identity/direct-IP recipe.
+
+Compile in the native MSYS2 CLANGARM64 shell:
+
+```sh
+clang++ -std=c++17 -Wall -Wextra -Werror tools/e2e/windows-fixture.cpp \
+  -o windows-fixture.exe -luser32 -lpowrprof
+```
+
+In a **separate task-owned interactive console**, launch
+`windows-fixture.exe PRIVATE_COMMAND_FILE OWNED_STOP_FILE`. The command file is
+a private UTF-8 CreateProcess command line, possibly containing a throwaway
+bunker URI: restrict its ACL and never print/commit it. Its child is the real
+host/client, not a video fixture. Run the enclosing `.cmd` with
+`tools/win/run-interactive.ps1 -TimeoutSeconds 43200`, recording helper exit and
+a done marker only after completion. A scheduled-task marker alone is not a
+product exit receipt. Stop by creating only the assigned stop file; the helper
+requests Ctrl+C in its private console and waits for the product, then reaps its
+kill-on-close job. Never run it in an operator's existing terminal.
+
+The visible **md-l7 Owned Windows Target** has an animated label, owned button
+and text entry. Power notifications re-wake only that owned window; no input is
+injected to wake the display. Do not lock the console or use session 0 as a GUI
+receipt. Keep the viewer open while awaiting human confirmation; the long helper
+limit is only a leak guard, never a success/capture/consent deadline.
+
+`tools/e2e/windows-progress.py` is a separate no-display/no-capture/input-disabled
+regression. Supply `--binary PATH --role client|host --relay PRIVATE_URL
+--host-npub HOST_NPUB --unused-signer-pubkey UNUSED_TRANSPORT_HEX`. The unused
+valid key must have **no bunker listening** on that controlled private relay.
+After an actual NIP-46 startup diagnostic, it uses `PeekNamedPipe` to prove the
+already-printed progress is readable while the child still awaits the signer,
+then terminates/reaps the test process. `--expect-buffered` reproduces the old
+Windows baseline. This is not an authenticated pairing or graceful-exit test.
+
 ## Per-cell attended checks and recording
 
 For every pairing, record the following **ten checks separately** in order:

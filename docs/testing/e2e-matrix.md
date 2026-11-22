@@ -9,7 +9,9 @@ is the owning matrix. L7 now supplies a [native runbook](e2e-runbook.md),
 [receipt harness](../../tools/e2e/matrix.py), and
 [2026-11-21 results](results/2026-11-21-l7.md). Round 1 tested `3f66fcc`;
 Round 2 tested `d9fbdfe817114337b6710727f1a81f284606e62b` and local fixes
-`e07e03f` on real macOS ↔ GNOME. No general pairing passed.
+`e07e03f` on real macOS ↔ GNOME. Round 3 is **in progress** on the merged
+socket port (`a195fca`); native Mac→Windows streams, but operator confirmation
+and the reverse direction are pending. No general pairing passed.
 
 ## Status and counting
 
@@ -26,9 +28,9 @@ checks, not full E2E passes. Counts exclude the checklist and summary tables.
 
 | Scope | PASS | FAIL | not yet run | pending | BLOCKED | N/A | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| General host/client pairings | 0 | 2 | 24 | 0 | 6 | 0 | 32 |
+| General host/client pairings | 0 | 3 | 25 | 0 | 4 | 0 | 32 |
 | Containers (historical receipts below) | 93 | 4 | 4 | 5 | 0 | 1 | 107 |
-| Total | 93 | 6 | 28 | 5 | 6 | 1 | 139 |
+| Total | 93 | 7 | 29 | 5 | 4 | 1 | 139 |
 
 ## General roles × platforms × transports
 
@@ -41,22 +43,25 @@ promoted to PASS. Container component checks below do not qualify these cells.
 
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
-| Windows | not yet run | not yet run | BLOCKED: md-z9pd | not yet run |
+| Windows | not yet run | not yet run | not yet run: reverse native run pending | not yet run |
 | GNOME/Linux | not yet run | not yet run | FAIL: streamed; md-a4ne, md-2pi2, md-op7n, md-r65z | not yet run |
-| macOS | BLOCKED: md-z9pd | FAIL: streamed; md-ixkl, md-rbyb, md-k3jg | not yet run | not yet run |
+| macOS | FAIL: streamed; md-f813, operator check pending | FAIL: streamed; md-ixkl, md-rbyb, md-k3jg | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
 
 ### FIPS mesh (npub, NIP-44 session negotiation, TCP over FIPS TUN)
 
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
-| Windows | not yet run | not yet run | BLOCKED: md-z9pd, md-m1we | not yet run |
+| Windows | not yet run | not yet run | BLOCKED: md-m1we | not yet run |
 | GNOME/Linux | not yet run | not yet run | BLOCKED: native mesh provisioning | not yet run |
-| macOS | BLOCKED: md-z9pd, md-m1we | BLOCKED: native mesh provisioning | not yet run | not yet run |
+| macOS | BLOCKED: md-m1we | BLOCKED: native mesh provisioning | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
 
-Four BLOCKED entries retain Round 1 Windows prerequisites; no Windows access
-occurred in Round 2. Both macOS↔GNOME IP directions genuinely negotiated and
+Windows binaries now compile and pass native stream tests (md-z9pd); Windows
+FIPS entries retain md-m1we, not the old build blocker. Round 3's real Mac→Windows
+IP sample decoded/displayed frames but reconnected unexpectedly (md-f813), with
+human checks pending; Windows→Mac is not run yet. Both macOS↔GNOME IP directions
+genuinely negotiated and
 streamed, but observed failures and unperformed input/permission checks prevent
 acceptance. The two corresponding FIPS attempts are BLOCKED: no provisioned
 daemons and unprivileged macOS utun creation was denied. Other Linux pairings
