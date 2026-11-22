@@ -1021,6 +1021,13 @@ fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.c',
 test_encoder_loader = executable('test_encoder_loader', 'tests/test_encoder_loader.c',
   dependencies : dep_metadesk)
 test('OpenH264 rejects incompatible ABI', test_encoder_loader, args : [fake_openh264.full_path()])
+foreach rejected : [['unvetted_build', '2,7,0,2611'], ['older_layout', '2,5,1,2501']]
+  fake_rejected = shared_library('fake_openh264_' + rejected[0], 'tests/fake_openh264.c',
+    include_directories : core_inc, install : false,
+    c_args : ['-DMD_FAKE_OPENH264_VERSION=' + rejected[1]])
+  test('OpenH264 rejects ' + rejected[0] + ' before create', test_encoder_loader,
+    args : [fake_rejected.full_path()])
+endforeach
 test('OpenH264 rejects missing explicit library', test_encoder_loader)
 if host_os != 'windows'
   test('FFmpeg Windows patch wiring (fixtures)', find_program('python3'),
