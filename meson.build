@@ -822,6 +822,14 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
+# GTK remains private to the opt-in Linux companion, never libmetadesk.
+if get_option('manager')
+  if host_os != 'linux'
+    error('metadesk-manager is currently Linux-only')
+  endif
+  subdir('src/manager')
+endif
+
 # ── Signer account tests ────────────────────────────────────────────────────
 if host_os == 'linux' or host_os == 'darwin' or host_os == 'windows'
   test_accounts = executable('test_accounts', 'tests/test_accounts.c',
