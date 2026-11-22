@@ -90,7 +90,26 @@ static int test_encoder_create(void) {
     MD_CHECK(md_encoder_get_size(enc, &w, &h) == 0);
     MD_CHECK(w == TEST_W && h == TEST_H);
 
-    printf("OK (%s)\n", md_encoder_is_hw(enc) ? "NVENC" : "x264");
+    const char *name = md_encoder_get_name(enc);
+    MD_CHECK(name != NULL);
+    MD_CHECK(strcmp(name, "h264_nvenc") == 0 ||
+             strcmp(name, "h264_videotoolbox") == 0 ||
+             strcmp(name, "h264_amf") == 0 || strcmp(name, "libx264") == 0);
+    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0));
+    MD_CHECK(md_encoder_get_name(NULL) == NULL);
+    printf("OK (%s)\n", name);
+    md_encoder_destroy(enc);
+
+    cfg.prefer_nvenc = false;
+    enc = md_encoder_create(&cfg);
+    MD_CHECK(enc != NULL);
+    name = md_encoder_get_name(enc);
+    MD_CHECK(name != NULL);
+    MD_CHECK(strcmp(name, "h264_nvenc") != 0);
+    MD_CHECK(strcmp(name, "h264_videotoolbox") == 0 ||
+             strcmp(name, "h264_amf") == 0 || strcmp(name, "libx264") == 0);
+    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0));
+    printf("  non-NVENC fallback: %s\n", name);
     md_encoder_destroy(enc);
     return 0;
 }
