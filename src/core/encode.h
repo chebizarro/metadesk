@@ -1,12 +1,12 @@
 /*
  * metadesk — encode.h
- * FFmpeg H.264 encoding pipeline (NVENC with libx264 fallback).
+ * Platform H.264 encoding pipeline with runtime OpenH264 fallback.
  * See spec §9 for encoder configuration.
  *
  * Pipeline:
  *   1. Caller submits captured frames (BGRx/RGBx/RGBA from PipeWire)
  *   2. libyuv converts to NV12 (encoder input format)
- *   3. FFmpeg encodes via NVENC (or libx264 fallback)
+ *   3. Selected platform codec or direct runtime OpenH264 encodes H.264
  *   4. Encoded NAL units delivered to callback
  *
  * Thread safety: submit and poll may be called from the same thread.
@@ -43,6 +43,8 @@ typedef struct {
     uint32_t bitrate;       /* bits/sec, default 8_000_000 (8 Mbps)   */
     uint32_t fps;           /* frames/sec, default 60                  */
     bool     prefer_nvenc;  /* try NVENC first (see md_encoder_create)  */
+    const char *openh264_path; /* optional absolute runtime library filename */
+    const char *encoder_name; /* optional exact backend; no fallback if set */
 } MdEncoderConfig;
 
 /* Default encoder settings */
@@ -64,11 +66,9 @@ typedef void (*MdEncodeCallback)(const MdEncodedPacket *pkt, void *userdata);
 
 /* Create encoder with given config. Returns NULL on failure.
  *
- * Codec selection cascades through the first that opens AND accepts the spec
- * §9 low-latency options: [NVENC if prefer_nvenc] -> VideoToolbox -> AMF ->
- * libx264. prefer_nvenc only controls whether NVENC is attempted first; the
- * hardware backends for the current platform are always tried before the
- * libx264 software fallback. md_encoder_is_hw() reports which kind was chosen. */
+ * Platform HW/OS encoders -> runtime OpenH264 -> optional FFmpeg libx264.
+ * See encoder-runtime.md for order, loading paths, and ABI requirements.
+ * Config strings are copied. No OpenH264 binary is bundled or fetched. */
 MdEncoder *md_encoder_create(const MdEncoderConfig *cfg);
 
 /* Submit a raw frame for encoding.
@@ -117,8 +117,7 @@ void md_encoder_force_keyframe(MdEncoder *enc);
  * Same threading rule as md_encoder_submit. */
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
 
-/* Selected FFmpeg encoder name (e.g. h264_nvenc, h264_videotoolbox,
- * h264_amf, libx264). Borrowed static string; NULL for a NULL encoder. */
+/* Selected backend name (e.g. h264_videotoolbox, h264_mf, openh264). Borrowed static string; NULL for a NULL encoder. */
 const char *md_encoder_get_name(const MdEncoder *enc);
 
 /* Query whether a hardware backend is being used (vs software fallback). */

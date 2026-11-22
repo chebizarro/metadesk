@@ -507,6 +507,10 @@ core_deps = [
   dep_threads,
 ] + platform_hal_deps
 
+if host_os != 'windows'
+  core_deps += cc.find_library('dl', required : false)
+endif
+
 # ── Signer backend deps + compile flags ─────────────────────────────────────
 # Diagnose stale nostrc objects after a system libwebsockets upgrade, including
 # the all-off configuration (test_nostr also creates websocket contexts).
@@ -728,6 +732,8 @@ core_sources = files(
   'src/core/signer.c',
   'src/core/capture.c',
   'src/core/encode.c',
+  'src/core/encoder_chain.c',
+  'src/core/encode_openh264.cpp',
     'src/core/bitrate_ctrl.c',
     'src/core/decode.c',
   'src/core/a11y.c',
@@ -771,6 +777,9 @@ core_sources += platform_hal_sources
 mcp_c_args = ['-DMD_MCP_BRIDGE_VERSION="' + meson.project_version() + '"']
 
 libmetadesk = shared_library('metadesk', core_sources,
+  # Preserve Darwin's C link driver: its C++ driver moves -lSystem
+  # behind nsync, reintroducing md-5aua's wall-clock symbol interposition.
+  link_language : host_os == 'darwin' ? 'c' : 'cpp',
   include_directories : core_inc,
   dependencies : core_deps,
   c_args : signer_c_args + mcp_c_args + accounts_c_args,
@@ -1005,6 +1014,17 @@ test_encode = executable('test_encode',
   dependencies : [dep_metadesk],
 )
 test('encode/decode round-trip', test_encode)
+
+test_encoder_chain = executable('test_encoder_chain',
+  files('tests/test_encoder_chain.c', 'src/core/encoder_chain.c'),
+  include_directories : core_inc)
+test('encoder chain policy', test_encoder_chain)
+fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.cpp',
+  include_directories : core_inc, install : false)
+test_encoder_loader = executable('test_encoder_loader', 'tests/test_encoder_loader.c',
+  dependencies : dep_metadesk)
+test('OpenH264 rejects incompatible ABI', test_encoder_loader, args : [fake_openh264.full_path()])
+test('OpenH264 rejects missing explicit library', test_encoder_loader)
 
 # md-ezto/md-pvlj: encoder size + input bounds follow capture restarts.
 test_capture_sync = executable('test_capture_sync',

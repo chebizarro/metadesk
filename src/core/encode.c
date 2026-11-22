@@ -1,20 +1,8 @@
-/*
- * metadesk — encode.c
- * FFmpeg H.264 encoding pipeline with NVENC and libx264 fallback.
- *
- * Encoder configuration per spec §9:
- *   NVENC: p1 preset, ull tune, cbr RC, no B-frames, intra-refresh
- *   x264:  ultrafast preset, zerolatency tune
- *
- * Colorspace conversion:
- *   Input from PipeWire is typically BGRx (4 bytes/pixel).
- *   libyuv converts to NV12 for the encoder.
- *
- * The encoder maintains its own NV12 frame buffer and AVFrame.
- * Caller submits raw frames via md_encoder_submit(); the callback
- * receives encoded NAL units synchronously during submit.
- */
+/* metadesk — platform H.264 encoders, runtime OpenH264, optional x264. */
 #include "encode.h"
+#include "encoder_chain.h"
+#include "encode_openh264.h"
+#include <libavutil/hwcontext.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
@@ -36,12 +24,13 @@
 
 struct MdEncoder {
     MdEncoderConfig      config;
+    char                *openh264_path, *encoder_name; /* owned config strings */
+    MdOpenH264          *openh264;
+    AVFrame             *hw_frame;
     const AVCodec       *codec;
     AVCodecContext       *ctx;
     AVFrame             *frame;      /* reusable NV12 frame                    */
     AVPacket            *pkt;        /* reusable output packet                 */
-    uint8_t             *nv12_buf;   /* NV12 plane data backing frame->data[]  */
-    int                  nv12_size;  /* total NV12 buffer size                 */
     bool                 is_hw;      /* true for any hardware backend          */
     bool                 force_keyframe; /* emit an IDR on the next frame       */
     int64_t              frame_idx;  /* the next frame's lowest codec pts      */
@@ -210,7 +199,7 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
     ctx->framerate = (AVRational){(int)fps, 1};
     ctx->pix_fmt   = AV_PIX_FMT_NV12;
     ctx->bit_rate  = (int64_t)br;
-    ctx->gop_size  = 0;           /* intra-refresh instead of keyframes */
+    ctx->gop_size  = 0;           /* existing hardware intra-refresh policy */
     ctx->max_b_frames = 0;        /* no B-frames for low latency        */
 
     /* Codec-specific low-latency options (spec §9). Collected into a dict and
@@ -238,6 +227,45 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
         av_dict_set(&opts, "realtime", "true", 0);
         av_dict_set(&opts, "allow_sw", "0",    0);
         av_dict_set(&opts, "profile",  "high", 0);
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    } else if (strcmp(codec_name, "h264_mf") == 0) {
+        ctx->gop_size = (int)fps * 2;
+        /* With hw_encoding=0 FFmpeg enumerates the OS software MFT too. */
+        av_dict_set(&opts, "hw_encoding", "0", 0);
+        av_dict_set(&opts, "scenario", "display_remoting", 0);
+        av_dict_set(&opts, "rate_control", "cbr", 0);
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    } else if (strcmp(codec_name, "h264_qsv") == 0) {
+        ctx->gop_size = (int)fps * 2;
+        av_dict_set(&opts, "preset", "veryfast", 0);
+        av_dict_set(&opts, "async_depth", "1", 0);
+        av_dict_set(&opts, "look_ahead", "0", 0);
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    } else if (strcmp(codec_name, "h264_vaapi") == 0) {
+        ctx->gop_size = (int)fps * 2;
+        AVBufferRef *device = NULL;
+        if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0) < 0) {
+            avcodec_free_context(&ctx);
+            return -1;
+        }
+        ctx->hw_frames_ctx = av_hwframe_ctx_alloc(device);
+        av_buffer_unref(&device);
+        if (!ctx->hw_frames_ctx) {
+            avcodec_free_context(&ctx);
+            return -1;
+        }
+        AVHWFramesContext *frames = (AVHWFramesContext *)ctx->hw_frames_ctx->data;
+        frames->format = AV_PIX_FMT_VAAPI;
+        frames->sw_format = AV_PIX_FMT_NV12;
+        frames->width = (int)w;
+        frames->height = (int)h;
+        frames->initial_pool_size = 4;
+        if (av_hwframe_ctx_init(ctx->hw_frames_ctx) < 0) {
+            avcodec_free_context(&ctx);
+            return -1;
+        }
+        ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+        av_dict_set(&opts, "rc_mode", "CBR", 0);
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     } else if (strcmp(codec_name, "libx264") == 0) {
         av_dict_set(&opts, "preset", "ultrafast",   0);
@@ -271,6 +299,18 @@ static int try_open_encoder(MdEncoder *enc, const char *codec_name) {
     return 0;
 }
 
+static bool attempt_encoder(void *userdata, const char *name) {
+    MdEncoder *enc = userdata;
+    if (strcmp(name, "openh264") == 0) {
+        enc->openh264 = md_openh264_create(&enc->config);
+        return enc->openh264 != NULL;
+    }
+    if (try_open_encoder(enc, name) < 0) return false;
+    /* MF may be the OS software MFT; don't label it as GPU hardware. */
+    enc->is_hw = strcmp(name, "libx264") != 0 && strcmp(name, "h264_mf") != 0;
+    return true;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
@@ -278,7 +318,9 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
         return NULL;
 
     if (cfg->width > (uint32_t)INT_MAX || cfg->height > (uint32_t)INT_MAX ||
-        cfg->fps > (uint32_t)INT_MAX)
+        cfg->fps > (uint32_t)INT_MAX / 2u ||
+        cfg->bitrate > MD_ENCODER_MAX_BITRATE ||
+        (uint64_t)cfg->width * cfg->height > (uint64_t)INT_MAX / 4u)
         return NULL;
 
     /* Width and height must be even for NV12 */
@@ -290,86 +332,42 @@ MdEncoder *md_encoder_create(const MdEncoderConfig *cfg) {
 
     enc->config = *cfg;
 
-    /* Try hardware encoders first, fall back to x264 software.
-     * Cascade: NVENC (Linux/Windows NVIDIA) → VideoToolbox (macOS) → x264 */
-    if (cfg->prefer_nvenc) {
-        if (try_open_encoder(enc, "h264_nvenc") == 0) {
-            enc->is_hw = true;
-        }
+    /* Copy optional strings: resize retains the config after the caller returns. */
+    if (cfg->openh264_path) enc->openh264_path = strdup(cfg->openh264_path);
+    if (cfg->encoder_name) enc->encoder_name = strdup(cfg->encoder_name);
+    if ((cfg->openh264_path && !enc->openh264_path) ||
+        (cfg->encoder_name && !enc->encoder_name)) {
+        md_encoder_destroy(enc); return NULL;
+    }
+    enc->config.openh264_path = enc->openh264_path;
+    enc->config.encoder_name = enc->encoder_name;
+#if defined(_WIN32)
+    MdEncoderPlatform platform = MD_ENCODER_WINDOWS;
+#elif defined(__APPLE__)
+    MdEncoderPlatform platform = MD_ENCODER_MACOS;
+#else
+    MdEncoderPlatform platform = MD_ENCODER_LINUX;
+#endif
+    if (!md_encoder_select(platform, cfg->prefer_nvenc, cfg->encoder_name,
+                           attempt_encoder, enc)) {
+        MD_LOG_E("No H.264 encoder available. Install Cisco OpenH264 2.7.0 and "
+                 "set --openh264-path; see src/core/encoder-runtime.md");
+        md_encoder_destroy(enc);
+        return NULL;
     }
 
-    /* Try VideoToolbox on macOS */
-    if (!enc->ctx) {
-        if (try_open_encoder(enc, "h264_videotoolbox") == 0) {
-            enc->is_hw = true;
-        }
-    }
-
-    /* Try AMF on Windows/AMD */
-    if (!enc->ctx) {
-        if (try_open_encoder(enc, "h264_amf") == 0) {
-            enc->is_hw = true;
-        }
-    }
-
-    /* Software fallback */
-    if (!enc->ctx) {
-        if (try_open_encoder(enc, "libx264") < 0) {
-            free(enc);
-            return NULL;
-        }
-        enc->is_hw = false;
-    }
-
-    /* Allocate reusable AVFrame for NV12 input */
+    /* CPU NV12 input, also used before VAAPI upload and OpenH264 I420 conversion. */
     enc->frame = av_frame_alloc();
-    if (!enc->frame) {
-        avcodec_free_context(&enc->ctx);
-        free(enc);
-        return NULL;
-    }
-
-    enc->frame->format = AV_PIX_FMT_NV12;
-    enc->frame->width  = (int)cfg->width;
-    enc->frame->height = (int)cfg->height;
-
-    /* Allocate NV12 buffer and assign to frame planes */
-    enc->nv12_size = av_image_get_buffer_size(AV_PIX_FMT_NV12,
-                                               (int)cfg->width, (int)cfg->height, 32);
-    if (enc->nv12_size <= 0) {
-        av_frame_free(&enc->frame);
-        avcodec_free_context(&enc->ctx);
-        free(enc);
-        return NULL;
-    }
-
-    enc->nv12_buf = av_malloc((size_t)enc->nv12_size);
-    if (!enc->nv12_buf) {
-        av_frame_free(&enc->frame);
-        avcodec_free_context(&enc->ctx);
-        free(enc);
-        return NULL;
-    }
-
-    int fill_ret = av_image_fill_arrays(enc->frame->data, enc->frame->linesize,
-                                        enc->nv12_buf, AV_PIX_FMT_NV12,
-                                        (int)cfg->width, (int)cfg->height, 32);
-    if (fill_ret < 0) {
-        av_free(enc->nv12_buf);
-        av_frame_free(&enc->frame);
-        avcodec_free_context(&enc->ctx);
-        free(enc);
-        return NULL;
-    }
-
-    /* Allocate reusable output packet */
     enc->pkt = av_packet_alloc();
-    if (!enc->pkt) {
-        av_free(enc->nv12_buf);
-        av_frame_free(&enc->frame);
-        avcodec_free_context(&enc->ctx);
-        free(enc);
-        return NULL;
+    enc->hw_frame = av_frame_alloc();
+    if (!enc->frame || !enc->pkt || !enc->hw_frame) {
+        md_encoder_destroy(enc); return NULL;
+    }
+    enc->frame->format = AV_PIX_FMT_NV12;
+    enc->frame->width = (int)cfg->width;
+    enc->frame->height = (int)cfg->height;
+    if (av_frame_get_buffer(enc->frame, 32) < 0) {
+        md_encoder_destroy(enc); return NULL;
     }
 
     return enc;
@@ -387,16 +385,14 @@ int md_encoder_submit_tagged(MdEncoder *enc, const uint8_t *data,
                              uint32_t stride, MdPixFmt input_fmt,
                              int64_t pts, uint64_t tag,
                              MdEncodeCallback cb, void *userdata) {
-    if (!enc || !data || !enc->ctx)
+    if (!enc || !data || (!enc->ctx && !enc->openh264))
         return -1;
 
-    enc->cb = cb;
-    enc->cb_userdata = userdata;
-
+    if (av_frame_make_writable(enc->frame) < 0) return -1;
     /* Convert input pixels to NV12 via libyuv */
     int ret = convert_to_nv12(data, stride, input_fmt,
-                              (uint32_t)enc->ctx->width,
-                              (uint32_t)enc->ctx->height,
+                              enc->config.width,
+                              enc->config.height,
                               enc->frame->data[0], enc->frame->linesize[0],
                               enc->frame->data[1], enc->frame->linesize[1]);
     if (ret < 0) {
@@ -412,20 +408,52 @@ int md_encoder_submit_tagged(MdEncoder *enc, const uint8_t *data,
     int64_t codec_pts = (pts >= 0) ? pts : enc->frame_idx;
     if (codec_pts < enc->frame_idx)
         codec_pts = enc->frame_idx;
+    if (codec_pts == INT64_MAX ||
+        (enc->openh264 && codec_pts > INT64_MAX / 1000)) return -1;
+    enc->cb = cb;
+    enc->cb_userdata = userdata;
     enc->frame->pts = codec_pts;
     enc->frame_idx = codec_pts + 1;
 
-    /* Force an IDR when requested (e.g. a new client connected and needs a
-     * decodable entry point); otherwise let the encoder pick the type. */
-    enc->frame->pict_type = enc->force_keyframe ? AV_PICTURE_TYPE_I
-                                                : AV_PICTURE_TYPE_NONE;
+    if (enc->openh264) {
+        MdEncodedPacket out;
+        bool force = enc->force_keyframe;
+        enc->force_keyframe = false;
+        ret = md_openh264_encode(enc->openh264, enc->frame->data[0], enc->frame->linesize[0],
+                                 enc->frame->data[1], enc->frame->linesize[1], codec_pts, force, &out);
+        if (ret == 0) {
+            inflight_push(enc, codec_pts, tag);
+            if (out.size) {
+                out.tag = inflight_take(enc, out.pts);
+                if (cb) cb(&out, userdata);
+            }
+        }
+        enc->cb = NULL; enc->cb_userdata = NULL;
+        return ret;
+    }
+    enc->frame->pict_type = enc->force_keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     enc->force_keyframe = false;
-
-    /* Send frame to encoder */
-    ret = avcodec_send_frame(enc->ctx, enc->frame);
+    AVFrame *input = enc->frame;
+    if (enc->ctx->pix_fmt == AV_PIX_FMT_VAAPI) {
+        av_frame_unref(enc->hw_frame);
+        if (av_hwframe_get_buffer(enc->ctx->hw_frames_ctx, enc->hw_frame, 0) < 0 ||
+            av_hwframe_transfer_data(enc->hw_frame, enc->frame, 0) < 0 ||
+            av_frame_copy_props(enc->hw_frame, enc->frame) < 0) {
+            enc->cb = NULL; enc->cb_userdata = NULL;
+            return -1;
+        }
+        input = enc->hw_frame;
+    }
+    ret = avcodec_send_frame(enc->ctx, input);
+    if (ret == AVERROR(EAGAIN)) {
+        if (receive_packets(enc) < 0) {
+            enc->cb = NULL; enc->cb_userdata = NULL;
+            return -1;
+        }
+        ret = avcodec_send_frame(enc->ctx, input);
+    }
     if (ret < 0) {
-        enc->cb = NULL;
-        enc->cb_userdata = NULL;
+        enc->cb = NULL; enc->cb_userdata = NULL;
         return -1;
     }
     inflight_push(enc, codec_pts, tag);
@@ -443,8 +471,9 @@ int md_encoder_submit_tagged(MdEncoder *enc, const uint8_t *data,
 }
 
 int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata) {
-    if (!enc || !enc->ctx)
-        return -1;
+    if (!enc) return -1;
+    if (enc->openh264) return 0; /* EncodeFrame has no delayed output. */
+    if (!enc->ctx) return -1;
 
     enc->cb = cb;
     enc->cb_userdata = userdata;
@@ -511,10 +540,14 @@ static uint32_t clamp_bitrate(uint32_t br) {
 }
 
 int md_encoder_set_bitrate(MdEncoder *enc, uint32_t new_bitrate) {
-    if (!enc || !enc->ctx)
-        return -1;
-
+    if (!enc) return -1;
     uint32_t br = clamp_bitrate(new_bitrate);
+    if (enc->openh264) {
+        if (md_openh264_bitrate(enc->openh264, br) < 0) return -1;
+        enc->config.bitrate = br;
+        return 0;
+    }
+    if (!enc->ctx) return -1;
 
     /* Runtime reconfiguration, codec-independent. bit_rate is the primary knob
      * every FFmpeg H.264 encoder reads; rc_max_rate + rc_buffer_size pin the
@@ -548,7 +581,7 @@ uint32_t md_encoder_get_bitrate(const MdEncoder *enc) {
 }
 
 const char *md_encoder_get_name(const MdEncoder *enc) {
-    return enc && enc->codec ? enc->codec->name : NULL;
+    return enc && enc->openh264 ? "openh264" : enc && enc->codec ? enc->codec->name : NULL;
 }
 
 bool md_encoder_is_hw(const MdEncoder *enc) {
@@ -568,12 +601,14 @@ void md_encoder_destroy(MdEncoder *enc) {
 
     if (enc->pkt)
         av_packet_free(&enc->pkt);
-    if (enc->nv12_buf)
-        av_free(enc->nv12_buf);
     if (enc->frame)
         av_frame_free(&enc->frame);
     if (enc->ctx)
         avcodec_free_context(&enc->ctx);
 
+    md_openh264_destroy(enc->openh264);
+    av_frame_free(&enc->hw_frame);
+    free(enc->openh264_path);
+    free(enc->encoder_name);
     free(enc);
 }

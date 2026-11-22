@@ -633,7 +633,9 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
     fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
-    fprintf(stderr, "  --no-nvenc       Skip NVENC; try other hardware, then x264\n");
+    fprintf(stderr, "  --openh264-path FILE  Load an explicitly installed Cisco OpenH264 library\n");
+    fprintf(stderr, "  --encoder NAME   Require this backend (e.g. openh264, h264_mf); no fallback\n");
+    fprintf(stderr, "  --no-nvenc       Skip NVENC; try HW/OS, OpenH264, optional x264\n");
     fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
     fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
     fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
@@ -959,6 +961,7 @@ int main(int argc, char **argv) {
     uint32_t fps = 60;
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
+    const char *openh264_path = NULL, *encoder_name = NULL;
     bool do_capture = true;
     /* Capture policy options: keep this block independent of input selection. */
     bool capture_unattended = false;
@@ -999,6 +1002,15 @@ int main(int argc, char **argv) {
             bitrate = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-nvenc") == 0)
             use_nvenc = false;
+        else if (strcmp(argv[i], "--openh264-path") == 0 || strcmp(argv[i], "--encoder") == 0) {
+            bool path_option = strcmp(argv[i], "--openh264-path") == 0;
+            if (++i >= argc || !argv[i][0]) {
+                fprintf(stderr, "ERROR: encoder option requires a value\n");
+                return 1;
+            }
+            if (path_option) openh264_path = argv[i];
+            else encoder_name = argv[i];
+        }
         else if (strcmp(argv[i], "--no-capture") == 0)
             do_capture = false;
         /* Capture policy: portal-required on Linux, never direct fallback. */
@@ -1209,8 +1221,9 @@ int main(int argc, char **argv) {
     printf("  port:      %u\n", port);
     printf("  fps:       %u\n", fps);
     printf("  bitrate:   %u bps\n", bitrate);
-    printf("  encoder:   %s\n", use_nvenc ? "NVENC preferred; hardware/x264 fallback"
-                                             : "non-NVENC hardware/x264 fallback");
+    printf("  encoder:   %s\n", encoder_name ? encoder_name
+           : use_nvenc ? "NVENC preferred; HW/OS, OpenH264, optional x264 fallback"
+                       : "non-NVENC HW/OS, OpenH264, optional x264 fallback");
     printf("  capture:   %s\n", do_capture ? "enabled" : "disabled");
     if (fips_npub)
         printf("  fips:      %.*s...\n", 12, fips_npub);
@@ -1488,6 +1501,8 @@ signaling_ready:
         .bitrate      = bitrate,
         .fps          = fps,
         .prefer_nvenc = use_nvenc,
+        .openh264_path = openh264_path,
+        .encoder_name = encoder_name,
     };
 
     MdEncoder *encoder = md_encoder_create(&enc_cfg);
