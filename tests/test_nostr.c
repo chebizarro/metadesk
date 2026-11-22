@@ -1887,7 +1887,7 @@ static int acl_fixture_tests(const char **urls) {
     return md_test_report();
 }
 
-int main(int argc, char **argv) {
+static int run_tests(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--acl-fixture"))
         return acl_fixture_tests((const char **)&argv[2]);
     printf("test_nostr (nostrc bridge):\n");
@@ -1913,4 +1913,12 @@ int main(int argc, char **argv) {
     test_bridge_lifecycle();
     printf("All nostr bridge tests passed.\n");
     return md_test_report();
+}
+
+int main(int argc, char **argv) {
+    int status = run_tests(argc, argv);
+    /* Drain the process-wide network runtime before ExitProcess kills its
+     * threads. DLL atexit handlers run too late to join them on Windows. */
+    md_nostr_shutdown();
+    return status;
 }

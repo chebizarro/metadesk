@@ -61,6 +61,9 @@
 
 struct MdStream {
     MdSocket          fd;
+#ifdef _WIN32
+    MdSocket wake_read, wake_write; /* terminal-close notification for WSAPoll */
+#endif
     atomic_bool  connected;      /* cleared by whichever direction fails */
     bool         session_bound;
     uint32_t     granted_caps;
@@ -105,9 +108,68 @@ uint32_t md_stream_now_ms(void) {
 
 /* ── Internal helpers ────────────────────────────────────────── */
 
+#ifdef _WIN32
+/* Local shutdown does not wake a pending WSAPoll on Windows. A private TCP
+ * pair supplies persistent readiness until the receive owner has unwound. */
+static int stream_wake_init(MdStream *s) {
+    MdSocket listener = -1, writer = -1, reader = -1;
+    struct sockaddr_in address = {.sin_family = AF_INET};
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(address);
+    listener = md_socket_open(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0 || md_socket_listener_reuse(listener) < 0 ||
+        md_socket_bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0 ||
+        md_socket_listen(listener, 1) < 0 ||
+        md_socket_getname(listener, (struct sockaddr *)&address, &len) < 0)
+        goto fail;
+    writer = md_socket_open(AF_INET, SOCK_STREAM, 0);
+    if (writer < 0 || md_socket_connect(writer, (struct sockaddr *)&address, len) < 0)
+        goto fail;
+    struct sockaddr_in peer, local;
+    len = sizeof(peer);
+    reader = md_socket_accept(listener, (struct sockaddr *)&peer, &len);
+    len = sizeof(local);
+    if (reader < 0 || md_socket_getname(writer, (struct sockaddr *)&local, &len) < 0)
+        goto fail;
+    if (peer.sin_addr.s_addr != local.sin_addr.s_addr || peer.sin_port != local.sin_port) {
+        errno = EACCES;
+        goto fail;
+    }
+    if (md_socket_nonblocking(writer, true) < 0) goto fail;
+    md_socket_close(listener);
+    s->wake_read = reader;
+    s->wake_write = writer;
+    return 0;
+fail: {
+    int saved = errno;
+    if (listener >= 0) md_socket_close(listener);
+    if (reader >= 0) md_socket_close(reader);
+    if (writer >= 0) md_socket_close(writer);
+    errno = saved;
+    return -1;
+}}
+#endif
+
+static int stream_poll(MdStream *s, short events, int timeout_ms, short *revents) {
+    if (!RLX_LOAD(s->connected)) { errno = ECANCELED; return -1; }
+    MdPollFd fds[] = {
+        {.fd = s->fd, .events = events},
+#ifdef _WIN32
+        {.fd = s->wake_read, .events = POLLIN},
+#endif
+    };
+    int rc = md_socket_poll(fds, sizeof(fds) / sizeof(fds[0]), timeout_ms);
+#ifdef _WIN32
+    if (fds[1].revents) { errno = ECANCELED; return -1; }
+#endif
+    if (!RLX_LOAD(s->connected)) { errno = ECANCELED; return -1; }
+    *revents = fds[0].revents;
+    return rc;
+}
+
 /* Wait, without ssl_mu, until the socket can satisfy an SSL_ERROR_WANT_*.
  * Returns 0 when ready, 1 on timeout, -1 on error or another SSL error. */
-static int ssl_retry_wait(MdSocket fd, int ssl_err, int timeout_ms) {
+static int ssl_retry_wait(MdStream *s, int ssl_err, int timeout_ms) {
     short events;
 
     if (ssl_err == SSL_ERROR_WANT_READ) {
@@ -119,8 +181,8 @@ static int ssl_retry_wait(MdSocket fd, int ssl_err, int timeout_ms) {
     }
 
     for (;;) {
-        MdPollFd pfd = { .fd = fd, .events = events };
-        int pr = md_socket_poll(&pfd, 1, timeout_ms);
+        short revents = 0;
+        int pr = stream_poll(s, events, timeout_ms, &revents);
         if (pr == 0) return 1;   /* timeout */
         if (pr < 0) {
             /* Not a restart with the full budget: the caller retries the
@@ -130,7 +192,7 @@ static int ssl_retry_wait(MdSocket fd, int ssl_err, int timeout_ms) {
         }
         /* Readable-at-hangup still holds the peer's last records (and its
          * close_notify); the next SSL call reports the end. */
-        if (!(pfd.revents & POLLNVAL) && (pfd.revents & events))
+        if (!(revents & POLLNVAL) && (revents & events))
             return 0;
         return -1;
     }
@@ -182,20 +244,24 @@ static int read_exact_progress(MdStream *s, uint8_t *buf, size_t n,
             }
             if (err == SSL_ERROR_ZERO_RETURN)
                 return -1;  /* clean TLS close */
-            int wr = ssl_retry_wait(fd, err, wait_ms);
+            int wr = ssl_retry_wait(s, err, wait_ms);
             if (wr != 0) return wr;
             continue;
         }
 
-        if (wait_ms >= 0) {
-            MdPollFd pfd = { .fd = fd, .events = POLLIN };
-            int pr = md_socket_poll(&pfd, 1, wait_ms);
+        bool poll_read = wait_ms >= 0;
+#ifdef _WIN32
+        poll_read = true; /* include the explicit close notification even without a deadline */
+#endif
+        if (poll_read) {
+            short revents = 0;
+            int pr = stream_poll(s, POLLIN, wait_ms, &revents);
             if (pr == 0) return 1;   /* timeout */
             if (pr < 0) {
                 if (errno == EINTR) continue;
                 return -1;
             }
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            if (revents & (POLLERR | POLLHUP | POLLNVAL))
                 return -1;
         }
 
@@ -238,7 +304,7 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
                     return -1;  /* clean TLS close */
                 const int slice = err == SSL_ERROR_WANT_READ
                     ? SSL_WRITE_WANT_READ_SLICE_MS : -1;
-                if (ssl_retry_wait(s->fd, err, slice) < 0) return -1;
+                if (ssl_retry_wait(s, err, slice) < 0) return -1;
                 continue;
             }
             total += (size_t)w;
@@ -288,6 +354,15 @@ static MdStream *stream_from_fd(MdSocket fd, SSL *ssl) {
     s->fd = fd;
     s->ssl = ssl;
     atomic_init(&s->connected, true);
+#ifdef _WIN32
+    if (stream_wake_init(s) < 0) {
+        if (ssl) SSL_free(ssl);
+        md_socket_close(fd);
+        pthread_mutex_destroy(&s->ssl_mu);
+        free(s);
+        return NULL;
+    }
+#endif
     set_tcp_nodelay(fd);
 #ifdef SO_NOSIGPIPE
     int one = 1;
@@ -808,6 +883,11 @@ void md_stream_close(MdStream *s) {
     s->session_bound = false;
     s->granted_caps = 0;
     RLX_STORE(s->connected, false);
+#ifdef _WIN32
+    /* Never drain this byte: closure must also win a race with entering poll. */
+    if (md_socket_send(s->wake_write, "", 1, 0) < 0 && errno != EWOULDBLOCK)
+        MD_LOG_W("failed to signal stream closure: %s", strerror(errno));
+#endif
     if (s->fd >= 0) md_socket_shutdown(s->fd, SHUT_RDWR);
 }
 
@@ -914,6 +994,10 @@ void md_stream_destroy(MdStream *s) {
     }
     if (s->fd >= 0)
         md_socket_close(s->fd);
+#ifdef _WIN32
+    md_socket_close(s->wake_read);
+    md_socket_close(s->wake_write);
+#endif
     pthread_mutex_destroy(&s->ssl_mu);
     free(s->recv_payload);
     free(s);

@@ -537,15 +537,20 @@ static void cancel_client_connect(ClientCtx *ctx) {
     if (!atomic_exchange(&ctx->cancel_connect, true) && ctx->cancel_ch)
         go_channel_close(ctx->cancel_ch);
     /* Borrow only while holding the same lock the worker uses to withdraw
-     * the candidate. Shutdown wakes bind I/O; the worker alone destroys it. */
+     * the candidate. Close wakes bind I/O; the worker alone destroys it. */
     pthread_mutex_lock(&g_connect_mu);
     if (ctx->binding_stream)
-        md_socket_shutdown(md_stream_get_fd(ctx->binding_stream), SHUT_RDWR);
+        md_stream_close(ctx->binding_stream);
     pthread_mutex_unlock(&g_connect_mu);
 }
 
 static int bind_client_stream(MdStream *stream, ClientCtx *ctx) {
     pthread_mutex_lock(&g_connect_mu);
+    if (!client_owner_current(ctx)) {
+        pthread_mutex_unlock(&g_connect_mu);
+        md_stream_close(stream);
+        return -1;
+    }
     ctx->binding_stream = stream;
     pthread_mutex_unlock(&g_connect_mu);
     int rc = send_session_info(stream, ctx);
@@ -984,7 +989,7 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 
 /* ── Main ────────────────────────────────────────────────────── */
 
-int main(int argc, char **argv) {
+static int client_run(int argc, char **argv) {
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
 #ifdef _WIN32
@@ -1515,4 +1520,12 @@ int main(int argc, char **argv) {
     printf("client: done. decoded %u frames, displayed %u, tree updates %u\n",
            ctx.frames_decoded, ctx.frames_displayed, ctx.tree_updates);
     return 0;
+}
+
+int main(int argc, char **argv) {
+    int status = client_run(argc, argv);
+    /* Drain the process-wide network runtime before ExitProcess kills its
+     * threads. DLL atexit handlers run too late to join them on Windows. */
+    md_nostr_shutdown();
+    return status;
 }

@@ -166,27 +166,37 @@ static void *cancel_after_bind(void *data) {
     return NULL;
 }
 static void test_bind_cancel(void) {
-    MdStreamServer *server = md_stream_server_create("::1", 0);
-    MD_CHECK(server);
-    MdStream *client = md_stream_connect("::1", md_stream_server_port(server), 1000);
-    MD_CHECK(client);
-    MdStream *peer = md_stream_server_accept(server, 1000);
-    MD_CHECK(peer);
-    md_stream_server_destroy(server);
-    ClientCtx ctx = {.cancel_ch = go_channel_create(1),
-                     .request_started_us = now_us(), .granted_caps = MD_CAP_VIDEO};
-    snprintf(ctx.accepted_session_id, sizeof(ctx.accepted_session_id), "w6-binding");
-    memset(ctx.stream_token, 'a', 64);
-    BindCancel job = {peer, &ctx};
-    pthread_t thread;
-    MD_CHECK(pthread_create(&thread, NULL, cancel_after_bind, &job) == 0);
-    int64_t start = now_us();
-    MD_CHECK(bind_client_stream(client, &ctx) < 0);
-    MD_CHECK(now_us() - start < 2000000); /* cancellation, not five-second ACK timeout */
-    pthread_join(thread, NULL);
-    MD_CHECK(ctx.cancel_connect && !ctx.binding_stream);
-    md_stream_destroy(client); md_stream_destroy(peer);
-    go_channel_unref(ctx.cancel_ch);
+    for (int after_proof = 0; after_proof < 2; after_proof++) {
+        MdStreamServer *server = md_stream_server_create("::1", 0);
+        MD_CHECK(server);
+        MdStream *client = md_stream_connect("::1", md_stream_server_port(server), 1000);
+        MD_CHECK(client);
+        MdStream *peer = md_stream_server_accept(server, 1000);
+        MD_CHECK(peer);
+        md_stream_server_destroy(server);
+        ClientCtx ctx = {.cancel_ch = go_channel_create(1),
+                         .request_started_us = now_us(), .granted_caps = MD_CAP_VIDEO};
+        snprintf(ctx.accepted_session_id, sizeof(ctx.accepted_session_id), "w6-binding");
+        memset(ctx.stream_token, 'a', 64);
+        BindCancel job = {peer, &ctx};
+        pthread_t thread;
+        if (after_proof) MD_CHECK(pthread_create(&thread, NULL, cancel_after_bind, &job) == 0);
+        else cancel_client_connect(&ctx);
+        int64_t start = now_us();
+        MD_CHECK(bind_client_stream(client, &ctx) < 0);
+        MD_CHECK(now_us() - start < 2000000); /* cancellation, not five-second ACK timeout */
+        if (after_proof) pthread_join(thread, NULL);
+        else {
+            MdPacketHeader hdr;
+            uint8_t *payload = NULL;
+            MD_CHECK(md_stream_recv(peer, &hdr, &payload, 1000) < 0); /* no proof after cancellation */
+            free(payload);
+        }
+        MD_CHECK(!md_stream_is_connected(client));
+        MD_CHECK(ctx.cancel_connect && !ctx.binding_stream);
+        md_stream_destroy(client); md_stream_destroy(peer);
+        go_channel_unref(ctx.cancel_ch);
+    }
 }
 
 static void test_overlay_controls(void) {
@@ -239,7 +249,54 @@ static void test_overlay_controls(void) {
     SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();
 }
 
+/* Ordered TCP sentinel proves absence without a timeout or desktop input. */
+static void test_input_grants(void) {
+    const uint32_t grants[] = {0, MD_CAP_VIDEO, MD_CAP_VIDEO | MD_CAP_AGENT,
+                              MD_CAP_VIDEO | MD_CAP_INPUT};
+    MdStreamServer *server = md_stream_server_create("::1", 0);
+    MD_CHECK(server != NULL);
+    if (!server) return;
+    MdStream *sender = md_stream_connect("::1", md_stream_server_port(server), 1000);
+    MdStream *peer = md_stream_server_accept(server, 1000);
+    MD_CHECK(sender && peer);
+    if (!sender || !peer) goto done;
+    for (size_t i = 0; i < sizeof(grants) / sizeof(grants[0]); i++) {
+        ClientCtx ctx = {.stream = sender, .granted_caps = grants[i],
+                         .shown = {.w = 640, .h = 480, .pkt_seq = 7}};
+        send_input(&ctx, MD_INPUT_EV_MOVE, 0, 20, 30, NULL, 0);
+        send_input(&ctx, MD_INPUT_EV_BUTTON, 1, 20, 30, NULL, 0);
+        send_input(&ctx, MD_INPUT_EV_WHEEL, 0, 0, 1, NULL, 0);
+        send_input(&ctx, MD_INPUT_EV_KEY, 0, 0, 0, "a", 1);
+        unsigned expected = (grants[i] & MD_CAP_INPUT) ? 4 : 0;
+        MD_CHECK(ctx.input_seq == expected);
+        MD_CHECK(md_stream_send(sender, MD_PKT_PING, 99, NULL, 0) == 0);
+        unsigned inputs = 0;
+        for (;;) {
+            MdPacketHeader hdr;
+            uint8_t *payload = NULL;
+            int rc = md_stream_recv(peer, &hdr, &payload, 1000);
+            MD_CHECK(rc == 0);
+            if (rc != 0) { free(payload); break; }
+            if (hdr.type == MD_PKT_PING) {
+                MD_CHECK(hdr.sequence == 99 && hdr.payload_len == 0);
+                free(payload);
+                break;
+            }
+            MD_CHECK(hdr.type == MD_PKT_INPUT && hdr.payload_len > 0);
+            inputs++;
+            free(payload);
+        }
+        MD_CHECK(inputs == expected);
+        MD_CHECK(md_stream_is_connected(sender) && md_stream_is_connected(peer));
+    }
+done:
+    md_stream_destroy(sender);
+    md_stream_destroy(peer);
+    md_stream_server_destroy(server);
+}
+
 int main(void) {
+    test_input_grants();
     const char *reasons[] = {"capture_unavailable", "request_refused"};
     for (unsigned i = 0; i < 2; i++) {
         ClientCtx ctx = {0};

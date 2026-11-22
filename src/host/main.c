@@ -527,6 +527,8 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
     if (hdr->type == MD_PKT_ACTION) needed = MD_CAP_AGENT | MD_CAP_INPUT;
     if (hdr->type == MD_PKT_SESSION_INFO ||
         !md_stream_has_capability(ctx->client, needed)) {
+        fprintf(stderr, "host: rejecting stream packet type=0x%02x: capability/proof violation\n",
+                hdr->type);
         md_stream_close(ctx->client);
         return;
     }
@@ -913,7 +915,7 @@ static void host_finish_client(HostCtx *ctx, MdStream *client) {
 #include "win_dpi.h"
 #endif
 
-int main(int argc, char **argv) {
+static int host_run(int argc, char **argv) {
     /* Standalone explicit action, before capture, signer, relay or threads. */
     if (argc > 1 && strcmp(argv[1], "--fetch-openh264") == 0) {
         if (argc != 2) {
@@ -923,6 +925,7 @@ int main(int argc, char **argv) {
         extern int md_openh264_fetch(void);
         return md_openh264_fetch();
     }
+
 
 #ifdef _WIN32
     /* md-m5x4: per-monitor DPI aware before any window, UIA, DXGI or input
@@ -1862,4 +1865,12 @@ signaling_ready:
 
     printf("host: done. served %u client(s)\n", client_num);
     return exit_status;
+}
+
+int main(int argc, char **argv) {
+    int status = host_run(argc, argv);
+    /* Drain the process-wide network runtime before ExitProcess kills its
+     * threads. DLL atexit handlers run too late to join them on Windows. */
+    md_nostr_shutdown();
+    return status;
 }

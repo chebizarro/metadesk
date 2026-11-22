@@ -188,6 +188,12 @@ MdSigner *md_nostr_get_signer(MdNostr *n);
  * A shared signer is retained, not shut down, by the bridge. */
 void md_nostr_destroy(MdNostr *n);
 
+/* Terminal process-wide shutdown. First destroy every bridge and signer; call
+ * from the executable before returning from main, never a callback or DLL
+ * destructor. Joins the shared network runtime while its threads still exist.
+ * Idempotent, but no subsequent Nostr network use is permitted. */
+void md_nostr_shutdown(void);
+
 /* Invalidate inbound/outbound admission immediately without freeing state.
  * Pending DM results are discarded; destroy joins any non-abortable signer
  * call. Does not shut down a signer shared with another bridge/role. */
