@@ -268,7 +268,12 @@ static bool consumer_wait(UinputConsumer *c, const char *node, const char *name)
                 changed = true;
             free(event);
         }
-        if (changed && consumer_enabled(c, node, name)) return true;
+        if (changed) {
+            if (consumer_enabled(c, node, name)) return true;
+            /* Reply reads can also queue hierarchy events. Drain those before
+             * waiting on the socket, which may no longer be readable. */
+            continue;
+        }
         int64_t left = c->deadline - md_now_ms();
         if (left <= 0 || xcb_connection_has_error(c->connection)) break;
         struct pollfd pfd = { .fd = xcb_get_file_descriptor(c->connection), .events = POLLIN };
