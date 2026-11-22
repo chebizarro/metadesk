@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline safety tests: dry-run purity, destination guards and source manifests."""
 import os
+import importlib.util
 from pathlib import Path
 import subprocess
 import shutil
@@ -107,6 +108,31 @@ exit 0
                                             env=env, capture_output=True)
                     expected = status == 1 and diagnostic.startswith('host[mcp]: accessibility backend unavailable')
                     self.assertEqual(result.returncode == 0, expected)
+
+    def test_staged_ffmpeg_preserves_verified_origin(self):
+        spec = importlib.util.spec_from_file_location('linux_produce', LINUX / 'produce.py')
+        producer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(producer)
+        with tempfile.TemporaryDirectory(prefix='md-w9-test-') as d:
+            root = Path(d)
+            prefix, staged, system = root / 'verified', root / 'staged', root / 'system'
+            for directory in (prefix / 'lib', staged, system):
+                directory.mkdir(parents=True)
+            reference = prefix / 'lib/libavcodec.so.62'
+            reference.write_bytes(b'verified-minimal-codec')
+            producer.require_minimal_ffmpeg_origin(reference, staged, prefix)
+            copied = staged / reference.name
+            shutil.copy2(reference, copied)
+            producer.require_minimal_ffmpeg_origin(copied, staged, prefix)
+            copied.write_bytes(b'unverified-codec')
+            with self.assertRaises(ValueError):
+                producer.require_minimal_ffmpeg_origin(copied, staged, prefix)
+            outside = system / reference.name
+            shutil.copy2(reference, outside)
+            with self.assertRaises(ValueError):
+                producer.require_minimal_ffmpeg_origin(outside, staged, prefix)
+            with self.assertRaises(ValueError):
+                producer.require_minimal_ffmpeg_origin(prefix / 'lib/libavformat.so.62', staged, prefix)
 
     def test_release_checksums_are_not_skipped(self):
         text = (LINUX / 'aur/PKGBUILD').read_text()

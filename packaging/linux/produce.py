@@ -43,6 +43,24 @@ def revision(root, marker):
     return value
 
 
+def require_minimal_ffmpeg_origin(origin, staged_lib, prefix):
+    component = re.match(r'lib(avcodec|avutil|avformat|avfilter|avdevice|swscale|swresample|postproc)\.', origin.name)
+    if not component:
+        return
+    if component.group(1) not in ('avcodec', 'avutil'):
+        raise ValueError('FFmpeg component outside minimal profile: ' + origin.name)
+    prefix = prefix.resolve()
+    if prefix in origin.resolve().parents:
+        return
+    reference = prefix / 'lib' / origin.name
+    # A later ldd walk resolves to our already-copied closure, not the input.
+    # Preserve provenance by byte identity, never merely by its staged location.
+    if (origin.parent.resolve() == staged_lib.resolve() and reference.is_file()
+            and prefix in reference.resolve().parents and digest(origin) == digest(reference)):
+        return
+    raise ValueError('refusing system/unverified FFmpeg in OCI: ' + str(origin))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('mode', choices=['native', 'oci'])
@@ -131,11 +149,7 @@ def main():
         if a.mode == 'oci':
             for path in re.findall(r'=> (/\S+)', output):
                 origin = Path(path)
-                ffmpeg = re.match(r'lib(avcodec|avutil|avformat|avfilter|avdevice|swscale|swresample|postproc)\.', origin.name)
-                if ffmpeg and ffmpeg.group(1) not in ('avcodec', 'avutil'):
-                    raise ValueError('FFmpeg component outside minimal profile: ' + origin.name)
-                if ffmpeg and a.ffmpeg_prefix.resolve() not in origin.resolve().parents:
-                    raise ValueError('refusing system FFmpeg in OCI')
+                require_minimal_ffmpeg_origin(origin, lib, a.ffmpeg_prefix)
                 if base.fullmatch(origin.name):
                     continue
                 if re.search(r'(openh264|x264|x265)', origin.name, re.I):
