@@ -780,7 +780,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     unsigned received, boundaries, signed_count, auth_results, processing, admitted;
-    unsigned sign_entered, draining, history_waiting, queued;
+    unsigned sign_entered, draining, history_waiting, queued, ignored;
     bool hold_boundary, release_boundary;
     bool hold_signed, release_signed, hold_processing, release_processing;
     bool hold_backend_sign, release_backend_sign;
@@ -803,6 +803,7 @@ static void acl_hook(MdNostrTestPoint point, void *data) {
     if (point != MD_NOSTR_TEST_DRAINING &&
         point != MD_NOSTR_TEST_ALLOWLIST_PROCESSING &&
         point != MD_NOSTR_TEST_ALLOWLIST_RECEIVED &&
+        point != MD_NOSTR_TEST_ALLOWLIST_IGNORED &&
         point != MD_NOSTR_TEST_ALLOWLIST_BOUNDARY &&
         point != MD_NOSTR_TEST_ALLOWLIST_SIGNED &&
         point != MD_NOSTR_TEST_AUTH_RESULT &&
@@ -814,6 +815,7 @@ static void acl_hook(MdNostrTestPoint point, void *data) {
     if (point == MD_NOSTR_TEST_SUBSCRIPTION_QUEUED) s->queued++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_PROCESSING) s->processing++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_RECEIVED) s->received++;
+    if (point == MD_NOSTR_TEST_ALLOWLIST_IGNORED) s->ignored++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_BOUNDARY) s->boundaries++;
     if (point == MD_NOSTR_TEST_AUTH_RESULT) s->auth_results++;
     if (point == MD_NOSTR_TEST_ALLOWLIST_SIGNED) s->signed_count++;
@@ -1315,10 +1317,12 @@ static void test_acl_tag_shapes(const char **urls, const char *a, const char *b)
 
     /* The first d tag is the address (NIP-01): a newer event addressed
      * elsewhere is not ours, even if a later d tag says metadesk-allowlist.
-     * Same relay, so it is handled before the older event that follows. */
+     * Wait for its handler explicitly, without assuming relay FIFO dispatch. */
     char *foreign = acl_event_json(&s, t + 200, "[\"d\",\"other\"]," ACL_D
                                    "[\"p\",\"@B\"],[\"metadesk-caps\",\"@B\",\"v1:video\"]", a, b);
+    unsigned ignored = acl_counter(&s, &s.ignored);
     acl_control("{\"op\":\"event\",\"relay\":0,\"event\":%s}", foreign); free(foreign);
+    acl_wait(&s, &s.ignored, ignored + 1);
     char *base = acl_event_json(&s, t + 100, ACL_D ACL_GRANT_A ","
         "[\"p\",\"@B\"],[\"metadesk-caps\",\"@B\",\"v1:video\",\"x\"],"
         "[\"t\",\"topic\"],[\"r\",\"wss://r.example\",\"read\"],[\"x\",\"1\",\"2\",\"3\"],"

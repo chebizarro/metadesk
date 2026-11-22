@@ -876,6 +876,8 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             pthread_mutex_unlock(&n->allowlist_mu);
             nostr_nip51_list_free(list);
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_RECEIVED);
+        } else {
+            test_point(n, MD_NOSTR_TEST_ALLOWLIST_IGNORED);
         }
     }
 }
