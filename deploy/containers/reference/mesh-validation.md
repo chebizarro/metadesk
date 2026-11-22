@@ -388,6 +388,96 @@ Compose behaviour, and they match md-ah9.5's note. **Supported commands:**
 its consumers. To change or recover the holder, run `compose down`, then `mesh-netns.sh down`
 and `up`, then `up -d`. If Compose and the network look healthy but the mesh is
 dark, `mesh-netns.sh up` reports a stopped or drifted holder.
-Requalifying a Compose-owned holder on Podman ≥ 5.4 is **md-czf**. Cleanup:
+The Podman ≥ 5.4 Compose-owned-holder requalification (**md-czf**) is below. Cleanup:
 task containers, networks and the mesh image layers (by the exact IDs from the
 build log) were removed. A sibling agent's `hal-video` image was untouched.
+
+## Podman ≥ 5.4 requalification — md-czf
+
+Measured 2026-11-21 (2026-11-22 01:38–01:54 UTC), Ubuntu 24.04 aarch64 VM.
+**Unchanged Compose-owned holder: idempotent. Dependent recreation: unsafe.**
+Keep the out-of-Compose `mesh-netns.sh` holder and the supported commands above;
+the newer NetworkID fix alone does not make Compose holder recreation safe.
+This answers md-czf's acceptance criterion; it does not qualify a new deployment.
+
+### Exact test boundary
+
+The system Podman remained **4.9.3**; no VM system package was changed. A
+static **Podman 5.8.10** distribution ran inside the task-owned outer container
+`md-l3-czf-p5`, as its unprivileged `ubuntu` (1000) user. Inner `podman info`:
+`rootless=true`, crun, netavark, pasta, cgroupfs, overlay. Standalone Docker
+Compose **5.5.1** used the inner rootless API at
+`unix:///run/user/1000/api.sock`. This is nested-rootless lifecycle evidence,
+not native newer-Podman-host or Docker qualification.
+
+The outer container was launched by rootless system Podman with `--userns
+keep-id`, TUN/FUSE devices, `seccomp=unconfined`, `unmask=ALL`, and
+`label=disable` to enable nesting. These are **test-rig exceptions**, not changes
+to the reference sandbox. `uidmap` was installed only inside that disposable
+container. Its static binaries, API socket and storage were task-local.
+
+| Component | Measured pin |
+|---|---|
+| Static Podman archive SHA-256 | `d33a039d144a03a0c67aee52ee68ea3044959ff5e47b4e0a080ebb812ddf4ae5` |
+| Compose binary SHA-256 | `732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7` |
+| FIPS image | `md-l3-mesh:5d09cab`, image ID `d99ad7c35ef8…`, the pinned `Dockerfile.mesh` build |
+| Underlay | IPv4-only `10.89.92.0/24`, holder `.2`, remote peer `.3` |
+
+The isolated Compose experiment restored a `netns` service: the pinned Ubuntu
+base, `sleep infinity`, keep-ID UID 1000, read-only root, all caps dropped,
+no-new-privileges, init, no restart policy; attached through `networks:` at `.2`.
+Mesh, loopback HTTP stand-in and HAProxy joined its netns **and** userns, with
+explicit `depends_on: [netns]` (proxy also depended on mesh and stand-in).
+Only mesh had NET_ADMIN/TUN, matching the existing reference. An independent
+peer holder and real fipsd at `.3` sent GETs over fips0 to HAProxy's mesh
+address on 7711; the stand-in returned `md-czf stand-in`. No desktop was mounted.
+
+Two consumer forms were tested separately:
+A `network_mode: service:netns`; B `network_mode: container:md-l3-czf-netns`
+(with the same explicit dependency and `userns_mode: container:…`). A holder
+label revision and proxy environment revision provided independent spec edits.
+
+### Results (same in A and B)
+
+| Cell | Result |
+|---|---|
+| Fresh `config -q` / `up -d` | PASS; real mesh GET receipt, consumers share the holder netns |
+| Compat inspect NetworkID vs `/networks/{name}` Id | PASS: identical full IDs, no longer the network name |
+| Plain `up -d` ×3, then `up -d --dry-run` | PASS; identical container IDs, State, StartedAt and RestartCount; no temporary holder; mesh receipt still works |
+| Proxy-only environment edit | PASS; proxy recreated, holder and other consumers unchanged; mesh GET works |
+| `up -d --force-recreate` from a healthy stack | UNSAFE, exit 1; holder stopped before dependent removal; Podman rejects removing it; consumers retain `lo fips0` but lose `eth0` |
+| Holder-only label edit on a separately fresh stack | UNSAFE, exit 1; same ordering failure and underlay loss |
+| `down` after each destructive case | PASS; dependents removed first, then original/temporary holders and network |
+
+The final rerun compared stable fields, not the human `Status` string (`Up 1
+second` changes without a restart). In the first recovered A log that volatile
+field incorrectly printed `CHANGED`; its IDs were unchanged. The corrected
+A and B comparisons both passed. Force-recreate and holder-edit failures were
+reproduced independently from healthy stacks, not merely after a prior failure.
+
+Representative final receipts, A:
+
+```text
+IDEMPOTENT: IDs, state, StartedAt and RestartCount identical
+FORCE_EXIT=1
+mesh: lo 127.0.0.1/8 lo fips0 net:[4026532824]
+holder: exited dd3550a7550325e07e364adb3bddee2d992bef05870841785f6a5fb7e1f71679
+```
+
+B likewise retained netns `4026532892` while losing `eth0`; both independent
+holder-label edits exited 1. Error: `has dependent containers which must be
+removed before it`. A renamed `<id>_md-l3-czf-netns` remained in Created state.
+An earlier recovery attempt with `restart mesh` also failed because its holder
+was stopped. A retained netns inode is **not** proof of a usable underlay.
+
+**Conclusion:** NetworkID reconciliation is fixed in this measured newer
+runtime, but Compose 5.5.1 still attempts holder stop/remove before dependent
+removal in either consumer form. Do not move the holder back into Compose.
+Revisit only with a pairing that proves dependency-safe recreation; native
+newer-Podman and Docker remain separate evidence boundaries.
+
+Final L3 cleanup (2026-11-21): the outer container, dedicated inner store,
+static Podman and `~/md-l3` were removed. Zero md-l3 containers/pods/networks/
+volumes/images remain; all 38 task image IDs (including build stages) are absent.
+The pre-existing Ubuntu image and system Podman 4.9.3 were preserved. Full
+receipt: [mesh-video-validation.md §Cleanup](mesh-video-validation.md#cleanup-receipt--2026-11-21).

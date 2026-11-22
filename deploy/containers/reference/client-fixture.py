@@ -8,6 +8,7 @@ a FIPS control endpoint that reports the host peer as connected. That control
 socket is a fixture, not a FIPS daemon: the TCP stream then travels a container
 bridge without TUN. Bunker URIs go to ROLE/bunker.uri (0600). Prints `fixture
 ready` when everything listens; on SIGTERM prints its counters and exits.
+md-ah9.6 adds --no-store-ephemeral (NIP-01 ephemeral kinds are relayed, not stored).
 """
 import argparse
 import json
@@ -90,16 +91,40 @@ def main():
     p.add_argument("--control", metavar="ROLE", help="role directory that also gets control.sock")
     p.add_argument("--local-npub")
     p.add_argument("--peer-npub")
+    p.add_argument("--no-store-ephemeral", action="store_true",
+                   help="relay kinds 20000-29999 (NIP-46 traffic) live without storing them")
     a = p.parse_args()
     sys.path.insert(0, str(a.tests))
-    from account_startup_fixture import Peer, Relay
+    from account_startup_fixture import Peer, Relay, matches
+
+    class EphemeralPeer(Peer):
+        """NIP-01: ephemeral events are delivered to live subscriptions and not
+        stored. Long runs then stay inside the tests/ relay's 256-event history
+        bound, while stored kinds (session DMs, grants) still build history."""
+
+        def dispatch(self, msg):
+            if msg[0] != "EVENT" or not 20000 <= msg[1].get("kind", 0) < 30000:
+                return super().dispatch(msg)
+            event = msg[1]
+            with self.server.lock:
+                self.send(["OK", event["id"], True, ""])
+                self.server.oks += 1
+                self.server.ephemeral += 1
+                for peer in list(self.server.peers):
+                    for sid, filters in peer.subs.items():
+                        if any(matches(event, f) for f in filters):
+                            try:
+                                peer.send(["EVENT", sid, event])
+                            except OSError:
+                                pass
 
     class BoundRelay(Relay):
         def __init__(self, address):
-            socketserver.ThreadingTCPServer.__init__(self, address, Peer)
+            handler = EphemeralPeer if a.no_store_ephemeral else Peer
+            socketserver.ThreadingTCPServer.__init__(self, address, handler)
             self.lock = threading.RLock()
             self.peers, self.events = set(), {}
-            self.reqs = self.oks = self.eoses = 0
+            self.reqs = self.oks = self.eoses = self.ephemeral = 0
 
     host, port = a.relay.rsplit(":", 1)
     servers = {"relay": BoundRelay((host, int(port)))}
@@ -134,7 +159,8 @@ def main():
     print("fixture ready", flush=True)
     stop.wait()
     relay = servers.pop("relay")
-    report = {"relay": {"REQ": relay.reqs, "EOSE": relay.eoses, "OK": relay.oks, "events": len(relay.events)}}
+    report = {"relay": {"REQ": relay.reqs, "EOSE": relay.eoses, "OK": relay.oks, "events": len(relay.events),
+                        "ephemeral": relay.ephemeral}}
     report.update({name: s.counts for name, s in servers.items()})
     for role, proc in bunkers.items():
         proc.terminate()
