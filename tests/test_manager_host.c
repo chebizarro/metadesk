@@ -3,8 +3,34 @@
 #include <time.h>
 #include "manager_fake_host.h"
 
-static void host_gone(gpointer data,GObject *object) { (void)object; *(gboolean *)data=TRUE; }
+static gboolean finalization_received(gpointer data) {
+    MD_CHECK(g_main_context_is_owner(g_main_context_default()));
+    *(gboolean *)data=TRUE;
+    return G_SOURCE_REMOVE;
+}
+static void host_gone(gpointer data,GObject *object) {
+    (void)object;
+    /* GTask can release its last source-object reference on its worker. Always
+     * deliver the cleanup receipt on the test context, including its wakeup. */
+    GSource *receipt=g_idle_source_new();
+    g_source_set_callback(receipt,finalization_received,data,NULL);
+    g_source_attach(receipt,g_main_context_default());
+    g_source_unref(receipt);
+}
+static gpointer release_last_reference(gpointer object) {
+    g_object_unref(object);
+    return NULL;
+}
 int main(void) {
+    /* Force worker-thread finalization. Joining it must not update main-context
+     * state; only dispatching the explicit receipt may complete the wait. */
+    gboolean worker_finalized=FALSE;
+    GObject *probe=g_object_new(G_TYPE_OBJECT,NULL);
+    g_object_weak_ref(probe,host_gone,&worker_finalized);
+    GThread *worker=g_thread_new("manager-finalize",release_last_reference,probe);
+    g_thread_join(worker);
+    MD_CHECK(!worker_finalized);
+    MANAGER_WAIT(worker_finalized);
     cJSON *j=fake_snapshot(1,TRUE);
     g_autoptr(GError) error=NULL;
     MD_CHECK(md_manager_host_validate(j,&error));

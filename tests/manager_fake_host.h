@@ -95,5 +95,5 @@ static gboolean manager_timeout(gpointer data) { *(gboolean *)data=TRUE; return 
     gboolean deadline=FALSE; guint watchdog=g_timeout_add_seconds(10,manager_timeout,&deadline); \
     while (!(condition)&&!deadline) g_main_context_iteration(NULL,TRUE); \
     if (!deadline) g_source_remove(watchdog); \
-    MD_CHECK(condition); if (deadline) return md_test_report(); \
+    MD_CHECK((condition) && !deadline); if (deadline) return md_test_report(); \
 } while (0)
