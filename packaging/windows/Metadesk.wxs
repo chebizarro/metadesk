@@ -1,0 +1,48 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Metadesk" Manufacturer="Chris Daley" Version="$(var.Version)"
+           UpgradeCode="0D682EE1-44D8-49AA-865E-EB91C50890FB" Scope="perUser"
+           Language="1033" InstallerVersion="500">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Metadesk is already installed."
+                  Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="INSTALLDIR">
+      <RegistrySearch Id="InstalledDirectory" Root="HKCU" Key="Software\Metadesk.Installer"
+                      Name="InstallDir" Type="raw" />
+    </Property>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLDIR" Name="Metadesk" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MetadeskMenu" Name="Metadesk">
+        <Component Id="Menu" Guid="5DC0356F-C6A8-45D8-9A21-66FB203315CF">
+          <Shortcut Id="HostShortcut" Name="Metadesk Host" Target="[INSTALLDIR]metadesk-host.exe"
+                    WorkingDirectory="INSTALLDIR" />
+          <Shortcut Id="ClientShortcut" Name="Metadesk Client" Target="[INSTALLDIR]metadesk-client.exe"
+                    WorkingDirectory="INSTALLDIR" />
+          <RemoveFolder Id="RemoveMenu" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\Metadesk.Installer" Name="Menu"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="UserPath" Guid="CA47491C-6A83-4CF0-9E17-EFCDFB6AEFB0">
+        <Environment Id="CliPath" Name="PATH" Value="[INSTALLDIR]" Action="set"
+                     Part="last" System="no" Permanent="no" />
+        <RegistryKey Root="HKCU" Key="Software\Metadesk.Installer" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="Path" Type="integer" Value="1" KeyPath="yes" />
+          <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLDIR]" />
+        </RegistryKey>
+        <RemoveFolder Id="RemoveInstallDir" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsParent" Directory="ProgramsFolder" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+    <Feature Id="Main" Title="Metadesk" Level="1">
+      <ComponentRef Id="UserPath" />
+      <ComponentRef Id="Menu" />
+      <ComponentGroupRef Id="Payload" />
+    </Feature>
+  </Package>
+</Wix>
