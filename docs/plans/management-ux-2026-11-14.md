@@ -12,7 +12,7 @@ Introduce a UI-independent C management layer, a Linux-first GTK4/libadwaita com
 
 Work items to file as spin-offs of `md-70v` (details + verification in §6; file/impact in §4). "Size" is rough: S ≤ a few days, M ≈ 1–2 weeks, L ≈ 3+ weeks.
 
-Corrected against the 2026-11-14 design review (`docs/reviews/management-ux-plan-critique-2026-11-14.md`); see §7 for the corrections and open decisions those IDs reference.
+Corrected against the 2026-11-14 design review (`docs/reviews/management-ux-plan-critique-2026-11-14.md`); see §7 for the corrections and open decisions those IDs reference. **Status and filed bead IDs as of 2026-11-21: §8.1** (several items have shipped; P3.8 was superseded by `md-mrw`/`md-6ns`).
 
 | # | Goal | Done when | Key files | Depends on | Size |
 |---|------|-----------|-----------|------------|------|
@@ -1063,7 +1063,7 @@ These can land without changing metadesk runtime behavior.
 - **Host-authoritative, scoped, correlated approvals and one-use stream binding before any access.**
 - **Upstream nostrc ownership/NIP work first; protocol migration and enforcement land atomically.**
 
-The numbered Phase 0–5 items are ready to file as spin-offs from `md-70v`; the spike itself ends with the reviewed design, not a claim that management UX has shipped. The spin-off work items (P0–P5.14) are **not yet filed** in bd.
+The numbered Phase 0–5 items are ready to file as spin-offs from `md-70v`; the spike itself ends with the reviewed design, not a claim that management UX has shipped. The spin-off work items are filed in bd as of 2026-11-21; see §8.1 for the item → bead map.
 
 ## 7. Design-review corrections and open decisions (2026-11-14)
 
@@ -1134,3 +1134,141 @@ Address-book **import/export** and **QR scan/display** (Grotto has `sheet-qr-dis
 **Effects:** new work item **P2.7** (index); P3.7 consumes the host-role binding; P4.10 provides the account list and role picker; §4.2 gains `src/core/accounts.c/.h` and `tests/test_accounts.c`.
 
 
+
+## 8. Spike close-out (2026-11-21)
+
+This section completes the `md-70v` deliverable against every item in the bead and records what has shipped since §1–§7 were written. Where it conflicts with earlier sections, §8 wins (same rule as §7).
+
+### 8.1 Status of the execution index
+
+| Item | Status | Where |
+|---|---|---|
+| P0 spec | **Done** with this section | this document |
+| P1.1 pool capabilities | Partly shipped (AUTH-OK recovery `md-1be`, CLOSED-aware backoff `md-odg`, per-callback info API); handles/enumeration/publish-cancel remain | **`md-b970`** |
+| P1.2 unsigned builders | NIP-51 shipped upstream (`nostr_nip51_document_build_unsigned`, `nip51.h:102`); NIP-78 + 10050 remain | **`md-055m`** |
+| P1.3 Grotto Control1 adapter | Open | **`md-crk7`** |
+| P2.4 encrypted management store | Open | **`md-v3oh`** |
+| P2.5 resolution + relay planning | Open; the binaries still fall back to built-in `MD_DEFAULT_RELAY` | **`md-2l87`** |
+| P2.6 signer/bridge hardening | **Done** | `md-70v.1` |
+| P2.7 signer accounts + roles | **Done**, incl. live adoption and persistent NIP-46 | `md-70v.2`, `md-70v.3`, `docs/accounts.md` |
+| P3.7 host policy + headless CLI | Headless `metadesk-host access list/add/remove` + fail-closed ACL + per-client caps **shipped**; attended approval, pending requests, session list/kick remain | `md-pss`, `md-q6m`, `md-ikr`, `docs/access.md` → **`md-trex`** |
+| P3.8a/b session v2 + binding | **Superseded/done** in a different shape: one-use stream binding (`md-mrw`, `docs/stream-binding.md`) + request correlation (`md-6ns`); NIP-42 AUTH (`md-xcy`) | — |
+| P3.9 host IPC + client launch | Open (no peer-cred IPC yet) | **`md-trex`** (IPC), **`md-vb18`** (launch) |
+| P4.10 manager shell | Open | **`md-fbg4`** |
+| P4.11a collections + connect | Open | **`md-vb18`** |
+| P4.11b approval inbox + access UI | Open | **`md-a9f2`** |
+| P4.12 overlay connect/reconnect | Open; related `md-3nv` | **`md-hx89`** |
+| P5.13 allowlist privacy migration | **Promoted to P2**: see §8.2 | **`md-bmiw`** |
+| P5.14 release matrix | Folded into `md-5zi` (per-platform E2E) plus each bead's acceptance | `md-5zi` |
+| §7.4 deferred parity items | Filed | `md-vex4` clipboard, `md-wvd2` quality, `md-qb6t` monitors, `md-l35t` overlay switcher |
+| macOS frontend (deferred) | Filed | `md-pep3` |
+| Host lifecycle (§7.5 Q2) | Filed, shared with packaging | `md-pw1q` |
+
+### 8.2 Divergences between this design and what shipped
+
+1. **The host allowlist is public.** `docs/access.md` documents the shipped list as a *public* NIP-51 kind-30000 `d=metadesk-allowlist` with `p` + `metadesk-caps` tags, so the npub of every authorized client and its capabilities are visible on relays. §3.6 specified NIP-44 self-encrypted private entries. The shipped list is therefore the "legacy public" case in §3.6, and migration is now a P2 item (`md-bmiw`). The MCP NIP-98 ACL (`md-ah9.3`) reuses the same list and must move with it.
+2. **The default relay is still silent.** §3.1 says "no silent public relay fallback", but both binaries default to `MD_DEFAULT_RELAY`. That is acceptable for the CLI. The manager must require explicit first-run relays (`md-2l87`).
+3. **Ephemeral client identities remain** on the legacy no-role path (`md-70v.3`). That is fine for the CLI. Managed connections must require a bound client role (note added to `md-fbg4`).
+4. **Persistent NIP-46 pairing shipped** (Keychain/Secret Service credential store, `md-70v.2`). The §3.4 item 3 "in memory only" statement is obsolete.
+
+### 8.3 Bead checklist → design coverage
+
+Every item in the `md-70v` description, with where it is designed and which bead builds it. The *new design* rows fill the gaps left by §1–§7.
+
+| Bead item | Design | Build |
+|---|---|---|
+| Generate / import keys | Delegated to the signer (Grotto/Groundhog/bunker); metadesk never creates a durable key (§3.4). The manager's Identity page offers "Create/Import in signer" (`open_in_signer`) and "Add account" (§7.6) | `md-fbg4` |
+| **Rotate keys** *(new)* | Two cases. **Client rotation:** bind the new account to the client role (§7.6). Hosts know the old npub, so the old host grants are orphaned. The manager lists the saved hosts to re-request from, and host admins see "replace client key" (atomic remove-old/add-new with the same caps). **Host rotation:** requires FIPS re-provisioning (§3.4). Every client holding the old pin hits the *host key changed* block (below), and there is no auto-migration (§7.3) | `md-a9f2`, `md-vb18` |
+| Secure at-rest storage | Keys stay in the signer. NIP-46 transport secrets live in Keychain/Secret Service (shipped). `op://` (`MdSecrets`) remains for CLI operational secrets such as MCP tokens and is **not** a key store; 1Password as a signer backend is out of scope | shipped / — |
+| **Unlock flow** *(new)* | metadesk has no vault, so there is **no metadesk password**. "Locked" is a signer state, surfaced as a persistent banner with one action. **Grotto/NIP-55L locked:** "Unlock in signer". **NIP-46 bunker unreachable or awaiting approval:** pending, with Cancel. **NIP-5F socket missing:** "Start signer". **OS credential store locked:** the OS prompt appears on first credential read; a refusal shows a typed error and leaves the role unbound. A headless host with a locked/unavailable signer fails closed at startup with a diagnostic (shipped) | `md-fbg4` |
+| **Display npub / fingerprint** *(new)* | Everywhere a key appears (This Computer, TOFU review, Access list, `metadesk-host account`/`access list`), show the NIP-19 npub plus a **verbal fingerprint**: the first 16 hex chars of the pubkey in four 4-char groups (e.g. `3bf0 c63f cb93 4634`). Also show an `nprofile` QR on the host. One shared formatter in core (`md_key_fingerprint`), so CLI and GUI match | `md-vb18`, `md-fbg4` |
+| Signer selection (46 / 55L / 5F / local) | Signer accounts + roles (§7.6). Local raw key is test-only | shipped |
+| **Enter / scan npub, NIP-05, or IP** *(new rules)* | Accepted inputs: `npub`, `nprofile`, 64-hex, `name@domain`, or a QR of `nprofile`. **npub / nprofile / hex:** the user supplied the key; show the fingerprint for confirmation and pin it. **`name@domain`:** a NIP-05 lookup produces a candidate key, and the first save is a TOFU review (fingerprint, domain, verified-at time). Later lookups that disagree with the pin are a hard block. **Raw IP/hostname is a route hint, never an identity.** Since `md-mrw` there is no unauthenticated direct mode, and the TCP peer cannot be identified without its key. An IP entry must be paired with a key (paste or scan from the host's This Computer page). Rejected alternative: TOFU on a key announced over raw TCP, because an on-path attacker could present any key | `md-2l87`, `md-vb18` |
+| Trust-on-first-use prompt | As above. The saved host's key **is** the pin (§3.6). The *host key changed* screen shows old and new fingerprints and offers only **Keep old (cancel)** or **Review and replace**, which requires typing/confirming the new fingerprint. No "connect anyway" | `md-vb18` |
+| Saved credentials | Nothing secret is stored per host: authentication is the client-role key plus the host's grant. "Saved" means pinned key + label + route hints + requested caps (NIP-78) | `md-v3oh` |
+| **Connection status / errors** *(new taxonomy)* | One typed phase/error enum in core, rendered by the overlay, the manager and CLI stderr. The phases are: **resolve** (NIP-05 fetch failed / mismatch); **relay** (connect failed, `AUTH` required/failed, `CLOSED` reason, publish `OK false`); **signer** (locked, denied, timeout); **negotiation** (no reply before deadline, or explicit deny); **FIPS** (daemon missing, not ready, route to npub not found); **bind** (token rejected / expired); **media** (decoder, display). "No reply" deliberately does not distinguish "host offline" from "not allowlisted", to avoid an authorization oracle | `md-hx89`, `md-vb18` |
+| Named saved hosts | NIP-51 `metadesk-hosts` + NIP-78 `label` (§3.6) | `md-v3oh` |
+| **Last-connected** *(new)* | **Local only**: retention-bounded recent records (§3.6), not synced. Syncing would publish a usage timeline (even encrypted, `created_at` and replacement cadence leak activity). Shown as "last connected on this device" | `md-v3oh` |
+| Tags, favorites | NIP-51 `metadesk-tag:<uuid>`, `metadesk-favorites` + NIP-78 tag labels | `md-v3oh` |
+| Per-host capabilities | NIP-78 `requested_caps` (client side) and host grants (host side, `md-ikr`) | `md-v3oh`, shipped |
+| **Per-host notes** *(new field)* | Add `hosts[pk].notes`: UTF-8, ≤ 2 KiB, default `""`, inside the NIP-44-encrypted NIP-78 document (§3.6 schema, version stays 1 since unknown fields are preserved) | `md-v3oh` |
+| Quick-connect | Manager Hosts page: favorites first, then recents. In the overlay, a switcher only (`md-l35t`) | `md-vb18`, `md-l35t` |
+| **Import / export** *(new format)* | Versioned JSON `{"schema":"metadesk-hosts/1","hosts":[{"pubkey","label","nip05","relay_hints","requested_caps","tags","notes"}]}`. No secrets and no grants. Import puts each new key through the TOFU review in bulk (list with fingerprints, select all after review). Export warns that the labels and notes in the file are plaintext | `md-vb18` |
+| Host: approve / deny incoming | Attended flow: pending request → approve once / approve and remember with exact caps / deny. Bounded queue, deadlines, no-UI default deny (§3.9) | `md-trex`, `md-a9f2` |
+| NIP-51 allowlist management UI | CLI shipped. GUI Access page; private-entry migration first | `md-pss`, `md-bmiw`, `md-a9f2` |
+| **Session list / kick** *(new)* | Host IPC methods `session.list` / `session.kick(session_id)` and CLI `metadesk-host session list|kick`. Kick closes the bound stream, burns its token and cancels pending input. "Kick and revoke" also removes the allowlist entry | `md-trex`, `md-a9f2` |
+| Per-client granted capabilities | Shipped (`md-ikr`); UI shows the effective grant (`requested ∧ granted ∧ local restrictions`) | shipped / `md-a9f2` |
+| Settings (resolution / bitrate / fps) | Client preferences in the session request, clamped by host policy, persisted per host in NIP-78 | `md-wvd2` |
+| Reconnect UX | Typed phases above, explicit retry/cancel, no stale input | `md-hx89` (+ `md-3nv`) |
+| Clipboard | New `clipboard` capability, off by default, text-first | `md-vex4` |
+| Multi-monitor selection | Host output list in session info + capability-gated switch | `md-qb6t` |
+| In-overlay connection manager | **Decision:** a quick switcher only. Editing stays in the manager, so the overlay stays lightweight (§3.1) | `md-l35t` |
+| Where it lives | GTK4/libadwaita manager on Linux; SDL/ImGui overlay for in-session; CLI for headless; native macOS later (§3.1, `md-pep3`). Packaging consequences: Flatpak-first manager, no GTK in the macOS/Windows bundles (`docs/plans/packaging-2026-11-21.md` §2) | — |
+| Survey 2–3 tools | §3.2 + parity matrix below | — |
+| Nostr primitive per feature, relay strategy, offline/first-run | §3.3, §3.8, §3.12 + this table | — |
+
+### 8.4 Parity matrix and adopted patterns
+
+Columns summarize **publicly documented** behavior (product docs as cited in §3.2), not a fresh hands-on evaluation; edition-specific details vary.
+
+| Capability | RustDesk | Parsec | AnyDesk | Moonlight/Sunshine | metadesk today | metadesk plan |
+|---|---|---|---|---|---|---|
+| Identity | numeric ID + password / one-time password | account login | numeric address/alias + account | host PIN pairing | Nostr key via signer roles | same; fingerprint + QR (`md-vb18`) |
+| First-contact trust | ID + password | account/friend | address + accept prompt | 4-digit PIN pairing | key pin by construction | TOFU review for NIP-05; key changed = hard block |
+| Attended accept with permission toggles | yes | yes (keyboard/mouse/gamepad) | yes | n/a | no (allowlist-only) | `md-trex`, `md-a9f2` |
+| Unattended access | permanent password | yes (owner's computers) | unattended password | paired clients | allowlist + caps (shipped) | private allowlist (`md-bmiw`) |
+| Address book / favorites / tags | yes | computer list | yes (address books, tags) | host list | none | `md-v3oh`, `md-vb18` (synced, encrypted) |
+| Session list / kick | yes | yes | yes | yes | no | `md-trex` |
+| Clipboard | yes | yes | yes | limited | no | `md-vex4` |
+| Monitor switch | yes | yes | yes | per app/display | host-side only | `md-qb6t` |
+| Quality settings | client-side | client-side | client-side | client-side | host CLI only | `md-wvd2` |
+| Reconnect | auto | auto | auto | manual | basic (`md-d9y`); reliability `md-3nv` | `md-hx89` |
+| Installable packages | all platforms | all platforms | all platforms | all platforms | source only | `md-kb7` follow-ups |
+
+**Adopted patterns:**
+- RustDesk/AnyDesk: separate quick connect, saved hosts and access configuration.
+- Parsec: permission toggles on the accept prompt.
+- Moonlight: an explicit pairing step, via fingerprint compare/QR instead of a PIN.
+- AnyDesk: naming kept separate from authorization.
+
+**Rejected patterns:**
+- Passwords or one-time codes. A shared secret is weaker than key-based allowlists and needs a server or rendezvous to be meaningful.
+- Central accounts and IDs. Nostr keys and NIP-05 replace them (§3.2).
+
+### 8.5 Recommendation
+
+1. Keep the architecture of §1/§3.1, with signer accounts and roles per §7.6, both already shipped.
+2. Fix the security/privacy gap next: private allowlist migration (`md-bmiw`) and attended approval + session control over authenticated IPC (`md-trex`). Headless hosts become complete before any GUI exists.
+3. Then build the client-side data plane (`md-055m` → `md-v3oh`, `md-b970` → `md-2l87`) and ship the manager's address book/connect flow (`md-fbg4` → `md-vb18`) on the current session protocol.
+4. Add the host-side GUI (`md-a9f2`) and the overlay work (`md-hx89`) last. Parity features (`md-vex4`, `md-wvd2`, `md-qb6t`, `md-l35t`) are independent and can interleave.
+
+### 8.6 Remaining phases
+
+| Phase | Beads | Gate |
+|---|---|---|
+| A — security/privacy on the shipped host | `md-bmiw`, `md-trex` | private relay + real signer tests; Nostr Protocol Review; headless approve/deny/kick E2E |
+| B — upstream building blocks | `md-b970`, `md-055m`, `md-crk7` | nostrc sanitizer-clean tests |
+| C — client data plane | `md-v3oh`, `md-2l87` | headless load/edit/publish via fake signer + private relay; NIP-05 pin-mismatch tests |
+| D — Linux manager | `md-fbg4`, `md-vb18`, then `md-a9f2` | GTK smoke with fake Control1 + fake host IPC; keyboard/360px; offline |
+| E — in-session UX + parity | `md-hx89`, `md-vex4`, `md-wvd2`, `md-qb6t`, `md-l35t` | per-bead; `md-5zi` matrix |
+| F — platform | `md-pep3` (macOS frontend), `md-pw1q` (lifecycle) | packaging (`md-kb7`) |
+
+### 8.7 Open decisions (updated)
+
+| # | Question | Status |
+|---|---|---|
+| 1 | Host identity model | **Resolved** (§7.6) |
+| 2 | Host process lifetime / unattended after logout | **Open** → `md-pw1q` (shared with packaging) |
+| 3 | Headless hosting in first release | **Resolved:** yes, CLI shipped (`md-pss`); approvals/kick added in `md-trex` |
+| 4 | AUTH-required DM relays in v1 | **Resolved:** in scope (`md-xcy`, `md-1be`) |
+| 5 | Client UI on the current session protocol | **Resolved:** yes (`md-vb18`) |
+| 6 | Where unsigned builders live | **Resolved:** upstream nostrc (NIP-51 done; `md-055m`) |
+| 7 | NIP-05 fetch ownership | **Recommended:** metadesk-owned HTTPS + `nostr_nip05_resolve_from_json` (`md-2l87`); revisit if nostrc adds an explicit-options API |
+| 8 | One pool per concern vs per-subscription handles | **Open**; default to waiting for `md-b970`, fall back to separate pools only if it slips |
+| 9 | `docs/designs/` vs `docs/plans/` | **Resolved:** `docs/plans/` |
+| 10 | Allowlist migration ordering: does the MCP NIP-98 ACL (`md-ah9.3`) migrate in the same change? | **Open**; recommend the same change (`md-bmiw`) |
+| 11 | Sync last-connected across devices? | **Recommended no** (privacy; §8.3) |
+| 12 | IP-only connect without a key | **Recommended no** (no TOFU from raw TCP; §8.3) |
+| 13 | macOS management frontend timing relative to the notarized DMG | **Open** → `md-pep3` / `md-wdi3` |
+
+With §8, the spike deliverable is complete: a concrete recommendation (§8.5), a phased plan with filed beads (§8.1, §8.6), and the open decisions (§8.7).
