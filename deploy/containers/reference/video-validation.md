@@ -6,6 +6,10 @@ The final md-ah9.10 section records the new implementation and its qualification
 old statements about fallback, timestamps and unchanged production code are not
 claims about the current branch.
 
+For the current PipeWire pin, version matrix and actual-host recovery evidence,
+see [L10 qualification](#l10-newer-pipewire-and-real-host-recovery-2026-11-21).
+The sections before that qualification are historical.
+
 ## Verdict and boundaries
 
 **Conditional capture compatibility, not DRI-free compatibility.** The pinned
@@ -868,3 +872,279 @@ records it in `summary.json`. With `--max-size`, it requires one
 Reproduce: run the existing commands, adding `--max-size 1280x0` to
 `validate-video.py`. The probe reads `MD_CAPTURE_MAX_SIZE` and expects
 `md_capture_fit_size(1920, 1080, cap)`.
+
+## L10: newer PipeWire and real-host recovery (2026-11-21)
+
+This section supersedes the historical reference-version and watchdog statements
+above. Scope: isolated Ubuntu 24.04 aarch64, rootless Podman 4.9.3, the same pinned
+Sway 1.9 / wlroots 0.17.1 / xdpw 0.7.1 / portal 1.18.4 / WirePlumber 0.4.17
+stack, explicit `/dev/dri/renderD128` and virgl. No live GNOME, AT-SPI, shared
+checkout, production relay or actual FIPS daemon was used.
+
+### Runtime pin and support policy
+
+**Current reference pin: PipeWire 1.4.10. Minimum supported PipeWire for this
+reliable Tier B Linux capture reference: 1.2.7.** Both versions passed 20/20
+full sequences after the flag-compatibility repair below. Ubuntu 24.04's
+1.0.5 is a legacy, best-effort comparison: watchdog recovery works, but it is
+not supported as an allocation-reliable reference. This is a support-policy
+floor based on the tested stack, not a claim that 1.2.7 was the first fixed
+upstream release or a qualification of every Linux compositor.
+
+`reference/build-pipewire.sh` pins upstream **1.4.10**, commit
+`ced36a5315135044a22c4b373be44368d312f9c8`, archive SHA-256
+`3c3460f6fa93036f108e9576d1ba1c43de74f593a33b8ced0fad7747e316ac33`.
+`reference/Dockerfile.pipewire` overlays that complete userspace runtime on the
+legacy image and replaces the bundle's old PipeWire client-library copy too.
+The build checks both compiled and linked versions against its default 1.4.10
+pin. It never installs anything or restarts services on the VM itself.
+`Dockerfile.video` remains the historical 1.0.5 **comparison/base** recipe, not
+by itself the newly qualified reference. Mutable apt repositories and an
+external throwaway metadesk bundle still preclude a reproducible-build claim.
+
+The 1.2.7 comparator used the same external Meson options, tag archive SHA-256
+`e75568ed18bcbe75e9779af57cb9cc256fd7ebfaadc12bb347a0717055d1d3a9`.
+The image deliberately retains the distro dpkg database: it still lists the
+1.0.5 package. `pipewire-runtime.txt` records **actual compiled/linked runtime
+versions, daemon/client-library hashes and daemon ldd**, rather than treating
+dpkg's original package version as the active source-overlay version.
+
+### A separate metadesk flag-validation defect
+
+The first unmodified-library pilot on **each** newer runtime failed fresh
+capture before the rest of its positive cells could run. Those failures were
+not the allocation skeleton: concrete mapped `SPA_DATA_MemFd` buffers had
+`maxsize=8294400`, `chunk.size=8294400`, stride 7680 and **flags=8**.
+
+| Descriptor flags | Meaning and decision |
+|---|---|
+| 0, observed on valid 1.0.5 buffers | Access unspecified; retained legacy acceptance, subject to all mapping/type/bounds checks |
+| 8, observed on 1.2.7 and 1.4.10 | `SPA_DATA_FLAG_MAPPABLE`, not a write-only permission; accept valid mapped descriptors |
+| 4 | `DYNAMIC`, not an access permission; likewise does not imply write-only |
+| 1 or 3, with optional 4/8 | `READABLE` or `READWRITE`; accept valid mapped descriptors |
+| 2, 6, 10, 14 | Explicit `WRITABLE` without `READABLE`; still reject |
+
+The old predicate rejected *any* nonzero flags lacking `READABLE`. The approved
+fix rejects **only explicit write-only access**, leaving NULL, extent, stride,
+type and DMA-BUF checks intact. Thus 1.0.5's flags=0 behavior is unchanged;
+`SPA_ID_INVALID`/unmapped/maxsize=0 skeletons remain rejected on every runtime.
+The newer server's backwards-compatibility path explicitly adds MAPPABLE to
+MemFd buffers whose older producer omitted it; see upstream
+[client-node.c, 1.2.7](https://github.com/PipeWire/pipewire/blob/1.2.7/src/modules/module-client-node/client-node.c)
+and [the flag definitions](https://github.com/PipeWire/pipewire/blob/1.4.10/spa/include/spa/buffer/buffer.h).
+This flag repair is **not** claimed as the fix for the original upstream
+allocation-publication violation.
+
+Once-per-start diagnostics now distinguish an unresolved allocation skeleton
+from a 5-second first-frame deadline. Version text explicitly identifies the
+**client library**, not an unqueried server version. No retry, sleep, deadline
+increase, authorization bypass or unsafe descriptor publication was added to
+production capture.
+
+### Repeated full sequences (no retries-to-green)
+
+| PipeWire | Full sequences | Valid pixel/held-buffer receipts | Reopen starts/passes | Rejected descriptors |
+|---|---|---|---|---|
+| 1.0.5, original master library | **10 pass, 10 fail / 20** | 191 / 171 | 102 / 98 (later cycles unexercised after failure) | **104**, all unresolved skeletons |
+| 1.2.7, corrected library | **20 pass, 0 fail / 20** | 220 / 200 | **120 / 120** | **0** |
+| 1.4.10, corrected library | **20 pass, 0 fail / 20** | 220 / 200 | **120 / 120** | **0** |
+
+1.0.5 failed sequences: 1, 4, 5, 6, 8, 9, 12, 13, 15, 19. Fresh and saved-token
+reuse passed 20/20; unknown UUID passed 19/20; cleared-token capture passed
+14/20; the six-cycle cell completed 16/20 sequences; private-PipeWire loss
+passed 20/20. All malformed/retention and other expected negatives passed.
+The 1.2.7 and 1.4.10 batches observed **2,219** and **2,224** validated frames,
+respectively; all expected negatives passed. All three batches used one
+consistent image/probe/library identity per version across their 20 invocations.
+
+Supplementary, not replacements for failures: original 1.0.5 pilot **1 pass**;
+fixed-library, trace-enabled 1.0.5 matrices **3/3 pass** (logging can perturb
+this race); final source-producer/default-pin image **1 full matrix pass**.
+The two pre-fix newer-version pilots failed fresh capture on the distinct
+MAPPABLE flag rejection described above and are not counted as ordering failures.
+
+Every invocation uses the full four-cell driver, normal static-idle checks,
+default upstream logging and **six** same-context start/stop reopens. It checks
+fresh/reuse/unknown UUID/malformed UUID retention/clear/reopens/PipeWire loss,
+changing pixels, monotonic timestamps, negotiated size, held-buffer lifetime,
+pixman denial, explicit denial and stalled-chooser timeout. Failed invocations
+remain failures; an early positive failure can leave later positive cells
+unexercised. Twenty invocations are not twenty successful reopens on one context.
+
+The original 1.0.5 batch used master `595b71d`'s library; newer-runtime batches
+required the approved flag fix. Separate 1.0.5 runs with that same fixed library
+are reported explicitly, rather than silently replacing baseline failures.
+No individual upstream ordering-fix commit or earliest fixed release was
+identified. Release/source inspection is not a causal bisect; successful
+qualification establishes the tested version/stack, not every intervening or
+future PipeWire version.
+
+### Actual host recovery, separate from backend reliability
+
+**Natural 1.0.5 run: 20/20 cleared-token host starts eventually streamed,
+953 decoded frames.** Eighteen host starts were clean. Two started with **zero
+acquired frames**, rejected 48 unresolved descriptors each, and recovered after
+**one actual host watchdog restart each: 2/2 natural recoveries**. Sequence 11
+then acquired 60 frames / decoded 54; sequence 17 acquired 66 / decoded 57.
+All 20 retained authorization. These two faults take the existing immediate
+invalid-descriptor `MD_CAPTURE_ERROR` path; they do not depend on waiting five
+seconds for the new no-first-frame deadline.
+
+**Do not call the complete recovery preparation matrix 20/20 green:** sequence
+5's earlier unknown-UUID probe returned 6 (zero frames), although its subsequent
+cleared-token host streamed 47 decoded frames. Thus the strict full-sequence
+gate is **19 pass, 1 fail**. That batch ran before the aggregate preparation gate
+was hardened: its original process exit was 0, but re-evaluation of the saved
+receipts with the final gate fails it. The final driver now returns nonzero for
+this condition; the failure was neither retried nor dropped.
+
+**Separate injected no-first-frame run: 5/5 pass**, 329 decoded frames. Every
+run suppressed 83–87 valid initial-stream buffers, acquired zero generation-1
+frames, emitted the production **5-second deadline** diagnostic, restarted once,
+and then acquired/decoded real generation-2 frames. Suppression lasted
+9.007–9.014 seconds, matching the unchanged 5-second startup deadline plus
+4-second host error watchdog. No rejected descriptor contaminated these runs;
+authorization remained present. These five are **not** natural allocation-race
+recoveries. A separate final-driver/native corrected-library smoke sequence
+also passed, decoding 48 frames without a restart.
+
+`validate-video-recovery.py` executes real preparatory captures on one private
+backend, clears the token, and launches the **unmodified host** for the reopened
+stream. The real decoder client negotiates NIP-17, consumes the one-use stream
+binding, and must decode at least 30 frames. The relay/signers/FIPS-control
+endpoint are fixtures; this is local TCP encode/decode proof, **not real FIPS
+transport or a production-relay acceptance claim**. Trace receipts establish
+whether any initial-generation buffer was acquired before a watchdog restart.
+Preparatory failures are retained and fail the aggregate; they are not retried.
+
+The fixture uses the existing NIP-01 live-only ephemeral mode for NIP-46 RPCs,
+while retaining stored authorization/session history. Preliminary fixtures did
+not enable this mode and could hit their 256-event bound; those exploratory or
+interrupted runs are excluded from the qualified 20-run recovery batch, not
+counted as PipeWire failures or passes. The failed setup of a simultaneous
+injection run (overlapping fixture subnet) likewise exercised no capture.
+
+The explicit `no-first-frame.c` interposer is **test-only** and is never bundled
+or enabled by default. It withholds only complete mapped reference-output CPU
+frames on the initial host stream, passes other descriptors through to actual
+production validation, and becomes transparent after that stream is destroyed.
+Injected rows require valid-drop receipts, the 5-second deadline, exactly one
+initial-zero-frame watchdog restart and subsequent decoding. Any natural
+rejected descriptor contaminates/fails the injection result. These injected
+counts must never be added to natural allocation-fault recovery counts.
+
+### Reproduce and quality gates
+
+Build the legacy image/bundle and matching probe using the earlier commands,
+but use the dedicated **read-only** `/home/bizarro/nostrc-master` dependency tree,
+never the obsolete shared `~/nostrc`. Then, inside a new task-owned source copy:
+
+```sh
+./deploy/containers/reference/build-pipewire.sh \
+  "$HOME/md-l10/pw-work" "$PWD/deploy/containers/reference/pipewire-runtime"
+podman build --layers=false -t localhost/md-l10-video:1.4.10 \
+  --build-arg REFERENCE_IMAGE="$(podman image inspect localhost/md-l10-video:1.0.5 --format '{{.Id}}')" \
+  -f deploy/containers/reference/Dockerfile.pipewire deploy/containers
+# Run this for each i=1..20, retaining every exit/summary, including failures.
+python3 deploy/containers/reference/validate-video.py \
+  localhost/md-l10-video:1.4.10 ./capture-probe "./video-$i" \
+  --prefix "md-l10-video-$i" --render-node /dev/dri/renderD128 --reopens 6 \
+  --library "$PWD/build-container/libmetadesk.so.0.1.0"
+```
+
+For recovery, prepare a **new** private fixture work directory and matching
+host/client/signers-enabled image as in [client-validation.md](client-validation.md#reproduce)
+(`client=true,signer_nip46=true,signer_nip5f=true`), containing `tests/`,
+`mesh-peer.py`, `client-fixture.py`, `bin/nip5f-crypto`, `bin/nip46-bunker`:
+
+```sh
+python3 deploy/containers/reference/validate-video-recovery.py \
+  --work "$HOME/md-l10/recovery" --prefix md-l10-recovery \
+  --video-image localhost/md-l10-recovery:1.0.5 --probe ./capture-probe --sequences 20
+# Separate, explicitly labelled fault-injection run, never a natural-fault count:
+cc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
+  deploy/containers/reference/no-first-frame.c $(pkg-config --cflags libpipewire-0.3) \
+  -ldl -pthread -o no-first-frame.so
+# Supply --fault-injection "$PWD/no-first-frame.so" and a NEW --work/--prefix.
+# Do not run two fixture networks with the same subnet simultaneously.
+```
+
+The production-descriptor seam does not duplicate the validator: it includes
+`capture_pipewire.c` and substitutes only dequeue/queue. It exercises all 16
+flag combinations, valid MemPtr, NULL/type/skeleton/size/offset/stride rejection,
+publication versus requeue, and actual CPU-frame metadata:
+
+```sh
+cc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Isrc \
+  deploy/containers/reference/test-pipewire-descriptors.c \
+  $(pkg-config --cflags --libs libpipewire-0.3 dbus-1) \
+  -Lbuild-container -lmetadesk -pthread -o test-pipewire-descriptors
+LD_LIBRARY_PATH="$PWD/build-container" ./test-pipewire-descriptors
+# Also compiled/run with -fsanitize=address,undefined -fno-omit-frame-pointer.
+```
+
+Final gates: Linux native **34/34**, no skips/timeouts; actual production
+`on_process` seam **35/35 native and ASan+UBSan**, leak detection enabled, no
+sanitizer report. Only the seam compilation was instrumented; this is not a
+claim of a full sanitized runtime matrix. The seam compiled against pre-fix
+source fails on flags=8 (exit 1), while the corrected source passes. Reference
+Python tests **37/37**, including nine recovery receipt/gate cases; Linux also
+ran the receipt tests. Both reference C probes compile with
+`-Wall -Wextra -Werror`; the final source producer and version assertion were
+actually executed, not just syntax-checked.
+
+| Input | SHA-256 / image ID |
+|---|---|
+| Source baseline | `595b71d084f351c33a32d8d1b2a0d41e00ad3005` |
+| Production repair + seam commit | `04884c8` |
+| Probe | `4c3be1390b7dc3f8b9d371e3cbc1a1fc66a82c466c831b99dbafe45656a04ca3` |
+| Original matrix library | `35255327dfcdd10fbfe89537d956a16782a400a438eefbaeb28d162c76ee784f` |
+| Corrected matrix library | `4c53ee1e8259de6b7bd4c80b08a72650c694f686349b3392d06c04cd1f4f6b15` |
+| 1.0.5 image | `5728a4733e09734ba6e717f94b0754755788aa83c4ab41116c69728d1d724ba2` |
+| 1.2.7 image | `ef6f0b2b71a5eba9756f2adf52246cfdb6afc63d81e233417bce192adaa62a07` |
+| 1.4.10 image, 20 sequences | `e133add3b7cccd79d1d48973ddb4b5f19ead7978c888fee8cd0e450d00aa9a9c` |
+| Final pinned-producer image, extra matrix | `68eb8289126cef52f81386d8a4a5d300cef0c44a2633fae0f785d621a74403de` |
+| Natural-recovery host/client image | `80b7d0e7dfdd4d8215a52bae71b7107a1f8604fa40f834ae09caff311cf452b8` |
+| Injected/final-smoke host/client image | `a8b22d362c9091be4251ea757ce3e78b912294dc33b59f7fbe157cfb57ccc8e8` |
+
+The actual installed libraries in the two recovery images hash to
+`3b87addb73652b366014281474cd20ed19371f31a3565e6328bdbc94c97ccbe2`
+and `85a96e25d47738c67727d7554429cca89448ac72cfdc3f4f8f4d966cd6c13b78`,
+respectively (producer RPATHs stripped). The former is the unmodified master
+host/library with md-3nv; the latter adds this lane's approved flag repair and
+diagnostics, not a host watchdog change. Preliminary recovery experiments:
+one pilot streamed; an exploratory six-attempt batch streamed four before
+fixture startup/session failures; an interrupted five-attempt batch streamed
+four. These are preserved separately, not merged into the final 20 attempts.
+
+Diff-scoped Nostr Protocol Review (A–J): no new relay polling, timeout-driven
+subscription closes, manual relay frames or ignored protocol acknowledgements
+were introduced. Existing subscription/OK/EOSE-aware session logic is reused;
+the color redraw interval is a visual test stimulus, not a Nostr delivery timer.
+Oracle review found three false-green/injection risks; preparation failures now
+fail the gate, injected runs require explicit path receipts, and invalid
+buffers remain visible to production validation. Nine classifier/gate tests
+cover these distinctions. Oracle's first artifact-based request had no usable
+context because worktree artifact aliases were rejected by the tab; the actual
+implementation was supplied inline for the completed review.
+
+Cleanup verified: all six task images/layers, task containers, fixture networks,
+volumes, build containers and the complete `~/md-l10` tree were removed. No
+task processes remained. Only the pre-existing Ubuntu image/default Podman
+network remained; the shared nostrc/metadesk trees and live GNOME/AT-SPI session
+were untouched. VM free disk space after cleanup was recorded in the private
+cleanup receipt. Sanitized counts, hashes, selected recovery receipts and test
+results remain under macOS `~/Library/Caches/metadesk-md-l10-20261121`; no keys,
+tokens, home/runtime state or raw backend/relay logs were retained there.
+
+**Closure recommendation: md-atg can close after the L10 commits land with the
+1.4.10 reference pin and the documented 1.2.7 support floor.** This remedies the
+supported reference by replacing the faulty runtime and removes the separate
+metadesk compatibility rejection. It does not repair upstream 1.0.5 or certify
+all Linux desktops. The old-runtime failures and the 19/20 complete recovery
+preparation gate remain failures, even though all 20 cleared-token host starts
+eventually streamed. No bead was closed, no push or merge performed.
+
+Jev triage: eight find-lines judgments (24 requests, 190,668 input tokens,
+approximately $0.00801) narrowed source/history reads; no model judgment was
+used as runtime or cleanup evidence.

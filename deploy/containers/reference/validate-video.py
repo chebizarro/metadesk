@@ -61,6 +61,10 @@ cd /evidence
 ldd /opt/metadesk/bin/metadesk-host > closure.txt || exit 7
 if grep -q 'not found' closure.txt; then exit 7; fi
 dpkg-query -W sway libwlroots12t64 xdg-desktop-portal-wlr xdg-desktop-portal pipewire wireplumber libspa-0.2-modules > versions.txt
+# A source-built variant deliberately leaves the distro package database alone.
+{ pipewire --version; pw-cli --version;
+  sha256sum /usr/bin/pipewire /opt/metadesk/lib/libpipewire-0.3.so.0;
+  ldd /usr/bin/pipewire; } > pipewire-runtime.txt
 grep -E 'CapEff|NoNewPrivs' /proc/self/status > security.txt
 ls -l /dev/dri >> security.txt 2>/dev/null || :
 /opt/capture-probe > fresh.log 2>&1
