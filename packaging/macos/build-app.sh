@@ -8,6 +8,7 @@
 # a nostrc CMake build with the libraries metadesk links (docs/build-signers.md).
 # Signing: MD_CODESIGN_IDENTITY (default '-' = ad-hoc). Setting a Developer ID
 # identity enables the hardened runtime. MD_DMG=1 also produces a .dmg.
+# MD_FFMPEG_PREFIX selects a build-minimal-lgpl.sh install prefix (optional).
 set -eu
 [ "$#" -ge 3 ] || { echo "usage: $0 NOSTRC_ROOT NOSTRC_BUILD_DIR OUTPUT [MESON_OPTION...]" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,6 +20,17 @@ mkdir -p "$3"
 out=$(cd "$3" && pwd)
 case "$out/" in "$src"/*) echo "output must be outside the source tree" >&2; rmdir "$out"; exit 2 ;; esac
 shift 3
+
+# Only pkg-config selection is wired here. Rebuilding the rest of the closure,
+# staging license texts/source, and production release gates remain md-ouw3.
+if [ -n "${MD_FFMPEG_PREFIX:-}" ]; then
+    MD_FFMPEG_PREFIX=$(cd "$MD_FFMPEG_PREFIX" && pwd -P)
+    export PKG_CONFIG_PATH="$MD_FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    for lib in libavcodec libavutil; do
+        selected=$(pkg-config --variable=prefix "$lib")
+        [ "$selected" = "$MD_FFMPEG_PREFIX" ] || { echo "$lib not from MD_FFMPEG_PREFIX" >&2; exit 1; }
+    done
+fi
 
 identity=${MD_CODESIGN_IDENTITY:--}
 version=$(meson introspect --projectinfo "$src/meson.build" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
