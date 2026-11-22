@@ -78,8 +78,10 @@ def main():
     if a.mode == 'oci':
         ff = a.ffmpeg_prefix.resolve()
         probe_env = dict(os.environ, PKG_CONFIG_PATH=str(ff / 'lib/pkgconfig'), LD_LIBRARY_PATH=str(ff / 'lib'))
-        if Path(run('pkg-config', '--variable=prefix', 'libavcodec', env=probe_env)).resolve() != ff:
-            raise ValueError('pkg-config did not select the private FFmpeg prefix')
+        for module in ('libavcodec', 'libavutil'):
+            for variable, expected in (('prefix', ff), ('libdir', ff / 'lib'), ('includedir', ff / 'include')):
+                if Path(run('pkg-config', '--variable=' + variable, module, env=probe_env)).resolve() != expected:
+                    raise ValueError(f'pkg-config did not select private {module} {variable}')
         flags = shlex.split(run('pkg-config', '--cflags', '--libs', 'libavcodec', 'libavutil', env=probe_env))
         probe = out / 'codec-probe'
         subprocess.run(['cc', str(src / 'packaging/ffmpeg/verify-codecs.c'), *flags, '-o', str(probe)], env=probe_env, check=True)

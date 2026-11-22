@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline safety tests: dry-run purity, destination guards and source manifests."""
-import json
+import os
 from pathlib import Path
 import subprocess
 import shutil
@@ -79,6 +79,34 @@ class Safety(unittest.TestCase):
             library.unlink()
             subprocess.run(['cc', '-shared', str(source), '-o', str(library)], check=True)
             self.assertEqual(subprocess.run(['sh', '-c', guard], cwd=root, capture_output=True).returncode, 0)
+
+    def test_no_desktop_gate_requires_application_diagnostic(self):
+        with tempfile.TemporaryDirectory(prefix='md-w9-test-') as d:
+            root = Path(d)
+            podman = root / 'podman'
+            podman.write_text("""#!/bin/sh
+if [ "$1" = run ]; then
+    case " $* " in
+        *" md-w9-fixture-direct "*)
+            printf '%s\\n' "$MD_FAKE_DIRECT_DIAGNOSTIC" >&2
+            exit "$MD_FAKE_DIRECT_STATUS" ;;
+    esac
+fi
+exit 0
+""")
+            podman.chmod(0o755)
+            cases = [(127, 'missing timeout'), (126, 'permission denied'),
+                     (134, 'aborted'), (1, 'unrelated error'),
+                     (1, 'host[mcp]: accessibility backend unavailable')]
+            for status, diagnostic in cases:
+                with self.subTest(status=status, diagnostic=diagnostic):
+                    env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                               MD_RECEIPT_DIR=str(root / 'receipts'), MD_FAKE_DIRECT_STATUS=str(status),
+                               MD_FAKE_DIRECT_DIAGNOSTIC=diagnostic)
+                    result = subprocess.run(['sh', str(LINUX / 'verify-image.sh'), 'image', 'md-w9-fixture'],
+                                            env=env, capture_output=True)
+                    expected = status == 1 and diagnostic.startswith('host[mcp]: accessibility backend unavailable')
+                    self.assertEqual(result.returncode == 0, expected)
 
     def test_release_checksums_are_not_skipped(self):
         text = (LINUX / 'aur/PKGBUILD').read_text()

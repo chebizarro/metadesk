@@ -24,7 +24,8 @@ podman run --rm --name "${name}-direct" --network=none --read-only --tmpfs /tmp:
   "$image" 10 /opt/metadesk/bin/metadesk-host --mcp --no-input > "$receipts/${name}-no-desktop.txt" 2>&1
 status=$?
 set -e
-[ "$status" -ne 0 ] && [ "$status" -ne 125 ] && [ "$status" -ne 124 ] && [ -s "$receipts/${name}-no-desktop.txt" ]
+[ "$status" -eq 1 ]
+grep -Fq 'host[mcp]: accessibility backend unavailable' "$receipts/${name}-no-desktop.txt"
 echo "gate 4 no-desktop exit=$status"
 # Inspect the launch configuration. This is NOT a SIGTERM or live-session test.
 podman create --name "$name" --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid \

@@ -76,6 +76,20 @@ echo 'License: LGPL version 2.1 or later'
                     self.assertIn('h264_amf', encoders)
                     self.assertIn('h264_mf' if profile == 'windows' else 'h264_vaapi', encoders)
 
+    def test_target_compiler_inference_and_explicit_override(self):
+        helper = SCRIPT.with_name('profile-encoders.sh')
+        compiler = self.root / 'target-cc'
+        compiler.write_text('#!/bin/sh\nprintf \'%s\\n\' x86_64-w64-mingw32\n')
+        compiler.chmod(0o755)
+        env = dict(self.env, CC=str(compiler))
+        env.pop('MD_FFMPEG_ARCH', None)
+        encoders = subprocess.check_output([SH, str(helper), 'windows'], env=env, text=True)
+        self.assertIn('h264_qsv', encoders)
+        env['MD_FFMPEG_ARCH'] = 'aarch64'
+        compiler.write_text('#!/bin/sh\nexit 99\n')
+        encoders = subprocess.check_output([SH, str(helper), 'windows'], env=env, text=True)
+        self.assertNotIn('h264_qsv', encoders)
+
     def test_windows_patches_private_copy_and_retains_receipt(self):
         result = self.run_profile("windows")
         self.assertEqual(result.returncode, 0, result.stdout)

@@ -7,6 +7,19 @@ header for toolchain/header overrides. Windows patches a private source copy,
 retains `patches/`, `patches.txt`, `configure-args.txt` and build logs in OUTPUT,
 and fails closed if the carried patch no longer applies.
 
+## Current target-architecture policy
+
+Windows, container and Flatpak retain NVENC/AMF and their platform MF/VAAPI
+encoder. libvpl and h264_qsv are requested only for x86/x86_64 targets.
+`MD_FFMPEG_ARCH` overrides compiler inference; otherwise CC/cross-prefix
+`-dumpmachine` determines the target, not the build machine's CPU.
+`profile-encoders.sh` is shared by configure and Linux runtime inventory gates.
+The three-argument build interface is unchanged. macOS remains VideoToolbox.
+
+The Windows result below is historical, before this policy change; its four
+encoders are not the new ARM64 expected inventory. The measured MF patch result
+is retained, not relabeled as a fresh Windows build without QSV.
+
 ## Windows ARM64 qualification (2026-11-22, md-gml8)
 
 The complete **windows** profile, not a reduced MF-only substitute, was built

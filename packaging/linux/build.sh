@@ -13,8 +13,16 @@ case "$mode" in
     python3 - "$src" "${build}-codec-probe" <<'PYCODE'
 import shlex
 import platform
+import os
+from pathlib import Path
 import subprocess
 import sys
+prefix = Path(os.environ['MD_FFMPEG_PREFIX']).resolve()
+for module in ('libavcodec', 'libavutil'):
+    for variable, expected in (('prefix', prefix), ('libdir', prefix / 'lib'), ('includedir', prefix / 'include')):
+        actual = Path(subprocess.check_output(['pkg-config', '--variable=' + variable, module], text=True).strip()).resolve()
+        if actual != expected:
+            raise ValueError(f'private {module} {variable}: {actual} != {expected}')
 flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'libavcodec', 'libavutil'], text=True))
 subprocess.run(['cc', sys.argv[1] + '/packaging/ffmpeg/verify-codecs.c', *flags, '-o', sys.argv[2]], check=True)
 encoders = subprocess.check_output([sys.argv[1] + '/packaging/ffmpeg/profile-encoders.sh', 'container', platform.machine()], text=True).strip().split(',')
