@@ -660,6 +660,8 @@ typedef struct {
     MdFrame                 pending_frame;
     bool                    frame_ready;
     bool                    received_frame;
+    bool                    first_frame_deadline_reported;
+    bool                    allocation_fault_reported;
     bool                    broken;
     bool                    stopping;
     uint64_t                started_ns;
@@ -816,9 +818,11 @@ static void on_process(void *userdata) {
     MdCapturePixFmt format;
     if (!spa_to_capture_fmt(pw->spa_format, &format) ||
         !width || !height || !ctx->width || !ctx->height || stride < (uint64_t)width * 4 ||
-        /* xdpw/PW 1.0.5 supplies flags=0 even for readable MAP_BUFFERS.
-         * Reject an explicit write-only descriptor, not that legacy default. */
-        d->chunk->stride < 0 || (d->flags && !(d->flags & SPA_DATA_FLAG_READABLE)) ||
+        /* Access bits may be absent: xdpw/PW 1.0.5 uses flags=0, newer
+         * runtimes use MAPPABLE alone. DYNAMIC/MAPPABLE are not access bits.
+         * Keep the legacy default, but reject explicit write-only access. */
+        d->chunk->stride < 0 || ((d->flags & SPA_DATA_FLAG_WRITABLE) &&
+                               !(d->flags & SPA_DATA_FLAG_READABLE)) ||
         d->chunk->offset > d->maxsize || d->chunk->size > d->maxsize - d->chunk->offset ||
         needed > d->chunk->size ||
         (d->type == SPA_DATA_DmaBuf && (!pw->prefer_dmabuf || d->fd < 0)) ||
@@ -827,6 +831,13 @@ static void on_process(void *userdata) {
         MD_LOG_I("reject buffer: format=%u type=%u flags=%u mapped=%d max=%u offset=%u size=%u stride=%d",
                  pw->spa_format, d->type, d->flags, d->data != NULL, d->maxsize,
                  d->chunk->offset, d->chunk->size, d->chunk->stride);
+        if (d->type == SPA_ID_INVALID && !d->data && !d->maxsize &&
+            !pw->allocation_fault_reported) {
+            pw->allocation_fault_reported = true;
+            MD_LOG_E("PipeWire backend allocation/publication fault: unresolved buffer skeleton "
+                     "(SPA_ID_INVALID, unmapped, maxsize=0); rejecting unsafe frames "
+                     "(client library %s; md-atg)", pw_get_library_version());
+        }
         pthread_mutex_lock(&pw->frame_lock);
         pw->broken = true;
         pthread_cond_broadcast(&pw->frame_cond);
@@ -1039,6 +1050,8 @@ static int pw_start(MdCaptureCtx *ctx) {
     pw->generation++;
     if (pw->trace_buffers) MD_LOG_I("capture start gen=%u", pw->generation);
     pw->received_frame = false;
+    pw->first_frame_deadline_reported = false;
+    pw->allocation_fault_reported = false;
     pw->broken = false;
     pw->stopping = false;
     uint32_t stream_node_id = PW_ID_ANY;
@@ -1191,8 +1204,15 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     }
 
     if (pw->stopping || !pw->frame_ready) {
-        bool broken = pw->stopping || pw->broken || (!pw->received_frame &&
-            md_monotonic_ns() - pw->started_ns >= PW_FIRST_FRAME_DEADLINE_NS);
+        bool first_frame_expired = !pw->received_frame &&
+            md_monotonic_ns() - pw->started_ns >= PW_FIRST_FRAME_DEADLINE_NS;
+        if (first_frame_expired && !pw->stopping && !pw->broken &&
+            !pw->first_frame_deadline_reported) {
+            pw->first_frame_deadline_reported = true;
+            MD_LOG_E("PipeWire first-frame deadline exceeded: no valid frame within 5000ms "
+                     "of stream start (client library %s)", pw_get_library_version());
+        }
+        bool broken = pw->stopping || pw->broken || first_frame_expired;
         pthread_mutex_unlock(&pw->frame_lock);
         return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
