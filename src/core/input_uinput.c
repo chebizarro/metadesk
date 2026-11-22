@@ -14,6 +14,13 @@
 #include <linux/input-event-codes.h>
 
 #include <libudev.h>
+#include <xcb/xcb.h>
+#include <xcb/xcbext.h>
+#include <xcb/xinput.h>
+#include <X11/Xauth.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
 #include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -77,15 +84,202 @@ static bool uinput_is_our_event_node(struct udev_device *dev, const char *sysnam
            parent_name && strcmp(parent_name, sysname) == 0;
 }
 
-/* UI_DEV_CREATE registers the device synchronously, but libinput consumers
- * learn of it only from udev's broadcast after rule processing. Subscribe
- * before creating so that broadcast cannot be missed, then wait for it
- * (bounded) instead of sleeping. This is the last observable precondition:
- * the consumer opening the node afterwards is not observable from here, and
- * events injected before that open are not delivered to it. Without a
- * running udevd (e.g. a container) nothing announces the device, so there
- * is nothing to wait for. */
-static int uinput_dev_create(int fd, const char *label) {
+/* Xorg probes and closes evdev before its final DEVICE_ON open. IN_OPEN
+ * (even after udev add) therefore is not an acknowledgement. XI2 reports
+ * enabled only after DEVICE_ON succeeded. Match Device Node, not a reusable
+ * device name or XI id, and subscribe before creation to avoid lost wakeups.
+ * There is no equivalent generic uinput acknowledgement on Wayland: use the
+ * RemoteDesktop portal there. Headless/no-udevd callers retain kernel-only
+ * creation semantics, without claiming desktop delivery. */
+typedef struct {
+    xcb_connection_t *connection;
+    uint8_t opcode;
+    xcb_atom_t node_atom;
+    int64_t deadline;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    pthread_t watchdog;
+    int watchdog_fd;
+    bool watchdog_started, done;
+} UinputConsumer;
+
+/* libxcb also waits inside connection setup/get_setup. Shutdown of a dup of
+ * the same socket interrupts those waits without unsafe fork-after-threads
+ * or cancellation inside libxcb. The watchdog only enforces failure; normal
+ * readiness signals its condvar and joins immediately. */
+static void *consumer_watchdog(void *data) {
+    UinputConsumer *c = data;
+    pthread_mutex_lock(&c->mutex);
+    while (!c->done && md_now_ms() < c->deadline)
+        md_cond_timedwait_until(&c->changed, &c->mutex, (uint64_t)c->deadline * 1000000);
+    if (!c->done) shutdown(c->watchdog_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&c->mutex);
+    return NULL;
+}
+
+static void consumer_close(UinputConsumer *c) {
+    if (c->watchdog_started) {
+        pthread_mutex_lock(&c->mutex); c->done = true;
+        pthread_cond_signal(&c->changed); pthread_mutex_unlock(&c->mutex);
+        pthread_join(c->watchdog, NULL);
+        close(c->watchdog_fd);
+        pthread_cond_destroy(&c->changed); pthread_mutex_destroy(&c->mutex);
+    }
+    if (c->connection) xcb_disconnect(c->connection);
+}
+
+static void *consumer_reply(UinputConsumer *c, unsigned sequence) {
+    void *reply = NULL;
+    xcb_generic_error_t *error = NULL;
+    xcb_flush(c->connection);
+    for (;;) {
+        if (xcb_poll_for_reply(c->connection, sequence, &reply, &error)) {
+            if (error) { free(reply); reply = NULL; }
+            free(error);
+            return reply;
+        }
+        int64_t left = c->deadline - md_now_ms();
+        if (left <= 0 || xcb_connection_has_error(c->connection)) break;
+        struct pollfd pfd = { .fd = xcb_get_file_descriptor(c->connection), .events = POLLIN };
+        int n = poll(&pfd, 1, (int)left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) break;
+    }
+    xcb_discard_reply(c->connection, sequence);
+    return NULL;
+}
+
+static bool consumer_watch(UinputConsumer *c) {
+    int screen, display;
+    char *host = NULL;
+    c->deadline = md_now_ms() + 2000;
+    if (!xcb_parse_display(NULL, &host, &display, &screen)) return false;
+    /* Only the local X server can acknowledge this kernel's evdev device. */
+    bool local = !host[0] || !strcmp(host, "unix");
+    free(host);
+    if (!local) return false;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    int n = snprintf(address.sun_path, sizeof(address.sun_path), "/tmp/.X11-unix/X%d", display);
+    if (n < 0 || n >= (int)sizeof(address.sun_path)) return false;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return false;
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        if (errno != EINPROGRESS && errno != EAGAIN) { close(fd); return false; }
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int rc = -1;
+        for (;;) {
+            int64_t left = c->deadline - md_now_ms();
+            if (left <= 0) break;
+            rc = poll(&pfd, 1, (int)left);
+            if (rc < 0 && errno == EINTR) continue;
+            break;
+        }
+        int error = 0; socklen_t size = sizeof(error);
+        if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) || error) { close(fd); return false; }
+    }
+    c->watchdog_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    if (c->watchdog_fd < 0) { close(fd); return false; }
+    if (pthread_mutex_init(&c->mutex, NULL)) { close(c->watchdog_fd); close(fd); return false; }
+    if (md_cond_init_monotonic(&c->changed)) {
+        pthread_mutex_destroy(&c->mutex); close(c->watchdog_fd); close(fd); return false;
+    }
+    if (pthread_create(&c->watchdog, NULL, consumer_watchdog, c)) {
+        pthread_cond_destroy(&c->changed); pthread_mutex_destroy(&c->mutex);
+        close(c->watchdog_fd); close(fd); return false;
+    }
+    c->watchdog_started = true;
+    char hostname[256], display_name[32];
+    snprintf(display_name, sizeof(display_name), "%d", display);
+    Xauth *auth = NULL;
+    char *types[] = { "MIT-MAGIC-COOKIE-1" }; int lengths[] = { 18 };
+    if (!gethostname(hostname, sizeof(hostname))) {
+        hostname[sizeof(hostname)-1] = 0;
+        auth = XauGetBestAuthByAddr(FamilyLocal, (unsigned short)strlen(hostname), hostname,
+            (unsigned short)strlen(display_name), display_name, 1, types, lengths);
+    }
+    xcb_auth_info_t info = {0};
+    if (auth) info = (xcb_auth_info_t){ .namelen = auth->name_length, .name = auth->name,
+                                       .datalen = auth->data_length, .data = auth->data };
+    c->connection = xcb_connect_to_fd(fd, auth ? &info : NULL); /* takes fd */
+    if (auth) XauDisposeAuth(auth);
+    if (!c->connection || xcb_connection_has_error(c->connection)) return false;
+    xcb_query_extension_reply_t *ext = consumer_reply(c,
+        xcb_query_extension(c->connection, 15, "XInputExtension").sequence);
+    if (!ext) return false;
+    bool present = ext->present;
+    c->opcode = ext->major_opcode; free(ext);
+    if (!present) return false;
+    xcb_input_xi_query_version_reply_t *version = consumer_reply(c,
+        xcb_input_xi_query_version(c->connection, 2, 0).sequence);
+    if (!version) return false;
+    bool supported = version->major_version >= 2;
+    free(version);
+    if (!supported) return false;
+    xcb_screen_iterator_t it = xcb_setup_roots_iterator(xcb_get_setup(c->connection));
+    while (screen-- > 0 && it.rem) xcb_screen_next(&it);
+    if (!it.rem) return false;
+    struct { xcb_input_event_mask_t header; uint32_t bits; } mask = {
+        { XCB_INPUT_DEVICE_ALL, 1 }, XCB_INPUT_XI_EVENT_MASK_HIERARCHY
+    };
+    xcb_input_xi_select_events(c->connection, it.data->root, 1, &mask.header);
+    xcb_intern_atom_reply_t *atom = consumer_reply(c,
+        xcb_intern_atom(c->connection, 0, 11, "Device Node").sequence);
+    if (!atom) return false;
+    c->node_atom = atom->atom;
+    free(atom);
+    return true;
+}
+
+static bool consumer_enabled(UinputConsumer *c, const char *node, const char *name) {
+    xcb_input_xi_query_device_reply_t *reply = consumer_reply(c,
+        xcb_input_xi_query_device(c->connection, XCB_INPUT_DEVICE_ALL).sequence);
+    if (!reply) return false;
+    bool found = false;
+    xcb_input_xi_device_info_iterator_t it = xcb_input_xi_query_device_infos_iterator(reply);
+    for (; it.rem && !found && md_now_ms() < c->deadline; xcb_input_xi_device_info_next(&it)) {
+        /* eventN can be reused while Xorg still exposes the old XI device.
+         * The per-create name fences that stale enabled object as well. */
+        if (it.data->name_len != strlen(name) ||
+            memcmp(xcb_input_xi_device_info_name(it.data), name, strlen(name))) continue;
+        if (!it.data->enabled || (it.data->type != XCB_INPUT_DEVICE_TYPE_SLAVE_KEYBOARD &&
+                                  it.data->type != XCB_INPUT_DEVICE_TYPE_SLAVE_POINTER)) continue;
+        xcb_input_xi_get_property_reply_t *prop = consumer_reply(c,
+            xcb_input_xi_get_property(c->connection, it.data->deviceid, 0,
+                c->node_atom, XCB_ATOM_STRING, 0, 256).sequence);
+        if (!prop) continue;
+        found = prop->type == XCB_ATOM_STRING && prop->format == 8 &&
+            prop->num_items == strlen(node) && !prop->bytes_after &&
+            memcmp(xcb_input_xi_get_property_items(prop), node, strlen(node)) == 0;
+        free(prop);
+    }
+    free(reply);
+    return found;
+}
+
+static bool consumer_wait(UinputConsumer *c, const char *node, const char *name) {
+    if (consumer_enabled(c, node, name)) return true;
+    while (md_now_ms() < c->deadline) {
+        xcb_generic_event_t *event;
+        bool changed = false;
+        while (md_now_ms() < c->deadline && (event = xcb_poll_for_event(c->connection))) {
+            xcb_ge_generic_event_t *ge = (void *)event;
+            if ((event->response_type & 0x7f) == XCB_GE_GENERIC &&
+                ge->extension == c->opcode && ge->event_type == XCB_INPUT_HIERARCHY)
+                changed = true;
+            free(event);
+        }
+        if (changed && consumer_enabled(c, node, name)) return true;
+        int64_t left = c->deadline - md_now_ms();
+        if (left <= 0 || xcb_connection_has_error(c->connection)) break;
+        struct pollfd pfd = { .fd = xcb_get_file_descriptor(c->connection), .events = POLLIN };
+        int n = poll(&pfd, 1, (int)left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) break;
+    }
+    return false;
+}
+
+static int uinput_dev_create(int fd, const char *label, const char *name) {
     struct udev *udev = udev_new();
     struct udev_monitor *mon = NULL;
     if (udev) {
@@ -100,6 +294,19 @@ static int uinput_dev_create(int fd, const char *label) {
         }
     }
 
+    UinputConsumer consumer = {0};
+    bool desktop = getenv("DISPLAY") && getenv("DISPLAY")[0];
+    const char *session_type = getenv("XDG_SESSION_TYPE");
+    if ((getenv("WAYLAND_DISPLAY") && getenv("WAYLAND_DISPLAY")[0]) ||
+        (session_type && !strcmp(session_type, "wayland")) ||
+        (desktop && !consumer_watch(&consumer))) {
+        MD_LOG_E("%s: no acknowledged X11 consumer; use portal input on Wayland", label);
+        consumer_close(&consumer);
+        if (mon) udev_monitor_unref(mon);
+        if (udev) udev_unref(udev);
+        return -1;
+    }
+    char node[256] = {0};
     int rc = ioctl(fd, UI_DEV_CREATE);
     char sysname[64] = {0};
     if (rc == 0 && mon &&
@@ -118,6 +325,7 @@ static int uinput_dev_create(int fd, const char *label) {
             while (!settled && md_now_ms() < deadline &&
                    (dev = udev_monitor_receive_device(mon)) != NULL) {
                 settled = uinput_is_our_event_node(dev, sysname);
+                if (settled) snprintf(node, sizeof(node), "%s", udev_device_get_devnode(dev));
                 udev_device_unref(dev);
             }
         }
@@ -125,6 +333,12 @@ static int uinput_dev_create(int fd, const char *label) {
             MD_LOG_W("%s: udev did not announce %s within %d ms", label, sysname,
                      UINPUT_UDEV_SETTLE_MS);
     }
+    if (rc == 0 && desktop && (!node[0] || !consumer_wait(&consumer, node, name))) {
+        MD_LOG_E("%s: desktop did not enable the new evdev node", label);
+        ioctl(fd, UI_DEV_DESTROY);
+        rc = -1;
+    }
+    consumer_close(&consumer);
     if (mon) udev_monitor_unref(mon);
     if (udev) udev_unref(udev);
     return rc;
@@ -160,14 +374,15 @@ static int create_keyboard(void) {
 
     struct uinput_setup setup;
     memset(&setup, 0, sizeof(setup));
-    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "metadesk-keyboard");
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "metadesk-keyboard-%ld-%llu",
+             (long)getpid(), (unsigned long long)md_monotonic_ns());
     setup.id.bustype = BUS_VIRTUAL;
     setup.id.vendor  = 0x1234;
     setup.id.product = 0x0001;
     setup.id.version = 1;
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) { close(fd); return -1; }
-    if (uinput_dev_create(fd, "keyboard") < 0) { close(fd); return -1; }
+    if (uinput_dev_create(fd, "keyboard", setup.name) < 0) { close(fd); return -1; }
     return fd;
 }
 
@@ -205,14 +420,15 @@ static int create_mouse(uint32_t screen_w, uint32_t screen_h) {
 
     struct uinput_setup setup;
     memset(&setup, 0, sizeof(setup));
-    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "metadesk-mouse");
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "metadesk-mouse-%ld-%llu",
+             (long)getpid(), (unsigned long long)md_monotonic_ns());
     setup.id.bustype = BUS_VIRTUAL;
     setup.id.vendor  = 0x1234;
     setup.id.product = 0x0002;
     setup.id.version = 1;
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) { close(fd); return -1; }
-    if (uinput_dev_create(fd, "mouse") < 0) { close(fd); return -1; }
+    if (uinput_dev_create(fd, "mouse", setup.name) < 0) { close(fd); return -1; }
     return fd;
 }
 

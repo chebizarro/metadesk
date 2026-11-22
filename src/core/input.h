@@ -106,7 +106,10 @@ typedef MdInputCtx MdInput;
 /* Create and initialise an input context with the platform backend.
  * cfg may be NULL only for legacy callers; that uses the documented
  * fallback dimensions above and logs a warning. Prefer passing actual
- * capture/display dimensions. Returns NULL on failure. */
+ * capture/display dimensions. Returns NULL on failure.
+ * Linux uinput waits for the exact new device to be enabled by a local X11
+ * consumer when DISPLAY is set; known Wayland sessions require portal input.
+ * With no desktop environment, uinput only guarantees kernel device creation. */
 MdInput *md_input_create(const MdInputConfig *cfg);
 
 /* ── Mouse injection ─────────────────────────────────────────── */

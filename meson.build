@@ -381,6 +381,9 @@ if host_os == 'linux'
   dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
   dep_atspi     = dependency('atspi-2',         version : '>=2.48')
   dep_udev      = dependency('libudev',         version : '>=252')
+  dep_xcb_input = dependency('xcb-xinput', version : '>=1.15')
+  dep_xcb = dependency('xcb', version : '>=1.15')
+  dep_xau = dependency('xau')
   dep_dbus      = dependency('dbus-1',          version : '>=1.14')
   # a11y_atspi.c calls g_object_unref/g_boxed_free directly; atspi-2.pc only
   # exposes gobject-2.0 privately, so link it explicitly.
@@ -395,7 +398,7 @@ if host_os == 'linux'
     'src/core/ipc_unix.c',
   )
   platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus,
-                        dep_gobject, dep_uuid]
+                        dep_gobject, dep_uuid, dep_xcb_input, dep_xcb, dep_xau]
 
 elif host_os == 'darwin'
   add_languages('objc', required : true)
@@ -1069,6 +1072,13 @@ test_input = executable('test_input',
   dependencies : [dep_metadesk] + wayland_test_deps,
 )
 test('input injection', test_input)
+if host_os == 'linux'
+  dep_input_x11 = dependency('x11')
+  test_input_desktop = executable('test_input_desktop',
+    'tests/test_input_desktop.c', dependencies : [dep_metadesk, dep_input_x11])
+  test('input first-key desktop (opt-in)', test_input_desktop, timeout : 180)
+endif
+
 
 test_agent = executable('test_agent',
   files('tests/test_agent.c'),
