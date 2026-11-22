@@ -777,6 +777,8 @@ core_sources = files(
   'src/core/a11y_snapshot.c',
   'src/core/input.c',
   'src/core/session.c',
+  'src/core/host_access.c',
+  'src/core/management_ipc.c',
   'src/core/jsonrpc.c',
   'src/core/mcp_server.c',
   'src/core/mcp_tools.c',
@@ -1391,3 +1393,19 @@ test('OpenH264 offline fetch', test_oh_fetch)
 
 test('OpenH264 explicit fetch CLI offline', find_program('python3'),
   args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)
+
+# Same-user host admission and management; no desktop devices.
+test_host_access = executable('test_host_access', files('tests/test_host_access.c'),
+  dependencies : dep_metadesk)
+test('host attended access state machine', test_host_access, timeout : 30)
+if host_os == 'linux' or host_os == 'darwin'
+  test_management_ipc = executable('test_management_ipc', files('tests/test_management_ipc.c'),
+    dependencies : dep_metadesk)
+  test('management IPC peer credentials', test_management_ipc, timeout : 30)
+endif
+
+if enable_nip5f and enable_client and (host_os == 'linux' or host_os == 'darwin')
+  test('attended real host client private relay', accounts_python,
+    args : [files('tests/test_host_approval.py'), metadesk_host, metadesk_client, access_signer_fixture],
+    timeout : 180)
+endif

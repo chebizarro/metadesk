@@ -558,7 +558,10 @@ static void hist_session(const char *url, const char *session_id,
     /* Earlier sessions' requests replay as history and never latch. */
     MD_CHECK(hist_wait(&hp, &hp.host_history, host_history));
     md_nostr_drain_dm(host);
-    MD_CHECK(!ctx.session_requested && hp.host_live == 0);
+    MD_CHECK(!host_has_request(&ctx));
+    pthread_mutex_lock(&hp.mu);
+    MD_CHECK(hp.host_live == 0);
+    pthread_mutex_unlock(&hp.mu);
 
     /* Arm before the client bridge exists, so replayed acceptances are
      * judged against this request rather than an idle client. */
@@ -665,7 +668,10 @@ static void test_two_relay_upgrade(const char *url1, const char *url2) {
     ctx.nostr = host;
     MD_CHECK(hist_wait(&hp, &hp.host_history, 1));
     md_nostr_drain_dm(host);
-    MD_CHECK(!ctx.session_requested && hp.host_live == 0);
+    MD_CHECK(!host_has_request(&ctx));
+    pthread_mutex_lock(&hp.mu);
+    MD_CHECK(hp.host_live == 0);
+    pthread_mutex_unlock(&hp.mu);
 
     printf("md6ns: inject\n");
     fflush(stdout);

@@ -144,6 +144,10 @@ bool md_session_reject_matches_request(const MdSessionReject *reject,
                                        int64_t rumor_created_at);
 const char *md_session_reject_message(const MdSessionReject *reject);
 
+/* Local cancellation is correlated to the authenticated sender and request.
+ * Cancel does not carry or create a stream token. */
+int md_session_cancel_from_json(const char *json, char request_id[MD_SESSION_REQUEST_ID_LEN + 1]);
+
 /* Serialize a session request to a newly-allocated JSON string. Caller frees. */
 char *md_session_request_to_json(const MdSessionRequest *req);
 

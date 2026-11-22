@@ -33,6 +33,8 @@
 #include "host_mcp.h"
 #include "capture_sync.h"
 #include "md_time.h"
+#include "host_access.h"
+#include "management_ipc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +101,11 @@ typedef struct {
     MdInput      *input;        /* raw human input injection (MD_PKT_INPUT) */
     MdNostr      *nostr;
     MdSession    *session;
+    MdHostAccess *access;
+    bool attended;
+    uint32_t supported_caps;
+    uint32_t approved_caps;
+    bool human_approved;
     uint32_t      frame_seq;
     uint32_t      pkt_seq;
     int64_t       total_encode_us;
@@ -134,7 +141,8 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
 
     pthread_mutex_lock(&ctx->client_mu);
     MdStream *client = ctx->client;
-    if (!md_stream_has_capability(client, MD_CAP_VIDEO)) {
+    if ((ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
+        !md_stream_has_capability(client, MD_CAP_VIDEO)) {
         pthread_mutex_unlock(&ctx->client_mu);
         return;
     }
@@ -164,6 +172,16 @@ static pthread_mutex_t g_host_request_mu = PTHREAD_MUTEX_INITIALIZER;
 /* Callback and host thread transfer one immutable request at a time. */
 static bool host_has_request(HostCtx *ctx) {
     pthread_mutex_lock(&g_host_request_mu);
+    if (!ctx->session_requested && ctx->access) {
+        MdHostRequest q;
+        if (md_host_access_take(ctx->access, (int64_t)time(NULL), &q)) {
+            ctx->pending_req = q.request;
+            strcpy(ctx->pending_client_pk, q.peer);
+            ctx->approved_caps = q.granted;
+            ctx->human_approved = q.human;
+            ctx->session_requested = 1;
+        }
+    }
     bool ready = ctx->session_requested != 0;
     pthread_mutex_unlock(&g_host_request_mu);
     return ready;
@@ -184,6 +202,9 @@ static bool host_wait_request(HostCtx *ctx) {
 
 static void host_rearm_request(HostCtx *ctx) {
     pthread_mutex_lock(&g_host_request_mu);
+    if (ctx->access) md_host_access_release(ctx->access);
+    ctx->approved_caps = 0;
+    ctx->human_approved = false;
     memset(&ctx->pending_req, 0, sizeof(ctx->pending_req));
     ctx->pending_client_pk[0] = '\0';
     md_session_reset(ctx->session);
@@ -214,7 +235,14 @@ static bool host_remember_request(HostCtx *ctx, const MdSessionRequest *req,
 static void host_handle_dm(const char *sender_pubkey_hex, const char *content,
                        const MdNostrDmInfo *info, void *userdata) {
     HostCtx *ctx = userdata;
-    if (!ctx || !content || !info || ctx->session_requested) return;
+    if (!ctx || !content || !info) return;
+    char cancelled[MD_SESSION_REQUEST_ID_LEN + 1];
+    if (ctx->access && info->live && md_session_cancel_from_json(content, cancelled) == 0) {
+        md_host_access_cancel(ctx->access, sender_pubkey_hex, cancelled);
+        go_channel_try_send(ctx->session_req_ch, (void *)(uintptr_t)1);
+        return;
+    }
+    if (ctx->session_requested && !ctx->access) return;
 
     /* Try to parse as session_request */
     MdSessionRequest req;
@@ -244,20 +272,32 @@ static void host_handle_dm(const char *sender_pubkey_hex, const char *content,
             return;
         }
 
-        /* Enforce allowlist: if an allowlist is configured, reject
-         * clients that are not on it. If no allowlist is configured
-         * (open mode), accept all clients. */
-        if (!ctx->nostr || !md_nostr_is_allowed(ctx->nostr, sender_pubkey_hex)) {
-            fprintf(stderr, "host: REJECTED session request from "
-                    "non-allowlisted pubkey %.*s...\n",
-                    8, sender_pubkey_hex);
-            return;
-        }
-
         if (!host_remember_request(ctx, &req, (int64_t)time(NULL))) {
             fprintf(stderr, "host: ignoring replayed session request or full replay cache\n");
             return;
         }
+        uint32_t grant = md_nostr_granted_capabilities(ctx->nostr, sender_pubkey_hex, req.capabilities);
+        if (ctx->access) {
+            grant &= ctx->supported_caps;
+            if (!grant || md_host_access_auto(ctx->access, sender_pubkey_hex, &req,
+                                               grant, (int64_t)time(NULL))) {
+                if (ctx->attended && !md_host_access_enqueue(ctx->access, sender_pubkey_hex,
+                                                            &req, (int64_t)time(NULL))) {
+                    fprintf(stderr, "host: pending attended request %.32s from %.64s\n", req.request_id, sender_pubkey_hex);
+                } else {
+                    fprintf(stderr, "host: refused session request %.32s (not authorized or busy)\n", req.request_id);
+                    MdSessionReject reject = {0};
+                    strcpy(reject.request_id, req.request_id);
+                    strcpy(reject.reason, "request_refused");
+                    char *json = md_session_reject_to_json(&reject);
+                    if (json && md_nostr_send_session_accept(ctx->nostr, sender_pubkey_hex, json))
+                        fprintf(stderr, "host: failed to publish admission refusal\n");
+                    free(json);
+                }
+                return;
+            }
+            ctx->approved_caps = grant;
+        } else if (!grant) return;
 
         strncpy(ctx->pending_client_pk, sender_pubkey_hex,
                 sizeof(ctx->pending_client_pk) - 1);
@@ -472,7 +512,9 @@ static int host_reject_request(HostCtx *ctx, const char *reason) {
 /* Publish only after listener/backend startup, so no valid proof is stranded
  * in the listen backlog while the client's bounded ACK wait expires. */
 static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
-    if (!g_running || (owner && !md_account_binding_is_current(owner)) ||
+    if ((ctx->access && (!md_host_access_valid(ctx->access, ctx->pending_req.request_id) ||
+        (int64_t)time(NULL) >= ctx->pending_req.expires_at)) ||
+        !g_running || (owner && !md_account_binding_is_current(owner)) ||
         (ctx->capture_required && (!ctx->capture_ready ||
                                    atomic_load(&ctx->capture_failed)))) return -1;
     if (md_session_request_freshness(&ctx->pending_req, (int64_t)time(NULL),
@@ -492,7 +534,9 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     int ret = md_nostr_send_session_accept(ctx->nostr, ctx->pending_client_pk, json);
     OPENSSL_cleanse(json, strlen(json));
     free(json);
-    if (ret || !g_running || (owner && !md_account_binding_is_current(owner)))
+    if (ret || !g_running ||
+        (ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
+        (owner && !md_account_binding_is_current(owner)))
         return -1;
     if (ctx->session_log)
         md_session_log_event(ctx->session_log, MD_SESSION_LOG_ACCEPT,
@@ -504,11 +548,17 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
 /* Candidate ownership stays on the host thread. It is never published here;
  * capture sees it only after the bind has consumed the reservation and ACKed. */
 static int host_bind_candidate(HostCtx *ctx, MdStream *candidate) {
-    if (ctx->client) {
+    if (ctx->client || (ctx->access &&
+        !md_host_access_valid(ctx->access, ctx->pending_req.request_id))) {
         md_stream_close(candidate);
         return -1;
     }
-    return md_stream_accept_binding(candidate, ctx->session);
+    int rc = md_stream_accept_binding(candidate, ctx->session);
+    if (!rc && ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) {
+        md_stream_close(candidate);
+        return -1;
+    }
+    return rc;
 }
 
 static MdAgentTreeJob *host_send_initial_tree(HostCtx *ctx) {
@@ -525,7 +575,8 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
     uint32_t needed = 0;
     if (hdr->type == MD_PKT_INPUT) needed = MD_CAP_INPUT;
     if (hdr->type == MD_PKT_ACTION) needed = MD_CAP_AGENT | MD_CAP_INPUT;
-    if (hdr->type == MD_PKT_SESSION_INFO ||
+    if ((ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
+        hdr->type == MD_PKT_SESSION_INFO ||
         !md_stream_has_capability(ctx->client, needed)) {
         fprintf(stderr, "host: rejecting stream packet type=0x%02x: capability/proof violation\n",
                 hdr->type);
@@ -662,6 +713,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-public-url URL   Accepted exact NIP-98 /mcp URL (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-npub NPUB  MCP HTTP authorized signer (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-file PATH  MCP HTTP npub allowlist (one per line)\n");
+    fprintf(stderr, "  --attended           Enable bounded local approval of unlisted clients\n");
+    fprintf(stderr, "  --management-socket PATH  Private same-user management endpoint\n");
     fprintf(stderr, "  --mcp-allow-host-list  Also authorize NIP-98 signers granted 'agent' by the saved\n"
                     "                   host role's live metadesk-allowlist (uses --relay);\n"
                     "                   action tools also need their 'input' grant\n");
@@ -832,13 +885,17 @@ cleanup:
  * Read the latest winning grant immediately before recording negotiation. */
 static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
                                const char *session_id, bool no_input) {
-    uint32_t granted = md_nostr_granted_capabilities(nostr,
+    uint32_t granted = ctx->access && ctx->human_approved ? ctx->approved_caps : md_nostr_granted_capabilities(nostr,
         ctx->pending_client_pk, ctx->pending_req.capabilities);
+    if (ctx->access && (!md_host_access_valid(ctx->access, ctx->pending_req.request_id) ||
+        (int64_t)time(NULL) >= ctx->pending_req.expires_at)) return -1;
     if (no_input) granted &= ~MD_CAP_INPUT;
     if (!granted) return -1;
     if (md_session_request(ctx->session, ctx->pending_client_pk,
             ctx->pending_req.capabilities, ctx->pending_req.tree_format)) return -1;
-    return md_session_accept(ctx->session, session_id, granted);
+    int rc = md_session_accept(ctx->session, session_id, granted);
+    if (!rc && ctx->access) md_host_access_bound(ctx->access, ctx->pending_req.request_id, session_id, granted);
+    return rc;
 }
 
 static int host_accept_fresh_request(HostCtx *ctx, MdNostr *nostr, bool no_input) {
@@ -880,10 +937,16 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
             host_rearm_request(ctx);
             continue;
         }
-        if (host_replace_agent(ctx, agent, cfg) != 0 ||
-            host_publish_session_accept(ctx, owner) != 0) {
+        if (host_replace_agent(ctx, agent, cfg) != 0) {
             host_reject_request(ctx, "request_refused");
             return -1;
+        }
+        if (host_publish_session_accept(ctx, owner) != 0) {
+            host_reject_request(ctx, "request_refused");
+            if (!ctx->access || !g_running || atomic_load(&ctx->capture_failed) ||
+                (owner && !md_account_binding_is_current(owner))) return -1;
+            host_rearm_request(ctx);
+            continue;
         }
         return 0;
     }
@@ -891,7 +954,8 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
 }
 
 static bool host_binding_pending(HostCtx *ctx, uint64_t now_ms) {
-    return ctx->session->state == MD_SESSION_NEGOTIATING &&
+    return (!ctx->access || md_host_access_valid(ctx->access, ctx->pending_req.request_id)) &&
+        ctx->session->state == MD_SESSION_NEGOTIATING &&
         ctx->session->stream_token[0] && now_ms < ctx->session->stream_deadline_ms;
 }
 
@@ -915,7 +979,14 @@ static void host_finish_client(HostCtx *ctx, MdStream *client) {
 #include "win_dpi.h"
 #endif
 
+static void host_management_wake(void *data) {
+    HostCtx *ctx = data;
+    if (ctx->session_req_ch) go_channel_try_send(ctx->session_req_ch, (void *)(uintptr_t)1);
+}
+
 static int host_run(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "session") || !strcmp(argv[1], "requests")))
+        return md_host_management_cli(argv[1], argc - 2, argv + 2);
     /* Standalone explicit action, before capture, signer, relay or threads. */
     if (argc > 1 && strcmp(argv[1], "--fetch-openh264") == 0) {
         if (argc != 2) {
@@ -990,6 +1061,8 @@ static int host_run(int argc, char **argv) {
     size_t mcp_public_url_count = 0, mcp_allow_npub_count = 0;
     bool mcp_allow_host_list = false;
     bool no_input = false;
+    bool attended = false;
+    const char *management_socket = NULL;
     MdInputConfig input_options = {0};
     bool signaling_option = false;
     const char *mcp_http_bind = NULL;
@@ -1025,6 +1098,10 @@ static int host_run(int argc, char **argv) {
             if (path_option) openh264_path = argv[i];
             else encoder_name = argv[i];
         }
+        else if (strcmp(argv[i], "--attended") == 0)
+            attended = true;
+        else if (strcmp(argv[i], "--management-socket") == 0 && i + 1 < argc)
+            management_socket = argv[++i];
         else if (strcmp(argv[i], "--no-capture") == 0)
             do_capture = false;
         /* Capture policy: portal-required on Linux, never direct fallback. */
@@ -1333,6 +1410,21 @@ static int host_run(int argc, char **argv) {
         }
     }
 
+#ifdef _WIN32
+    if (attended || management_socket) {
+        fprintf(stderr, "ERROR: attended management unsupported on Windows; owner-DACL/client-SID pipe required\n");
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
+        return 1;
+    }
+#endif
+    MdHostAccess access;
+    if (md_host_access_init(&access)) {
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
+        return 1;
+    }
+    MdManagementIpc *management = NULL;
     /* Initialize session state */
     MdSession session;
     md_session_init(&session);
@@ -1351,6 +1443,9 @@ static int host_run(int argc, char **argv) {
         .session     = &session,
         .session_log = session_log,
         .capture_required = do_capture,
+        .access = &access,
+        .attended = attended,
+        .supported_caps = MD_HOST_ACCESS_CAPS & (no_input ? ~MD_CAP_INPUT : MD_HOST_ACCESS_CAPS),
     };
     pthread_mutex_init(&ctx.client_mu, NULL);
     if (expected_client_pk[0])
@@ -1381,12 +1476,25 @@ static int host_run(int argc, char **argv) {
 
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (nostr) {
+            pthread_mutex_lock(&g_host_request_mu);
             ctx.nostr = nostr;
+            pthread_mutex_unlock(&g_host_request_mu);
 
             /* Wire nostr into session log for relay publishing */
             if (session_log)
                 md_session_log_set_nostr(session_log, nostr);
 
+#ifndef _WIN32
+            char *host_key = NULL;
+            if (md_signer_get_pubkey(signer, &host_key) == 0)
+                management = md_management_start(&access, nostr, host_key, management_socket,
+                    ctx.supported_caps, host_management_wake, &ctx);
+            free(host_key);
+            if (!management) {
+                fprintf(stderr, "host: management endpoint unavailable/unsafe; use --management-socket with a private canonical parent\n");
+                if (attended || management_socket) goto signaling_failed;
+            }
+#endif
             /* Subscribe to allowlist updates */
             md_nostr_refresh_allowlist(nostr);
 
@@ -1398,7 +1506,7 @@ static int host_run(int argc, char **argv) {
 
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
-            if (host_wait_request(&ctx) &&
+            while (host_wait_request(&ctx) &&
                 (!account.binding || md_account_binding_is_current(account.binding))) {
                 if (fips_npub) {
                     printf("host: waiting for FIPS peer readiness for %.*s...\n",
@@ -1418,15 +1526,9 @@ static int host_run(int argc, char **argv) {
                     printf("host: FIPS peer ready: %s\n", ready.detail);
                 }
 
-                if (host_accept_fresh_request(&ctx, nostr, no_input) != 0)
-                    goto signaling_failed;
-
-            } else if (g_running) {
-                if (fips_npub || account.binding) {
-                    fprintf(stderr, "ERROR: authorized host-role session request unavailable; refusing direct TCP fallback\n");
-                    goto signaling_failed;
-                }
-                fprintf(stderr, "ERROR: no negotiated session request\n");
+                if (host_accept_fresh_request(&ctx, nostr, no_input) == 0) break;
+                host_reject_request(&ctx, "request_refused");
+                host_rearm_request(&ctx);
             }
         } else {
             if (fips_npub || account.binding) {
@@ -1444,6 +1546,8 @@ static int host_run(int argc, char **argv) {
     goto signaling_ready;
 signaling_failed:
     free(ctx.cached_frame.data);
+    md_nostr_stop(nostr);
+    md_management_stop(management);
     md_nostr_destroy(nostr);
     if (ctx.session_req_ch) {
         go_channel_close(ctx.session_req_ch);
@@ -1452,6 +1556,7 @@ signaling_failed:
     md_session_log_destroy(session_log);
     md_signer_destroy(signer);
     md_account_startup_clear(&account);
+    md_host_access_destroy(&access);
     pthread_mutex_destroy(&ctx.client_mu);
     return 1;
 signaling_ready:
@@ -1598,8 +1703,14 @@ signaling_ready:
         host_reject_request(&ctx, ctx.capture_required &&
             (!ctx.capture_ready || atomic_load(&ctx.capture_failed))
             ? "capture_unavailable" : "request_refused");
-        exit_status = 1;
-        g_running = 0; /* Use the normal backend cleanup below. */
+        if (g_running && !atomic_load(&ctx.capture_failed) &&
+            (!ctx.capture_required || ctx.capture_ready) &&
+            (!account.binding || md_account_binding_is_current(account.binding))) {
+            host_rearm_request(&ctx);
+        } else {
+            exit_status = 1;
+            g_running = 0; /* Use the normal backend cleanup below. */
+        }
     }
 
     /* ══════════════════════════════════════════════════════════════
@@ -1692,6 +1803,7 @@ signaling_ready:
         uint32_t last_br = bitrate;
 
         while (g_running && !atomic_load(&ctx.capture_failed) &&
+               (!ctx.access || md_host_access_valid(ctx.access, ctx.pending_req.request_id)) &&
                md_stream_is_connected(client)) {
             char *tree = NULL;
             if (initial_tree && md_agent_tree_take(initial_tree, &tree) == 1) {
@@ -1699,7 +1811,8 @@ signaling_ready:
                 initial_tree = NULL;
                 if (tree) {
                     pthread_mutex_lock(&ctx.client_mu);
-                    if (md_stream_has_capability(client, MD_CAP_AGENT))
+                    if ((!ctx.access || md_host_access_valid(ctx.access, ctx.pending_req.request_id)) &&
+                        md_stream_has_capability(client, MD_CAP_AGENT))
                         md_stream_send(client, MD_PKT_UI_TREE, ctx.pkt_seq++,
                                        (const uint8_t *)tree, (uint32_t)strlen(tree));
                     pthread_mutex_unlock(&ctx.client_mu);
@@ -1789,6 +1902,9 @@ signaling_ready:
             }
         }
 
+        pthread_mutex_lock(&ctx.client_mu);
+        md_stream_close(client);
+        pthread_mutex_unlock(&ctx.client_mu);
         free(md_agent_tree_finish(initial_tree));
 
         /* Client disconnected — clean up per-connection resources */
@@ -1852,6 +1968,8 @@ signaling_ready:
 
     md_stream_server_destroy(srv);
 
+    md_nostr_stop(nostr);
+    md_management_stop(management);
     md_nostr_destroy(nostr);
     if (ctx.session_req_ch) {
         go_channel_close(ctx.session_req_ch);
@@ -1861,6 +1979,7 @@ signaling_ready:
     md_signer_destroy(signer);
     md_account_startup_clear(&account);
 
+    md_host_access_destroy(&access);
     pthread_mutex_destroy(&ctx.client_mu);
 
     printf("host: done. served %u client(s)\n", client_num);

@@ -159,8 +159,8 @@ def run(host, client, crypto):
             denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
                                      str(root / "host.sock")], env=env,
                                     capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "timed out waiting for session accept" in denied.stderr, denied
-            hp.wait("non-allowlisted pubkey")
+            assert denied.returncode == 1 and "host refused session" in denied.stderr, denied
+            hp.wait("refused session request")
             assert not proxy.proofs, "unauthorized client reached TCP"
             print("PASS: non-allowlisted signed client is refused before TCP")
             cp = Process([*args, "--timeout", "5000", "--socket-signer", str(root / "client.sock")], env)
@@ -211,7 +211,7 @@ def run(host, client, crypto):
             denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
                                      str(root / "host.sock")], env=env,
                                     capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "timed out waiting for session accept" in denied.stderr, denied
+            assert denied.returncode == 1 and "host refused session" in denied.stderr, denied
             assert hp.p.poll() is None
             # Also exercise positional syntax straight to the native host
             # listener, with no fault proxy anywhere in this connection.
