@@ -9,7 +9,7 @@ authority of a `--mcp-public-url` gets 403. After that, a request must carry one
 
 | Scheme | Header | Configure with |
 |---|---|---|
-| Bearer | `Authorization: Bearer <token>` | `--mcp-token-file PATH` (regular file, mode exactly 0600) |
+| Bearer | `Authorization: Bearer <token>` | `--mcp-token-file PATH` (owner-only regular file; see Windows below) |
 | NIP-98 | `Authorization: Nostr <base64 kind-27235 event>` | one or more NIP-98 sources (below) |
 
 With no credential configured, a loopback bind serves unauthenticated requests
@@ -491,3 +491,60 @@ events, delivered through a condition variable. The filter is tightly scoped:
 host author, kind 30000, exact `#d`, `limit:1`. The proxy's SSE reconnect is
 HTTP, not Nostr; it backs off and re-signs. Test waits are failure bounds,
 never completion signals: the barriers are the logged EOSE and version lines.
+
+## Bearer file permissions on Windows
+
+Windows does not authorize using POSIX mode bits. A bearer file must be owned
+by the current user, have no DACL allow grants to other SIDs, and be inside an
+owner-only directory. Even SYSTEM/Administrators read grants are rejected.
+Null DACLs, hardlinks, reparse points (including parent junctions), alternate
+streams, mapped/SUBST drives and non-local/relative paths are rejected with an explicit startup
+error. The opened file and all ancestors are pinned while validating/reading;
+handles are not inherited, and concurrent writes/deletes are denied. The token
+is read once, validated, copied, and temporary buffers are wiped. POSIX still
+requires current ownership, exactly 0600, and a single-link regular file.
+
+Create a **new** random bearer file in PowerShell (do not use `chmod` or save a
+secret into a broadly readable file and fix it afterwards):
+
+```powershell
+$dir = Join-Path $env:LOCALAPPDATA 'metadesk\mcp'
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object System.Security.AccessControl.DirectorySecurity
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $dir -AclObject $acl
+$path = Join-Path $dir 'bearer.txt'
+$fileAcl = New-Object System.Security.AccessControl.FileSecurity
+$fileAcl.SetOwner($sid)
+$fileAcl.SetAccessRuleProtection($true, $false)
+$fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $sid, 'FullControl', 'Allow')))
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$random = New-Object byte[] 32
+$rng.GetBytes($random)
+$bytes = [Text.Encoding]::ASCII.GetBytes([Convert]::ToBase64String($random) + "`n")
+$stream = $null
+try {
+    $stream = New-Object IO.FileStream($path, [IO.FileMode]::CreateNew,
+        [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None,
+        4096, [IO.FileOptions]::None, $fileAcl)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+} finally {
+    if ($stream) { $stream.Dispose() }
+    $rng.Dispose()
+    [Array]::Clear($random, 0, $random.Length)
+    [Array]::Clear($bytes, 0, $bytes.Length)
+}
+# Start your configured host with: --mcp-token-file $path
+```
+
+The new file receives an explicit current-user owner and protected, owner-only
+DACL at creation, including when an elevated token defaults to a group owner. Never print its contents into logs or put the token itself in argv.
+Use a directory without junction/symlink ancestors. An existing file is not
+overwritten by this recipe.

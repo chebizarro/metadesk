@@ -8,6 +8,7 @@
 #include "mcp_server.h"
 #include "md_mcp_fixture.h"
 #include "mcp_http.h"
+#include "md_test_win_private.h"
 #include "jsonrpc.h"
 #include "session.h"
 #include <nostr-event.h>
@@ -1046,7 +1047,35 @@ static int auth_status(uint16_t port, const char *method, const char *path,
     return status;
 }
 
-#ifndef _WIN32
+static void bearer_fixture(char path[32768], const char *token) {
+#ifdef _WIN32
+    char *dir = md_test_win_directory();
+    MD_CHECK(dir != NULL);
+    if (!dir) return;
+    snprintf(path, 32768, "%s/token", dir);
+    MdWinDirectory *d = md_win_directory(dir, false);
+    MD_CHECK(d && md_win_replace(d, "token", token, strlen(token)));
+    md_win_directory_close(d); free(dir);
+#else
+    snprintf(path, 32768, "/tmp/md-http-token-XXXXXX");
+    int fd = mkstemp(path); MD_CHECK(fd >= 0);
+    MD_CHECK(write(fd, token, strlen(token)) == (ssize_t)strlen(token)); close(fd);
+#endif
+}
+static void bearer_remove(char *path) {
+    MD_CHECK(!unlink(path));
+#ifdef _WIN32
+    char *slash = strrchr(path, '/');
+    if (slash) { *slash = 0; MD_CHECK(RemoveDirectoryA(path)); *slash = '/'; }
+#endif
+}
+static void bearer_permissions(const char *path, bool private) {
+#ifdef _WIN32
+    MD_CHECK(md_test_win_acl(path, private));
+#else
+    MD_CHECK(!chmod(path, private ? 0600 : 0644));
+#endif
+}
 static void test_auth_configuration(void)
 {
     MdMcpServer *mcp = make_mcp_server();
@@ -1055,15 +1084,12 @@ static void test_auth_configuration(void)
     cfg.bind_addr = "::";
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
     cfg.bind_addr = NULL;
-    char token_path[] = "/tmp/md-http-token-XXXXXX";
-    MdSocket fd = mkstemp(token_path);
-    MD_CHECK(fd >= 0);
-    MD_CHECK(write(fd, "test-secret\n", 12) == 12);
-    md_socket_close(fd);
+    char token_path[32768];
+    bearer_fixture(token_path, "test-secret\n");
     cfg.token_file = token_path;
-    MD_CHECK(chmod(token_path, 0644) == 0);
+    bearer_permissions(token_path, false);
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
-    MD_CHECK(chmod(token_path, 0600) == 0);
+    bearer_permissions(token_path, true);
     FILE *token_file = fopen(token_path, "wb");
     MD_CHECK(token_file != NULL);
     const char malformed[] = "a\0long-secret\n";
@@ -1078,7 +1104,7 @@ static void test_auth_configuration(void)
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     MD_CHECK(http != NULL);
     if (!http) {
-        unlink(token_path);
+        bearer_remove(token_path);
         md_mcp_server_destroy(mcp);
         return;
     }
@@ -1099,10 +1125,7 @@ static void test_auth_configuration(void)
         MD_CHECK(md_mcp_http_create(&cfg) == NULL);
     }
     cfg.public_url_count = 0;
-    char allow_path[] = "/tmp/md-http-allow-XXXXXX";
-    fd = mkstemp(allow_path);
-    MD_CHECK(fd >= 0);
-    md_socket_close(fd);
+    char allow_path[32768]; bearer_fixture(allow_path, "");
     cfg.allow_file = allow_path;
     MD_CHECK(md_mcp_http_create(&cfg) == NULL); /* explicit empty list fails closed */
     FILE *file = fopen(allow_path, "w");
@@ -1112,23 +1135,18 @@ static void test_auth_configuration(void)
     cfg.bind_addr = "0.0.0.0";
     http = md_mcp_http_create(&cfg);
     free(npub);
-    unlink(token_path); unlink(allow_path);
+    bearer_remove(token_path); bearer_remove(allow_path);
     REQUIRE_HTTP(http, mcp);
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
     PASS("auth startup credentials, permissions, URL validation and allow-file");
 }
-#endif
 
-#ifndef _WIN32
 static void test_http_auth(void)
 {
     MdMcpServer *mcp = make_mcp_server();
-    char token_path[] = "/tmp/md-http-auth-XXXXXX";
-    MdSocket fd = mkstemp(token_path);
-    MD_CHECK(fd >= 0);
-    MD_CHECK(write(fd, "test-secret\n", 12) == 12);
-    md_socket_close(fd);
+    char token_path[32768];
+    bearer_fixture(token_path, "test-secret\n");
     char *npub = test_npub();
     const char *npubs[] = {npub};
     const char *urls[] = {"https://agent.example/mcp", "http://proxy.example:8000/mcp"};
@@ -1137,7 +1155,7 @@ static void test_http_auth(void)
         .public_urls = urls, .public_url_count = 2 };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     /* Config is owned by the server, not borrowed from its caller/files. */
-    unlink(token_path); free(npub);
+    bearer_remove(token_path); free(npub);
     REQUIRE_HTTP(http, mcp);
     uint16_t port = md_mcp_http_port(http);
     ServerArgs sa = { .http = http, .result = -1 };
@@ -1216,7 +1234,6 @@ static void test_http_auth(void)
     md_mcp_server_destroy(mcp);
     PASS("bearer and NIP-98 POST/SSE authentication, replay, payload, Host/Origin, healthz");
 }
-#endif
 
 /* ── Live NIP-98 authorizer (md-ah9.3) ───────────────────────── */
 
@@ -1572,17 +1589,13 @@ static MdMcpServer *make_caps_server(void)
     return mcp;
 }
 
-#ifndef _WIN32
 static void test_per_principal_tool_caps(void)
 {
     char *pk1 = nostr_key_get_public(auth_sk);
     char *npub2 = npub_for(auth_sk2);
     MD_CHECK(pk1 && npub2);
-    char token_path[] = "/tmp/md-http-caps-XXXXXX";
-    MdSocket fd = mkstemp(token_path);
-    MD_CHECK(fd >= 0);
-    MD_CHECK(write(fd, "caps-secret\n", 12) == 12);
-    md_socket_close(fd);
+    char token_path[32768];
+    bearer_fixture(token_path, "caps-secret\n");
     LiveAcl acl = { .mu = PTHREAD_MUTEX_INITIALIZER };
     MdMcpServer *mcp = make_caps_server();
     const char *npubs[] = { npub2 };
@@ -1590,7 +1603,7 @@ static void test_per_principal_tool_caps(void)
         .allow_npubs = npubs, .allow_npub_count = 1,
         .nip98_grant = live_acl_grant, .nip98_grant_userdata = &acl };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    unlink(token_path);
+    bearer_remove(token_path);
     REQUIRE_HTTP(http, mcp);
     wire_server_to_http(mcp, http);
     uint16_t port = md_mcp_http_port(http);
@@ -1683,7 +1696,6 @@ static void test_per_principal_tool_caps(void)
     PASS("per-principal caps: live agent-only hides/refuses actions, grant changes apply "
          "next request, static/bearer/open full, SSE recheck needs agent");
 }
-#endif
 
 static void test_unauthenticated_guards_and_read_budget(void)
 {
@@ -1823,14 +1835,10 @@ static void expect_list_changes(MdMcpHttp *http, const MdSocket *fds, const int 
     }
 }
 
-#ifndef _WIN32
 static void test_grant_change_list_changed(void)
 {
-    char token_path[] = "/tmp/md-http-watch-XXXXXX";
-    int tfd = mkstemp(token_path);
-    MD_CHECK(tfd >= 0);
-    MD_CHECK(write(tfd, "watch-secret\n", 13) == 13);
-    md_socket_close(tfd);
+    char token_path[32768];
+    bearer_fixture(token_path, "watch-secret\n");
     char *pk1 = nostr_key_get_public(auth_sk);
     char *pk2 = nostr_key_get_public(auth_sk2);
     MD_CHECK(pk1 && pk2);
@@ -1845,7 +1853,7 @@ static void test_grant_change_list_changed(void)
     MdMcpHttp *http = md_mcp_http_create(&cfg);
     /* One listener per source: a failed registration fails create cleanly. */
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
-    unlink(token_path);
+    bearer_remove(token_path);
     REQUIRE_HTTP(http, mcp);
     MD_CHECK(acl.on_change != NULL);
     wire_server_to_http(mcp, http);
@@ -1947,7 +1955,6 @@ static void test_grant_change_list_changed(void)
     PASS("grant change: one targeted list_changed per tool-set change, none for no-op/"
          "bearer/other principals, revocation closes, quiesce/teardown safe");
 }
-#endif
 
 static void wait_sse_count(MdMcpHttp *http, int want)
 {
@@ -1960,14 +1967,10 @@ static void wait_sse_count(MdMcpHttp *http, int want)
 /* md-554: while the live source cannot answer, its streams are held (open,
  * sent nothing) and its principals refused; the first known answer closes,
  * notifies or silently resumes each one. Bearer streams are unaffected. */
-#ifndef _WIN32
 static void test_grant_outage_holds_streams(void)
 {
-    char token_path[] = "/tmp/md-http-hold-XXXXXX";
-    int tfd = mkstemp(token_path);
-    MD_CHECK(tfd >= 0);
-    MD_CHECK(write(tfd, "hold-secret\n", 12) == 12);
-    md_socket_close(tfd);
+    char token_path[32768];
+    bearer_fixture(token_path, "hold-secret\n");
     char *pk1 = nostr_key_get_public(auth_sk);
     char *pk2 = nostr_key_get_public(auth_sk2);
     MD_CHECK(pk1 && pk2);
@@ -1980,7 +1983,7 @@ static void test_grant_outage_holds_streams(void)
         .nip98_grant = watch_acl_grant, .nip98_grant_userdata = &acl,
         .nip98_grant_watch = watch_acl_watch, .max_clients = 3 };
     MdMcpHttp *http = md_mcp_http_create(&cfg);
-    unlink(token_path);
+    bearer_remove(token_path);
     REQUIRE_HTTP(http, mcp);
     wire_server_to_http(mcp, http);
     uint16_t port = md_mcp_http_port(http);
@@ -2076,7 +2079,6 @@ out:
     PASS("allowlist outage: live streams held (no frames, no close), live requests refused; "
          "recovery resumes, notifies once or closes; held slots yield to bearer");
 }
-#endif
 
 /* ── Main ────────────────────────────────────────────────────── */
 
@@ -2084,39 +2086,12 @@ int main(void)
 {
     printf("test_mcp_http: HTTP+SSE transport tests\n");
 
-#ifndef _WIN32
     test_auth_configuration();
-#else
-    puts("SKIP: test_auth_configuration requires POSIX bearer-token permissions");
-#endif
-#ifndef _WIN32
     test_http_auth();
-#else
-    puts("SKIP: test_http_auth requires POSIX bearer-token permissions");
-#endif
-#ifdef _WIN32
-    MdMcpServer *token_server = make_mcp_server();
-    MdMcpHttpConfig token_config = { .server = token_server,
-        .token_file = __FILE__, .ephemeral_port = true };
-    MD_CHECK(md_mcp_http_create(&token_config) == NULL);
-    md_mcp_server_destroy(token_server);
-#endif
     test_live_authorizer();
-#ifndef _WIN32
     test_per_principal_tool_caps();
-#else
-    puts("SKIP: test_per_principal_tool_caps requires POSIX bearer-token permissions");
-#endif
-#ifndef _WIN32
     test_grant_change_list_changed();
-#else
-    puts("SKIP: test_grant_change_list_changed requires POSIX bearer-token permissions");
-#endif
-#ifndef _WIN32
     test_grant_outage_holds_streams();
-#else
-    puts("SKIP: test_grant_outage_holds_streams requires POSIX bearer-token permissions");
-#endif
     test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();
