@@ -22,7 +22,8 @@ Never build in the macOS main checkout or another lane's VM tree.
 | Windows native Meson setup + full build, client/tools enabled | Exit 0 |
 | Windows-applicable Meson suite | 29 passed, 0 failed; conditional cells listed below |
 | macOS Meson suite in L9 worktree | 37 passed, 0 failed |
-| Linux VM `/home/bizarro/md-l9`, native compile `-j2`, no containers | Exit 0; Linux tests not run |
+| Linux VM `/home/bizarro/md-l9`, build and full suite `-j2` | Exit 0; 36 passed, 0 failed |
+| Linux ASan+UBSan focused stream/MCP/host-binding gates | Exit 0; 6 passed, 0 failed, leak detection enabled |
 | Native `metadesk-host.exe --help` | Exit 0, usage printed |
 | Native `metadesk-client.exe --help` | Exit 0, usage printed |
 | Interactive `metadesk-host.exe capture-frame host-frame.raw` | Exit 0; 1024x768 BGRA, stride 4096, 3,145,728 bytes |
@@ -94,6 +95,72 @@ I/O diagnostic control stayed at 97 through repeated cancellation/EOF/write cycl
 than add a success sleep or relax an assertion, ownership coverage is isolated
 from unrelated asynchronous DLL initialization; full-product stdio integration
 also remains tested. The diagnostic idle intervals are not part of the gates.
+
+## Linux pre-merge verification of `cbf3b76`
+
+The unmodified port passed the full baseline Linux suite (36/36). That first
+pass exposed a safety preflight miss: `test_agent` called a real input
+constructor before its no-a11y skip, independently of `MD_INPUT_LIVE_TESTS`.
+On this VM the UID has `/dev/uinput` access. The contexts were destroyed on the
+skip path and no actions were dispatched through them, but this was not a
+valid device-free run and must not be described as one.
+
+The follow-up changes **only the agent test and this guide**, not production
+stream/MCP/I/O code: remove the unused input constructor/cleanup from its
+tree-only smoke and require `MD_A11Y_LIVE_TESTS=1` before creating live a11y.
+All mocked input assertions remain; no timeout or assertion was relaxed.
+After the fix, Linux passed **36/36** and macOS passed **37/37** again. The
+Windows results above refer to the original port qualification, not a new
+Windows rerun for this test-only follow-up.
+
+Linux used kernel 7.0.0-42-generic/aarch64, GCC 13.3.0, Meson 1.3.2, and the
+unchanged dedicated nostrc tree at `cfcb86296`. Both build and test concurrency
+were limited to `-j2`. HOME, XDG runtime/state/cache and the session-bus address
+were private to `/home/bizarro/md-l9`; live display variables were unset and
+both live-test opt-ins were 0. L7's directory and GNOME session configuration
+were not modified; no containers were used.
+
+For the final full run a task-owned, unprivileged
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) launcher denied
+host input-device access, with an additional process-local seccomp trap on
+`UI_DEV_CREATE`. System libraries/seat metadata were read-only; task directories
+and temporary files remained writable. Read-only `/run/systemd` metadata is
+necessary for private D-Bus UID/seat authorization: an earlier overly strict
+launcher denied it and caused three fixture failures, not shared-code failures.
+Restoring that narrow read-only prerequisite fixed those fixtures without
+changing their assertions or global security policy.
+
+The final `strace` audit found **zero `/dev/uinput` open attempts and zero
+successful input-device opens**. The existing offscreen SDL negative-startup
+fixture made nine read-only physical input probes; all nine were denied by
+the process policy. The audit, rather than an unconditional pass, checked the
+actual syscall results. No success sleep was added to the gates.
+
+The sanitizer profile disabled only client/tools and live opt-ins; it built
+`libmetadesk` and these test executables with `-Db_sanitize=address,undefined`:
+
+```sh
+meson compile -C build-asan -j2 \
+  test_stream test_mcp test_mcp_stdio test_mcp_http test_host_binding
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  ./safe-run meson test -C build-asan --no-rebuild --print-errorlogs -j2 \
+    'TCP stream transport' 'MCP server core' 'MCP accessibility queries' \
+    'MCP stdio transport' 'MCP HTTP+SSE transport' host_binding
+```
+
+`safe-run` is the task-owned process restriction launcher described above,
+not a production variant or container. The sanitized run was not under ptrace,
+so leak detection remained active; it passed all six tests without suppressions.
+Compile commands confirmed instrumentation of `stream.c`, `mcp_http.c`,
+`mcp_stdio.c` and `io_util.c`. Shared `io_util` is exercised by the stdio and HTTP
+transport tests; the standalone Windows I/O test is not a Linux target.
+Third-party/nostrc dependencies were reused without a sanitizer rebuild, so
+this is not a fully instrumented dependency-closure claim.
+
+The entire Linux `md-l9` directory (source, normal/sanitized builds, private
+runtime and evidence) and local task scratch were removed after recording the
+results in the bead. No work in `md-l7` or the live GNOME session was cleaned up.
 
 ## Provisioning
 
