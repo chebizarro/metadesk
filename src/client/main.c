@@ -42,12 +42,82 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <go.h>
+#include <stdatomic.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
-static volatile int g_running = 1;
-
+static atomic_int g_running = 1;
+static GoChannel *g_shutdown_ch;
+static pthread_t g_signal_thread;
+#ifndef _WIN32
+static sigset_t g_signal_set, g_previous_mask;
+#else
+static HANDLE g_signal_event;
 static void signal_handler(int sig) {
     (void)sig;
+    SetEvent(g_signal_event);
+}
+#endif
+
+/* Channel operations take locks: never call them from a POSIX handler. Block
+ * before starting workers; sigwait delivers shutdown on an ordinary thread. */
+static void *signal_waiter(void *unused) {
+    (void)unused;
+#ifndef _WIN32
+    int sig;
+    if (sigwait(&g_signal_set, &sig) != 0) return NULL;
+#else
+    WaitForSingleObject(g_signal_event, INFINITE);
+#endif
     g_running = 0;
+    go_channel_close(g_shutdown_ch);
+    return NULL;
+}
+
+static void stop_signal_wake(void) {
+    if (!g_shutdown_ch) return;
+#ifndef _WIN32
+    pthread_kill(g_signal_thread, SIGTERM);
+#else
+    SetEvent(g_signal_event);
+#endif
+    pthread_join(g_signal_thread, NULL);
+    go_channel_unref(g_shutdown_ch);
+    g_shutdown_ch = NULL;
+#ifndef _WIN32
+    pthread_sigmask(SIG_SETMASK, &g_previous_mask, NULL);
+#else
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    CloseHandle(g_signal_event);
+#endif
+}
+
+static int start_signal_wake(void) {
+    g_shutdown_ch = go_channel_create(1);
+    if (!g_shutdown_ch) return -1;
+#ifndef _WIN32
+    sigemptyset(&g_signal_set);
+    sigaddset(&g_signal_set, SIGINT);
+    sigaddset(&g_signal_set, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &g_signal_set, &g_previous_mask)) goto fail;
+#else
+    g_signal_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_signal_event) goto fail;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+#endif
+    if (!pthread_create(&g_signal_thread, NULL, signal_waiter, NULL)) return 0;
+#ifndef _WIN32
+    pthread_sigmask(SIG_SETMASK, &g_previous_mask, NULL);
+#else
+    CloseHandle(g_signal_event);
+#endif
+fail:
+    go_channel_unref(g_shutdown_ch);
+    g_shutdown_ch = NULL;
+    return -1;
 }
 
 /* ── State ───────────────────────────────────────────────────── */
@@ -361,6 +431,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     void *dummy = NULL;
     GoSelectCase cases[] = {
         { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &dummy },
+        { .op = GO_SELECT_RECEIVE, .chan = g_shutdown_ch, .recv_buf = &dummy },
     };
     int64_t deadline_us = now_us() + (int64_t)wait_ms * 1000;
     int accepted = 0;
@@ -371,7 +442,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         int64_t left_us = deadline_us - now_us();
         if (accepted || left_us <= 0 || !client_owner_current(ctx))
             break;
-        go_select_timeout(cases, 1, (uint64_t)(left_us + 999) / 1000);
+        go_select_timeout(cases, g_shutdown_ch ? 2 : 1, (uint64_t)(left_us + 999) / 1000);
     }
     pthread_mutex_lock(&g_negotiation_mu);
     ctx->request_pending = 0; /* late answers to this request are ignored */
@@ -379,7 +450,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     pthread_mutex_unlock(&g_negotiation_mu);
 
     if (!client_owner_current(ctx)) {
-        fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
+        fprintf(stderr, "client: session negotiation cancelled\n");
         return -1;
     }
     if (accepted < 0) {
@@ -726,8 +797,8 @@ int main(int argc, char **argv) {
 #else
     setvbuf(stdout, NULL, _IOLBF, 0);
 #endif
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    if (start_signal_wake() != 0) return 1;
+    atexit(stop_signal_wake);
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);  /* host going away mid-send is EPIPE, not fatal */
 #else
@@ -954,6 +1025,10 @@ int main(int argc, char **argv) {
         cleanup_session_nostr(&nostr, &ctx);
         md_signer_destroy(signer);
         md_account_startup_clear(&account);
+        if (!g_running) {
+            printf("client: done. decoded 0 frames, displayed 0, tree updates 0\n");
+            return 0;
+        }
         return 1;
     }
     printf("client: connected\n");
