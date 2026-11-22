@@ -10,7 +10,7 @@ url='https://github.com/chebizarro/metadesk'
 license=('MIT' 'Apache-2.0')
 provides=('metadesk')
 conflicts=('metadesk')
-depends=('ffmpeg' 'sdl2' 'pipewire' 'at-spi2-core' 'glib2' 'libsecret' 'systemd-libs'
+depends=('bzip2' 'ffmpeg' 'sdl2' 'pipewire' 'at-spi2-core' 'glib2' 'libsecret' 'systemd-libs'
          'dbus' 'libxcb>=1.15' 'libxau' 'util-linux-libs' 'curl' 'libwebsockets' 'openssl' 'libsecp256k1'
          'jansson' 'cjson' 'libb2' 'libyuv')
 optdepends=('fipsd: FIPS mesh transport' 'xdg-desktop-portal: desktop capture portal'

@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  libxcb-xinput-dev libxcb1-dev libxau-dev \
  libatspi2.0-dev libglib2.0-dev libsecret-1-dev libudev-dev libdbus-1-dev uuid-dev \
  libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev libjansson-dev \
- libcjson-dev libb2-dev libnsync-dev libsodium-dev libevent-dev ca-certificates \
+ libbz2-dev libcjson-dev libb2-dev libnsync-dev libsodium-dev libevent-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY src/ /src/
 COPY nostrc/ /nostrc/

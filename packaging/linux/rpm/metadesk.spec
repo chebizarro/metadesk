@@ -24,7 +24,7 @@ BuildRequires:  pkgconfig(xau)
 BuildRequires:  pkgconfig(libudev) pkgconfig(dbus-1) pkgconfig(uuid)
 BuildRequires:  pkgconfig(libcurl) pkgconfig(libwebsockets) pkgconfig(openssl)
 BuildRequires:  pkgconfig(libsecp256k1) pkgconfig(jansson) pkgconfig(libcjson)
-BuildRequires:  pkgconfig(libb2) libyuv-devel libsodium-devel
+BuildRequires:  pkgconfig(libb2) libyuv-devel libsodium-devel bzip2-devel
 BuildRequires:  systemd-rpm-macros
 Provides:       bundled(nsync) = 1.30.0
 Recommends:     xdg-desktop-portal
