@@ -94,6 +94,21 @@ def main():
         relay.server_close()
         thread.join()
     two_relay(binding, env)
+    relay = Relay()
+    thread = threading.Thread(target=relay.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"ws://127.0.0.1:{relay.server_address[1]}"
+        p = subprocess.run([binding, "--rebind-fixture", url], env=env,
+                           capture_output=True, text=True, timeout=90)
+        sys.stdout.write(p.stdout)
+        sys.stderr.write(p.stderr)
+        assert p.returncode == 0, p.returncode
+        print("PASS: same host accepts and streams three sessions; old request/token replays refused")
+    finally:
+        relay.shutdown()
+        relay.server_close()
+        thread.join()
 
 
 if __name__ == "__main__":

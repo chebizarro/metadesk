@@ -32,7 +32,7 @@ typedef enum {
 /* Parsed action */
 typedef struct MdAction {
     MdActionType type;
-    char         target_id[64]; /* empty for key_combo */
+    char         target_id[512]; /* empty for key_combo */
 
     /* Payload fields — which are valid depends on type */
     char         text[1024];

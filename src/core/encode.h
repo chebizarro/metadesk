@@ -117,7 +117,11 @@ void md_encoder_force_keyframe(MdEncoder *enc);
  * Same threading rule as md_encoder_submit. */
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
 
-/* Query whether NVENC is being used (vs software fallback). */
+/* Selected FFmpeg encoder name (e.g. h264_nvenc, h264_videotoolbox,
+ * h264_amf, libx264). Borrowed static string; NULL for a NULL encoder. */
+const char *md_encoder_get_name(const MdEncoder *enc);
+
+/* Query whether a hardware backend is being used (vs software fallback). */
 bool md_encoder_is_hw(const MdEncoder *enc);
 
 /* Get the current encoder dimensions (create time, or the last resize). */

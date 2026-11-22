@@ -606,10 +606,38 @@ static void test_accept_matches_request(void) {
     MD_CHECK(!md_session_accept_matches_request(NULL, &req, now));
 }
 
+static void test_session_reject(void) {
+    MdSessionRequest req = {.capabilities = MD_CAP_VIDEO};
+    MD_CHECK(md_session_request_prepare(&req, 1000, 30) == 0);
+    MdSessionReject reject = {.reason = "capture_unavailable"}, parsed;
+    memcpy(reject.request_id, req.request_id, sizeof(reject.request_id));
+    char *json = md_session_reject_to_json(&reject);
+    MD_CHECK(json && md_session_reject_from_json(json, &parsed) == 0);
+    MD_CHECK(!strcmp(parsed.reason, reject.reason));
+    MD_CHECK(md_session_reject_matches_request(&parsed, &req, 1000));
+    MD_CHECK(!md_session_reject_matches_request(&parsed, &req, 900));
+    MD_CHECK(md_session_request_prepare(&req, 1000, 30) == 0);
+    MD_CHECK(!md_session_reject_matches_request(&parsed, &req, 1000));
+    MD_CHECK(strstr(md_session_reject_message(&parsed), "authorize screen sharing"));
+    char *invalid = malloc(strlen(json) + 3);
+    sprintf(invalid, "%s{}", json);
+    MD_CHECK(md_session_reject_from_json(invalid, &parsed) < 0);
+    free(invalid); free(json);
+    strcpy(reject.reason, "request_refused");
+    json = md_session_reject_to_json(&reject);
+    MD_CHECK(json && md_session_reject_from_json(json, &parsed) == 0); free(json);
+    strcpy(reject.reason, "unknown");
+    MD_CHECK(!md_session_reject_to_json(&reject));
+    MD_CHECK(md_session_reject_from_json("{\"type\":\"session_reject\",\"v\":1,\"reason\":\"capture_unavailable\"}", &parsed) < 0);
+    MD_CHECK(!parsed.request_id[0]);
+    MD_CHECK(md_session_reject_from_json("{\"type\":\"session_accept\"}", &parsed) < 0);
+}
+
 int main(void) {
     printf("test_session (JSON + state machine):\n");
 
     /* JSON serialization tests */
+    test_session_reject();
     test_request_roundtrip();
     test_accept_roundtrip();
     test_single_capability();

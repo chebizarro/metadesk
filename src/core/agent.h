@@ -64,6 +64,16 @@ int md_agent_handle_action(MdAgent *agent, MdStream *stream,
  * Called on initial connection or when client requests a full refresh. */
 int md_agent_send_tree(MdAgent *agent, MdStream *stream, uint32_t *seq);
 
+/* Initial snapshots are built off the transport thread. The job borrows the
+ * a11y context, not the stream or agent; finish/join it before that context.
+ * take returns 0 while pending, 1 when complete (possibly NULL on walk failure).
+ * A completed result is transferred exactly once; caller frees it. */
+typedef struct MdAgentTreeJob MdAgentTreeJob;
+MdAgentTreeJob *md_agent_tree_start(MdAgent *agent);
+int md_agent_tree_take(MdAgentTreeJob *job, char **out);
+/* Join and free the job; returns any result not yet taken. Caller frees. */
+char *md_agent_tree_finish(MdAgentTreeJob *job);
+
 /* JSON sessions: send a delta against the previous snapshot, if changed.
  * Compact sessions: send a full compact snapshot as MD_PKT_UI_TREE.
  * Returns 0 if sent or nothing is available (including a NULL walk),

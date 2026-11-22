@@ -42,7 +42,7 @@ struct MdEncoder {
     AVPacket            *pkt;        /* reusable output packet                 */
     uint8_t             *nv12_buf;   /* NV12 plane data backing frame->data[]  */
     int                  nv12_size;  /* total NV12 buffer size                 */
-    bool                 is_hw;      /* true if using NVENC                    */
+    bool                 is_hw;      /* true for any hardware backend          */
     bool                 force_keyframe; /* emit an IDR on the next frame       */
     int64_t              frame_idx;  /* the next frame's lowest codec pts      */
 
@@ -545,6 +545,10 @@ uint32_t md_encoder_get_bitrate(const MdEncoder *enc) {
     return enc->config.bitrate
          ? enc->config.bitrate
          : MD_ENCODER_DEFAULT_BITRATE;
+}
+
+const char *md_encoder_get_name(const MdEncoder *enc) {
+    return enc && enc->codec ? enc->codec->name : NULL;
 }
 
 bool md_encoder_is_hw(const MdEncoder *enc) {

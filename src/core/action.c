@@ -75,8 +75,11 @@ int md_action_parse(MdAction *action, const char *json, size_t json_len) {
     /* target_id (optional for key_combo) */
     cJSON *tid = cJSON_GetObjectItemCaseSensitive(root, "target_id");
     if (cJSON_IsString(tid)) {
-        strncpy(action->target_id, tid->valuestring, sizeof(action->target_id) - 1);
-        action->target_id[sizeof(action->target_id) - 1] = '\0';
+        if (strlen(tid->valuestring) >= sizeof(action->target_id)) {
+            cJSON_Delete(root);
+            return -1;
+        }
+        strcpy(action->target_id, tid->valuestring);
     }
 
     /* Payload */

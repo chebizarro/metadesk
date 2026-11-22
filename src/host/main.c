@@ -41,13 +41,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <go.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 
 #ifdef _WIN32
 #include "md_interrupt.h"
-#include <stdatomic.h>
 static atomic_bool g_running = true;
 static BOOL WINAPI host_console_interrupt(DWORD kind) {
     if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT || kind == CTRL_CLOSE_EVENT ||
@@ -85,6 +85,13 @@ static int install_signal_handlers(void) {
 
 /* ── State shared between capture callback and main loop ─────── */
 
+/* Full caches fail closed; no unexpired replay fence is evicted. */
+#define HOST_REQUEST_CACHE_SIZE 256
+typedef struct {
+    char id[MD_SESSION_REQUEST_ID_LEN + 1];
+    int64_t expires_at;
+} HostRequestSeen;
+
 typedef struct {
     MdStream     *client;
     pthread_mutex_t client_mu;  /* protects client pointer lifetime */
@@ -109,7 +116,14 @@ typedef struct {
     char          pending_client_pk[128]; /* pubkey of requesting client */
     MdSessionRequest pending_req;         /* parsed session request      */
     int           session_requested;      /* guarded by g_host_request_mu */
-    char          previous_request_id[MD_SESSION_REQUEST_ID_LEN + 1];
+    HostRequestSeen seen_requests[HOST_REQUEST_CACHE_SIZE];
+    bool          capture_required;
+    bool          capture_ready;
+    atomic_bool   capture_failed; /* capture worker -> admission/stream loop */
+    atomic_bool   capture_stopping;
+    atomic_bool   initial_frame_requested;
+    MdFrame       cached_frame;   /* owned CPU snapshot; capture-thread only */
+    size_t        cached_capacity;
     GoChannel      *session_req_ch;       /* signaled on session request */
 } HostCtx;
 
@@ -160,23 +174,40 @@ static bool host_wait_request(HostCtx *ctx) {
     GoSelectCase request_case = {
         .op = GO_SELECT_RECEIVE, .chan = ctx->session_req_ch, .recv_buf = &signal,
     };
-    while (g_running && !host_has_request(ctx)) {
+    while (g_running && !atomic_load(&ctx->capture_failed) && !host_has_request(ctx)) {
         /* Delivery wakes this wait. The bound only observes process shutdown;
          * it never expires admission or polls/reopens a relay subscription. */
         go_select_timeout(&request_case, 1, 1000);
     }
-    return g_running && host_has_request(ctx);
+    return g_running && !atomic_load(&ctx->capture_failed) && host_has_request(ctx);
 }
 
 static void host_rearm_request(HostCtx *ctx) {
     pthread_mutex_lock(&g_host_request_mu);
-    memcpy(ctx->previous_request_id, ctx->pending_req.request_id,
-           sizeof(ctx->previous_request_id));
     memset(&ctx->pending_req, 0, sizeof(ctx->pending_req));
     ctx->pending_client_pk[0] = '\0';
     md_session_reset(ctx->session);
     ctx->session_requested = 0;
     pthread_mutex_unlock(&g_host_request_mu);
+}
+
+/* Caller holds g_host_request_mu. Remember every admitted ID, including
+ * refused/expired negotiations, for the entire authenticated freshness window. */
+static bool host_remember_request(HostCtx *ctx, const MdSessionRequest *req,
+                                   int64_t now) {
+    HostRequestSeen *slot = NULL;
+    for (size_t i = 0; i < HOST_REQUEST_CACHE_SIZE; i++) {
+        HostRequestSeen *seen = &ctx->seen_requests[i];
+        if (seen->id[0] && now <= seen->expires_at) {
+            if (!strcmp(seen->id, req->request_id)) return false;
+        } else if (!slot) {
+            slot = seen;
+        }
+    }
+    if (!slot) return false;
+    memcpy(slot->id, req->request_id, sizeof(slot->id));
+    slot->expires_at = req->expires_at + MD_SESSION_CLOCK_SKEW_S;
+    return true;
 }
 
 /* Caller holds g_host_request_mu. */
@@ -223,8 +254,8 @@ static void host_handle_dm(const char *sender_pubkey_hex, const char *content,
             return;
         }
 
-        if (!strcmp(req.request_id, ctx->previous_request_id)) {
-            fprintf(stderr, "host: ignoring previously consumed session request\n");
+        if (!host_remember_request(ctx, &req, (int64_t)time(NULL))) {
+            fprintf(stderr, "host: ignoring replayed session request or full replay cache\n");
             return;
         }
 
@@ -265,7 +296,9 @@ static MdPixFmt capture_fmt_to_enc(MdCapturePixFmt cfmt) {
     return MD_PIX_FMT_BGRX; /* unreachable: backends emit only the above */
 }
 
-#define HOST_CAPTURE_SIZE_WAIT_MS 2000
+/* Failure-only first-frame bound, matching the PipeWire startup deadline.
+ * A negotiated size alone is not evidence that capture produces frames. */
+#define HOST_CAPTURE_FIRST_FRAME_WAIT_MS 5000
 /* Upper bound on one idle get_frame wait, so has_client and g_running are
  * re-sampled while a damage-driven stream is quiet. */
 #define HOST_CAPTURE_FRAME_WAIT_MS 100
@@ -292,26 +325,41 @@ static void host_apply_fallback_dimensions(uint32_t *width, uint32_t *height,
             reason ? reason : "actual capture/display size unavailable");
 }
 
-static int host_wait_capture_dimensions(MdCaptureCtx *capture,
-                                        uint32_t *width, uint32_t *height) {
-    if (!capture || !width || !height)
-        return -1;
-
-    uint32_t w = 0, h = 0;
-    if (md_capture_wait_size(capture, HOST_CAPTURE_SIZE_WAIT_MS, &w, &h) != 0)
-        return -1;
-    if (!host_dimensions_are_valid(w, h)) {
-        fprintf(stderr,
-                "host: WARNING: capture reported invalid dimensions %ux%u; "
-                "minimum is %ux%u\n",
-                w, h,
-                MD_INPUT_MIN_SCREEN_DIMENSION,
-                MD_INPUT_MIN_SCREEN_DIMENSION);
-        return -1;
+/* Keep one owned snapshot, not a borrowed portal buffer: a static desktop
+ * need not produce damage just because another client has bound. */
+static bool host_cache_frame(HostCtx *ctx, const MdFrame *frame) {
+    if (frame->buf_type != MD_BUF_CPU || !frame->data || !frame->data_size)
+        return false;
+    uint8_t *data = ctx->cached_frame.data;
+    if (frame->data_size > ctx->cached_capacity) {
+        data = realloc(data, frame->data_size);
+        if (!data) return false;
+        ctx->cached_capacity = frame->data_size;
     }
-    *width = w;
-    *height = h;
-    return 0;
+    memcpy(data, frame->data, frame->data_size);
+    ctx->cached_frame = *frame;
+    ctx->cached_frame.data = data;
+    ctx->cached_frame.dmabuf_fd = -1;
+    ctx->cached_frame.gpu_handle = NULL;
+    return true;
+}
+
+static int host_start_capture(MdCaptureCtx *capture,
+                               uint32_t *width, uint32_t *height, HostCtx *ctx) {
+    if (!capture || !width || !height || !ctx || md_capture_start(capture) != 0)
+        return -1;
+    MdFrame frame;
+    if (md_capture_get_frame(capture, &frame,
+                             HOST_CAPTURE_FIRST_FRAME_WAIT_MS) != 0)
+        return -1;
+    bool valid = host_dimensions_are_valid(frame.width, frame.height) &&
+                 host_cache_frame(ctx, &frame);
+    if (valid) {
+        *width = frame.width;
+        *height = frame.height;
+    }
+    md_capture_release_frame(capture, &frame);
+    return valid ? 0 : -1;
 }
 
 /* ── Capture thread: pull frames and encode ──────────────────── */
@@ -320,6 +368,26 @@ typedef struct {
     HostCtx      *host;
     MdCaptureCtx *capture;
 } CaptureThread;
+
+static void host_encode_frame(HostCtx *ctx, MdCaptureCtx *cap,
+                               const MdFrame *frame, bool has_client) {
+    if (!host_capture_sync_frame(&ctx->sync, cap, frame) || !has_client)
+        return;
+    uint64_t start_ns = md_monotonic_ns();
+    int ret = md_encoder_submit_tagged(ctx->sync.encoder, frame->data,
+        frame->stride, capture_fmt_to_enc(frame->format), (int64_t)frame->seq,
+        host_capture_sync_frame_tag(&ctx->sync), on_encoded, ctx);
+    if (ret == 0) {
+        ctx->total_encode_us += (int64_t)((md_monotonic_ns() - start_ns) / 1000u);
+        ctx->frames_encoded++;
+    }
+    ctx->frame_seq++;
+}
+
+static void host_request_initial_frame(HostCtx *ctx) {
+    host_capture_sync_request_keyframe(&ctx->sync);
+    atomic_store(&ctx->initial_frame_requested, true);
+}
 
 static void *capture_thread_func(void *arg) {
     CaptureThread *ct  = arg;
@@ -330,7 +398,8 @@ static void *capture_thread_func(void *arg) {
      * pulling frames; only MD_CAPTURE_ERROR arms the recovery watchdog. */
     MdCaptureWatchdog watchdog = {0};
 
-    while (g_running) {
+    while (!atomic_load(&ctx->capture_stopping) &&
+           !atomic_load(&ctx->capture_failed)) {
         pthread_mutex_lock(&ctx->client_mu);
         bool has_client = (ctx->client != NULL);
         pthread_mutex_unlock(&ctx->client_mu);
@@ -341,6 +410,12 @@ static void *capture_thread_func(void *arg) {
             capture_result, has_client, md_stream_now_ms(),
             HOST_CAPTURE_STALL_MS, HOST_CAPTURE_MAX_RESTARTS);
         if (capture_result != 0) {
+            if (capture_result == MD_CAPTURE_IDLE && has_client &&
+                ctx->cached_frame.data_size &&
+                atomic_exchange(&ctx->initial_frame_requested, false))
+                host_encode_frame(ctx, cap, &ctx->cached_frame, true);
+            if (capture_result == MD_CAPTURE_ERROR)
+                ctx->cached_frame.data_size = 0; /* never replay a broken capture */
             if (recovery != MD_CAPTURE_RECOVERY_NONE) {
                 md_capture_stop(cap);
                 if (recovery == MD_CAPTURE_RECOVERY_EXHAUSTED) {
@@ -350,6 +425,8 @@ static void *capture_thread_func(void *arg) {
                         "host: capture unrecoverable after %u restarts; "
                         "screencast authorization %s — operator action required\n",
                         watchdog.restarts, forget ? "cleared" : "retained");
+                    atomic_store(&ctx->capture_failed, true);
+                    break;
                 } else {
                     fprintf(stderr,
                         "host: capture broken for %dms with a client "
@@ -364,41 +441,43 @@ static void *capture_thread_func(void *arg) {
             continue;
         }
 
-        /* Every frame reconciles the encoder size and input bounds with the
-         * capture, so a restart above, an access-loss re-duplication or a
-         * mode/layout change is picked up by the first frame it produces. */
-        if (!host_capture_sync_frame(&ctx->sync, cap, &frame) || !has_client) {
-            md_capture_release_frame(cap, &frame);
-            continue;
-        }
-
-        MdPixFmt fmt = capture_fmt_to_enc(frame.format);
-
-        uint64_t start_ns = md_monotonic_ns();
-
-        int ret = md_encoder_submit_tagged(ctx->sync.encoder, frame.data,
-                                    frame.stride, fmt,
-                                    (int64_t)frame.seq,
-                                    host_capture_sync_frame_tag(&ctx->sync),
-                                    on_encoded, ctx);
-
-        int64_t elapsed_us = (int64_t)((md_monotonic_ns() - start_ns) / 1000u);
-
-        if (ret == 0) {
-            ctx->total_encode_us += elapsed_us;
-            ctx->frames_encoded++;
-        }
-        ctx->frame_seq++;
-
+        bool cached = host_cache_frame(ctx, &frame);
         md_capture_release_frame(cap, &frame);
+        if (!cached) {
+            fprintf(stderr, "host: cannot retain a usable capture frame\n");
+            atomic_store(&ctx->capture_failed, true);
+            break;
+        }
+        if (has_client) atomic_store(&ctx->initial_frame_requested, false);
+        host_encode_frame(ctx, cap, &ctx->cached_frame, has_client);
     }
     return NULL;
+}
+
+/* A refusal is a correlated NIP-17 session response, through the same
+ * host-role and relay-OK-checked publisher as acceptance. Never mint a token. */
+static int host_reject_request(HostCtx *ctx, const char *reason) {
+    MdSessionReject reject = {0};
+    memcpy(reject.request_id, ctx->pending_req.request_id, sizeof(reject.request_id));
+    snprintf(reject.reason, sizeof(reject.reason), "%s", reason);
+    char *json = md_session_reject_to_json(&reject);
+    if (!json) return -1;
+    int rc = md_nostr_send_session_accept(ctx->nostr, ctx->pending_client_pk, json);
+    free(json);
+    if (rc != 0) fprintf(stderr, "host: failed to publish session refusal\n");
+    md_session_reset(ctx->session);
+    return rc;
 }
 
 /* Publish only after listener/backend startup, so no valid proof is stranded
  * in the listen backlog while the client's bounded ACK wait expires. */
 static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
-    if (!g_running || (owner && !md_account_binding_is_current(owner))) return -1;
+    if (!g_running || (owner && !md_account_binding_is_current(owner)) ||
+        (ctx->capture_required && (!ctx->capture_ready ||
+                                   atomic_load(&ctx->capture_failed)))) return -1;
+    if (md_session_request_freshness(&ctx->pending_req, (int64_t)time(NULL),
+                                     ctx->pending_req.issued_at) != MD_SESSION_REQUEST_FRESH)
+        return -1;
     MdSessionAccept acc;
     /* Same clock as md_stream_accept_binding()'s deadline checks. */
     if (!ctx->pending_req.request_id[0] ||
@@ -432,9 +511,9 @@ static int host_bind_candidate(HostCtx *ctx, MdStream *candidate) {
     return md_stream_accept_binding(candidate, ctx->session);
 }
 
-static void host_send_initial_tree(HostCtx *ctx) {
-    if (ctx->agent && md_stream_has_capability(ctx->client, MD_CAP_AGENT))
-        md_agent_send_tree(ctx->agent, ctx->client, &ctx->pkt_seq);
+static MdAgentTreeJob *host_send_initial_tree(HostCtx *ctx) {
+    return ctx->agent && md_stream_has_capability(ctx->client, MD_CAP_AGENT)
+        ? md_agent_tree_start(ctx->agent) : NULL;
 }
 
 /* ── Handle incoming packets from client ─────────────────────── */
@@ -554,7 +633,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
     fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
-    fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
+    fprintf(stderr, "  --no-nvenc       Skip NVENC; try other hardware, then x264\n");
     fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
     fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
     fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
@@ -783,6 +862,42 @@ static int host_replace_agent(HostCtx *ctx, MdAgent **agent, MdAgentConfig *cfg)
     *agent = next;
     ctx->agent = next;
     return 0;
+}
+
+/* A policy change or an expired request rejects just that negotiation. */
+static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
+                             MdAccountBinding *owner, MdAgent **agent,
+                             MdAgentConfig *cfg) {
+    while (host_wait_request(ctx)) {
+        if (owner && !md_account_binding_is_current(owner)) return -1;
+        if (host_accept_fresh_request(ctx, nostr, no_input) != 0) {
+            host_reject_request(ctx, "request_refused");
+            host_rearm_request(ctx);
+            continue;
+        }
+        if (host_replace_agent(ctx, agent, cfg) != 0 ||
+            host_publish_session_accept(ctx, owner) != 0) {
+            host_reject_request(ctx, "request_refused");
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static bool host_binding_pending(HostCtx *ctx, uint64_t now_ms) {
+    return ctx->session->state == MD_SESSION_NEGOTIATING &&
+        ctx->session->stream_token[0] && now_ms < ctx->session->stream_deadline_ms;
+}
+
+/* Called only after recv reports disconnect (or process shutdown), with no
+ * dispatch in flight. Capture must relinquish the pointer before destruction. */
+static void host_finish_client(HostCtx *ctx, MdStream *client) {
+    pthread_mutex_lock(&ctx->client_mu);
+    ctx->client = NULL;
+    pthread_mutex_unlock(&ctx->client_mu);
+    md_stream_destroy(client);
+    host_rearm_request(ctx);
 }
 
 #ifdef _WIN32
@@ -1094,7 +1209,8 @@ int main(int argc, char **argv) {
     printf("  port:      %u\n", port);
     printf("  fps:       %u\n", fps);
     printf("  bitrate:   %u bps\n", bitrate);
-    printf("  encoder:   %s\n", use_nvenc ? "NVENC (preferred)" : "x264");
+    printf("  encoder:   %s\n", use_nvenc ? "NVENC preferred; hardware/x264 fallback"
+                                             : "non-NVENC hardware/x264 fallback");
     printf("  capture:   %s\n", do_capture ? "enabled" : "disabled");
     if (fips_npub)
         printf("  fips:      %.*s...\n", 12, fips_npub);
@@ -1207,6 +1323,7 @@ int main(int argc, char **argv) {
     HostCtx ctx = {
         .session     = &session,
         .session_log = session_log,
+        .capture_required = do_capture,
     };
     pthread_mutex_init(&ctx.client_mu, NULL);
     if (expected_client_pk[0])
@@ -1254,16 +1371,7 @@ int main(int argc, char **argv) {
 
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
-            /* Wait for a session request DM (event-driven with timeout) */
-            {
-                void *dummy = NULL;
-                GoSelectCase cases[] = {
-                    { .op = GO_SELECT_RECEIVE, .chan = ctx.session_req_ch, .recv_buf = &dummy },
-                };
-                go_select_timeout(cases, 1, 60000); /* 60s timeout */
-            }
-
-            if (host_has_request(&ctx) && g_running &&
+            if (host_wait_request(&ctx) &&
                 (!account.binding || md_account_binding_is_current(account.binding))) {
                 if (fips_npub) {
                     printf("host: waiting for FIPS peer readiness for %.*s...\n",
@@ -1288,7 +1396,7 @@ int main(int argc, char **argv) {
 
             } else if (g_running) {
                 if (fips_npub || account.binding) {
-                    fprintf(stderr, "ERROR: timed out waiting for authorized host-role session request; refusing direct TCP fallback\n");
+                    fprintf(stderr, "ERROR: authorized host-role session request unavailable; refusing direct TCP fallback\n");
                     goto signaling_failed;
                 }
                 fprintf(stderr, "ERROR: no negotiated session request\n");
@@ -1308,6 +1416,7 @@ int main(int argc, char **argv) {
     }
     goto signaling_ready;
 signaling_failed:
+    free(ctx.cached_frame.data);
     md_nostr_destroy(nostr);
     if (ctx.session_req_ch) {
         go_channel_close(ctx.session_req_ch);
@@ -1324,7 +1433,7 @@ signaling_ready:
     MdStreamServer *srv = md_stream_server_create(bind_addr, port);
     if (!srv) {
         fprintf(stderr, "ERROR: failed to bind TCP server on port %u\n", port);
-        return 1;
+        goto signaling_failed;
     }
     printf("host: listening on port %u\n", port);
 
@@ -1349,27 +1458,16 @@ signaling_ready:
             .max_height = capture_max_h,
         };
         capture = md_capture_create(&cap_cfg);
-        if (!capture) {
-            fprintf(stderr, "WARNING: screen capture unavailable\n");
-        } else if (md_capture_start(capture) < 0) {
-            fprintf(stderr, "WARNING: failed to start capture\n");
-            md_capture_destroy(capture);
-            capture = NULL;
-        } else if (host_wait_capture_dimensions(capture,
-                                                &display_width,
-                                                &display_height) == 0) {
-            printf("host: capture started (%ux%u)\n",
-                   display_width, display_height);
-        } else {
-            host_apply_fallback_dimensions(&display_width, &display_height,
-                                           "capture dimensions not negotiated");
-            printf("host: capture started\n");
+        if (host_start_capture(capture, &display_width, &display_height, &ctx) != 0) {
+            fprintf(stderr, "ERROR: capture unavailable: authorize screen sharing and retry; "
+                    "refusing video session (use --no-capture only for fixtures)\n");
+            host_reject_request(&ctx, "capture_unavailable");
+            if (capture) md_capture_destroy(capture);
+            md_stream_server_destroy(srv);
+            goto signaling_failed;
         }
-    }
-
-    if (do_capture && capture_unattended && !capture) {
-        fprintf(stderr, "ERROR: unattended capture authorization/start failed\n");
-        return 1;
+        printf("host: capture ready (%ux%u, first frame received)\n",
+               display_width, display_height);
     }
 
     if (!host_dimensions_are_valid(display_width, display_height)) {
@@ -1397,10 +1495,11 @@ signaling_ready:
         fprintf(stderr, "ERROR: failed to create encoder\n");
         if (capture) md_capture_destroy(capture);
         md_stream_server_destroy(srv);
-        return 1;
+        host_reject_request(&ctx, "capture_unavailable");
+        goto signaling_failed;
     }
     printf("host: encoder ready (%s, %ux%u)\n",
-           md_encoder_is_hw(encoder) ? "NVENC" : "x264",
+           md_encoder_get_name(encoder),
            enc_width, enc_height);
 
     /* Initialize input injection (persistent) */
@@ -1458,14 +1557,18 @@ signaling_ready:
                            &cap_thr_ctx) == 0) {
             cap_thread_started = true;
         } else {
-            fprintf(stderr, "WARNING: failed to start capture thread\n");
+            fprintf(stderr, "ERROR: failed to start capture thread\n");
         }
     }
 
     /* No remote client can start its bind/ACK wait before this point. */
     int exit_status = 0;
+    ctx.capture_ready = cap_thread_started;
     if (host_publish_session_accept(&ctx, account.binding) != 0) {
         fprintf(stderr, "ERROR: session acceptance failed or host role revoked\n");
+        host_reject_request(&ctx, ctx.capture_required &&
+            (!ctx.capture_ready || atomic_load(&ctx.capture_failed))
+            ? "capture_unavailable" : "request_refused");
         exit_status = 1;
         g_running = 0; /* Use the normal backend cleanup below. */
     }
@@ -1479,14 +1582,32 @@ signaling_ready:
      * ══════════════════════════════════════════════════════════════ */
     uint32_t client_num = 0;
 
-    while (g_running) {
+    while (g_running && !atomic_load(&ctx.capture_failed)) {
+        /* A consumed/expired grant must never be reused. Refused negotiations
+         * return to the same long-lived DM subscription, not process exit. */
+        if (!host_has_request(&ctx)) {
+            printf("host: ready for next authorized session request\n");
+            if (host_next_session(&ctx, nostr, no_input, account.binding,
+                                   &agent, &agent_cfg) != 0) {
+                if (g_running) exit_status = 1;
+                break;
+            }
+        }
         /* Wait for client connection */
         printf("host: waiting for client...\n");
         MdStream *client = NULL;
-        while (g_running && !client) {
+        while (g_running && !atomic_load(&ctx.capture_failed) && !client &&
+               host_binding_pending(&ctx, (uint64_t)md_now_ms())) {
             client = md_stream_server_accept(srv, 1000);
         }
-        if (!client || !g_running) break;
+        if (!g_running || atomic_load(&ctx.capture_failed)) {
+            md_stream_destroy(client);
+            break;
+        }
+        if (!client) {
+            host_rearm_request(&ctx); /* abandoned binding reservation */
+            continue;
+        }
 
         client_num++;
         printf("host: client #%u connected\n", client_num);
@@ -1518,12 +1639,13 @@ signaling_ready:
 
         /* The encoder is persistent across connections, so a new client joins
          * mid-GOP with no decodable entry point. Force an IDR for it. */
-        host_capture_sync_request_keyframe(&ctx.sync);
-
-        /* Send initial UI tree to new client */
-        host_send_initial_tree(&ctx);
+        host_request_initial_frame(&ctx);
 
         pthread_mutex_unlock(&ctx.client_mu);
+
+        /* No stream/client lock is held during the potentially slow OS walk.
+         * This connection owns the job and joins it before backend replacement. */
+        MdAgentTreeJob *initial_tree = host_send_initial_tree(&ctx);
 
         /* ── Streaming loop ─────────────────────────────────────── */
         printf("host: streaming to client #%u (Ctrl+C to stop)\n", client_num);
@@ -1540,7 +1662,21 @@ signaling_ready:
         MdBitrateCtrl *br_ctrl = md_bitrate_ctrl_create(&br_cfg);
         uint32_t last_br = bitrate;
 
-        while (g_running && md_stream_is_connected(client)) {
+        while (g_running && !atomic_load(&ctx.capture_failed) &&
+               md_stream_is_connected(client)) {
+            char *tree = NULL;
+            if (initial_tree && md_agent_tree_take(initial_tree, &tree) == 1) {
+                free(md_agent_tree_finish(initial_tree));
+                initial_tree = NULL;
+                if (tree) {
+                    pthread_mutex_lock(&ctx.client_mu);
+                    if (md_stream_has_capability(client, MD_CAP_AGENT))
+                        md_stream_send(client, MD_PKT_UI_TREE, ctx.pkt_seq++,
+                                       (const uint8_t *)tree, (uint32_t)strlen(tree));
+                    pthread_mutex_unlock(&ctx.client_mu);
+                    free(tree);
+                }
+            }
             /* Never leave a second connection waiting to inherit this grant. */
             MdStream *extra = md_stream_server_accept(srv, 1);
             if (extra) {
@@ -1553,6 +1689,12 @@ signaling_ready:
             int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
 
             if (ret == 0) {
+                /* Do not publish a pre-action snapshot after an action update.
+                 * Join outside client_mu so video continues during the wait. */
+                if (hdr.type == MD_PKT_ACTION && initial_tree) {
+                    free(md_agent_tree_finish(initial_tree));
+                    initial_tree = NULL;
+                }
                 pthread_mutex_lock(&ctx.client_mu);
                 handle_client_packet(&ctx, &hdr, payload);
                 pthread_mutex_unlock(&ctx.client_mu);
@@ -1618,6 +1760,8 @@ signaling_ready:
             }
         }
 
+        free(md_agent_tree_finish(initial_tree));
+
         /* Client disconnected — clean up per-connection resources */
         md_bitrate_ctrl_destroy(br_ctrl);
         br_ctrl = NULL;
@@ -1644,37 +1788,19 @@ signaling_ready:
          * next client with frames=0. Any buffered packets would only go to the
          * client that just left. The next client gets a forced keyframe above. */
 
-        /* Null out client before destroying so capture thread stops sending */
-        pthread_mutex_lock(&ctx.client_mu);
-        ctx.client = NULL;
-        pthread_mutex_unlock(&ctx.client_mu);
-        md_stream_destroy(client);
+        host_finish_client(&ctx, client);
 
-        if (!g_running) break;
+    }
 
-        host_rearm_request(&ctx);
-        printf("host: ready for next authorized session request\n");
-        if (!host_wait_request(&ctx)) break;
-        if (host_accept_fresh_request(&ctx, nostr, no_input) != 0) {
-            fprintf(stderr, "ERROR: fresh authorized session required after disconnect\n");
-            exit_status = 1;
-            break;
-        }
-        /* Finish replacement backends before granting a new stream. */
-        if (host_replace_agent(&ctx, &agent, &agent_cfg) != 0) {
-            fprintf(stderr, "ERROR: failed to recreate agent for new session\n");
-            exit_status = 1;
-            break;
-        }
-        if (host_publish_session_accept(&ctx, account.binding) != 0) {
-            fprintf(stderr, "ERROR: new session acceptance failed\n");
-            exit_status = 1;
-            break;
-        }
+    if (atomic_load(&ctx.capture_failed)) {
+        fprintf(stderr, "ERROR: capture failed permanently; ending host session\n");
+        exit_status = 1;
+        g_running = 0;
     }
 
     /* ── Shutdown ────────────────────────────────────────────────── */
     printf("\nhost: shutting down...\n");
+    atomic_store(&ctx.capture_stopping, true);
 
     if (capture) {
         md_capture_stop(capture);
@@ -1683,6 +1809,7 @@ signaling_ready:
         md_capture_destroy(capture);
     }
 
+    free(ctx.cached_frame.data);
     md_encoder_destroy(encoder);
 
     if (agent) {

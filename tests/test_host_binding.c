@@ -1,7 +1,7 @@
 #include "md_socket.h"
 /* Private loopback tests of real host admission/capture/dispatch. No desktop. */
 #define main md_host_main_not_run
-#define md_agent_send_tree test_send_tree
+#define md_agent_tree_start test_tree_start
 #define md_agent_handle_action test_action
 #define md_input_mouse_move test_move
 #define md_nostr_send_session_accept test_publish
@@ -11,6 +11,7 @@
 #undef md_nostr_send_session_accept
 #undef md_agent_create
 #include "md_test.h"
+#include "decode.h"
 /* nostr.h's prototype was renamed by the macro above; restore the real one. */
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload);
@@ -23,16 +24,22 @@ MdAgent *test_create_agent(const MdAgentConfig *cfg) {
 
 static unsigned tree_calls, action_calls, input_calls, publish_calls;
 static MdSessionAccept published;
+static MdSessionReject rejected;
+static unsigned reject_calls;
 /* Records the acceptance; with a real bridge (relay fixture) also publishes. */
 int test_publish(MdNostr *n, const char *peer, const char *json) {
-    publish_calls++;
-    MD_CHECK(md_session_accept_from_json(json, &published) == 0);
+    if (md_session_reject_from_json(json, &rejected) == 0) {
+        reject_calls++;
+    } else {
+        publish_calls++;
+        MD_CHECK(md_session_accept_from_json(json, &published) == 0);
+    }
     return n ? md_nostr_send_session_accept(n, peer, json) : 0;
 }
 int md_host_account_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
 int md_host_access_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
-int test_send_tree(MdAgent *a, MdStream *s, uint32_t *seq) {
-    (void)a; (void)s; (void)seq; tree_calls++; return 0;
+MdAgentTreeJob *test_tree_start(MdAgent *a) {
+    (void)a; tree_calls++; return NULL;
 }
 int test_action(MdAgent *a, MdStream *s, uint32_t *seq,
                 const uint8_t *p, uint32_t n) {
@@ -431,7 +438,7 @@ typedef struct {
     MdSessionRequest req;        /* client probe: its current request */
     bool armed;
     MdSessionAccept accepted;
-    unsigned matched, ignored_history, ignored_live, host_history, host_live;
+    unsigned matched, rejections, ignored_history, ignored_live, host_history, host_live;
 } HistProbe;
 
 static void hist_init(HistProbe *p, HostCtx *host) {
@@ -458,7 +465,19 @@ static void hist_client_dm(const char *pk, const char *content,
                            const MdNostrDmInfo *info, void *ud) {
     HistProbe *p = ud;
     MdSessionAccept acc;
+    MdSessionReject reject;
     (void)pk;
+    if (md_session_reject_from_json(content, &reject) == 0) {
+        pthread_mutex_lock(&p->mu);
+        if (p->armed && md_session_reject_matches_request(&reject, &p->req,
+                                                         info->rumor_created_at)) {
+            p->rejections++;
+            p->armed = false;
+        }
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+        return;
+    }
     if (md_session_accept_from_json(content, &acc) != 0) return;
     pthread_mutex_lock(&p->mu);
     if (p->armed && md_session_accept_matches_request(&acc, &p->req, info->rumor_created_at)) {
@@ -708,6 +727,7 @@ static void test_rearm_request(void) {
     HostCtx ctx = context(&s);
     ctx.session_requested = 1;
     MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
+    MD_CHECK(host_remember_request(&ctx, &ctx.pending_req, (int64_t)time(NULL)));
     char previous[MD_SESSION_REQUEST_ID_LEN + 1];
     memcpy(previous, ctx.pending_req.request_id, sizeof(previous));
     strcpy(ctx.pending_client_pk, "old-peer");
@@ -715,7 +735,7 @@ static void test_rearm_request(void) {
     host_rearm_request(&ctx);
     MD_CHECK(!host_has_request(&ctx));
     MD_CHECK(!ctx.pending_req.request_id[0] && !ctx.pending_client_pk[0]);
-    MD_CHECK(!strcmp(ctx.previous_request_id, previous));
+    MD_CHECK(!strcmp(ctx.seen_requests[0].id, previous));
     MD_CHECK(s.state == MD_SESSION_IDLE && !s.stream_token[0]);
     Pair replay = pair();
     send_proof(replay, &acc);
@@ -723,6 +743,296 @@ static void test_rearm_request(void) {
     closed(replay);
     destroy_pair(replay);
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
+}
+
+
+/* No desktop: real HAL calls with scripted startup/first-frame outcomes. */
+typedef struct {
+    int start_result, frame_result;
+    uint32_t width, height, timeout;
+    unsigned pulls, releases;
+} AdmissionCapture;
+static int admission_start(MdCaptureCtx *cap) {
+    AdmissionCapture *m = cap->backend_data;
+    return m->start_result;
+}
+static int admission_frame(MdCaptureCtx *cap, MdFrame *frame, uint32_t timeout) {
+    AdmissionCapture *m = cap->backend_data;
+    static uint8_t pixel[640 * 360 * 4];
+    m->pulls++; m->timeout = timeout;
+    *frame = (MdFrame){ .width = m->width, .height = m->height,
+                       .stride = m->width * 4, .format = MD_PIX_CAPTURE_RGBA,
+                       .buf_type = MD_BUF_CPU, .data = pixel,
+                       .data_size = (size_t)m->width * m->height * 4 };
+    return m->frame_result;
+}
+static void admission_release(MdCaptureCtx *cap, MdFrame *frame) {
+    (void)frame;
+    ((AdmissionCapture *)cap->backend_data)->releases++;
+}
+static void test_capture_admission(void) {
+    const MdCaptureBackend backend = { .start = admission_start,
+        .get_frame = admission_frame, .release_frame = admission_release };
+    AdmissionCapture cases[] = {
+        {.start_result = -1}, /* portal denial/timeout */
+        {.frame_result = MD_CAPTURE_ERROR}, /* broken/never delivered */
+        {.frame_result = MD_CAPTURE_IDLE}, /* size alone is not readiness */
+        {.width = 1, .height = 1}, /* unusable first frame */
+        {.width = 640, .height = 360},
+    };
+    for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        MdCaptureCtx cap = {.vtable = &backend, .backend_data = &cases[i]};
+        uint32_t w = 0, h = 0;
+        HostCtx snapshot = {0};
+        bool ready = host_start_capture(&cap, &w, &h, &snapshot) == 0;
+        MD_CHECK(ready == (i == 4));
+        MD_CHECK(cases[i].pulls == (i == 0 ? 0 : 1));
+        MD_CHECK(cases[i].releases == (i >= 3 ? 1 : 0));
+        if (i) MD_CHECK(cases[i].timeout == HOST_CAPTURE_FIRST_FRAME_WAIT_MS);
+        MdSession session; md_session_init(&session);
+        HostCtx ctx = {.session = &session, .capture_required = true,
+                       .capture_ready = ready};
+        MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
+        MD_CHECK(md_session_accept(&session, "capture-admission", MD_CAP_VIDEO) == 0);
+        unsigned accepts = publish_calls, rejects = reject_calls;
+        if (ready) {
+            MD_CHECK(w == 640 && h == 360);
+            MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
+            MD_CHECK(publish_calls == accepts + 1 && session.stream_token[0]);
+        } else {
+            MD_CHECK(host_publish_session_accept(&ctx, NULL) < 0);
+            MD_CHECK(publish_calls == accepts && !session.stream_token[0]);
+            MD_CHECK(host_reject_request(&ctx, "capture_unavailable") == 0);
+            MD_CHECK(reject_calls == rejects + 1 && session.state == MD_SESSION_IDLE);
+            MD_CHECK(!strcmp(rejected.request_id, ctx.pending_req.request_id));
+            MD_CHECK(md_session_reject_matches_request(&rejected, &ctx.pending_req,
+                                                       ctx.pending_req.issued_at));
+        }
+        md_session_reset(&session);
+        free(snapshot.cached_frame.data);
+    }
+    uint32_t w = 0, h = 0;
+    MD_CHECK(host_start_capture(NULL, &w, &h, NULL) < 0);
+    MdSession session; md_session_init(&session);
+    HostCtx ctx = {.session = &session}; /* explicit --no-capture fixture */
+    MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
+    MD_CHECK(md_session_accept(&session, "no-capture-fixture", MD_CAP_VIDEO) == 0);
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
+    MD_CHECK(host_binding_pending(&ctx, session.stream_deadline_ms - 1));
+    MD_CHECK(!host_binding_pending(&ctx, session.stream_deadline_ms + 1));
+    md_session_reset(&session);
+    MD_CHECK(md_session_accept(&session, "worker-failed", MD_CAP_VIDEO) == 0);
+    ctx.capture_required = true; /* failed pthread_create, no admission */
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) < 0);
+    ctx.capture_ready = true;
+    atomic_store(&ctx.capture_failed, true); /* exhausted watchdog */
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) < 0);
+    MD_CHECK(!session.stream_token[0]);
+}
+
+/* After the sole startup frame, the backend has no desktop damage. A
+ * condition wait models its blocking get_frame; the socket packet is the
+ * completion event, never a guessed sleep or retry-until-encode loop. */
+static pthread_mutex_t idle_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t idle_cv = PTHREAD_COND_INITIALIZER;
+static int idle_frame(MdCaptureCtx *cap, MdFrame *frame, uint32_t timeout) {
+    (void)cap; (void)frame;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long)timeout * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+    pthread_mutex_lock(&idle_mu);
+    pthread_cond_timedwait(&idle_cv, &idle_mu, &deadline);
+    pthread_mutex_unlock(&idle_mu);
+    return MD_CAPTURE_IDLE;
+}
+static void idle_decoded(const MdDecodedFrame *frame, void *data) {
+    unsigned *count = data;
+    MD_CHECK(frame->width == 640 && frame->height == 360 && frame->data);
+    (*count)++;
+}
+static void test_idle_capture_rebind(void) {
+    MdSession session;
+    md_session_init(&session);
+    HostCtx ctx = {.session = &session};
+    pthread_mutex_init(&ctx.client_mu, NULL);
+    AdmissionCapture source = {.width = 640, .height = 360};
+    const MdCaptureBackend startup = {.start = admission_start,
+        .get_frame = admission_frame, .release_frame = admission_release};
+    const MdCaptureBackend idle = {.get_frame = idle_frame};
+    MdCaptureCtx cap = {.vtable = &startup, .backend_data = &source};
+    uint32_t w = 0, h = 0;
+    MD_CHECK(host_start_capture(&cap, &w, &h, &ctx) == 0);
+    MD_CHECK(source.releases == 1 && ctx.cached_frame.data_size);
+    cap.vtable = &idle;
+    MdEncoderConfig cfg = {.width = w, .height = h, .fps = 30,
+                            .bitrate = MD_ENCODER_DEFAULT_BITRATE};
+    MdEncoder *encoder = md_encoder_create(&cfg);
+    MD_CHECK(encoder);
+    printf("idle capture rebind encoder: %s\n", md_encoder_get_name(encoder));
+    host_capture_sync_init(&ctx.sync, encoder, NULL, &ctx.client_mu,
+                            &ctx.pkt_seq, w, h, NULL);
+    CaptureThread worker = {.host = &ctx, .capture = &cap};
+    pthread_t thread;
+    MD_CHECK(pthread_create(&thread, NULL, capture_thread_func, &worker) == 0);
+    for (unsigned round = 0; round < 2; round++) {
+        MdSessionAccept acceptance = reserve(&session, MD_CAP_VIDEO);
+        Pair p = pair(); send_proof(p, &acceptance);
+        MD_CHECK(host_bind_candidate(&ctx, p.host) == 0);
+        ack(p, MD_CAP_VIDEO);
+        pthread_mutex_lock(&ctx.client_mu);
+        ctx.client = p.host;
+        ctx.pkt_seq = 0;
+        host_capture_sync_reset_sequence(&ctx.sync);
+        host_request_initial_frame(&ctx);
+        pthread_mutex_unlock(&ctx.client_mu);
+        pthread_mutex_lock(&idle_mu);
+        pthread_cond_signal(&idle_cv);
+        pthread_mutex_unlock(&idle_mu);
+        MdPacketHeader hdr; uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(p.peer, &hdr, &payload, 10000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME && hdr.payload_len);
+        MdDecoder *decoder = md_decoder_create();
+        MD_CHECK(decoder && md_decoder_submit(decoder, payload, hdr.payload_len, 0) == 0);
+        unsigned decoded = 0;
+        MD_CHECK(md_decoder_poll(decoder, idle_decoded, &decoded) >= 0);
+        MD_CHECK(md_decoder_flush(decoder, idle_decoded, &decoded) >= 0);
+        MD_CHECK(decoded == 1); /* independently decodable IDR per stream */
+        md_decoder_destroy(decoder); free(payload);
+        md_stream_close(p.peer);
+        payload = NULL;
+        MD_CHECK(md_stream_recv(p.host, &hdr, &payload, 1000) < 0); free(payload);
+        host_finish_client(&ctx, p.host);
+        md_stream_destroy(p.peer);
+        OPENSSL_cleanse(acceptance.stream_token, sizeof(acceptance.stream_token));
+    }
+    atomic_store(&ctx.capture_stopping, true); /* normal worker teardown */
+    pthread_mutex_lock(&idle_mu);
+    pthread_cond_signal(&idle_cv);
+    pthread_mutex_unlock(&idle_mu);
+    MD_CHECK(pthread_join(thread, NULL) == 0);
+    MD_CHECK(source.pulls == 1 && source.releases == 1);
+    free(ctx.cached_frame.data);
+    md_encoder_destroy(encoder);
+    pthread_mutex_destroy(&ctx.client_mu);
+}
+
+static void test_request_cache(void) {
+    HostCtx ctx = {0};
+    MdSessionRequest req = {0}, first = {0};
+    int64_t now = (int64_t)time(NULL);
+    for (unsigned i = 0; i < HOST_REQUEST_CACHE_SIZE; i++) {
+        MD_CHECK(md_session_request_prepare(&req, now, 30) == 0);
+        MD_CHECK(host_remember_request(&ctx, &req, now));
+        if (!i) first = req;
+    }
+    MD_CHECK(!host_remember_request(&ctx, &first, now)); /* A, B, ... A */
+    MD_CHECK(md_session_request_prepare(&req, now, 30) == 0);
+    MD_CHECK(!host_remember_request(&ctx, &req, now)); /* full fails closed */
+    MD_CHECK(!host_remember_request(&ctx, &first, first.expires_at + MD_SESSION_CLOCK_SKEW_S));
+    MD_CHECK(host_remember_request(&ctx, &req, first.expires_at + MD_SESSION_CLOCK_SKEW_S + 1));
+}
+
+typedef struct {
+    HostCtx *ctx;
+    MdNostr *nostr;
+    MdAgent **agent;
+    MdAgentConfig *cfg;
+    int result;
+} NextSession;
+static void *next_session_thread(void *data) {
+    NextSession *next = data;
+    next->result = host_next_session(next->ctx, next->nostr, true, NULL,
+                                     next->agent, next->cfg);
+    return NULL;
+}
+
+/* Three real negotiations and bound streams, one host/DM subscription.
+ * Replay the first request/token after two disconnects, not only the last. */
+static void test_relay_rebind(const char *url) {
+    MdSession session; md_session_init(&session);
+    HostCtx ctx = {.session = &session};
+    pthread_mutex_init(&ctx.client_mu, NULL);
+    ctx.session_req_ch = go_channel_create(1);
+    HistProbe hp, cp; hist_init(&hp, &ctx); hist_init(&cp, NULL);
+    MdNostr *host = hist_bridge(url, HIST_HOST_SK, hist_host_dm, &hp);
+    ctx.nostr = host;
+    MdNostr *client = hist_bridge(url, HIST_CLIENT_SK, hist_client_dm, &cp);
+    const char *host_pk = md_nostr_get_npub(host), *client_pk = md_nostr_get_npub(client);
+    MdAgentConfig cfg = {.tree_format = MD_TREE_FORMAT_COMPACT};
+    MdAgent *agent = NULL;
+    MdSessionRequest first = {0}; MdSessionAccept old_accept = {0};
+    for (unsigned round = 0; round < 3; round++) {
+        NextSession next = {.ctx = &ctx, .nostr = host, .agent = &agent, .cfg = &cfg};
+        pthread_t thread;
+        MD_CHECK(pthread_create(&thread, NULL, next_session_thread, &next) == 0);
+        if (round == 1) {
+            /* Membership permits delivery, but current --no-input policy
+             * grants none of this request. Refuse it, then keep listening. */
+            MdSessionRequest denied = {.capabilities = MD_CAP_INPUT};
+            MD_CHECK(md_session_request_prepare(&denied, (int64_t)time(NULL), 30) == 0);
+            pthread_mutex_lock(&cp.mu);
+            cp.req = denied; cp.armed = true;
+            pthread_mutex_unlock(&cp.mu);
+            char *bad = md_session_request_to_json(&denied);
+            MD_CHECK(bad && md_nostr_send_session_request(client, host_pk, bad) == 0);
+            free(bad);
+            MD_CHECK(hist_wait(&cp, &cp.rejections, 1));
+        }
+        MdSessionRequest req = {.capabilities = MD_CAP_VIDEO,
+                                .tree_format = round == 1 ? MD_TREE_FORMAT_JSON : MD_TREE_FORMAT_COMPACT};
+        MD_CHECK(md_session_request_prepare(&req, (int64_t)time(NULL), 30) == 0);
+        if (!round) first = req;
+        pthread_mutex_lock(&cp.mu);
+        cp.req = req; cp.armed = true;
+        pthread_mutex_unlock(&cp.mu);
+        char *json = md_session_request_to_json(&req);
+        MD_CHECK(json && md_nostr_send_session_request(client, host_pk, json) == 0);
+        free(json);
+        MD_CHECK(pthread_join(thread, NULL) == 0 && next.result == 0);
+        MD_CHECK(hist_wait(&cp, &cp.matched, round + 1));
+        MD_CHECK(session.tree_format == req.tree_format && cfg.tree_format == req.tree_format);
+        if (!round) old_accept = cp.accepted;
+        if (round) {
+            MD_CHECK(strcmp(cp.accepted.stream_token, old_accept.stream_token));
+            Pair old = pair(); send_proof(old, &old_accept);
+            MD_CHECK(host_bind_candidate(&ctx, old.host) < 0);
+            closed(old); destroy_pair(old);
+            MD_CHECK(session.state == MD_SESSION_NEGOTIATING);
+        }
+        Pair p = pair(); send_proof(p, &cp.accepted);
+        MD_CHECK(host_bind_candidate(&ctx, p.host) == 0);
+        MdPacketHeader hdr; uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(p.peer, &hdr, &payload, 1000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_SESSION_INFO);
+        free(payload);
+        ctx.client = p.host;
+        /* Exercise the production capture-to-stream gate on each grant. */
+        uint8_t bytes[] = {0, 0, 0, 1, 0x65};
+        MdEncodedPacket packet = {.data = bytes, .size = sizeof(bytes)};
+        on_encoded(&packet, &ctx);
+        payload = NULL;
+        MD_CHECK(md_stream_recv(p.peer, &hdr, &payload, 1000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME && hdr.payload_len == sizeof(bytes));
+        MD_CHECK(!memcmp(bytes, payload, sizeof(bytes))); free(payload);
+        md_stream_close(p.peer);
+        payload = NULL;
+        MD_CHECK(md_stream_recv(p.host, &hdr, &payload, 1000) < 0); free(payload);
+        host_finish_client(&ctx, p.host);
+        md_stream_destroy(p.peer);
+        MD_CHECK(!ctx.client && !host_has_request(&ctx) && !session.stream_token[0]);
+        json = md_session_request_to_json(&first);
+        const MdNostrDmInfo live = {.rumor_created_at = first.issued_at, .live = true};
+        host_on_dm(client_pk, json, &live, &ctx); free(json);
+        MD_CHECK(!host_has_request(&ctx));
+    }
+    md_agent_destroy(agent);
+    md_nostr_destroy(client); md_nostr_destroy(host);
+    go_channel_close(ctx.session_req_ch); go_channel_unref(ctx.session_req_ch);
+    hist_free(&hp); hist_free(&cp);
+    pthread_mutex_destroy(&ctx.client_mu);
+    OPENSSL_cleanse(old_accept.stream_token, sizeof(old_accept.stream_token));
 }
 
 static void test_agent_replacement_failure(void) {
@@ -747,6 +1057,10 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
+    if (argc == 3 && !strcmp(argv[1], "--rebind-fixture")) {
+        test_relay_rebind(argv[2]);
+        return md_test_report();
+    }
     if (argc == 4 && !strcmp(argv[1], "--nip5f-fixture")) {
         hist_nip5f_socket = argv[3];
         hist_session(argv[2], "nip5f-quoted-seal", 0, 0, false);
@@ -764,6 +1078,9 @@ int main(int argc, char **argv) {
         test_relay_history(argv[2]);
         return md_test_report();
     }
+    test_capture_admission();
+    test_idle_capture_rebind();
+    test_request_cache();
     test_request_gate();
     test_rearm_request();
     test_agent_replacement_failure();

@@ -51,6 +51,15 @@ MdA11yNode *md_a11y_walk(MdA11yCtx *ctx) {
     return root;
 }
 
+bool md_a11y_target_at_point(MdA11yCtx *ctx, const char *id, int x, int y) {
+    if (!ctx || !id || !*id || !ctx->vtable || !ctx->vtable->hit_test)
+        return false;
+    char *hit = ctx->vtable->hit_test(ctx, x, y);
+    bool matches = hit && strcmp(hit, id) == 0;
+    free(hit);
+    return matches;
+}
+
 /* ── Shared diff engine ──────────────────────────────────────
  * Computes deltas between the previous snapshot and a fresh tree from
  * vtable->get_tree. Operates only on platform-neutral MdA11yNode, so

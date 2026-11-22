@@ -1389,6 +1389,55 @@ static void uia_destroy(MdA11yCtx *ctx) {
     ctx->backend_data = nullptr;
 }
 
+#ifdef MD_UIA_TESTING
+static HRESULT (*uia_test_point_runtime)(IUIAutomation *, POINT, SAFEARRAY **) = nullptr;
+#endif
+
+static HRESULT uia_point_runtime(IUIAutomation *automation, POINT point, SAFEARRAY **rid) {
+#ifdef MD_UIA_TESTING
+    if (uia_test_point_runtime) return uia_test_point_runtime(automation, point, rid);
+#endif
+    IUIAutomationElement *hit = nullptr;
+    HRESULT hr = automation->ElementFromPoint(point, &hit);
+    if (SUCCEEDED(hr) && hit) hr = hit->GetRuntimeId(rid);
+    else if (SUCCEEDED(hr)) hr = E_FAIL;
+    SAFE_RELEASE(hit);
+    return hr;
+}
+
+static char *uia_hit_test(MdA11yCtx *ctx, int x, int y) {
+    auto *st = ctx ? static_cast<UIAState *>(ctx->backend_data) : nullptr;
+    if (!st || !st->lock_initialized) return nullptr;
+    AcquireSRWLockExclusive(&st->calls_lock);
+    if (st->closing) {
+        ReleaseSRWLockExclusive(&st->calls_lock);
+        return nullptr;
+    }
+    st->active_calls++;
+    ReleaseSRWLockExclusive(&st->calls_lock);
+    char *id = nullptr;
+    HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(apartment)) {
+        MdPhysicalPixels physical;
+        EnterCriticalSection(&st->lock);
+        POINT point = {x, y};
+        SAFEARRAY *rid = nullptr;
+        if (uia_connected(st) && st->automation &&
+            SUCCEEDED(uia_point_runtime(st->automation, point, &rid)) && rid) {
+            MdA11yNode node = {};
+            set_runtime_id(&node, rid);
+            id = node.id;
+        }
+        if (rid) SafeArrayDestroy(rid);
+        LeaveCriticalSection(&st->lock);
+        CoUninitialize();
+    }
+    AcquireSRWLockExclusive(&st->calls_lock);
+    if (--st->active_calls == 0) WakeAllConditionVariable(&st->calls_drained);
+    ReleaseSRWLockExclusive(&st->calls_lock);
+    return id;
+}
+
 /* ── Singleton vtable ────────────────────────────────────────── */
 
 static bool uia_is_connected(const MdA11yCtx *ctx) {
@@ -1404,6 +1453,8 @@ static const MdA11yBackend uia_backend = {
     uia_unsubscribe_changes,
     uia_destroy,
     uia_is_connected,
+    uia_hit_test,
+    nullptr, /* coordinate click after a native hit test */
 };
 
 extern "C"

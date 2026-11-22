@@ -545,3 +545,60 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
     cJSON_Delete(root);
     return 0;
 }
+
+/* ── Correlated admission refusal ────────────────────────────── */
+
+const char *md_session_reject_message(const MdSessionReject *reject) {
+    if (!reject) return NULL;
+    if (!strcmp(reject->reason, "capture_unavailable"))
+        return "host screen capture unavailable; authorize screen sharing on the host and retry";
+    if (!strcmp(reject->reason, "request_refused"))
+        return "host refused session; check current access grants and retry with a fresh request";
+    return NULL;
+}
+
+char *md_session_reject_to_json(const MdSessionReject *reject) {
+    if (!reject || !is_request_id(reject->request_id) ||
+        !md_session_reject_message(reject)) return NULL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    char *json = NULL;
+    if (cJSON_AddStringToObject(root, "type", "session_reject") &&
+        cJSON_AddNumberToObject(root, "v", 1) &&
+        cJSON_AddStringToObject(root, "request_id", reject->request_id) &&
+        cJSON_AddStringToObject(root, "reason", reject->reason))
+        json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return json;
+}
+
+int md_session_reject_from_json(const char *json, MdSessionReject *out) {
+    if (!json || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+    if (!root) return -1;
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
+    cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+    bool valid = cJSON_IsObject(root) && cJSON_GetArraySize(root) == 4 &&
+        cJSON_IsString(type) && !strcmp(type->valuestring, "session_reject") &&
+        cJSON_IsNumber(v) && v->valuedouble == 1 &&
+        parse_request_id(root, out->request_id) == 1 &&
+        cJSON_IsString(reason) && strlen(reason->valuestring) < sizeof(out->reason);
+    if (valid) {
+        strcpy(out->reason, reason->valuestring);
+        valid = md_session_reject_message(out) != NULL;
+    }
+    cJSON_Delete(root);
+    if (!valid) memset(out, 0, sizeof(*out));
+    return valid ? 0 : -1;
+}
+
+bool md_session_reject_matches_request(const MdSessionReject *reject,
+                                       const MdSessionRequest *req,
+                                       int64_t rumor_created_at) {
+    return reject && req && is_request_id(req->request_id) &&
+        !strcmp(reject->request_id, req->request_id) &&
+        md_session_reject_message(reject) && req->issued_at > 0 &&
+        rumor_created_at >= req->issued_at - MD_SESSION_CLOCK_SKEW_S;
+}

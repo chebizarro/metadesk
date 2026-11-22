@@ -865,6 +865,7 @@ endif
 if enable_client
   client_sources = files(
     'src/client/main.c',
+    'src/client/rates.c',
     'src/client/render.c',
     'src/client/ui.cpp',
   )
@@ -905,6 +906,12 @@ if enable_client
       include_directories : [core_inc, include_directories('src/client'), include_directories('tests')],
       dependencies : [dep_metadesk, dep_sdl2])
   endif
+  test_client_session = executable('test_client_session',
+    files('tests/test_client_session.c', 'src/client/rates.c',
+          'src/client/render.c', 'src/client/ui.cpp'),
+    include_directories : [core_inc, include_directories('src/client')],
+    dependencies : [dep_metadesk, dep_sdl2, dep_imgui])
+  test('client session refusal', test_client_session)
 endif
 
 # Client process contracts without a TTY or display (md-rk4, md-33e).
@@ -920,6 +927,12 @@ if enable_nip46 and enable_client and host_os == 'linux'
     timeout : 200)
 endif
 
+test_client_rates = executable('test_client_rates',
+  files('tests/test_client_rates.c', 'src/client/rates.c'),
+  include_directories : [core_inc, include_directories('src/client')],
+)
+test('client sliding-window rates', test_client_rates)
+
 # ── Tests ───────────────────────────────────────────────────────────────────
 test_packet = executable('test_packet',
   files('tests/test_packet.c'),
@@ -933,8 +946,12 @@ test_atspi = executable('test_atspi',
 )
 test('a11y tree serialisation', test_atspi)
 if host_machine.system() == 'linux'
+  test_atspi_hit = executable('test_atspi_hit', files('tests/test_atspi_hit.c'),
+    dependencies : [dep_metadesk])
+  test('AT-SPI native hit adapter', test_atspi_hit)
   test('a11y private bus loss', test_atspi,
     args : ['--private-bus-loss', metadesk_host.full_path()],
+    env : {'G_DEBUG' : 'fatal-criticals'},
     depends : metadesk_host,
     timeout : 45,
   )
@@ -1160,6 +1177,13 @@ if host_os == 'darwin'
     dependencies : [dep_metadesk],
   )
   test('ScreenCaptureKit system stop', test_capture_sck, timeout : 30)
+  test_axui_hit = executable('test_axui_hit', files('tests/test_axui_hit.m'),
+    dependencies : [dep_metadesk])
+  test('AX native hit adapter', test_axui_hit)
+  test_agent_axui = executable('test_agent_axui',
+    files('tests/test_agent_axui.m'), dependencies : [dep_metadesk])
+  test('AX owned clicks and native video', test_agent_axui,
+    timeout : 300, suite : 'live')
 endif
 
 test_ipc = executable('test_ipc',
