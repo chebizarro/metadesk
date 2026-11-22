@@ -42,6 +42,7 @@ if [ -n "${MD_MACOS_MIN:-}" ]; then
     [ "$newest" = "$MD_MACOS_MIN" ] || bad "bundle needs macOS $min, release floor is $MD_MACOS_MIN"
 fi
 echo "minimum macOS: $min"
+python3 "$(dirname "$0")/macho.py" "${MD_MACOS_MIN:-$min}" "$app" || bad "Mach-O deployment floor"
 
 home=$(mktemp -d "${TMPDIR:-/tmp}/md-verify.XXXXXX")
 trap 'rm -rf "$home"' EXIT INT TERM

@@ -21,8 +21,22 @@ out=$(cd "$3" && pwd)
 case "$out/" in "$src"/*) echo "output must be outside the source tree" >&2; rmdir "$out"; exit 2 ;; esac
 shift 3
 
-# Only pkg-config selection is wired here. Rebuilding the rest of the closure,
-# staging license texts/source, and production release gates remain md-ouw3.
+# A private source-built closure takes precedence over every host pkg-config
+# directory. MD_FFMPEG_PREFIX remains supported for the prototype profile.
+if [ -n "${MD_DEPS_PREFIX:-}" ]; then
+    [ -z "${MD_FFMPEG_PREFIX:-}" ] || { echo "do not mix MD_DEPS_PREFIX and MD_FFMPEG_PREFIX" >&2; exit 1; }
+    unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH CPPFLAGS \
+        DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH PKG_CONFIG_SYSROOT_DIR CMAKE_PREFIX_PATH
+    MD_DEPS_PREFIX=$(cd "$MD_DEPS_PREFIX" && pwd -P)
+    export PKG_CONFIG_PATH=
+    export PKG_CONFIG_LIBDIR="$MD_DEPS_PREFIX/lib/pkgconfig"
+    export MACOSX_DEPLOYMENT_TARGET=13.0 MD_MACOS_MIN=13.0
+    export CFLAGS="-I$MD_DEPS_PREFIX/include -mmacosx-version-min=13.0"
+    export CXXFLAGS="$CFLAGS"
+    export OBJCFLAGS="$CFLAGS"
+    export LDFLAGS="-L$MD_DEPS_PREFIX/lib"
+    set -- "-Dmacos_deps_prefix=$MD_DEPS_PREFIX" "$@"
+fi
 if [ -n "${MD_FFMPEG_PREFIX:-}" ]; then
     MD_FFMPEG_PREFIX=$(cd "$MD_FFMPEG_PREFIX" && pwd -P)
     export PKG_CONFIG_PATH="$MD_FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -36,13 +50,18 @@ identity=${MD_CODESIGN_IDENTITY:--}
 version=$(meson introspect --projectinfo "$src/meson.build" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 rev=$(git -C "$src" rev-parse --short=12 HEAD)
 git -C "$src" diff --quiet HEAD -- . ':!.beads' || rev="$rev-dirty"
-nostrc_rev=$(git -C "$nostrc" rev-parse --short=12 HEAD)
+if [ -f "$nostrc/SOURCE_REVISION" ]; then
+    nostrc_rev=$(cat "$nostrc/SOURCE_REVISION")
+else
+    nostrc_rev=$(git -C "$nostrc" rev-parse --short=12 HEAD)
+fi
 
 meson setup "$out/build" "$src" --buildtype=release --prefix=/opt/metadesk \
     -Dclient=true -Dsigner_nip5f=true -Dsigner_nip46=true \
     -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nostrc_build" "$@"
 meson compile -C "$out/build"
 meson install -C "$out/build" --destdir "$out/stage" --quiet
+"$here/check-install.sh" "$out/stage/opt/metadesk"
 
 # Homebrew's sdl2 is sdl2-compat, which dlopens SDL3 at SDL_Init time. The
 # link closure cannot see it, so it is declared explicitly (contract: enumerate
@@ -68,6 +87,20 @@ hardened=
 python3 "$here/bundle_app.py" --stage "$out/stage/opt/metadesk" --out "$out/Metadesk.app" \
     --version "$version" --source-rev "$rev" --nostrc-rev "$nostrc_rev" \
     --sign-identity "$identity" $hardened $dlopen_args $search_args
+if [ -n "${MD_DEPS_PREFIX:-}" ]; then
+    deps=$(dirname "$MD_DEPS_PREFIX")
+    cp "$deps/deps.lock.json" "$out/Metadesk.app/Contents/Resources/"
+    cp -R "$deps/licenses" "$out/Metadesk.app/Contents/Resources/"
+    cp "$src/THIRD_PARTY_NOTICES.md" "$src/LICENSE" "$out/Metadesk.app/Contents/Resources/"
+    mkdir -p "$out/Metadesk.app/Contents/Resources/licenses/imgui"
+    cp "$src/imgui_vendor/LICENSE.txt" "$out/Metadesk.app/Contents/Resources/licenses/imgui/"
+    # Resources were added after bundling: re-seal using the same identity.
+    if [ "$identity" = - ]; then
+        codesign --force --sign "$identity" "$out/Metadesk.app"
+    else
+        codesign --force --sign "$identity" --options runtime --timestamp "$out/Metadesk.app"
+    fi
+fi
 "$here/verify-app.sh" "$out/Metadesk.app"
 
 if [ "${MD_DMG:-0}" = 1 ]; then
