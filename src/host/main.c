@@ -432,9 +432,9 @@ static int host_bind_candidate(HostCtx *ctx, MdStream *candidate) {
     return md_stream_accept_binding(candidate, ctx->session);
 }
 
-static void host_send_initial_tree(HostCtx *ctx) {
-    if (ctx->agent && md_stream_has_capability(ctx->client, MD_CAP_AGENT))
-        md_agent_send_tree(ctx->agent, ctx->client, &ctx->pkt_seq);
+static MdAgentTreeJob *host_send_initial_tree(HostCtx *ctx) {
+    return ctx->agent && md_stream_has_capability(ctx->client, MD_CAP_AGENT)
+        ? md_agent_tree_start(ctx->agent) : NULL;
 }
 
 /* ── Handle incoming packets from client ─────────────────────── */
@@ -1515,10 +1515,11 @@ signaling_ready:
          * mid-GOP with no decodable entry point. Force an IDR for it. */
         host_capture_sync_request_keyframe(&ctx.sync);
 
-        /* Send initial UI tree to new client */
-        host_send_initial_tree(&ctx);
-
         pthread_mutex_unlock(&ctx.client_mu);
+
+        /* No stream/client lock is held during the potentially slow OS walk.
+         * This connection owns the job and joins it before backend replacement. */
+        MdAgentTreeJob *initial_tree = host_send_initial_tree(&ctx);
 
         /* ── Streaming loop ─────────────────────────────────────── */
         printf("host: streaming to client #%u (Ctrl+C to stop)\n", client_num);
@@ -1536,6 +1537,19 @@ signaling_ready:
         uint32_t last_br = bitrate;
 
         while (g_running && md_stream_is_connected(client)) {
+            char *tree = NULL;
+            if (initial_tree && md_agent_tree_take(initial_tree, &tree) == 1) {
+                free(md_agent_tree_finish(initial_tree));
+                initial_tree = NULL;
+                if (tree) {
+                    pthread_mutex_lock(&ctx.client_mu);
+                    if (md_stream_has_capability(client, MD_CAP_AGENT))
+                        md_stream_send(client, MD_PKT_UI_TREE, ctx.pkt_seq++,
+                                       (const uint8_t *)tree, (uint32_t)strlen(tree));
+                    pthread_mutex_unlock(&ctx.client_mu);
+                    free(tree);
+                }
+            }
             /* Never leave a second connection waiting to inherit this grant. */
             MdStream *extra = md_stream_server_accept(srv, 1);
             if (extra) {
@@ -1548,6 +1562,12 @@ signaling_ready:
             int ret = md_stream_recv(client, &hdr, &payload, 10 /* 10ms poll */);
 
             if (ret == 0) {
+                /* Do not publish a pre-action snapshot after an action update.
+                 * Join outside client_mu so video continues during the wait. */
+                if (hdr.type == MD_PKT_ACTION && initial_tree) {
+                    free(md_agent_tree_finish(initial_tree));
+                    initial_tree = NULL;
+                }
                 pthread_mutex_lock(&ctx.client_mu);
                 handle_client_packet(&ctx, &hdr, payload);
                 pthread_mutex_unlock(&ctx.client_mu);
@@ -1612,6 +1632,8 @@ signaling_ready:
                 last_stats_ms = now;
             }
         }
+
+        free(md_agent_tree_finish(initial_tree));
 
         /* Client disconnected — clean up per-connection resources */
         md_bitrate_ctrl_destroy(br_ctrl);

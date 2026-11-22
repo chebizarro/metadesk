@@ -101,6 +101,68 @@ static char *serialize_tree(const MdA11yNode *root, MdTreeFormat fmt) {
     return NULL; /* MdTreeFormat is exhaustive */
 }
 
+struct MdAgentTreeJob {
+    MdA11yCtx *a11y;
+    MdTreeFormat format;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    bool done;
+    char *data;
+};
+
+static void *agent_tree_worker(void *data) {
+    MdAgentTreeJob *job = data;
+    MdA11yNode *root = md_a11y_walk(job->a11y);
+    char *tree = serialize_tree(root, job->format);
+    md_a11y_node_free(root);
+    pthread_mutex_lock(&job->mu);
+    job->data = tree;
+    job->done = true;
+    pthread_mutex_unlock(&job->mu);
+    return NULL;
+}
+
+MdAgentTreeJob *md_agent_tree_start(MdAgent *agent) {
+    if (!agent || !agent->a11y) return NULL;
+    MdAgentTreeJob *job = calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    job->a11y = agent->a11y;
+    job->format = agent->tree_format;
+    if (pthread_mutex_init(&job->mu, NULL) != 0) {
+        free(job);
+        return NULL;
+    }
+    if (pthread_create(&job->thread, NULL, agent_tree_worker, job) != 0) {
+        pthread_mutex_destroy(&job->mu);
+        free(job);
+        return NULL;
+    }
+    return job;
+}
+
+int md_agent_tree_take(MdAgentTreeJob *job, char **out) {
+    if (!out) return -1;
+    *out = NULL;
+    if (!job) return -1;
+    pthread_mutex_lock(&job->mu);
+    bool done = job->done;
+    if (done) {
+        *out = job->data;
+        job->data = NULL;
+    }
+    pthread_mutex_unlock(&job->mu);
+    return done ? 1 : 0;
+}
+
+char *md_agent_tree_finish(MdAgentTreeJob *job) {
+    if (!job) return NULL;
+    pthread_join(job->thread, NULL);
+    char *data = job->data;
+    pthread_mutex_destroy(&job->mu);
+    free(job);
+    return data;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 MdAgent *md_agent_create(const MdAgentConfig *cfg) {

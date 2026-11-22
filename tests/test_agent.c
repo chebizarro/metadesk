@@ -726,6 +726,75 @@ static int test_target_hit_verification(void) {
     return 0;
 }
 
+/* A tree walk held on an event, not a guessed sleep, must not hold the
+ * transport. Both JSON and compact must still return a complete tree. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered, release;
+} BlockedTree;
+
+static int agent_blocked_tree(MdA11yCtx *ctx, MdA11yNode **out) {
+    BlockedTree *state = ctx->backend_data;
+    pthread_mutex_lock(&state->mu);
+    state->entered = true;
+    pthread_cond_broadcast(&state->cv);
+    while (!state->release) pthread_cond_wait(&state->cv, &state->mu);
+    pthread_mutex_unlock(&state->mu);
+    int walks = 0;
+    MdA11yCtx fake = { .backend_data = &walks };
+    return agent_fake_tree(&fake, out);
+}
+
+static int test_initial_tree_does_not_block_video(void) {
+    const MdA11yBackend backend = { .get_tree = agent_blocked_tree };
+    MdStreamServer *server = md_stream_server_create(NULL, 0);
+    MD_CHECK(server);
+    MdStream *client = md_stream_connect("127.0.0.1",
+                                         md_stream_server_port(server), 3000);
+    MdStream *host = md_stream_server_accept(server, 3000);
+    MD_CHECK(client && host);
+    for (int compact = 0; compact < 2; compact++) {
+        BlockedTree state = { .mu = PTHREAD_MUTEX_INITIALIZER,
+                              .cv = PTHREAD_COND_INITIALIZER };
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = &state };
+        MdAgentConfig cfg = { .a11y = &a11y,
+            .tree_format = compact ? MD_TREE_FORMAT_COMPACT : MD_TREE_FORMAT_JSON };
+        MdAgent *agent = md_agent_create(&cfg);
+        MdAgentTreeJob *job = md_agent_tree_start(agent);
+        MD_CHECK(job);
+        pthread_mutex_lock(&state.mu);
+        while (!state.entered) pthread_cond_wait(&state.cv, &state.mu);
+        pthread_mutex_unlock(&state.mu);
+        char *tree = NULL;
+        MD_CHECK(md_agent_tree_take(job, &tree) == 0 && !tree);
+        /* A frame is delivered while the accessibility provider is blocked. */
+        const uint8_t frame[] = {1, 2, 3};
+        MD_CHECK(md_stream_send(host, MD_PKT_VIDEO_FRAME, 1, frame, sizeof(frame)) == 0);
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(client, &hdr, &payload, 3000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME && hdr.payload_len == sizeof(frame));
+        MD_CHECK(payload && memcmp(payload, frame, sizeof(frame)) == 0);
+        free(payload);
+        pthread_mutex_lock(&state.mu);
+        state.release = true;
+        pthread_cond_broadcast(&state.cv);
+        pthread_mutex_unlock(&state.mu);
+        tree = md_agent_tree_finish(job);
+        MD_CHECK(tree && strstr(tree, "btn1") && strstr(tree, "Before"));
+        free(tree);
+        md_agent_destroy(agent);
+        pthread_cond_destroy(&state.cv);
+        pthread_mutex_destroy(&state.mu);
+    }
+    md_stream_destroy(host);
+    md_stream_destroy(client);
+    md_stream_server_destroy(server);
+    puts("  PASS: initial tree worker preserves video and complete snapshots");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -747,6 +816,7 @@ int main(void) {
     failures += test_handle_action_mcp();
     failures += test_missing_input_never_acknowledges();
     failures += test_format_aware_updates();
+    failures += test_initial_tree_does_not_block_video();
     failures += test_target_hit_verification();
 
     clear_agent_mcp_response();

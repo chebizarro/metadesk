@@ -1158,6 +1158,10 @@ if host_os == 'darwin'
   test_axui_hit = executable('test_axui_hit', files('tests/test_axui_hit.m'),
     dependencies : [dep_metadesk])
   test('AX native hit adapter', test_axui_hit)
+  test_agent_axui = executable('test_agent_axui',
+    files('tests/test_agent_axui.m'), dependencies : [dep_metadesk])
+  test('AX owned clicks and native video', test_agent_axui,
+    timeout : 300, suite : 'live')
 endif
 
 test_ipc = executable('test_ipc',

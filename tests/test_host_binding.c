@@ -1,7 +1,7 @@
 #include "md_socket.h"
 /* Private loopback tests of real host admission/capture/dispatch. No desktop. */
 #define main md_host_main_not_run
-#define md_agent_send_tree test_send_tree
+#define md_agent_tree_start test_tree_start
 #define md_agent_handle_action test_action
 #define md_input_mouse_move test_move
 #define md_nostr_send_session_accept test_publish
@@ -31,8 +31,8 @@ int test_publish(MdNostr *n, const char *peer, const char *json) {
 }
 int md_host_account_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
 int md_host_access_cli(int argc, char **argv) { (void)argc; (void)argv; return -1; }
-int test_send_tree(MdAgent *a, MdStream *s, uint32_t *seq) {
-    (void)a; (void)s; (void)seq; tree_calls++; return 0;
+MdAgentTreeJob *test_tree_start(MdAgent *a) {
+    (void)a; tree_calls++; return NULL;
 }
 int test_action(MdAgent *a, MdStream *s, uint32_t *seq,
                 const uint8_t *p, uint32_t n) {
