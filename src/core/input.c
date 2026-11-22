@@ -229,10 +229,15 @@ static void input_apply_fallback_dimensions(MdInputConfig *cfg,
 MdInput *md_input_create(const MdInputConfig *cfg) {
     const char *name = cfg ? cfg->backend : NULL;
     const MdInputBackend *vtable = NULL;
+    bool portal_auto = false;
     if (!name || strcmp(name, "auto") == 0) {
-        /* TODO(md-y8kc): consider preferring portal only after live GNOME
-         * acceptance. Until then auto keeps the established platform backend
-         * (uinput on Linux), with no portal probe or fallback. */
+#if defined(__linux__) && defined(MD_HAVE_PORTAL_INPUT)
+        const char *session = getenv("XDG_SESSION_TYPE");
+        if (session && !strcmp(session, "wayland") && md_input_portal_available()) {
+            vtable = md_input_portal_backend();
+            portal_auto = true;
+        } else
+#endif
         vtable = md_input_backend_create();
 #ifdef MD_HAVE_PORTAL_INPUT
     } else if (strcmp(name, "portal") == 0) {
@@ -268,8 +273,17 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
     }
 
     if (inp->vtable->init(inp) != 0) {
-        free(inp);
-        return NULL;
+        /* Failed init owns its partial-state cleanup. Explicit overrides
+         * never silently change authority/backend. Linux uinput itself
+         * refuses known Wayland sessions before creating any device. */
+        if (portal_auto) {
+            MD_LOG_W("automatic portal input unavailable; trying platform backend");
+            inp->vtable = md_input_backend_create();
+        }
+        if (!portal_auto || !inp->vtable || inp->vtable->init(inp) != 0) {
+            free(inp);
+            return NULL;
+        }
     }
 
     return inp;

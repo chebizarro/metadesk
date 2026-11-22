@@ -45,6 +45,13 @@ not grant capabilities, enable input, or weaken relay/stream authorization.
   unit can wait for authenticated requests, but an attempted video setup exits
   78 and needs an operator. `--capture-unattended` only caps a consent budget;
   it is not a no-prompt API and does not override this restriction.
+* **Linux input limit:** RemoteDesktop likewise has no no-prompt Start flag.
+  An invalid or revoked restore token can display consent, so managed portal
+  input refuses before creating a session, even with a saved token. Native
+  input backends retain their existing behavior; uinput refuses known Wayland
+  sessions before device creation. Unavailable requested input makes a managed
+  host fail with exit 78 / `needs_interaction`, rather than silently serve
+  without control. Use `--no-input` explicitly for a read-only host.
 * **macOS:** managed SCK preflights Screen Recording permission before enumeration.
   Missing authorization refuses without requesting it. AX already preflights
   trust. Permission for a Terminal-launched binary is not permission for a

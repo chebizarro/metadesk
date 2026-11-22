@@ -6,6 +6,7 @@
 #include <dbus/dbus.h>
 #include <libeis.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-names.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -22,7 +23,7 @@
 #define REQUEST "org.freedesktop.portal.Request"
 #define SESSION "org.freedesktop.portal.Session"
 
-typedef struct { atomic_int keys, buttons, moves, scrolls, closes, requests; } Stats;
+typedef struct { atomic_int keys, shifts, ms, ones, buttons, moves, scrolls, closes, requests; } Stats;
 static Stats *stats;
 
 static void dict_value(DBusMessageIter *dict, const char *key, int type, const void *v) {
@@ -60,16 +61,43 @@ static void send(DBusConnection *bus, DBusMessage *msg) {
     dbus_connection_flush(bus); /* local controlled fixture */
 }
 
-static struct eis_device *add_keyboard(struct eis_seat *seat) {
+static struct eis_device *add_keyboard(struct eis_seat *seat, int mode) {
     struct eis_device *dev = eis_seat_new_device(seat);
     eis_device_configure_name(dev, "fixture keyboard");
     eis_device_configure_type(dev, EIS_DEVICE_TYPE_VIRTUAL);
     eis_device_configure_capability(dev, EIS_DEVICE_CAP_KEYBOARD);
     struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    struct xkb_keymap *map = xkb_keymap_new_from_names(ctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    const char *remapped = mode == 6 ?
+        "xkb_keymap { xkb_keycodes { include \"evdev+aliases(qwerty)\" }; "
+        "xkb_types { include \"complete\" }; xkb_compatibility { include \"complete\" }; "
+        "xkb_symbols { include \"pc+us+inet(evdev)\" "
+        "replace key <LFSH> { [ Control_L ] }; modifier_map None { <LFSH> }; "
+        "modifier_map Control { <LFSH> }; }; };" :
+        "xkb_keymap { xkb_keycodes { include \"evdev+aliases(qwerty)\" }; "
+        "xkb_types { include \"complete\" }; xkb_compatibility { include \"complete\" }; "
+        "xkb_symbols { include \"pc+us+inet(evdev)\" "
+        "replace key <LFSH> { type=\"ONE_LEVEL\", symbols[Group1]=[ Shift_L ], "
+        "actions[Group1]=[ SetMods(modifiers=Shift+Mod1) ] }; }; };";
+    struct xkb_keymap *map = mode >= 6 ?
+        xkb_keymap_new_from_string(ctx, remapped, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS) :
+        xkb_keymap_new_from_names(ctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!map) _exit(2);
+    if (mode >= 6) {
+        struct xkb_state *state = xkb_state_new(map);
+        xkb_state_update_key(state, 42 + 8, XKB_KEY_DOWN);
+        /* Ensure this fixture really exercises the intended unsafe mapping. */
+        if (!xkb_state_mod_name_is_active(state, mode == 6 ? XKB_MOD_NAME_CTRL : XKB_MOD_NAME_ALT,
+                                          XKB_STATE_MODS_EFFECTIVE) ||
+            (mode == 7 && !xkb_state_mod_name_is_active(state, XKB_MOD_NAME_SHIFT,
+                                                        XKB_STATE_MODS_EFFECTIVE))) {
+            fputs("fixture keymap does not activate the required remapped modifiers\n", stderr);
+            _exit(2);
+        }
+        xkb_state_unref(state);
+    }
     char *text = xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1);
     int fd = memfd_create("keymap", MFD_CLOEXEC);
-    size_t size = strlen(text) + 1;
+    size_t size = strlen(text) + (mode == 5 ? 0 : 1);
     if (write(fd, text, size) != (ssize_t)size) _exit(2);
     struct eis_keymap *keymap = eis_device_new_keymap(dev, EIS_KEYMAP_TYPE_XKB, fd, size);
     eis_keymap_add(keymap); eis_keymap_unref(keymap); close(fd);
@@ -185,7 +213,7 @@ static void server(int commands, int notices, int mode) {
                 eis_seat_add(seat); break;
             }
             case EIS_EVENT_SEAT_BIND:
-                keyboard = add_keyboard(eis_event_get_seat(event));
+                keyboard = add_keyboard(eis_event_get_seat(event), mode);
                 pointer = add_pointer(eis_event_get_seat(event)); break;
             case EIS_EVENT_CLIENT_DISCONNECT:
                 if (keyboard) { eis_device_remove(keyboard); keyboard = eis_device_unref(keyboard); }
@@ -194,6 +222,9 @@ static void server(int commands, int notices, int mode) {
                 break;
             case EIS_EVENT_KEYBOARD_KEY:
                 if (eis_event_keyboard_get_key(event) == 30) atomic_fetch_add(&stats->keys, 1);
+                if (eis_event_keyboard_get_key(event) == 42) atomic_fetch_add(&stats->shifts, 1);
+                if (eis_event_keyboard_get_key(event) == 50) atomic_fetch_add(&stats->ms, 1);
+                if (eis_event_keyboard_get_key(event) == 2) atomic_fetch_add(&stats->ones, 1);
                 ack = 'E'; if (write(notices, &ack, 1) != 1) _exit(2); break;
             case EIS_EVENT_POINTER_MOTION_ABSOLUTE:
                 if (eis_event_pointer_get_absolute_x(event) == 100 && eis_event_pointer_get_absolute_y(event) == 200)
@@ -253,7 +284,7 @@ int main(void) {
     stats = mmap(NULL,sizeof(*stats),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     MD_CHECK(stats != MAP_FAILED);
     if (stats == MAP_FAILED) return md_test_report();
-    for (int mode=0; mode<5; mode++) {
+    for (int mode=0; mode<8; mode++) {
         memset(stats,0,sizeof(*stats));
         int commands[2], notices[2];
         if (pipe(commands) || pipe(notices)) return 1;
@@ -263,9 +294,15 @@ int main(void) {
         MD_CHECK(child > 0); MD_CHECK(notice(notices[0],'R'));
         MD_CHECK(md_input_portal_available());
         MdInputConfig cfg = { .screen_width=1920,.screen_height=1080,.backend="portal",.portal_timeout_ms=2000 };
+        /* Later modes already have a saved token from mode 0. Even with a
+         * token, managed mode must not gamble on Start being prompt-free. */
+        cfg.no_interaction = true;
+        MD_CHECK(md_input_create(&cfg) == NULL);
+        MD_CHECK(atomic_load(&stats->requests) == 0);
+        cfg.no_interaction = false;
         uint64_t start = md_monotonic_ns();
         MdInput *input = md_input_create(&cfg);
-        if (!mode) {
+        if (!mode || mode >= 5) {
             MD_CHECK(input != NULL);
             if (input) {
                 MD_CHECK(md_input_is_ready(input));
@@ -283,9 +320,18 @@ int main(void) {
                 MD_CHECK(atomic_load(&stats->scrolls) == 1);
                 MD_CHECK(md_input_type_text(input,"a\xc3\xa9") == -1);
                 MD_CHECK(atomic_load(&stats->keys) == 2); /* preflight: no partial 'a' */
-                MD_CHECK(md_input_type_text(input,"a") == 0);
-                MD_CHECK(notice(notices[0],'E')); MD_CHECK(notice(notices[0],'E'));
-                MD_CHECK(atomic_load(&stats->keys) == 4);
+                if (mode >= 6) {
+                    MD_CHECK(md_input_type_text(input,"aA") == -1);
+                    MD_CHECK(atomic_load(&stats->keys) == 2);
+                    MD_CHECK(atomic_load(&stats->shifts) == 0);
+                } else {
+                    MD_CHECK(md_input_type_text(input,"Ma!") == 0);
+                    for (int i=0;i<10;i++) MD_CHECK(notice(notices[0],'E'));
+                    MD_CHECK(atomic_load(&stats->keys) == 4);
+                    MD_CHECK(atomic_load(&stats->ms) == 2);
+                    MD_CHECK(atomic_load(&stats->ones) == 2);
+                    MD_CHECK(atomic_load(&stats->shifts) == 4);
+                }
                 char command='C'; MD_CHECK(write(commands[1],&command,1) == 1);
                 MD_CHECK(notice(notices[0],'C'));
                 /* is_ready synchronously drains revocation, not a timer. */
