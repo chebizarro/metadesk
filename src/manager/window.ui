@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.14"/>
+  <requires lib="Adw" version="1.5"/>
+  <template class="MdManagerWindow" parent="AdwApplicationWindow">
+    <property name="title">Metadesk</property>
+    <property name="default-width">1000</property>
+    <property name="default-height">740</property>
+    <property name="width-request">360</property>
+    <property name="height-request">294</property>
+    <child>
+      <object class="AdwBreakpoint">
+        <condition>max-width: 650sp</condition>
+        <setter object="split" property="collapsed">True</setter>
+      </object>
+    </child>
+    <property name="content">
+      <object class="AdwToastOverlay" id="toasts">
+        <property name="child">
+          <object class="AdwNavigationSplitView" id="split">
+            <property name="min-sidebar-width">190</property>
+            <property name="max-sidebar-width">230</property>
+            <property name="sidebar">
+              <object class="AdwNavigationPage">
+                <property name="title">Metadesk</property>
+                <property name="child">
+                  <object class="AdwToolbarView">
+                    <child type="top"><object class="AdwHeaderBar"/></child>
+                    <property name="content">
+                      <object class="GtkScrolledWindow">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="child">
+                          <object class="GtkListBox" id="navigation">
+                            <property name="selection-mode">single</property>
+                            <property name="activate-on-single-click">True</property>
+                            <style><class name="navigation-sidebar"/></style>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </property>
+              </object>
+            </property>
+            <property name="content">
+              <object class="AdwNavigationPage" id="content_page">
+                <property name="title">Hosts</property>
+                <property name="child">
+                  <object class="AdwToolbarView">
+                    <child type="top">
+                      <object class="AdwHeaderBar">
+                        <child type="end">
+                          <object class="GtkButton" id="refresh">
+                            <property name="icon-name">view-refresh-symbolic</property>
+                            <property name="tooltip-text">Refresh Accounts and Signer Status</property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <property name="content">
+                      <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <child>
+                          <object class="AdwBanner" id="banner">
+                            <property name="title">Checking signer status…</property>
+                            <property name="revealed">True</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkStack" id="pages">
+                            <property name="vexpand">True</property>
+                            <property name="hhomogeneous">False</property>
+                            <property name="vhomogeneous">False</property>
+                            <child>
+                              <object class="GtkStackPage">
+                                <property name="name">Identity</property>
+                                <property name="child">
+                                  <object class="GtkScrolledWindow">
+                                    <property name="hscrollbar-policy">never</property>
+                                    <property name="child">
+                                      <object class="AdwClamp">
+                                        <property name="maximum-size">680</property>
+                                        <property name="child">
+                                          <object class="GtkBox" id="identity_form">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">24</property>
+                                            <property name="margin-start">18</property>
+                                            <property name="margin-end">18</property>
+                                            <property name="margin-top">24</property>
+                                            <property name="margin-bottom">24</property>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Signer Status</property>
+                                                <property name="description">Read-only Grotto status, not the state of every account. Key custody and unlocking remain in the signer.</property>
+                                                <child><object class="AdwActionRow" id="key_status"><property name="title">Key lock</property></object></child>
+                                                <child><object class="AdwActionRow" id="session_status"><property name="title">Desktop session lock</property></object></child>
+                                                <child><object class="AdwActionRow" id="signing_status"><property name="title">Signing</property></object></child>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Signer Accounts</property>
+                                                <property name="description">Public metadata saved by Metadesk. Expand an account to compare the full npub; a fingerprint is only a short visual aid.</property>
+                                                <child><object class="GtkListBox" id="account_list"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Account Roles</property>
+                                                <property name="description">Save a verified signer selection for the next host or client start. Running sessions are not changed. Managed connections require a client role; FIPS hosting must match the local node key.</property>
+                                                <child><object class="AdwComboRow" id="client_role"><property name="title">Client account</property></object></child>
+                                                <child><object class="GtkButton" id="save_client"><property name="label">Save _Client Role</property><property name="use-underline">True</property><property name="halign">end</property><property name="margin-top">8</property></object></child>
+                                                <child><object class="AdwComboRow" id="host_role"><property name="title">Host account</property></object></child>
+                                                <child><object class="GtkButton" id="save_host"><property name="label">Save _Host Role</property><property name="use-underline">True</property><property name="halign">end</property><property name="margin-top">8</property></object></child>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Add a Signer Account</property>
+                                                <property name="description">Create or import keys in an external signer, then add its public key here. Remote accounts need an existing CLI pairing. Adding metadata does not verify access.</property>
+                                                <child><object class="AdwComboRow" id="backend"><property name="title">Signer transport</property><property name="model"><object class="GtkStringList"><items><item>Local D-Bus (NIP-55L)</item><item>Local Socket (NIP-5F)</item><item>Remote Signer (NIP-46)</item></items></object></property></object></child>
+                                                <child><object class="AdwEntryRow" id="public_key"><property name="title">_Public key (npub or hex)</property><property name="use-underline">True</property></object></child>
+                                                <child><object class="AdwEntryRow" id="account_label"><property name="title">Account _label</property><property name="use-underline">True</property></object></child>
+                                                <child><object class="GtkButton" id="add_account"><property name="label">_Add Account</property><property name="use-underline">True</property><property name="halign">end</property><property name="margin-top">8</property></object></child>
+                                              </object>
+                                            </child>
+                                            <child><object class="GtkLabel" id="account_error"><property name="wrap">True</property><property name="selectable">True</property><property name="xalign">0</property><style><class name="error"/></style></object></child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkStackPage">
+                                <property name="name">Relays</property>
+                                <property name="child">
+                                  <object class="GtkScrolledWindow">
+                                    <property name="hscrollbar-policy">never</property>
+                                    <property name="child">
+                                      <object class="AdwClamp">
+                                        <property name="maximum-size">680</property>
+                                        <property name="child">
+                                          <object class="GtkBox" id="relay_form">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">24</property>
+                                            <property name="margin-start">18</property>
+                                            <property name="margin-end">18</property>
+                                            <property name="margin-top">24</property>
+                                            <property name="margin-bottom">24</property>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Bootstrap Relays</property>
+                                                <property name="description">Choose relays explicitly. No public relay is selected automatically. These local settings are not yet used by the connection or discovery backend (md-2l87).</property>
+                                                <child><object class="GtkListBox" id="relay_list"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="AdwPreferencesGroup">
+                                                <property name="title">Add a Relay</property>
+                                                <property name="description">Prefer wss:// for encrypted transport. ws:// is unencrypted. Credentials and query parameters cannot be stored here. Saving a URL does not test connectivity.</property>
+                                                <child><object class="AdwEntryRow" id="relay_url"><property name="title">Relay _URL</property><property name="use-underline">True</property></object></child>
+                                                <child><object class="GtkButton" id="add_relay"><property name="label">_Save Relay</property><property name="use-underline">True</property><property name="halign">end</property><property name="margin-top">8</property></object></child>
+                                              </object>
+                                            </child>
+                                            <child><object class="GtkLabel" id="relay_error"><property name="wrap">True</property><property name="selectable">True</property><property name="xalign">0</property><style><class name="error"/></style></object></child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </property>
+                  </object>
+                </property>
+              </object>
+            </property>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

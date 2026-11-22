@@ -1,0 +1,5 @@
+<gresources>
+  <gresource prefix="/org/metadesk/Manager">
+    <file>window.ui</file>
+  </gresource>
+</gresources>

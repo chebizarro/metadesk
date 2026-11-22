@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Metadesk
+Comment=Manage Metadesk signer accounts and relay setup
+Exec=metadesk-manager
+Icon=preferences-desktop-remote-desktop
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true
+DBusActivatable=false
