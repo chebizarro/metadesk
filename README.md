@@ -251,4 +251,9 @@ the tree above is a top-level orientation only.
 
 ## License
 
-See repository root for license terms.
+metadesk is [MIT licensed](LICENSE), Copyright (c) 2026 Chris Daley
+(project started 2026-04-13). Dependencies retain their own licenses; see
+[Third-party notices](THIRD_PARTY_NOTICES.md). Bundled releases use LGPL-only
+FFmpeg, hardware/OS H.264 encoders, and an optional separately downloaded
+Cisco OpenH264 runtime, not bundled GPL codecs. Distro packages use system
+FFmpeg under the distro's licensing.

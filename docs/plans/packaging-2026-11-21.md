@@ -17,7 +17,7 @@
    - Always bundle on macOS/Windows.
    - On Linux native packages, use distro FFmpeg/SDL2/PipeWire/OpenSSL/GLib.
    - Link nostrc statically from a **pinned nostrc revision** (the build already links nostrc almost entirely as static archives; §3).
-4. **Ship our own minimal LGPL FFmpeg** (H.264 only) wherever we bundle it. Homebrew/most distro FFmpeg builds are GPL and drag in ~15 codec libraries metadesk never uses (§3). Whether a GPL `libx264` fallback ships, and in which artifacts, is an explicit open decision (§13).
+4. **Ship our own minimal LGPL FFmpeg** (H.264 only) wherever we bundle it. Homebrew/most distro FFmpeg builds are GPL and drag in ~15 codec libraries metadesk never uses (§3). **Decided:** no GPL codec in bundled releases; software fallback is Cisco OpenH264, separately downloaded and loaded at runtime by metadesk (§13). Distro packages use system FFmpeg under distro licensing.
 5. **Updates follow the channel:**
    - Package managers update everything except the DMG.
    - The DMG gets **Sparkle 2** (EdDSA-signed appcast).
@@ -57,6 +57,58 @@ Evidence from the macOS prototype run on 2026-11-21:
 | Homebrew bottles carry the **builder's OS** as minimum | `LC_BUILD_VERSION minos 27.2` on `libwebsockets`, `SDL3`, `SvtAv1Enc` | the bundle's honest `LSMinimumSystemVersion` is 27.2; **Launch Services refuses to open it on this 27.0.1 machine (`-10825`)**. Release dependencies must be built with `MACOSX_DEPLOYMENT_TARGET=13.0` (ScreenCaptureKit floor) |
 | `libSDL2` is **sdl2-compat**, which `dlopen`s SDL3 | `strings libSDL2-2.0.0.dylib` → `@loader_path/libSDL3.dylib` | the linker view misses a required runtime library; exactly the contract's "enumerate dlopen features" rule |
 | OpenSSL comes from `openssl@4` via libwebsockets | closure | one TLS stack only; bundle it (macOS/Windows) or use the system one (Linux packages) |
+
+### 3.1 License decision (owner, 2026-11-22; `md-2exc`)
+
+metadesk is **MIT**, Copyright (c) 2026 Chris Daley; project started 2026-04-13.
+The root `LICENSE` and Meson project metadata record it. The observations
+above remain historical prototype evidence, **not the release configuration**.
+In particular, the old Homebrew GPL FFmpeg and OpenSSL 4 closure must not be
+represented as the planned LGPL-only FFmpeg / OpenSSL 3 producer.
+
+Bundled DMG/MSI/container/Flatpak artifacts use a minimal **LGPL-2.1-or-later**
+FFmpeg, native H.264 decoder/parser and HW/OS encoders only. No libx264,
+libx265 or libopenh264. Encoder policy is hardware/OS candidates
+(VideoToolbox, NVENC, AMF, QSV, VAAPI, Media Foundation as applicable), then
+optional **Cisco OpenH264**, downloaded separately from Cisco and loaded by
+metadesk, never bundled. L14 owns `encode.c`/the loader; exact order, user
+controls, download trust and ABI details must be reconciled after landing.
+This lane does not assert the runtime integration is implemented.
+
+Native .deb/.rpm/AUR link system libavcodec; the distro's FFmpeg configuration
+and licensing apply (including libx264 only where the distro supplies it).
+libx264 remains an optional **source-build-only** feature outside bundled
+artifacts. See [third-party notices](../../THIRD_PARTY_NOTICES.md) and the
+[release-notes template](../../packaging/RELEASE_NOTES_TEMPLATE.md).
+
+### 3.2 L15 macOS verification (2026-11-21)
+
+Private native arm64 build of upstream `ffmpeg-8.1.2.tar.xz` from
+`https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz`, archive SHA-256
+`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`.
+The `macos` profile with `MACOSX_DEPLOYMENT_TARGET=13.0` built successfully:
+
+```text
+License: LGPL version 2.1 or later
+Enabled decoders: h264
+Enabled encoders: h264_videotoolbox
+Enabled parsers: h264
+```
+
+`verify-codecs.c` independently enumerated the built shared libraries and
+checked avcodec/avutil licenses: **PASS**, exactly that inventory. Mach-O
+closure contains only avutil and Apple system libraries/frameworks, no GPL
+codec library. The optional `MD_FFMPEG_PREFIX` app producer passed
+`verify-app.sh` with **20 private libraries** and explicit SDL3 dlopen;
+notices tabulate that manifest. Metadesk (client, NIP-5F and NIP-46 enabled,
+nostrc `cfcb86296068`) suite: **46 OK, 0 failed, 1 opt-in live AX/video skip**,
+exit 0. Shell syntax/ShellCheck and negative codec/path guards passed.
+
+The app still requires macOS **27.2** because of other Homebrew dependencies
+and uses OpenSSL 4; only FFmpeg was rebuilt for 13.0. This does not qualify a
+release, Windows/Linux profiles, or L14's pending runtime fallback. Private
+build trees are removed after verification; source hash/flags and results
+are recorded here and on `md-2exc`.
 
 ## 4. Consuming the runtime-bundle contract (`md-ah9.13`)
 
@@ -144,8 +196,9 @@ Evidence from the macOS prototype run on 2026-11-21:
 |---|---|---|---|---|---|---|
 | **nostrc** (libnostr, libgo, nip11/17/19/44/51/98, signer cores) | P | P | P | P | P | Already static except `libnostr-json`; pin by commit in the manifest. Long-term: nostrc install rules + `.pc` → `S` on Linux |
 | `libnostr-json` (nostrc) | B | B | P (build static) | P | B | Only shared nostrc lib today |
-| FFmpeg (`libavcodec`, `libavutil`) | B (own LGPL minimal build) | B (own LGPL build w/ NVENC/AMF headers) | S | Flatpak runtime ffmpeg extension or bundled module | B (distro `libavcodec` from base) | §13 Q1 decides GPL `libx264` fallback |
-| `libx264` | optional (GPL) | optional (GPL) | S (distro choice) | — (HW/ VAAPI path) | S | Only fallback when no HW encoder |
+| FFmpeg (`libavcodec`, `libavutil`) | B (minimal LGPL) | B (minimal LGPL, NVENC/AMF headers) | S (system FFmpeg) | B (own minimal LGPL module) | B (own minimal LGPL) | §7.1 flags; no unverified runtime FFmpeg extension or distro codec closure in bundled payload |
+| `libx264` | — | — | S (only if distro FFmpeg supplies it) | — | — | No GPL codec in bundled artifacts; optional source-build feature only |
+| OpenH264 | not bundled | not bundled | not bundled | not bundled | not bundled | Cisco binary downloaded separately at runtime; metadesk loads it, not FFmpeg |
 | SDL2 (+ SDL3 if sdl2-compat) | B (+ dlopen SDL3) | B | S | runtime | — (host only) | Prefer building **real SDL2** or migrate to SDL3 directly to drop the dlopen indirection |
 | Dear ImGui | vendored source (`imgui_vendor/`) | same | same | same | — | already in-tree |
 | libyuv | B | B | S where packaged at a usable version, else P | P | B | verify per distro (§12) |
@@ -156,6 +209,55 @@ Evidence from the macOS prototype run on 2026-11-21:
 | PipeWire, AT-SPI2, D-Bus, udev, portals | — | — | S | runtime/portals | Tier B per contract | never bundled on Linux |
 | GTK4/libadwaita (manager) | — | — | S | GNOME runtime | — | Linux only |
 | **FIPS daemon** | not bundled | not bundled | `Recommends:`/`optdepends` `fipsd` | not bundled (host-side daemon) | Tier B/C mesh per md-ah9 | §9 |
+
+### 7.1 FFmpeg configure policy per artifact
+
+All bundled profiles share this **base** (shared libraries so users can replace
+LGPL components; no FFmpeg command-line tools, containers, filters or audio):
+
+```sh
+--disable-everything --disable-autodetect
+--disable-gpl --disable-nonfree --disable-version3
+--enable-shared --disable-static --disable-programs --disable-doc
+--disable-avdevice --disable-avfilter --disable-avformat
+--disable-swresample --disable-swscale --enable-avcodec --enable-avutil
+--enable-decoder=h264 --enable-parser=h264
+```
+
+| Artifact / script profile | Additional configure flags | Build inputs / runtime boundary |
+|---|---|---|
+| macOS DMG / `macos` | `--enable-videotoolbox --enable-encoder=h264_videotoolbox` | Apple SDK; `MACOSX_DEPLOYMENT_TARGET=13.0`; OS VideoToolbox, no codec dylib from Homebrew FFmpeg |
+| Windows MSI / `windows` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-mediafoundation --enable-libvpl --enable-encoder=h264_nvenc,h264_amf,h264_mf,h264_qsv` | nv-codec-headers + AMF **headers only**; Media Foundation SDK; oneVPL dispatcher; driver runtimes supplied by OS/user, not bundled |
+| Linux container image / `container` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-vaapi --enable-libdrm --enable-libvpl --enable-encoder=h264_nvenc,h264_amf,h264_vaapi,h264_qsv` | nv-codec-headers + AMF headers, libva/libdrm + oneVPL; classify dispatcher libraries in BOM; GPU access is deployment-dependent |
+| Flatpak / `flatpak` | same as `container` | Own minimal LGPL module, not an unverified full-codec extension; current client needs only decode, encoders do not promise Flatpak host/input support |
+| .deb / .rpm / AUR | **system FFmpeg** (no metadesk configure invocation) | Link system libavcodec/libavutil, declare package dependencies; distro licensing/configuration applies |
+
+`packaging/ffmpeg/build-minimal-lgpl.sh PROFILE SOURCE OUTPUT` implements these
+flags. No `--enable-libx264`, `--enable-libx265` or `--enable-libopenh264`;
+`--disable-autodetect` prevents accidental external codec pickup. Required
+headers/SDKs must exist: missing requested encoders fail, never silently
+produce a reduced “success.” Cross-toolchain variables are documented in the
+script. Profiles are native by default and take already pinned/extracted
+source, with all build/install output outside the source trees.
+
+`MD_FFMPEG_PREFIX=/absolute/output/install packaging/macos/build-app.sh …`
+selects a private minimal build behind an option. This is not a release gate
+for the entire closure; OpenSSL pinning, dependency OS floors, legal-file
+staging and production closure enforcement remain `md-ouw3`/pipeline work.
+Record each release's exact source archive/hash, patches, toolchain and full
+configure arguments (including install prefix) in its manifest/source archive.
+Verify configure says `License: LGPL version 2.1 or later`, inspect enabled
+codec/parser lists and runtime codec enumeration, and reject GPL/nonfree or
+unexpected codecs. Only the macOS profile has local L15 build verification;
+other profiles require their platform CI, headers and runtime smoke tests.
+
+Every bundled FFmpeg release includes `COPYING.LGPLv2.1`, notices, an exact
+corresponding-source archive beside the binary and a concrete source link in
+release notes. Keep LGPL libraries dynamically replaceable; if ever static,
+provide relinkable application objects/instructions. Include build recipes and
+patches, and preserve reverse-engineering rights for debugging modifications.
+Apply the same compliance process to other privately shipped LGPL libraries.
+See [FFmpeg guidance](https://ffmpeg.org/legal.html) and the root notices.
 
 ## 8. Signing, notarization, reproducibility, updates
 
@@ -244,7 +346,7 @@ Run on a real Omarchy install (or Arch + Hyprland + Omarchy defaults), from the 
 
 ## 13. Open decisions
 
-1. **FFmpeg licensing.** Ship LGPL-only (HW encoders + native decoder; no software encode fallback when no HW encoder) or also a GPL `libx264` fallback? GPL fallback makes those artifacts GPL. metadesk has **no LICENSE file** today. A project license must be chosen before any binary release.
+1. **RESOLVED — project/codec licensing (`md-2exc`, owner DECISION 2026-11-22).** MIT, Copyright (c) 2026 Chris Daley. Bundles ship minimal LGPL-only FFmpeg (HW/OS encoders + native H.264 decoder/parser, §7.1), **no GPL**, no bundled OpenH264. Software fallback uses Cisco's separately downloaded prebuilt OpenH264 binary, loaded directly at runtime; Cisco patent coverage is conditional on its binary distribution terms, not self-built BSD source. Provide user control and the required Cisco attribution/full binary-license display (L14 integration). Native distro packages use system FFmpeg under distro licensing; libx264 is only a distro-provided or optional source-build path. H.264 patent obligations vary by use and jurisdiction; this is not legal advice. See [Cisco terms](https://www.openh264.org/BINARY_LICENSE.txt).
 2. **macOS floor and arch.** 13.0 (ScreenCaptureKit) and universal2, or arm64-only at first?
 3. **Apple/Windows signing identities.** Who holds the Developer ID and Trusted Signing accounts, and are HSM-backed keys required?
 4. **SDL.** Keep SDL2 (and build real SDL2 for bundles) or migrate the client to SDL3 to remove the sdl2-compat dlopen hop?
