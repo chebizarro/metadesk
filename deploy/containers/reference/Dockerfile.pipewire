@@ -1,0 +1,16 @@
+# Comparison variant, NOT an assertion that this release fixes md-atg.
+# Context: deploy/containers, after build-pipewire.sh produced reference/pipewire-runtime.
+# Supply the immutable ID of a matching Dockerfile.video image as REFERENCE_IMAGE.
+ARG REFERENCE_IMAGE
+FROM ${REFERENCE_IMAGE}
+ARG PIPEWIRE_VERSION=1.4.10
+USER 0:0
+COPY reference/pipewire-runtime/ /
+# The throwaway bundle contains the distro client library. Replace that copy too:
+# daemon, xdpw, WirePlumber and metadesk must all use the selected runtime.
+RUN ln -sf /usr/lib/aarch64-linux-gnu/libpipewire-0.3.so.0 /opt/metadesk/lib/libpipewire-0.3.so.0 \
+    && ldconfig && pipewire --version > /tmp/pipewire-version \
+    && grep -Fx "Compiled with libpipewire ${PIPEWIRE_VERSION}" /tmp/pipewire-version \
+    && grep -Fx "Linked with libpipewire ${PIPEWIRE_VERSION}" /tmp/pipewire-version \
+    && pw-cli --version && rm /tmp/pipewire-version
+USER 1000:1000
