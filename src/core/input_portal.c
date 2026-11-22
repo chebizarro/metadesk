@@ -149,8 +149,8 @@ static bool add_match(PortalInput *p, const char *rule) {
     return true;
 }
 
-/* Discover RemoteDesktop v2 before auto-selection. A denial once selected
- * remains an error: availability is not authorization. */
+/* Capability discovery for explicit portal callers/tests, not auto-selection
+ * pending md-y8kc live acceptance. Availability is not authorization. */
 bool md_input_portal_available(void) {
     PortalInput p = { .deadline = md_now_ms() + 1000 };
     bool found = false;

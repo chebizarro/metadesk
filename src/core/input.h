@@ -36,9 +36,10 @@ typedef struct MdInputCtx MdInputCtx;
 typedef struct {
     uint32_t screen_width;   /* absolute mouse coordinate range */
     uint32_t screen_height;
-    /* NULL/"auto": prefer RemoteDesktop v2 when compiled and available.
-     * Consent denial never falls back. Linux also accepts "portal", "uinput"
-     * and explicit "wayland" (requires -Dwayland_input=true). No fallback. */
+    /* NULL/"auto": established platform backend (uinput on Linux).
+     * Portal input is explicit-only pending md-y8kc live acceptance. Linux
+     * also accepts "portal", "uinput", and explicit "wayland" (requires
+     * -Dwayland_input=true). No probing or fallback between backends. */
     const char *backend;
     /* Wayland requires an absolute socket path. Ambient WAYLAND_DISPLAY and
      * WAYLAND_SOCKET are deliberately ignored. Strings are borrowed. */

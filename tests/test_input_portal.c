@@ -262,7 +262,7 @@ int main(void) {
         close(commands[0]); close(notices[1]);
         MD_CHECK(child > 0); MD_CHECK(notice(notices[0],'R'));
         MD_CHECK(md_input_portal_available());
-        MdInputConfig cfg = { .screen_width=1920,.screen_height=1080,.backend=mode == 1 ? "auto" : "portal",.portal_timeout_ms=2000 };
+        MdInputConfig cfg = { .screen_width=1920,.screen_height=1080,.backend="portal",.portal_timeout_ms=2000 };
         uint64_t start = md_monotonic_ns();
         MdInput *input = md_input_create(&cfg);
         if (!mode) {

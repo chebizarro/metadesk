@@ -1078,6 +1078,16 @@ test_input = executable('test_input',
   dependencies : [dep_metadesk] + wayland_test_deps,
 )
 test('input injection', test_input)
+# Compile the real selection logic against device-free backend factories.
+# Exercise portal choice even on hosts without libei, never native injection.
+test_input_selection = executable('test_input_selection',
+  files('tests/test_input_selection.c', 'src/core/input.c', 'src/core/log.c'),
+  include_directories : core_inc,
+  c_args : ['-DMD_HAVE_PORTAL_INPUT'],
+  dependencies : [dep_threads],
+)
+test('input backend selection', test_input_selection)
+
 if host_os == 'linux'
   dep_input_x11 = dependency('x11')
   test_input_desktop = executable('test_input_desktop',
