@@ -1,0 +1,7 @@
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -880,3 +880,3 @@
+         if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
+-            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_UI4(1));
++            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_BOOL(VARIANT_TRUE));
+     }

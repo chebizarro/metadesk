@@ -61,6 +61,12 @@ require the headers/SDKs/dispatchers listed in the plan; native distro packages
 use system FFmpeg and do not run this script. Configure arguments and logs
 are retained in its output root; build/config files remain in `build/`.
 Archive the exact source, patches and these records with each release.
+The Windows profile applies `ffmpeg/patches/0001-mf-low-latency-vt-bool.patch`
+to a private `OUTPUT/source` copy; it retains `OUTPUT/patches/` and
+`OUTPUT/patches.txt`. Patch drift or an already-applied fix fails closed before
+configure (never reverse-applied); review the patch when updating the FFmpeg pin.
+The caller's source is unchanged. Windows also enables D3D11VA for MF SDK types.
+
 
 `MD_FFMPEG_PREFIX` only selects avcodec/avutil for the macOS producer; it does
 not validate the rest of the app closure or install legal files. Until

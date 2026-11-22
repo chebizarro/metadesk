@@ -14,6 +14,15 @@
 #include <limits.h>
 #include "md_test.h"
 
+/* Force a real backend without changing production fallback semantics. */
+static MdEncoder *create_test_encoder(const MdEncoderConfig *config) {
+    if (!config) return md_encoder_create(NULL);
+    MdEncoderConfig cfg = *config;
+    cfg.encoder_name = getenv("MD_TEST_ENCODER");
+    return md_encoder_create(&cfg);
+}
+#define md_encoder_create create_test_encoder
+
 static int g_encoded_count;
 static int g_decoded_count;
 static uint8_t *g_last_encoded_data;
@@ -85,6 +94,7 @@ static int test_encoder_create(void) {
 
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     uint32_t w, h;
     MD_CHECK(md_encoder_get_size(enc, &w, &h) == 0);
@@ -92,10 +102,12 @@ static int test_encoder_create(void) {
 
     const char *name = md_encoder_get_name(enc);
     MD_CHECK(name != NULL);
-    MD_CHECK(strcmp(name, "h264_nvenc") == 0 ||
-             strcmp(name, "h264_videotoolbox") == 0 ||
+    MD_CHECK(strcmp(name, "openh264") == 0 || strcmp(name, "h264_mf") == 0 ||
+             strcmp(name, "h264_vaapi") == 0 || strcmp(name, "h264_qsv") == 0 ||
+             strcmp(name, "h264_videotoolbox") == 0 || strcmp(name, "h264_nvenc") == 0 ||
              strcmp(name, "h264_amf") == 0 || strcmp(name, "libx264") == 0);
-    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0));
+    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0 &&
+             strcmp(name, "openh264") != 0 && strcmp(name, "h264_mf") != 0));
     MD_CHECK(md_encoder_get_name(NULL) == NULL);
     printf("OK (%s)\n", name);
     md_encoder_destroy(enc);
@@ -103,12 +115,17 @@ static int test_encoder_create(void) {
     cfg.prefer_nvenc = false;
     enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
     name = md_encoder_get_name(enc);
     MD_CHECK(name != NULL);
-    MD_CHECK(strcmp(name, "h264_nvenc") != 0);
-    MD_CHECK(strcmp(name, "h264_videotoolbox") == 0 ||
+    const char *forced = getenv("MD_TEST_ENCODER");
+    MD_CHECK(forced ? strcmp(name, forced) == 0 : strcmp(name, "h264_nvenc") != 0);
+    MD_CHECK(strcmp(name, "openh264") == 0 || strcmp(name, "h264_mf") == 0 ||
+             strcmp(name, "h264_vaapi") == 0 || strcmp(name, "h264_qsv") == 0 ||
+             strcmp(name, "h264_videotoolbox") == 0 || strcmp(name, "h264_nvenc") == 0 ||
              strcmp(name, "h264_amf") == 0 || strcmp(name, "libx264") == 0);
-    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0));
+    MD_CHECK(md_encoder_is_hw(enc) == (strcmp(name, "libx264") != 0 &&
+             strcmp(name, "openh264") != 0 && strcmp(name, "h264_mf") != 0));
     printf("  non-NVENC fallback: %s\n", name);
     md_encoder_destroy(enc);
     return 0;
@@ -152,6 +169,7 @@ static int test_encoder_submit_rejects_short_stride(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     uint8_t *buf = calloc(1, (size_t)cfg.width * cfg.height * 4u);
     MD_CHECK(buf != NULL);
@@ -182,6 +200,7 @@ static int test_encode_frames(void) {
 
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
@@ -227,6 +246,7 @@ static int test_roundtrip(void) {
 
     MdEncoder *enc = md_encoder_create(&enc_cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     MdDecoder *dec = md_decoder_create();
     MD_CHECK(dec != NULL);
@@ -391,6 +411,7 @@ static int test_encoder_get_size_null(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     /* NULL output params */
     MD_CHECK(md_encoder_get_size(enc, NULL, NULL) == -1);
@@ -421,6 +442,7 @@ static int test_decode_from_encoded(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     MdDecoder *dec = md_decoder_create();
     MD_CHECK(dec != NULL);
@@ -487,6 +509,7 @@ static int test_encoder_get_bitrate(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     /* Should return the configured bitrate */
     MD_CHECK(md_encoder_get_bitrate(enc) == 5000000);
@@ -497,6 +520,7 @@ static int test_encoder_get_bitrate(void) {
     cfg.bitrate = 0;
     enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
     MD_CHECK(md_encoder_get_bitrate(enc) == MD_ENCODER_DEFAULT_BITRATE);
     md_encoder_destroy(enc);
 
@@ -520,6 +544,7 @@ static int test_encoder_set_bitrate(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     /* Set a new bitrate */
     MD_CHECK(md_encoder_set_bitrate(enc, 4000000) == 0);
@@ -547,6 +572,7 @@ static int test_encoder_set_bitrate_clamp(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     /* Below minimum → clamped to MIN */
     MD_CHECK(md_encoder_set_bitrate(enc, 1000) == 0);
@@ -585,6 +611,7 @@ static int test_encode_after_bitrate_change(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
@@ -647,6 +674,7 @@ static int test_bitrate_rapid_changes(void) {
     };
     MdEncoder *enc = md_encoder_create(&cfg);
     MD_CHECK(enc != NULL);
+    if (!enc) return 1;
 
     uint32_t stride = TEST_W * 4;
     uint8_t *buf = malloc((size_t)stride * TEST_H);
@@ -769,8 +797,7 @@ static int test_tags_follow_frames(void) {
     }
 
     printf("OK (%s: %d packets, %d emitted after later frames, %d "
-           "discarded at the resize)\n", md_encoder_is_hw(enc) ? "hardware"
-           : "x264", t.packets, t.late, TAG_RESIZE - before);
+           "discarded at the resize)\n", md_encoder_get_name(enc), t.packets, t.late, TAG_RESIZE - before);
     free(buf);
     md_encoder_destroy(enc);
     return 0;
