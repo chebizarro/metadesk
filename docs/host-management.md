@@ -8,8 +8,9 @@ unreadable, legacy/public, or unavailable policy never opens the host. Explicit
 local IPC. Starting a management client, connecting a socket, or opening a GUI
 never enables attended admission implicitly. Listed clients retain existing
 private-policy auto-admission; `--attended` is not a new unattended safety latch.
-The existing per-session grant/revocation behavior is unchanged; use `session
-kick` to end an active session. Dynamic relay-driven active revocation and the
+Use `session kick` to end an active session without changing policy. W16's
+local `access.set` / `access.remove` also end that principal's existing admission
+authority after the private policy write succeeds. Dynamic relay-driven active revocation and the
 plan's persistent unattended latch are not introduced here.
 
 `MdHostAccess` owns a mutex-serialized inbox of at most **16** authenticated,
@@ -52,6 +53,13 @@ can already be durable**. The response says `cancelled_or_expired_after_publish`
 reread `access list` before deciding whether to remove the grant. A lost OK or
 conflicting replacement can likewise already have reached storage. One OK is
 not a multi-relay quorum. No automatic retries are performed.
+
+## Process owner
+
+See [host lifecycle](host-lifecycle.md) for `--managed`, session boundaries,
+status fields, supervisor registration and exit/restart policy. Managed Unix
+startup can recover a checked, refused stale endpoint under a lifetime lock;
+interactive startup retains the no-unlink behavior described below.
 
 ## Startup and CLI
 
@@ -154,8 +162,8 @@ coalesced. Every event is already a **complete reconciliation snapshot**, not a
 delta; consumers need not reconstruct skipped changes. A new connection starts
 with a full snapshot, so no subscribe/snapshot race is required. If a separate
 snapshot is desired, subscribe first. Host generation changes require discarding
-old rows/decisions. This is the version-1 subset for the CLI/Access page, not the
-plan's unimplemented generic access-edit/host-latch API.
+old rows/decisions. W16 adds the bounded private-policy operations below; the plan's host-latch API
+is still not implemented.
 
 ### Mutate
 
@@ -303,3 +311,40 @@ The final merge includes that newer tip; Git object IDs for `src/`, `tests/`,
 Inherited master Beads metadata is unchanged; no lane-authored Beads file edit
 was included. Linux validation and local scratch directories were removed after
 recording these results. Windows was not requalified by this merge-only run.
+
+## Manager private-policy operations (W16 / md-a9f2)
+
+Version 1 additionally supports:
+
+```json
+{"v":1,"method":"access.list"}
+{"v":1,"method":"access.set","generation":"<32 hex>","revision":4,"policy_version":8,"peer":"<64 lowercase hex>","caps":1}
+{"v":1,"method":"access.remove","generation":"<32 hex>","revision":4,"policy_version":8,"peer":"<64 lowercase hex>"}
+```
+
+`access.list` and policy mutations return the ordinary full snapshot plus
+`policy_available`, `policy_version`, and `clients` (each has `peer`, canonical
+`caps`, and `review_required`). Unloaded/failed history is **unavailable**, not
+an empty policy. Legacy/mixed entries remain review-only; migrate with the CLI.
+Oversized policy lists return `policy_too_large`, unavailable and no partial
+clients; the 8192-byte framing bound is unchanged. Normal and subscription
+snapshots also expose `supported`, the host's locally restricted capability mask.
+
+Set replaces the exact known mask (zero means `none`); remove deletes the
+principal. Both use the host's existing private, self-encrypted acknowledged
+writer, never GUI relay publication. Generation/access revision are checked and
+`policy_version` is compared under the writer's ACL lock **before** staging.
+A stale policy yields `conflict`; writer/publication failures yield
+`publish_failed`. A positive result requires positive relay OK and an unchanged
+base. On any uncertain outcome, explicitly reconcile before retrying; a relay
+may already have stored the replacement. A successful set/remove cancels that
+principal's pending/remembering requests and revokes its active/pre-bind
+reservation, then wakes the host for cleanup. It does not silently change a
+running stream's grant. Subscription null-session is the cleanup receipt.
+
+Policy listing is on connect, after decisions, and on explicit Refresh Private
+Policy. External relay policy changes are not a new policy subscription here:
+refresh explicitly before editing; the conditional writer rejects a stale view.
+Requests/sessions themselves use the long-lived management subscription, without
+polling or blind retries. No unattended latch, remote management, public-policy
+migration, arbitrary signer method, or generic relay RPC is exposed.

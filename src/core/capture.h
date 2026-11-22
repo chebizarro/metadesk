@@ -69,6 +69,7 @@ typedef struct {
 typedef struct {
     uint32_t target_fps;   /* desired framerate, 0 = backend default     */
     bool     show_cursor;  /* include cursor in captured frames          */
+    bool     no_interaction; /* Never trigger OS consent UI; fail if not guaranteed. */
     bool     unattended;   /* Linux: consent budget capped at 10 seconds */
     bool     forget_authorization_on_stall; /* opt-in, ignored unattended */
     uint32_t consent_timeout_ms; /* 0 = 180s interactive / 10s unattended */
@@ -183,7 +184,7 @@ MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg);
 /* Start capturing. Returns 0 on success, -1 on error. */
 int md_capture_start(MdCaptureCtx *ctx);
 
-enum { MD_CAPTURE_ERROR = -1, MD_CAPTURE_IDLE = 1 };
+enum { MD_CAPTURE_INTERACTION_REQUIRED = -2, MD_CAPTURE_ERROR = -1, MD_CAPTURE_IDLE = 1 };
 
 /* Shared policy used by the portal and host watchdog. */
 uint32_t md_capture_consent_timeout_ms(const MdCaptureConfig *cfg);

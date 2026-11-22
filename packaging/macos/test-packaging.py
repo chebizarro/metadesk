@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Portable parser regressions; real installed/bundle checks run on macOS."""
 import unittest
+import plistlib
+from pathlib import Path
 import macho as m
 
 class MinimumTests(unittest.TestCase):
+    def test_agent_layout(self):
+        root=Path(__file__).parent
+        p=plistlib.loads((root/'dev.metadesk.host.plist').read_bytes())
+        self.assertEqual(p['BundleProgram'],'Contents/Resources/metadesk-host-agent')
+        self.assertIn('--managed',p['ProgramArguments'])
+        self.assertEqual(p['LimitLoadToSessionType'],'Aqua')
+        self.assertEqual(p['KeepAlive'],{'SuccessfulExit':False})
+        self.assertNotIn('UserName',p)
+
     def test_all_slices(self):
         self.assertEqual(m.versions('''arm64:
 Load command 1

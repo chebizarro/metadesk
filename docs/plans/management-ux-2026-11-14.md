@@ -1100,7 +1100,7 @@ Address-book **import/export** and **QR scan/display** (Grotto has `sheet-qr-dis
 
 ### 7.5 Open decisions (answers change design or order)
 1. ~~Host identity model~~ — **resolved 2026-11-16 → §7.6** (user-assigned signer accounts per role).
-2. Host-process lifetime owner — systemd user service vs operator-run CLI; is unattended-after-logout required?
+2. **Resolved W17 / md-pw1q:** opt-in per-user graphical-session agent; no after-logout/pre-login desktop hosting. See [lifecycle contract](../host-lifecycle.md) for prompt-free constraints and platform status.
 3. Is headless (macOS/agent-mode) hosting required in the first release? If yes, the CLI admin surface is in P3.7.
 4. Are AUTH-required DM relays in scope for v1? If no, the first-run DM-relay picker filters them via NIP-11.
 5. Can client-side management UI ship on session v1 (re-cut P4.11a)?

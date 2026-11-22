@@ -1041,6 +1041,12 @@ static void pw_cleanup_start_resources(PipewireState *pw) {
 }
 
 static int pw_start(MdCaptureCtx *ctx) {
+    /* ScreenCast has no no-prompt contract, even with a restore token. Do
+     * not call Start and hope the compositor silently restores consent. */
+    if (ctx->config.no_interaction) {
+        MD_LOG_E("managed capture requires interaction: portal cannot guarantee prompt-free consent; use an interactive host");
+        return MD_CAPTURE_INTERACTION_REQUIRED;
+    }
     PipewireState *pw = ctx->backend_data;
     if (!pw) return -1;
 

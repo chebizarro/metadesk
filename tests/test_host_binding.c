@@ -8,12 +8,14 @@
 #define md_agent_create test_create_agent
 #define md_capture_create test_capture_create
 #define md_encoder_set_quality test_set_quality
+#define md_cond_timedwait_until test_control_wait
 #include "../src/host/main.c"
 #undef main
 #undef md_nostr_send_session_accept
 #undef md_agent_create
 #undef md_capture_create
 #undef md_encoder_set_quality
+#undef md_cond_timedwait_until
 #include "md_test.h"
 #include "decode.h"
 /* nostr.h's prototype was renamed by the macro above; restore the real one. */
@@ -21,7 +23,12 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload);
 
 MdAgent *md_agent_create(const MdAgentConfig *cfg);
-static bool fail_quality;
+static bool fail_quality, stop_control_wait;
+int md_cond_timedwait_until(pthread_cond_t *,pthread_mutex_t *,uint64_t);
+int test_control_wait(pthread_cond_t *cv,pthread_mutex_t *mu,uint64_t deadline) {
+    if (stop_control_wait) { atomic_store(&g_running,false); return 0; }
+    return md_cond_timedwait_until(cv,mu,deadline);
+}
 int md_encoder_set_quality(MdEncoder *e,uint32_t w,uint32_t h,uint32_t fps,uint32_t br);
 int test_set_quality(MdEncoder *e,uint32_t w,uint32_t h,uint32_t fps,uint32_t br) {
     return fail_quality ? -1 : md_encoder_set_quality(e,w,h,fps,br);
@@ -898,6 +905,11 @@ static void admission_release(MdCaptureCtx *cap, MdFrame *frame) {
 static void test_capture_admission(void) {
     const MdCaptureBackend backend = { .start = admission_start,
         .get_frame = admission_frame, .release_frame = admission_release };
+    AdmissionCapture interaction = {.start_result = MD_CAPTURE_INTERACTION_REQUIRED};
+    MdCaptureCtx interaction_cap = {.vtable = &backend, .backend_data = &interaction};
+    uint32_t iw = 0, ih = 0; HostCtx interaction_ctx = {0};
+    MD_CHECK(host_start_capture(&interaction_cap, &iw, &ih, &interaction_ctx) == MD_CAPTURE_INTERACTION_REQUIRED);
+    MD_CHECK(interaction.pulls == 0);
     AdmissionCapture cases[] = {
         {.start_result = -1}, /* portal denial/timeout */
         {.frame_result = MD_CAPTURE_ERROR}, /* broken/never delivered */
@@ -1192,6 +1204,16 @@ static void test_quality_admission_deadline(void) {
     unsigned before=publish_calls;
     MD_CHECK(host_publish_session_accept(&ctx,NULL)<0);
     MD_CHECK(ctx.quality_error && !ctx.quality_pending && !ctx.output_pending);
+    MD_CHECK(publish_calls==before && s.state!=MD_SESSION_ACTIVE);
+    /* Deterministic stop at the wait boundary, without a successful timeout or
+     * a capture producer. Managed shutdown must never publish late authority. */
+    md_session_init(&s);
+    MD_CHECK(!md_session_request(&s,"fixture-peer",MD_CAP_VIDEO,MD_TREE_FORMAT_COMPACT));
+    MD_CHECK(!md_session_accept(&s,"negotiated-id",MD_CAP_VIDEO));
+    ctx.session=&s; ctx.quality_error=false; ctx.quality_pending=true;
+    stop_control_wait=true;
+    MD_CHECK(host_publish_session_accept(&ctx,NULL)<0);
+    stop_control_wait=false; atomic_store(&g_running,true);
     MD_CHECK(publish_calls==before && s.state!=MD_SESSION_ACTIVE);
     pthread_cond_destroy(&ctx.capture_control_cv); pthread_mutex_destroy(&ctx.client_mu);
 }

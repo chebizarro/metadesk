@@ -212,6 +212,12 @@ def main():
     for d in (macos, frameworks, resources):
         d.mkdir(parents=True)
 
+    agents = contents / 'Library/LaunchAgents'
+    agents.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).with_name('dev.metadesk.host.plist'), agents / 'dev.metadesk.host.plist')
+    shutil.copyfile(Path(__file__).with_name('metadesk-host-agent'), resources / 'metadesk-host-agent')
+    (resources / 'metadesk-host-agent').chmod(0o755)
+
     bundler = Bundler(frameworks)
     rewrites, queue, staged = {}, [], []
     for b in bins:

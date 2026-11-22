@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -25,6 +26,7 @@ struct MdManagementIpc {
     void (*wake)(void *);
     void *data;
     int listener;
+    int lock_fd;
     int stop_pipe[2];
     pthread_t thread;
     pthread_mutex_t mu;
@@ -142,7 +144,8 @@ static bool schema(const cJSON *j) {
         for (b = a->next; b; b = b->next) if (!strcmp(a->string, b->string)) return false;
         if (strcmp(a->string,"v") && strcmp(a->string,"method") && strcmp(a->string,"generation") &&
             strcmp(a->string,"revision") && strcmp(a->string,"request_id") && strcmp(a->string,"session_id") &&
-            strcmp(a->string,"decision") && strcmp(a->string,"caps") && strcmp(a->string,"remember")) return false;
+            strcmp(a->string,"decision") && strcmp(a->string,"caps") && strcmp(a->string,"remember") &&
+            strcmp(a->string,"peer") && strcmp(a->string,"policy_version")) return false;
     }
     uint64_t v; return number(j,"v",&v) && v == 1 && str(j,"method");
 }
@@ -164,6 +167,11 @@ static cJSON *snapshot(MdHostAccess *a, const char *error) {
     if (error) cJSON_AddStringToObject(j,"error",error);
     cJSON_AddStringToObject(j,"generation",v.generation);
     cJSON_AddNumberToObject(j,"revision",(double)v.revision);
+    cJSON *host = cJSON_AddObjectToObject(j,"host");
+    cJSON_AddBoolToObject(host,"managed",v.managed);
+    cJSON_AddNumberToObject(host,"pid",(double)getpid());
+    cJSON_AddStringToObject(host,"state",v.lifecycle[0] ? v.lifecycle : "starting");
+    cJSON_AddStringToObject(host,"mode","user-session");
     cJSON *qs = cJSON_AddArrayToObject(j,"requests");
     for (size_t i=0; i<v.count; ++i) cJSON_AddItemToArray(qs, request_json(&v.requests[i]));
     if (v.occupied) {
@@ -172,6 +180,34 @@ static cJSON *snapshot(MdHostAccess *a, const char *error) {
         cJSON_AddBoolToObject(active,"revoked",v.revoked);
         cJSON_AddItemToObject(j,"session",active);
     } else cJSON_AddNullToObject(j,"session");
+    return j;
+}
+static cJSON *policy_snapshot(MdManagementIpc *s, const char *error) {
+    cJSON *j = snapshot(s->access, error);
+    MdAllowlistEntry *entries = NULL; size_t count = 0; uint64_t version = 0;
+    bool available = s->nostr && md_nostr_allowlist_state(s->nostr) == MD_NOSTR_ACL_LOADED &&
+        !md_nostr_allowlist_snapshot_version(s->nostr, &entries, &count, &version);
+    cJSON_AddBoolToObject(j, "policy_available", available);
+    cJSON_AddNumberToObject(j, "policy_version", (double)version);
+    cJSON *clients = cJSON_AddArrayToObject(j, "clients");
+    for (size_t i = 0; i < count; ++i) {
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "peer", entries[i].pubkey_hex);
+        cJSON_AddStringToObject(entry, "caps", entries[i].caps);
+        cJSON_AddBoolToObject(entry, "review_required", entries[i].review_required);
+        cJSON_AddItemToArray(clients, entry);
+    }
+    free(entries);
+    char *encoded = cJSON_PrintUnformatted(j);
+    if (!encoded || strlen(encoded) > LINE_MAX_BYTES - 64) {
+        cJSON_DeleteItemFromObjectCaseSensitive(j,"clients");
+        cJSON_AddArrayToObject(j,"clients");
+        cJSON_SetBoolValue(item(j,"policy_available"),false);
+        cJSON_SetBoolValue(item(j,"ok"),false);
+        cJSON_DeleteItemFromObjectCaseSensitive(j,"error");
+        cJSON_AddStringToObject(j,"error","policy_too_large");
+    }
+    free(encoded);
     return j;
 }
 static void caps_text(uint32_t caps, char out[64]) {
@@ -187,11 +223,26 @@ static const char *dispatch(MdManagementIpc *s, cJSON *j) {
     if (!schema(j)) return "invalid";
     const char *method = str(j,"method");
     if (!strcmp(method,"management.snapshot") || !strcmp(method,"management.subscribe") ||
-        !strcmp(method,"session.list") || !strcmp(method,"requests.list"))
+        !strcmp(method,"session.list") || !strcmp(method,"requests.list") || !strcmp(method,"access.list"))
         return cJSON_GetArraySize(j) == 2 ? NULL : "invalid";
     const char *g = str(j,"generation"); uint64_t rev;
     if (!g || !number(j,"revision",&rev)) return "invalid";
-    if (!strcmp(method,"session.kick")) {
+    if (!strcmp(method,"access.set") || !strcmp(method,"access.remove")) {
+        const char *peer = str(j,"peer"); uint64_t version, bits = 0;
+        bool remove = !strcmp(method,"access.remove");
+        if (!peer || strlen(peer) != 64 || strspn(peer,"0123456789abcdef") != 64 ||
+            !number(j,"policy_version",&version) || cJSON_GetArraySize(j) != (remove ? 6 : 7) ||
+            (!remove && (!number(j,"caps",&bits) || bits > MD_HOST_ACCESS_CAPS))) return "invalid";
+        MdHostAccessSnapshot current; md_host_access_snapshot(s->access,(int64_t)time(NULL),&current);
+        if (strcmp(g,current.generation) || rev != current.revision) return "conflict";
+        if (!s->nostr || md_nostr_allowlist_state(s->nostr) != MD_NOSTR_ACL_LOADED) return "policy_unavailable";
+        char caps[64]; caps_text((uint32_t)bits,caps); if (!bits) strcpy(caps,"none");
+        int rc = md_nostr_allowlist_edit_version(s->nostr,peer,remove ? NULL : caps,version);
+        if (rc) return rc == -2 ? "conflict" : "publish_failed";
+        /* A changed remembered grant applies to future requests, not a silent
+         * mid-stream elevation/downgrade. End existing authority on every edit. */
+        md_host_access_revoke_peer(s->access,peer);
+    } else if (!strcmp(method,"session.kick")) {
         const char *id = str(j,"session_id");
         if (!id || cJSON_GetArraySize(j) != 5) return "invalid";
         if (md_host_access_kick(s->access,g,rev,id)) return "conflict";
@@ -248,9 +299,12 @@ static void *serve_peer(void *data) {
         }
         if (!watched) { subscribe=false; error="subscription_unavailable"; }
     }
-    cJSON *reply = snapshot(s->access,error);
+    bool policy = j && str(j,"method") && !strncmp(str(j,"method"),"access.",7);
+    cJSON *reply = policy ? policy_snapshot(s,error) : snapshot(s->access,error);
+    cJSON_AddNumberToObject(reply,"supported",s->supported);
     uint64_t sent_revision = 0;
     while (reply) {
+        if (!item(reply,"supported")) cJSON_AddNumberToObject(reply,"supported",s->supported);
         uint64_t revision = (uint64_t)item(reply,"revision")->valuedouble;
         bool sent = revision == sent_revision || send_json(p->fd,reply);
         cJSON_Delete(reply); reply = NULL;
@@ -316,14 +370,36 @@ static void *accept_peers(void *data) {
     }
     return NULL;
 }
-MdManagementIpc *md_management_start(MdHostAccess *a, MdNostr *n, const char *key,
-    const char *path, uint32_t supported, void (*wake)(void *), void *data) {
+static bool claim_managed_endpoint(MdManagementIpc *s) {
+    char path[PATH_MAX];
+    snprintf(path,sizeof(path),"%s.lock",s->path);
+    s->lock_fd=open(path,O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    struct stat lock, named;
+    if (s->lock_fd<0 || fstat(s->lock_fd,&lock) || !S_ISREG(lock.st_mode) ||
+        lock.st_uid!=geteuid() || (lock.st_mode&0777)!=0600 || lock.st_nlink!=1 ||
+        flock(s->lock_fd,LOCK_EX|LOCK_NB) || lstat(path,&named) ||
+        named.st_dev!=lock.st_dev || named.st_ino!=lock.st_ino) return false;
+    struct stat stale, current;
+    if (lstat(s->path,&stale)) return errno==ENOENT;
+    if (!S_ISSOCK(stale.st_mode) || stale.st_uid!=geteuid() || (stale.st_mode&0777)!=0600) return false;
+    int fd=unix_socket(); if (fd<0) return false;
+    struct sockaddr_un addr={.sun_family=AF_UNIX};strcpy(addr.sun_path,s->path);
+    int rc=connect(fd,(struct sockaddr *)&addr,sizeof(addr)), error=errno;
+    close(fd);
+    if (!rc || error!=ECONNREFUSED || lstat(s->path,&current) ||
+        current.st_dev!=stale.st_dev || current.st_ino!=stale.st_ino) return false;
+    return unlink(s->path)==0;
+}
+static MdManagementIpc *management_start(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t supported, void (*wake)(void *), void *data, bool managed) {
     MdManagementIpc *s = calloc(1,sizeof(*s)); if (!s) return NULL;
+    s->lock_fd = -1;
     s->listener = -1; s->stop_pipe[0] = s->stop_pipe[1] = -1; s->access=a; s->nostr=n; s->supported=supported; s->wake=wake; s->data=data;
     if (path) { if (strlen(path) >= sizeof(s->path)) goto fail; strcpy(s->path,path); }
     else if (md_management_path(key,s->path,sizeof(s->path))) goto fail;
     if (!private_parent(s->path)) goto fail;
     struct stat st;
+    if (managed && !claim_managed_endpoint(s)) goto fail;
     if (!lstat(s->path,&st) || errno != ENOENT) goto fail;
     s->listener = unix_socket(); if (s->listener < 0) goto fail;
     struct sockaddr_un addr = { .sun_family=AF_UNIX }; strcpy(addr.sun_path,s->path);
@@ -344,7 +420,16 @@ bound_fail:
 fail:
     for (int i=0; i<2; ++i) if (s->stop_pipe[i] >= 0) close(s->stop_pipe[i]);
     if (s->listener >= 0) close(s->listener);
+    if (s->lock_fd >= 0) close(s->lock_fd);
     free(s); return NULL;
+}
+MdManagementIpc *md_management_start(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t caps, void (*wake)(void *), void *data) {
+    return management_start(a,n,key,path,caps,wake,data,false);
+}
+MdManagementIpc *md_management_start_managed(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t caps, void (*wake)(void *), void *data) {
+    return management_start(a,n,key,path,caps,wake,data,true);
 }
 void md_management_stop(MdManagementIpc *s) {
     if (!s) return;
@@ -363,25 +448,32 @@ void md_management_stop(MdManagementIpc *s) {
     close(s->stop_pipe[0]); close(s->stop_pipe[1]);
     struct stat st;
     if (!lstat(s->path,&st) && st.st_dev == s->dev && st.st_ino == s->ino) unlink(s->path);
+    if (s->lock_fd >= 0) close(s->lock_fd);
     pthread_mutex_destroy(&s->mu); free(s);
 }
-cJSON *md_management_call(const char *path, const cJSON *j) {
+int md_management_connect(const char *path) {
     struct stat st;
     if (!private_parent(path) || lstat(path,&st) || !S_ISSOCK(st.st_mode) ||
-        st.st_uid != geteuid() || (st.st_mode & 0077)) return NULL;
-    int fd = unix_socket(); if (fd < 0) return NULL;
+        st.st_uid != geteuid() || (st.st_mode & 0077)) return -1;
+    int fd = unix_socket(); if (fd < 0) return -1;
     struct sockaddr_un addr = { .sun_family=AF_UNIX }; strcpy(addr.sun_path,path);
-    cJSON *reply = NULL;
     int rc = connect(fd,(struct sockaddr *)&addr,sizeof(addr));
     if (rc && errno == EINPROGRESS) {
         int error = 0; socklen_t size = sizeof(error);
         rc = !ready(fd,POLLOUT,md_now_ms()+5000) || getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size) || error;
     }
-    if (!rc && md_management_peer_is_user(fd,(uint64_t)geteuid()) && send_json(fd,j)) reply = read_json(fd);
+    if (!rc && md_management_peer_is_user(fd,(uint64_t)geteuid())) return fd;
+    close(fd); return -1;
+}
+cJSON *md_management_call(const char *path, const cJSON *j) {
+    int fd = md_management_connect(path);
+    if (fd < 0) return NULL;
+    cJSON *reply = send_json(fd,j) ? read_json(fd) : NULL;
     close(fd); return reply;
 }
 #else
 struct MdManagementIpc { int unused; };
+int md_management_connect(const char *p) { (void)p; return -1; }
 int md_management_path(const char *k,char *p,size_t n) { (void)k;(void)p;(void)n;return -1; }
 bool md_management_peer_is_user(int fd,uint64_t uid) { (void)fd;(void)uid;return false; }
 MdManagementIpc *md_management_start(MdHostAccess *a,MdNostr *n,const char *k,const char *p,
@@ -389,6 +481,8 @@ MdManagementIpc *md_management_start(MdHostAccess *a,MdNostr *n,const char *k,co
     (void)a;(void)n;(void)k;(void)p;(void)caps;(void)wake;(void)d;
     fprintf(stderr,"management: unsupported on Windows (owner-DACL/client-SID named pipe not implemented)\n"); return NULL;
 }
+MdManagementIpc *md_management_start_managed(MdHostAccess *a,MdNostr *n,const char *k,const char *p,
+    uint32_t caps,void (*wake)(void *),void *d) { return md_management_start(a,n,k,p,caps,wake,d); }
 void md_management_stop(MdManagementIpc *s) { (void)s; }
 cJSON *md_management_call(const char *p,const cJSON *j) { (void)p;(void)j;return NULL; }
 #endif

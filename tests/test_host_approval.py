@@ -39,7 +39,7 @@ class Subscription:
         self.file.close()
         self.sock.close()
 
-def main():
+def main(manager_driver=None):
     host, client, crypto = map(os.path.abspath, sys.argv[1:])
     # Short canonical path fits Darwin's 104-byte sockaddr_un.
     base = '/private/tmp' if sys.platform == 'darwin' else '/tmp'
@@ -88,6 +88,13 @@ def main():
             def command(area,verb,v=None,id=None,extra=(),rc=0):
                 args = [host,area,'--socket',str(path),verb]
                 if v: args += [id,v['generation'],str(v['revision'])]
+                if manager_driver and v and rc == 0:
+                    action = 'kick' if verb == 'kick' else 'deny' if verb == 'deny' else 'remember' if '--remember' in extra else 'approve'
+                    p = subprocess.run([*manager_driver,str(path),action,v['generation'],str(v['revision']),id],
+                                       capture_output=True,text=True,timeout=25)
+                    assert p.returncode == 0, (p.stdout,p.stderr)
+                    # The UI driver also prints the shared assertion summary.
+                    return next(json.loads(line) for line in p.stdout.splitlines() if line.startswith('{'))
                 p = checked(args+list(extra),rc=rc)
                 return json.loads(p.stdout)
             hp = start_host(True)
@@ -125,6 +132,18 @@ def main():
             cp.wait('TLS connected (TLSv1.3)'); cp.wait('receiving stream...')
             sub.until(lambda v: v['session'] is not None and v['session']['session_id'])
             listed = command('session','list')
+            def ipc(command):
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.settimeout(10); connection.connect(str(path))
+                    connection.sendall((json.dumps(command)+'\n').encode())
+                    with connection.makefile('rb') as stream:
+                        return json.loads(stream.readline(8193))
+            policy = ipc({'v':1,'method':'access.list'})
+            assert policy['ok'] and policy['policy_available'] and policy['clients'][0]['caps']=='video', policy
+            stale_policy = ipc({'v':1,'method':'access.set','generation':listed['generation'],
+                                'revision':listed['revision'],'policy_version':policy['policy_version']+1,
+                                'peer':CLIENT_PK,'caps':1})
+            assert not stale_policy['ok'] and stale_policy['error']=='conflict', stale_policy
             assert checked([host,'access','--relay',url,'list']).stdout.strip() == CLIENT_PK+'\tvideo'
             with relay.lock:
                 policies = [e for e in relay.events.values() if e['kind']==30000]
@@ -132,6 +151,22 @@ def main():
             assert command('session','kick',listed,listed['session']['session_id'])['ok']
             cp.wait('connection lost'); cp.stop()
             sub.until(lambda v: v['session'] is None)
+            # All five exact permissions survive the real fenced IPC/publish/read path.
+            def set_caps(bits, version):
+                current = command('session','list')
+                return ipc({'v':1,'method':'access.set','generation':current['generation'],
+                            'revision':current['revision'],'policy_version':version,
+                            'peer':CLIENT_PK,'caps':bits})
+            assert set_caps(31, policy['policy_version'])['ok']
+            all_caps = ipc({'v':1,'method':'access.list'})
+            assert all_caps['clients'][0]['caps']=='video,agent,input,monitor,clipboard', all_caps
+            assert all_caps['policy_version'] != policy['policy_version']
+            stale = set_caps(1, policy['policy_version'])
+            assert not stale['ok'] and stale['error']=='conflict', stale
+            unknown = set_caps(32, all_caps['policy_version'])
+            assert not unknown['ok'] and unknown['error']=='invalid', unknown
+            assert set_caps(1, all_caps['policy_version'])['ok']
+            print('PASS: fenced access.set preserves all five exact caps and refuses stale/unknown mutations')
             sub.close(); sub = None
             hp.stop()
             assert not path.exists(), 'host leaked control socket'
@@ -142,6 +177,19 @@ def main():
             assert command('session','kick',listed,listed['session']['session_id'])['ok']
             cp.wait('connection lost'); cp.stop()
             print('PASS: remember acknowledged, private-only persisted grant, fresh-host auto-admission, list then kick')
+            if manager_driver:
+                cp = start_client(); cp.wait('receiving stream...')
+                p = subprocess.run([*manager_driver,str(path),'set'],capture_output=True,text=True,timeout=25)
+                assert p.returncode == 0, (p.stdout,p.stderr)
+                cp.wait('connection lost'); cp.stop()
+                assert checked([host,'access','--relay',url,'list']).stdout.strip() == CLIENT_PK+'\tvideo,agent'
+                print('PASS: manager exact grant edit acknowledged and existing session ended')
+                cp = start_client(); cp.wait('receiving stream...')
+                p = subprocess.run([*manager_driver,str(path),'revoke'],capture_output=True,text=True,timeout=25)
+                assert p.returncode == 0, (p.stdout,p.stderr)
+                cp.wait('connection lost'); cp.stop()
+                assert checked([host,'access','--relay',url,'list']).stdout.strip() == ''
+                print('PASS: manager private-policy revoke acknowledged, active session disconnected, remembered grant removed')
         finally:
             if sub: sub.close()
             for p in reversed(children): p.stop()

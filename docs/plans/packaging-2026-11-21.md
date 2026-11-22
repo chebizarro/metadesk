@@ -366,7 +366,7 @@ Run on a real Omarchy install (or Arch + Hyprland + Omarchy defaults), from the 
 6. **nostrc distribution.** Keep static pin forever, or have nostrc ship install rules + pkg-config + a versioned ABI so distros package it (`S` on Linux)?
 7. **Host-in-Flatpak.** Worth a portal/libei input backend, or keep host as native package only?
 8. **Release key for NIP-94.** Separate project identity held by a bunker; which relays?
-9. **Login-screen / pre-login access** (Windows service + agent, macOS LaunchDaemon) — in scope at all? It changes the service model on both platforms.
+9. **Resolved W17 / md-pw1q:** login-screen/pre-login/after-logout desktop hosting is unsupported. Ship opt-in per-user agents, not a Windows service or LaunchDaemon. See [host lifecycle](../host-lifecycle.md); signed helper identity and SMAppService registration UX remain md-wdi3.
 
 ## 14. Follow-up beads filed (discovered-from `md-kb7`)
 

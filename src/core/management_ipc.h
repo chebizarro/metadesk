@@ -9,12 +9,19 @@ typedef struct MdManagementIpc MdManagementIpc;
  * unlinked, including stale sockets. Windows returns unsupported. */
 MdManagementIpc *md_management_start(MdHostAccess *access, MdNostr *nostr,
     const char *host_key, const char *path, uint32_t supported, void (*wake)(void *), void *data);
+/* Managed supervisors may recover a refused, owner-only stale socket while
+ * holding a checked owner-only lifetime flock. Live endpoints are never replaced.
+ * The empty .lock file persists so concurrent starters share one lock inode. */
+MdManagementIpc *md_management_start_managed(MdHostAccess *access, MdNostr *nostr,
+    const char *host_key, const char *path, uint32_t supported, void (*wake)(void *), void *data);
 /* Stop nostr before joining: a pending remember may be waiting for relay OK. */
 void md_management_stop(MdManagementIpc *s);
 int md_management_path(const char *host_key, char *out, size_t size);
 /* Uses real kernel credentials; expected_uid normally geteuid(). Public for
  * credential-rejection testing without changing a test process's privileges. */
 bool md_management_peer_is_user(int fd, uint64_t expected_uid);
+/* Verified nonblocking descriptor for a subscription; caller owns it. */
+int md_management_connect(const char *path);
 /* One request/reply with credential verification in both directions. */
 cJSON *md_management_call(const char *path, const cJSON *request);
 int md_host_management_cli(const char *area, int argc, char **argv);

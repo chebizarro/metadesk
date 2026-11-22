@@ -47,6 +47,15 @@ int md_host_access_init(MdHostAccess *a) {
     if (pthread_cond_init(&a->changed, NULL)) { pthread_mutex_destroy(&a->mu); return -1; }
     return 0;
 }
+void md_host_access_lifecycle(MdHostAccess *a, bool managed, const char *state) {
+    pthread_mutex_lock(&a->mu);
+    if (a->view.managed != managed || strcmp(a->view.lifecycle, state)) {
+        a->view.managed = managed;
+        snprintf(a->view.lifecycle, sizeof(a->view.lifecycle), "%s", state);
+        changed(a);
+    }
+    pthread_mutex_unlock(&a->mu);
+}
 void md_host_access_destroy(MdHostAccess *a) {
     pthread_cond_destroy(&a->changed);
     pthread_mutex_destroy(&a->mu);
@@ -181,6 +190,16 @@ void md_host_access_cancel(MdHostAccess *a, const char *peer, const char *id) {
     if (i >= 0 && !strcmp(a->view.requests[i].peer, peer)) remove_at(a, (size_t)i);
     if (a->view.occupied && !strcmp(a->view.active.peer, peer) &&
         !strcmp(a->view.active.request.request_id, id) && !a->view.revoked) {
+        a->view.revoked = true; changed(a);
+    }
+    pthread_mutex_unlock(&a->mu);
+}
+void md_host_access_revoke_peer(MdHostAccess *a, const char *peer) {
+    pthread_mutex_lock(&a->mu);
+    for (size_t i = 0; i < a->view.count;)
+        if (!strcmp(a->view.requests[i].peer, peer)) remove_at(a, i);
+        else ++i;
+    if (a->view.occupied && !strcmp(a->view.active.peer, peer) && !a->view.revoked) {
         a->view.revoked = true; changed(a);
     }
     pthread_mutex_unlock(&a->mu);

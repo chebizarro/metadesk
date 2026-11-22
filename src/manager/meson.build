@@ -5,15 +5,15 @@ manager_inc = include_directories('.')
 # Consume the shared core API, not its private raw nostrc OBJECT link inputs.
 dep_manager_core = declare_dependency(link_with : libmetadesk,
   include_directories : core_inc)
-manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c'],
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19])
+manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c'],
+  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson])
 dep_manager_model = declare_dependency(link_with : manager_model,
   include_directories : manager_inc,
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19])
+  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson])
 gnome = import('gnome')
 manager_resources = gnome.compile_resources('manager-resources', 'manager.gresource.xml',
   source_dir : meson.current_source_dir(), c_name : 'md_manager')
-manager_ui = static_library('metadesk-manager-ui', ['window.c', manager_resources],
+manager_ui = static_library('metadesk-manager-ui', ['window.c', 'access-page.c', manager_resources],
   dependencies : [dep_manager_model, dep_manager_gtk, dep_manager_adw])
 dep_manager_ui = declare_dependency(link_whole : manager_ui,
   dependencies : [dep_manager_model, dep_manager_gtk, dep_manager_adw])
@@ -34,4 +34,14 @@ if manager_dbus.found() and manager_xvfb.found()
             manager_xvfb.full_path(), manager_smoke], suite : 'manager', timeout : 45)
 else
   message('manager-ui smoke test unavailable: install dbus-run-session and xvfb-run')
+endif
+manager_host_test = executable('test_manager_host', '../../tests/test_manager_host.c',
+  dependencies : dep_manager_model)
+test('manager-host-ipc', manager_host_test, suite : 'manager', timeout : 30)
+manager_access_test = executable('test_manager_access', '../../tests/test_manager_access.c',
+  dependencies : dep_manager_ui)
+if manager_dbus.found() and manager_xvfb.found()
+  test('manager-access-ui', manager_python,
+    args : [files('../../tests/run_manager_ui.py'), manager_dbus.full_path(),
+            manager_xvfb.full_path(), manager_access_test], suite : 'manager', timeout : 45)
 endif

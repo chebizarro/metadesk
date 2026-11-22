@@ -159,3 +159,10 @@ this packaging work. x64 and older Windows support require separate native
 build/install qualification; the available VM is Windows 11 ARM64 only.
 
 Native x64 product/installer qualification is tracked by **md-sfxh**.
+
+## Optional host logon controls (W17)
+
+Install `ADDLOCAL=Main,HostLogon` to add the explicit Enable Host at logon action.
+Provision a host account before enabling it. The task is InteractiveToken/Limited,
+never a session-0 service; stop/uninstall in the same interactive session.
+See [host lifecycle](../../docs/host-lifecycle.md) for stop, logs and limitations.

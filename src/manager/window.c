@@ -1,6 +1,8 @@
 #include "window.h"
 #include "model.h"
 #include "signer-status.h"
+#include "access-page.h"
+#include "management_ipc.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +21,7 @@ struct _MdManagerWindow {
     GtkButton *save_client, *save_host, *add_account, *add_relay;
     GtkLabel *account_error, *relay_error;
     MdSignerStatus *status;
+    MdManagerAccess *access;
     char *directory;
     GPtrArray *accounts, *choices;
     char **relays;
@@ -40,7 +43,7 @@ static void update_banner(MdManagerWindow *self) {
             client |= ((MdManagerAccount *)g_ptr_array_index(self->accounts, i))->roles[MD_ACCOUNT_CLIENT];
         if (!client) message = "Assign a client account in Identity before managed connections become available";
         else if (!self->relays || !self->relays[0]) message = "Choose bootstrap relays in Relays — no default is selected";
-        else message = "Connection and host-control services are not integrated yet";
+        else message = "Use Access to manage a running local host; host startup and managed connections are not integrated yet";
     }
     adw_banner_set_title(self->banner, message);
 }
@@ -64,6 +67,7 @@ static void navigate(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
     if (!row) return;
     MdManagerWindow *self = data;
     const char *name = sections[gtk_list_box_row_get_index(row)];
+    gtk_widget_set_visible(GTK_WIDGET(self->banner), strcmp(name,"Access") && strcmp(name,"Activity"));
     gtk_stack_set_visible_child_name(self->pages, name);
     adw_navigation_page_set_title(self->content_page, name);
     adw_navigation_split_view_set_show_content(self->split, TRUE);
@@ -284,6 +288,7 @@ static void add_placeholder(MdManagerWindow *self, guint section, const char *ti
 static gboolean close_requested(GtkWindow *window, gpointer data) {
     (void)data;
     MD_MANAGER_WINDOW(window)->closed = TRUE;
+    md_manager_access_stop(MD_MANAGER_WINDOW(window)->access);
     return FALSE;
 }
 static void get_property(GObject *object, guint id, GValue *value, GParamSpec *pspec) {
@@ -293,6 +298,7 @@ static void get_property(GObject *object, guint id, GValue *value, GParamSpec *p
 static void dispose(GObject *object) {
     MdManagerWindow *self = MD_MANAGER_WINDOW(object);
     self->closed = TRUE;
+    g_clear_object(&self->access);
     g_clear_object(&self->status);
     gtk_widget_dispose_template(GTK_WIDGET(self), MD_TYPE_MANAGER_WINDOW);
     G_OBJECT_CLASS(md_manager_window_parent_class)->dispose(object);
@@ -328,9 +334,8 @@ static void md_manager_window_init(MdManagerWindow *self) {
         gtk_list_box_append(self->navigation, row);
     }
     add_placeholder(self, 0, "Host Connections Are Coming", "Saved hosts, favorites, search, and managed client launch are planned in md-vb18. No connection is started here.");
-    add_placeholder(self, 1, "Host Controls Are Coming", "Local host readiness, sharing controls, session list, and disconnect actions need authenticated host IPC (md-trex). No host status is inferred.");
-    add_placeholder(self, 2, "Access Management Is Coming", "The approval inbox and remembered-client permissions are planned in md-a9f2. This page does not grant desktop access.");
-    add_placeholder(self, 5, "Activity Is Not Connected", "Real connection and approval outcomes will appear when the management and host-control backends are integrated. No sample activity is shown.");
+    add_placeholder(self, 1, "Host Controls Are Coming", "Host lifecycle controls are planned in md-37rb. Use Access to connect to a running host and Activity to end its current session.");
+    self->access = md_manager_access_new(GTK_WINDOW(self), self->pages);
     g_signal_connect(self->navigation, "row-activated", G_CALLBACK(navigate), self);
     g_signal_connect(self->refresh, "clicked", G_CALLBACK(refresh_clicked), self);
     g_signal_connect(self->add_account, "clicked", G_CALLBACK(add_account_clicked), self);
@@ -350,4 +355,16 @@ GtkWindow *md_manager_window_new(GtkApplication *app, const char *directory) {
     self->directory = directory ? g_strdup(directory) : md_manager_config_directory();
     start_job(self, g_new0(Job, 1));
     return GTK_WINDOW(self);
+}
+
+MdManagerAccess *md_manager_window_access(MdManagerWindow *self) { return self->access; }
+void md_manager_window_review(MdManagerWindow *self,const char *generation,const char *id) {
+    GtkListBoxRow *row=gtk_list_box_get_row_at_index(self->navigation,2);
+    gtk_list_box_select_row(self->navigation,row); navigate(self->navigation,row,self);
+    md_manager_access_review(self->access,generation,id);
+}
+void md_manager_window_connect_host(MdManagerWindow *self,const char *path) {
+    GtkListBoxRow *row=gtk_list_box_get_row_at_index(self->navigation,2);
+    gtk_list_box_select_row(self->navigation,row); navigate(self->navigation,row,self);
+    md_manager_access_connect(self->access,path);
 }

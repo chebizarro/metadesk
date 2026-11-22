@@ -334,6 +334,13 @@ int md_nostr_allowlist_migrate(MdNostr *n, const MdAllowlistEntry *confirmed, si
  * Empty history succeeds with *entries=NULL and *count=0. Caller frees entries.
  * No deadline is interpreted as successful history completion. */
 int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *count);
+/* Management compare-and-edit: coherent policy version; -2 means stale base.
+ * NULL caps removes; non-NULL canonical caps replaces exactly. Same private
+ * writer, positive-OK and unchanged-base fences as the CLI. */
+int md_nostr_allowlist_snapshot_version(MdNostr *n, MdAllowlistEntry **entries,
+                                      size_t *count, uint64_t *version);
+int md_nostr_allowlist_edit_version(MdNostr *n, const char *pk, const char *caps,
+                                  uint64_t version);
 
 /* Return number of entries on the current allowlist (0 if none). */
 int md_nostr_allowlist_count(const MdNostr *n);

@@ -39,6 +39,25 @@
         <RemoveFolder Id="RemoveProgramsParent" Directory="ProgramsFolder" On="uninstall" />
       </Component>
     </DirectoryRef>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="HostLogonControls" Guid="CB44D58F-FE41-40D2-BF1E-927B1EC0CE98">
+        <File Id="HostTaskScript" Source="$(sys.SOURCEFILEDIR)host-task.ps1" />
+        <RegistryValue Root="HKCU" Key="Software\Metadesk.Installer" Name="HostLogonControls"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="EnableHostLogon" Directory="MetadeskMenu" Name="Enable Metadesk Host at logon"
+                  Target="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe"
+                  Arguments="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]host-task.ps1&quot; -Action Install" />
+      </Component>
+    </DirectoryRef>
+    <CustomAction Id="RemoveHostTask" Directory="SystemFolder" Execute="immediate" Return="check"
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]host-task.ps1&quot; -Action Uninstall" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveHostTask" Before="RemoveFiles" Condition="$HostLogonControls = 2 AND ?HostLogonControls = 3" />
+    </InstallExecuteSequence>
+    <Feature Id="HostLogon" Title="Host logon task controls (opt-in)" Level="2"
+             Description="Install the explicit Enable Host at logon action. Requires a provisioned host account. Uninstall stops and unregisters the task in the same user session.">
+      <ComponentRef Id="HostLogonControls" />
+    </Feature>
     <Feature Id="Main" Title="Metadesk" Level="1">
       <ComponentRef Id="UserPath" />
       <ComponentRef Id="Menu" />
