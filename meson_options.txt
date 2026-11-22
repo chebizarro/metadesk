@@ -1,5 +1,5 @@
 option('portal_input', type : 'feature', value : 'auto',
-       description : 'Build explicit-only Linux RemoteDesktop v2 / libei input (md-y8kc)')
+       description : 'Build Linux RemoteDesktop v2 / libei input (preferred automatically on Wayland)')
 option('wayland_input', type : 'boolean', value : false,
        description : 'Build explicit Linux wlroots virtual input (Wayland client, xkbcommon, scanner)')
 option('live_tests', type : 'boolean', value : false,

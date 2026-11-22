@@ -7,6 +7,7 @@
 #include <dbus/dbus.h>
 #include <libei.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-names.h>
 #include <sys/mman.h>
 #include <linux/input-event-codes.h>
 #include <pthread.h>
@@ -149,8 +150,7 @@ static bool add_match(PortalInput *p, const char *rule) {
     return true;
 }
 
-/* Capability discovery for explicit portal callers/tests, not auto-selection
- * pending md-y8kc live acceptance. Availability is not authorization. */
+/* Capability discovery is not authorization; init must still succeed. */
 bool md_input_portal_available(void) {
     PortalInput p = { .deadline = md_now_ms() + 1000 };
     bool found = false;
@@ -413,6 +413,12 @@ static void portal_destroy(MdInputCtx *ctx) {
 }
 
 static int portal_init(MdInputCtx *ctx) {
+    /* Invalid/revoked restore tokens may prompt normally. The protocol has
+     * no no-prompt Start flag, so even an existing token is not sufficient. */
+    if (ctx->config.no_interaction) {
+        MD_LOG_E("managed input requires interaction: RemoteDesktop cannot guarantee prompt-free consent; use an interactive host");
+        return -1;
+    }
     PortalInput *p = calloc(1, sizeof(*p));
     if (!p) return -1;
     p->wake[0] = p->wake[1] = -1;
@@ -579,28 +585,55 @@ static int portal_text(MdInputCtx *ctx, const char *text) {
     struct xkb_context *xctx = NULL;
     struct xkb_keymap *map = NULL;
     struct xkb_state *state = NULL;
-    if (!ready(p) || p->depressed || p->latched || p->locked) goto done;
+    if (!ready(p) || p->depressed || p->latched || p->locked) {
+        MD_LOG_W("text unavailable: ready=%d depressed=%u latched=%u locked=%u",
+                 ready(p), p->depressed, p->latched, p->locked); goto done;
+    }
     for (unsigned k = 0; k <= KEY_MAX; k++) if (p->held[k]) goto done;
     struct ei_keymap *keymap = ei_device_keyboard_get_keymap(p->keyboard);
-    if (!keymap || ei_keymap_get_type(keymap) != EI_KEYMAP_TYPE_XKB) goto done;
+    if (!keymap || ei_keymap_get_type(keymap) != EI_KEYMAP_TYPE_XKB) {
+        MD_LOG_W("text unavailable: compositor did not provide an XKB keymap"); goto done;
+    }
     size_t size = ei_keymap_get_size(keymap);
     struct stat st;
     int fd = ei_keymap_get_fd(keymap);
-    if (!size || size > 1024 * 1024 || fstat(fd, &st) || st.st_size < (off_t)size) goto done;
+    if (!size || size > 1024 * 1024 || fstat(fd, &st) || st.st_size < (off_t)size) {
+        MD_LOG_W("text unavailable: invalid keymap size or fd"); goto done;
+    }
     const char *buffer = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (buffer == MAP_FAILED) goto done;
     xctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (xctx && buffer[size - 1] == 0)
-        map = xkb_keymap_new_from_string(xctx, buffer, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    /* EI supplies a sized buffer, not necessarily a NUL-terminated string.
+     * Strip an optional terminator for older xkbcommon buffer parsers. */
+    size_t length = size - (buffer[size - 1] == 0);
+    if (xctx)
+        map = xkb_keymap_new_from_buffer(xctx, buffer, length, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
     munmap((void *)buffer, size);
-    if (!map || !(state = xkb_state_new(map))) goto done;
+    if (!map || !(state = xkb_state_new(map))) {
+        MD_LOG_W("text unavailable: cannot parse compositor keymap"); goto done;
+    }
+    xkb_mod_index_t shift_index = xkb_keymap_mod_get_index(map, XKB_MOD_NAME_SHIFT);
+    xkb_state_update_mask(state, 0, 0, 0, 0, 0, p->group);
+    xkb_layout_index_t layout = xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE);
     for (const char *c = text; *c; c++) {
         uint32_t key; bool shift;
         if (!md_input_ascii_key(*c, &key, &shift)) goto done;
-        xkb_state_update_mask(state, 0, 0, 0, 0, 0, p->group);
+        if (shift && shift_index >= sizeof(xkb_mod_mask_t) * CHAR_BIT) goto done;
+        /* Validate the physical sequence we will inject, including remapped
+         * Left Shift. A manufactured Shift mask could approve Ctrl+A/Alt+A. */
+        xkb_mod_mask_t allowed = shift ? (xkb_mod_mask_t)1 << shift_index : 0;
         if (shift) xkb_state_update_key(state, KEY_LEFTSHIFT + 8, XKB_KEY_DOWN);
+        xkb_state_update_key(state, key + 8, XKB_KEY_DOWN);
         uint32_t expected = *c == '\n' ? '\r' : (unsigned char)*c;
-        if (xkb_state_key_get_utf32(state, key + 8) != expected) goto done;
+        if (xkb_state_key_get_utf32(state, key + 8) != expected ||
+            xkb_state_serialize_mods(state, XKB_STATE_MODS_EFFECTIVE) != allowed ||
+            xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE) != layout) {
+            MD_LOG_W("text unavailable: ASCII key does not match compositor keymap (group=%u)", p->group); goto done;
+        }
+        xkb_state_update_key(state, key + 8, XKB_KEY_UP);
+        if (shift) xkb_state_update_key(state, KEY_LEFTSHIFT + 8, XKB_KEY_UP);
+        if (xkb_state_serialize_mods(state, XKB_STATE_MODS_EFFECTIVE) ||
+            xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE) != layout) goto done;
     }
     for (const char *c = text; *c; c++) {
         uint32_t key; bool shift;

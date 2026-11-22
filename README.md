@@ -32,7 +32,7 @@ Both modes connect to the same host daemon and can run simultaneously.
 │  Platform HAL (compile-time selected)           │
 │  Capture:  PipeWire │ ScreenCaptureKit │ DXGI   │
 │  A11y:     AT-SPI2  │ AXUIElement      │ UIA    │
-│  Input:    uinput   │ CGEvent          │ SendInput│
+│  Input: portal/uinput│ CGEvent         │ SendInput│
 ├─────────────────────────────────────────────────┤
 │  Transport: TCP over FIPS TUN (fd00::/8)        │
 │  Identity:  secp256k1 keypair (Nostr nsec/npub) │

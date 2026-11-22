@@ -36,16 +36,19 @@ typedef struct MdInputCtx MdInputCtx;
 typedef struct {
     uint32_t screen_width;   /* absolute mouse coordinate range */
     uint32_t screen_height;
-    /* NULL/"auto": established platform backend (uinput on Linux).
-     * Portal input is explicit-only pending md-y8kc live acceptance. Linux
-     * also accepts "portal", "uinput", and explicit "wayland" (requires
-     * -Dwayland_input=true). No probing or fallback between backends. */
+    /* NULL/"auto": on Linux Wayland, prefer RemoteDesktop v2+ when available
+     * and initialization succeeds, otherwise try the platform backend.
+     * Other sessions keep the platform backend. Explicit "portal", "uinput"
+     * and "wayland" (-Dwayland_input=true) never fall back. */
     const char *backend;
     /* Wayland requires an absolute socket path. Ambient WAYLAND_DISPLAY and
      * WAYLAND_SOCKET are deliberately ignored. Strings are borrowed. */
     const char *wayland_display;
     /* Portal consent + EIS startup failure bound; 0 = 30s, max = 180s. */
     uint32_t portal_timeout_ms;
+    /* Never present consent UI. RemoteDesktop cannot guarantee silent token
+     * restoration, so portal input fails before opening a session. */
+    bool no_interaction;
     /* Global desktop bounds of the captured output that the client's
      * frame-relative coordinates address (md_capture_get_output_rect; macOS:
      * CoreGraphics global points; Windows: physical virtual-desktop pixels,

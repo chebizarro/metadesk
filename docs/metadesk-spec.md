@@ -209,9 +209,26 @@ MdInputBackend *md_input_backend_create(void);
 
 | Platform | Backend file | API used |
 |---|---|---|
-| Linux | `input_uinput.c` | uinput (`/dev/uinput`) via ioctl |
+| Linux Wayland | `input_portal.c` | RemoteDesktop v2+ portal / libei ≥ 1.2, preferred by `auto` when available and initialized |
+| Linux platform fallback / X11 | `input_uinput.c` | uinput (`/dev/uinput`) via ioctl; refuses known Wayland sessions before device creation |
 | macOS | `input_cgevent.m` | `CGEventCreateMouseEvent` / `CGEventCreateKeyboardEvent` |
 | Windows | `input_sendinput.cpp` | `SendInput` |
+
+Linux `--input-backend portal|uinput|wayland` overrides never fall back;
+`wayland` requires the optional wlroots build and an explicit socket. `auto`
+probes RemoteDesktop only when `XDG_SESSION_TYPE=wayland`, then tries the
+platform backend if portal discovery or initialization fails. X11, headless,
+macOS and Windows keep their platform backend. Portal denial/revocation never
+authorizes native input on Wayland: uinput rejects that session, and a lost
+running portal session fails closed rather than switching backends.
+
+Portal input currently has its **own** session and 0600 restore token
+(`$XDG_STATE_HOME/metadesk/remote-desktop.token`, defaulting to
+`~/.local/state/metadesk/remote-desktop.token`). Capture uses a separate
+ScreenCast session/token: two permissions may be needed. Shared-session
+consent, persistence and stream-to-EI `mapping_id` coordination are tracked by
+**md-kmoa**. Do not claim paired consent or Flatpak qualification from native
+input testing. See [portal input tests](testing/input-portal.md).
 
 ### 2.4 Component Boundary
 

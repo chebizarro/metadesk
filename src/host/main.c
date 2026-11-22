@@ -947,7 +947,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
     fprintf(stderr, "  --clipboard MODE Restrict granted clipboard: off|send|receive|both (default both; grant required)\n");
     fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
-    fprintf(stderr, "  --input-backend auto|uinput|wayland  Explicit input backend (default: auto)\n");
+    fprintf(stderr, "  --input-backend auto|portal|uinput|wayland  Input backend (default: auto)\n");
     fprintf(stderr, "  --input-wayland-display PATH  Absolute private Wayland socket; no ambient display\n");
     fprintf(stderr, "  --mcp-tree-format=json|compact  UI tree resource only (default: compact); action results always JSON\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
@@ -1548,6 +1548,7 @@ static int host_run(int argc, char **argv) {
         fprintf(stderr, "ERROR: --managed is a video host mode, not an MCP transport\n");
         return MD_HOST_EXIT_CONFIG;
     }
+    input_options.no_interaction = managed;
     if (mcp_stdio || mcp_http) {
         const MdMcpBridgeConfig http_auth = {
             .http_token_file = mcp_token_file,
@@ -1979,6 +1980,18 @@ signaling_ready:
     }
     MdInput *input = no_input ? NULL : md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
+        if (managed && !no_input) {
+            fprintf(stderr, "ERROR: managed input unavailable; use --no-input for a read-only host or authorize an interactive host\n");
+            startup_status = MD_HOST_EXIT_CONFIG;
+            md_host_access_lifecycle(&access, managed, "needs_interaction");
+            md_host_lifecycle_event("needs_interaction", startup_status);
+            md_input_destroy(input);
+            md_encoder_destroy(encoder);
+            if (capture) md_capture_destroy(capture);
+            md_stream_server_destroy(srv);
+            host_reject_request(&ctx, "input_unavailable");
+            goto signaling_failed;
+        }
         fprintf(stderr, "WARNING: input injection unavailable\n");
     } else {
         printf("host: input injection ready (%ux%u)\n",
