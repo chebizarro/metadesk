@@ -384,6 +384,12 @@ if host_os == 'linux'
   dep_xcb_input = dependency('xcb-xinput', version : '>=1.15')
   dep_xcb = dependency('xcb', version : '>=1.15')
   dep_xau = dependency('xau')
+  dep_ei = dependency('libei-1.0', version : '>=1.2', required : get_option('portal_input'))
+  if dep_ei.found()
+    add_project_arguments('-DMD_HAVE_PORTAL_INPUT', language : ['c', 'cpp'])
+    platform_hal_sources += files('src/core/input_portal.c')
+    platform_hal_deps += [dep_ei, dependency('xkbcommon', version : '>=1.0')]
+  endif
   dep_dbus      = dependency('dbus-1',          version : '>=1.14')
   # a11y_atspi.c calls g_object_unref/g_boxed_free directly; atspi-2.pc only
   # exposes gobject-2.0 privately, so link it explicitly.
@@ -1077,6 +1083,16 @@ if host_os == 'linux'
   test_input_desktop = executable('test_input_desktop',
     'tests/test_input_desktop.c', dependencies : [dep_metadesk, dep_input_x11])
   test('input first-key desktop (opt-in)', test_input_desktop, timeout : 180)
+  if dep_ei.found()
+    dep_eis_test = dependency('libeis-1.0', version : '>=1.2', required : false)
+    if dep_eis_test.found()
+      test_input_portal = executable('test_input_portal', 'tests/test_input_portal.c',
+        dependencies : [dep_metadesk, dep_eis_test, dep_dbus, dependency('xkbcommon')])
+      test('input portal private bus + EIS', find_program('python3'),
+        args : [files('tests/run_input_portal.py'), test_input_portal], timeout : 30)
+    endif
+  endif
+
 endif
 
 

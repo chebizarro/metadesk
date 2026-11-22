@@ -1,3 +1,5 @@
+option('portal_input', type : 'feature', value : 'auto',
+       description : 'Linux RemoteDesktop v2 / libei input (preferred over uinput)')
 option('wayland_input', type : 'boolean', value : false,
        description : 'Build explicit Linux wlroots virtual input (Wayland client, xkbcommon, scanner)')
 option('live_tests', type : 'boolean', value : false,

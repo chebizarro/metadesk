@@ -230,7 +230,15 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
     const char *name = cfg ? cfg->backend : NULL;
     const MdInputBackend *vtable = NULL;
     if (!name || strcmp(name, "auto") == 0) {
+#ifdef MD_HAVE_PORTAL_INPUT
+        if (md_input_portal_available()) vtable = md_input_portal_backend();
+        else
+#endif
         vtable = md_input_backend_create();
+#ifdef MD_HAVE_PORTAL_INPUT
+    } else if (strcmp(name, "portal") == 0) {
+        vtable = md_input_portal_backend();
+#endif
 #ifdef __linux__
     } else if (strcmp(name, "uinput") == 0) {
         vtable = md_input_backend_create();
