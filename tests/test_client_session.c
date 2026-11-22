@@ -166,27 +166,37 @@ static void *cancel_after_bind(void *data) {
     return NULL;
 }
 static void test_bind_cancel(void) {
-    MdStreamServer *server = md_stream_server_create("::1", 0);
-    MD_CHECK(server);
-    MdStream *client = md_stream_connect("::1", md_stream_server_port(server), 1000);
-    MD_CHECK(client);
-    MdStream *peer = md_stream_server_accept(server, 1000);
-    MD_CHECK(peer);
-    md_stream_server_destroy(server);
-    ClientCtx ctx = {.cancel_ch = go_channel_create(1),
-                     .request_started_us = now_us(), .granted_caps = MD_CAP_VIDEO};
-    snprintf(ctx.accepted_session_id, sizeof(ctx.accepted_session_id), "w6-binding");
-    memset(ctx.stream_token, 'a', 64);
-    BindCancel job = {peer, &ctx};
-    pthread_t thread;
-    MD_CHECK(pthread_create(&thread, NULL, cancel_after_bind, &job) == 0);
-    int64_t start = now_us();
-    MD_CHECK(bind_client_stream(client, &ctx) < 0);
-    MD_CHECK(now_us() - start < 2000000); /* cancellation, not five-second ACK timeout */
-    pthread_join(thread, NULL);
-    MD_CHECK(ctx.cancel_connect && !ctx.binding_stream);
-    md_stream_destroy(client); md_stream_destroy(peer);
-    go_channel_unref(ctx.cancel_ch);
+    for (int after_proof = 0; after_proof < 2; after_proof++) {
+        MdStreamServer *server = md_stream_server_create("::1", 0);
+        MD_CHECK(server);
+        MdStream *client = md_stream_connect("::1", md_stream_server_port(server), 1000);
+        MD_CHECK(client);
+        MdStream *peer = md_stream_server_accept(server, 1000);
+        MD_CHECK(peer);
+        md_stream_server_destroy(server);
+        ClientCtx ctx = {.cancel_ch = go_channel_create(1),
+                         .request_started_us = now_us(), .granted_caps = MD_CAP_VIDEO};
+        snprintf(ctx.accepted_session_id, sizeof(ctx.accepted_session_id), "w6-binding");
+        memset(ctx.stream_token, 'a', 64);
+        BindCancel job = {peer, &ctx};
+        pthread_t thread;
+        if (after_proof) MD_CHECK(pthread_create(&thread, NULL, cancel_after_bind, &job) == 0);
+        else cancel_client_connect(&ctx);
+        int64_t start = now_us();
+        MD_CHECK(bind_client_stream(client, &ctx) < 0);
+        MD_CHECK(now_us() - start < 2000000); /* cancellation, not five-second ACK timeout */
+        if (after_proof) pthread_join(thread, NULL);
+        else {
+            MdPacketHeader hdr;
+            uint8_t *payload = NULL;
+            MD_CHECK(md_stream_recv(peer, &hdr, &payload, 1000) < 0); /* no proof after cancellation */
+            free(payload);
+        }
+        MD_CHECK(!md_stream_is_connected(client));
+        MD_CHECK(ctx.cancel_connect && !ctx.binding_stream);
+        md_stream_destroy(client); md_stream_destroy(peer);
+        go_channel_unref(ctx.cancel_ch);
+    }
 }
 
 static void test_overlay_controls(void) {

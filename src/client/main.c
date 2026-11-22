@@ -537,15 +537,20 @@ static void cancel_client_connect(ClientCtx *ctx) {
     if (!atomic_exchange(&ctx->cancel_connect, true) && ctx->cancel_ch)
         go_channel_close(ctx->cancel_ch);
     /* Borrow only while holding the same lock the worker uses to withdraw
-     * the candidate. Shutdown wakes bind I/O; the worker alone destroys it. */
+     * the candidate. Close wakes bind I/O; the worker alone destroys it. */
     pthread_mutex_lock(&g_connect_mu);
     if (ctx->binding_stream)
-        md_socket_shutdown(md_stream_get_fd(ctx->binding_stream), SHUT_RDWR);
+        md_stream_close(ctx->binding_stream);
     pthread_mutex_unlock(&g_connect_mu);
 }
 
 static int bind_client_stream(MdStream *stream, ClientCtx *ctx) {
     pthread_mutex_lock(&g_connect_mu);
+    if (!client_owner_current(ctx)) {
+        pthread_mutex_unlock(&g_connect_mu);
+        md_stream_close(stream);
+        return -1;
+    }
     ctx->binding_stream = stream;
     pthread_mutex_unlock(&g_connect_mu);
     int rc = send_session_info(stream, ctx);

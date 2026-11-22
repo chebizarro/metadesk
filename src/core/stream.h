@@ -125,7 +125,8 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
  * the transport (caller still destroys the object). Single host-thread use. */
 int md_stream_accept_binding(MdStream *s, MdSession *session);
 bool md_stream_has_capability(const MdStream *s, uint32_t capabilities);
-/* Reject a connection without destroying it; caller retains lifetime ownership. */
+/* Close the connection and wake readiness waits without destroying the stream; the caller must join
+ * its I/O owners before destroying it. Also rejects an unbound candidate. */
 void md_stream_close(MdStream *s);
 
 /* Send a ping packet. Records send timestamp for RTT measurement. */
