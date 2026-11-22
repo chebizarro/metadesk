@@ -5,25 +5,29 @@ receipts incorporated by **md-ah9.12** against master `c571b5d`; no new runtime
 tests were run for that documentation task. Container client cells were added by
 **md-ah9.11** against master `8eebb6c`; md-rk4/md-33e re-ran those cells against
 `66c1886` plus their fix, and md-cdz/md-rnc against `85af248` plus theirs. This
-is the owning matrix, not a new E2E harness.
+is the owning matrix. L7 now supplies a [native runbook](e2e-runbook.md),
+[receipt harness](../../tools/e2e/matrix.py), and
+[2026-11-21 results](results/2026-11-21-l7.md) at product commit
+`3f66fcc46a0dcc1b56931f8803aee813f9bf09cc`. No general pairing passed.
 
 ## Status and counting
 
 **PASS** means the cited evidence establishes the named check on that stack;
 **FAIL** preserves observed failures, including intermittent ones. **not yet
 run** means no qualifying receipt here; **pending** names a prerequisite owner;
-**N/A** means a runtime-specific assertion does not apply. Expected-negative
+**BLOCKED** means an attempted run stopped at a demonstrated prerequisite;
+its unperformed checks remain NOT_RUN. **N/A** means a runtime-specific assertion does not apply. Expected-negative
 checks pass only when rejection was observed.
 
 A cell is one table body entry in a result column, excluding row labels.
 General cells are complete pairing runs; container cells are narrower component
 checks, not full E2E passes. Counts exclude the checklist and summary tables.
 
-| Scope | PASS | FAIL | not yet run | pending | N/A | Total |
-|---|---:|---:|---:|---:|---:|---:|
-| General host/client pairings | 0 | 0 | 32 | 0 | 0 | 32 |
-| Containers | 93 | 4 | 4 | 5 | 1 | 107 |
-| Total | 93 | 4 | 36 | 5 | 1 | 139 |
+| Scope | PASS | FAIL | not yet run | pending | BLOCKED | N/A | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| General host/client pairings | 0 | 0 | 28 | 0 | 4 | 0 | 32 |
+| Containers (historical receipts below) | 93 | 4 | 4 | 5 | 0 | 1 | 107 |
+| Total | 93 | 4 | 32 | 5 | 4 | 1 | 139 |
 
 ## General roles × platforms × transports
 
@@ -36,19 +40,28 @@ promoted to PASS. Container component checks below do not qualify these cells.
 
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
-| Windows | not yet run | not yet run | not yet run | not yet run |
+| Windows | not yet run | not yet run | BLOCKED: md-z9pd | not yet run |
 | GNOME/Linux | not yet run | not yet run | not yet run | not yet run |
-| macOS | not yet run | not yet run | not yet run | not yet run |
+| macOS | BLOCKED: md-z9pd, md-p4tl | not yet run | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
 
 ### FIPS mesh (npub, NIP-44 session negotiation, TCP over FIPS TUN)
 
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
-| Windows | not yet run | not yet run | not yet run | not yet run |
+| Windows | not yet run | not yet run | BLOCKED: md-z9pd, md-m1we | not yet run |
 | GNOME/Linux | not yet run | not yet run | not yet run | not yet run |
-| macOS | not yet run | not yet run | not yet run | not yet run |
+| macOS | BLOCKED: md-z9pd, md-m1we | not yet run | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
+
+The four BLOCKED entries are the prioritized macOS↔Windows attempts in both
+transports, not failed video sessions. Native component passes do not qualify
+any of the ten per-cell checks end-to-end. See the dated results for per-check
+NOT_RUN/BLOCKED status, exact evidence and cleanup. All Linux entries await VM
+owner approval; all Omarchy entries lack hardware. Other pairings are unattempted,
+even where the same prerequisite would block them. Direct-IP authorization
+is unavailable in the current CLI (md-p4tl); Windows FIPS control is explicitly
+unsupported (md-m1we). These are not bypassed by the harness.
 
 General platform runs remain md-5zi work. Container FIPS cells are pending
 **md-ah9.5**; its results doc is **to be added by md-ah9.5**. Future container
@@ -78,9 +91,10 @@ Record pass/fail and notes for each check, not just connection success:
    fixtures for actions, not the operator's desktop.
 2. Start the host with platform capture consent/input permissions. For mesh,
    establish control readiness and the route before connecting. Record actual
-   launch commands and endpoint/identities without secrets. Platform-wide launch
-   recipes are **not yet recorded** here; md-5zi must supply exercised commands
-   or scripts with its receipts.
+   launch commands and endpoint/identities without secrets. Use the
+   [native runbook](e2e-runbook.md) and dated receipts; its planned mesh launch
+   procedure is clearly separated from exercised native commands. There is no
+   working authenticated direct-IP recipe until md-p4tl is fixed.
 3. Connect and execute every check above, including authorization negatives,
    reconnect/restore and teardown. Observe events/state, not arbitrary sleeps.
 4. Attach dated results, exact commands/versions, per-check observations,
