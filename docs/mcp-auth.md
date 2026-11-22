@@ -548,3 +548,14 @@ The new file receives an explicit current-user owner and protected, owner-only
 DACL at creation, including when an elevated token defaults to a group owner. Never print its contents into logs or put the token itself in argv.
 Use a directory without junction/symlink ancestors. An existing file is not
 overwritten by this recipe.
+
+### Private host-list compatibility (md-bmiw / md-ah9.3)
+
+`--mcp-allow-host-list` decrypts the host's NIP-51 private items using its saved
+host-role signer, via the same core policy as video sessions. Only an effective
+private `agent` grant authorizes NIP-98; action tools also require `input`.
+Legacy public and mixed lists require explicit complete scope review with
+`metadesk-host access migrate`; until then they grant no live-list authority.
+Unreadable private content likewise fails closed. Static flag/file grants remain
+independent and additive as documented above. Migration cannot erase historical
+public copies retained by relays or observers; see [access migration](access.md#legacy-public-permissions--review-required).

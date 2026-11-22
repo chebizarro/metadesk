@@ -4,7 +4,7 @@
  * See spec §2.3.3 — platform backends selected at compile time.
  *
  * Backends:
- *   Linux:   uinput virtual devices, or opt-in Wayland virtual input
+ *   Linux:   RemoteDesktop portal, uinput, or opt-in Wayland virtual input
  *   macOS:   CGEvent / Quartz        (input_cgevent.m)
  *   Windows: SendInput               (input_sendinput.cpp)
  *
@@ -36,12 +36,16 @@ typedef struct MdInputCtx MdInputCtx;
 typedef struct {
     uint32_t screen_width;   /* absolute mouse coordinate range */
     uint32_t screen_height;
-    /* NULL/"auto": existing platform backend. Linux also accepts "uinput"
-     * and explicit "wayland" (requires -Dwayland_input=true). No fallback. */
+    /* NULL/"auto": established platform backend (uinput on Linux).
+     * Portal input is explicit-only pending md-y8kc live acceptance. Linux
+     * also accepts "portal", "uinput", and explicit "wayland" (requires
+     * -Dwayland_input=true). No probing or fallback between backends. */
     const char *backend;
     /* Wayland requires an absolute socket path. Ambient WAYLAND_DISPLAY and
      * WAYLAND_SOCKET are deliberately ignored. Strings are borrowed. */
     const char *wayland_display;
+    /* Portal consent + EIS startup failure bound; 0 = 30s, max = 180s. */
+    uint32_t portal_timeout_ms;
     /* Global desktop bounds of the captured output that the client's
      * frame-relative coordinates address (md_capture_get_output_rect; macOS:
      * CoreGraphics global points; Windows: physical virtual-desktop pixels,
@@ -89,6 +93,10 @@ struct MdInputCtx {
 /* Create the platform-appropriate input backend.
  * Each platform's backend source file implements this function. */
 const MdInputBackend *md_input_backend_create(void);
+#ifdef MD_HAVE_PORTAL_INPUT
+bool md_input_portal_available(void);
+const MdInputBackend *md_input_portal_backend(void);
+#endif
 #ifdef MD_HAVE_WAYLAND_INPUT
 const MdInputBackend *md_input_wayland_backend(void);
 #endif
@@ -106,7 +114,10 @@ typedef MdInputCtx MdInput;
 /* Create and initialise an input context with the platform backend.
  * cfg may be NULL only for legacy callers; that uses the documented
  * fallback dimensions above and logs a warning. Prefer passing actual
- * capture/display dimensions. Returns NULL on failure. */
+ * capture/display dimensions. Returns NULL on failure.
+ * Linux uinput waits for the exact new device to be enabled by a local X11
+ * consumer when DISPLAY is set; known Wayland sessions require portal input.
+ * With no desktop environment, uinput only guarantees kernel device creation. */
 MdInput *md_input_create(const MdInputConfig *cfg);
 
 /* ── Mouse injection ─────────────────────────────────────────── */
@@ -130,7 +141,9 @@ int md_input_key_combo(MdInput *inp, const char **keys, int key_count);
 
 /* Type a UTF-8 string if supported by the backend. Wayland synthesizes a
  * fixed US keymap: printable ASCII, tab and newline only, at most 4096 bytes;
- * unsupported text, held keys or latched/locked modifiers fail before input. */
+ * unsupported text, held keys or latched/locked modifiers fail before input.
+ * Portal input preflights ASCII against the compositor's actual XKB keymap
+ * and active group, and refuses held or active modifiers before typing. */
 int md_input_type_text(MdInput *inp, const char *text);
 
 /* ── Action dispatch ─────────────────────────────────────────── */

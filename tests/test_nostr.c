@@ -14,6 +14,7 @@
 #include <nostr-kinds.h>
 #include <nostr/nip51/nip51.h>
 #include <json.h>
+#include <cjson/cJSON.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -785,6 +786,8 @@ typedef struct {
     bool hold_signed, release_signed, hold_processing, release_processing;
     bool hold_backend_sign, release_backend_sign;
     atomic_bool fail_sign;
+    bool hold_encrypt, release_encrypt, fail_encrypt;
+    unsigned encrypt_entered;
     atomic_int signs;
     MdNostrAclState state;
 } AclTest;
@@ -871,7 +874,20 @@ static int acl_sign(MdSigner *signer, const char *json, char **out) {
 static int acl_pk(MdSigner *signer, char **out) {
     return md_signer_get_pubkey(((AclTest *)signer->backend)->direct, out);
 }
-static const MdSignerOps acl_ops = { .get_pubkey = acl_pk, .sign_event = acl_sign };
+static int acl_encrypt(MdSigner *signer, const char *peer, const char *text, char **out) {
+    AclTest *s = signer->backend;
+    pthread_mutex_lock(&s->mu);
+    s->encrypt_entered++; pthread_cond_broadcast(&s->cv);
+    while (s->hold_encrypt && !s->release_encrypt) pthread_cond_wait(&s->cv, &s->mu);
+    bool fail = s->fail_encrypt;
+    pthread_mutex_unlock(&s->mu);
+    return fail ? MD_SIGNER_ERR_DENIED : md_signer_nip44_encrypt(s->direct, peer, text, out);
+}
+static int acl_decrypt(MdSigner *signer, const char *peer, const char *text, char **out) {
+    return md_signer_nip44_decrypt(((AclTest *)signer->backend)->direct, peer, text, out);
+}
+static const MdSignerOps acl_ops = { .get_pubkey = acl_pk, .sign_event = acl_sign,
+    .nip44_encrypt = acl_encrypt, .nip44_decrypt = acl_decrypt };
 static void acl_unused_dm(const char *pk, const char *content,
                           const MdNostrDmInfo *info, void *data) {
     (void)pk; (void)content; (void)info; (void)data;
@@ -901,6 +917,30 @@ static void acl_finish(AclTest *s) {
     md_signer_destroy(s->direct);
     pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->mu);
 }
+/* Move all but the first address tag to NIP-51 self-encrypted content. */
+static void acl_privatize(AclTest *s, NostrEvent *ev) {
+    cJSON *items = cJSON_CreateArray();
+    NostrTags *tags = nostr_event_get_tags(ev);
+    NostrTags *outer = nostr_tags_new(0);
+    bool addressed = false;
+    for (size_t i = 0; i < nostr_tags_size(tags); i++) {
+        NostrTag *tag = nostr_tags_get(tags, i);
+        if (!addressed && nostr_tag_size(tag) >= 2 && !strcmp(nostr_tag_get(tag, 0), "d")) {
+            nostr_tags_append(outer, nostr_tag_new("d", nostr_tag_get(tag, 1), NULL));
+            addressed = true;
+            continue;
+        }
+        cJSON *item = cJSON_CreateArray();
+        for (size_t j = 0; j < nostr_tag_size(tag); j++)
+            MD_CHECK(cJSON_AddItemToArray(item, cJSON_CreateString(nostr_tag_get(tag, j))));
+        MD_CHECK(cJSON_AddItemToArray(items, item));
+    }
+    char *plain = cJSON_PrintUnformatted(items), *cipher = NULL;
+    MD_CHECK(md_signer_nip44_encrypt(s->direct, md_nostr_get_npub(s->bridge), plain, &cipher) == 0);
+    nostr_event_set_tags(ev, outer);
+    nostr_event_set_content(ev, cipher);
+    free(plain); free(cipher); cJSON_Delete(items);
+}
 static char *acl_event(AclTest *s, int64_t created, const char *member) {
     NostrEvent *ev = nostr_event_new();
     nostr_event_set_kind(ev, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
@@ -910,6 +950,7 @@ static char *acl_event(AclTest *s, int64_t created, const char *member) {
     NostrTags *tags = nostr_tags_new(1, nostr_tag_new("d", "metadesk-allowlist", NULL));
     if (member) nostr_tags_append(tags, nostr_tag_new("p", member, "video", NULL));
     nostr_event_set_tags(ev, tags);
+    acl_privatize(s, ev);
     char *json = nostr_event_serialize(ev), *signed_json = NULL;
     MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
     free(json); nostr_event_free(ev);
@@ -1240,8 +1281,12 @@ static char *acl_event_json(AclTest *s, int64_t created, const char *tmpl,
     snprintf(json, sizeof(json), "{\"kind\":%d,\"pubkey\":\"%s\",\"created_at\":%lld,"
              "\"content\":\"\",\"tags\":[%s]}", NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,
              md_nostr_get_npub(s->bridge), (long long)created, tags);
-    char *signed_json = NULL;
-    MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
+    NostrEvent *ev = nostr_event_new();
+    MD_CHECK(nostr_event_deserialize(ev, json) == 0);
+    acl_privatize(s, ev);
+    char *private_json = nostr_event_serialize(ev), *signed_json = NULL;
+    MD_CHECK(md_signer_sign_event(s->direct, private_json, &signed_json) == 0);
+    free(private_json); nostr_event_free(ev);
     return signed_json;
 }
 #define ACL_D "[\"d\",\"metadesk-allowlist\"],"
@@ -1256,7 +1301,16 @@ static void acl_report_linked_policy(AclTest *s, const char *a) {
         char *json = acl_event_json(s, 1, probes[i], a, a);
         NostrEvent *ev = nostr_event_new();
         MD_CHECK(json && nostr_event_deserialize(ev, json) == 0);
-        NostrList *list = nostr_nip51_parse_list(ev, NULL);
+        char *plain = NULL;
+        MD_CHECK(md_signer_nip44_decrypt(s->direct, md_nostr_get_npub(s->bridge),
+                                        nostr_event_get_content(ev), &plain) == 0);
+        char probe[2400];
+        snprintf(probe, sizeof(probe), "{\"kind\":30000,\"pubkey\":\"%s\",\"created_at\":1,\"content\":\"\",\"tags\":%s}", md_nostr_get_npub(s->bridge), plain);
+        free(plain);
+        NostrEvent *raw = nostr_event_new();
+        MD_CHECK(nostr_event_deserialize(raw, probe) == 0);
+        NostrList *list = nostr_nip51_parse_list(raw, NULL);
+        nostr_event_free(raw);
         result[i] = list ? (int)list->count : -1;
         nostr_nip51_list_free(list); nostr_event_free(ev); free(json);
     }
@@ -1332,9 +1386,8 @@ static void test_acl_tag_shapes(const char **urls, const char *a, const char *b)
     MD_CHECK(md_nostr_granted_capabilities(s.bridge, b, UINT32_MAX) == 0);
     MD_CHECK(md_nostr_allowlist_count(s.bridge) == 2);
 
-    /* md-30w round trip: an ack-gated edit republishes only d/p/metadesk-caps
-     * (never stale event-level tags such as expiration), keeps b's invalid
-     * record invalid, and both nostrc parsers accept the result. */
+    /* Only d is public. Unknown private items stay encrypted and inert;
+     * malformed grants remain invalid across unrelated edits. */
     acl_mode("accept");
     MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video,agent") == 0);
     MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == VA);
@@ -1345,21 +1398,17 @@ static void test_acl_tag_shapes(const char **urls, const char *a, const char *b)
     NostrEvent *ev = nostr_event_new();
     MD_CHECK(published && nostr_event_deserialize(ev, published) == 0);
     MD_CHECK(nostr_event_validate(ev, NULL) == NOSTR_EVENT_VALIDATION_OK);
+    MD_CHECK(nostr_tags_size(nostr_event_get_tags(ev)) == 1);
     MD_CHECK(acl_has_tag(ev, 2, "d", "metadesk-allowlist", NULL));
-    MD_CHECK(acl_has_tag(ev, 2, "p", a, NULL) && acl_has_tag(ev, 2, "p", b, NULL));
-    MD_CHECK(acl_has_tag(ev, 3, "metadesk-caps", a, "v1:video,agent"));
-    MD_CHECK(acl_has_tag(ev, 3, "metadesk-caps", b, ""));
-    NostrTags *tags = nostr_event_get_tags(ev);
-    size_t ds = 0, others = 0;
-    for (size_t i = 0; i < nostr_tags_size(tags); i++) {
-        const char *name = nostr_tag_get(nostr_tags_get(tags, i), 0);
-        if (!strcmp(name, "d")) ds++;
-        else if (strcmp(name, "p") && strcmp(name, "metadesk-caps")) others++;
-    }
-    MD_CHECK(ds == 1 && others == 0 && nostr_tags_size(tags) == 5);
-    NostrList *third_party = nostr_nip51_parse_list(ev, NULL);
-    MD_CHECK(third_party != NULL); /* readable by either nostrc tag policy */
-    nostr_nip51_list_free(third_party); nostr_event_free(ev);
+    MD_CHECK(!strstr(published, a) && !strstr(published, b));
+    char *plain = NULL;
+    MD_CHECK(md_signer_nip44_decrypt(s.direct, md_nostr_get_npub(s.bridge),
+                                    nostr_event_get_content(ev), &plain) == 0);
+    MD_CHECK(strstr(plain, a) && strstr(plain, b) && strstr(plain, "v1:video,agent"));
+    /* Unknown PRIVATE entries survive without becoming public event metadata. */
+    MD_CHECK(strstr(plain, "expiration") && strstr(plain, "topic"));
+    MD_CHECK(!strstr(published, "expiration") && !strstr(published, "topic"));
+    free(plain); nostr_event_free(ev);
     acl_finish(&s);
 
     acl_reset(); acl_bridge(&s, urls, 1, false, false);
@@ -1370,6 +1419,233 @@ static void test_acl_tag_shapes(const char **urls, const char *a, const char *b)
     free(published); acl_finish(&s);
     printf("  PASS: raw-tag allowlist decoding (application/duplicate/trailing/>3-field/"
            "1-field/NIP-02 p/second d/foreign address) and edit round trip\n");
+}
+
+/* Resign a host-authentic envelope after changing its public/private shape or
+ * ciphertext. The MAC failures below must not be confused with bad signatures. */
+static char *acl_rewrap(AclTest *s, const char *source, bool public, bool mixed,
+                        bool tamper, bool foreign_key) {
+    cJSON *event = cJSON_Parse(source);
+    const char *cipher = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event, "content"));
+    char *plain = NULL;
+    MD_CHECK(md_signer_nip44_decrypt(s->direct, md_nostr_get_npub(s->bridge), cipher, &plain) == 0);
+    if (public || mixed) {
+        cJSON *items = cJSON_Parse(plain);
+        cJSON *tags = cJSON_GetObjectItemCaseSensitive(event, "tags");
+        while (cJSON_GetArraySize(items))
+            MD_CHECK(cJSON_AddItemToArray(tags, cJSON_DetachItemFromArray(items, 0)));
+        cJSON_Delete(items);
+        if (public) MD_CHECK(cJSON_ReplaceItemInObjectCaseSensitive(event, "content", cJSON_CreateString("")));
+    }
+    if (tamper || foreign_key) {
+        char *altered = NULL;
+        if (foreign_key) {
+            MdSigner *other = md_signer_create_direct("0000000000000000000000000000000000000000000000000000000000000003");
+            char *pk = NULL;
+            MD_CHECK(md_signer_get_pubkey(other, &pk) == 0);
+            MD_CHECK(md_signer_nip44_encrypt(other, pk, plain, &altered) == 0);
+            free(pk); md_signer_destroy(other);
+        } else {
+            altered = strdup(cipher);
+            altered[50] = altered[50] == 'A' ? 'B' : 'A';
+        }
+        MD_CHECK(cJSON_ReplaceItemInObjectCaseSensitive(event, "content", cJSON_CreateString(altered)));
+        free(altered);
+    }
+    free(plain);
+    char *json = cJSON_PrintUnformatted(event), *signed_json = NULL;
+    MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
+    free(json); cJSON_Delete(event);
+    return signed_json;
+}
+
+typedef struct { MdNostr *n; MdAllowlistEntry *entries; size_t count; int result; } AclMigration;
+static void *acl_migrate_thread(void *data) {
+    AclMigration *m = data;
+    m->result = md_nostr_allowlist_migrate(m->n, m->entries, m->count);
+    return NULL;
+}
+static char *acl_plain_event(AclTest *s, int64_t created, const char *plain) {
+    NostrEvent *ev = nostr_event_new();
+    char *cipher = NULL;
+    MD_CHECK(md_signer_nip44_encrypt(s->direct, md_nostr_get_npub(s->bridge), plain, &cipher) == 0);
+    nostr_event_set_kind(ev, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
+    nostr_event_set_created_at(ev, created);
+    nostr_event_set_pubkey(ev, md_nostr_get_npub(s->bridge));
+    nostr_event_set_tags(ev, nostr_tags_new(1, nostr_tag_new("d", "metadesk-allowlist", NULL)));
+    nostr_event_set_content(ev, cipher);
+    char *json = nostr_event_serialize(ev), *signed_json = NULL;
+    MD_CHECK(md_signer_sign_event(s->direct, json, &signed_json) == 0);
+    free(cipher); free(json); nostr_event_free(ev);
+    return signed_json;
+}
+static void test_acl_private(const char **urls, const char *a, const char *b) {
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    int64_t t = time(NULL) - 100;
+    char *base = acl_event_json(&s, t, ACL_D ACL_GRANT_A, a, b);
+    char *public = acl_rewrap(&s, base, true, false, false, false);
+    acl_deliver(&s, 0, public);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, a));
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    MdAllowlistEntry *snapshot = NULL;
+    size_t count = 0;
+    MD_CHECK(md_nostr_allowlist_snapshot(s.bridge, &snapshot, &count) == 0 && count == 1);
+    MD_CHECK(snapshot && snapshot[0].review_required && !strcmp(snapshot[0].caps, "none"));
+    free(snapshot);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, b, "video") == -1);
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, a) == -1);
+    MdAllowlistEntry confirmations[2] = {0};
+    snprintf(confirmations[0].pubkey_hex, 65, "%s", a);
+    snprintf(confirmations[0].caps, 64, "video,agent");
+    confirmations[1] = confirmations[0];
+    MD_CHECK(md_nostr_allowlist_migrate(s.bridge, NULL, 0) == -1);
+    MD_CHECK(md_nostr_allowlist_migrate(s.bridge, confirmations, 2) == -1);
+    acl_mode("reject");
+    MD_CHECK(md_nostr_allowlist_migrate(s.bridge, confirmations, 1) == -1);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, confirmations + 1) == 0 && confirmations[1].review_required);
+    atomic_store(&s.fail_sign, true);
+    MD_CHECK(md_nostr_allowlist_migrate(s.bridge, confirmations, 1) == -1);
+    atomic_store(&s.fail_sign, false);
+    pthread_mutex_lock(&s.mu); s.fail_encrypt = true; pthread_mutex_unlock(&s.mu);
+    int signs = atomic_load(&s.signs);
+    MD_CHECK(md_nostr_allowlist_migrate(s.bridge, confirmations, 1) == -1);
+    MD_CHECK(atomic_load(&s.signs) == signs); /* encryption failure never signs/publishes */
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, confirmations + 1) == 0 && confirmations[1].review_required);
+    pthread_mutex_lock(&s.mu); s.fail_encrypt = false; pthread_mutex_unlock(&s.mu);
+    acl_mode("hold");
+    AclMigration migration = {s.bridge, confirmations, 1, -2};
+    pthread_t worker;
+    MD_CHECK(pthread_create(&worker, NULL, acl_migrate_thread, &migration) == 0);
+    acl_control("{\"op\":\"held\"}");
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, confirmations + 1) == 0 && confirmations[1].review_required);
+    /* A reflected EVENT before OK must not activate the candidate. */
+    unsigned received = acl_counter(&s, &s.received);
+    acl_control("{\"op\":\"echo\"}"); acl_wait(&s, &s.received, received + 1);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    acl_control("{\"op\":\"ack\",\"ok\":true}");
+    pthread_join(worker, NULL);
+    MD_CHECK(migration.result == 0);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == (MD_CAP_VIDEO | MD_CAP_AGENT));
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, confirmations + 1) == 0 && !confirmations[1].review_required);
+    free(base); free(public);
+
+    base = acl_event_json(&s, time(NULL) + 10, ACL_D ACL_GRANT_A, a, b);
+    char *mixed = acl_rewrap(&s, base, false, true, false, false);
+    acl_deliver(&s, 0, mixed);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, confirmations + 1) == 0 && confirmations[1].review_required);
+    free(base); free(mixed);
+    for (int foreign = 0; foreign < 2; foreign++) {
+        base = acl_event_json(&s, time(NULL) + 20 + foreign, ACL_D ACL_GRANT_A, a, b);
+        char *bad = acl_rewrap(&s, base, false, false, !foreign, foreign);
+        acl_deliver(&s, 0, bad);
+        MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+        MD_CHECK(md_nostr_allowlist_snapshot(s.bridge, &snapshot, &count) == -1);
+        MD_CHECK(md_nostr_allowlist_migrate(s.bridge, NULL, 0) == -1);
+        /* Replaying an older valid list cannot restore authority. */
+        char *old = acl_event_json(&s, t, ACL_D ACL_GRANT_A, a, b);
+        acl_deliver(&s, 0, old);
+        MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+        free(base); free(bad); free(old);
+    }
+    /* cJSON strings must not truncate a key or scope at an encoded U+0000. */
+    const char *bad_templates[] = {
+        "[[\"p\",\"%s\\u0000junk\"],[\"metadesk-caps\",\"%s\",\"v1:video\"]]",
+        "[[\"p\",\"%s\"],[\"metadesk-caps\",\"%s\",\"v1:video\\u0000junk\"]]",
+        "{\"p\":\"%s\",\"grant\":\"%s\"}",
+        "[[\"p\",\"%s\"],[\"metadesk-caps\",\"%s\",7]]",
+        "[[\"p\",\"%s\"],[\"metadesk-caps\",\"%s\",\"v1:video\"]] []"
+    };
+    for (size_t i = 0; i < sizeof(bad_templates) / sizeof(bad_templates[0]); i++) {
+        char plain[512]; snprintf(plain, sizeof(plain), bad_templates[i], a, a);
+        char *bad = acl_plain_event(&s, time(NULL) + 30 + (int64_t)i, plain);
+        acl_deliver(&s, 0, bad); free(bad);
+        MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+        MD_CHECK(md_nostr_allowlist_snapshot(s.bridge, &snapshot, &count) == -1);
+    }
+    char escaped[512];
+    snprintf(escaped, sizeof(escaped), "[[\"p\",\"%s\"],[\"metadesk-caps\",\"%s\",\"v1:video\"],[\"x\",\"\\\\u0000\"]]", a, a);
+    char *literal = acl_plain_event(&s, time(NULL) + 40, escaped);
+    acl_deliver(&s, 0, literal); free(literal);
+    MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == MD_CAP_VIDEO);
+    acl_finish(&s);
+    printf("  PASS: private NIP-51, public/mixed review-only, complete migration, pre-OK echo/rejection, MAC tamper, foreign-key denial, no stale fallback\n");
+}
+
+static void test_acl_migration_fences(const char **urls, const char *a, const char *b) {
+    AclTest s;
+    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    int64_t t = time(NULL) - 100;
+    MdAllowlistEntry confirmation = {0};
+    snprintf(confirmation.pubkey_hex, 65, "%s", a);
+    snprintf(confirmation.caps, 64, "video,agent");
+    for (int phase = 0; phase < 3; phase++) {
+        char *base = acl_event_json(&s, t + phase * 2, ACL_D ACL_GRANT_A, a, b);
+        char *public = acl_rewrap(&s, base, true, false, false, false);
+        acl_deliver(&s, 0, public); free(base); free(public);
+        base = acl_event_json(&s, t + phase * 2 + 1, ACL_D ACL_GRANT_A, a, b);
+        /* Public replacement requires no signer, so it can arrive while a
+         * serialized external encrypt/sign call is held by the fixture. */
+        public = acl_rewrap(&s, base, true, false, false, false); free(base);
+        pthread_mutex_lock(&s.mu);
+        s.hold_encrypt = phase == 0; s.release_encrypt = false;
+        s.hold_backend_sign = phase == 1; s.release_backend_sign = false;
+        unsigned encrypts = s.encrypt_entered, signs = s.sign_entered;
+        pthread_mutex_unlock(&s.mu);
+        acl_mode(phase == 2 ? "hold" : "accept");
+        AclMigration m = {s.bridge, &confirmation, 1, -2};
+        pthread_t thread;
+        MD_CHECK(pthread_create(&thread, NULL, acl_migrate_thread, &m) == 0);
+        if (phase == 0) acl_wait(&s, &s.encrypt_entered, encrypts + 1);
+        if (phase == 1) acl_wait(&s, &s.sign_entered, signs + 1);
+        if (phase == 2) acl_control("{\"op\":\"held\"}");
+        acl_deliver(&s, 0, public); free(public);
+        pthread_mutex_lock(&s.mu);
+        s.release_encrypt = s.release_backend_sign = true;
+        pthread_cond_broadcast(&s.cv);
+        pthread_mutex_unlock(&s.mu);
+        if (phase == 2) acl_control("{\"op\":\"ack\",\"ok\":true}");
+        pthread_join(thread, NULL);
+        MD_CHECK(m.result == -1);
+        MdAllowlistEntry entry;
+        MD_CHECK(md_nostr_allowlist_get_entry(s.bridge, 0, &entry) == 0 && entry.review_required);
+        MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    }
+    /* Cancellation after admission to an external encrypt call must discard
+     * the result, never sign/publish it, and allow stop/destroy to drain. */
+    pthread_mutex_lock(&s.mu);
+    s.hold_encrypt = true; s.release_encrypt = false; s.hold_backend_sign = false;
+    unsigned encrypts = s.encrypt_entered;
+    pthread_mutex_unlock(&s.mu);
+    int signs = atomic_load(&s.signs);
+    AclMigration m = {s.bridge, &confirmation, 1, -2};
+    pthread_t thread;
+    MD_CHECK(pthread_create(&thread, NULL, acl_migrate_thread, &m) == 0);
+    acl_wait(&s, &s.encrypt_entered, encrypts + 1);
+    md_nostr_stop(s.bridge);
+    pthread_mutex_lock(&s.mu); s.release_encrypt = true;
+    pthread_cond_broadcast(&s.cv); pthread_mutex_unlock(&s.mu);
+    pthread_join(thread, NULL);
+    MD_CHECK(m.result == -1 && atomic_load(&s.signs) == signs);
+    acl_finish(&s);
+
+    /* A late positive OK cannot commit after a stop. */
+    acl_reset(); acl_bridge(&s, urls, 1, false, false); acl_eose(&s, 0);
+    char *base = acl_event_json(&s, t, ACL_D ACL_GRANT_A, a, b);
+    char *public = acl_rewrap(&s, base, true, false, false, false);
+    acl_deliver(&s, 0, public); free(base); free(public);
+    acl_mode("hold"); m = (AclMigration){s.bridge, &confirmation, 1, -2};
+    MD_CHECK(pthread_create(&thread, NULL, acl_migrate_thread, &m) == 0);
+    acl_control("{\"op\":\"held\"}");
+    md_nostr_stop(s.bridge);
+    acl_control("{\"op\":\"ack\",\"ok\":true}");
+    pthread_join(thread, NULL);
+    MD_CHECK(m.result == -1 && md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) == 0);
+    acl_finish(&s);
+    printf("  PASS: migration base replaced during encrypt/sign/publish, encrypt failure/cancellation, stop before late OK\n");
 }
 
 static void test_auth_wire(const char **urls, const char *a) {
@@ -1598,6 +1874,8 @@ static int acl_fixture_tests(const char **urls) {
     test_acl_refusals(urls, a);
     test_acl_edits(urls, a, b);
     test_acl_tag_shapes(urls, a, b);
+    test_acl_private(urls, a, b);
+    test_acl_migration_fences(urls, a, b);
     test_history_wait(urls);
     test_auth_wire(urls, a);
 #ifndef _WIN32

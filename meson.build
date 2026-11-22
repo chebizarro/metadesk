@@ -386,6 +386,15 @@ if host_os == 'linux'
   dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
   dep_atspi     = dependency('atspi-2',         version : '>=2.48')
   dep_udev      = dependency('libudev',         version : '>=252')
+  dep_xcb_input = dependency('xcb-xinput', version : '>=1.15')
+  dep_xcb = dependency('xcb', version : '>=1.15')
+  dep_xau = dependency('xau')
+  dep_ei = dependency('libei-1.0', version : '>=1.2', required : get_option('portal_input'))
+  if dep_ei.found()
+    add_project_arguments('-DMD_HAVE_PORTAL_INPUT', language : ['c', 'cpp'])
+    platform_hal_sources += files('src/core/input_portal.c')
+    platform_hal_deps += [dep_ei, dependency('xkbcommon', version : '>=1.0')]
+  endif
   dep_dbus      = dependency('dbus-1',          version : '>=1.14')
   # a11y_atspi.c calls g_object_unref/g_boxed_free directly; atspi-2.pc only
   # exposes gobject-2.0 privately, so link it explicitly.
@@ -400,7 +409,7 @@ if host_os == 'linux'
     'src/core/ipc_unix.c',
   )
   platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus,
-                        dep_gobject, dep_uuid]
+                        dep_gobject, dep_uuid, dep_xcb_input, dep_xcb, dep_xau]
 
 elif host_os == 'darwin'
   add_languages('objc', required : true)
@@ -853,7 +862,12 @@ if host_os == 'windows'
 endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
+# Explicit OpenH264 fetcher only; encoder startup has no downloader.
+dep_oh_fetch = [dep_curl, dependency('openssl'), cc.find_library('bz2')]
+if host_os == 'windows'
+  dep_oh_fetch += cc.find_library('advapi32')
+endif
+host_sources = files('src/core/encode_openh264_fetch.c', 'src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
   'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
   'src/host/capture_sync.c')
 host_includes = [core_inc]
@@ -870,7 +884,7 @@ endif
 
 metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
-  dependencies : [dep_metadesk],
+  dependencies : [dep_metadesk] + dep_oh_fetch,
   c_args : host_c_args,
   install : true,
   install_rpath : _product_exe_rpath,
@@ -891,6 +905,9 @@ if host_os == 'linux' or host_os == 'darwin'
   if get_option('signer_nip5f')
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
+      timeout : 120)
+    test('access migration private relay', accounts_python,
+      args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture, '--migration-only'],
       timeout : 120)
     # md-ah9.14/md-ah9.3: real mcp-proxy <-> NIP-98 MCP HTTP + live host allowlist.
     mcp_proxy_host_fixture = executable('mcp_proxy_host_fixture',
@@ -1065,6 +1082,13 @@ fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.c',
 test_encoder_loader = executable('test_encoder_loader', 'tests/test_encoder_loader.c',
   dependencies : dep_metadesk)
 test('OpenH264 rejects incompatible ABI', test_encoder_loader, args : [fake_openh264.full_path()])
+foreach rejected : [['unvetted_build', '2,7,0,2611'], ['older_layout', '2,5,1,2501']]
+  fake_rejected = shared_library('fake_openh264_' + rejected[0], 'tests/fake_openh264.c',
+    include_directories : core_inc, install : false,
+    c_args : ['-DMD_FAKE_OPENH264_VERSION=' + rejected[1]])
+  test('OpenH264 rejects ' + rejected[0] + ' before create', test_encoder_loader,
+    args : [fake_rejected.full_path()])
+endforeach
 test('OpenH264 rejects missing explicit library', test_encoder_loader)
 if host_os != 'windows'
   test('FFmpeg Windows patch wiring (fixtures)', find_program('python3'),
@@ -1113,6 +1137,33 @@ test_input = executable('test_input',
   dependencies : [dep_metadesk] + wayland_test_deps,
 )
 test('input injection', test_input)
+# Compile the real selection logic against device-free backend factories.
+# Exercise portal choice even on hosts without libei, never native injection.
+test_input_selection = executable('test_input_selection',
+  files('tests/test_input_selection.c', 'src/core/input.c', 'src/core/log.c'),
+  include_directories : core_inc,
+  c_args : ['-DMD_HAVE_PORTAL_INPUT'],
+  dependencies : [dep_threads],
+)
+test('input backend selection', test_input_selection)
+
+if host_os == 'linux'
+  dep_input_x11 = dependency('x11')
+  test_input_desktop = executable('test_input_desktop',
+    'tests/test_input_desktop.c', dependencies : [dep_metadesk, dep_input_x11])
+  test('input first-key desktop (opt-in)', test_input_desktop, timeout : 180)
+  if dep_ei.found()
+    dep_eis_test = dependency('libeis-1.0', version : '>=1.2', required : false)
+    if dep_eis_test.found()
+      test_input_portal = executable('test_input_portal', 'tests/test_input_portal.c',
+        dependencies : [dep_metadesk, dep_eis_test, dep_dbus, dependency('xkbcommon')])
+      test('input portal private bus + EIS', find_program('python3'),
+        args : [files('tests/run_input_portal.py'), test_input_portal], timeout : 30)
+    endif
+  endif
+
+endif
+
 
 test_agent = executable('test_agent',
   files('tests/test_agent.c'),
@@ -1175,13 +1226,18 @@ test_signer = executable('test_signer',
 test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
-  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
+  files('tests/test_host_binding.c', 'src/core/encode_openh264_fetch.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
     'src/host/capture_sync.c', 'src/host/capture_cli.c'),
-  dependencies : [dep_metadesk])
+  dependencies : [dep_metadesk] + dep_oh_fetch)
 test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
   test('NIP-5F host session quoted seal', accounts_python,
     args : [files('tests/test_nip5f_session.py'), test_host_binding, access_signer_fixture],
+    timeout : 90)
+endif
+if enable_nip5f and enable_client and (host_os == 'linux' or host_os == 'darwin')
+  test('private allowlist real host/client loopback', accounts_python,
+    args : [files('tests/access_private_session.py'), metadesk_host, metadesk_client, access_signer_fixture],
     timeout : 90)
 endif
 test('session correlation retaining private relay', find_program('python3'),
@@ -1322,3 +1378,13 @@ if host_os == 'darwin'
     files('packaging/macos/fix-install-names.py'),
     get_option('libdir'), get_option('bindir'), _installed_bins)
 endif
+
+# Offline fetch fixtures include the implementation to exercise private I/O
+# without adding network overrides or unauthenticated install APIs to the CLI.
+test_oh_fetch = executable('test_openh264_fetch', 'tests/test_openh264_fetch.c',
+  include_directories : [core_inc] + (_sys_inc_dirs.length() > 0 ? [include_directories(_sys_inc_dirs[0])] : []),
+  dependencies : dep_oh_fetch)
+test('OpenH264 offline fetch', test_oh_fetch)
+
+test('OpenH264 explicit fetch CLI offline', find_program('python3'),
+  args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)
