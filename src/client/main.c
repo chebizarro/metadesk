@@ -29,6 +29,7 @@
 #include "ui.h"
 #include "packet.h"
 #include "input_event.h"
+#include "md_socket.h"
 #include "md_time.h"
 
 #include <SDL2/SDL.h>
@@ -42,12 +43,82 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <go.h>
+#include <stdatomic.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
-static volatile int g_running = 1;
-
+static atomic_int g_running = 1;
+static GoChannel *g_shutdown_ch;
+static pthread_t g_signal_thread;
+#ifndef _WIN32
+static sigset_t g_signal_set, g_previous_mask;
+#else
+static HANDLE g_signal_event;
 static void signal_handler(int sig) {
     (void)sig;
+    SetEvent(g_signal_event);
+}
+#endif
+
+/* Channel operations take locks: never call them from a POSIX handler. Block
+ * before starting workers; sigwait delivers shutdown on an ordinary thread. */
+static void *signal_waiter(void *unused) {
+    (void)unused;
+#ifndef _WIN32
+    int sig;
+    if (sigwait(&g_signal_set, &sig) != 0) return NULL;
+#else
+    WaitForSingleObject(g_signal_event, INFINITE);
+#endif
     g_running = 0;
+    go_channel_close(g_shutdown_ch);
+    return NULL;
+}
+
+static void stop_signal_wake(void) {
+    if (!g_shutdown_ch) return;
+#ifndef _WIN32
+    pthread_kill(g_signal_thread, SIGTERM);
+#else
+    SetEvent(g_signal_event);
+#endif
+    pthread_join(g_signal_thread, NULL);
+    go_channel_unref(g_shutdown_ch);
+    g_shutdown_ch = NULL;
+#ifndef _WIN32
+    pthread_sigmask(SIG_SETMASK, &g_previous_mask, NULL);
+#else
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    CloseHandle(g_signal_event);
+#endif
+}
+
+static int start_signal_wake(void) {
+    g_shutdown_ch = go_channel_create(1);
+    if (!g_shutdown_ch) return -1;
+#ifndef _WIN32
+    sigemptyset(&g_signal_set);
+    sigaddset(&g_signal_set, SIGINT);
+    sigaddset(&g_signal_set, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &g_signal_set, &g_previous_mask)) goto fail;
+#else
+    g_signal_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_signal_event) goto fail;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+#endif
+    if (!pthread_create(&g_signal_thread, NULL, signal_waiter, NULL)) return 0;
+#ifndef _WIN32
+    pthread_sigmask(SIG_SETMASK, &g_previous_mask, NULL);
+#else
+    CloseHandle(g_signal_event);
+#endif
+fail:
+    go_channel_unref(g_shutdown_ch);
+    g_shutdown_ch = NULL;
+    return -1;
 }
 
 /* ── State ───────────────────────────────────────────────────── */
@@ -85,17 +156,24 @@ typedef struct {
     int           request_pending;    /* accepting an answer to pending_req */
     char          accepted_session_id[64]; /* from session_accept DM     */
     char          stream_token[65];       /* ephemeral DM-only proof    */
-    uint32_t      granted_caps;       /* from session_accept DM          */
+    atomic_uint   granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
-    volatile int  session_accepted;   /* 1 accepted, -1 refused; under mutex */
+    atomic_int    session_accepted;   /* 1 accepted, -1 refused; under mutex */
+    int64_t        request_started_us; /* conservative token lifetime anchor */
     GoChannel      *session_ch;       /* signaled on session accepted    */
     MdAccountWatch *owner_watch;      /* also guards direct-IP sessions  */
     MdAccountBinding *owner;          /* borrowed from startup until drain */
 
     /* Connection recovery UI state */
+    atomic_int     phase;
+    atomic_int     error;
+    atomic_bool    cancel_connect;
+    MdStream      *binding_stream;    /* borrowed under g_connect_mu */
+    GoChannel     *cancel_ch;          /* closed by UI, drained before unref */
+    bool           paused;            /* explicit disconnect, not process quit */
     int            reconnecting;      /* unexpected disconnect recovery  */
     uint32_t       reconnect_delay_ms; /* next retry delay for overlay     */
-    const char    *connection_status; /* transient user-facing detail     */
+    _Atomic(const char *) connection_status; /* transient user-facing detail     */
 } ClientCtx;
 
 /* ── Decode callback: display frame ──────────────────────────── */
@@ -127,7 +205,7 @@ static void on_decoded(const MdDecodedFrame *frame, void *userdata) {
 /* ── Nostr callbacks for --npub session negotiation ──────────── */
 
 static bool client_owner_current(const ClientCtx *ctx) {
-    return g_running && (!ctx->owner || md_account_binding_is_current(ctx->owner));
+    return g_running && !ctx->cancel_connect && (!ctx->owner || md_account_binding_is_current(ctx->owner));
 }
 
 static void client_owner_revoked(void *data) {
@@ -139,6 +217,7 @@ static void client_owner_revoked(void *data) {
 /* Guards pending_req/request_pending and the accepted_* fields between the
  * DM worker and the negotiating thread. */
 static pthread_mutex_t g_negotiation_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_connect_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_session_dm(const char *sender_pubkey_hex, const char *content,
                           const MdNostrDmInfo *info, void *userdata) {
@@ -332,6 +411,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         return -1;
     }
 
+    ctx->request_started_us = now_us();
     char *req_json = md_session_request_to_json(&req);
     if (!req_json) {
         fprintf(stderr, "ERROR: failed to serialize session request\n");
@@ -361,6 +441,8 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     void *dummy = NULL;
     GoSelectCase cases[] = {
         { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &dummy },
+        { .op = GO_SELECT_RECEIVE, .chan = g_shutdown_ch, .recv_buf = &dummy },
+        { .op = GO_SELECT_RECEIVE, .chan = ctx->cancel_ch, .recv_buf = &dummy },
     };
     int64_t deadline_us = now_us() + (int64_t)wait_ms * 1000;
     int accepted = 0;
@@ -371,7 +453,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         int64_t left_us = deadline_us - now_us();
         if (accepted || left_us <= 0 || !client_owner_current(ctx))
             break;
-        go_select_timeout(cases, 1, (uint64_t)(left_us + 999) / 1000);
+        go_select_timeout(cases, ctx->cancel_ch ? 3 : (g_shutdown_ch ? 2 : 1), (uint64_t)(left_us + 999) / 1000);
     }
     pthread_mutex_lock(&g_negotiation_mu);
     ctx->request_pending = 0; /* late answers to this request are ignored */
@@ -379,7 +461,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     pthread_mutex_unlock(&g_negotiation_mu);
 
     if (!client_owner_current(ctx)) {
-        fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
+        fprintf(stderr, "client: session negotiation cancelled\n");
         return -1;
     }
     if (accepted < 0) {
@@ -400,6 +482,9 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
     if (!stream || !ctx || !client_owner_current(ctx))
         return -1;
 
+    int64_t token_left_ms = (ctx->request_started_us +
+        (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000 - now_us()) / 1000;
+    if (token_left_ms <= 0) return -1;
     MdSessionAccept acc = { .tree_format = ctx->accepted_tree_format };
     strncpy(acc.session_id, ctx->accepted_session_id, sizeof(acc.session_id) - 1);
     acc.granted = ctx->granted_caps;
@@ -424,7 +509,11 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
     /* Do not declare this client active on a successful send alone. */
     MdPacketHeader hdr;
     uint8_t *payload = NULL;
-    ret = md_stream_recv(stream, &hdr, &payload, MD_SESSION_BIND_TIMEOUT_MS);
+    token_left_ms = (ctx->request_started_us +
+        (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000 - now_us()) / 1000;
+    if (token_left_ms <= 0 || !client_owner_current(ctx)) return -1;
+    ret = md_stream_recv(stream, &hdr, &payload,
+        token_left_ms < MD_SESSION_BIND_TIMEOUT_MS ? (uint32_t)token_left_ms : MD_SESSION_BIND_TIMEOUT_MS);
     if (ret != 0) return -1;
     bool valid = hdr.type == MD_PKT_SESSION_INFO && hdr.payload_len > 0 &&
         hdr.payload_len <= MD_SESSION_JSON_MAX &&
@@ -440,7 +529,88 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
             ack.tree_format == ctx->accepted_tree_format && !ack.stream_token[0];
     }
     free(payload);
-    return valid && client_owner_current(ctx) ? 0 : -1;
+    return valid && client_owner_current(ctx) && now_us() < ctx->request_started_us +
+        (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000 ? 0 : -1;
+}
+
+static void cancel_client_connect(ClientCtx *ctx) {
+    if (!atomic_exchange(&ctx->cancel_connect, true) && ctx->cancel_ch)
+        go_channel_close(ctx->cancel_ch);
+    /* Borrow only while holding the same lock the worker uses to withdraw
+     * the candidate. Shutdown wakes bind I/O; the worker alone destroys it. */
+    pthread_mutex_lock(&g_connect_mu);
+    if (ctx->binding_stream)
+        md_socket_shutdown(md_stream_get_fd(ctx->binding_stream), SHUT_RDWR);
+    pthread_mutex_unlock(&g_connect_mu);
+}
+
+static int bind_client_stream(MdStream *stream, ClientCtx *ctx) {
+    pthread_mutex_lock(&g_connect_mu);
+    ctx->binding_stream = stream;
+    pthread_mutex_unlock(&g_connect_mu);
+    int rc = send_session_info(stream, ctx);
+    pthread_mutex_lock(&g_connect_mu);
+    ctx->binding_stream = NULL;
+    pthread_mutex_unlock(&g_connect_mu);
+    return rc;
+}
+
+static int wait_client_backoff(ClientCtx *ctx, uint32_t delay_ms) {
+    void *value;
+    GoSelectCase cases[] = {
+        { .op = GO_SELECT_RECEIVE, .chan = ctx->session_ch, .recv_buf = &value },
+        { .op = GO_SELECT_RECEIVE, .chan = g_shutdown_ch, .recv_buf = &value },
+        { .op = GO_SELECT_RECEIVE, .chan = ctx->cancel_ch, .recv_buf = &value },
+    };
+    int64_t deadline = now_us() + (int64_t)delay_ms * 1000;
+    while (client_owner_current(ctx)) {
+        int64_t left = deadline - now_us();
+        if (left <= 0) return 0;
+        go_select_timeout(cases, ctx->cancel_ch ? 3 : (g_shutdown_ch ? 2 : 1), (left + 999) / 1000);
+    }
+    return -1;
+}
+
+/* No readiness-event command exists in the FIPS control protocol. Use actual
+ * dial outcomes and fresh control snapshots, with cancellable exponential
+ * retry backoff, never a sleep-based path gate or a new session request. */
+static MdStream *dial_fips_session(const char *npub, const char *control,
+                                   uint16_t port, uint32_t timeout_ms,
+                                   ClientCtx *ctx) {
+    int64_t deadline = ctx->request_started_us +
+        (int64_t)MD_SESSION_TOKEN_LIFETIME_MS * 1000;
+    uint32_t backoff = 100;
+    while (client_owner_current(ctx)) {
+        int64_t left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        uint32_t budget = (uint32_t)left_ms;
+        if (budget > 1000) budget = 1000;
+        if (timeout_ms && budget > timeout_ms) budget = timeout_ms;
+        MdFipsPeerReadiness ready;
+        MdFipsPeerReadinessState state = md_fips_control_check_peer_ready(
+            control, npub, budget, &ready);
+        if (!client_owner_current(ctx)) break;
+        left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        if (budget > (uint32_t)left_ms) budget = (uint32_t)left_ms;
+        if (state == MD_FIPS_PEER_READY) {
+            MdStream *stream = md_stream_connect_fips(npub, port, budget);
+            if (stream) {
+                if (now_us() < deadline && client_owner_current(ctx)) return stream;
+                md_stream_destroy(stream);
+                break;
+            }
+        } else if (state == MD_FIPS_PEER_ERROR &&
+                   ready.control_result != MD_FIPS_CONTROL_DAEMON_UNAVAILABLE) {
+            break; /* malformed/unsupported control state is not transient */
+        }
+        left_ms = (deadline - now_us()) / 1000;
+        if (left_ms <= 0) break;
+        uint32_t delay = backoff < (uint32_t)left_ms ? backoff : (uint32_t)left_ms;
+        if (wait_client_backoff(ctx, delay) != 0) break;
+        if (backoff < 2000) backoff = backoff * 2 > 2000 ? 2000 : backoff * 2;
+    }
+    return NULL;
 }
 
 static MdStream *connect_client_stream(const char *host, const char *npub,
@@ -458,16 +628,30 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         return NULL;
     }
 
+    ctx->error = MD_CLIENT_ERROR_NONE;
     if (!host) {
+        ctx->phase = MD_CLIENT_FIPS;
         printf("client: checking FIPS daemon health...\n");
-        if (check_fips_daemon(fips_control_socket, timeout_ms) != 0)
+        if (check_fips_daemon(fips_control_socket,
+                              timeout_ms && timeout_ms < 1000 ? timeout_ms : 1000) != 0)
             return NULL;
 
         printf("client: waiting for FIPS peer readiness for %.*s...\n", 12, npub);
-        MdFipsPeerReadiness ready;
-        MdFipsPeerReadinessState rstate = md_fips_control_wait_peer_ready(
-            fips_control_socket, npub, timeout_ms,
-            MD_FIPS_CONTROL_DEFAULT_PEER_POLL_MS, &ready);
+        MdFipsPeerReadiness ready = {0};
+        MdFipsPeerReadinessState rstate = MD_FIPS_PEER_CONVERGING;
+        int64_t deadline = now_us() + (int64_t)(timeout_ms ? timeout_ms : 5000) * 1000;
+        uint32_t backoff = 100;
+        while (client_owner_current(ctx)) {
+            int64_t left = (deadline - now_us()) / 1000;
+            if (left <= 0) break;
+            rstate = md_fips_control_check_peer_ready(fips_control_socket, npub,
+                (uint32_t)(left < 1000 ? left : 1000), &ready);
+            if (rstate == MD_FIPS_PEER_READY || rstate == MD_FIPS_PEER_ERROR) break;
+            left = (deadline - now_us()) / 1000;
+            if (left <= 0 || wait_client_backoff(ctx,
+                backoff < (uint32_t)left ? backoff : (uint32_t)left) != 0) break;
+            if (backoff < 2000) backoff = backoff * 2 > 2000 ? 2000 : backoff * 2;
+        }
         if (rstate != MD_FIPS_PEER_READY) {
             if (rstate == MD_FIPS_PEER_NOT_FOUND)
                 print_fips_setup_guidance("client", npub, &ready);
@@ -481,23 +665,27 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     }
 
     /* Endpoint selection never bypasses identity-pinned Nostr admission. */
+    ctx->phase = MD_CLIENT_NEGOTIATING;
     MdSessionRequest req;
     if (negotiate_session(nostr, ctx, host_pubkey_hex,
                           timeout_ms, &req) != 0 || !client_owner_current(ctx))
         return NULL;
 
+    ctx->phase = MD_CLIENT_CONNECTING;
     if (host) {
         printf("client: connecting to %s:%u...\n", host, port);
-        stream = md_stream_connect(host, port, timeout_ms);
+        stream = md_stream_connect(host, port,
+                                   timeout_ms && timeout_ms < 1000 ? timeout_ms : 1000);
     } else {
         printf("client: connecting via FIPS to %.*s...\n", 12, npub);
-        stream = md_stream_connect_fips(npub, port, timeout_ms);
+        stream = dial_fips_session(npub, fips_control_socket, port, timeout_ms, ctx);
     }
     if (!stream) {
         fprintf(stderr, "ERROR: %s connect failed\n", host ? "direct TCP" : "FIPS");
         return NULL;
     }
-    if (!client_owner_current(ctx) || send_session_info(stream, ctx) != 0 ||
+    ctx->phase = MD_CLIENT_BINDING;
+    if (!client_owner_current(ctx) || bind_client_stream(stream, ctx) != 0 ||
         !client_owner_current(ctx)) {
         fprintf(stderr, "ERROR: session binding/ACK failed\n");
         md_stream_destroy(stream);
@@ -514,6 +702,8 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         md_stream_destroy(stream);
         return NULL;
     }
+    ctx->phase = MD_CLIENT_STREAMING;
+    ctx->error = MD_CLIENT_ERROR_NONE;
     return stream;
 }
 
@@ -549,7 +739,7 @@ static const char *sdl_key_name(SDL_Keycode k) {
  * decoded, so queued input is mapped while its frame is still shown. */
 static void send_input(ClientCtx *ctx, uint8_t kind, uint8_t button,
                        int16_t x, int16_t y, const char *text, uint16_t tlen) {
-    if (!ctx->stream) return;
+    if (!ctx->stream || !(ctx->granted_caps & MD_CAP_INPUT)) return;
     uint8_t buf[MD_INPUT_EVENT_MAX_LEN];
     const FrameTag *t = &ctx->shown;
     const bool fits = t->w <= UINT16_MAX && t->h <= UINT16_MAX;
@@ -613,6 +803,7 @@ static void forward_input_event(ClientCtx *ctx, const SDL_Event *ev) {
     case SDL_KEYDOWN: {
         if (md_overlay_wants_keyboard(ctx->overlay)) return;
         SDL_Keycode k = ev->key.keysym.sym;
+        if (k == SDLK_F1 || k == SDLK_ESCAPE) return;
         char namebuf[2] = {0, 0};
         const char *name = NULL;
         if (k >= SDLK_a && k <= SDLK_z) { namebuf[0] = (char)k; name = namebuf; }
@@ -638,8 +829,8 @@ static void forward_input_event(ClientCtx *ctx, const SDL_Event *ev) {
 /* Feed every SDL event to the overlay, then forward un-consumed input. */
 static void overlay_event_forward(void *event, void *userdata) {
     ClientCtx *ctx = (ClientCtx *)userdata;
-    md_overlay_handle_sdl_event(ctx->overlay, event);
-    forward_input_event(ctx, (const SDL_Event *)event);
+    if (!md_overlay_handle_sdl_event(ctx->overlay, event))
+        forward_input_event(ctx, (const SDL_Event *)event);
 }
 
 static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
@@ -665,6 +856,10 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
         .encode_ms    = 0.0f,
         .decode_ms    = (float)avg_decode_ms,
         .rtt_ms       = (float)stream_stats.avg_rtt_ms,
+        .phase = ctx->phase,
+        .error = ctx->error,
+        .granted_caps = ctx->granted_caps,
+        .paused = ctx->paused,
         .connected    = stream && md_stream_is_connected(stream),
         .reconnecting = ctx->reconnecting != 0,
         .reconnect_delay_ms = ctx->reconnect_delay_ms,
@@ -684,34 +879,106 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
     ctx->shown = ctx->uploaded;
 }
 
-static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
-                                   bool *deliberate_exit) {
-    uint32_t start = md_stream_now_ms();
+static void reset_client_video(ClientCtx *ctx) {
+    ctx->stream = NULL;
+    ctx->uploaded = ctx->shown = (FrameTag){0};
+    ctx->frame_w = ctx->frame_h = ctx->input_seq = 0;
+    ctx->rates = (MdClientRates){0};
+    free(ctx->ui_tree_json);
+    ctx->ui_tree_json = NULL;
+    ctx->ui_tree_len = 0;
+    md_renderer_reset_frame(ctx->renderer);
+}
 
-    while (g_running) {
-        uint32_t now = md_stream_now_ms();
-        uint32_t elapsed = now - start;
-        if (elapsed >= delay_ms)
-            return 0;
+static void pump_client_ui(ClientCtx *ctx, MdStream *stream) {
+    if (ctx->renderer && md_renderer_poll_events(ctx->renderer) < 0) g_running = 0;
+    render_client_overlay(ctx, stream);
+    MdOverlayAction action = md_overlay_take_action(ctx->overlay);
+    if (action == MD_OVERLAY_QUIT) g_running = 0;
+    if (action == MD_OVERLAY_DISCONNECT || !g_running) {
+        ctx->paused = true;
+        ctx->error = MD_CLIENT_ERROR_NONE;
+        ctx->connection_status = "Disconnected by you";
+        cancel_client_connect(ctx);
+        ctx->stream = NULL; /* no input after explicit disconnect */
+    } else if (action == MD_OVERLAY_RETRY) {
+        ctx->paused = false;
+    }
+}
 
-        if (ctx) {
-            ctx->reconnect_delay_ms = delay_ms - elapsed;
-            if (ctx->renderer && md_renderer_poll_events(ctx->renderer) < 0) {
-                if (deliberate_exit)
-                    *deliberate_exit = true;
-                g_running = 0;
-                return -1;
-            }
-            render_client_overlay(ctx, NULL);
-        }
+typedef struct {
+    const char *host, *npub, *control, *pubkey;
+    uint16_t port;
+    uint32_t timeout;
+    MdNostr *nostr;
+    ClientCtx *ctx;
+    MdSession *session;
+    MdStream *result;
+    GoChannel *done;
+} ClientConnect;
 
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
-        while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
-            if (!g_running)
-                return -1;
+static void *connect_worker(void *data) {
+    ClientConnect *job = data;
+    job->result = connect_client_stream(job->host, job->npub, job->control,
+        job->port, job->timeout, job->nostr, job->pubkey, job->ctx, job->session);
+    if (!job->result && client_owner_current(job->ctx)) {
+        switch (job->ctx->phase) {
+        case MD_CLIENT_FIPS: job->ctx->error = MD_CLIENT_ERROR_FIPS; break;
+        case MD_CLIENT_NEGOTIATING: job->ctx->error = MD_CLIENT_ERROR_ADMISSION; break;
+        case MD_CLIENT_BINDING: job->ctx->error = MD_CLIENT_ERROR_BINDING; break;
+        default: job->ctx->error = MD_CLIENT_ERROR_TRANSPORT; break;
         }
     }
+    go_channel_close(job->done);
+    return NULL;
+}
 
+static MdStream *connect_with_ui(const char *host, const char *npub,
+                                 const char *control, uint16_t port, uint32_t timeout,
+                                 MdNostr *nostr, const char *pubkey,
+                                 ClientCtx *ctx, MdSession *session) {
+    ctx->cancel_connect = false;
+    ctx->reconnect_delay_ms = 0;
+    ctx->cancel_ch = go_channel_create(1);
+    ClientConnect job = {host, npub, control, pubkey, port, timeout,
+                         nostr, ctx, session, NULL, go_channel_create(1)};
+    pthread_t thread;
+    if (!ctx->cancel_ch || !job.done ||
+        pthread_create(&thread, NULL, connect_worker, &job) != 0) {
+        if (job.done) go_channel_unref(job.done);
+        if (ctx->cancel_ch) go_channel_unref(ctx->cancel_ch);
+        ctx->cancel_ch = NULL;
+        return NULL;
+    }
+    void *value;
+    GoSelectCase done = {.op = GO_SELECT_RECEIVE, .chan = job.done, .recv_buf = &value};
+    /* 16ms is the overlay animation cadence, not a relay completion timer.
+     * Cancellation closes a channel; all worker ownership drains via join. */
+    while (go_select_timeout(&done, 1, 16).selected_case < 0) pump_client_ui(ctx, NULL);
+    pthread_join(thread, NULL);
+    go_channel_unref(job.done);
+    go_channel_unref(ctx->cancel_ch);
+    ctx->cancel_ch = NULL;
+    if (ctx->cancel_connect || !g_running) {
+        md_stream_destroy(job.result);
+        job.result = NULL;
+    }
+    return job.result;
+}
+
+static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
+                                   bool *deliberate_exit) {
+    int64_t deadline = now_us() + (int64_t)delay_ms * 1000;
+    ctx->phase = MD_CLIENT_BACKOFF;
+    while (g_running && !ctx->paused) {
+        int64_t left = (deadline - now_us()) / 1000;
+        if (left <= 0) return 0;
+        ctx->reconnect_delay_ms = (uint32_t)left;
+        pump_client_ui(ctx, NULL);
+        if (!g_running || ctx->paused) break;
+        wait_client_backoff(ctx, (uint32_t)(left < 16 ? left : 16));
+    }
+    *deliberate_exit = !g_running;
     return -1;
 }
 
@@ -726,8 +993,8 @@ int main(int argc, char **argv) {
 #else
     setvbuf(stdout, NULL, _IOLBF, 0);
 #endif
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    if (start_signal_wake() != 0) return 1;
+    atexit(stop_signal_wake);
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);  /* host going away mid-send is EPIPE, not fatal */
 #else
@@ -941,23 +1208,6 @@ int main(int argc, char **argv) {
 
     }
 
-    if (!g_running) {
-        cleanup_session_nostr(&nostr, &ctx);
-        md_signer_destroy(signer);
-        md_account_startup_clear(&account);
-        return 1;
-    }
-    stream = connect_client_stream(host, npub, fips_control_socket,
-                                   port, timeout_ms, nostr,
-                                   host_pubkey_hex, &ctx, &session);
-    if (!stream) {
-        cleanup_session_nostr(&nostr, &ctx);
-        md_signer_destroy(signer);
-        md_account_startup_clear(&account);
-        return 1;
-    }
-    printf("client: connected\n");
-
     /* Create decoder */
     MdDecoder *decoder = md_decoder_create();
     if (!decoder) {
@@ -998,6 +1248,23 @@ int main(int argc, char **argv) {
         }
     }
 
+    stream = connect_with_ui(host, npub, fips_control_socket,
+                                   port, timeout_ms, nostr,
+                                   host_pubkey_hex, &ctx, &session);
+    if (!stream && !ctx.renderer) {
+        md_decoder_destroy(decoder);
+        cleanup_session_nostr(&nostr, &ctx);
+        md_signer_destroy(signer);
+        md_account_startup_clear(&account);
+        if (!g_running) {
+            printf("client: done. decoded 0 frames, displayed 0, tree updates 0\n");
+            return 0;
+        }
+        return 1;
+    }
+    ctx.paused = !stream;
+    if (stream) printf("client: connected\n");
+
     /* ── Main loop ───────────────────────────────────────────── */
     printf("client: receiving stream... (Ctrl+C to stop)\n\n");
 
@@ -1009,6 +1276,19 @@ int main(int argc, char **argv) {
     bool deliberate_exit = false;
 
     while (g_running) {
+        if (ctx.paused) {
+            if (stream) { md_stream_destroy(stream); stream = NULL; }
+            reset_client_video(&ctx);
+            md_session_reset(&session);
+            ctx.phase = MD_CLIENT_IDLE;
+            ctx.reconnecting = 0;
+            ctx.reconnect_delay_ms = 0;
+            pump_client_ui(&ctx, NULL);
+            /* UI cadence only: input is drained while disconnected. */
+            SDL_Delay(16);
+            if (!ctx.paused) ctx.cancel_connect = false;
+            continue;
+        }
         if (!stream || !md_stream_is_connected(stream)) {
             if (stream) {
                 ctx.stream = NULL;
@@ -1016,6 +1296,10 @@ int main(int argc, char **argv) {
                 stream = NULL;
             }
             md_session_reset(&session);
+            reset_client_video(&ctx);
+            md_decoder_destroy(decoder);
+            decoder = md_decoder_create();
+            if (!decoder) break;
 
             ctx.reconnecting = 1;
             if (ctx.session_accepted >= 0)
@@ -1028,10 +1312,11 @@ int main(int argc, char **argv) {
             if (sleep_with_reconnect_ui(&ctx, reconnect_delay_ms,
                                         &deliberate_exit) != 0 ||
                 deliberate_exit || !g_running) {
+                if (ctx.paused && g_running) continue;
                 break;
             }
 
-            stream = connect_client_stream(host, npub, fips_control_socket,
+            stream = connect_with_ui(host, npub, fips_control_socket,
                                            port, timeout_ms, nostr,
                                            host_pubkey_hex, &ctx, &session);
             if (stream) {
@@ -1055,15 +1340,8 @@ int main(int argc, char **argv) {
         /* Keep the input-forwarding path pointed at the live stream. */
         ctx.stream = stream;
 
-        /* Check SDL events (window close, Escape, etc.) */
-        if (ctx.renderer) {
-            if (md_renderer_poll_events(ctx.renderer) < 0) {
-                printf("client: window closed\n");
-                deliberate_exit = true;
-                g_running = 0;
-                break;
-            }
-        }
+        pump_client_ui(&ctx, stream);
+        if (!g_running || ctx.paused) continue;
 
         /* Receive next packet */
         MdPacketHeader hdr;

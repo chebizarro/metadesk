@@ -243,8 +243,8 @@ md_fc_inspect_sessions(const cJSON *data, const char *peer_npub,
                             ? state->valuestring : "unknown";
         if (strcmp(state_s, "established") == 0) {
             snprintf(detail, detail_len,
-                     "peer present in show_sessions with state=established");
-            return MD_FIPS_PEER_READY;
+                     "established session has no usable peer link; route unverified");
+            return MD_FIPS_PEER_CONVERGING;
         }
 
         snprintf(detail, detail_len,
@@ -257,6 +257,34 @@ md_fc_inspect_sessions(const cJSON *data, const char *peer_npub,
         snprintf(detail, detail_len,
                  "peer not present in show_peers or show_sessions");
     return prior_state;
+}
+
+/* The current control protocol is one request/one response; it exposes no
+ * route/readiness subscription. Callers schedule cancellable retry backoff. */
+MdFipsPeerReadinessState
+md_fips_control_check_peer_ready(const char *socket_override,
+                                 const char *peer_npub, uint32_t timeout_ms,
+                                 MdFipsPeerReadiness *out)
+{
+    if (!out || !peer_npub || !peer_npub[0]) {
+        md_fc_readiness_set(out, MD_FIPS_PEER_ERROR,
+                            MD_FIPS_CONTROL_INVALID_ARGUMENT, NULL, "missing peer npub");
+        return MD_FIPS_PEER_ERROR;
+    }
+    MdFipsControlResponse resp = {0};
+    MdFipsControlResult r = md_fips_control_request(socket_override, "show_peers",
+                                                   NULL, timeout_ms, &resp);
+    char detail[256];
+    MdFipsPeerReadinessState state = MD_FIPS_PEER_ERROR;
+    if (r == MD_FIPS_CONTROL_OK) {
+        state = md_fc_inspect_peers(resp.data, peer_npub, detail, sizeof(detail));
+        if (state == MD_FIPS_PEER_ERROR) r = MD_FIPS_CONTROL_INVALID_RESPONSE;
+    } else {
+        snprintf(detail, sizeof(detail), "show_peers: %s", md_fips_control_result_string(r));
+    }
+    md_fc_readiness_set(out, state, r, resp.socket_path, "%s", detail);
+    md_fips_control_response_free(&resp);
+    return state;
 }
 
 static void md_fc_sleep_ms(uint32_t ms)

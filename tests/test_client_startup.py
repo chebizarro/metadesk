@@ -13,8 +13,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 sys.dont_write_bytecode = True
 from test_access_cli import HOST_NPUB
+from account_startup_fixture import Relay, Peer
 
 
 def env_for(home):
@@ -24,6 +27,41 @@ def env_for(home):
     env.update(HOME=home, XDG_CONFIG_HOME=os.path.join(home, ".config"),
                DBUS_SESSION_BUS_ADDRESS="unix:path=" + os.path.join(home, "no-bus"))
     return env
+
+
+class PendingSessionPeer(Peer):
+    def dispatch(self, msg):
+        super().dispatch(msg)
+        if msg[0] == "EVENT" and msg[1]["kind"] == 1059:
+            self.server.request_published.set()
+
+
+def pending_shutdown(client, env):
+    relay = Relay()
+    relay.RequestHandlerClass = PendingSessionPeer
+    relay.request_published = threading.Event()
+    thread = threading.Thread(target=relay.serve_forever, daemon=True)
+    thread.start()
+    process = subprocess.Popen([client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
+                                "--relay", f"ws://127.0.0.1:{relay.server_address[1]}",
+                                "--timeout", "180000", "--no-display"],
+                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert relay.request_published.wait(20), "pending request never published"
+        start = time.monotonic()
+        process.terminate()
+        out, err = process.communicate(timeout=5)
+        assert process.returncode == 0, (process.returncode, out, err)
+        assert "client: done. decoded 0 frames" in out, (out, err)
+        assert time.monotonic() - start < 5
+        print("PASS: SIGTERM during pending session exits 0 with decode summary in <5s")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        relay.shutdown()
+        relay.server_close()
+        thread.join()
 
 
 def main():
@@ -70,6 +108,7 @@ def main():
             except BlockingIOError:
                 pass
         print("PASS: named and positional direct endpoints require host identity before TCP")
+        pending_shutdown(client, env)
 
 
 if __name__ == "__main__":
