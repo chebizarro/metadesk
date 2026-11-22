@@ -92,8 +92,8 @@ static struct timespec monotonic_timespec(uint64_t at_ns) {
                               .tv_nsec = (long)(at_ns % 1000000000ULL) };
 }
 
-/* A started stream that never reaches PAUSED/STREAMING is broken. */
-#define PW_CONNECT_DEADLINE_NS 5000000000ULL
+/* A started stream must deliver a valid initial frame, not merely link. */
+#define PW_FIRST_FRAME_DEADLINE_NS 5000000000ULL
 
 static int portal_remaining_ms(PortalScreencast *p, int limit) {
     uint64_t now = md_monotonic_ns();
@@ -659,7 +659,7 @@ typedef struct {
     pthread_cond_t          frame_cond;
     MdFrame                 pending_frame;
     bool                    frame_ready;
-    bool                    connected;
+    bool                    received_frame;
     bool                    broken;
     bool                    stopping;
     uint64_t                started_ns;
@@ -886,7 +886,7 @@ static void on_process(void *userdata) {
     }
 
     pw->broken = false;
-    pw->connected = true;
+    pw->received_frame = true;
     pw->pending_frame = frame;
     pw->held_pw_buf   = pw_buf;
     pw->frame_ready   = true;
@@ -909,8 +909,6 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
 
     pthread_mutex_lock(&pw->frame_lock);
     ctx->active = state == PW_STREAM_STATE_STREAMING;
-    if (state == PW_STREAM_STATE_STREAMING || state == PW_STREAM_STATE_PAUSED)
-        pw->connected = true;
     pw->broken = state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
@@ -923,7 +921,7 @@ static void on_core_error(void *userdata, uint32_t id, int seq, int res, const c
     MD_LOG_I("PipeWire core error: %d", res);
     pthread_mutex_lock(&pw->frame_lock);
     pw->broken = true;
-    pw->connected = false;
+    pw->received_frame = false;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
     pw_main_loop_quit(pw->loop);
@@ -950,7 +948,7 @@ static void *pw_thread_func(void *arg) {
     pw_main_loop_run(pw->loop);
     pthread_mutex_lock(&pw->frame_lock);
     pw->broken = true;
-    pw->connected = false;
+    pw->received_frame = false;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
     return NULL;
@@ -1013,7 +1011,7 @@ static void pw_cleanup_start_resources(PipewireState *pw) {
     memset(&pw->pending_frame, 0, sizeof(pw->pending_frame));
     pw->ctx->width = pw->ctx->height = 0;
     pw->src_width = pw->src_height = 0;
-    pw->connected = false;
+    pw->received_frame = false;
     pw->broken = true;
     pthread_mutex_unlock(&pw->frame_lock);
     if (pw->stream) {
@@ -1040,8 +1038,7 @@ static int pw_start(MdCaptureCtx *ctx) {
     if (pw->thread_started || pw->stream) return -1;
     pw->generation++;
     if (pw->trace_buffers) MD_LOG_I("capture start gen=%u", pw->generation);
-    pw->started_ns = md_monotonic_ns();
-    pw->connected = false;
+    pw->received_frame = false;
     pw->broken = false;
     pw->stopping = false;
     uint32_t stream_node_id = PW_ID_ANY;
@@ -1119,6 +1116,9 @@ static int pw_start(MdCaptureCtx *ctx) {
         return -1;
     }
 
+    /* Consent can take arbitrarily long. Start the first-frame deadline only
+     * once the authorized stream is ready to run, not before the portal UI. */
+    pw->started_ns = md_monotonic_ns();
     /* Start PipeWire loop on its own thread */
     if (pthread_create(&pw->thread, NULL, pw_thread_func, pw) != 0) {
         pw_cleanup_start_resources(pw);
@@ -1177,22 +1177,22 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     uint64_t until = md_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     pthread_mutex_lock(&pw->frame_lock);
 
-    /* Damage-driven capture can legitimately remain idle indefinitely.
-     * A connected paused/streaming stream is not broken merely for silence;
-     * an unconnected one is, once the connect deadline passes, so that
-     * deadline also bounds the wait. */
+    /* PAUSED/STREAMING alone does not prove a usable link: restored portal
+     * nodes can enter those states without delivering any buffers. Require a
+     * valid first frame within the startup deadline. After that, damage-driven
+     * capture can legitimately remain idle indefinitely. */
     while (!pw->frame_ready && !pw->broken && !pw->stopping) {
         uint64_t limit = until;
-        if (!pw->connected && pw->started_ns + PW_CONNECT_DEADLINE_NS < limit)
-            limit = pw->started_ns + PW_CONNECT_DEADLINE_NS;
+        if (!pw->received_frame && pw->started_ns + PW_FIRST_FRAME_DEADLINE_NS < limit)
+            limit = pw->started_ns + PW_FIRST_FRAME_DEADLINE_NS;
         if (md_monotonic_ns() >= limit) break;
         struct timespec ts = monotonic_timespec(limit);
         pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &ts);
     }
 
     if (pw->stopping || !pw->frame_ready) {
-        bool broken = pw->stopping || pw->broken || (!pw->connected &&
-            md_monotonic_ns() - pw->started_ns >= PW_CONNECT_DEADLINE_NS);
+        bool broken = pw->stopping || pw->broken || (!pw->received_frame &&
+            md_monotonic_ns() - pw->started_ns >= PW_FIRST_FRAME_DEADLINE_NS);
         pthread_mutex_unlock(&pw->frame_lock);
         return broken ? MD_CAPTURE_ERROR : MD_CAPTURE_IDLE;
     }
