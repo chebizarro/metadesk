@@ -45,7 +45,7 @@ binding and authoritative TCP ACK into that stream. Video requires VIDEO; tree
 requires AGENT; actions require AGENT + INPUT; raw input requires INPUT.
 
 `access add NPUB [CAPS]` accepts `none` or any nonempty subset in canonical
-`video,agent,input` order, comma-separated without whitespace. For example:
+`video,agent,input,monitor,clipboard` order, comma-separated without whitespace. For example:
 
 ```sh
 metadesk-host access add "$CLIENT_NPUB" video
@@ -338,3 +338,54 @@ described above. See [host management](host-management.md) for startup, CLI,
 request expiry/cancellation, kick completion, protocol version 1 for md-a9f2,
 platform support, and validation boundaries. Windows attended management fails
 unsupported pending md-wmo6; there is no insecure fallback.
+
+## Session parity grants: monitors and clipboard
+
+The complete canonical vocabulary is now `video,agent,input,monitor,clipboard`
+(in that order; any subset, or `none`). Old grants still mean exactly their old
+capabilities. Default new grants remain **video only**, never clipboard/monitor.
+The same exact vocabulary is used by private NIP-44 `metadesk-caps` entries,
+`access add`, migration and attended `requests approve [--remember]`. Approval
+cannot add capabilities outside the client's request or the host's supported
+mask. W16 Access consumers should render the capability strings from IPC rather
+than assuming three bits. No public grant tags or new authorization bypass exist.
+
+Examples (replace an existing grant only after review):
+
+```sh
+metadesk-host access add "$CLIENT_NPUB" video,input,monitor
+metadesk-host access add "$CLIENT_NPUB" video,clipboard
+metadesk-client --host ADDRESS --npub "$HOST_NPUB" --monitor-control
+metadesk-client --host ADDRESS --npub "$HOST_NPUB" --clipboard both
+```
+
+Clipboard is opt-in at the client (`--clipboard send|receive|both`, default off)
+and requires an explicit host grant. The host can further restrict local
+clipboard directions with `--clipboard off|send|receive|both`. Send/receive are
+local to the endpoint; signaling confirms their intersection from the **client's**
+perspective. A grant without negotiated directions grants no clipboard access.
+Neither endpoint opens/reads the clipboard before the bound stream grants it.
+Receive-only endpoints do not read clipboard contents or query change metadata.
+Kicking/disconnecting the session destroys clipboard state and stops sync.
+
+Only valid UTF-8 plain text, including empty text, is sent: at most **64 KiB**,
+no NUL, over the TLS-pinned bound stream, not in relay events/DM contents.
+Oversized packets are rejected before payload allocation. Incoming writes require
+both the clipboard grant and the receive direction. Native revision checks run at
+the existing stream/UI cadence; only a changed text value is sent, and echoed or
+replayed content is idempotent. Logs contain byte counts, never clipboard text.
+This permission exposes whatever text the local user copies during the session;
+do not grant it to a peer that should not receive passwords or other copied data.
+
+macOS uses NSPasteboard; Windows uses CF_UNICODETEXT with strict UTF-8 conversion
+and bounded native allocation. A busy/unavailable Windows clipboard reports an
+error rather than claiming delivery. Linux Wayland/X11 clipboard is **not
+implemented in this build**: client opt-in fails explicitly and the host removes
+clipboard from supported/granted capabilities. There is no shell-command,
+`wl-paste`, XWayland or portal-consent fallback. Linux screen capture still works;
+monitor changes require a new local portal selection, not a remote consent bypass.
+
+Quality uses `--max-size WxH --bitrate BPS --fps FPS`, clamped by host policy.
+F1 exposes session quality and granted monitor switching. `--save-quality` stores
+per-host preferences in a self-encrypted NIP-78 document; it stores no grants.
+See [W15 design and verification](reviews/w15-session-features.md) for boundaries.

@@ -133,9 +133,12 @@ typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
     MdClientRates rates;
+    MdClipboard *clipboard;
+    uint8_t clipboard_requested, clipboard_directions;
     bool monitor_control;
     char requested_output[32];
     MdCaptureOutputs outputs;
+    char control_error[256]; /* main/UI thread; never aliases packet storage */
     MdQuality requested_quality, effective_quality;
     bool quality_supported;
     uint32_t      frames_decoded;
@@ -279,6 +282,9 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         ctx->session_accepted = -1; ctx->request_pending = 0;
         ctx->connection_status = "host does not support requested quality; upgrade host";
     } else if (matched) {
+        ctx->clipboard_directions=acc.clipboard_directions;
+        if (ctx->clipboard_requested && !(acc.granted&MD_CAP_CLIPBOARD))
+            fprintf(stderr,"client: clipboard not granted; no clipboard reads or writes\n");
         ctx->outputs=acc.outputs;
         for (size_t i=0;i<acc.outputs.count;i++)
             fprintf(stderr,"client: output %s %s%s\n",acc.outputs.items[i].id,acc.outputs.items[i].name,
@@ -326,6 +332,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
+    fprintf(stderr, "  --clipboard MODE  Opt in to granted text sync: send|receive|both (default off)\n");
     fprintf(stderr, "  --monitor-control Request monitor switching capability (off by default)\n");
     fprintf(stderr, "  --output id:N     Select host output at connect (requires monitor grant)\n");
     fprintf(stderr, "  --save-quality    Save requested quality per host (self-encrypted NIP-78)\n");
@@ -423,8 +430,9 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         return -1;
 
     MdSessionRequest req = {
-        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | (ctx->monitor_control ? MD_CAP_MONITOR : 0),
+        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | (ctx->monitor_control ? MD_CAP_MONITOR : 0) | (ctx->clipboard_requested ? MD_CAP_CLIPBOARD : 0),
         .tree_format = MD_TREE_FORMAT_COMPACT,
+        .clipboard_directions=ctx->clipboard_requested,
         .quality = ctx->requested_quality, .quality_present = true,
     };
     strcpy(req.output,ctx->requested_output);
@@ -502,6 +510,8 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     }
     if (!accepted) {
         fprintf(stderr, "ERROR: timed out waiting for session accept\n");
+        if (ctx->monitor_control || ctx->clipboard_requested)
+            fprintf(stderr,"  Requested monitor/clipboard capabilities require an updated host and explicit grants.\n");
         return -1;
     }
 
@@ -558,7 +568,10 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
         valid = md_session_accept_from_json(json, &ack) == 0 &&
             strcmp(ack.session_id, ctx->accepted_session_id) == 0 &&
             ack.granted == ctx->granted_caps &&
-            ack.tree_format == ctx->accepted_tree_format && !ack.stream_token[0];
+            ack.tree_format == ctx->accepted_tree_format &&
+            ack.clipboard_directions==ctx->clipboard_directions &&
+            ack.quality_present==ctx->quality_supported &&
+            (!ack.quality_present || !memcmp(&ack.quality,&ctx->effective_quality,sizeof(ack.quality))) && !ack.stream_token[0];
     }
     free(payload);
     return valid && client_owner_current(ctx) && now_us() < ctx->request_started_us +
@@ -912,7 +925,7 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
         .connected    = stream && md_stream_is_connected(stream),
         .reconnecting = ctx->reconnecting != 0,
         .reconnect_delay_ms = ctx->reconnect_delay_ms,
-        .status_message = ctx->connection_status,
+        .status_message = stream && ctx->control_error[0] ? ctx->control_error : ctx->connection_status,
         .fps          = (int)rates.fps,
         .bitrate_mbps = (float)rates.mbps,
         .encoder_name = NULL,
@@ -950,6 +963,8 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
 }
 
 static void reset_client_video(ClientCtx *ctx) {
+    ctx->control_error[0]=0;
+    md_clipboard_destroy(ctx->clipboard); ctx->clipboard=NULL;
     ctx->stream = NULL;
     ctx->uploaded = ctx->shown = (FrameTag){0};
     ctx->frame_w = ctx->frame_h = ctx->input_seq = 0;
@@ -1083,6 +1098,7 @@ static int client_run(int argc, char **argv) {
     uint16_t port = MD_STREAM_PORT;
     bool quality_cli = false, save_quality = false;
     bool do_display = true;
+    uint8_t clipboard_requested=0;
     bool monitor_control=false;
     char requested_output[32]={0};
     MdQuality requested_quality = {0};
@@ -1121,6 +1137,12 @@ static int client_run(int argc, char **argv) {
                 fprintf(stderr,"ERROR: --output requires a stable id:N selector (Windows also all)\n"); return 1;
             }
             strcpy(requested_output,id); monitor_control=true;
+        }
+        else if (!strcmp(argv[i],"--clipboard") && i+1<argc) {
+            int d=md_clipboard_directions_parse(argv[++i]);
+            if (d<0) { fprintf(stderr,"ERROR: --clipboard requires off|send|receive|both\n"); return 1; }
+            if (d && !md_clipboard_backend()) { fprintf(stderr,"ERROR: %s\n",md_clipboard_unavailable_reason()); return 1; }
+            clipboard_requested=(uint8_t)d;
         }
         else if (!strcmp(argv[i],"--monitor-control")) monitor_control=true;
         else if (strcmp(argv[i], "--save-quality") == 0) save_quality = true;
@@ -1231,6 +1253,7 @@ static int client_run(int argc, char **argv) {
 
     /* Client context (needed before connect for nostr callbacks) */
     ClientCtx ctx = { .owner = account.binding, .requested_quality = requested_quality };
+    ctx.clipboard_requested=clipboard_requested;
     ctx.monitor_control=monitor_control;
     strcpy(ctx.requested_output,requested_output);
     if (account.binding) {
@@ -1454,6 +1477,17 @@ static int client_run(int argc, char **argv) {
 
         /* Keep the input-forwarding path pointed at the live stream. */
         ctx.stream = stream;
+        if (!ctx.clipboard && (ctx.granted_caps&MD_CAP_CLIPBOARD)) {
+            ctx.clipboard=md_clipboard_create(ctx.granted_caps,ctx.clipboard_directions);
+            if (!ctx.clipboard) { fprintf(stderr,"client: %s\n",md_clipboard_unavailable_reason()); md_stream_close(stream); }
+        }
+        char *clipboard_text=NULL; size_t clipboard_size=0;
+        int clipboard_result=md_clipboard_poll(ctx.clipboard,&clipboard_text,&clipboard_size);
+        if (clipboard_result==1) {
+            if (md_stream_send(stream,MD_PKT_CLIPBOARD,ctx.input_seq++,(uint8_t*)clipboard_text,(uint32_t)clipboard_size)) md_stream_close(stream);
+            else fprintf(stderr,"client: clipboard sent (%zu bytes)\n",clipboard_size);
+            free(clipboard_text);
+        } else if (clipboard_result<0) fprintf(stderr,"client: clipboard read rejected (size, UTF-8 or platform unavailable)\n");
 
         pump_client_ui(&ctx, stream);
         if (!g_running || ctx.paused) continue;
@@ -1575,18 +1609,24 @@ static int client_run(int argc, char **argv) {
             }
             break;
 
+        case MD_PKT_CLIPBOARD:
+            if (!(ctx.granted_caps&MD_CAP_CLIPBOARD) || md_clipboard_receive(ctx.clipboard,payload,hdr.payload_len)) {
+                fprintf(stderr,"client: clipboard update rejected (grant, direction, size, UTF-8 or platform error)\n"); md_stream_close(stream);
+            } else fprintf(stderr,"client: clipboard received (%u bytes)\n",hdr.payload_len);
+            break;
         case MD_PKT_SESSION_STATE: {
             if (hdr.payload_len > MD_SESSION_JSON_MAX || !hdr.payload_len ||
                 memchr(payload, 0, hdr.payload_len)) { md_stream_close(stream); break; }
             char json[MD_SESSION_JSON_MAX + 1];
             memcpy(json, payload, hdr.payload_len); json[hdr.payload_len] = 0;
-            cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+            cJSON *root = md_session_json_strings_safe(json) ? cJSON_ParseWithOpts(json, NULL, true) : NULL;
             cJSON *type=cJSON_GetObjectItemCaseSensitive(root,"type");
             if (cJSON_IsString(type) && !strcmp(type->valuestring,"outputs")) {
                 bool present;
                 if (md_session_outputs_read(root,&ctx.outputs,&present) || !present) md_stream_close(stream);
                 else {
                     cJSON *error=cJSON_GetObjectItemCaseSensitive(root,"error");
+                    snprintf(ctx.control_error,sizeof(ctx.control_error),"%s",cJSON_IsString(error) ? error->valuestring : "");
                     fprintf(stderr,"client: output selected %s%s%s\n",ctx.outputs.selected,
                         cJSON_IsString(error) ? ": " : "",cJSON_IsString(error) ? error->valuestring : "");
                     if (!cJSON_IsString(error)) strcpy(ctx.requested_output,ctx.outputs.selected);
@@ -1594,8 +1634,12 @@ static int client_run(int argc, char **argv) {
                 cJSON_Delete(root); break;
             }
             bool present; MdQuality applied;
-            if (!root || md_quality_read(root, &applied, &present) || !present) md_stream_close(stream);
+            if (!cJSON_IsString(type) || strcmp(type->valuestring,"quality") ||
+                md_quality_read(root, &applied, &present) || !present) md_stream_close(stream);
             else {
+                cJSON *error=cJSON_GetObjectItemCaseSensitive(root,"error");
+                snprintf(ctx.control_error,sizeof(ctx.control_error),"%s",cJSON_IsString(error) ? error->valuestring : "");
+                if (cJSON_IsString(error)) { ctx.requested_quality=applied; fprintf(stderr,"client: quality change refused: %s\n",error->valuestring); }
                 ctx.effective_quality = applied;
                 fprintf(stderr, "client: quality applied cap=%ux%u bitrate=%u fps=%u\n",
                     applied.max_width, applied.max_height, applied.bitrate, applied.fps);
@@ -1640,6 +1684,7 @@ static int client_run(int argc, char **argv) {
     /* ── Shutdown ────────────────────────────────────────────── */
     printf("\nclient: shutting down...\n");
 
+    md_clipboard_destroy(ctx.clipboard); ctx.clipboard=NULL;
     md_decoder_flush(decoder, on_decoded, &ctx);
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);

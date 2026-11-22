@@ -25,10 +25,16 @@ static void parsing(void) {
     MD_CHECK(s && !md_session_accept_from_json(s,&b) && b.quality_present && b.quality.fps==30); free(s);
 }
 static void policy(void) {
+    MD_CHECK(md_quality_frame_due(15,0,1));
+    MD_CHECK(!md_quality_frame_due(15,1000000000,1000000001));
+    MD_CHECK(md_quality_frame_due(15,1000000000,1066666667));
+    MD_CHECK(!md_quality_frame_due(0,0,1));
     MdQuality p={1920,1080,8000000,60}, r={3840,720,16000000,120};
     MdQuality q=md_quality_clamp(&r,&p);
     MD_CHECK(q.max_width==1920 && q.max_height==720 && q.bitrate==8000000 && q.fps==60);
     r=(MdQuality){0}; q=md_quality_clamp(&r,&p); MD_CHECK(!memcmp(&q,&p,sizeof(p)));
+    MD_CHECK(md_quality_accepts(&r,&q));
+    r.fps=15; MD_CHECK(!md_quality_accepts(&r,&q));
     MdBitrateCtrlConfig c={.max_bitrate=8000000,.initial_bitrate=8000000};
     MdBitrateCtrl *ctrl=md_bitrate_ctrl_create(&c); MD_CHECK(ctrl);
     MD_CHECK(md_bitrate_ctrl_set_max(ctrl,1000000)==1000000);
@@ -46,9 +52,10 @@ static void scale(void) {
     f.format=MD_PIX_CAPTURE_NV12; f.stride=16; f.data_size=16*8*3/2;
     MD_CHECK(!md_quality_scale(&q,&f,&scaled,&buf,&cap) && scaled.data[0]==123);
     free(buf);
-    MdEncoderConfig cfg={.width=64,.height=64,.fps=60,.bitrate=1000000};
+    MdEncoderConfig cfg={.width=640,.height=360,.fps=60,.bitrate=1000000};
     MdEncoder *e=md_encoder_create(&cfg); MD_CHECK(e);
-    MD_CHECK(!md_encoder_set_fps(e,30) && md_encoder_set_fps(e,0)<0);
-    MD_CHECK(!md_encoder_resize(e,32,32)); md_encoder_destroy(e);
+    MD_CHECK(!md_encoder_set_quality(e,640,360,30,1000000) && md_encoder_set_quality(e,640,360,0,1000000)<0);
+    MD_CHECK(!md_encoder_resize(e,320,180));
+    MD_CHECK(md_encoder_set_quality(e,0,0,30,1000000)<0); md_encoder_destroy(e);
 }
 int main(void) { parsing(); policy(); scale(); return md_test_report(); }

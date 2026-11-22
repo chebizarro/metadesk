@@ -19,16 +19,26 @@ from test_access_cli import Signer, HOST_PK, CLIENT_PK, HOST_NPUB, CLIENT_NPUB
 
 
 def main():
+    clipboard_native = "--clipboard-native" in sys.argv
+    clipboard_denied = "--clipboard-denied" in sys.argv
     live_monitor = "--monitor-capture" in sys.argv
     live_quality = "--quality-capture" in sys.argv or live_monitor
-    host, client, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a not in ("--quality-capture","--monitor-capture")])
+    host, client, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a not in ("--quality-capture","--monitor-capture","--clipboard-native","--clipboard-denied")])
 
     with tempfile.TemporaryDirectory(prefix="md-w15-session-") as tmp:
         root = Path(tmp).resolve()
         relay = Relay()
         servers, threads, children, readers = [relay], [], [], []
         logs = {}
+        clipboard_events = {role: threading.Event() for role in ("host", "client")}
+        clipboard_helper = None
         try:
+            if clipboard_native or clipboard_denied:
+                clipboard_helper = subprocess.Popen([str(Path(crypto).parent / "clipboard_native_fixture")],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                assert clipboard_helper.stdout.readline().strip() == "READY"
+                clipboard_helper.stdin.write("set md-w15-round-trip\n"); clipboard_helper.stdin.flush()
+                assert clipboard_helper.stdout.readline().strip() == "SET"
             envs = {}
             for role, pk in (("host", HOST_PK), ("client", CLIENT_PK)):
                 home = root / role
@@ -55,9 +65,9 @@ def main():
                 checked([host, "account", "add", "nip5f", pk, "Private session"], role)
                 checked([host, "account", "bind-role", role, "nip5f", pk], role)
             url = f"ws://127.0.0.1:{relay.server_address[1]}"
-            checked([host, "access", "--relay", url, "add", CLIENT_NPUB, "video,monitor" if live_monitor else "video"], "host")
+            checked([host, "access", "--relay", url, "add", CLIENT_NPUB, "video,clipboard" if clipboard_native else "video,monitor" if live_monitor else "video"], "host")
             listed = checked([host, "access", "--relay", url, "list"], "host")
-            assert listed.stdout.strip() == CLIENT_PK + ("\tvideo,monitor" if live_monitor else "\tvideo"), listed.stdout
+            assert listed.stdout.strip() == CLIENT_PK + ("\tvideo,clipboard" if clipboard_native else "\tvideo,monitor" if live_monitor else "\tvideo"), listed.stdout
             with relay.lock:
                 policy = next(e for e in relay.events.values() if e["kind"] == 30000)
                 assert policy["tags"] == [["d", "metadesk-allowlist"]] and policy["content"]
@@ -76,6 +86,7 @@ def main():
                         with os.fdopen(master, "r", errors="replace") as stream:
                             for line in stream:
                                 logs[role].append(line)
+                                if "clipboard received" in line: clipboard_events[role].set()
                                 if target in line:
                                     ready.set()
                     except OSError:  # PTY EOF on Linux
@@ -91,10 +102,20 @@ def main():
             assert ready.wait(20), logs
             cp, connected = launch("client", [client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
                                                "--relay", url, "--port", port, "--no-display", "--timeout", "15000",
+                                               *(["--clipboard","both"] if clipboard_native or clipboard_denied else []),
                                                *(["--max-size", "640x480", "--bitrate", "1000000", "--fps", "15", *(["--output","id:1"] if live_monitor else [])] if live_quality else [])],
                                    "decoded frame size" if live_quality else "receiving stream...")
             assert connected.wait(25), logs
             assert hp.poll() is None and cp.poll() is None, logs
+            if clipboard_native:
+                assert all(e.wait(15) for e in clipboard_events.values()), logs
+                clipboard_helper.stdin.write("check md-w15-round-trip\n"); clipboard_helper.stdin.flush()
+                assert clipboard_helper.stdout.readline().strip() == "MATCH"
+                print("PASS: native general NSPasteboard bidirectional text over real granted bound host/client stream")
+            if clipboard_denied:
+                assert any("clipboard not granted" in s for s in logs["client"]), logs
+                assert not any("clipboard sent" in s or "clipboard received" in s for lines in logs.values() for s in lines), logs
+                print("PASS: real host/client denies ungranted clipboard; unit backend counters prove zero accesses")
             if live_quality:
                 assert any("cap=640x480 bitrate=1000000 fps=15" in s for s in logs["host"]), logs
                 sizes = [s.split("decoded frame size ")[1].strip() for s in logs["client"] if "decoded frame size " in s]
@@ -112,6 +133,11 @@ def main():
                 except subprocess.TimeoutExpired:
                     p.kill()
                     p.wait()
+            if clipboard_helper:
+                clipboard_helper.stdin.write("restore\n"); clipboard_helper.stdin.flush()
+                assert clipboard_helper.stdout.readline().strip() == "RESTORED", "clipboard restoration failed"
+                assert clipboard_helper.wait(timeout=10) == 0
+                clipboard_helper.stdin.close(); clipboard_helper.stdout.close()
             for t in readers:
                 t.join(timeout=10)
                 assert not t.is_alive(), "process output reader leaked"

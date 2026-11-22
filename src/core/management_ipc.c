@@ -180,6 +180,7 @@ static void caps_text(uint32_t caps, char out[64]) {
     if (caps & MD_CAP_AGENT) strcat(out,"agent,");
     if (caps & MD_CAP_INPUT) strcat(out,"input,");
     if (caps & MD_CAP_MONITOR) strcat(out,"monitor,");
+    if (caps & MD_CAP_CLIPBOARD) strcat(out,"clipboard,");
     size_t n = strlen(out); if (n) out[n-1] = 0;
 }
 static const char *dispatch(MdManagementIpc *s, cJSON *j) {
@@ -397,7 +398,7 @@ static int usage(void) {
         "       metadesk-host session [endpoint] kick SESSION_ID GENERATION REVISION\n"
         "       metadesk-host requests [endpoint] approve REQUEST_ID GENERATION REVISION CAPS [--remember]\n"
         "       metadesk-host requests [endpoint] deny REQUEST_ID GENERATION REVISION\n"
-        "Use exact generation/revision from list JSON; caps: canonical video,agent,input,monitor subset.\n");
+        "Use exact generation/revision from list JSON; caps: canonical video,agent,input,monitor,clipboard subset.\n");
     return 2;
 }
 int md_host_management_cli(const char *area, int argc, char **argv) {

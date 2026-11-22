@@ -134,6 +134,7 @@
  */
 extern "C" {
 #include "capture.h"
+#include <stdio.h>
 }
 
 #ifdef _WIN32
@@ -1517,7 +1518,7 @@ int md_capture_outputs(MdCaptureOutputs *out) {
     for (UINT i=0;i<list.count && out->count<MD_CAPTURE_OUTPUTS_MAX-1;i++) {
         MdCaptureOutput *o=&out->items[out->count++];
         char name[96]; output_name(list.desc[i],name,sizeof(name));
-        snprintf(o->id,sizeof(o->id),"id:%u",display_number(name));
+        snprintf(o->id,sizeof(o->id),"id:%u",display_number(strip_device_prefix(name)));
         snprintf(o->name,sizeof(o->name),"%s",name);
         RECT r=list.rect[i]; o->rect={r.left,r.top,(uint32_t)(r.right-r.left),(uint32_t)(r.bottom-r.top)};
         o->primary=output_is_primary(list.desc[i]); if (o->primary) strcpy(out->selected,o->id);

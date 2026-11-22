@@ -180,6 +180,7 @@ static const struct { const char *name; MdCapability bit; } cap_table[] = {
     { "agent", MD_CAP_AGENT },
     { "input", MD_CAP_INPUT },
     { "monitor", MD_CAP_MONITOR },
+    { "clipboard", MD_CAP_CLIPBOARD },
 };
 #define CAP_TABLE_LEN (sizeof(cap_table) / sizeof(cap_table[0]))
 
@@ -330,10 +331,31 @@ bool md_session_accept_matches_request(const MdSessionAccept *acc,
         strcmp(acc->request_id, req->request_id) == 0 &&
         acc->session_id[0] && strlen(acc->stream_token) == 64 &&
         acc->granted != 0 && (acc->granted & ~req->capabilities) == 0 &&
+        (!acc->quality_present || md_quality_accepts(&req->quality,&acc->quality)) &&
+        (acc->clipboard_directions & ~req->clipboard_directions)==0 &&
+        ((acc->granted & MD_CAP_CLIPBOARD) ? acc->clipboard_directions!=0 : acc->clipboard_directions==0) &&
         req->issued_at > 0 &&
         rumor_created_at >= req->issued_at - MD_SESSION_CLOCK_SKEW_S;
 }
 
+bool md_session_json_strings_safe(const char *json) {
+    if (!json) return false;
+    for (const char *p=json;*p;p++) {
+        if (*p!='\\') continue;
+        if (!*++p) break;
+        if (*p=='u' && !strncmp(p+1,"0000",4)) return false;
+    }
+    return true;
+}
+static int clipboard_read(const cJSON *root,uint8_t *out) {
+    *out=0; const cJSON *p=NULL,*item;
+    cJSON_ArrayForEach(item,root) if (item->string && !strcmp(item->string,"clipboard")) {
+        if (p) return -1; p=item;
+    }
+    if (!p) return 0;
+    int d=cJSON_IsString(p) ? md_clipboard_directions_parse(p->valuestring) : -1;
+    if (d<0) return -1; *out=(uint8_t)d; return 0;
+}
 /* ── Session request JSON ────────────────────────────────────── */
 
 char *md_session_request_to_json(const MdSessionRequest *req) {
@@ -357,6 +379,8 @@ char *md_session_request_to_json(const MdSessionRequest *req) {
          !cJSON_AddNumberToObject(root, "expires_at", (double)req->expires_at)))
         goto fail;
 
+    if (req->clipboard_directions && (req->clipboard_directions>3 ||
+        !cJSON_AddStringToObject(root,"clipboard",md_clipboard_directions_name(req->clipboard_directions)))) goto fail;
     if (req->output[0] && (!md_capture_output_id_valid(req->output) ||
         !cJSON_AddStringToObject(root,"output",req->output))) goto fail;
     if (req->quality_present && md_quality_write(root, &req->quality)) goto fail;
@@ -397,10 +421,10 @@ fail:
 }
 
 int md_session_request_from_json(const char *json, MdSessionRequest *out) {
-    if (!json || !out) return -1;
+    if (!out || !md_session_json_strings_safe(json)) return -1;
     memset(out, 0, sizeof(*out));
 
-    cJSON *root = cJSON_Parse(json);
+    cJSON *root = cJSON_ParseWithOpts(json,NULL,true);
     if (!root) return -1;
 
     /* Verify type */
@@ -410,6 +434,7 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
         return -1;
     }
 
+    if (clipboard_read(root,&out->clipboard_directions)) { cJSON_Delete(root); return -1; }
     if (md_quality_read(root, &out->quality, &out->quality_present)) {
         cJSON_Delete(root); return -1;
     }
@@ -493,6 +518,8 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
         !cJSON_AddStringToObject(root, "tls_cert_sha256", acc->tls_cert_sha256))
         goto fail;
 
+    if (acc->clipboard_directions && (acc->clipboard_directions>3 ||
+        !cJSON_AddStringToObject(root,"clipboard",md_clipboard_directions_name(acc->clipboard_directions)))) goto fail;
     if (acc->outputs_present && md_session_outputs_write(root,&acc->outputs)) goto fail;
     if (acc->quality_present && md_quality_write(root, &acc->quality)) goto fail;
 
@@ -527,10 +554,10 @@ fail:
 }
 
 int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
-    if (!json || !out) return -1;
+    if (!out || !md_session_json_strings_safe(json)) return -1;
     memset(out, 0, sizeof(*out));
 
-    cJSON *root = cJSON_Parse(json);
+    cJSON *root = cJSON_ParseWithOpts(json,NULL,true);
     if (!root) return -1;
 
     /* Verify type */
@@ -545,6 +572,7 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
     }
 
     if (md_session_outputs_read(root,&out->outputs,&out->outputs_present)) { cJSON_Delete(root); return -1; }
+    if (clipboard_read(root,&out->clipboard_directions)) { cJSON_Delete(root); return -1; }
     /* tree_format (optional — defaults to JSON for backwards compat) */
     cJSON *tf = cJSON_GetObjectItem(root, "tree_format");
     if (cJSON_IsString(tf) && strcmp(tf->valuestring, "compact") == 0)
@@ -599,6 +627,8 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
 
 const char *md_session_reject_message(const MdSessionReject *reject) {
     if (!reject) return NULL;
+    if (!strcmp(reject->reason,"quality_unsupported"))
+        return "host capture/encoder cannot honor requested quality; choose a larger resolution cap or lower frame rate";
     if (!strcmp(reject->reason,"output_unavailable"))
         return "requested output unavailable or monitor grant missing; Linux portal switching requires new local consent";
     if (!strcmp(reject->reason, "tls_required"))

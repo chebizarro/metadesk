@@ -10,6 +10,15 @@ bool md_quality_valid(const MdQuality *q) {
         (!q->bitrate || (q->bitrate >= MD_ENCODER_MIN_BITRATE && q->bitrate <= MD_ENCODER_MAX_BITRATE)) &&
         q->fps <= MD_QUALITY_MAX_FPS;
 }
+bool md_quality_frame_due(uint32_t fps,uint64_t last,uint64_t now) {
+    return fps && (!last || (now>=last && now-last>=1000000000u/fps));
+}
+bool md_quality_accepts(const MdQuality *r,const MdQuality *e) {
+    return md_quality_valid(e) && e->bitrate && e->fps &&
+        (!r->max_width || (e->max_width && e->max_width<=r->max_width)) &&
+        (!r->max_height || (e->max_height && e->max_height<=r->max_height)) &&
+        (!r->bitrate || e->bitrate<=r->bitrate) && (!r->fps || e->fps<=r->fps);
+}
 static uint32_t bound(uint32_t a, uint32_t b) { return !a ? b : !b ? a : a < b ? a : b; }
 MdQuality md_quality_clamp(const MdQuality *r, const MdQuality *p) {
     MdQuality q = { bound(r->max_width, p->max_width), bound(r->max_height, p->max_height),
@@ -54,13 +63,14 @@ int md_quality_write(cJSON *root, const MdQuality *q) {
         cJSON_AddNumberToObject(obj, "bitrate", q->bitrate) &&
         cJSON_AddNumberToObject(obj, "fps", q->fps) ? 0 : -1;
 }
-char *md_quality_control(const MdQuality *q) {
+char *md_quality_state(const MdQuality *q, const char *error) {
     cJSON *root = cJSON_CreateObject();
     char *json = root && cJSON_AddStringToObject(root, "type", "quality") &&
-        md_quality_write(root, q) == 0 ? cJSON_PrintUnformatted(root) : NULL;
+        md_quality_write(root, q) == 0 && (!error || cJSON_AddStringToObject(root,"error",error)) ? cJSON_PrintUnformatted(root) : NULL;
     cJSON_Delete(root); return json;
 }
 
+char *md_quality_control(const MdQuality *q) { return md_quality_state(q,NULL); }
 int md_quality_scale(const MdQuality *q, const MdFrame *src, MdFrame *out,
                      uint8_t **scratch, size_t *capacity) {
     uint32_t w, h;

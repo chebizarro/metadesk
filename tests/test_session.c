@@ -354,7 +354,7 @@ static void test_reset_after_disconnect(void) {
 static void test_invalid_capability_strings_rejected(void) {
     MdSessionRequest req;
     const char *bad_req = "{\"type\":\"session_request\",\"v\":1,"
-                          "\"capabilities\":[\"video\",\"clipboard\"],"
+                          "\"capabilities\":[\"video\",\"unknown_future_cap\"],"
                           "\"tree_format\":\"json\"}";
     MD_CHECK(md_session_request_from_json(bad_req, &req) == -1);
 
@@ -366,7 +366,7 @@ static void test_invalid_capability_strings_rejected(void) {
     MdSessionAccept acc;
     const char *bad_acc = "{\"type\":\"session_accept\",\"v\":1,"
                           "\"session_id\":\"sid\","
-                          "\"granted\":[\"agent\",\"clipboard\"],"
+                          "\"granted\":[\"agent\",\"unknown_future_cap\"],"
                           "\"tree_format\":\"compact\"}";
     MD_CHECK(md_session_accept_from_json(bad_acc, &acc) == -1);
 

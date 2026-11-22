@@ -1505,7 +1505,23 @@ static const char *const cap_names[] = {
     "input,monitor",
     "video,input,monitor",
     "agent,input,monitor",
-    "video,agent,input,monitor"
+    "video,agent,input,monitor",
+    "clipboard",
+    "video,clipboard",
+    "agent,clipboard",
+    "video,agent,clipboard",
+    "input,clipboard",
+    "video,input,clipboard",
+    "agent,input,clipboard",
+    "video,agent,input,clipboard",
+    "monitor,clipboard",
+    "video,monitor,clipboard",
+    "agent,monitor,clipboard",
+    "video,agent,monitor,clipboard",
+    "input,monitor,clipboard",
+    "video,input,monitor,clipboard",
+    "agent,input,monitor,clipboard",
+    "video,agent,input,monitor,clipboard"
 };
 
 int md_nostr_parse_caps(const char *text, uint32_t *out) {
@@ -2047,7 +2063,7 @@ static cJSON *quality_document(MdNostr *n) {
     pthread_mutex_unlock(&n->allowlist_mu);
     if (!exists) {
         cJSON *doc = cJSON_CreateObject();
-        if (doc) { cJSON_AddNumberToObject(doc,"v",1); cJSON_AddObjectToObject(doc,"hosts"); }
+        if (doc && (!cJSON_AddNumberToObject(doc,"v",1) || !cJSON_AddObjectToObject(doc,"hosts"))) { cJSON_Delete(doc); doc=NULL; }
         return doc;
     }
     char *plain = NULL;

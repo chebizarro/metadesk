@@ -783,6 +783,7 @@ core_sources = files(
   'src/core/input.c',
   'src/core/session.c',
   'src/core/quality.c',
+  'src/core/clipboard.c',
   'src/core/host_access.c',
   'src/core/management_ipc.c',
   'src/core/jsonrpc.c',
@@ -820,6 +821,11 @@ elif host_os == 'windows'
 endif
 
 # Append platform HAL backend sources
+if host_os == 'darwin'
+  core_sources += files('src/core/clipboard_macos.m')
+elif host_os == 'windows'
+  core_sources += files('src/core/clipboard_windows.c')
+endif
 core_sources += platform_hal_sources
 
 mcp_c_args = ['-DMD_MCP_BRIDGE_VERSION="' + meson.project_version() + '"']
@@ -1270,7 +1276,21 @@ test('session JSON + state machine', test_session)
 test_quality = executable('test_quality', 'tests/test_quality.c', dependencies : dep_metadesk)
 test('session quality policy + scaling', test_quality)
 test_outputs = executable('test_outputs', 'tests/test_outputs.c', dependencies : dep_metadesk)
-test('session outputs + native enumeration', test_outputs)
+test('session outputs wire contract', test_outputs)
+test('session outputs native enumeration', test_outputs, args : ['--native'])
+test_clipboard = executable('test_clipboard', 'tests/test_clipboard.c', dependencies : dep_metadesk)
+test('clipboard grant + direction + UTF-8 bounds', test_clipboard)
+if host_os == 'windows'
+  test_clipboard_windows = executable('test_clipboard_windows', 'tests/test_clipboard_windows.c',
+    dependencies : [dep_metadesk, cc.find_library('user32')])
+  test('Windows private-station clipboard text', test_clipboard_windows)
+endif
+if host_os == 'darwin'
+  test_clipboard_macos = executable('test_clipboard_macos', 'tests/test_clipboard_macos.m', dependencies : [dep_metadesk, dependency('appleframeworks', modules : ['AppKit'])])
+  test('NSPasteboard private native text', test_clipboard_macos)
+  clipboard_native_fixture = executable('clipboard_native_fixture', 'tests/clipboard_native_fixture.m',
+    dependencies : [dep_metadesk, dependency('appleframeworks', modules : ['AppKit'])])
+endif
 test_quality_preferences = executable('test_quality_preferences', 'tests/test_quality_preferences.c', dependencies : dep_metadesk)
 if host_os != 'windows'
   test('encrypted quality preferences private relay', find_program('python3'),

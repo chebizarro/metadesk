@@ -7,11 +7,13 @@
 #define md_nostr_send_session_accept test_publish
 #define md_agent_create test_create_agent
 #define md_capture_create test_capture_create
+#define md_encoder_set_quality test_set_quality
 #include "../src/host/main.c"
 #undef main
 #undef md_nostr_send_session_accept
 #undef md_agent_create
 #undef md_capture_create
+#undef md_encoder_set_quality
 #include "md_test.h"
 #include "decode.h"
 /* nostr.h's prototype was renamed by the macro above; restore the real one. */
@@ -19,6 +21,11 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload);
 
 MdAgent *md_agent_create(const MdAgentConfig *cfg);
+static bool fail_quality;
+int md_encoder_set_quality(MdEncoder *e,uint32_t w,uint32_t h,uint32_t fps,uint32_t br);
+int test_set_quality(MdEncoder *e,uint32_t w,uint32_t h,uint32_t fps,uint32_t br) {
+    return fail_quality ? -1 : md_encoder_set_quality(e,w,h,fps,br);
+}
 static bool fake_output_capture, fail_output_capture;
 MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg);
 static int output_start(MdCaptureCtx *c) { c->active=true; return 0; }
@@ -975,6 +982,7 @@ static void test_idle_capture_rebind(void) {
     md_session_init(&session);
     HostCtx ctx = {.tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = &session};
     pthread_mutex_init(&ctx.client_mu, NULL);
+    pthread_cond_init(&ctx.capture_control_cv,NULL);
     AdmissionCapture source = {.width = 640, .height = 360};
     const MdCaptureBackend startup = {.start = admission_start,
         .get_frame = admission_frame, .release_frame = admission_release};
@@ -1033,6 +1041,7 @@ static void test_idle_capture_rebind(void) {
     MD_CHECK(source.pulls == 1 && source.releases == 1);
     free(ctx.cached_frame.data);
     md_encoder_destroy(encoder);
+    pthread_cond_destroy(&ctx.capture_control_cv);
     pthread_mutex_destroy(&ctx.client_mu);
 }
 
@@ -1128,7 +1137,8 @@ static void test_relay_rebind(const char *url) {
         ctx.client = p.host;
         /* Exercise the production capture-to-stream gate on each grant. */
         uint8_t bytes[] = {0, 0, 0, 1, 0x65};
-        MdEncodedPacket packet = {.data = bytes, .size = sizeof(bytes)};
+        MdEncodedPacket packet = {.data = bytes, .size = sizeof(bytes),
+            .tag=host_frame_tag(ctx.control_epoch,host_capture_sync_frame_tag(&ctx.sync))};
         on_encoded(&packet, &ctx);
         payload = NULL;
         MD_CHECK(md_stream_recv(p.peer, &hdr, &payload, 1000) == 0);
@@ -1171,6 +1181,91 @@ static void test_agent_replacement_failure(void) {
     md_agent_destroy(agent);
 }
 
+static void test_quality_admission_deadline(void) {
+    MdSession s; md_session_init(&s);
+    MD_CHECK(!md_session_request(&s,"fixture-peer",MD_CAP_VIDEO,MD_TREE_FORMAT_COMPACT));
+    MD_CHECK(!md_session_accept(&s,"negotiated-id",MD_CAP_VIDEO));
+    HostCtx ctx=context(&s); ctx.capture_required=true; ctx.capture_ready=true;
+    ctx.quality_pending=true; ctx.quality_policy=(MdQuality){0,0,1000000,30};
+    MD_CHECK(!md_session_request_prepare(&ctx.pending_req,(int64_t)time(NULL),30));
+    pthread_mutex_init(&ctx.client_mu,NULL); md_cond_init_monotonic(&ctx.capture_control_cv);
+    unsigned before=publish_calls;
+    MD_CHECK(host_publish_session_accept(&ctx,NULL)<0);
+    MD_CHECK(ctx.quality_error && !ctx.quality_pending && !ctx.output_pending);
+    MD_CHECK(publish_calls==before && s.state!=MD_SESSION_ACTIVE);
+    pthread_cond_destroy(&ctx.capture_control_cv); pthread_mutex_destroy(&ctx.client_mu);
+}
+static void test_quality_rollback(void) {
+    Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO);
+    send_proof(p,&a); MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_VIDEO);
+    HostCtx ctx={.client=p.host,.session=&s,.quality={32,32,1000000,15},.quality_policy={0,0,8000000,60},
+        .applied_quality={64,64,1000000,30},.quality_revision=2,.applied_quality_revision=1,.quality_state_pending=true};
+    pthread_mutex_init(&ctx.client_mu,NULL); pthread_cond_init(&ctx.capture_control_cv,NULL);
+    MdEncoderConfig cfg={.width=64,.height=64,.fps=30,.bitrate=1000000};
+    MdEncoder *e=md_encoder_create(&cfg); MD_CHECK(e);
+    host_capture_sync_init(&ctx.sync,e,NULL,&ctx.client_mu,&ctx.pkt_seq,64,64,NULL);
+    uint8_t pixels[64*64*4]={0};
+    MdFrame f={.data=pixels,.width=64,.height=64,.stride=256,.data_size=sizeof(pixels),.format=MD_PIX_CAPTURE_BGRA,.buf_type=MD_BUF_CPU};
+    MdCaptureCtx cap={.output_rect={0,0,64,64}};
+    fail_quality=true; host_encode_frame(&ctx,&cap,&f,true,true); fail_quality=false;
+    MD_CHECK(!atomic_load(&ctx.capture_failed) && ctx.quality.max_width==64 && md_encoder_get_bitrate(e)==1000000);
+    MdPacketHeader h; uint8_t *body=NULL;
+    MD_CHECK(!md_stream_recv(p.peer,&h,&body,1000) && h.type==MD_PKT_SESSION_STATE); free(body);
+    host_encode_frame(&ctx,&cap,&f,true,true);
+    MD_CHECK(!md_stream_recv(p.peer,&h,&body,1000) && h.type==MD_PKT_VIDEO_FRAME); free(body);
+    destroy_pair(p); ctx.client=NULL;
+    ctx.control_epoch++; ctx.quality=(MdQuality){32,32,1000000,15};
+    ctx.quality_revision++; ctx.quality_pending=true;
+    fail_quality=true; host_encode_frame(&ctx,&cap,&f,false,false); fail_quality=false;
+    MD_CHECK(ctx.quality_error && !ctx.quality_pending && !atomic_load(&ctx.capture_failed));
+    ctx.quality_error=false; ctx.control_epoch++; ctx.quality_revision++; ctx.quality_pending=true;
+    host_encode_frame(&ctx,&cap,&f,false,false);
+    MD_CHECK(!ctx.quality_pending && !atomic_load(&ctx.capture_failed));
+    free(ctx.quality_pixels); md_encoder_destroy(e);
+    pthread_cond_destroy(&ctx.capture_control_cv); pthread_mutex_destroy(&ctx.client_mu);
+}
+static void test_encoder_epoch(void) {
+    Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO);
+    send_proof(p,&a); MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_VIDEO);
+    HostCtx ctx={.session=&s,.client=p.host,.control_epoch=2};
+    pthread_mutex_init(&ctx.client_mu,NULL);
+    host_capture_sync_init(&ctx.sync,NULL,NULL,&ctx.client_mu,&ctx.pkt_seq,64,64,NULL);
+    uint8_t bytes[]={0}; uint64_t gen=host_capture_sync_frame_tag(&ctx.sync);
+    MdEncodedPacket pkt={.data=bytes,.size=sizeof(bytes),.tag=(1ULL<<32)|gen};
+    on_encoded(&pkt,&ctx); MD_CHECK(!ctx.frames_sent && !ctx.pkt_seq && md_stream_is_connected(p.host));
+    pkt.tag=(2ULL<<32)|gen; on_encoded(&pkt,&ctx); MD_CHECK(ctx.frames_sent==1 && ctx.pkt_seq==1);
+    MdPacketHeader h; uint8_t *body=NULL;
+    MD_CHECK(!md_stream_recv(p.peer,&h,&body,1000) && h.type==MD_PKT_VIDEO_FRAME); free(body);
+    pthread_mutex_destroy(&ctx.client_mu); destroy_pair(p);
+}
+static void test_quality_rebind(void) {
+    HostCtx ctx={.quality={0,0,1000000,30},.quality_policy={0,0,8000000,60},.quality_revision=1};
+    pthread_mutex_init(&ctx.client_mu,NULL);
+    MdEncoderConfig cfg={.width=64,.height=64,.fps=30,.bitrate=8000000};
+    MdEncoder *e=md_encoder_create(&cfg); MD_CHECK(e);
+    host_capture_sync_init(&ctx.sync,e,NULL,&ctx.client_mu,&ctx.pkt_seq,64,64,NULL);
+    uint8_t pixels[64*64*4]={0};
+    MdFrame f={.data=pixels,.width=64,.height=64,.stride=256,.data_size=sizeof(pixels),.format=MD_PIX_CAPTURE_BGRA,.buf_type=MD_BUF_CPU};
+    MdCaptureCtx cap={.output_rect={0,0,64,64}};
+    host_encode_frame(&ctx,&cap,&f,false,true); MD_CHECK(md_encoder_get_bitrate(e)==1000000);
+    MD_CHECK(!md_encoder_set_bitrate(e,8000000)); /* retained encoder from another session */
+    ctx.quality_revision++;
+    host_encode_frame(&ctx,&cap,&f,false,true); MD_CHECK(md_encoder_get_bitrate(e)==1000000);
+    md_encoder_destroy(e); free(ctx.quality_pixels); pthread_mutex_destroy(&ctx.client_mu);
+}
+static void test_clipboard_dispatch(void) {
+    Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO);
+    send_proof(p,&a); MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_VIDEO);
+    HostCtx ctx=context(&s); ctx.client=p.host;
+    MdPacketHeader h={.type=MD_PKT_CLIPBOARD,.payload_len=4};
+    handle_client_packet(&ctx,&h,(const uint8_t*)"text"); closed(p); destroy_pair(p);
+    /* The framed receiver rejects an oversized clipboard before payload allocation. */
+    p=pair(); uint8_t header[MD_PACKET_HEADER_SIZE];
+    h=(MdPacketHeader){.version=MD_PROTOCOL_VERSION,.type=MD_PKT_CLIPBOARD,.payload_len=MD_CLIPBOARD_MAX_UTF8+1};
+    MD_CHECK(md_packet_header_write(&h,header,sizeof(header))==MD_PACKET_HEADER_SIZE);
+    MD_CHECK(md_socket_send(md_stream_get_fd(p.peer),header,sizeof(header),0)==sizeof(header));
+    uint8_t *payload=NULL; MD_CHECK(md_stream_recv(p.host,&h,&payload,1000)<0 && !payload); destroy_pair(p);
+}
 static void test_monitor_switch(void) {
     fake_output_capture=true;
     Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO|MD_CAP_MONITOR);
@@ -1213,6 +1308,13 @@ static void test_quality_control(void) {
     handle_client_packet(&ctx,&h,(uint8_t*)json);
     MD_CHECK(ctx.quality.max_width==1280 && ctx.quality.bitrate==2000000 && ctx.quality.fps==30);
     MD_CHECK(ctx.quality_state_pending && md_stream_is_connected(p.host));
+    free(json);
+    ctx.native_width=2000; ctx.native_height=64;
+    json=md_quality_control(&(MdQuality){2,0,1000000,30}); h.payload_len=(uint32_t)strlen(json);
+    handle_client_packet(&ctx,&h,(uint8_t*)json);
+    MD_CHECK(ctx.quality.max_width==1280);
+    MdPacketHeader reply; uint8_t *body=NULL;
+    MD_CHECK(!md_stream_recv(p.peer,&reply,&body,1000) && reply.type==MD_PKT_SESSION_STATE); free(body);
     free(json); destroy_pair(p);
     p=pair(); a=reserve(&s,MD_CAP_AGENT); send_proof(p,&a);
     MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_AGENT);
@@ -1244,6 +1346,11 @@ int main(int argc, char **argv) {
         test_relay_history(argv[2]);
         return md_test_report();
     }
+    test_quality_admission_deadline();
+    test_quality_rollback();
+    test_encoder_epoch();
+    test_quality_rebind();
+    test_clipboard_dispatch();
     test_monitor_switch();
     test_quality_control();
     test_capture_admission();
