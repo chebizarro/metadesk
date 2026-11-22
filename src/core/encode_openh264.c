@@ -2,6 +2,7 @@
  * Public C vtable; see the documented ForceIntraFrame signature correction
  * in openh264_headers/README.md. Runtime installation: encoder-runtime.md. */
 #include "encode_openh264.h"
+#include "encode_openh264_runtime.h"
 #include "openh264_headers/codec_api.h"
 #include "openh264_headers/codec_ver.h"
 #include <libyuv.h>
@@ -19,24 +20,13 @@ static Library load_library(const char *path) {
 }
 static void *symbol(Library lib, const char *name) { return (void *)GetProcAddress(lib, name); }
 static void close_library(Library lib) { FreeLibrary(lib); }
-#if defined(_M_ARM64) || defined(__aarch64__)
-#define MD_OH_NAME "openh264-2.7.0-win-arm64.dll"
-#elif defined(_WIN64)
-#define MD_OH_NAME "openh264-2.7.0-win64.dll"
-#else
-#define MD_OH_NAME "openh264-2.7.0-win32.dll"
-#endif
 #else
 #include <dlfcn.h>
 typedef void *Library;
 static Library load_library(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
 static void *symbol(Library lib, const char *name) { return dlsym(lib, name); }
 static void close_library(Library lib) { dlclose(lib); }
-#ifdef __APPLE__
-#define MD_OH_NAME "libopenh264.8.dylib"
-#else
-#define MD_OH_NAME "libopenh264.so.8"
-#endif
+
 #endif
 
 struct MdOpenH264 {
@@ -67,10 +57,8 @@ static bool bind_library(MdOpenH264 *enc, const char *path) {
     OpenH264Version v = {0};
     if (version) version(&v);
     /* Reject before calling any version-dependent vtable or structure. */
-    if (!version || !create || !destroy || v.uMajor != OPENH264_MAJOR ||
-        v.uMinor != OPENH264_MINOR || v.uRevision != OPENH264_REVISION ||
-        v.uReserved != OPENH264_RESERVED) {
-        fprintf(stderr, "OpenH264: rejected %s (need 2.7.0.2610, found %u.%u.%u.%u)\n",
+    if (!version || !create || !destroy || !md_openh264_version_supported(v.uMajor, v.uMinor, v.uRevision, v.uReserved)) {
+        fprintf(stderr, "OpenH264: rejected %s (need 2.6.0.2502 or 2.7.0.2610, found %u.%u.%u.%u)\n",
                 path, v.uMajor, v.uMinor, v.uRevision, v.uReserved);
         close_library(lib);
         return false;
@@ -78,7 +66,8 @@ static bool bind_library(MdOpenH264 *enc, const char *path) {
     enc->library = lib;
     enc->destroy = destroy;
     if (create(&enc->encoder) != 0 || !enc->encoder) return false;
-    fprintf(stderr, "OpenH264: loaded %s (2.7.0.2610)\n", path);
+    fprintf(stderr, "OpenH264: loaded %s (%u.%u.%u.%u)\n", path,
+            v.uMajor, v.uMinor, v.uRevision, v.uReserved);
     return true;
 }
 
@@ -98,7 +87,11 @@ MdOpenH264 *md_openh264_create(const MdEncoderConfig *cfg) {
         if (!loaded && !enc->library) {
             char cache[4096];
 #ifdef _WIN32
-            const char *base = getenv("LOCALAPPDATA");
+            char base_buf[4096];
+            wchar_t wide_base[4096];
+            DWORD wide_size = GetEnvironmentVariableW(L"LOCALAPPDATA", wide_base, 4096);
+            const char *base = wide_size && wide_size < 4096 && WideCharToMultiByte(CP_UTF8, 0, wide_base, -1,
+                base_buf, sizeof(base_buf), NULL, NULL) ? base_buf : NULL;
             if (base && *base && absolute_path(base)) {
                 int n = snprintf(cache, sizeof(cache), "%s/metadesk/openh264/%s", base, MD_OH_NAME);
 #elif defined(__APPLE__)
@@ -122,7 +115,7 @@ MdOpenH264 *md_openh264_create(const MdEncoderConfig *cfg) {
                 "https://github.com/cisco/openh264/releases/tag/v2.7.0, verify its published "
                 "signature/checksum, decompress it, then set --openh264-path (or "
                 "METADESK_OPENH264_PATH) to the absolute library filename. "
-                "metadesk never downloads or bundles this binary.\n");
+                "use --fetch-openh264 for an explicit verified download; never bundled.\n");
         md_openh264_destroy(enc);
         return NULL;
     }

@@ -31,8 +31,10 @@ geometry-tag test's maximum pending-depth assertion. Do not relax that assertion
 The Windows profile of `packaging/ffmpeg/build-minimal-lgpl.sh` applies
 `packaging/ffmpeg/patches/0001-mf-low-latency-vt-bool.patch` to a private source
 copy, preserving the caller's clean FFmpeg tree and retaining a patch receipt.
-Upstreaming remains pending (`md-gml8`). With the property changed to
-`VT_BOOL(VARIANT_TRUE)`, a private minimal LGPL FFmpeg 9.0.2 build passed all
+The complete Windows profile and an unsent FFmpeg-master patch/email draft
+are recorded in [the qualification notes](../../packaging/ffmpeg/README.md)
+(`md-gml8`). With the property changed to `VT_BOOL(VARIANT_TRUE)`, the private
+minimal LGPL FFmpeg 9.0.2 build passed all
 1,771 encode/decode checks: 24 tagged packets, none late or discarded at resize,
 and 20 independent reconnect decoders. Stock MSYS2 FFmpeg is **not qualified**
 for the low-latency MF path. Merely consuming an FFmpeg AVOption cannot prove
@@ -46,7 +48,8 @@ the OS software MFT. The Windows packaging profile enables D3D11VA explicitly. N
 
 ## Direct OpenH264, not FFmpeg's libopenh264
 
-No OpenH264 library is linked, bundled, installed or downloaded by metadesk.
+No OpenH264 library is linked or bundled. The standalone `--fetch-openh264`
+action can download and install Cisco's binary; normal startup never does.
 Only Cisco's public BSD-licensed headers are vendored in `openh264_headers/`,
 from [v2.7.0](https://github.com/cisco/openh264/tree/v2.7.0/codec/api/wels)
 with their `COPYING`. The backend and loader fake are plain C, using
@@ -54,17 +57,15 @@ with their `COPYING`. The backend and loader fake are plain C, using
 The sole local header correction restores the omitted `ForceIntraFrame` layer
 argument to match the actual ABI; see `openh264_headers/README.md`.
 
-This adapter pins **OpenH264 2.7.0.2610, ABI soname 8**. It resolves
-`WelsGetCodecVersionEx`, `WelsCreateSVCEncoder`, `WelsDestroySVCEncoder` and checks
-all four version fields **before creating or invoking an encoder**. Other
-versions, missing symbols and wrong-architecture libraries are rejected; ABI
-updates require a header/version review, not an unversioned library guess.
-This exact pin also rejects distro/Homebrew OpenH264 builds of **other versions**,
-including ABI-soname-compatible builds: a shared soname alone is insufficient.
-The vetted version-range follow-up (`md-7xx2`) requires header/layout and per-platform
-round-trip validation before widening this allowlist. Source-built distro codecs
-also do not acquire Cisco binary patent coverage through version compatibility.
-Version checking is compatibility validation, **not binary authentication**.
+This adapter accepts exactly **2.6.0.2502 and 2.7.0.2610, ABI soname 8**.
+It resolves `WelsGetCodecVersionEx`, `WelsCreateSVCEncoder`, and
+`WelsDestroySVCEncoder` and checks all four version fields **before creating
+or invoking an encoder**. Missing symbols, other builds, and wrong-architecture
+libraries are rejected. A shared soname or arbitrary 2.x version is not enough.
+See [the ABI review](encode_openh264_versions.md) for header hashes and real
+round-trip qualification. The fetcher pins only 2.7.0 and authenticates bytes;
+a loader version check alone is compatibility validation, **not authentication**.
+Source-built distro codecs do not acquire Cisco binary patent coverage.
 
 Search order:
 
@@ -96,13 +97,55 @@ output. IDR requests, resize and runtime bitrate updates use the direct API.
 
 ## Installing the fallback
 
-Choose the matching OS/architecture binary from
-[Cisco's 2.7.0 release](https://github.com/cisco/openh264/releases/tag/v2.7.0).
-Review its binary license, verify Cisco's published checksum and signature,
-decompress it and point `--openh264-path` at the library. To use cache discovery,
-rename the POSIX Cisco filename to the ABI filename above. There is currently
-**no `--fetch-openh264`**; any future fetcher must require explicit action and
-authenticate the download, not run during startup or silently trust a checksum.
+Run this **standalone, explicit user action**:
+
+```sh
+metadesk-host --fetch-openh264
+```
+
+It prints the complete [Cisco binary license](https://www.openh264.org/BINARY_LICENSE.txt)
+and flushes it before DNS/network activity. The command itself is the explicit
+action (no hidden startup fetch, updater, or acceptance inferred from encoder
+selection). Read that notice before choosing to run it. Mixed CLI options are
+rejected. Unsupported platforms fail closed.
+
+The URL is fixed to `https://ciscobinary.openh264.org/` with the matching Cisco
+2.7.0 platform/architecture filename from the
+[official release](https://github.com/cisco/openh264/releases/tag/v2.7.0).
+macOS supports arm64/x86_64, Windows arm64/x86_64/x86, and Linux
+arm64/arm/x86_64/x86. Normal CA/hostname TLS verification stays enabled;
+redirects are rejected. Standard curl HTTPS proxy/CA configuration remains
+available; no arbitrary artifact URL, digest override or insecure switch exists.
+
+`encode_openh264_fetch.c` pins the **decompressed signed library's SHA-256**
+from Cisco's matching `<artifact>.signed.sha256.txt` file retrieved over
+verified HTTPS. This is the published-checksum route, not a claim of detached
+signature verification. Pins are trust roots reviewed with the source: never
+replace them with a checksum downloaded at runtime alongside the artifact.
+The full binary license is retained in `encode_openh264_license.h`.
+
+Download size is capped at 8 MiB, output at 16 MiB. Partial, concatenated,
+trailing or corrupt bzip2 streams and digest mismatches are rejected before
+any cache write or library load. The verified binary is written to a random,
+exclusive private temporary file, flushed, and atomically renamed to the
+loader's cache filename. On POSIX the installer walks directory descriptors
+without following symlinks, rejects macOS extended allow ACLs (including inherited
+grants), requires safe owned ancestors and private 0700
+metadesk/openh264 directories, and writes a 0600 library. On Windows it rejects
+reparse points, validates ownership/mutation ACLs through opened handles,
+and holds every ancestor without delete sharing through publication; mutation
+ACLs exclude untrusted reparse changes and child deletion.
+It creates protected current-user-only DACLs for cache directories/files and
+uses the wide Windows environment APIs, including non-ASCII profile paths.
+Unsafe pre-existing cache permissions fail closed rather than being modified.
+An interrupted/failed transfer never replaces the previous cached binary.
+The extra host dependency is libbz2 (system library on macOS); OpenSSL and
+libcurl were already required. No FFmpeg profile/script interface changed.
+
+Manual installation with an explicit absolute path is still supported. Verify
+Cisco's checksum/signature yourself, decompress and point `--openh264-path` at
+the library; for cache discovery use the ABI filename above. Only the explicit
+fetch command performs the pinned-checksum install flow.
 
 Example diagnostic runs (the tests also accept `MD_TEST_ENCODER=openh264`):
 
