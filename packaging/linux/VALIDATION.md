@@ -65,7 +65,7 @@ Podman's SIGKILL escalation; this was not a product SIGTERM qualification.
   `16f7d73e0b45c473e903e46981ed0b91efc4c091` (sparse source checkout).
   VAAPI headers 2.20.0-2ubuntu0.2 extracted into the private tree; no host
   packages installed. No hardware encoder/GPU success is inferred.
-- Master `1a3cc8e` (W3 and subsequent owner integrations) merged into W9 via
+- Master `426de60` (W3 plus owner W4 backend integrations) merged into W9 via
   `3a385db`, after profile fix `ef367e9`; no application changes by W9.
 - Fresh macOS client/tools build against the dedicated nostrc pin: **51 pass,
   0 fail, 1 opt-in AX owned-clicks/native-video skip (77)**. Homebrew dependency
