@@ -31,8 +31,10 @@ geometry-tag test's maximum pending-depth assertion. Do not relax that assertion
 The Windows profile of `packaging/ffmpeg/build-minimal-lgpl.sh` applies
 `packaging/ffmpeg/patches/0001-mf-low-latency-vt-bool.patch` to a private source
 copy, preserving the caller's clean FFmpeg tree and retaining a patch receipt.
-Upstreaming remains pending (`md-gml8`). With the property changed to
-`VT_BOOL(VARIANT_TRUE)`, a private minimal LGPL FFmpeg 9.0.2 build passed all
+The complete Windows profile and an unsent FFmpeg-master patch/email draft
+are recorded in [the qualification notes](../../packaging/ffmpeg/README.md)
+(`md-gml8`). With the property changed to `VT_BOOL(VARIANT_TRUE)`, the private
+minimal LGPL FFmpeg 9.0.2 build passed all
 1,771 encode/decode checks: 24 tagged packets, none late or discarded at resize,
 and 20 independent reconnect decoders. Stock MSYS2 FFmpeg is **not qualified**
 for the low-latency MF path. Merely consuming an FFmpeg AVOption cannot prove

@@ -1,0 +1,28 @@
+DRAFT ONLY -- NOT SENT
+To: ffmpeg-devel@ffmpeg.org
+Subject: [PATCH] avcodec/mfenc: use VT_BOOL for low-latency encoder mode
+
+Hi,
+
+Please find the adjacent git-format-patch attachment for mfenc.c. It is
+based on FFmpeg master 359c82515228774eb683dffce9d623b6b4a2fa53,
+fetched on 2026-11-22. The patch changes only the encoder property's
+VARIANT type; Microsoft documents VT_BOOL for encoders, whereas VT_UI4
+is the decoder-specific exception:
+https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avlowlatencymode
+
+The Windows ARM64 OS H.264 software MFT otherwise opens and encodes but
+buffers ten frames under AV_CODEC_FLAG_LOW_DELAY. With VARIANT_TRUE
+passed as VT_BOOL, metadesk's unchanged encode/decode test passes its
+four-frame maximum pending-tag bound, including geometry changes and
+independent reconnect decoders. The packaged minimal LGPL n9.0.2 profile
+is tested separately from this rebased master patch; no full master build
+or positive NVENC/AMF/QSV hardware qualification is claimed.
+
+The one-line downstream fix is carried in metadesk until an upstream
+release includes it. Nothing has been submitted by the preparation tool.
+Please review the author identity, wording and current master base before
+sending the attachment as plain-text email.
+
+Thanks,
+Chris Daley
