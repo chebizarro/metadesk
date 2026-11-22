@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include "md_test.h"
 
 #ifdef __linux__
@@ -300,6 +302,56 @@ static int test_empty_payload(void) {
 }
 
 /* ── Test: recv timeout ──────────────────────────────────────── */
+
+/* md-a4ne: a read deadline may split either header or payload. No timed
+ * sender/sleep: queue a prefix, observe timeout, then queue the exact suffix. */
+static int test_partial_recv_timeout(void) {
+    printf("  test_partial_recv_timeout... ");
+    const size_t prefixes[] = { 1, MD_PACKET_HEADER_SIZE - 1,
+                                MD_PACKET_HEADER_SIZE, MD_PACKET_HEADER_SIZE + 3 };
+    uint8_t wire[MD_PACKET_HEADER_SIZE + 8];
+    REQUIRE(md_packet_encode(MD_PKT_VIDEO_FRAME, 1234, 99,
+        (const uint8_t *)"fragment", 8, wire, sizeof(wire)) == (int)sizeof(wire));
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        MdStreamServer *srv = md_stream_server_create("127.0.0.1", 0);
+        REQUIRE(srv != NULL);
+        int raw = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(raw >= 0);
+        struct sockaddr_in addr = { .sin_family = AF_INET,
+            .sin_port = htons(md_stream_server_port(srv)) };
+        REQUIRE(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+        REQUIRE(connect(raw, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+        MdStream *peer = md_stream_server_accept(srv, 1000);
+        REQUIRE(peer != NULL);
+        REQUIRE(write(raw, wire, prefixes[i]) == (ssize_t)prefixes[i]);
+        MdPacketHeader header;
+        uint8_t *payload = NULL;
+        REQUIRE(md_stream_recv(peer, &header, &payload, 5) == 1);
+        REQUIRE(payload == NULL && md_stream_is_connected(peer));
+        MdStreamStats stats;
+        md_stream_get_stats(peer, &stats);
+        REQUIRE(stats.packets_recv == 0 && stats.bytes_recv == 0);
+        size_t remaining = sizeof(wire) - prefixes[i];
+        REQUIRE(write(raw, wire + prefixes[i], remaining) == (ssize_t)remaining);
+        REQUIRE(md_stream_recv(peer, &header, &payload, 100) == 0);
+        REQUIRE(header.sequence == 1234 && header.payload_len == 8);
+        REQUIRE(payload != NULL && memcmp(payload, "fragment", 8) == 0);
+        free(payload); payload = NULL;
+        REQUIRE(write(raw, wire, sizeof(wire)) == (ssize_t)sizeof(wire));
+        REQUIRE(md_stream_recv(peer, &header, &payload, 100) == 0);
+        REQUIRE(header.sequence == 1234 && memcmp(payload, "fragment", 8) == 0);
+        free(payload); payload = NULL;
+        md_stream_get_stats(peer, &stats);
+        REQUIRE(stats.packets_recv == 2 && stats.bytes_recv == 2 * sizeof(wire));
+        REQUIRE(write(raw, wire, MD_PACKET_HEADER_SIZE + 1) == MD_PACKET_HEADER_SIZE + 1);
+        REQUIRE(md_stream_recv(peer, &header, &payload, 5) == 1);
+        md_stream_destroy(peer); /* pending allocation must be released */
+        close(raw);
+        md_stream_server_destroy(srv);
+    }
+    printf("OK\n");
+    return 0;
+}
 
 static int test_recv_timeout(void) {
     printf("  test_recv_timeout... ");
@@ -696,6 +748,7 @@ int main(void) {
     failures += test_ping_pong();
     failures += test_empty_payload();
     failures += test_recv_timeout();
+    failures += test_partial_recv_timeout();
     failures += test_tls_roundtrip();
     failures += test_plaintext_no_tls();
     failures += test_concurrent_send_recv_peer_close(false);
