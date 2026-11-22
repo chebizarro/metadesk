@@ -161,6 +161,18 @@ static const HostPacketRun *newest_run(const HostCaptureSync *s) {
 void host_capture_sync_packet_sent(HostCaptureSync *s, uint64_t frame_tag,
                                    uint32_t seq) {
     if (!s) return;
+    /* Keep every retained start within the unambiguous half of sequence
+     * space, even when one geometry runs indefinitely. Expired runs may
+     * share a start: run_of picks the newest, which owns that boundary. */
+    const uint32_t counter = seq + 1u;
+    const uint32_t horizon = 1u << 30;
+    const uint32_t count = s->runs_total < HOST_CAPTURE_SYNC_RUNS
+                         ? s->runs_total : HOST_CAPTURE_SYNC_RUNS;
+    for (uint32_t i = 1; i <= count; i++) {
+        HostPacketRun *r = &s->runs[(s->runs_total - i) % HOST_CAPTURE_SYNC_RUNS];
+        if (counter - r->first_seq >= horizon)
+            r->first_seq = counter - (horizon - 1u);
+    }
     HostGeometry g = {0};
     const HostGeometry *held =
         &s->geometries[frame_tag % HOST_CAPTURE_SYNC_GEOMETRIES];

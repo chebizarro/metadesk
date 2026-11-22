@@ -802,6 +802,51 @@ static void test_points_follow_shown_frame(void) {
            current, translated, dropped);
 }
 
+/* The caller-owned counter is the seam: skip packet runs without sending
+ * billions of real packets. Exercise both sides of the horizon and wrap. */
+static void test_point_sequence_horizon(void) {
+    printf("  test_point_sequence_horizon... ");
+    md_test_name = "point_sequence_horizon";
+    const uint32_t horizon = 1u << 30;
+    const uint32_t starts[] = { 0, UINT32_MAX - 10u };
+    for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        MdCaptureCtx cap; MockCap mc;
+        capture_open(&cap, &mc, &G0);
+        uint32_t seq = starts[i];
+        HostCaptureSync sync;
+        host_capture_sync_init(&sync, NULL, NULL, NULL, &seq, G0.w, G0.h, &G0.rect);
+        send_packets(&sync, &seq, 1);
+        int ox, oy;
+        seq = starts[i] + horizon - 2u;
+        send_packets(&sync, &seq, 1); /* counter is horizon - 1 past start */
+        MD_CHECK(sync.runs[0].first_seq == starts[i]);
+        MD_CHECK(map_on(&sync, &G0, starts[i], 100, 50, &ox, &oy) == HOST_POINT_CURRENT);
+        send_packets(&sync, &seq, 1); /* counter reaches horizon */
+        MD_CHECK(sync.runs[0].first_seq == starts[i] + 1u);
+        MD_CHECK(map_on(&sync, &G0, starts[i], 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+        MD_CHECK(map_on(&sync, &G0, starts[i] + 1u, 100, 50, &ox, &oy) == HOST_POINT_CURRENT);
+        for (unsigned step = 0; step < 4; step++) {
+            seq += horizon - 1u;
+            send_packets(&sync, &seq, 1);
+            MD_CHECK(seq - sync.runs[0].first_seq == horizon - 1u);
+            MD_CHECK(map_on(&sync, &G0, seq - 1u, 100, 50, &ox, &oy) == HOST_POINT_CURRENT);
+            MD_CHECK(map_on(&sync, &G0, seq - horizon, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+        }
+        /* When several starts expire together, the newest geometry owns
+         * their common retained boundary; an old run must not mask it. */
+        apply_geometry(&sync, &cap, &GS);
+        send_packets(&sync, &seq, 1);
+        seq += horizon;
+        send_packets(&sync, &seq, 1);
+        const uint32_t cutoff = seq - (horizon - 1u);
+        MD_CHECK(map_on(&sync, &GS, cutoff, 50, 25, &ox, &oy) == HOST_POINT_CURRENT);
+        MD_CHECK(map_on(&sync, &G0, cutoff, 100, 50, &ox, &oy) == HOST_POINT_DROPPED);
+        MD_CHECK(map_on(&sync, &GS, cutoff - 1u, 50, 25, &ox, &oy) == HOST_POINT_DROPPED);
+        md_capture_stop(&cap);
+    }
+    printf("OK\n");
+}
+
 /* Sequences compare modulo 2^32; without a sequence counter nothing is
  * attributable. */
 static void test_point_sequence_edges(void) {
@@ -1430,6 +1475,7 @@ int main(void) {
     test_capped_capture_maps_input();
     test_points_follow_shown_frame();
     test_point_sequence_edges();
+    test_point_sequence_horizon();
     test_async_encoder_attribution();
     test_concurrent_dispatch();
     test_end_to_end_stream();
