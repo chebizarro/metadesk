@@ -898,6 +898,12 @@ if enable_client
     include_directories : [core_inc, include_directories('src/client')],
     dependencies : [dep_metadesk, dep_sdl2])
   test('client render driver selection', test_render_select)
+  test_client_session = executable('test_client_session',
+    files('tests/test_client_session.c', 'src/client/rates.c',
+          'src/client/render.c', 'src/client/ui.cpp'),
+    include_directories : [core_inc, include_directories('src/client')],
+    dependencies : [dep_metadesk, dep_sdl2, dep_imgui])
+  test('client session refusal', test_client_session)
 endif
 
 # Client process contracts without a TTY or display (md-rk4, md-33e).

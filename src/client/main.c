@@ -86,7 +86,7 @@ typedef struct {
     char          stream_token[65];       /* ephemeral DM-only proof    */
     uint32_t      granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
-    volatile int  session_accepted;   /* set by on_dm callback           */
+    volatile int  session_accepted;   /* 1 accepted, -1 refused; under mutex */
     GoChannel      *session_ch;       /* signaled on session accepted    */
     MdAccountWatch *owner_watch;      /* also guards direct-IP sessions  */
     MdAccountBinding *owner;          /* borrowed from startup until drain */
@@ -153,6 +153,22 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         return;
     }
 
+    MdSessionReject reject;
+    if (md_session_reject_from_json(content, &reject) == 0) {
+        pthread_mutex_lock(&g_negotiation_mu);
+        bool matched = ctx->request_pending && !ctx->session_accepted &&
+            md_session_reject_matches_request(&reject, &ctx->pending_req,
+                                               info->rumor_created_at);
+        if (matched) {
+            ctx->session_accepted = -1;
+            ctx->request_pending = 0;
+            ctx->connection_status = md_session_reject_message(&reject);
+        }
+        pthread_mutex_unlock(&g_negotiation_mu);
+        if (matched && ctx->session_ch)
+            go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
+        return;
+    }
     MdSessionAccept acc;
     if (md_session_accept_from_json(content, &acc) != 0) {
         OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
@@ -286,6 +302,7 @@ static void reset_session_accept_state(ClientCtx *ctx) {
     ctx->granted_caps = 0;
     ctx->accepted_tree_format = MD_TREE_FORMAT_COMPACT;
     ctx->session_accepted = 0;
+    ctx->connection_status = NULL;
 }
 
 static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
@@ -362,6 +379,10 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
 
     if (!client_owner_current(ctx)) {
         fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
+        return -1;
+    }
+    if (accepted < 0) {
+        fprintf(stderr, "ERROR: %s\n", ctx->connection_status);
         return -1;
     }
     if (!accepted) {
@@ -993,7 +1014,8 @@ int main(int argc, char **argv) {
             md_session_reset(&session);
 
             ctx.reconnecting = 1;
-            ctx.connection_status = "Disconnected — reconnecting...";
+            if (ctx.session_accepted >= 0)
+                ctx.connection_status = "Disconnected — reconnecting...";
             ctx.reconnect_delay_ms = reconnect_delay_ms;
             render_client_overlay(&ctx, NULL);
 

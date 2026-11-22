@@ -131,6 +131,19 @@ typedef struct {
     char         request_id[MD_SESSION_REQUEST_ID_LEN + 1]; /* echoed; "" if absent */
 } MdSessionAccept;
 
+/* Authenticated host refusal: no session, token, or capabilities are granted.
+ * Unknown reasons fail closed; display only the local, actionable text below. */
+typedef struct {
+    char request_id[MD_SESSION_REQUEST_ID_LEN + 1];
+    char reason[32]; /* capture_unavailable or request_refused */
+} MdSessionReject;
+char *md_session_reject_to_json(const MdSessionReject *reject);
+int md_session_reject_from_json(const char *json, MdSessionReject *out);
+bool md_session_reject_matches_request(const MdSessionReject *reject,
+                                       const MdSessionRequest *req,
+                                       int64_t rumor_created_at);
+const char *md_session_reject_message(const MdSessionReject *reject);
+
 /* Serialize a session request to a newly-allocated JSON string. Caller frees. */
 char *md_session_request_to_json(const MdSessionRequest *req);
 
