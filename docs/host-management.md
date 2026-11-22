@@ -53,6 +53,13 @@ reread `access list` before deciding whether to remove the grant. A lost OK or
 conflicting replacement can likewise already have reached storage. One OK is
 not a multi-relay quorum. No automatic retries are performed.
 
+## Process owner
+
+See [host lifecycle](host-lifecycle.md) for `--managed`, session boundaries,
+status fields, supervisor registration and exit/restart policy. Managed Unix
+startup can recover a checked, refused stale endpoint under a lifetime lock;
+interactive startup retains the no-unlink behavior described below.
+
 ## Startup and CLI
 
 ```sh

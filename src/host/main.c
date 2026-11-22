@@ -48,41 +48,10 @@
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 
-#ifdef _WIN32
-#include "md_interrupt.h"
+#include "lifecycle.h"
 static atomic_bool g_running = true;
-static BOOL WINAPI host_console_interrupt(DWORD kind) {
-    if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT || kind == CTRL_CLOSE_EVENT ||
-        kind == CTRL_LOGOFF_EVENT || kind == CTRL_SHUTDOWN_EVENT) {
-        atomic_store(&g_running, false);
-        return TRUE;
-    }
-    return FALSE;
-}
-#else
-static volatile sig_atomic_t g_running = 1;
-
-static void signal_handler(int sig) {
-    (void)sig;
-    g_running = 0;
-}
-
-#endif
-static int install_signal_handlers(void) {
-#ifdef _WIN32
-    return SetConsoleCtrlHandler(host_console_interrupt, TRUE) ? 0 : -1;
-#else
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    /* A client vanishing mid-send must be an EPIPE on that stream, not a
-     * fatal signal for the whole host (OpenSSL writes bypass MSG_NOSIGNAL). */
-    signal(SIGPIPE, SIG_IGN);
-    return 0;
-#endif
+static bool host_running(void) {
+    return atomic_load(&g_running) && !md_host_lifecycle_stopping();
 }
 
 /* ── State shared between capture callback and main loop ─────── */
@@ -193,12 +162,12 @@ static bool host_wait_request(HostCtx *ctx) {
     GoSelectCase request_case = {
         .op = GO_SELECT_RECEIVE, .chan = ctx->session_req_ch, .recv_buf = &signal,
     };
-    while (g_running && !atomic_load(&ctx->capture_failed) && !host_has_request(ctx)) {
+    while (host_running() && !atomic_load(&ctx->capture_failed) && !host_has_request(ctx)) {
         /* Delivery wakes this wait. The bound only observes process shutdown;
          * it never expires admission or polls/reopens a relay subscription. */
         go_select_timeout(&request_case, 1, 1000);
     }
-    return g_running && !atomic_load(&ctx->capture_failed) && host_has_request(ctx);
+    return host_running() && !atomic_load(&ctx->capture_failed) && host_has_request(ctx);
 }
 
 static void host_rearm_request(HostCtx *ctx) {
@@ -387,8 +356,9 @@ static bool host_cache_frame(HostCtx *ctx, const MdFrame *frame) {
 
 static int host_start_capture(MdCaptureCtx *capture,
                                uint32_t *width, uint32_t *height, HostCtx *ctx) {
-    if (!capture || !width || !height || !ctx || md_capture_start(capture) != 0)
-        return -1;
+    if (!capture || !width || !height || !ctx) return MD_CAPTURE_ERROR;
+    int start_status = md_capture_start(capture);
+    if (start_status != 0) return start_status;
     MdFrame frame;
     if (md_capture_get_frame(capture, &frame,
                              HOST_CAPTURE_FIRST_FRAME_WAIT_MS) != 0)
@@ -515,7 +485,7 @@ static int host_reject_request(HostCtx *ctx, const char *reason) {
 static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     if ((ctx->access && (!md_host_access_valid(ctx->access, ctx->pending_req.request_id) ||
         (int64_t)time(NULL) >= ctx->pending_req.expires_at)) ||
-        !g_running || (owner && !md_account_binding_is_current(owner)) ||
+        !host_running() || (owner && !md_account_binding_is_current(owner)) ||
         (ctx->capture_required && (!ctx->capture_ready ||
                                    atomic_load(&ctx->capture_failed)))) return -1;
     if (md_session_request_freshness(&ctx->pending_req, (int64_t)time(NULL),
@@ -537,7 +507,7 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     int ret = md_nostr_send_session_accept(ctx->nostr, ctx->pending_client_pk, json);
     OPENSSL_cleanse(json, strlen(json));
     free(json);
-    if (ret || !g_running ||
+    if (ret || !host_running() ||
         (ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
         (owner && !md_account_binding_is_current(owner)))
         return -1;
@@ -717,6 +687,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --mcp-allow-npub NPUB  MCP HTTP authorized signer (repeatable)\n");
     fprintf(stderr, "  --mcp-allow-file PATH  MCP HTTP npub allowlist (one per line)\n");
     fprintf(stderr, "  --attended           Enable bounded local approval of unlisted clients\n");
+    fprintf(stderr, "  --managed            Session-supervised, no consent UI; provision account first\n");
     fprintf(stderr, "  --management-socket PATH  Private same-user management endpoint\n");
     fprintf(stderr, "  --mcp-allow-host-list  Also authorize NIP-98 signers granted 'agent' by the saved\n"
                     "                   host role's live metadesk-allowlist (uses --relay);\n"
@@ -950,7 +921,7 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
         }
         if (host_publish_session_accept(ctx, owner) != 0) {
             host_reject_request(ctx, "request_refused");
-            if (!ctx->access || !g_running || atomic_load(&ctx->capture_failed) ||
+            if (!ctx->access || !host_running() || atomic_load(&ctx->capture_failed) ||
                 (owner && !md_account_binding_is_current(owner))) return -1;
             host_rearm_request(ctx);
             continue;
@@ -1054,6 +1025,7 @@ static int host_run(int argc, char **argv) {
     uint32_t bitrate = MD_ENCODER_DEFAULT_BITRATE;
     bool use_nvenc = true;
     const char *openh264_path = NULL, *encoder_name = NULL;
+    bool managed = false;
     bool do_capture = true;
     /* Capture policy options: keep this block independent of input selection. */
     bool capture_unattended = false;
@@ -1105,6 +1077,8 @@ static int host_run(int argc, char **argv) {
             if (path_option) openh264_path = argv[i];
             else encoder_name = argv[i];
         }
+        else if (strcmp(argv[i], "--managed") == 0)
+            managed = true;
         else if (strcmp(argv[i], "--attended") == 0)
             attended = true;
         else if (strcmp(argv[i], "--management-socket") == 0 && i + 1 < argc)
@@ -1280,6 +1254,10 @@ static int host_run(int argc, char **argv) {
 
     /* MCP does not use video session negotiation, Nostr or its session log.
      * Enter before allocating them, and reserve stdout for JSON-RPC. */
+    if (managed && (mcp_stdio || mcp_http)) {
+        fprintf(stderr, "ERROR: --managed is a video host mode, not an MCP transport\n");
+        return MD_HOST_EXIT_CONFIG;
+    }
     if (mcp_stdio || mcp_http) {
         const MdMcpBridgeConfig http_auth = {
             .http_token_file = mcp_token_file,
@@ -1307,7 +1285,7 @@ static int host_run(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
 #endif
 
-    if (install_signal_handlers() != 0) {
+    if (md_host_lifecycle_init(managed) != 0) {
         fprintf(stderr, "ERROR: cannot install termination handlers\n");
         return 1;
     }
@@ -1315,6 +1293,12 @@ static int host_run(int argc, char **argv) {
     pthread_sigmask(SIG_UNBLOCK, &term_signals, NULL);
 #endif
 
+    md_host_lifecycle_event("starting", 0);
+    if (managed && (mcp_stdio || mcp_http || bunker_uri || auto_signer ||
+        use_dbus_signer || use_socket_signer)) {
+        fprintf(stderr, "ERROR: --managed requires a pre-bound host account, not interactive/auto signer or MCP options\n");
+        return MD_HOST_EXIT_CONFIG;
+    }
     printf("metadesk-host v0.1.0\n");
     printf("  port:      %u\n", port);
     printf("  fps:       %u\n", fps);
@@ -1335,7 +1319,9 @@ static int host_run(int argc, char **argv) {
         int rc = md_account_startup_open(MD_ACCOUNT_HOST, &account);
         if (rc) {
             fprintf(stderr, "ERROR: host account restore: %s\n", md_accounts_error_string(rc));
-            return 1;
+            if (rc == MD_SIGNER_ERR_CONNECT || rc == MD_SIGNER_ERR_TIMEOUT ||
+                rc == MD_ACCOUNTS_BUSY || rc == MD_CREDENTIAL_UNAVAILABLE) return 1;
+            return managed ? MD_HOST_EXIT_CONFIG : 1;
         }
         signer = md_signer_ref(md_account_binding_signer(account.binding));
     } else if (bunker_uri) {
@@ -1353,6 +1339,11 @@ static int host_run(int argc, char **argv) {
             printf("host: auto-detecting signer...\n");
             signer = md_signer_auto_detect();
         }
+    }
+    if (managed && !signer) {
+        fprintf(stderr, "ERROR: managed host needs a provisioned, bound host account; run account add/bind-role interactively\n");
+        md_account_startup_clear(&account);
+        return MD_HOST_EXIT_CONFIG;
     }
     /* If no signer from CLI, log that Nostr features require a signer */
     if (signer) {
@@ -1425,12 +1416,14 @@ static int host_run(int argc, char **argv) {
         return 1;
     }
 #endif
+    int startup_status = 1;
     MdHostAccess access;
     if (md_host_access_init(&access)) {
         md_signer_destroy(signer);
         md_account_startup_clear(&account);
         return 1;
     }
+    md_host_access_lifecycle(&access, managed, "starting");
     MdManagementIpc *management = NULL;
     /* Initialize session state */
     MdSession session;
@@ -1494,12 +1487,12 @@ static int host_run(int argc, char **argv) {
 #ifndef _WIN32
             char *host_key = NULL;
             if (md_signer_get_pubkey(signer, &host_key) == 0)
-                management = md_management_start(&access, nostr, host_key, management_socket,
+                management = (managed ? md_management_start_managed : md_management_start)(&access, nostr, host_key, management_socket,
                     ctx.supported_caps, host_management_wake, &ctx);
             free(host_key);
             if (!management) {
                 fprintf(stderr, "host: management endpoint unavailable/unsafe; use --management-socket with a private canonical parent\n");
-                if (attended || management_socket) goto signaling_failed;
+                if (managed || attended || management_socket) goto signaling_failed;
             }
 #endif
             /* Subscribe to allowlist updates */
@@ -1511,6 +1504,8 @@ static int host_run(int argc, char **argv) {
                 fprintf(stderr, "host: WARNING: relay history catch-up (EOSE) not "
                         "confirmed; answering live session requests only\n");
 
+            md_host_access_lifecycle(&access, managed, "waiting");
+            md_host_lifecycle_event("waiting", 0);
             printf("host: nostr bridge ready, waiting for session requests...\n");
 
             while (host_wait_request(&ctx) &&
@@ -1546,12 +1541,13 @@ static int host_run(int argc, char **argv) {
         }
     }
 
-    if (!g_running || session.state != MD_SESSION_NEGOTIATING) {
+    if (!host_running() || session.state != MD_SESSION_NEGOTIATING) {
         fprintf(stderr, "ERROR: negotiated stream authorization required; direct TCP disabled\n");
         goto signaling_failed;
     }
     goto signaling_ready;
 signaling_failed:
+    md_host_access_lifecycle(&access, managed, "stopping");
     free(ctx.cached_frame.data);
     md_nostr_stop(nostr);
     md_management_stop(management);
@@ -1565,7 +1561,7 @@ signaling_failed:
     md_account_startup_clear(&account);
     md_host_access_destroy(&access);
     pthread_mutex_destroy(&ctx.client_mu);
-    return 1;
+    return startup_status;
 signaling_ready:
     ;
     /* Create TCP server */
@@ -1579,6 +1575,7 @@ signaling_ready:
         md_stream_server_destroy(srv);
         goto signaling_failed;
     }
+    md_host_access_lifecycle(&access, managed, "serving");
     printf("host: listening on port %u (pinned TLS 1.3 required)\n", port);
 
     /* Start capture first so encoder/input dimensions match the negotiated
@@ -1592,6 +1589,7 @@ signaling_ready:
 
     if (do_capture) {
         MdCaptureConfig cap_cfg = {
+            .no_interaction = managed,
             .target_fps  = fps,
             .show_cursor = true,
             .unattended = capture_unattended,
@@ -1602,9 +1600,15 @@ signaling_ready:
             .max_height = capture_max_h,
         };
         capture = md_capture_create(&cap_cfg);
-        if (host_start_capture(capture, &display_width, &display_height, &ctx) != 0) {
+        int capture_status = host_start_capture(capture, &display_width, &display_height, &ctx);
+        if (capture_status != 0) {
             fprintf(stderr, "ERROR: capture unavailable: authorize screen sharing and retry; "
                     "refusing video session (use --no-capture only for fixtures)\n");
+            if (managed && capture_status == MD_CAPTURE_INTERACTION_REQUIRED) {
+                startup_status = MD_HOST_EXIT_CONFIG;
+                md_host_access_lifecycle(&access, managed, "needs_interaction");
+                md_host_lifecycle_event("needs_interaction", startup_status);
+            }
             host_reject_request(&ctx, "capture_unavailable");
             if (capture) md_capture_destroy(capture);
             md_stream_server_destroy(srv);
@@ -1715,7 +1719,7 @@ signaling_ready:
         host_reject_request(&ctx, ctx.capture_required &&
             (!ctx.capture_ready || atomic_load(&ctx.capture_failed))
             ? "capture_unavailable" : "request_refused");
-        if (g_running && !atomic_load(&ctx.capture_failed) &&
+        if (host_running() && !atomic_load(&ctx.capture_failed) &&
             (!ctx.capture_required || ctx.capture_ready) &&
             (!account.binding || md_account_binding_is_current(account.binding))) {
             host_rearm_request(&ctx);
@@ -1734,25 +1738,25 @@ signaling_ready:
      * ══════════════════════════════════════════════════════════════ */
     uint32_t client_num = 0;
 
-    while (g_running && !atomic_load(&ctx.capture_failed)) {
+    while (host_running() && !atomic_load(&ctx.capture_failed)) {
         /* A consumed/expired grant must never be reused. Refused negotiations
          * return to the same long-lived DM subscription, not process exit. */
         if (!host_has_request(&ctx)) {
             printf("host: ready for next authorized session request\n");
             if (host_next_session(&ctx, nostr, no_input, account.binding,
                                    &agent, &agent_cfg) != 0) {
-                if (g_running) exit_status = 1;
+                if (host_running()) exit_status = 1;
                 break;
             }
         }
         /* Wait for client connection */
         printf("host: waiting for client...\n");
         MdStream *client = NULL;
-        while (g_running && !atomic_load(&ctx.capture_failed) && !client &&
+        while (host_running() && !atomic_load(&ctx.capture_failed) && !client &&
                host_binding_pending(&ctx, (uint64_t)md_now_ms())) {
             client = md_stream_server_accept(srv, 1000);
         }
-        if (!g_running || atomic_load(&ctx.capture_failed)) {
+        if (!host_running() || atomic_load(&ctx.capture_failed)) {
             md_stream_destroy(client);
             break;
         }
@@ -1814,7 +1818,7 @@ signaling_ready:
         MdBitrateCtrl *br_ctrl = md_bitrate_ctrl_create(&br_cfg);
         uint32_t last_br = bitrate;
 
-        while (g_running && !atomic_load(&ctx.capture_failed) &&
+        while (host_running() && !atomic_load(&ctx.capture_failed) &&
                (!ctx.access || md_host_access_valid(ctx.access, ctx.pending_req.request_id)) &&
                md_stream_is_connected(client)) {
             char *tree = NULL;
@@ -1955,6 +1959,9 @@ signaling_ready:
         g_running = 0;
     }
 
+    md_host_access_lifecycle(&access, managed, "stopping");
+    md_host_lifecycle_event("stopping", 0);
+
     /* ── Shutdown ────────────────────────────────────────────────── */
     printf("\nhost: shutting down...\n");
     atomic_store(&ctx.capture_stopping, true);
@@ -1999,9 +2006,12 @@ signaling_ready:
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 2 && !strcmp(argv[1], "--managed-stop")) return md_host_lifecycle_stop();
+#endif
     int status = host_run(argc, argv);
     /* Drain the process-wide network runtime before ExitProcess kills its
      * threads. DLL atexit handlers run too late to join them on Windows. */
     md_nostr_shutdown();
-    return status;
+    return md_host_lifecycle_finish(status);
 }

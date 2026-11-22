@@ -13,6 +13,14 @@ Optional Cisco OpenH264 must be obtained separately and is never bundled.
 .TP
 .B \-\-help
 Print the complete command-line options and exit without starting a session.
+.TP
+.B \-\-managed
+Run as a provisioned per-user graphical-session agent without consent UI.
+Linux portal video needs an interactive host; managed capture refuses rather
+than displaying a portal dialog. This mode does not support after-logout access.
+.SH EXIT STATUS
+0 on intentional stop; 78 when managed configuration/consent needs operator
+intervention; 1 on runtime failure. The user unit does not restart exit 78.
 .SH FILES
 Configuration and account state are stored in the user's XDG configuration directory.
 No keys or account state are installed by this package.

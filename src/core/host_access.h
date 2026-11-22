@@ -15,6 +15,8 @@ typedef struct {
 typedef struct {
     char generation[33];
     uint64_t revision;
+    bool managed;
+    char lifecycle[24];
     size_t count;
     MdHostRequest requests[MD_HOST_ACCESS_LIMIT];
     bool occupied, revoked;
@@ -33,6 +35,7 @@ typedef struct {
  * Thread safe. No signer, stream, relay or blocking callback work under this
  * lock; observer hooks only signal nonblocking handles. */
 int md_host_access_init(MdHostAccess *a);
+void md_host_access_lifecycle(MdHostAccess *a, bool managed, const char *state);
 void md_host_access_destroy(MdHostAccess *a);
 void md_host_access_stop(MdHostAccess *a);
 /* Notification hooks ONLY signal nonblocking wake handles. Called under mu;

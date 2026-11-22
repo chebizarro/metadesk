@@ -106,3 +106,10 @@ GnuTLS and CMake's prefix propagation discovering host metadata. The profile
 now explicitly disables HTTP/3/QUIC/GnuTLS and CMake-to-pkg-config prefix
 injection. No files under `packaging/ffmpeg/` were changed. Private outputs and
 archives were deleted after verification. x86_64/universal2 remains `md-c17b`.
+
+## Host session agent (W17)
+
+The bundle includes `Contents/Library/LaunchAgents/dev.metadesk.host.plist`
+and a sealed `Contents/Resources/metadesk-host-agent` launcher. Registration
+is opt-in; SMAppService approval, stable signed helper/TCC identity and
+notarization remain md-wdi3. See [host lifecycle](../../docs/host-lifecycle.md).

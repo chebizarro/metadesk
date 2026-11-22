@@ -553,6 +553,10 @@ void *md_capture_sck_test_bind_delegate(MdCaptureCtx *ctx) {
  * compiler prove that instead of re-checking per call. */
 API_AVAILABLE(macos(12.3))
 static int sck_start(MdCaptureCtx *ctx) {
+    if (ctx->config.no_interaction && !CGPreflightScreenCaptureAccess()) {
+        MD_LOG_E("managed capture requires prior Screen Recording authorization for this host identity");
+        return MD_CAPTURE_INTERACTION_REQUIRED;
+    }
     SCKState *sck = ctx->backend_data;
     if (!sck) return -1;
 

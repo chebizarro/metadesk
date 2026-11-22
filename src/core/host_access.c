@@ -47,6 +47,15 @@ int md_host_access_init(MdHostAccess *a) {
     if (pthread_cond_init(&a->changed, NULL)) { pthread_mutex_destroy(&a->mu); return -1; }
     return 0;
 }
+void md_host_access_lifecycle(MdHostAccess *a, bool managed, const char *state) {
+    pthread_mutex_lock(&a->mu);
+    if (a->view.managed != managed || strcmp(a->view.lifecycle, state)) {
+        a->view.managed = managed;
+        snprintf(a->view.lifecycle, sizeof(a->view.lifecycle), "%s", state);
+        changed(a);
+    }
+    pthread_mutex_unlock(&a->mu);
+}
 void md_host_access_destroy(MdHostAccess *a) {
     pthread_cond_destroy(&a->changed);
     pthread_mutex_destroy(&a->mu);

@@ -187,3 +187,10 @@ release trust, hosted CI or owner key policy. See
 [cosign signing documentation](https://docs.sigstore.dev/cosign/signing/signing_with_containers/)
 and the result summary in VALIDATION.md. Debian packaging conventions follow the
 [Debian maintainer guide](https://www.debian.org/doc/manuals/debmake-doc/).
+
+## Managed graphical-session host (W17)
+
+The staged deb/rpm/AUR tree ships the refined opt-in systemd user unit.
+Managed Linux video refuses rather than open portal consent UI; see
+[host lifecycle](../../docs/host-lifecycle.md) before enabling the unit.
+No linger or root service is installed.

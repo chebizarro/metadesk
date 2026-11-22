@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -25,6 +26,7 @@ struct MdManagementIpc {
     void (*wake)(void *);
     void *data;
     int listener;
+    int lock_fd;
     int stop_pipe[2];
     pthread_t thread;
     pthread_mutex_t mu;
@@ -164,6 +166,11 @@ static cJSON *snapshot(MdHostAccess *a, const char *error) {
     if (error) cJSON_AddStringToObject(j,"error",error);
     cJSON_AddStringToObject(j,"generation",v.generation);
     cJSON_AddNumberToObject(j,"revision",(double)v.revision);
+    cJSON *host = cJSON_AddObjectToObject(j,"host");
+    cJSON_AddBoolToObject(host,"managed",v.managed);
+    cJSON_AddNumberToObject(host,"pid",(double)getpid());
+    cJSON_AddStringToObject(host,"state",v.lifecycle[0] ? v.lifecycle : "starting");
+    cJSON_AddStringToObject(host,"mode","user-session");
     cJSON *qs = cJSON_AddArrayToObject(j,"requests");
     for (size_t i=0; i<v.count; ++i) cJSON_AddItemToArray(qs, request_json(&v.requests[i]));
     if (v.occupied) {
@@ -314,14 +321,36 @@ static void *accept_peers(void *data) {
     }
     return NULL;
 }
-MdManagementIpc *md_management_start(MdHostAccess *a, MdNostr *n, const char *key,
-    const char *path, uint32_t supported, void (*wake)(void *), void *data) {
+static bool claim_managed_endpoint(MdManagementIpc *s) {
+    char path[PATH_MAX];
+    snprintf(path,sizeof(path),"%s.lock",s->path);
+    s->lock_fd=open(path,O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    struct stat lock, named;
+    if (s->lock_fd<0 || fstat(s->lock_fd,&lock) || !S_ISREG(lock.st_mode) ||
+        lock.st_uid!=geteuid() || (lock.st_mode&0777)!=0600 || lock.st_nlink!=1 ||
+        flock(s->lock_fd,LOCK_EX|LOCK_NB) || lstat(path,&named) ||
+        named.st_dev!=lock.st_dev || named.st_ino!=lock.st_ino) return false;
+    struct stat stale, current;
+    if (lstat(s->path,&stale)) return errno==ENOENT;
+    if (!S_ISSOCK(stale.st_mode) || stale.st_uid!=geteuid() || (stale.st_mode&0777)!=0600) return false;
+    int fd=unix_socket(); if (fd<0) return false;
+    struct sockaddr_un addr={.sun_family=AF_UNIX};strcpy(addr.sun_path,s->path);
+    int rc=connect(fd,(struct sockaddr *)&addr,sizeof(addr)), error=errno;
+    close(fd);
+    if (!rc || error!=ECONNREFUSED || lstat(s->path,&current) ||
+        current.st_dev!=stale.st_dev || current.st_ino!=stale.st_ino) return false;
+    return unlink(s->path)==0;
+}
+static MdManagementIpc *management_start(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t supported, void (*wake)(void *), void *data, bool managed) {
     MdManagementIpc *s = calloc(1,sizeof(*s)); if (!s) return NULL;
+    s->lock_fd = -1;
     s->listener = -1; s->stop_pipe[0] = s->stop_pipe[1] = -1; s->access=a; s->nostr=n; s->supported=supported; s->wake=wake; s->data=data;
     if (path) { if (strlen(path) >= sizeof(s->path)) goto fail; strcpy(s->path,path); }
     else if (md_management_path(key,s->path,sizeof(s->path))) goto fail;
     if (!private_parent(s->path)) goto fail;
     struct stat st;
+    if (managed && !claim_managed_endpoint(s)) goto fail;
     if (!lstat(s->path,&st) || errno != ENOENT) goto fail;
     s->listener = unix_socket(); if (s->listener < 0) goto fail;
     struct sockaddr_un addr = { .sun_family=AF_UNIX }; strcpy(addr.sun_path,s->path);
@@ -342,7 +371,16 @@ bound_fail:
 fail:
     for (int i=0; i<2; ++i) if (s->stop_pipe[i] >= 0) close(s->stop_pipe[i]);
     if (s->listener >= 0) close(s->listener);
+    if (s->lock_fd >= 0) close(s->lock_fd);
     free(s); return NULL;
+}
+MdManagementIpc *md_management_start(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t caps, void (*wake)(void *), void *data) {
+    return management_start(a,n,key,path,caps,wake,data,false);
+}
+MdManagementIpc *md_management_start_managed(MdHostAccess *a, MdNostr *n, const char *key,
+    const char *path, uint32_t caps, void (*wake)(void *), void *data) {
+    return management_start(a,n,key,path,caps,wake,data,true);
 }
 void md_management_stop(MdManagementIpc *s) {
     if (!s) return;
@@ -361,6 +399,7 @@ void md_management_stop(MdManagementIpc *s) {
     close(s->stop_pipe[0]); close(s->stop_pipe[1]);
     struct stat st;
     if (!lstat(s->path,&st) && st.st_dev == s->dev && st.st_ino == s->ino) unlink(s->path);
+    if (s->lock_fd >= 0) close(s->lock_fd);
     pthread_mutex_destroy(&s->mu); free(s);
 }
 cJSON *md_management_call(const char *path, const cJSON *j) {
@@ -387,6 +426,8 @@ MdManagementIpc *md_management_start(MdHostAccess *a,MdNostr *n,const char *k,co
     (void)a;(void)n;(void)k;(void)p;(void)caps;(void)wake;(void)d;
     fprintf(stderr,"management: unsupported on Windows (owner-DACL/client-SID named pipe not implemented)\n"); return NULL;
 }
+MdManagementIpc *md_management_start_managed(MdHostAccess *a,MdNostr *n,const char *k,const char *p,
+    uint32_t caps,void (*wake)(void *),void *d) { return md_management_start(a,n,k,p,caps,wake,d); }
 void md_management_stop(MdManagementIpc *s) { (void)s; }
 cJSON *md_management_call(const char *p,const cJSON *j) { (void)p;(void)j;return NULL; }
 #endif
