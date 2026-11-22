@@ -58,6 +58,15 @@ def main():
             for t in threads:
                 t.join()
 
+    # Reuse the registered signer/session gate for full native-TCP binaries.
+    # A -Dclient=false build still exercises the host-only quoted-seal test.
+    client = Path(binding).with_name("metadesk-client")
+    if client.exists():
+        from direct_ip_session import run
+        run(str(Path(binding).with_name("metadesk-host")), str(client), crypto)
+    else:
+        print("SKIP: direct-IP binary E2E requires -Dclient=true")
+
 
 if __name__ == "__main__":
     main()

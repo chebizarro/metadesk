@@ -90,7 +90,8 @@ typedef struct {
     char          expected_client_pk[128]; /* optional required client pubkey hex */
     char          pending_client_pk[128]; /* pubkey of requesting client */
     MdSessionRequest pending_req;         /* parsed session request      */
-    volatile int  session_requested;      /* set by on_dm callback       */
+    int           session_requested;      /* guarded by g_host_request_mu */
+    char          previous_request_id[MD_SESSION_REQUEST_ID_LEN + 1];
     GoChannel      *session_req_ch;       /* signaled on session request */
 } HostCtx;
 
@@ -126,7 +127,42 @@ static void host_owner_revoked(void *data) {
 }
 
 
-static void host_on_dm(const char *sender_pubkey_hex, const char *content,
+static pthread_mutex_t g_host_request_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Callback and host thread transfer one immutable request at a time. */
+static bool host_has_request(HostCtx *ctx) {
+    pthread_mutex_lock(&g_host_request_mu);
+    bool ready = ctx->session_requested != 0;
+    pthread_mutex_unlock(&g_host_request_mu);
+    return ready;
+}
+
+static bool host_wait_request(HostCtx *ctx) {
+    void *signal = NULL;
+    GoSelectCase request_case = {
+        .op = GO_SELECT_RECEIVE, .chan = ctx->session_req_ch, .recv_buf = &signal,
+    };
+    while (g_running && !host_has_request(ctx)) {
+        /* Delivery wakes this wait. The bound only observes process shutdown;
+         * it never expires admission or polls/reopens a relay subscription. */
+        go_select_timeout(&request_case, 1, 1000);
+    }
+    return g_running && host_has_request(ctx);
+}
+
+static void host_rearm_request(HostCtx *ctx) {
+    pthread_mutex_lock(&g_host_request_mu);
+    memcpy(ctx->previous_request_id, ctx->pending_req.request_id,
+           sizeof(ctx->previous_request_id));
+    memset(&ctx->pending_req, 0, sizeof(ctx->pending_req));
+    ctx->pending_client_pk[0] = '\0';
+    md_session_reset(ctx->session);
+    ctx->session_requested = 0;
+    pthread_mutex_unlock(&g_host_request_mu);
+}
+
+/* Caller holds g_host_request_mu. */
+static void host_handle_dm(const char *sender_pubkey_hex, const char *content,
                        const MdNostrDmInfo *info, void *userdata) {
     HostCtx *ctx = userdata;
     if (!ctx || !content || !info || ctx->session_requested) return;
@@ -169,6 +205,11 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
             return;
         }
 
+        if (!strcmp(req.request_id, ctx->previous_request_id)) {
+            fprintf(stderr, "host: ignoring previously consumed session request\n");
+            return;
+        }
+
         strncpy(ctx->pending_client_pk, sender_pubkey_hex,
                 sizeof(ctx->pending_client_pk) - 1);
         ctx->pending_req = req;
@@ -183,6 +224,13 @@ static void host_on_dm(const char *sender_pubkey_hex, const char *content,
                                  NULL, sender_pubkey_hex,
                                  "session request via NIP-17 DM");
     }
+}
+
+static void host_on_dm(const char *sender_pubkey_hex, const char *content,
+                       const MdNostrDmInfo *info, void *userdata) {
+    pthread_mutex_lock(&g_host_request_mu);
+    host_handle_dm(sender_pubkey_hex, content, info, userdata);
+    pthread_mutex_unlock(&g_host_request_mu);
 }
 
 /* ── Map capture pixel format to encoder pixel format ──────────── */
@@ -690,6 +738,34 @@ static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
     return md_session_accept(ctx->session, session_id, granted);
 }
 
+static int host_accept_fresh_request(HostCtx *ctx, MdNostr *nostr, bool no_input) {
+    unsigned char random[16];
+    char session_id[64];
+    if (RAND_bytes(random, sizeof(random)) != 1) return -1;
+    snprintf(session_id, sizeof(session_id),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             random[0], random[1], random[2], random[3], random[4], random[5],
+             random[6], random[7], random[8], random[9], random[10], random[11],
+             random[12], random[13], random[14], random[15]);
+    if (md_session_request_freshness(&ctx->pending_req, (int64_t)time(NULL),
+                                     ctx->pending_req.issued_at) != MD_SESSION_REQUEST_FRESH ||
+        host_accept_request(ctx, nostr, session_id, no_input) != 0) {
+        fprintf(stderr, "ERROR: stale request or current client policy grants no requested capabilities\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int host_replace_agent(HostCtx *ctx, MdAgent **agent, MdAgentConfig *cfg) {
+    cfg->tree_format = ctx->session->tree_format;
+    MdAgent *next = md_agent_create(cfg);
+    if (!next) return -1;
+    md_agent_destroy(*agent);
+    *agent = next;
+    ctx->agent = next;
+    return 0;
+}
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1152,7 +1228,7 @@ int main(int argc, char **argv) {
                 go_select_timeout(cases, 1, 60000); /* 60s timeout */
             }
 
-            if (ctx.session_requested && g_running &&
+            if (host_has_request(&ctx) && g_running &&
                 (!account.binding || md_account_binding_is_current(account.binding))) {
                 if (fips_npub) {
                     printf("host: waiting for FIPS peer readiness for %.*s...\n",
@@ -1172,27 +1248,8 @@ int main(int argc, char **argv) {
                     printf("host: FIPS peer ready: %s\n", ready.detail);
                 }
 
-                /* Generate cryptographically random session ID */
-                char session_id[64];
-                {
-                    uint8_t rnd[16];
-                    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
-                        fprintf(stderr, "ERROR: session entropy unavailable\n");
-                        goto signaling_failed;
-                    }
-                    snprintf(session_id, sizeof(session_id),
-                             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                             rnd[0],rnd[1],rnd[2],rnd[3], rnd[4],rnd[5],
-                             rnd[6],rnd[7], rnd[8],rnd[9],
-                             rnd[10],rnd[11],rnd[12],rnd[13],rnd[14],rnd[15]);
-                }
-
-                /* Record the current per-client grant now; reserve/publish
-                 * its token only after listener/backends are ready. */
-                if (host_accept_request(&ctx, nostr, session_id, no_input)) {
-                    fprintf(stderr, "ERROR: current client policy grants no requested capabilities\n");
+                if (host_accept_fresh_request(&ctx, nostr, no_input) != 0)
                     goto signaling_failed;
-                }
 
             } else if (g_running) {
                 if (fips_npub || account.binding) {
@@ -1560,7 +1617,25 @@ signaling_ready:
 
         if (!g_running) break;
 
-        printf("host: ready for next connection\n");
+        host_rearm_request(&ctx);
+        printf("host: ready for next authorized session request\n");
+        if (!host_wait_request(&ctx)) break;
+        if (host_accept_fresh_request(&ctx, nostr, no_input) != 0) {
+            fprintf(stderr, "ERROR: fresh authorized session required after disconnect\n");
+            exit_status = 1;
+            break;
+        }
+        /* Finish replacement backends before granting a new stream. */
+        if (host_replace_agent(&ctx, &agent, &agent_cfg) != 0) {
+            fprintf(stderr, "ERROR: failed to recreate agent for new session\n");
+            exit_status = 1;
+            break;
+        }
+        if (host_publish_session_accept(&ctx, account.binding) != 0) {
+            fprintf(stderr, "ERROR: new session acceptance failed\n");
+            exit_status = 1;
+            break;
+        }
     }
 
     /* ── Shutdown ────────────────────────────────────────────────── */

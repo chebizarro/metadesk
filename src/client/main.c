@@ -189,12 +189,13 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s HOST|--npub NPUB [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "Usage: %s [--host ADDRESS] --npub HOST_NPUB [OPTIONS]\n\n", argv0);
     fprintf(stderr, "Connect to a metadesk host and display remote desktop.\n\n");
     fprintf(stderr, "Arguments:\n");
-    fprintf(stderr, "  HOST               Host address (IP or hostname)\n\n");
+    fprintf(stderr, "  ADDRESS            Positional alias for --host (requires --npub)\n\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --npub NPUB        Connect via FIPS mesh (npub1xxx)\n");
+    fprintf(stderr, "  --host ADDRESS     Direct TCP endpoint (IP or hostname; port via --port)\n");
+    fprintf(stderr, "  --npub HOST_NPUB   Required host identity; FIPS route unless --host is set\n");
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
     fprintf(stderr, "  --timeout MS       Connect/readiness timeout (default: 5000)\n");
@@ -256,7 +257,7 @@ static int check_fips_daemon(const char *socket_path, uint32_t timeout_ms) {
     return 0;
 }
 
-static void cleanup_npub_nostr(MdNostr **nostr, ClientCtx *ctx) {
+static void cleanup_session_nostr(MdNostr **nostr, ClientCtx *ctx) {
     /* Drain callbacks/revocation before releasing their channel. */
     if (ctx) {
         md_account_binding_unwatch(ctx->owner_watch);
@@ -285,7 +286,7 @@ static void reset_session_accept_state(ClientCtx *ctx) {
     ctx->session_accepted = 0;
 }
 
-static int negotiate_npub_session(MdNostr *nostr, ClientCtx *ctx,
+static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
                                   const char *host_pubkey_hex,
                                   uint32_t timeout_ms,
                                   MdSessionRequest *out_req) {
@@ -428,7 +429,12 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     MdStream *stream = NULL;
     if (!client_owner_current(ctx)) return NULL;
 
-    if (npub) {
+    if (!npub || !nostr || !host_pubkey_hex || !host_pubkey_hex[0]) {
+        fprintf(stderr, "ERROR: authenticated session requires --npub host identity\n");
+        return NULL;
+    }
+
+    if (!host) {
         printf("client: checking FIPS daemon health...\n");
         if (check_fips_daemon(fips_control_socket, timeout_ms) != 0)
             return NULL;
@@ -448,37 +454,37 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         }
         printf("client: FIPS peer ready: %s\n", ready.detail);
 
-        MdSessionRequest req;
-        if (negotiate_npub_session(nostr, ctx, host_pubkey_hex,
-                                   timeout_ms, &req) != 0 || !client_owner_current(ctx))
-            return NULL;
+    }
 
-        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
-        stream = md_stream_connect_fips(npub, port, timeout_ms);
-        if (!stream) {
-            fprintf(stderr, "ERROR: FIPS connect failed\n");
-            return NULL;
-        }
+    /* Endpoint selection never bypasses identity-pinned Nostr admission. */
+    MdSessionRequest req;
+    if (negotiate_session(nostr, ctx, host_pubkey_hex,
+                          timeout_ms, &req) != 0 || !client_owner_current(ctx))
+        return NULL;
 
-        if (!client_owner_current(ctx) || send_session_info(stream, ctx) != 0 ||
-            !client_owner_current(ctx)) {
-            fprintf(stderr, "ERROR: failed to send session info\n");
-            md_stream_destroy(stream);
-            return NULL;
-        }
-
-        md_session_reset(session);
-        md_session_request(session, npub, req.capabilities,
-                           ctx->accepted_tree_format);
-        md_session_accept(session, ctx->accepted_session_id,
-                          ctx->granted_caps);
-        md_session_activate(session);
-    } else {
+    if (host) {
         printf("client: connecting to %s:%u...\n", host, port);
         stream = md_stream_connect(host, port, timeout_ms);
-        if (!stream)
-            fprintf(stderr, "ERROR: failed to connect to %s:%u\n", host, port);
+    } else {
+        printf("client: connecting via FIPS to %.*s...\n", 12, npub);
+        stream = md_stream_connect_fips(npub, port, timeout_ms);
     }
+    if (!stream) {
+        fprintf(stderr, "ERROR: %s connect failed\n", host ? "direct TCP" : "FIPS");
+        return NULL;
+    }
+    if (!client_owner_current(ctx) || send_session_info(stream, ctx) != 0 ||
+        !client_owner_current(ctx)) {
+        fprintf(stderr, "ERROR: session binding/ACK failed\n");
+        md_stream_destroy(stream);
+        return NULL;
+    }
+
+    md_session_reset(session);
+    md_session_request(session, npub, req.capabilities,
+                       ctx->accepted_tree_format);
+    md_session_accept(session, ctx->accepted_session_id, ctx->granted_caps);
+    md_session_activate(session);
 
     if (!client_owner_current(ctx)) {
         md_stream_destroy(stream);
@@ -721,6 +727,13 @@ int main(int argc, char **argv) {
             timeout_ms = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--fips-control") == 0 && i + 1 < argc)
             fips_control_socket = argv[++i];
+        else if (strcmp(argv[i], "--host") == 0) {
+            if (host || i + 1 >= argc || argv[i + 1][0] == '-' || !argv[i + 1][0]) {
+                fprintf(stderr, "ERROR: --host requires one address (port via --port)\n");
+                return 1;
+            }
+            host = argv[++i];
+        }
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             npub = argv[++i];
         else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
@@ -744,16 +757,20 @@ int main(int argc, char **argv) {
         }
         else if (argv[i][0] != '-' && !host)
             host = argv[i];
+        else {
+            fprintf(stderr, "ERROR: unknown or incomplete option: %s\n", argv[i]);
+            return 1;
+        }
     }
 
-    if (!host && !npub) {
-        fprintf(stderr, "ERROR: host address or --npub required\n\n");
+    if (!npub) {
+        fprintf(stderr, "ERROR: --npub host identity required, including for direct TCP (--host ADDRESS)\n\n");
         usage(argv[0]);
         return 1;
     }
 
     printf("metadesk-client v0.1.0\n");
-    if (npub) {
+    if (!host) {
         printf("  fips:      %.*s...\n", 12, npub);
     } else {
         printf("  host:      %s:%u\n", host, port);
@@ -827,7 +844,7 @@ int main(int argc, char **argv) {
     char host_pubkey_hex[65] = { 0 };
 
     if (npub) {
-        /* ── Nostr-signaled FIPS connect (Phase 2.1) ──────────── */
+        /* Nostr authorization is shared by direct TCP and FIPS. */
 
         /* Ensure we have a signer for NIP-17 DMs */
         if (!signer) {
@@ -869,7 +886,7 @@ int main(int argc, char **argv) {
 
         if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
             fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
-            cleanup_npub_nostr(&nostr, &ctx);
+            cleanup_session_nostr(&nostr, &ctx);
             md_signer_destroy(signer);
             md_account_startup_clear(&account);
             return 1;
@@ -883,7 +900,7 @@ int main(int argc, char **argv) {
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (!nostr) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
-            cleanup_npub_nostr(&nostr, &ctx);
+            cleanup_session_nostr(&nostr, &ctx);
             md_signer_destroy(signer);
             md_account_startup_clear(&account);
             return 1;
@@ -893,7 +910,7 @@ int main(int argc, char **argv) {
     }
 
     if (!g_running) {
-        cleanup_npub_nostr(&nostr, &ctx);
+        cleanup_session_nostr(&nostr, &ctx);
         md_signer_destroy(signer);
         md_account_startup_clear(&account);
         return 1;
@@ -902,7 +919,7 @@ int main(int argc, char **argv) {
                                    port, timeout_ms, nostr,
                                    host_pubkey_hex, &ctx, &session);
     if (!stream) {
-        cleanup_npub_nostr(&nostr, &ctx);
+        cleanup_session_nostr(&nostr, &ctx);
         md_signer_destroy(signer);
         md_account_startup_clear(&account);
         return 1;
@@ -914,7 +931,7 @@ int main(int argc, char **argv) {
     if (!decoder) {
         fprintf(stderr, "ERROR: failed to create H.264 decoder\n");
         md_stream_destroy(stream);
-        cleanup_npub_nostr(&nostr, &ctx);
+        cleanup_session_nostr(&nostr, &ctx);
         md_signer_destroy(signer);
         md_account_startup_clear(&account);
         return 1;
@@ -928,7 +945,7 @@ int main(int argc, char **argv) {
                             "use --no-display for decode-only\n");
             md_decoder_destroy(decoder);
             md_stream_destroy(stream);
-            cleanup_npub_nostr(&nostr, &ctx);
+            cleanup_session_nostr(&nostr, &ctx);
             md_signer_destroy(signer);
             md_account_startup_clear(&account);
             md_renderer_close_display();
@@ -1174,7 +1191,7 @@ int main(int argc, char **argv) {
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
-    cleanup_npub_nostr(&nostr, &ctx);
+    cleanup_session_nostr(&nostr, &ctx);
     md_signer_destroy(signer);
     md_account_startup_clear(&account);
     free(ctx.ui_tree_json);

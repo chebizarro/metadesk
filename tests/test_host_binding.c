@@ -4,13 +4,21 @@
 #define md_agent_handle_action test_action
 #define md_input_mouse_move test_move
 #define md_nostr_send_session_accept test_publish
+#define md_agent_create test_create_agent
 #include "../src/host/main.c"
 #undef main
 #undef md_nostr_send_session_accept
+#undef md_agent_create
 #include "md_test.h"
 /* nostr.h's prototype was renamed by the macro above; restore the real one. */
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload);
+
+MdAgent *md_agent_create(const MdAgentConfig *cfg);
+static bool fail_agent_create;
+MdAgent *test_create_agent(const MdAgentConfig *cfg) {
+    return fail_agent_create ? NULL : md_agent_create(cfg);
+}
 
 static unsigned tree_calls, action_calls, input_calls, publish_calls;
 static MdSessionAccept published;
@@ -573,6 +581,22 @@ static void hist_session(const char *url, const char *session_id,
     MD_CHECK(strcmp(cp.accepted.request_id, req.request_id) == 0);
     MD_CHECK(CRYPTO_memcmp(cp.accepted.stream_token, s.stream_token, 64) == 0);
 
+    /* Same-process admission rearms, but cannot answer the consumed request
+     * again even if a live delivery bypasses the transport's event dedup. */
+    host_rearm_request(&ctx);
+    json = md_session_request_to_json(&req);
+    const MdNostrDmInfo live = { .rumor_created_at = req.issued_at, .live = true };
+    host_on_dm(client_pk, json, &live, &ctx);
+    free(json);
+    MD_CHECK(!host_has_request(&ctx));
+    MD_CHECK(md_session_request_prepare(&req, (int64_t)time(NULL), 30) == 0);
+    json = md_session_request_to_json(&req);
+    const MdNostrDmInfo next = { .rumor_created_at = req.issued_at, .live = true };
+    host_on_dm(client_pk, json, &next, &ctx);
+    free(json);
+    MD_CHECK(host_has_request(&ctx));
+    MD_CHECK(!strcmp(ctx.pending_req.request_id, req.request_id));
+
     md_nostr_destroy(client);
     md_nostr_destroy(host);
     go_channel_close(ctx.session_req_ch);
@@ -676,6 +700,48 @@ static void test_request_gate(void) {
     MD_CHECK(!ctx.session_requested && !ctx.pending_req.request_id[0]);
 }
 
+/* Rearming discards a consumed grant, not the last request's replay fence. */
+static void test_rearm_request(void) {
+    MdSession s;
+    MdSessionAccept acc = reserve(&s, MD_CAP_VIDEO);
+    HostCtx ctx = context(&s);
+    ctx.session_requested = 1;
+    MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
+    char previous[MD_SESSION_REQUEST_ID_LEN + 1];
+    memcpy(previous, ctx.pending_req.request_id, sizeof(previous));
+    strcpy(ctx.pending_client_pk, "old-peer");
+    MD_CHECK(host_has_request(&ctx));
+    host_rearm_request(&ctx);
+    MD_CHECK(!host_has_request(&ctx));
+    MD_CHECK(!ctx.pending_req.request_id[0] && !ctx.pending_client_pk[0]);
+    MD_CHECK(!strcmp(ctx.previous_request_id, previous));
+    MD_CHECK(s.state == MD_SESSION_IDLE && !s.stream_token[0]);
+    Pair replay = pair();
+    send_proof(replay, &acc);
+    MD_CHECK(host_bind_candidate(&ctx, replay.host) < 0);
+    closed(replay);
+    destroy_pair(replay);
+    OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
+}
+
+static void test_agent_replacement_failure(void) {
+    MdSession s; md_session_init(&s);
+    s.tree_format = MD_TREE_FORMAT_JSON;
+    HostCtx ctx = context(&s);
+    MdAgentConfig cfg = { .tree_format = MD_TREE_FORMAT_COMPACT };
+    MdAgent *agent = md_agent_create(&cfg), *original = agent;
+    MD_CHECK(agent);
+    ctx.agent = agent;
+    fail_agent_create = true;
+    MD_CHECK(host_replace_agent(&ctx, &agent, &cfg) < 0);
+    MD_CHECK(agent == original && ctx.agent == original);
+    fail_agent_create = false;
+    MD_CHECK(host_replace_agent(&ctx, &agent, &cfg) == 0);
+    MD_CHECK(agent != original && ctx.agent == agent);
+    MD_CHECK(cfg.tree_format == MD_TREE_FORMAT_JSON);
+    md_agent_destroy(agent);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc == 4 && !strcmp(argv[1], "--nip5f-fixture")) {
@@ -696,6 +762,8 @@ int main(int argc, char **argv) {
         return md_test_report();
     }
     test_request_gate();
+    test_rearm_request();
+    test_agent_replacement_failure();
     test_candidate_and_second_client(); test_unbound_dispatch(); test_bad_proofs();
     test_denied_capabilities(); test_late_publication(); test_expiry_and_strict_json();
     return md_test_report();
