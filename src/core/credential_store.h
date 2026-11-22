@@ -29,6 +29,8 @@ MdCredentialStore *md_credential_store_default(void);
 MdCredentialStore *md_credential_store_secret_service(void);
 /* NULL path selects the default Keychain. Explicit path supports isolated tests. */
 MdCredentialStore *md_credential_store_keychain(const char *path);
+/* Current-user DPAPI ciphertext; NULL uses LOCALAPPDATA/metadesk/credentials. */
+MdCredentialStore *md_credential_store_windows(const char *directory);
 void md_credential_store_destroy(MdCredentialStore *);
 
 typedef struct {

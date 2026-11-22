@@ -39,7 +39,8 @@ For an **already paired** NIP-46 account:
 The JSON has `version: 1`, `user_pubkey`, `remote_pubkey`, `client_secret` (the
 transport key, not the user's private key), and `relays` (an array of ws/wss
 URLs). Pairing UI/URI generation is not implemented by this CLI. Credentials go
-only to Secret Service on Linux or Keychain on macOS. There is no plaintext
+only to Secret Service on Linux, Keychain on macOS, or current-user DPAPI on
+Windows. There is no plaintext
 fallback. Headless operations do not prompt to unlock a locked OS store; unlock
 it externally and retry. Duplicate Secret Service items fail closed; remove the
 remote account and re-import its pairing to recover. Removal deletes only
@@ -61,7 +62,8 @@ other role's signer. Release leases when work drains.
 
 `management.json` stores only versioned account metadata and role pairs. Default
 location: `$XDG_CONFIG_HOME/metadesk` (or `~/.config/metadesk`) on Linux;
-`~/Library/Application Support/metadesk` on macOS. A private, owned 0700 directory
+`~/Library/Application Support/metadesk` on macOS;
+`%LOCALAPPDATA%/metadesk/accounts` on Windows. On POSIX, a private, owned 0700 directory
 and 0600 regular, single-link files are required; symlink path components are
 refused. `account --config-dir ABSOLUTE_DIRECTORY ...` overrides the location.
 An advisory lock prevents concurrent controller/CLI writers. Saves use a 0600
@@ -141,3 +143,41 @@ installed; otherwise Meson explicitly reports the unavailable fixture. It uses
 a private HOME, XDG directories, runtime directory, D-Bus session, and daemon,
 then removes all fixture files. It tests replacement across a default-collection
 change and rejects duplicate items. No live user keyring is used by the tests.
+
+### Windows storage
+
+Windows writes the same metadata/role schema, locks writers using an exclusive
+non-inheritable file handle, and replaces flushed metadata atomically. Runtime
+snapshots release that lock after loading; saved direct-key selections still
+require an explicit key at activation. Identity pins, independent role
+cancellation, removal and credential-deletion failure semantics are unchanged.
+
+NIP-46 credentials are encrypted by `CryptProtectData` for the **current user**
+(not machine-wide), with the account public key as entropy, then atomically
+stored under `%LOCALAPPDATA%/metadesk/credentials/<pubkey>.dpapi`. DPAPI supports
+the complete 64 KiB credential schema; Credential Manager's 2560-byte blob limit
+would truncate valid multi-relay payloads. No Credential Manager entries are
+created. The OS profile must support DPAPI; failure is fatal, never a plaintext
+fallback or UI prompt. Copying ciphertext to another user/machine is not a
+portable backup. Removal deletes only that account's encrypted file.
+
+Native security checks require the final directory and files to be owned by
+the current user, with no effective allow ACEs for any other SID (including
+SYSTEM/Administrators). Unknown ACE types, null DACLs, hardlinked files, and
+reparse points at any path component are refused. Paths must be on a local fixed drive (not a network mapping or SUBST alias),
+drive-absolute UTF-8, without alternate streams, dot components or device/UNC
+namespaces. Ancestors deny write/delete sharing during use. The private final directory
+allows child updates but denies delete sharing; its owner-only DACL excludes
+untrusted reparse writers. Reads deny concurrent file writers. Existing permissive stores are **not** silently
+repaired. Newly created directories/files receive protected owner-only DACLs.
+
+Native tests: `meson test -C build accounts 'Windows native private storage + DPAPI'`
+(the real user DPAPI backend uses isolated temporary directories, never a mock
+or the user's saved store). The normal accounts test also runs role persistence,
+identity rejection, credential removal and in-flight revocation on Windows.
+
+The foreign-owner negative cell additionally runs
+`test_win_security.exe --foreign-owner` under an administrative test token with
+`SeRestorePrivilege`. It temporarily assigns a task-private file to SYSTEM,
+asserts rejection, restores its original owner, deletes it, and restores token
+privileges. Do not run it against a real account store.

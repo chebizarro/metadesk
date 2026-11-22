@@ -27,11 +27,12 @@ typedef struct MdAccountWatch MdAccountWatch;
 /* Control-plane objects are single-owner, not concurrently mutable. Leases
  * below are thread-safe and may outlive the controller. A retained advisory
  * lock rejects concurrent writers to the same directory (no lost CLI updates).
- * NULL directory = XDG_CONFIG_HOME/metadesk, or macOS Application Support.
+ * NULL directory = XDG_CONFIG_HOME/metadesk, macOS Application Support,
+ * or Windows LOCALAPPDATA/metadesk/accounts.
  * NULL store is allowed for metadata-only use, but NIP-46 removal fails closed.
  * The store is borrowed and must outlive the accounts controller.
- * Persistence is Linux/macOS only; Windows returns UNSUPPORTED, never a
- * plaintext fallback. Metadata getters borrow until the next mutation. */
+ * Windows uses native owner-only DACLs; secret persistence uses user DPAPI.
+ * Metadata getters borrow until the next mutation. */
 int md_accounts_open(const char *directory, MdCredentialStore *store, MdAccounts **out);
 void md_accounts_destroy(MdAccounts *);
 /* Runtime snapshot: load atomically under the writer lock, then release it so
