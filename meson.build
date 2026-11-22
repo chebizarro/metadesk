@@ -386,6 +386,15 @@ if host_os == 'linux'
   dep_pipewire  = dependency('libpipewire-0.3', version : '>=0.3.65')
   dep_atspi     = dependency('atspi-2',         version : '>=2.48')
   dep_udev      = dependency('libudev',         version : '>=252')
+  dep_xcb_input = dependency('xcb-xinput', version : '>=1.15')
+  dep_xcb = dependency('xcb', version : '>=1.15')
+  dep_xau = dependency('xau')
+  dep_ei = dependency('libei-1.0', version : '>=1.2', required : get_option('portal_input'))
+  if dep_ei.found()
+    add_project_arguments('-DMD_HAVE_PORTAL_INPUT', language : ['c', 'cpp'])
+    platform_hal_sources += files('src/core/input_portal.c')
+    platform_hal_deps += [dep_ei, dependency('xkbcommon', version : '>=1.0')]
+  endif
   dep_dbus      = dependency('dbus-1',          version : '>=1.14')
   # a11y_atspi.c calls g_object_unref/g_boxed_free directly; atspi-2.pc only
   # exposes gobject-2.0 privately, so link it explicitly.
@@ -400,7 +409,7 @@ if host_os == 'linux'
     'src/core/ipc_unix.c',
   )
   platform_hal_deps += [dep_pipewire, dep_atspi, dep_udev, dep_dbus,
-                        dep_gobject, dep_uuid]
+                        dep_gobject, dep_uuid, dep_xcb_input, dep_xcb, dep_xau]
 
 elif host_os == 'darwin'
   add_languages('objc', required : true)
@@ -1123,6 +1132,33 @@ test_input = executable('test_input',
   dependencies : [dep_metadesk] + wayland_test_deps,
 )
 test('input injection', test_input)
+# Compile the real selection logic against device-free backend factories.
+# Exercise portal choice even on hosts without libei, never native injection.
+test_input_selection = executable('test_input_selection',
+  files('tests/test_input_selection.c', 'src/core/input.c', 'src/core/log.c'),
+  include_directories : core_inc,
+  c_args : ['-DMD_HAVE_PORTAL_INPUT'],
+  dependencies : [dep_threads],
+)
+test('input backend selection', test_input_selection)
+
+if host_os == 'linux'
+  dep_input_x11 = dependency('x11')
+  test_input_desktop = executable('test_input_desktop',
+    'tests/test_input_desktop.c', dependencies : [dep_metadesk, dep_input_x11])
+  test('input first-key desktop (opt-in)', test_input_desktop, timeout : 180)
+  if dep_ei.found()
+    dep_eis_test = dependency('libeis-1.0', version : '>=1.2', required : false)
+    if dep_eis_test.found()
+      test_input_portal = executable('test_input_portal', 'tests/test_input_portal.c',
+        dependencies : [dep_metadesk, dep_eis_test, dep_dbus, dependency('xkbcommon')])
+      test('input portal private bus + EIS', find_program('python3'),
+        args : [files('tests/run_input_portal.py'), test_input_portal], timeout : 30)
+    endif
+  endif
+
+endif
+
 
 test_agent = executable('test_agent',
   files('tests/test_agent.c'),
