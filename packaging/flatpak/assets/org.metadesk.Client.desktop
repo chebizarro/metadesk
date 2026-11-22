@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Metadesk Client
+Comment=Connect to a remote Metadesk desktop
+Exec=metadesk-client
+Icon=org.metadesk.Client
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true

@@ -1,0 +1,294 @@
+{
+  "name": "dependencies",
+  "buildsystem": "simple",
+  "build-commands": [],
+  "modules": [
+    {
+      "name": "cjson",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/DaveGamble/cJSON/tar.gz/refs/tags/v1.7.19",
+          "sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DENABLE_CJSON_TEST=OFF",
+        "-DENABLE_CJSON_UTILS=OFF",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "libb2",
+      "buildsystem": "autotools",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/BLAKE2/libb2/releases/download/v0.98.1/libb2-0.98.1.tar.gz",
+          "sha256": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "--disable-static",
+        "--disable-openmp"
+      ]
+    },
+    {
+      "name": "jansson",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/akheron/jansson/tar.gz/refs/tags/v2.14",
+          "sha256": "c739578bf6b764aa0752db9a2fdadcfe921c78f1228c7ec0bb47fa804c55d17b",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DJANSSON_BUILD_SHARED_LIBS=ON",
+        "-DJANSSON_BUILD_DOCS=OFF",
+        "-DJANSSON_BUILD_TESTS=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "secp256k1",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.6.0",
+          "sha256": "785bb98e7d6705c51c8dfa8ac3af6aa2ccfa3774714d51c0b9e28fac1146e9f1",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DSECP256K1_ENABLE_MODULE_RECOVERY=ON",
+        "-DSECP256K1_BUILD_TESTS=OFF",
+        "-DSECP256K1_BUILD_BENCHMARK=OFF",
+        "-DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "nsync",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/google/nsync/tar.gz/refs/tags/1.30.0",
+          "sha256": "883a0b3f8ffc1950670425df3453c127c1a3f6ed997719ca1bbe7f474235b6cc",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DNSYNC_ENABLE_TESTS=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "libwebsockets",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/warmcat/libwebsockets/tar.gz/refs/tags/v4.3.3",
+          "sha256": "6fd33527b410a37ebc91bb64ca51bdabab12b076bc99d153d7c5dd405e4bdf90",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DLWS_WITH_STATIC=OFF",
+        "-DLWS_WITH_SHARED=ON",
+        "-DLWS_WITHOUT_TESTAPPS=ON",
+        "-DLWS_WITH_LIBUV=OFF",
+        "-DLWS_WITH_GLIB=OFF",
+        "-DLWS_WITH_LIBEVENT=OFF",
+        "-DLWS_WITH_EVLIB_PLUGINS=OFF",
+        "-DLWS_WITHOUT_EXTENSIONS=ON",
+        "-DLWS_WITHOUT_CLIENT=OFF",
+        "-DLWS_WITHOUT_SERVER=OFF",
+        "-DLWS_WITH_HTTP2=OFF",
+        "-DLWS_WITH_EXTERNAL_POLL=ON",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "libyuv",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://chromium.googlesource.com/libyuv/libyuv",
+          "commit": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
+          "disable-submodules": true
+        }
+      ],
+      "config-opts": [
+        "-DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON",
+        "-DUNIT_TEST=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ]
+    },
+    {
+      "name": "sdl2",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://www.libsdl.org/release/SDL2-2.32.10.tar.gz",
+          "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+          "archive-type": "tar-gzip"
+        }
+      ],
+      "config-opts": [
+        "-DSDL_SHARED=ON",
+        "-DSDL_STATIC=OFF",
+        "-DSDL_TEST=OFF",
+        "-DSDL_TESTS=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ],
+      "builddir": true
+    },
+    {
+      "name": "nv-codec-headers",
+      "buildsystem": "simple",
+      "build-commands": [
+        "make PREFIX=/app install"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/refs/tags/n13.0.19.0",
+          "sha256": "86d15d1a7c0ac73a0eafdfc57bebfeba7da8264595bf531cf4d8db1c22940116",
+          "archive-type": "tar-gzip"
+        }
+      ]
+    },
+    {
+      "name": "amf-headers",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -d /app/include/AMF",
+        "cp -a amf/public/include/* /app/include/AMF/"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/AMF/tar.gz/16f7d73e0b45c473e903e46981ed0b91efc4c091",
+          "sha256": "4718172ea414a8219ef0e0c7863e127ee0ee6f3094662008f44bfd73ab77a23a",
+          "archive-type": "tar-gzip"
+        }
+      ]
+    },
+    {
+      "name": "onevpl",
+      "only-arches": [
+        "x86_64"
+      ],
+      "buildsystem": "cmake-ninja",
+      "config-opts": [
+        "-DBUILD_TESTS=OFF",
+        "-DBUILD_TOOLS=OFF",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_INSTALL_LIBDIR=lib"
+      ],
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/intel/libvpl.git",
+          "tag": "v2.15.0",
+          "commit": "c45b5d786bf7cdabbe49ff1bab78693ad78feb78",
+          "disable-submodules": true
+        }
+      ]
+    },
+    {
+      "name": "ffmpeg-lgpl",
+      "buildsystem": "simple",
+      "build-options": {
+        "cflags": "-I/app/include",
+        "env": {
+          "MD_FFMPEG_CFLAGS": "-I/app/include",
+          "MD_FFMPEG_JOBS": "2"
+        }
+      },
+      "build-commands": [
+        "chmod +x packaging/ffmpeg/*.sh",
+        "sh build-ffmpeg.sh"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+          "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+          "dest": "ffmpeg-source",
+          "archive-type": "tar-xz"
+        },
+        {
+          "type": "file",
+          "path": "build-ffmpeg.sh"
+        },
+        {
+          "type": "file",
+          "path": "../ffmpeg/build-minimal-lgpl.sh",
+          "dest": "packaging/ffmpeg"
+        },
+        {
+          "type": "file",
+          "path": "../ffmpeg/profile-encoders.sh",
+          "dest": "packaging/ffmpeg"
+        },
+        {
+          "type": "file",
+          "path": "../ffmpeg/verify-codecs.c",
+          "dest": "packaging/ffmpeg"
+        }
+      ]
+    },
+    {
+      "name": "nostrc",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cmake -S . -B _build -G \"Unix Makefiles\" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_USE_SYSTEM_NSYNC=ON -DWITH_NOSTRDB=OFF -DLIBNOSTR_WITH_NOSTRDB=OFF -DNOSTR_WITH_GLIB=OFF -DBUILD_APPS=OFF -DBUILD_GNOSTR_APP=OFF -DBUILD_NOSTR_GOBJECT=OFF -DBUILD_NOSTR_GTK=OFF -DBUILD_TESTING=OFF -DBUILD_TESTING_FRAMEWORK=OFF -DBUILD_SIGNER_TESTS=OFF -DBUILD_FIPS=OFF -DBUILD_RELAYD=OFF -DBUILD_LIBHANAMI=OFF -DBUILD_LIBBLOSSOM=OFF -DBUILD_LIBMARMOT=OFF -DBUILD_LIBPORTHOME=OFF -DBUILD_LIBVAULT=OFF -DBUILD_LIBVAULT_MARMOT=OFF -DBUILD_MARMOT_GOBJECT=OFF -DSIGNET_ENABLE=OFF -DCMAKE_PREFIX_PATH=/app",
+        "cmake --build _build -j2 --target nostr nostr_json go_fiber nostr_nip44_core nostr_nip46_core nostr_nip5f_core nip04 nip19 nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core",
+        "install -d /app/lib/metadesk-nostrc/source",
+        "cp -a libnostr libgo nips /app/lib/metadesk-nostrc/source/",
+        "cp -a _build /app/lib/metadesk-nostrc/build"
+      ],
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/chebizarro/nostrc.git",
+          "commit": "cfcb86296068c1e4090bc5ce8a486392dc74eb11",
+          "disable-submodules": true
+        }
+      ]
+    },
+    {
+      "name": "patchelf",
+      "buildsystem": "autotools",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0.tar.bz2",
+          "sha256": "1952b2a782ba576279c211ee942e341748fdb44997f704dd53def46cd055470b",
+          "archive-type": "tar-bzip2"
+        }
+      ]
+    }
+  ]
+}

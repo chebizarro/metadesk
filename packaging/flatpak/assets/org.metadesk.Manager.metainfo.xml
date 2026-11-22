@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.metadesk.Manager</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Metadesk Manager</name>
+  <summary>Manage signer accounts and relay setup</summary>
+  <description><p>Configure Metadesk signer accounts, host roles and relays. This companion does not install or run a host service.</p></description>
+  <launchable type="desktop-id">org.metadesk.Manager.desktop</launchable>
+  <url type="homepage">https://github.com/chebizarro/metadesk</url>
+  <url type="bugtracker">https://github.com/chebizarro/metadesk/issues</url>
+  <developer id="com.chrisdaley"><name>Chris Daley</name></developer>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="0.1.0" date="2026-11-22"/></releases>
+</component>
