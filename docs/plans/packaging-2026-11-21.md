@@ -236,13 +236,16 @@ LGPL components; no FFmpeg command-line tools, containers, filters or audio):
 | Artifact / script profile | Additional configure flags | Build inputs / runtime boundary |
 |---|---|---|
 | macOS DMG / `macos` | `--enable-videotoolbox --enable-encoder=h264_videotoolbox` | Apple SDK; `MACOSX_DEPLOYMENT_TARGET=13.0`; OS VideoToolbox, no codec dylib from Homebrew FFmpeg |
-| Windows MSI / `windows` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-mediafoundation --enable-libvpl --enable-encoder=h264_nvenc,h264_amf,h264_mf,h264_qsv` | nv-codec-headers + AMF **headers only**; Media Foundation SDK; oneVPL dispatcher; driver runtimes supplied by OS/user, not bundled |
-| Linux container image / `container` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-vaapi --enable-libdrm --enable-libvpl --enable-encoder=h264_nvenc,h264_amf,h264_vaapi,h264_qsv` | nv-codec-headers + AMF headers, libva/libdrm + oneVPL; classify dispatcher libraries in BOM; GPU access is deployment-dependent |
+| Windows MSI / `windows` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-mediafoundation --enable-encoder=h264_nvenc,h264_amf,h264_mf`; **x86/x86_64 only:** `--enable-libvpl` and add `h264_qsv` | nv-codec-headers + AMF **headers only**; Media Foundation SDK; oneVPL dispatcher; driver runtimes supplied by OS/user, not bundled |
+| Linux container image / `container` | `--enable-ffnvcodec --enable-nvenc --enable-amf --enable-vaapi --enable-libdrm --enable-encoder=h264_nvenc,h264_amf,h264_vaapi`; **x86/x86_64 only:** `--enable-libvpl` and add `h264_qsv` | nv-codec-headers + AMF headers, libva/libdrm + oneVPL; classify dispatcher libraries in BOM; GPU access is deployment-dependent |
 | Flatpak / `flatpak` | same as `container` | Own minimal LGPL module, not an unverified full-codec extension; current client needs only decode, encoders do not promise Flatpak host/input support |
 | .deb / .rpm / AUR | **system FFmpeg** (no metadesk configure invocation) | Link system libavcodec/libavutil, declare package dependencies; distro licensing/configuration applies |
 
 `packaging/ffmpeg/build-minimal-lgpl.sh PROFILE SOURCE OUTPUT` implements these
-flags. No `--enable-libx264`, `--enable-libx265` or `--enable-libopenh264`;
+flags. `MD_FFMPEG_ARCH` selects the target architecture; otherwise the compiler
+target is inferred (including `CC`/cross-prefix). ARM64 profiles retain NVENC/AMF
+and platform VAAPI/MF, but disable Intel-only libvpl/QSV. The configure and runtime
+inventory gates use the same architecture-specific encoder list. No `--enable-libx264`, `--enable-libx265` or `--enable-libopenh264`;
 `--disable-autodetect` prevents accidental external codec pickup. Required
 headers/SDKs must exist: missing requested encoders fail, never silently
 produce a reduced “success.” Cross-toolchain variables are documented in the

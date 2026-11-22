@@ -83,7 +83,8 @@ def main():
         flags = shlex.split(run('pkg-config', '--cflags', '--libs', 'libavcodec', 'libavutil', env=probe_env))
         probe = out / 'codec-probe'
         subprocess.run(['cc', str(src / 'packaging/ffmpeg/verify-codecs.c'), *flags, '-o', str(probe)], env=probe_env, check=True)
-        receipt = run(str(probe), 'h264_nvenc', 'h264_amf', 'h264_vaapi', 'h264_qsv', env=probe_env)
+        encoders = run(str(src / 'packaging/ffmpeg/profile-encoders.sh'), 'container', platform.machine()).split(',')
+        receipt = run(str(probe), *encoders, env=probe_env)
         (out / 'codec-inventory.txt').write_text(receipt + '\n')
         probe.unlink()
     stage = out / 'install'
