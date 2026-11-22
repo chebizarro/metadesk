@@ -11,7 +11,7 @@ license=('MIT' 'Apache-2.0')
 provides=('metadesk')
 conflicts=('metadesk')
 depends=('ffmpeg' 'sdl2' 'pipewire' 'at-spi2-core' 'glib2' 'libsecret' 'systemd-libs'
-         'dbus' 'util-linux-libs' 'curl' 'libwebsockets' 'openssl' 'libsecp256k1'
+         'dbus' 'libxcb>=1.15' 'libxau' 'util-linux-libs' 'curl' 'libwebsockets' 'openssl' 'libsecp256k1'
          'jansson' 'cjson' 'libb2' 'libyuv')
 optdepends=('fipsd: FIPS mesh transport' 'xdg-desktop-portal: desktop capture portal'
             'xdg-desktop-portal-gtk: GTK portal backend'

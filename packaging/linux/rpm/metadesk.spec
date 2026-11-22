@@ -18,6 +18,9 @@ BuildRequires:  pkgconfig(libavcodec) >= 60
 BuildRequires:  pkgconfig(libavutil) >= 58
 BuildRequires:  pkgconfig(sdl2) pkgconfig(libpipewire-0.3) pkgconfig(atspi-2)
 BuildRequires:  pkgconfig(glib-2.0) pkgconfig(gio-unix-2.0) pkgconfig(libsecret-1)
+BuildRequires:  pkgconfig(xcb-xinput) >= 1.15
+BuildRequires:  pkgconfig(xcb) >= 1.15
+BuildRequires:  pkgconfig(xau)
 BuildRequires:  pkgconfig(libudev) pkgconfig(dbus-1) pkgconfig(uuid)
 BuildRequires:  pkgconfig(libcurl) pkgconfig(libwebsockets) pkgconfig(openssl)
 BuildRequires:  pkgconfig(libsecp256k1) pkgconfig(jansson) pkgconfig(libcjson)

@@ -7,6 +7,7 @@ ARG BASE
 RUN apt-get update && apt-get install -y --no-install-recommends \
  build-essential cmake meson ninja-build python3 pkg-config patchelf binutils \
  libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev libpipewire-0.3-dev \
+ libxcb-xinput-dev libxcb1-dev libxau-dev \
  libatspi2.0-dev libglib2.0-dev libsecret-1-dev libudev-dev libdbus-1-dev uuid-dev \
  libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev libjansson-dev \
  libcjson-dev libb2-dev libnsync-dev libsodium-dev libevent-dev ca-certificates \
