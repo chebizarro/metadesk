@@ -14,6 +14,7 @@
  * ImGui will render on top of the video frame texture.
  */
 #include "render.h"
+#include "video_geometry.h"
 
 #include <SDL2/SDL.h>
 
@@ -322,9 +323,8 @@ void md_renderer_begin_frame(MdRenderer *r) {
      *  - viewport: force the full output in pixels. On a HiDPI macOS window
      *    the default viewport is the window POINT size, which would clip the
      *    frame to the top-left quarter of the drawable.
-     *  - scale: set to the HiDPI factor (output px / window pt). RenderCopy to
-     *    a point-sized dst then fills the whole window; ImGui geometry (also
-     *    in points) is scaled the same way.
+     *  - video: fit the source aspect in physical pixels; clear the bars.
+     *  - overlay: restore the HiDPI factor for ImGui's point-sized geometry.
      *  - clip: clear any leftover ImGui scissor rect. */
     int out_w = 0, out_h = 0;
     SDL_GetRendererOutputSize(r->sdl_renderer, &out_w, &out_h);
@@ -334,12 +334,15 @@ void md_renderer_begin_frame(MdRenderer *r) {
         SDL_RenderSetViewport(r->sdl_renderer, &vp);
     }
     SDL_RenderSetClipRect(r->sdl_renderer, NULL);
-    SDL_RenderSetScale(r->sdl_renderer, r->hidpi_scale_x, r->hidpi_scale_y);
+    SDL_SetRenderDrawColor(r->sdl_renderer, 0, 0, 0, 255);
     SDL_RenderClear(r->sdl_renderer);
     if (r->texture) {
-        SDL_Rect dst = { 0, 0, (int)r->win_width, (int)r->win_height };
-        SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, &dst);
+        MdVideoRect fit = md_video_fit(r->tex_width, r->tex_height, out_w, out_h);
+        SDL_Rect dst = { fit.x, fit.y, fit.w, fit.h };
+        if (dst.w > 0 && dst.h > 0)
+            SDL_RenderCopy(r->sdl_renderer, r->texture, NULL, &dst);
     }
+    SDL_RenderSetScale(r->sdl_renderer, r->hidpi_scale_x, r->hidpi_scale_y);
 }
 
 void md_renderer_end_frame(MdRenderer *r) {

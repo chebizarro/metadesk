@@ -898,6 +898,14 @@ if enable_client
     include_directories : [core_inc, include_directories('src/client')],
     dependencies : [dep_metadesk, dep_sdl2])
   test('client render driver selection', test_render_select)
+  test_video_geometry = executable('test_video_geometry', 'tests/test_video_geometry.c',
+    include_directories : [core_inc, include_directories('src/client'), include_directories('tests')])
+  test('client video fit and input geometry', test_video_geometry)
+  if get_option('tools')
+    executable('render_probe', files('tools/e2e/render-probe.c', 'src/client/render.c'),
+      include_directories : [core_inc, include_directories('src/client'), include_directories('tests')],
+      dependencies : [dep_metadesk, dep_sdl2])
+  endif
   test_client_session = executable('test_client_session',
     files('tests/test_client_session.c', 'src/client/rates.c',
           'src/client/render.c', 'src/client/ui.cpp'),

@@ -21,6 +21,7 @@
 #include "stream.h"
 #include "decode.h"
 #include "render.h"
+#include "video_geometry.h"
 #include "rates.h"
 #include "signer.h"
 #include "nostr.h"
@@ -565,22 +566,20 @@ static bool map_to_remote(ClientCtx *ctx, int wx, int wy,
     const uint32_t fw = ctx->shown.w, fh = ctx->shown.h;
     if (!ctx->renderer || fw == 0 || fh == 0)
         return false;
-    /* Use the LIVE window size, not the renderer's stored value: the OS may
-     * keep the window at a different size than we requested (e.g. zoomed to
-     * fill the screen), and the video is stretched to fill the whole window.
-     * SDL mouse coords are in the same point space as SDL_GetWindowSize. */
+    /* Use live point and drawable sizes, as presentation does. Input in
+     * letterbox/pillarbox regions must not become a click at a remote edge. */
     SDL_Window *win = (SDL_Window *)md_renderer_get_sdl_window(ctx->renderer);
     int ww = 0, wh = 0;
     if (win)
         SDL_GetWindowSize(win, &ww, &wh);
-    if (ww <= 0 || wh <= 0)
+    SDL_Renderer *renderer = (SDL_Renderer *)md_renderer_get_sdl_renderer(ctx->renderer);
+    int ow = 0, oh = 0;
+    if (!renderer || SDL_GetRendererOutputSize(renderer, &ow, &oh) != 0)
         return false;
-    long mx = (long)wx * (long)fw / (long)ww;
-    long my = (long)wy * (long)fh / (long)wh;
-    if (mx < 0) mx = 0;
-    if (mx > (long)fw - 1) mx = (long)fw - 1;
-    if (my < 0) my = 0;
-    if (my > (long)fh - 1) my = (long)fh - 1;
+    uint32_t mx, my;
+    if (!md_video_map(fw, fh, ww, wh, ow, oh, wx, wy, &mx, &my) ||
+        mx > INT16_MAX || my > INT16_MAX)
+        return false;
     *rx = (int16_t)mx;
     *ry = (int16_t)my;
     return true;
@@ -721,7 +720,12 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 int main(int argc, char **argv) {
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
+#ifdef _WIN32
+    /* UCRT treats _IOLBF as full buffering, including redirected output. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 #ifndef _WIN32

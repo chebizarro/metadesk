@@ -66,6 +66,14 @@ struct MdStream {
     uint32_t     granted_caps;
     uint32_t     send_seq;       /* monotonic sequence for sent packets    */
 
+    /* One receive owner, as before; timeout returns preserve packet progress. */
+    uint8_t      recv_header_buf[MD_PACKET_HEADER_SIZE];
+    size_t       recv_header_bytes;
+    MdPacketHeader recv_header;
+    bool         recv_header_ready;
+    uint8_t     *recv_payload;
+    size_t       recv_payload_bytes;
+
     /* TLS (NULL when plaintext). ssl_mu serialises every call into ssl and
      * is never held across a wait (md-z6nw). */
     SSL         *ssl;
@@ -142,12 +150,13 @@ static int ssl_io(MdStream *s, bool write, void *buf, size_t len, int *ssl_err) 
 }
 
 /* Read exactly n bytes, handling partial reads.
- * Uses SSL_read when TLS is active (see ssl_io), raw read() otherwise.
+ * Uses SSL_read when TLS is active (see ssl_io), md_socket_recv otherwise.
  * timeout_ms is a deadline for the whole read, not a per-syscall
  * budget — a peer dribbling bytes cannot extend it.
  * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
-static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) {
-    size_t total = 0;
+static int read_exact_progress(MdStream *s, uint8_t *buf, size_t n,
+                               size_t *received, uint32_t timeout_ms) {
+    size_t total = *received;
     MdSocket fd = s->fd;
     const uint32_t deadline = timeout_ms > 0
         ? md_stream_now_ms() + timeout_ms : 0;
@@ -168,6 +177,7 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
             int r = ssl_io(s, false, buf + total, n - total, &err);
             if (r > 0) {
                 total += (size_t)r;
+                *received = total;
                 continue;
             }
             if (err == SSL_ERROR_ZERO_RETURN)
@@ -195,8 +205,15 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
             return -1;
         }
         total += (size_t)r;
+        *received = total;
     }
     return 0;
+}
+
+/* Binding reads have a single bounded attempt and close on failure. */
+static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) {
+    size_t received = 0;
+    return read_exact_progress(s, buf, n, &received, timeout_ms);
 }
 
 /* A TLS 1.3 write (every context here pins 1.3) never waits on a read once
@@ -206,7 +223,7 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
 #define SSL_WRITE_WANT_READ_SLICE_MS 50
 
 /* Write exactly n bytes, handling partial writes.
- * Uses SSL_write when TLS is active (see ssl_io), raw write() otherwise. */
+ * Uses SSL_write when TLS is active (see ssl_io), md_socket_send otherwise. */
 static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
     size_t total = 0;
 
@@ -726,53 +743,59 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
     if (!s || !RLX_LOAD(s->connected) || !hdr)
         return -1;
 
-    /* Read header */
-    uint8_t hdr_buf[MD_PACKET_HEADER_SIZE];
-    int ret = read_exact(s, hdr_buf, MD_PACKET_HEADER_SIZE, timeout_ms);
-    if (ret != 0) {
-        if (ret < 0) RLX_STORE(s->connected, false);
-        return ret;  /* -1 = error, 1 = timeout */
-    }
-
-    if (md_packet_header_read(hdr, hdr_buf, sizeof(hdr_buf)) < 0) {
-        RLX_STORE(s->connected, false);
-        return -1;
-    }
-
-    /* Sanity check payload size */
-    if (hdr->payload_len > MD_STREAM_MAX_PAYLOAD) {
-        RLX_STORE(s->connected, false);
-        return -1;
-    }
-
-    /* Read payload */
-    uint8_t *payload = NULL;
-    if (hdr->payload_len > 0) {
-        payload = malloc(hdr->payload_len);
-        if (!payload) {
-            /* The header is already consumed but payload_len bytes remain
-             * unread; we cannot resync, so tear the connection down rather
-             * than let the next recv read payload as a header. */
-            RLX_STORE(s->connected, false);
-            return -1;
+    if (payload_out) *payload_out = NULL;
+    uint32_t started = md_stream_now_ms();
+    int ret = 0;
+    if (!s->recv_header_ready) {
+        ret = read_exact_progress(s, s->recv_header_buf, MD_PACKET_HEADER_SIZE,
+                                  &s->recv_header_bytes, timeout_ms);
+        if (ret != 0) goto incomplete;
+        if (md_packet_header_read(&s->recv_header, s->recv_header_buf,
+                                  sizeof(s->recv_header_buf)) < 0 ||
+            s->recv_header.payload_len > MD_STREAM_MAX_PAYLOAD) {
+            ret = -1;
+            goto incomplete;
         }
-
-        ret = read_exact(s, payload, hdr->payload_len, timeout_ms);
-        if (ret != 0) {
-            free(payload);
-            if (ret < 0) RLX_STORE(s->connected, false);
-            return ret;
+        if (s->recv_header.payload_len > 0) {
+            s->recv_payload = malloc(s->recv_header.payload_len);
+            if (!s->recv_payload) {
+                ret = -1;
+                goto incomplete;
+            }
         }
+        s->recv_header_ready = true;
+    }
+    if (s->recv_header.payload_len > s->recv_payload_bytes) {
+        uint32_t remaining = timeout_ms;
+        if (timeout_ms > 0) {
+            uint32_t elapsed = md_stream_now_ms() - started;
+            if (elapsed >= timeout_ms) return 1;
+            remaining -= elapsed;
+        }
+        ret = read_exact_progress(s, s->recv_payload, s->recv_header.payload_len,
+                                  &s->recv_payload_bytes, remaining);
+        if (ret != 0) goto incomplete;
     }
 
-    if (payload_out)
-        *payload_out = payload;
-    else
-        free(payload);
-
+    *hdr = s->recv_header;
+    if (payload_out) *payload_out = s->recv_payload;
+    else free(s->recv_payload);
+    s->recv_payload = NULL;
+    s->recv_payload_bytes = s->recv_header_bytes = 0;
+    s->recv_header_ready = false;
     RLX_ADD(s->bytes_recv, (uint64_t)MD_PACKET_HEADER_SIZE + hdr->payload_len);
     RLX_ADD(s->packets_recv, 1);
     return 0;
+
+incomplete:
+    if (ret < 0) {
+        RLX_STORE(s->connected, false);
+        free(s->recv_payload);
+        s->recv_payload = NULL;
+        s->recv_payload_bytes = s->recv_header_bytes = 0;
+        s->recv_header_ready = false;
+    }
+    return ret;
 }
 
 /* Session binding deadlines share md_session_prepare_binding()'s clock. */
@@ -892,5 +915,6 @@ void md_stream_destroy(MdStream *s) {
     if (s->fd >= 0)
         md_socket_close(s->fd);
     pthread_mutex_destroy(&s->ssl_mu);
+    free(s->recv_payload);
     free(s);
 }
