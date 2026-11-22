@@ -26,6 +26,10 @@ endif
 # (Tests assert via MD_CHECK in tests/md_test.h, which is never gated by
 #  NDEBUG; src/ contains no assert() calls. No -UNDEBUG stopgap needed.)
 
+if host_os == 'windows'
+  add_project_arguments('-DSDL_MAIN_HANDLED', language : ['c', 'cpp'])
+endif
+
 # ── Options ──────────────────────────────────────────────────────────────────
 enable_client  = get_option('client')
 enable_nip46   = get_option('signer_nip46')
@@ -424,6 +428,8 @@ elif host_os == 'windows'
   # Windows system libraries
   cc = meson.get_compiler('c')
   platform_hal_deps += [
+    cc.find_library('ws2_32', required : true),
+    cc.find_library('rpcrt4', required : true),
     cc.find_library('d3d11', required : true),
     cc.find_library('dxgi', required : true),
     cc.find_library('user32', required : true),
@@ -711,6 +717,9 @@ endif
 core_sources = files(
   'src/core/log.c',
   'src/core/io_util.c',
+  'src/core/md_socket.c',
+  'src/core/md_compat.c',
+  'src/core/md_interrupt.c',
   'src/core/md_time.c',
   'src/core/agent.c',
   'src/core/action.c',
@@ -796,7 +805,7 @@ if host_os == 'linux' or host_os == 'darwin'
 endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c', 'src/host/account_cli.c',
+host_sources = files('src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
   'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
   'src/host/capture_sync.c')
 host_includes = [core_inc]
@@ -1084,7 +1093,7 @@ test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
   files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
-    'src/host/capture_sync.c'),
+    'src/host/capture_sync.c', 'src/host/capture_cli.c'),
   dependencies : [dep_metadesk])
 test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
@@ -1115,11 +1124,22 @@ test_jsonrpc = executable('test_jsonrpc',
 )
 test('JSON-RPC 2.0 message layer', test_jsonrpc)
 
+stdio_test_source = host_os == 'windows' ? 'tests/test_mcp_stdio_win.c' : 'tests/test_mcp_stdio.c'
 test_mcp_stdio = executable('test_mcp_stdio',
-  files('tests/test_mcp_stdio.c'),
+  files(stdio_test_source),
   dependencies : [dep_metadesk],
 )
 test('MCP stdio transport', test_mcp_stdio, timeout : 10)
+if host_os == 'windows'
+  # Compile the unchanged production I/O sources without unrelated media DLLs;
+  # their asynchronous startup makes whole-product handle counts non-local.
+  test_io_util_win = executable('test_io_util_win',
+    files('tests/test_io_util_win.c', 'src/core/io_util.c',
+      'src/core/md_socket.c', 'src/core/md_time.c'),
+    include_directories : core_inc,
+    dependencies : [dep_threads, cc.find_library('ws2_32')])
+  test('Windows bounded I/O ownership', test_io_util_win, timeout : 15)
+endif
 
 test_action = executable('test_action',
   files('tests/test_action.c'),
@@ -1146,7 +1166,7 @@ test_ipc = executable('test_ipc',
   files('tests/test_ipc.c'),
   dependencies : [dep_metadesk],
 )
-test('IPC Unix domain sockets', test_ipc, timeout : 15)
+test(host_os == 'windows' ? 'IPC Windows named pipes' : 'IPC Unix domain sockets', test_ipc, timeout : 15)
 
 test_mcp_http = executable('test_mcp_http',
   files('tests/test_mcp_http.c'),

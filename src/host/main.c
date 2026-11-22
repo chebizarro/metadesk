@@ -40,12 +40,24 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
-#include <poll.h>
 #include <pthread.h>
 #include <go.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 
+#ifdef _WIN32
+#include "md_interrupt.h"
+#include <stdatomic.h>
+static atomic_bool g_running = true;
+static BOOL WINAPI host_console_interrupt(DWORD kind) {
+    if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT || kind == CTRL_CLOSE_EVENT ||
+        kind == CTRL_LOGOFF_EVENT || kind == CTRL_SHUTDOWN_EVENT) {
+        atomic_store(&g_running, false);
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
 static volatile sig_atomic_t g_running = 1;
 
 static void signal_handler(int sig) {
@@ -53,7 +65,11 @@ static void signal_handler(int sig) {
     g_running = 0;
 }
 
-static void install_signal_handlers(void) {
+#endif
+static int install_signal_handlers(void) {
+#ifdef _WIN32
+    return SetConsoleCtrlHandler(host_console_interrupt, TRUE) ? 0 : -1;
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -63,6 +79,8 @@ static void install_signal_handlers(void) {
     /* A client vanishing mid-send must be an EPIPE on that stream, not a
      * fatal signal for the whole host (OpenSSL writes bypass MSG_NOSIGNAL). */
     signal(SIGPIPE, SIG_IGN);
+    return 0;
+#endif
 }
 
 /* ── State shared between capture callback and main loop ─────── */
@@ -528,6 +546,7 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "  %s capture-frame OUTPUT.raw [DISPLAY]  Capture one local frame (no remote session)\n", argv0);
     fprintf(stderr, "  %s access --help  Manage saved host-role session access\n", argv0);
     fprintf(stderr, "  %s mcp-proxy --help  stdio MCP client -> NIP-98-signed HTTP MCP\n", argv0);
     fprintf(stderr, "Options:\n");
@@ -782,6 +801,10 @@ int main(int argc, char **argv) {
      * call, so UIA rectangles, capture and SendInput share physical pixels. */
     md_win_dpi_process_init();
 #endif
+    if (argc > 1 && strcmp(argv[1], "capture-frame") == 0) {
+        extern int md_host_capture_cli(int argc, char **argv);
+        return md_host_capture_cli(argc - 2, argv + 2);
+    }
     /* Isolated metadata CLI: no capture, session, or Nostr startup. */
     if (argc > 1 && strcmp(argv[1], "account") == 0) {
         extern int md_host_account_cli(int argc, char **argv);
@@ -796,6 +819,7 @@ int main(int argc, char **argv) {
         return md_host_mcp_proxy_cli(argc - 2, argv + 2);
     /* Every subsequently created thread inherits this mask. MCP consumes
      * termination signals with sigwait, never an async-signal-unsafe handler. */
+#ifndef _WIN32
     sigset_t term_signals;
     sigemptyset(&term_signals);
     sigaddset(&term_signals, SIGINT);
@@ -805,6 +829,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     /* Default options */
     uint16_t port = MD_STREAM_PORT;
@@ -1052,8 +1077,13 @@ int main(int argc, char **argv) {
      * stdout untouched; its stdio transport owns fd 1 via write(2). */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    install_signal_handlers();
+    if (install_signal_handlers() != 0) {
+        fprintf(stderr, "ERROR: cannot install termination handlers\n");
+        return 1;
+    }
+#ifndef _WIN32
     pthread_sigmask(SIG_UNBLOCK, &term_signals, NULL);
+#endif
 
     printf("metadesk-host v0.1.0\n");
     printf("  port:      %u\n", port);

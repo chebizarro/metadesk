@@ -370,10 +370,18 @@ static void test_accept_timeout(void)
 int main(void)
 {
     printf("test_ipc: Unix domain socket IPC tests\n");
+#ifndef _WIN32
     setup_runtime_dir();
+#else
+    puts("Windows named-pipe backend: no filesystem runtime directory required");
+#endif
 
     test_invalid_names();
+#ifndef _WIN32
     test_refuse_existing_non_socket();
+#else
+    puts("SKIP: Unix socket-path non-socket collision (named pipes have no filesystem endpoint)");
+#endif
     test_server_lifecycle();
     test_connect_no_server();
     test_connect_accept();

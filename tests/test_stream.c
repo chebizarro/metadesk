@@ -6,6 +6,7 @@
  * and ping/pong latency measurement.
  */
 #include "stream.h"
+#include "md_socket.h"
 #include "packet.h"
 
 #include <stdio.h>
@@ -15,8 +16,6 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include "md_test.h"
 
 #ifdef __linux__
@@ -315,15 +314,15 @@ static int test_partial_recv_timeout(void) {
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
         MdStreamServer *srv = md_stream_server_create("127.0.0.1", 0);
         REQUIRE(srv != NULL);
-        int raw = socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(raw >= 0);
+        MdSocket raw = md_socket_open(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(raw != (MdSocket)-1);
         struct sockaddr_in addr = { .sin_family = AF_INET,
             .sin_port = htons(md_stream_server_port(srv)) };
         REQUIRE(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
-        REQUIRE(connect(raw, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+        REQUIRE(md_socket_connect(raw, (struct sockaddr *)&addr, sizeof(addr)) == 0);
         MdStream *peer = md_stream_server_accept(srv, 1000);
         REQUIRE(peer != NULL);
-        REQUIRE(write(raw, wire, prefixes[i]) == (ssize_t)prefixes[i]);
+        REQUIRE(md_socket_send(raw, wire, prefixes[i], 0) == (ssize_t)prefixes[i]);
         MdPacketHeader header;
         uint8_t *payload = NULL;
         REQUIRE(md_stream_recv(peer, &header, &payload, 5) == 1);
@@ -332,21 +331,21 @@ static int test_partial_recv_timeout(void) {
         md_stream_get_stats(peer, &stats);
         REQUIRE(stats.packets_recv == 0 && stats.bytes_recv == 0);
         size_t remaining = sizeof(wire) - prefixes[i];
-        REQUIRE(write(raw, wire + prefixes[i], remaining) == (ssize_t)remaining);
+        REQUIRE(md_socket_send(raw, wire + prefixes[i], remaining, 0) == (ssize_t)remaining);
         REQUIRE(md_stream_recv(peer, &header, &payload, 100) == 0);
         REQUIRE(header.sequence == 1234 && header.payload_len == 8);
         REQUIRE(payload != NULL && memcmp(payload, "fragment", 8) == 0);
         free(payload); payload = NULL;
-        REQUIRE(write(raw, wire, sizeof(wire)) == (ssize_t)sizeof(wire));
+        REQUIRE(md_socket_send(raw, wire, sizeof(wire), 0) == (ssize_t)sizeof(wire));
         REQUIRE(md_stream_recv(peer, &header, &payload, 100) == 0);
         REQUIRE(header.sequence == 1234 && memcmp(payload, "fragment", 8) == 0);
         free(payload); payload = NULL;
         md_stream_get_stats(peer, &stats);
         REQUIRE(stats.packets_recv == 2 && stats.bytes_recv == 2 * sizeof(wire));
-        REQUIRE(write(raw, wire, MD_PACKET_HEADER_SIZE + 1) == MD_PACKET_HEADER_SIZE + 1);
+        REQUIRE(md_socket_send(raw, wire, MD_PACKET_HEADER_SIZE + 1, 0) == MD_PACKET_HEADER_SIZE + 1);
         REQUIRE(md_stream_recv(peer, &header, &payload, 5) == 1);
         md_stream_destroy(peer); /* pending allocation must be released */
-        close(raw);
+        md_socket_close(raw);
         md_stream_server_destroy(srv);
     }
     printf("OK\n");
@@ -737,7 +736,9 @@ static int test_tls_concurrent_duplex(void) {
 
 int main(void) {
     /* Ignore SIGPIPE — normal for socket tests where peers disconnect */
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     printf("test_stream: TCP stream transport tests\n");
 

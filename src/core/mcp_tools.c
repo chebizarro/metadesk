@@ -1,3 +1,4 @@
+#include "md_compat.h"
 /*
  * metadesk — mcp_tools.c
  * MCP accessibility read tools and handlers for the 9 action types.

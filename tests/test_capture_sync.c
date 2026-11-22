@@ -1460,7 +1460,9 @@ static void test_end_to_end_stream(void) {
 
 int main(void) {
     printf("test_capture_sync: encoder/input follow capture geometry\n");
-    signal(SIGPIPE, SIG_IGN); /* as the host: a closed peer is EPIPE */
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif /* as the host: a closed peer is EPIPE */
     for (size_t i = 0; i < sizeof(g_pixels); i += 4) {
         g_pixels[i] = (uint8_t)(i >> 4);
         g_pixels[i + 1] = 0x80;

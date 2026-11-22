@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdatomic.h>
 #include "io_util.h"
+#include "md_compat.h"
 
 static _Atomic int md_test_failures = 0;
 static _Atomic int md_test_checks   = 0;

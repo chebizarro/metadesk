@@ -23,22 +23,16 @@
  * directions drive the same one. After the handshake a TLS stream's socket is
  * non-blocking, and ssl_mu covers each SSL_read/SSL_write together with its
  * SSL_get_error, nothing more: on SSL_ERROR_WANT_READ/WANT_WRITE the lock is
- * dropped before poll(), so a receiver waiting for data never holds off a
+ * dropped before md_socket_poll(), so a receiver waiting for data never holds off a
  * sender, and a sender waiting for socket space never holds off a receiver.
  * Plain TCP stays blocking and never takes the lock.
  */
 #include "stream.h"
 #include "md_time.h"
+#include "md_socket.h"
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -66,7 +60,7 @@
 #define RLX_ADD(field, v) atomic_fetch_add_explicit(&(field), (v), memory_order_relaxed)
 
 struct MdStream {
-    int          fd;
+    MdSocket          fd;
     atomic_bool  connected;      /* cleared by whichever direction fails */
     bool         session_bound;
     uint32_t     granted_caps;
@@ -98,7 +92,7 @@ struct MdStream {
 };
 
 struct MdStreamServer {
-    int          fd;
+    MdSocket          fd;
     uint16_t     port;
     SSL_CTX     *ssl_ctx;        /* NULL when plaintext */
 };
@@ -113,7 +107,7 @@ uint32_t md_stream_now_ms(void) {
 
 /* Wait, without ssl_mu, until the socket can satisfy an SSL_ERROR_WANT_*.
  * Returns 0 when ready, 1 on timeout, -1 on error or another SSL error. */
-static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
+static int ssl_retry_wait(MdSocket fd, int ssl_err, int timeout_ms) {
     short events;
 
     if (ssl_err == SSL_ERROR_WANT_READ) {
@@ -125,8 +119,8 @@ static int ssl_retry_wait(int fd, int ssl_err, int timeout_ms) {
     }
 
     for (;;) {
-        struct pollfd pfd = { .fd = fd, .events = events };
-        int pr = poll(&pfd, 1, timeout_ms);
+        MdPollFd pfd = { .fd = fd, .events = events };
+        int pr = md_socket_poll(&pfd, 1, timeout_ms);
         if (pr == 0) return 1;   /* timeout */
         if (pr < 0) {
             /* Not a restart with the full budget: the caller retries the
@@ -156,14 +150,14 @@ static int ssl_io(MdStream *s, bool write, void *buf, size_t len, int *ssl_err) 
 }
 
 /* Read exactly n bytes, handling partial reads.
- * Uses SSL_read when TLS is active (see ssl_io), raw read() otherwise.
+ * Uses SSL_read when TLS is active (see ssl_io), md_socket_recv otherwise.
  * timeout_ms is a deadline for the whole read, not a per-syscall
  * budget — a peer dribbling bytes cannot extend it.
  * Returns 0 on success, -1 on error/EOF, 1 on timeout. */
 static int read_exact_progress(MdStream *s, uint8_t *buf, size_t n,
                                size_t *received, uint32_t timeout_ms) {
     size_t total = *received;
-    int fd = s->fd;
+    MdSocket fd = s->fd;
     const uint32_t deadline = timeout_ms > 0
         ? md_stream_now_ms() + timeout_ms : 0;
 
@@ -194,8 +188,8 @@ static int read_exact_progress(MdStream *s, uint8_t *buf, size_t n,
         }
 
         if (wait_ms >= 0) {
-            struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            int pr = poll(&pfd, 1, wait_ms);
+            MdPollFd pfd = { .fd = fd, .events = POLLIN };
+            int pr = md_socket_poll(&pfd, 1, wait_ms);
             if (pr == 0) return 1;   /* timeout */
             if (pr < 0) {
                 if (errno == EINTR) continue;
@@ -205,7 +199,7 @@ static int read_exact_progress(MdStream *s, uint8_t *buf, size_t n,
                 return -1;
         }
 
-        ssize_t r = read(fd, buf + total, n - total);
+        ssize_t r = md_socket_recv(fd, buf + total, n - total, 0);
         if (r <= 0) {
             if (r < 0 && errno == EINTR) continue;
             return -1;
@@ -229,7 +223,7 @@ static int read_exact(MdStream *s, uint8_t *buf, size_t n, uint32_t timeout_ms) 
 #define SSL_WRITE_WANT_READ_SLICE_MS 50
 
 /* Write exactly n bytes, handling partial writes.
- * Uses SSL_write when TLS is active (see ssl_io), raw write() otherwise. */
+ * Uses SSL_write when TLS is active (see ssl_io), md_socket_send otherwise. */
 static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
     size_t total = 0;
 
@@ -253,9 +247,9 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
              * the process: MSG_NOSIGNAL on Linux, SO_NOSIGPIPE (set in
              * stream_from_fd) on macOS/BSD. */
 #ifdef MSG_NOSIGNAL
-            ssize_t w = send(s->fd, buf + total, n - total, MSG_NOSIGNAL);
+            ssize_t w = md_socket_send(s->fd, buf + total, n - total, MSG_NOSIGNAL);
 #else
-            ssize_t w = write(s->fd, buf + total, n - total);
+            ssize_t w = md_socket_send(s->fd, buf + total, n - total, 0);
 #endif
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;
@@ -268,28 +262,27 @@ static int write_exact(MdStream *s, const uint8_t *buf, size_t n) {
 }
 
 /* Set TCP_NODELAY to minimize latency (disable Nagle's algorithm). */
-static void set_tcp_nodelay(int fd) {
+static void set_tcp_nodelay(MdSocket fd) {
     int flag = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
+    if (md_socket_setopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
         MD_LOG_W("warning: failed to set TCP_NODELAY: %s", strerror(errno));
     }
 }
 
 /* After a blocking handshake, a TLS socket goes non-blocking so that
  * ssl_io never blocks while holding ssl_mu (see the note at the top). */
-static int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ? -1 : 0;
+static int set_nonblocking(MdSocket fd) {
+    return md_socket_nonblocking(fd, true);
 }
 
 /* Create an MdStream from a connected fd (optionally with TLS, its handshake
  * done and fd already non-blocking). */
-static MdStream *stream_from_fd(int fd, SSL *ssl) {
+static MdStream *stream_from_fd(MdSocket fd, SSL *ssl) {
     MdStream *s = calloc(1, sizeof(MdStream));
     if (!s || pthread_mutex_init(&s->ssl_mu, NULL) != 0) {
         free(s);
         if (ssl) SSL_free(ssl);
-        close(fd);
+        md_socket_close(fd);
         return NULL;
     }
     s->fd = fd;
@@ -298,9 +291,21 @@ static MdStream *stream_from_fd(int fd, SSL *ssl) {
     set_tcp_nodelay(fd);
 #ifdef SO_NOSIGPIPE
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    md_socket_setopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
     return s;
+}
+
+/* OpenSSL's socket BIO API takes int even on native Windows. Refuse a
+ * non-representable handle rather than silently narrowing a Winsock SOCKET. */
+static int ssl_socket_fd(MdSocket fd) {
+#ifdef _WIN32
+    if (fd > INT_MAX || fd < 0) {
+        MD_LOG_E("TLS socket handle exceeds OpenSSL's int socket API");
+        return -1;
+    }
+#endif
+    return (int)fd;
 }
 
 /* ── TLS helpers ─────────────────────────────────────────────── */
@@ -394,17 +399,16 @@ MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port) {
 MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port,
                                             const MdStreamTlsConfig *tls) {
     /* Create IPv6 socket with dual-stack (accepts IPv4 too) */
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    MdSocket fd = md_socket_open(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0)
         return NULL;
 
     /* Allow address reuse */
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (md_socket_listener_reuse(fd) != 0) { md_socket_close(fd); return NULL; }
 
     /* Enable dual-stack: accept both IPv4 and IPv6 */
     int v6only = 0;
-    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    md_socket_setopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
@@ -422,7 +426,7 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
             } else {
                 MD_LOG_E("invalid TCP bind address '%s': expected an IPv4 or IPv6 literal",
                          bind_addr);
-                close(fd);
+                md_socket_close(fd);
                 errno = EINVAL;
                 return NULL;
             }
@@ -431,26 +435,26 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
         addr.sin6_addr = in6addr_any;
     }
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
+    if (md_socket_bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        md_socket_close(fd);
         return NULL;
     }
 
-    if (listen(fd, 1) < 0) {
-        close(fd);
+    if (md_socket_listen(fd, 1) < 0) {
+        md_socket_close(fd);
         return NULL;
     }
 
     MdStreamServer *srv = calloc(1, sizeof(MdStreamServer));
     if (!srv) {
-        close(fd);
+        md_socket_close(fd);
         return NULL;
     }
 
     srv->fd = fd;
     socklen_t bound_len = sizeof(addr);
-    if (getsockname(fd, (struct sockaddr *)&addr, &bound_len) != 0) {
-        close(fd);
+    if (md_socket_getname(fd, (struct sockaddr *)&addr, &bound_len) != 0) {
+        md_socket_close(fd);
         free(srv);
         return NULL;
     }
@@ -468,7 +472,7 @@ MdStreamServer *md_stream_server_create_tls(const char *bind_addr, uint16_t port
         }
         if (!srv->ssl_ctx) {
             MD_LOG_E("ERROR — failed to initialize TLS context");
-            close(fd);
+            md_socket_close(fd);
             free(srv);
             return NULL;
         }
@@ -482,15 +486,15 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
     if (!srv) return NULL;
 
     if (timeout_ms > 0) {
-        struct pollfd pfd = { .fd = srv->fd, .events = POLLIN };
-        int ret = poll(&pfd, 1, (int)timeout_ms);
+        MdPollFd pfd = { .fd = srv->fd, .events = POLLIN };
+        int ret = md_socket_poll(&pfd, 1, (int)timeout_ms);
         if (ret <= 0)
             return NULL;
     }
 
     struct sockaddr_in6 client_addr;
     socklen_t addr_len = sizeof(client_addr);
-    int client_fd = accept(srv->fd, (struct sockaddr *)&client_addr, &addr_len);
+    MdSocket client_fd = md_socket_accept(srv->fd, (struct sockaddr *)&client_addr, &addr_len);
     if (client_fd < 0)
         return NULL;
 
@@ -503,14 +507,14 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
     if (srv->ssl_ctx) {
         ssl = SSL_new(srv->ssl_ctx);
         if (!ssl) {
-            close(client_fd);
+            md_socket_close(client_fd);
             return NULL;
         }
-        SSL_set_fd(ssl, client_fd);
-        if (SSL_accept(ssl) != 1 || set_nonblocking(client_fd) != 0) {
+        int ssl_fd = ssl_socket_fd(client_fd);
+        if (ssl_fd < 0 || SSL_set_fd(ssl, ssl_fd) != 1 || SSL_accept(ssl) != 1 || set_nonblocking(client_fd) != 0) {
             MD_LOG_E("TLS handshake failed for %s", addr_str);
             SSL_free(ssl);
-            close(client_fd);
+            md_socket_close(client_fd);
             return NULL;
         }
         MD_LOG_I("TLS handshake complete (%s)", SSL_get_version(ssl));
@@ -527,7 +531,7 @@ void md_stream_server_destroy(MdStreamServer *srv) {
     if (!srv) return;
     if (srv->ssl_ctx)
         SSL_CTX_free(srv->ssl_ctx);
-    close(srv->fd);
+    md_socket_close(srv->fd);
     free(srv);
 }
 
@@ -536,6 +540,19 @@ void md_stream_server_destroy(MdStreamServer *srv) {
 MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms) {
     if (!host) return NULL;
 
+    if (md_socket_init()) return NULL;
+
+#ifdef _WIN32
+    /* Windows getaddrinfo(AF_UNSPEC) rejects IPv4-mapped numeric IPv6 even
+     * though InetPton and dual-stack listeners accept it. Resolve its IPv4
+     * endpoint without involving DNS. */
+    struct in6_addr numeric;
+    char mapped[INET_ADDRSTRLEN];
+    if (inet_pton(AF_INET6, host, &numeric) == 1 && IN6_IS_ADDR_V4MAPPED(&numeric)) {
+        if (!inet_ntop(AF_INET, &numeric.s6_addr[12], mapped, sizeof(mapped))) return NULL;
+        host = mapped;
+    }
+#endif
     /* Resolve hostname */
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
@@ -548,45 +565,52 @@ MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms
     if (getaddrinfo(host, port_str, &hints, &res) != 0)
         return NULL;
 
-    int fd = -1;
+    MdSocket fd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        fd = md_socket_open(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
 
         /* Non-blocking connect with timeout */
         if (timeout_ms > 0) {
-            int flags = fcntl(fd, F_GETFL, 0);
-            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            if (md_socket_nonblocking(fd, true) != 0) {
+                md_socket_close(fd);
+                fd = -1;
+                continue;
+            }
 
-            int ret = connect(fd, rp->ai_addr, rp->ai_addrlen);
+            int ret = md_socket_connect(fd, rp->ai_addr, rp->ai_addrlen);
             if (ret < 0 && errno == EINPROGRESS) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                ret = poll(&pfd, 1, (int)timeout_ms);
+                MdPollFd pfd = { .fd = fd, .events = POLLOUT };
+                ret = md_socket_poll(&pfd, 1, (int)timeout_ms);
                 if (ret <= 0) {
-                    close(fd);
+                    md_socket_close(fd);
                     fd = -1;
                     continue;
                 }
                 /* Check connect result */
                 int err = 0;
                 socklen_t errlen = sizeof(err);
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+                md_socket_getopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
                 if (err != 0) {
-                    close(fd);
+                    md_socket_close(fd);
                     fd = -1;
                     continue;
                 }
             } else if (ret < 0) {
-                close(fd);
+                md_socket_close(fd);
                 fd = -1;
                 continue;
             }
 
             /* Restore blocking mode */
-            fcntl(fd, F_SETFL, flags);
+            if (md_socket_nonblocking(fd, false) != 0) {
+                md_socket_close(fd);
+                fd = -1;
+                continue;
+            }
         } else {
-            if (connect(fd, rp->ai_addr, rp->ai_addrlen) < 0) {
-                close(fd);
+            if (md_socket_connect(fd, rp->ai_addr, rp->ai_addrlen) < 0) {
+                md_socket_close(fd);
                 fd = -1;
                 continue;
             }
@@ -627,7 +651,12 @@ MdStream *md_stream_connect_tls(const char *host, uint16_t port,
         return NULL;
     }
 
-    SSL_set_fd(ssl, s->fd);
+    int ssl_fd = ssl_socket_fd(s->fd);
+    if (ssl_fd < 0 || SSL_set_fd(ssl, ssl_fd) != 1) {
+        SSL_free(ssl);
+        md_stream_destroy(s);
+        return NULL;
+    }
     /* SNI for name-based virtual hosting */
     SSL_set_tlsext_host_name(ssl, host);
     /* Verify the certificate matches the host we dialed (SNI alone
@@ -779,7 +808,7 @@ void md_stream_close(MdStream *s) {
     s->session_bound = false;
     s->granted_caps = 0;
     RLX_STORE(s->connected, false);
-    if (s->fd >= 0) shutdown(s->fd, SHUT_RDWR);
+    if (s->fd >= 0) md_socket_shutdown(s->fd, SHUT_RDWR);
 }
 
 bool md_stream_has_capability(const MdStream *s, uint32_t caps) {
@@ -865,7 +894,7 @@ void md_stream_get_stats(const MdStream *s, MdStreamStats *stats) {
     stats->packets_recv = RLX_LOAD(s->packets_recv);
 }
 
-int md_stream_get_fd(const MdStream *s) {
+MdSocket md_stream_get_fd(const MdStream *s) {
     return s ? s->fd : -1;
 }
 
@@ -884,7 +913,7 @@ void md_stream_destroy(MdStream *s) {
         SSL_free(s->ssl);
     }
     if (s->fd >= 0)
-        close(s->fd);
+        md_socket_close(s->fd);
     pthread_mutex_destroy(&s->ssl_mu);
     free(s->recv_payload);
     free(s);

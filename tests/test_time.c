@@ -32,7 +32,7 @@ static uint64_t ref_ns(clockid_t id) {
 static void test_helper_is_platform_monotonic(void) {
     md_test_name = "helper_is_platform_monotonic";
     /* Back-to-back reads bracket the reference exactly when both are the
-     * same clock; wall time (~1.8e18 ns) would land far outside. */
+     * same clock; wall time (~1.8e18 ns) would land far_deadline outside. */
     const uint64_t a = md_monotonic_ns();
     const uint64_t ref = ref_ns(CLOCK_MONOTONIC);
     const uint64_t b = md_monotonic_ns();
@@ -112,15 +112,15 @@ static void test_cond_timedwait_until(void) {
     MD_CHECK(end >= deadline);
     MD_CHECK(end - start < 5000000000ull);
 
-    /* A signal wakes the wait long before a far deadline. */
+    /* A signal wakes the wait long before a far_deadline deadline. */
     pthread_t tid;
     MD_CHECK(pthread_create(&tid, NULL, signal_later, &w) == 0);
-    const uint64_t far = md_monotonic_ns() + 30 * 1000000000ull;
+    const uint64_t far_deadline = md_monotonic_ns() + 30 * 1000000000ull;
     rc = 0;
     while (!w.flag && rc == 0)
-        rc = md_cond_timedwait_until(&w.cv, &w.mu, far);
+        rc = md_cond_timedwait_until(&w.cv, &w.mu, far_deadline);
     MD_CHECK(w.flag && rc == 0);
-    MD_CHECK(md_monotonic_ns() < far - 25 * 1000000000ull);
+    MD_CHECK(md_monotonic_ns() < far_deadline - 25 * 1000000000ull);
     pthread_mutex_unlock(&w.mu);
     pthread_join(tid, NULL);
 
