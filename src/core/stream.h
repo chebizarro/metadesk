@@ -18,6 +18,7 @@
 #define MD_STREAM_H
 
 #include "packet.h"
+#include "md_socket_types.h"
 #include "session.h"
 #include "fips_addr.h"
 #include <stdint.h>
@@ -138,7 +139,7 @@ void md_stream_handle_pong(MdStream *s, const MdPacketHeader *hdr);
 void md_stream_get_stats(const MdStream *s, MdStreamStats *stats);
 
 /* Get the file descriptor (for poll/select integration). */
-int md_stream_get_fd(const MdStream *s);
+MdSocket md_stream_get_fd(const MdStream *s);
 
 /* Check if the stream is still connected. */
 bool md_stream_is_connected(const MdStream *s);

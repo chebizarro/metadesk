@@ -166,8 +166,13 @@ class Peer(socketserver.StreamRequestHandler):
                 self.send(["NOTICE", "unsupported fixture command"])
 
 
-class PrivateUnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
+if hasattr(socketserver, "ThreadingUnixStreamServer"):
+    class PrivateUnixServer(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+else:
+    class PrivateUnixServer:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("Unix signer fixture is unsupported on Windows")
 
 
 class IdentitySigner(socketserver.StreamRequestHandler):

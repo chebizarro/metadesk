@@ -2,6 +2,7 @@
  * test_fips_control.c — FIPS control socket client seam tests.
  */
 #include "fips_control.h"
+#include "md_test.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,6 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include "md_test.h"
 #endif
 
 

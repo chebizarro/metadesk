@@ -21,7 +21,8 @@ typedef struct MdMcpStdio MdMcpStdio;
  * in_fd: file descriptor to read from (e.g. STDIN_FILENO)
  * out_fd: file descriptor to write to (e.g. STDOUT_FILENO).
  * Borrowed output must be exclusively written through this transport.
- * Descriptor flags are unchanged. Host must ignore SIGPIPE. */
+ * Descriptor flags are unchanged. POSIX hosts must ignore SIGPIPE. Windows
+ * callers pass CRT file/pipe descriptors, not Winsock SOCKET values. */
 MdMcpStdio *md_mcp_stdio_create(MdMcpServer *server, int in_fd, int out_fd);
 
 /* Configurable per-message write budget; <=0 uses the 2000ms default. */

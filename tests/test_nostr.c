@@ -1546,7 +1546,12 @@ static void test_constructor_revocation(const char **urls) {
     snprintf(directory, sizeof(directory), "%s/md-create-XXXXXX", getenv("HOME"));
     MD_CHECK(mkdtemp(directory));
     MdAccounts *accounts = NULL;
-    char *resolved = realpath(directory, NULL); /* macOS /var is a symlink */
+    char *resolved =
+#ifdef _WIN32
+        _fullpath(NULL, directory, 0);
+#else
+        realpath(directory, NULL); /* macOS /var is a symlink */
+#endif
     MD_CHECK(resolved && md_accounts_open(resolved, NULL, &accounts) == 0);
     free(resolved);
     MdSigner *signer = md_signer_create_direct(dm_recipient_sk);
@@ -1595,7 +1600,11 @@ static int acl_fixture_tests(const char **urls) {
     test_acl_tag_shapes(urls, a, b);
     test_history_wait(urls);
     test_auth_wire(urls, a);
+#ifndef _WIN32
     test_constructor_revocation(urls);
+#else
+    puts("SKIP: account constructor revocation requires POSIX account persistence");
+#endif
     free(a); free(b);
     return md_test_report();
 }

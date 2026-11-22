@@ -15,6 +15,7 @@
  * reachability.
  */
 #include "fips_addr.h"
+#include "md_socket.h"
 
 #include <libavutil/sha.h>
 #include <libavutil/mem.h>
@@ -25,9 +26,6 @@
 #include <ctype.h>
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <arpa/inet.h>
 #include "log.h"
 #define MD_LOG_TAG "fips_addr"
 
@@ -352,6 +350,7 @@ int md_fips_resolve(const char *npub,
         return -1;
 
     /* Try DNS resolution first (primes identity cache) */
+    if (md_socket_init() != 0) return -1;
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET6;

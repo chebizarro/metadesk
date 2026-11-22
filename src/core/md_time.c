@@ -26,7 +26,7 @@ uint64_t md_monotonic_ns(void)
 
 int md_cond_init_monotonic(pthread_cond_t *cv)
 {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     return pthread_cond_init(cv, NULL);
 #else
     pthread_condattr_t attr;
@@ -50,17 +50,10 @@ int md_cond_timedwait_until(pthread_cond_t *cv, pthread_mutex_t *mu,
 {
     const uint64_t now = md_monotonic_ns();
     if (now >= deadline_ns) return ETIMEDOUT;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
+    /* winpthreads supports relative waits, but not a MONOTONIC condattr. */
     struct timespec rel = ns_timespec(deadline_ns - now);
     int rc = pthread_cond_timedwait_relative_np(cv, mu, &rel);
-#elif defined(_WIN32)
-    /* winpthreads' CLOCK_MONOTONIC need not share QPC's origin: carry the
-     * remaining time over onto it. */
-    struct timespec base;
-    clock_gettime(CLOCK_MONOTONIC, &base);
-    struct timespec abs = ns_timespec((uint64_t)base.tv_sec * 1000000000ull +
-                                      (uint64_t)base.tv_nsec + (deadline_ns - now));
-    int rc = pthread_cond_timedwait(cv, mu, &abs);
 #else
     /* md_monotonic_ns() is CLOCK_MONOTONIC here, the condvar's clock. */
     struct timespec abs = ns_timespec(deadline_ns);

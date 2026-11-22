@@ -6,6 +6,7 @@
  * and ping/pong latency measurement.
  */
 #include "stream.h"
+#include "md_socket.h"
 #include "packet.h"
 
 #include <stdio.h>
@@ -685,7 +686,9 @@ static int test_tls_concurrent_duplex(void) {
 
 int main(void) {
     /* Ignore SIGPIPE — normal for socket tests where peers disconnect */
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     printf("test_stream: TCP stream transport tests\n");
 

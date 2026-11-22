@@ -700,7 +700,11 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);  /* host going away mid-send is EPIPE, not fatal */
+#else
+    SDL_SetMainReady();
+#endif
 
     /* Default options */
     const char *host = NULL;

@@ -1,41 +1,99 @@
 # Native Windows build qualification
 
-## Status: dependency closure reached; product portability blocked
+## Status
 
-L9 tested metadesk `3f66fcc46a0dcc1b56931f8803aee813f9bf09cc` plus the
-`meson.build` nostr-json import-library fix on 2026-11-21 (VM receipt:
-2026-11-22 02:28 UTC). This is **not** a successful full-product build or a
-Windows E2E qualification. Bead `md-z9pd` must remain open.
+Round 2 ports metadesk master `0b5d93861e29b4926c0dbe82c7a42b812764ce50`
+on lane `md/l9-windows-build`. Native Windows host and client now build and
+print usage; the host captures a real local frame in the interactive console.
+This is **not** an authenticated cross-OS product-session qualification. The
+written `md-z9pd` acceptance criterion for authenticated macOS-Windows checks
+remains unverified; do not close that criterion on usage/capture evidence alone.
 
 Environment: Windows 11 ARM64 VM `192.168.64.4`, MSYS2 `CLANGARM64` under
 `C:\msys64`, clang 23.1.5, Meson 1.12.1, CMake 4.5.0, Ninja 1.13.2.
-All source/build work was isolated in `C:\Users\bizarro\md-l9`. Do not use a
-sibling lane's source directory or run a native build in the macOS main checkout.
+All Windows source/build work is isolated in `C:\Users\bizarro\md-l9`.
+Never build in the macOS main checkout or another lane's VM tree.
 
-### Results
+### Qualified gates
 
 | Gate | Result |
 | --- | --- |
-| MSYS2 provisioning | Exit 0; 83 packages added, none removed |
-| nostrc CMake configure, selected targets | Exit 0; 90 Ninja steps completed |
-| metadesk Meson setup before fix | Exit 1: no recognized build-tree nostr-json import library |
-| metadesk Meson setup after fix | Exit 0; 33 targets configured, client enabled, tools enabled |
-| metadesk compile (`-j2`) | Exit 1: `src/core/io_util.c:4:10: fatal error: 'poll.h' file not found` |
-| Full-product Meson test suite | Not run: compilation blocked |
-| `metadesk-host.exe --help` | Not run: executable not produced |
-| `metadesk-client.exe --help` | Not run: executable not produced |
-| Host capture in interactive console | Not run: executable not produced; no task registered |
-| Authenticated macOS-Windows E2E | Not run; neither provisioning nor component harnesses qualify this |
+| nostrc selected library targets at `ea5ed954267c2b513eaa0f41acf3166fdc7f4951` | Build exit 0 (`BUILD_FIPS=OFF`) |
+| Windows native Meson setup + full build, client/tools enabled | Exit 0 |
+| Windows-applicable Meson suite | 29 passed, 0 failed; conditional cells listed below |
+| macOS Meson suite in L9 worktree | 37 passed, 0 failed |
+| Linux VM `/home/bizarro/md-l9`, native compile `-j2`, no containers | Exit 0; Linux tests not run |
+| Native `metadesk-host.exe --help` | Exit 0, usage printed |
+| Native `metadesk-client.exe --help` | Exit 0, usage printed |
+| Interactive `metadesk-host.exe capture-frame host-frame.raw` | Exit 0; 1024x768 BGRA, stride 4096, 3,145,728 bytes |
+| Authenticated Windows-host/macOS-client direct-IP session | Not run; no public relay used |
 
-The failed compiler invocation used native CLANGARM64 headers, not MSYS POSIX
-headers. `io_util.c` also depends on POSIX `sys/socket.h`, `poll`, pipe/file
-semantics and nonblocking socket flags. This needs a real Windows I/O port,
-not a header-search workaround or mixing MSYS and native ABI libraries.
-`src/host/main.c:43` independently includes `poll.h` unconditionally and its
-signal setup uses `struct sigaction`. L8 owns `src/host`, `src/client` and
-session/Nostr work, so L9 stopped portability edits rather than changing those
-files. A successful configure is not evidence that other translation units or
-the linker are Windows-ready; Ninja stopped at the first failed core object.
+### Port boundaries
+
+- `md_socket` keeps Windows `SOCKET` values pointer-width, distinct from CRT
+  descriptors. It owns Winsock initialization, error normalization,
+  `closesocket`, `ioctlsocket`, `WSAPoll` and Windows socket timeout values.
+  Listeners use `SO_EXCLUSIVEADDRUSE`, not Windows's permissive
+  `SO_REUSEADDR`; Unix retains address reuse. Numeric IPv4-mapped IPv6 connects
+  normalize to their IPv4 endpoint only on Windows, where `getaddrinfo` rejected
+  the mapped literal. TLS refuses a handle that OpenSSL's int socket API cannot
+  represent rather than silently narrowing it.
+- Stream and MCP HTTP socket I/O use that shim. Windows accepted HTTP sockets
+  are nonblocking before deadline-bounded I/O; Unix retains per-call flags.
+  No relay filters, signing, AUTH recovery or session authorization changed.
+- Native stdio uses borrowed CRT handles with joinable workers and
+  `CancelSynchronousIo`; cancellation completion is joined before buffers or
+  request state can expire. A potentially partial timed-out write poisons the
+  output channel. Borrowed stdin is not closed or put into another mode.
+- Winpthreads rejects `CLOCK_MONOTONIC` condattrs in this VM. Relative condvar
+  waits now carry the remaining QPC deadline; Linux/macOS clock paths remain
+  equivalent to their previous behavior. Native console events replace POSIX
+  signal waits, without calling bridge teardown from a console callback.
+  Actual console-close/logoff delivery was not tested by disrupting the seat.
+- Small Windows CRT helpers supply missing formatting, string/line routines
+  and non-inherited file opens; client startup explicitly initializes SDL main.
+- `metadesk-host capture-frame OUTPUT.raw [DISPLAY]` is a local diagnostic using
+  the production capture HAL. It creates no listener or relay, requires actual
+  CPU pixels, validates the complete file write, and fails clearly for unsupported
+  buffer types. It does **not** bypass authorization in normal video mode.
+
+API rationale: [WSAPoll](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll)
+operates on sockets, not CRT fds;
+[CancelSynchronousIo](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelsynchronousio)
+requests cancellation but does not join completion. The worker retains ownership
+until its thread has exited, including cancellation-before-syscall races.
+
+### Explicitly unsupported or unqualified
+
+- Windows account/OS-credential persistence remains explicitly unsupported (`md-wmuo`);
+  there is no plaintext credential fallback. `metadesk-host account list` was
+  checked natively: exit 1 with the explicit Linux/macOS-only persistence error. Default saved-account video startup
+  therefore fails clearly. Explicit remote signer builds need separate qualification;
+  this run leaves NIP-46/NIP-55L/NIP-5F optional backends disabled.
+- Windows MCP bearer-token files (`md-ezbe`) are rejected with an explanatory log: Unix
+  mode 0600 is not Windows ACL validation. NIP-98 authorization remains available
+  and its applicable private tests pass. A native test checks bearer configuration
+  fails closed. No token-file validation is silently bypassed.
+- Windows FIPS control remains unsupported (`md-m1we`), unchanged by this port.
+- Unix fork/signal process fixtures are not Windows tests. Native framing,
+  EOF, blocked/partial input shutdown, broken/stalled output, descriptor reuse
+  and handle ownership are covered by dedicated Windows tests instead.
+- Five HTTP test functions requiring POSIX 0600 bearer files are explicitly
+  skipped on Windows, as is the Nostr account-constructor revocation cell.
+  Common NIP-98 authorizer, stream/TLS/binding and private ACL/AUTH/session tests
+  still run. Unix socket-path collision/runtime-dir cells are inapplicable to
+  named pipes; common IPC behavior runs against the actual Windows backend.
+- No Windows live UIA, lock/disconnect, sanitizer, installer/DLL bundle or
+  authenticated cross-OS acceptance claim follows from this native suite.
+
+The exact handle-stability assertion is in a target compiling unchanged production
+I/O sources with only their direct dependencies. A whole-product process count
+was demonstrably confounded: a no-I/O control's loaded-DLL handles rose from 204
+to 1395 during idle startup, later settled at 651, and stayed there. The final ownership gate measured **68 handles before and after**. The isolated
+I/O diagnostic control stayed at 97 through repeated cancellation/EOF/write cycles. Rather
+than add a success sleep or relax an assertion, ownership coverage is isolated
+from unrelated asynchronous DLL initialization; full-product stdio integration
+also remains tested. The diagnostic idle intervals are not part of the gates.
 
 ## Provisioning
 
@@ -67,7 +125,7 @@ pacman -Q > packages-after.txt
 CMake, libwebsockets and Jansson were already installed and unchanged. The
 resolver selected **sdl2-compat 2.32.74-5**, backed by SDL3 3.4.20-1, instead of
 the requested legacy SDL2 package. FFmpeg is 9.0.2-4; libyuv is
-1924.r2921.644251f25-2. All 83 added packages remain installed for later runs;
+1924.r2921.644251f25-2. All 83 packages were added in round 1, not reinstalled in round 2, and remain installed;
 the complete transaction inventory is below.
 
 This VM already had `mingw-w64-clang-aarch64-nsync 1.30.0-3` (no `nsync.pc`,
@@ -146,12 +204,11 @@ even with `BUILD_SHARED_LIBS=OFF`, producing `libjson/libnostr-json.dll` and
 and uses `cc.find_library` in the selected tree, preserving existing behavior
 on macOS/Linux and avoiding a silently selected system library.
 
-## Configure and attempt metadesk
+## Configure, build and run metadesk
 
-Export the assigned metadesk worktree/commit to `md-l9/metadesk`, including
-`imgui_vendor` and the L9 Meson change, but excluding `.git`, `.beads` and local
-build directories. Do not install nostrc globally or point this at another
-lane's tree.
+Export the assigned metadesk tree, including `imgui_vendor`, this port's `src`
+and `tests`, and Meson files, to `md-l9/metadesk`; omit `.git`, `.beads` and
+local build directories. Do not install nostrc globally or use a sibling tree.
 
 ```sh
 cd /c/Users/bizarro/md-l9
@@ -160,48 +217,88 @@ meson setup metadesk/build-product metadesk \
   -Dnostrc_build_dir=C:/Users/bizarro/md-l9/nostrc/build \
   -Dtools=true
 meson compile -C metadesk/build-product -j2
-# Blocked at io_util.c; only run these after the Windows port builds:
-meson test -C metadesk/build-product --print-errorlogs
+export PATH="/c/Users/bizarro/md-l9/nostrc/build/libjson:$PATH"
+meson test -C metadesk/build-product --print-errorlogs -j2
+./metadesk/build-product/metadesk-host.exe --help
+./metadesk/build-product/metadesk-client.exe --help
 ```
 
-Both products are enabled by default. This baseline leaves optional NIP-46,
-NIP-55L and NIP-5F signer backends disabled. It does not qualify authenticated
-Windows sessions. Runtime lookup will also need the native MSYS2 bin directory
-and the selected nostrc `build/libjson` directory on PATH; there is no Windows
-rpath. DLL packaging remains untested until products link and run.
+Both products are enabled by default. Runtime lookup needs native MSYS2 bin,
+the metadesk build directory, and the selected nostrc `build/libjson` on PATH;
+Windows has no build rpath. The usage checks were also run from PowerShell with
+that PATH, not just from an MSYS shell. Optional signer backends are not enabled
+by this baseline. DLL distribution/packaging is not qualified by this recipe.
 
-## Interactive follow-up (not executed by L9)
+On macOS, L9 configured its own `build-l9-macos` with
+`-Dnostrc_root=/Users/bizarro/Documents/Projects/nostrc-wt/metadesk-master`
+and the corresponding `-Dnostrc_build_dir=.../_build`, then compiled and ran
+`meson test --print-errorlogs -j2`. Linux used dedicated `/home/bizarro/md-l9`,
+`-Dnostrc_root=/home/bizarro/nostrc-master`, corresponding `_build`, and `-j2`.
+Those dependency trees were read-only; L9 used no containers or live PipeWire
+resources and did not modify L10's work.
 
-Do not lock/disconnect the signed-in console. SSH/session 0 is not a valid
-DXGI capture environment. After the real products build, run usage checks and
-`meson test`, then use the existing `tools/win/run-interactive.ps1` with an
-isolated `.cmd` and done file in `md-l9`:
+## Interactive host capture
+
+Do not lock/disconnect the signed-in console. SSH/session 0 is not a DXGI
+capture environment. Use the existing runner with an isolated `.cmd`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Users\bizarro\md-l9\metadesk\tools\win\run-interactive.ps1 `
-  -Command C:\Users\bizarro\md-l9\smoke.cmd `
-  -DoneFile C:\Users\bizarro\md-l9\smoke.done
+  -Command C:\Users\bizarro\md-l9\capture.cmd `
+  -DoneFile C:\Users\bizarro\md-l9\capture.done
 ```
 
-The runner registers an Interactive-logon task, bounds failure, and unregisters
-it in `finally`; its exit 0 only proves the done file appeared. The `.cmd` must
-record each program's exit status separately before writing that file.
-`capture_frame.exe frame.raw` uses the production capture library but is a
-**diagnostic-tool** capture, not proof that `metadesk-host.exe` captured a frame.
-Verify actual host capture separately; do not label component results as a
-host smoke or authenticated E2E result. The VM's console display can power off
-and make duplication idle: consult `bd memories windows-vm-dxgi --json` for the
-existing display-wake harness behavior rather than adding success sleeps.
+The command runs the real product:
 
-## Evidence and cleanup
+```bat
+set PATH=C:\Users\bizarro\md-l9\metadesk\build-product;C:\Users\bizarro\md-l9\nostrc\build\libjson;C:\msys64\clangarm64\bin;%PATH%
+metadesk-host.exe capture-frame C:\Users\bizarro\md-l9\host-frame.raw
+```
 
-The VM retains `md-l9/{packages-before.txt,packages-after.txt,receipt.txt,
-nostrc-commit.txt,nostrc-configure.log,nostrc-build.log,metadesk-setup.log,
-metadesk-build.log}` and the task's provisioning/command scripts. No scheduled
-task was created. Task-owned metadesk source/build, nostrc source/build, and
-source archives were removed after collecting logs. Installed MSYS2 packages
-were intentionally retained. No sibling source, scheduled task, worktree,
-branch or stash was modified or removed.
+The `.cmd` records the program's exit status before writing its done file.
+Runner exit 0 alone only proves completion; check the recorded program status.
+L9's VM display powers off despite `ES_DISPLAY_REQUIRED`. Its task-owned helper
+used the existing `tests/test_capture_dxgi_win.cpp` display-watch pattern: create
+an owned window, register `GUID_CONSOLE_DISPLAY_STATE`, send `SC_MONITORPOWER`
+only to that window, and re-wake on display-off notifications. It launches the
+real host child and dispatches window messages until child completion, without
+injected input or success sleeps. This helper is test orchestration, not a
+production keep-awake change. Use an awake interactive desktop when reproducing.
+
+Observed product output:
+
+```text
+INFO: capture_dxgi: duplicating output 0 \\.\DISPLAY1 (1024x768 at 0,0, rotated 0 degrees)
+host: captured one frame: 1024x768 stride=4096 format=1 bytes=3145728 output=C:\Users\bizarro\md-l9\host-frame.raw
+```
+
+The final frame SHA-256 was `fc3e8130b44e789b080b47e279bb8db20ad574804cd3a7190c119a617f8f70ce`.
+
+This demonstrates host-local capture, not encoder/network delivery. The optional
+authenticated Windows-host/macOS-client `--host ADDRESS --npub HOST_NPUB` session
+was not run. Do not substitute this diagnostic or a standalone media harness for
+that pairing's acceptance evidence.
+
+## Review and cleanup
+
+The inline-scoped Oracle review found no actionable defects; it did not inspect
+workspace files or independently run tests. The diff-scoped Nostr Protocol Review
+found no new A-J protocol smells: relay publish/subscription/EOSE/OK/CLOSED/AUTH
+handling and grants were not changed; private ACL/AUTH/session gates still run.
+This is not a repository-wide Nostr audit.
+
+Cleanup exited 0 on both VMs. Before Windows deletion, task-owned running
+processes and scheduled tasks were both **0**. The retained FFmpeg, SDL2-compat
+and libyuv package versions were queried again successfully.
+
+After recording the final gates, L9 removed the **entire** task-owned
+`C:\Users\bizarro\md-l9` directory, including round-1 evidence, product/nostrc
+source and builds, raw frame, source archives, private helper executables and
+logs. Interactive tasks were unregistered by the runner. The Linux `md-l9`
+source/build was removed; local task scratch/build directories are also removed. The
+83 MSYS2 additions below intentionally stay installed. Counts, versions,
+results and cleanup receipts are recorded in the bead; no sibling checkout,
+VM resource, branch or stash is cleaned up.
 
 ## Exact package additions
 

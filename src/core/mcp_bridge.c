@@ -13,7 +13,12 @@
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "md_interrupt.h"
+#include <rpc.h>
+#else
 #include <uuid/uuid.h>
+#endif
 #include <signal.h>
 #include <time.h>
 
@@ -77,9 +82,19 @@ MdMcpBridge *md_mcp_bridge_create(const MdMcpBridgeConfig *config)
     b->session.state = MD_SESSION_NEGOTIATING;
 
     /* Generate session ID */
+#ifdef _WIN32
+    UUID uuid;
+    RPC_CSTR uuid_text = NULL;
+    RPC_STATUS uuid_status = UuidCreate(&uuid);
+    if ((uuid_status != RPC_S_OK && uuid_status != RPC_S_UUID_LOCAL_ONLY) ||
+        UuidToStringA(&uuid, &uuid_text) != RPC_S_OK) goto fail;
+    memcpy(b->session.session_id, uuid_text, sizeof(b->session.session_id));
+    RpcStringFreeA(&uuid_text);
+#else
     uuid_t uuid;
     uuid_generate(uuid);
     uuid_unparse_lower(uuid, b->session.session_id);
+#endif
 
     /* 2. Create agent */
     MdAgentConfig agent_cfg = {
@@ -205,11 +220,19 @@ typedef struct {
     pthread_cond_t cv;
     bool done;
     bool desktop_lost;
+#ifdef _WIN32
+    HANDLE stopped, interrupt;
+#endif
 } McpLifecycle;
 
 static void *bridge_signal_wait(void *userdata)
 {
     McpLifecycle *life = userdata;
+#ifdef _WIN32
+    HANDLE events[] = {life->stopped, life->interrupt};
+    if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+        md_mcp_bridge_shutdown(life->bridge);
+#else
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
@@ -217,6 +240,7 @@ static void *bridge_signal_wait(void *userdata)
     int sig;
     if (sigwait(&signals, &sig) == 0)
         md_mcp_bridge_shutdown(life->bridge);
+#endif
     return NULL;
 }
 
@@ -248,6 +272,16 @@ int md_mcp_bridge_run_supervised(MdMcpBridge *bridge)
         pthread_mutex_destroy(&life.mu);
         return -1;
     }
+#ifdef _WIN32
+    life.interrupt = md_win_interrupt_event();
+    life.stopped = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!life.interrupt || !life.stopped) {
+        if (life.stopped) CloseHandle(life.stopped);
+        pthread_cond_destroy(&life.cv);
+        pthread_mutex_destroy(&life.mu);
+        return -1;
+    }
+#endif
     int rc = -1;
     pthread_t signal_thread, desktop_thread;
     bool signal_started = pthread_create(&signal_thread, NULL, bridge_signal_wait, &life) == 0;
@@ -271,9 +305,16 @@ int md_mcp_bridge_run_supervised(MdMcpBridge *bridge)
     if (signal_started) {
         /* Wake a still-waiting sigwait on normal EOF. Bridge stays alive
          * until both lifecycle threads are joined. */
+#ifdef _WIN32
+        SetEvent(life.stopped);
+#else
         pthread_kill(signal_thread, SIGTERM);
+#endif
         pthread_join(signal_thread, NULL);
     }
+#ifdef _WIN32
+    CloseHandle(life.stopped);
+#endif
     pthread_cond_destroy(&life.cv);
     pthread_mutex_destroy(&life.mu);
     return rc;
