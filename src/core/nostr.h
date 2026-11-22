@@ -307,8 +307,15 @@ int md_nostr_allowlist_remove(MdNostr *n, const char *pubkey_hex);
 /* Allowlist entry snapshot (copied out under the allowlist lock) */
 typedef struct {
     char pubkey_hex[65];  /* NUL-terminated npub hex (64 chars)  */
+    bool review_required; /* legacy public or mixed: never active authority */
     char caps[64];        /* effective canonical caps, or "none" */
 } MdAllowlistEntry;
+
+/* Explicit complete membership/scope review. Every unique source member must
+ * appear exactly once with canonical caps; no additions or omissions. Replaces
+ * legacy/mixed policy with private-only items after positive OK and version fence.
+ * Unreadable private content refuses migration. Historical public copies remain. */
+int md_nostr_allowlist_migrate(MdNostr *n, const MdAllowlistEntry *confirmed, size_t count);
 
 /* Wait for EOSE/CLOSED/connection failure (or stop/revocation), then copy a
  * coherent membership snapshot. Returns -1 unless history loaded successfully.

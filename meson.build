@@ -887,6 +887,9 @@ if host_os == 'linux' or host_os == 'darwin'
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
       timeout : 120)
+    test('access migration private relay', accounts_python,
+      args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture, '--migration-only'],
+      timeout : 120)
     # md-ah9.14/md-ah9.3: real mcp-proxy <-> NIP-98 MCP HTTP + live host allowlist.
     mcp_proxy_host_fixture = executable('mcp_proxy_host_fixture',
       files('tests/mcp_proxy_host_fixture.c', 'src/host/mcp_nostr_acl.c'),
@@ -1177,6 +1180,11 @@ test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
   test('NIP-5F host session quoted seal', accounts_python,
     args : [files('tests/test_nip5f_session.py'), test_host_binding, access_signer_fixture],
+    timeout : 90)
+endif
+if enable_nip5f and enable_client and (host_os == 'linux' or host_os == 'darwin')
+  test('private allowlist real host/client loopback', accounts_python,
+    args : [files('tests/access_private_session.py'), metadesk_host, metadesk_client, access_signer_fixture],
     timeout : 90)
 endif
 test('session correlation retaining private relay', find_program('python3'),

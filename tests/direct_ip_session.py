@@ -110,9 +110,12 @@ def run(host, client, crypto):
         # env_for isolates accounts and rejects inherited Nostr configuration.
         relay = Relay()
         url = f"ws://127.0.0.1:{relay.server_address[1]}"
+        items = [["p", CLIENT_PK], ["metadesk-caps", CLIENT_PK, "v1:video"]]
+        encrypted = subprocess.run([crypto, "host"], input=json.dumps(
+            {"method": "nip44_encrypt", "params": {"peer_pub": HOST_PK, "plaintext": json.dumps(items)}}),
+            env=env, capture_output=True, text=True, timeout=15, check=True)
         event = {"kind": 30000, "pubkey": HOST_PK, "created_at": int(time.time()),
-                 "tags": [["d", "metadesk-allowlist"], ["p", CLIENT_PK],
-                          ["metadesk-caps", CLIENT_PK, "v1:video"]], "content": ""}
+                 "tags": [["d", "metadesk-allowlist"]], "content": json.loads(encrypted.stdout)}
         signed = subprocess.run([crypto, "host"], input=json.dumps(
             {"method": "sign_event", "params": {"event": event}}),
             env=env, capture_output=True, text=True, check=True, timeout=15)
