@@ -29,6 +29,7 @@ typedef enum {
     MD_CAP_VIDEO = (1 << 0),
     MD_CAP_AGENT = (1 << 1),
     MD_CAP_INPUT = (1 << 2),
+    MD_CAP_MONITOR = (1 << 3),
 } MdCapability;
 
 /* Tree format preference */
@@ -118,6 +119,7 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 
 /* Parsed session request from client */
 typedef struct {
+    char output[32]; /* optional stable capture selector; requires monitor grant */
     MdQuality quality;
     bool quality_present;
     uint32_t    capabilities;      /* bitwise OR of MdCapability */
@@ -131,6 +133,8 @@ typedef struct {
 
 /* Parsed session accept from host */
 typedef struct {
+    MdCaptureOutputs outputs;
+    bool outputs_present;
     MdQuality quality;
     bool quality_present;
     char         session_id[64];   /* UUID assigned by host      */
@@ -222,6 +226,10 @@ MdSessionRequestFreshness md_session_request_freshness(const MdSessionRequest *r
 bool md_session_accept_matches_request(const MdSessionAccept *acc,
                                        const MdSessionRequest *req,
                                        int64_t rumor_created_at);
+
+int md_session_outputs_write(cJSON *root, const MdCaptureOutputs *outputs);
+int md_session_outputs_read(const cJSON *root, MdCaptureOutputs *outputs, bool *present);
+char *md_session_outputs_json(const MdCaptureOutputs *outputs, const char *error);
 
 /* Helper: convert capability bitfield to/from JSON array of strings. */
 uint32_t md_caps_from_strings(const char **strs, int count);

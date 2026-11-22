@@ -1345,3 +1345,10 @@ static const MdCaptureBackend pipewire_backend = {
 const MdCaptureBackend *md_capture_backend_create(void) {
     return &pipewire_backend;
 }
+
+int md_capture_outputs(MdCaptureOutputs *out) {
+    if (!out) return -1;
+    memset(out,0,sizeof(*out)); out->count=1;
+    strcpy(out->items[0].id,"portal"); strcpy(out->items[0].name,"Portal-selected display (local consent required to switch)");
+    out->items[0].primary=true; strcpy(out->selected,"portal"); return 0;
+}

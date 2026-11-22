@@ -115,6 +115,11 @@ typedef struct {
     /* Encoder + input bounds follow the capture; the capture thread owns
      * the encoder, other threads go through its request calls. */
     HostCaptureSync sync;
+    MdCaptureOutputs outputs;         /* client_mu */
+    char desired_output[32], startup_output[32];
+    bool output_pending;
+    uint64_t control_epoch, output_revision;
+    pthread_cond_t capture_control_cv;
     MdQuality quality_policy, quality; /* client_mu; policy immutable */
     MdQuality applied_quality;         /* capture thread only */
     bool quality_state_pending;       /* client_mu */
@@ -415,6 +420,7 @@ static int host_start_capture(MdCaptureCtx *capture,
 typedef struct {
     HostCtx      *host;
     MdCaptureCtx *capture;
+    char *owned_output;
 } CaptureThread;
 
 static void host_encode_frame(HostCtx *ctx, MdCaptureCtx *cap,
@@ -470,6 +476,44 @@ static void host_request_initial_frame(HostCtx *ctx) {
     atomic_store(&ctx->initial_frame_requested, true);
 }
 
+/* Only the capture owner switches sources. Startup of the replacement is
+ * transactional; late completion from a disconnected session cannot retarget it. */
+static void host_switch_output(CaptureThread *ct) {
+    HostCtx *ctx=ct->host; char id[32]; uint64_t epoch, revision;
+    pthread_mutex_lock(&ctx->client_mu);
+    if (!ctx->output_pending) { pthread_mutex_unlock(&ctx->client_mu); return; }
+    strcpy(id,ctx->desired_output); epoch=ctx->control_epoch; revision=ctx->output_revision;
+    pthread_mutex_unlock(&ctx->client_mu);
+    char *owned=strdup(id); MdCaptureConfig cfg=ct->capture->config; cfg.output=owned;
+    MdCaptureCtx *next=owned ? md_capture_create(&cfg) : NULL;
+    HostCtx staging={0}; uint32_t w=0,h=0;
+    bool ok=next && !host_start_capture(next,&w,&h,&staging);
+    pthread_mutex_lock(&ctx->client_mu);
+    bool current=ctx->control_epoch==epoch && ctx->output_revision==revision;
+    if (ok && current && md_encoder_restart(ctx->sync.encoder)) ok=false;
+    if (ok && current) {
+        MdCaptureCtx *old=ct->capture; ct->capture=next; next=old;
+        char *old_id=ct->owned_output; ct->owned_output=owned; owned=old_id;
+        free(ctx->cached_frame.data); ctx->cached_frame=staging.cached_frame;
+        ctx->cached_capacity=staging.cached_capacity; staging.cached_frame.data=NULL;
+        strcpy(ctx->outputs.selected,id);
+        /* New source identity matters even for identical rects and sizes. */
+        host_capture_sync_reset_sequence(&ctx->sync);
+        ctx->last_quality_frame_ns=0;
+        atomic_store(&ctx->initial_frame_requested,true);
+    }
+    if (current) {
+        ctx->output_pending=false;
+        if (ctx->client) {
+            char *json=md_session_outputs_json(&ctx->outputs, ok ? NULL : "output unavailable; previous output retained");
+            if (json) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                (uint8_t*)json,(uint32_t)strlen(json))) md_stream_close(ctx->client); free(json); }
+        }
+        pthread_cond_broadcast(&ctx->capture_control_cv);
+    }
+    pthread_mutex_unlock(&ctx->client_mu);
+    free(staging.cached_frame.data); if (next) md_capture_destroy(next); free(owned);
+}
 static void *capture_thread_func(void *arg) {
     CaptureThread *ct  = arg;
     HostCtx       *ctx = ct->host;
@@ -481,6 +525,8 @@ static void *capture_thread_func(void *arg) {
 
     while (!atomic_load(&ctx->capture_stopping) &&
            !atomic_load(&ctx->capture_failed)) {
+        host_switch_output(ct);
+        cap=ct->capture;
         pthread_mutex_lock(&ctx->client_mu);
         bool has_client = (ctx->client != NULL);
         pthread_mutex_unlock(&ctx->client_mu);
@@ -532,6 +578,10 @@ static void *capture_thread_func(void *arg) {
         bool force = has_client && atomic_exchange(&ctx->initial_frame_requested, false);
         host_encode_frame(ctx, cap, &ctx->cached_frame, has_client, force);
     }
+    pthread_mutex_lock(&ctx->client_mu);
+    ctx->output_pending=false;
+    pthread_cond_broadcast(&ctx->capture_control_cv);
+    pthread_mutex_unlock(&ctx->client_mu);
     return NULL;
 }
 
@@ -569,6 +619,15 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
                                    (uint64_t)md_now_ms()) != 0)
         return -1;
     /* Correlate the answer with exactly the request it grants (md-6ns). */
+    pthread_mutex_lock(&ctx->client_mu);
+    while (ctx->output_pending && !atomic_load(&ctx->capture_failed) && g_running)
+        pthread_cond_wait(&ctx->capture_control_cv,&ctx->client_mu);
+    acc.outputs=ctx->outputs;
+    acc.outputs.switch_supported &= (ctx->session->capabilities & MD_CAP_MONITOR)!=0;
+    acc.outputs_present=ctx->capture_required;
+    bool selected_ok=!ctx->pending_req.output[0] || !strcmp(ctx->pending_req.output,ctx->outputs.selected);
+    pthread_mutex_unlock(&ctx->client_mu);
+    if (!selected_ok) { OPENSSL_cleanse(acc.stream_token,sizeof(acc.stream_token)); return -1; }
     acc.quality = ctx->session->quality;
     acc.quality_present = ctx->session->quality_present;
     memcpy(acc.request_id, ctx->pending_req.request_id, sizeof(acc.request_id));
@@ -639,6 +698,27 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         memcpy(json, payload, hdr->payload_len); json[hdr->payload_len] = 0;
         cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
         cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+        if (cJSON_IsString(type) && !strcmp(type->valuestring,"monitor")) {
+            cJSON *output=cJSON_GetObjectItemCaseSensitive(root,"output");
+            bool allowed=md_stream_has_capability(ctx->client,MD_CAP_MONITOR) &&
+                cJSON_GetArraySize(root)==2 && cJSON_IsString(output) &&
+                strlen(output->valuestring)<sizeof(ctx->desired_output) &&
+                md_capture_output_id_valid(output->valuestring) && !strstr(json,"\\u0000");
+            bool known=false;
+            for (size_t i=0;allowed && i<ctx->outputs.count;i++)
+                if (!strcmp(output->valuestring,ctx->outputs.items[i].id)) known=true;
+            if (!allowed) md_stream_close(ctx->client);
+            else if (!known || !ctx->outputs.switch_supported) {
+                char *reply=md_session_outputs_json(&ctx->outputs,
+                    "switch unavailable; Linux portal selection requires new local consent");
+                if (reply) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                    (uint8_t*)reply,(uint32_t)strlen(reply))) md_stream_close(ctx->client); free(reply); }
+            } else {
+                strcpy(ctx->desired_output,output->valuestring);
+                ctx->output_revision++; ctx->output_pending=true;
+            }
+            cJSON_Delete(root); break;
+        }
         MdQuality requested; bool present;
         if (!cJSON_IsObject(root) || cJSON_GetArraySize(root) != 2 ||
             !cJSON_IsString(type) || strcmp(type->valuestring, "quality") ||
@@ -960,6 +1040,14 @@ static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
         ctx->pending_client_pk, ctx->pending_req.capabilities);
     if (ctx->access && (!md_host_access_valid(ctx->access, ctx->pending_req.request_id) ||
         (int64_t)time(NULL) >= ctx->pending_req.expires_at)) return -1;
+    if (ctx->pending_req.output[0]) {
+        if (!(granted & MD_CAP_MONITOR)) return -1;
+        MdCaptureOutputs outputs;
+        if (md_capture_outputs(&outputs) || !outputs.switch_supported) return -1;
+        bool known=false;
+        for (size_t i=0;i<outputs.count;i++) if (!strcmp(outputs.items[i].id,ctx->pending_req.output)) known=true;
+        if (!known) return -1;
+    }
     if (no_input) granted &= ~MD_CAP_INPUT;
     if (!granted) return -1;
     if (md_session_request(ctx->session, ctx->pending_client_pk,
@@ -967,6 +1055,12 @@ static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
     int rc = md_session_accept(ctx->session, session_id, granted);
     if (!rc) {
         pthread_mutex_lock(&ctx->client_mu);
+        ctx->control_epoch++;
+        if (ctx->capture_ready && ctx->pending_req.output[0] &&
+            strcmp(ctx->pending_req.output,ctx->outputs.selected)) {
+            strcpy(ctx->desired_output,ctx->pending_req.output);
+            ctx->output_revision++; ctx->output_pending=true;
+        }
         ctx->quality = md_quality_clamp(&ctx->pending_req.quality, &ctx->quality_policy);
         ctx->session->quality = ctx->quality;
         ctx->session->quality_present = ctx->pending_req.quality_present;
@@ -1012,7 +1106,7 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
     while (host_wait_request(ctx)) {
         if (owner && !md_account_binding_is_current(owner)) return -1;
         if (host_accept_fresh_request(ctx, nostr, no_input) != 0) {
-            host_reject_request(ctx, ctx->pending_req.stream_tls ? "request_refused" : "tls_required");
+            host_reject_request(ctx, ctx->pending_req.output[0] ? "output_unavailable" : ctx->pending_req.stream_tls ? "request_refused" : "tls_required");
             host_rearm_request(ctx);
             continue;
         }
@@ -1043,6 +1137,8 @@ static bool host_binding_pending(HostCtx *ctx, uint64_t now_ms) {
 static void host_finish_client(HostCtx *ctx, MdStream *client) {
     pthread_mutex_lock(&ctx->client_mu);
     ctx->client = NULL;
+    ctx->control_epoch++;
+    if (ctx->output_pending) { ctx->output_pending=false; pthread_cond_broadcast(&ctx->capture_control_cv); }
     pthread_mutex_unlock(&ctx->client_mu);
     md_stream_destroy(client);
     host_rearm_request(ctx);
@@ -1528,6 +1624,7 @@ static int host_run(int argc, char **argv) {
         .supported_caps = MD_HOST_ACCESS_CAPS & (no_input ? ~MD_CAP_INPUT : MD_HOST_ACCESS_CAPS),
     };
     pthread_mutex_init(&ctx.client_mu, NULL);
+    pthread_cond_init(&ctx.capture_control_cv, NULL);
     if (expected_client_pk[0])
         strncpy(ctx.expected_client_pk, expected_client_pk, sizeof(ctx.expected_client_pk) - 1);
 
@@ -1607,7 +1704,7 @@ static int host_run(int argc, char **argv) {
                 }
 
                 if (host_accept_fresh_request(&ctx, nostr, no_input) == 0) break;
-                host_reject_request(&ctx, ctx.pending_req.stream_tls ? "request_refused" : "tls_required");
+                host_reject_request(&ctx, ctx.pending_req.output[0] ? "output_unavailable" : ctx.pending_req.stream_tls ? "request_refused" : "tls_required");
                 host_rearm_request(&ctx);
             }
         } else {
@@ -1665,13 +1762,14 @@ signaling_ready:
     uint32_t display_height = 0;
 
     if (do_capture) {
+        strcpy(ctx.startup_output,ctx.pending_req.output);
         MdCaptureConfig cap_cfg = {
             .target_fps  = fps,
             .show_cursor = true,
             .unattended = capture_unattended,
             .forget_authorization_on_stall = capture_forget_on_stall,
             .consent_timeout_ms = capture_consent_timeout_ms,
-            .output = capture_output,
+            .output = ctx.startup_output[0] ? ctx.startup_output : capture_output,
             .max_width = capture_max_w,
             .max_height = capture_max_h,
         };
@@ -1683,6 +1781,14 @@ signaling_ready:
             if (capture) md_capture_destroy(capture);
             md_stream_server_destroy(srv);
             goto signaling_failed;
+        }
+        md_capture_outputs(&ctx.outputs);
+        MdCaptureRect selected_rect={0};
+        if (ctx.pending_req.output[0]) strcpy(ctx.outputs.selected,ctx.pending_req.output);
+        else if (capture_output && !strcmp(capture_output,"all")) strcpy(ctx.outputs.selected,"all");
+        else if (!md_capture_get_output_rect(capture,&selected_rect)) {
+            for (size_t i=0;i<ctx.outputs.count;i++) if (!memcmp(&selected_rect,&ctx.outputs.items[i].rect,sizeof(selected_rect)))
+                strcpy(ctx.outputs.selected,ctx.outputs.items[i].id);
         }
         printf("host: capture ready (%ux%u, first frame received)\n",
                display_width, display_height);
@@ -2040,10 +2146,12 @@ signaling_ready:
     atomic_store(&ctx.capture_stopping, true);
 
     if (capture) {
-        md_capture_stop(capture);
-        if (cap_thread_started)
+        if (cap_thread_started) {
             pthread_join(cap_thread, NULL);
+            capture=cap_thr_ctx.capture;
+        }
         md_capture_destroy(capture);
+        free(cap_thr_ctx.owned_output);
     }
 
     free(ctx.quality_pixels);

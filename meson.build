@@ -1269,6 +1269,8 @@ test_session = executable('test_session',
 test('session JSON + state machine', test_session)
 test_quality = executable('test_quality', 'tests/test_quality.c', dependencies : dep_metadesk)
 test('session quality policy + scaling', test_quality)
+test_outputs = executable('test_outputs', 'tests/test_outputs.c', dependencies : dep_metadesk)
+test('session outputs + native enumeration', test_outputs)
 test_quality_preferences = executable('test_quality_preferences', 'tests/test_quality_preferences.c', dependencies : dep_metadesk)
 if host_os != 'windows'
   test('encrypted quality preferences private relay', find_program('python3'),

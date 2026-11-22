@@ -6,10 +6,12 @@
 #define md_input_mouse_move test_move
 #define md_nostr_send_session_accept test_publish
 #define md_agent_create test_create_agent
+#define md_capture_create test_capture_create
 #include "../src/host/main.c"
 #undef main
 #undef md_nostr_send_session_accept
 #undef md_agent_create
+#undef md_capture_create
 #include "md_test.h"
 #include "decode.h"
 /* nostr.h's prototype was renamed by the macro above; restore the real one. */
@@ -17,6 +19,23 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
                                  const char *json_payload);
 
 MdAgent *md_agent_create(const MdAgentConfig *cfg);
+static bool fake_output_capture, fail_output_capture;
+MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg);
+static int output_start(MdCaptureCtx *c) { c->active=true; return 0; }
+static int output_frame(MdCaptureCtx *c,MdFrame *f,uint32_t timeout) {
+    (void)timeout; static uint8_t pixels[64*64*4]; memset(pixels,123,sizeof(pixels));
+    c->width=c->height=64;
+    c->output_rect=(MdCaptureRect){!strcmp(c->config.output,"id:2") ? 640 : 0,0,640,360};
+    *f=(MdFrame){.width=64,.height=64,.stride=256,.data=pixels,.data_size=sizeof(pixels),
+        .buf_type=MD_BUF_CPU,.format=MD_PIX_CAPTURE_BGRA}; return 0;
+}
+static void output_release(MdCaptureCtx *c,MdFrame *f) { (void)c; (void)f; }
+MdCaptureCtx *test_capture_create(const MdCaptureConfig *cfg) {
+    if (!fake_output_capture) return md_capture_create(cfg);
+    if (fail_output_capture) return NULL;
+    static const MdCaptureBackend b={.start=output_start,.get_frame=output_frame,.release_frame=output_release};
+    MdCaptureCtx *c=calloc(1,sizeof(*c)); MD_CHECK(c); c->vtable=&b; c->config=*cfg; return c;
+}
 static bool fail_agent_create;
 MdAgent *test_create_agent(const MdAgentConfig *cfg) {
     return fail_agent_create ? NULL : md_agent_create(cfg);
@@ -1152,6 +1171,37 @@ static void test_agent_replacement_failure(void) {
     md_agent_destroy(agent);
 }
 
+static void test_monitor_switch(void) {
+    fake_output_capture=true;
+    Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO|MD_CAP_MONITOR);
+    send_proof(p,&a); MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,s.capabilities);
+    HostCtx ctx={.session=&s,.client=p.host,.outputs={.count=2,.switch_supported=true,.selected="id:1"},
+        .quality_policy={0,0,1000000,30},.quality={0,0,1000000,30},.output_pending=true,.desired_output="id:2"};
+    pthread_mutex_init(&ctx.client_mu,NULL); pthread_cond_init(&ctx.capture_control_cv,NULL);
+    MdEncoderConfig cfg={.width=64,.height=64,.fps=30,.bitrate=1000000};
+    MdEncoder *e=md_encoder_create(&cfg); MD_CHECK(e);
+    MdCaptureRect old={0,0,640,360};
+    host_capture_sync_init(&ctx.sync,e,NULL,&ctx.client_mu,&ctx.pkt_seq,64,64,&old);
+    host_capture_sync_packet_sent(&ctx.sync,host_capture_sync_frame_tag(&ctx.sync),ctx.pkt_seq++);
+    MdCaptureConfig capcfg={.output="id:1"};
+    CaptureThread ct={.host=&ctx,.capture=test_capture_create(&capcfg)};
+    MdCaptureCtx *old_capture=ct.capture;
+    host_switch_output(&ct);
+    MD_CHECK(ct.capture!=old_capture && !ctx.output_pending && !strcmp(ctx.outputs.selected,"id:2"));
+    MdPacketHeader hdr; uint8_t *payload=NULL;
+    MD_CHECK(!md_stream_recv(p.peer,&hdr,&payload,1000) && hdr.type==MD_PKT_SESSION_STATE); free(payload);
+    host_encode_frame(&ctx,ct.capture,&ctx.cached_frame,true,true);
+    MD_CHECK(ctx.sync.rect.x==640);
+    int x,y; MD_CHECK(host_capture_sync_map_point(&ctx.sync,64,64,0,1,1,&x,&y)==HOST_POINT_DROPPED);
+    MD_CHECK(!md_stream_recv(p.peer,&hdr,&payload,1000) && hdr.type==MD_PKT_VIDEO_FRAME); free(payload);
+    fail_output_capture=true; ctx.output_pending=true; strcpy(ctx.desired_output,"id:1"); ctx.output_revision++;
+    old_capture=ct.capture; host_switch_output(&ct);
+    MD_CHECK(ct.capture==old_capture && !strcmp(ctx.outputs.selected,"id:2") && !ctx.output_pending);
+    MD_CHECK(!md_stream_recv(p.peer,&hdr,&payload,1000) && hdr.type==MD_PKT_SESSION_STATE); free(payload);
+    md_capture_destroy(ct.capture); free(ct.owned_output); free(ctx.cached_frame.data); free(ctx.quality_pixels);
+    md_encoder_destroy(e); destroy_pair(p); pthread_cond_destroy(&ctx.capture_control_cv); pthread_mutex_destroy(&ctx.client_mu);
+    fail_output_capture=fake_output_capture=false;
+}
 static void test_quality_control(void) {
     Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO);
     s.quality_present=true;
@@ -1194,6 +1244,7 @@ int main(int argc, char **argv) {
         test_relay_history(argv[2]);
         return md_test_report();
     }
+    test_monitor_switch();
     test_quality_control();
     test_capture_admission();
     test_idle_capture_rebind();

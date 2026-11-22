@@ -174,11 +174,12 @@ static cJSON *snapshot(MdHostAccess *a, const char *error) {
     } else cJSON_AddNullToObject(j,"session");
     return j;
 }
-static void caps_text(uint32_t caps, char out[32]) {
+static void caps_text(uint32_t caps, char out[64]) {
     out[0] = 0;
     if (caps & MD_CAP_VIDEO) strcat(out,"video,");
     if (caps & MD_CAP_AGENT) strcat(out,"agent,");
     if (caps & MD_CAP_INPUT) strcat(out,"input,");
+    if (caps & MD_CAP_MONITOR) strcat(out,"monitor,");
     size_t n = strlen(out); if (n) out[n-1] = 0;
 }
 static const char *dispatch(MdManagementIpc *s, cJSON *j) {
@@ -208,7 +209,7 @@ static const char *dispatch(MdManagementIpc *s, cJSON *j) {
         if (md_host_access_decide(s->access,g,rev,id,approve,save,(uint32_t)bits,s->supported,
                                   (int64_t)time(NULL),&q)) return "conflict";
         if (save) {
-            char caps[32]; caps_text(q.granted,caps);
+            char caps[64]; caps_text(q.granted,caps);
             bool published = md_nostr_allowlist_add(s->nostr,q.peer,caps) == 0;
             if (md_host_access_remembered(s->access,id,published,(int64_t)time(NULL)))
                 return published ? "cancelled_or_expired_after_publish" : "publish_failed";
@@ -396,7 +397,7 @@ static int usage(void) {
         "       metadesk-host session [endpoint] kick SESSION_ID GENERATION REVISION\n"
         "       metadesk-host requests [endpoint] approve REQUEST_ID GENERATION REVISION CAPS [--remember]\n"
         "       metadesk-host requests [endpoint] deny REQUEST_ID GENERATION REVISION\n"
-        "Use exact generation/revision from list JSON; caps: canonical video,agent,input subset.\n");
+        "Use exact generation/revision from list JSON; caps: canonical video,agent,input,monitor subset.\n");
     return 2;
 }
 int md_host_management_cli(const char *area, int argc, char **argv) {

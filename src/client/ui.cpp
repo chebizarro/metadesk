@@ -27,12 +27,15 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 /* ── Overlay state ───────────────────────────────────────────── */
 
 struct MdOverlay {
     bool           visible;
     MdOverlayAction action;
+    char output[32];
+    bool output_changed;
     MdQuality quality;
     bool quality_changed;
     int quality_width, quality_height, quality_bitrate, quality_fps;
@@ -231,6 +234,20 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
                            "[-] Disconnected");
     }
 
+    if (stats->connected && stats->outputs && stats->outputs->count && ImGui::CollapsingHeader("Displays")) {
+        const MdCaptureOutputs *outputs=stats->outputs;
+        if (!outputs->switch_supported || !(stats->granted_caps & MD_CAP_MONITOR))
+            ImGui::TextWrapped("Switching unavailable: requires monitor grant; Linux portals require new local consent.");
+        for (size_t i=0;i<outputs->count;i++) {
+            const MdCaptureOutput *item=&outputs->items[i];
+            bool selected=strcmp(item->id,outputs->selected)==0;
+            ImGui::PushID((int)i);
+            if (ImGui::Selectable(item->name,selected) && outputs->switch_supported && (stats->granted_caps & MD_CAP_MONITOR)) {
+                snprintf(o->output,sizeof(o->output),"%s",item->id); o->output_changed=true;
+            }
+            ImGui::PopID();
+        }
+    }
     if (stats->connected && stats->quality_supported) {
         if (ImGui::CollapsingHeader("Session quality")) {
             ImGui::Text("Applied: cap %ux%u, %.2f Mbps, %u fps",
@@ -349,4 +366,9 @@ void md_overlay_destroy(MdOverlay *o) {
 bool md_overlay_take_quality(MdOverlay *o, MdQuality *quality) {
     if (!o || !quality || !o->quality_changed) return false;
     *quality = o->quality; o->quality_changed = false; return true;
+}
+
+bool md_overlay_take_output(MdOverlay *o,char output[32]) {
+    if (!o || !output || !o->output_changed) return false;
+    snprintf(output,32,"%s",o->output); o->output_changed=false; return true;
 }

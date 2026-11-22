@@ -19,8 +19,9 @@ from test_access_cli import Signer, HOST_PK, CLIENT_PK, HOST_NPUB, CLIENT_NPUB
 
 
 def main():
-    live_quality = "--quality-capture" in sys.argv
-    host, client, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a != "--quality-capture"])
+    live_monitor = "--monitor-capture" in sys.argv
+    live_quality = "--quality-capture" in sys.argv or live_monitor
+    host, client, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a not in ("--quality-capture","--monitor-capture")])
 
     with tempfile.TemporaryDirectory(prefix="md-w15-session-") as tmp:
         root = Path(tmp).resolve()
@@ -54,9 +55,9 @@ def main():
                 checked([host, "account", "add", "nip5f", pk, "Private session"], role)
                 checked([host, "account", "bind-role", role, "nip5f", pk], role)
             url = f"ws://127.0.0.1:{relay.server_address[1]}"
-            checked([host, "access", "--relay", url, "add", CLIENT_NPUB, "video"], "host")
+            checked([host, "access", "--relay", url, "add", CLIENT_NPUB, "video,monitor" if live_monitor else "video"], "host")
             listed = checked([host, "access", "--relay", url, "list"], "host")
-            assert listed.stdout.strip() == CLIENT_PK + "\tvideo", listed.stdout
+            assert listed.stdout.strip() == CLIENT_PK + ("\tvideo,monitor" if live_monitor else "\tvideo"), listed.stdout
             with relay.lock:
                 policy = next(e for e in relay.events.values() if e["kind"] == 30000)
                 assert policy["tags"] == [["d", "metadesk-allowlist"]] and policy["content"]
@@ -90,7 +91,7 @@ def main():
             assert ready.wait(20), logs
             cp, connected = launch("client", [client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
                                                "--relay", url, "--port", port, "--no-display", "--timeout", "15000",
-                                               *(["--max-size", "640x480", "--bitrate", "1000000", "--fps", "15"] if live_quality else [])],
+                                               *(["--max-size", "640x480", "--bitrate", "1000000", "--fps", "15", *(["--output","id:1"] if live_monitor else [])] if live_quality else [])],
                                    "decoded frame size" if live_quality else "receiving stream...")
             assert connected.wait(25), logs
             assert hp.poll() is None and cp.poll() is None, logs

@@ -1490,8 +1490,22 @@ int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,
 /* Exact canonical spellings make unknown/duplicate/out-of-order tokens fail
  * closed; the wire version is deliberately outside the CLI vocabulary. */
 static const char *const cap_names[] = {
-    "none", "video", "agent", "video,agent", "input", "video,input",
-    "agent,input", "video,agent,input"
+    "none",
+    "video",
+    "agent",
+    "video,agent",
+    "input",
+    "video,input",
+    "agent,input",
+    "video,agent,input",
+    "monitor",
+    "video,monitor",
+    "agent,monitor",
+    "video,agent,monitor",
+    "input,monitor",
+    "video,input,monitor",
+    "agent,input,monitor",
+    "video,agent,input,monitor"
 };
 
 int md_nostr_parse_caps(const char *text, uint32_t *out) {

@@ -83,7 +83,7 @@ typedef struct {
      *     localizedName, case-insensitive, must be unique).
      * An unknown selection fails (DXGI init, SCK start) and logs the
      * available displays. Linux/PipeWire picks its source in the portal and
-     * ignores it. Borrowed for the ctx lifetime. */
+     * rejects non-default remote selection (new portal consent required). Borrowed for the ctx lifetime. */
     const char *output;
     /* Upper bound on the delivered frame size, e.g. for bandwidth-limited
      * sessions; 0 leaves that dimension unbounded (both 0 = native pixels).
@@ -114,6 +114,19 @@ typedef struct {
     int32_t  x, y;
     uint32_t width, height;
 } MdCaptureRect;
+
+#define MD_CAPTURE_OUTPUTS_MAX 16
+/* Stable selectors, not transient display-list indices. */
+typedef struct { char id[32], name[96]; MdCaptureRect rect; bool primary; } MdCaptureOutput;
+typedef struct {
+    MdCaptureOutput items[MD_CAPTURE_OUTPUTS_MAX];
+    size_t count;
+    bool switch_supported;
+    char selected[32];
+} MdCaptureOutputs;
+/* Linux portals disclose only the consented source; switching needs new local consent. */
+int md_capture_outputs(MdCaptureOutputs *outputs);
+bool md_capture_output_id_valid(const char *id);
 
 /* ── Backend vtable (spec §2.3.1) ────────────────────────────── */
 

@@ -179,6 +179,7 @@ static const struct { const char *name; MdCapability bit; } cap_table[] = {
     { "video", MD_CAP_VIDEO },
     { "agent", MD_CAP_AGENT },
     { "input", MD_CAP_INPUT },
+    { "monitor", MD_CAP_MONITOR },
 };
 #define CAP_TABLE_LEN (sizeof(cap_table) / sizeof(cap_table[0]))
 
@@ -356,6 +357,8 @@ char *md_session_request_to_json(const MdSessionRequest *req) {
          !cJSON_AddNumberToObject(root, "expires_at", (double)req->expires_at)))
         goto fail;
 
+    if (req->output[0] && (!md_capture_output_id_valid(req->output) ||
+        !cJSON_AddStringToObject(root,"output",req->output))) goto fail;
     if (req->quality_present && md_quality_write(root, &req->quality)) goto fail;
 
     /* capabilities array */
@@ -411,6 +414,14 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
         cJSON_Delete(root); return -1;
     }
 
+    cJSON *output=cJSON_GetObjectItemCaseSensitive(root,"output");
+    if (output) {
+        if (!cJSON_IsString(output) || strlen(output->valuestring)>=sizeof(out->output) ||
+            !md_capture_output_id_valid(output->valuestring) || strstr(json,"\\u0000")) {
+            cJSON_Delete(root); return -1;
+        }
+        strcpy(out->output,output->valuestring);
+    }
     /* Correlation fields are optional on the wire (so a legacy request
      * parses and can be reported) but strictly typed when present. */
     if (parse_request_id(root, out->request_id) < 0 ||
@@ -482,6 +493,7 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
         !cJSON_AddStringToObject(root, "tls_cert_sha256", acc->tls_cert_sha256))
         goto fail;
 
+    if (acc->outputs_present && md_session_outputs_write(root,&acc->outputs)) goto fail;
     if (acc->quality_present && md_quality_write(root, &acc->quality)) goto fail;
 
     /* granted array */
@@ -532,6 +544,7 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
         cJSON_Delete(root); return -1;
     }
 
+    if (md_session_outputs_read(root,&out->outputs,&out->outputs_present)) { cJSON_Delete(root); return -1; }
     /* tree_format (optional — defaults to JSON for backwards compat) */
     cJSON *tf = cJSON_GetObjectItem(root, "tree_format");
     if (cJSON_IsString(tf) && strcmp(tf->valuestring, "compact") == 0)
@@ -586,6 +599,8 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
 
 const char *md_session_reject_message(const MdSessionReject *reject) {
     if (!reject) return NULL;
+    if (!strcmp(reject->reason,"output_unavailable"))
+        return "requested output unavailable or monitor grant missing; Linux portal switching requires new local consent";
     if (!strcmp(reject->reason, "tls_required"))
         return "Pinned TLS 1.3 required; upgrade both host and client";
     if (!strcmp(reject->reason, "capture_unavailable"))
@@ -656,4 +671,56 @@ int md_session_cancel_from_json(const char *json, char request_id[MD_SESSION_REQ
     if (ok) memcpy(request_id, id->valuestring, MD_SESSION_REQUEST_ID_LEN + 1);
     cJSON_Delete(root);
     return ok ? 0 : -1;
+}
+
+int md_session_outputs_write(cJSON *root,const MdCaptureOutputs *outputs) {
+    if (!root || !outputs || outputs->count>MD_CAPTURE_OUTPUTS_MAX) return -1;
+    cJSON *state=cJSON_AddObjectToObject(root,"displays");
+    if (!state || !cJSON_AddBoolToObject(state,"switch_supported",outputs->switch_supported) ||
+        !cJSON_AddStringToObject(state,"selected",outputs->selected)) return -1;
+    cJSON *array=cJSON_AddArrayToObject(state,"outputs"); if (!array) return -1;
+    for (size_t i=0;i<outputs->count;i++) {
+        const MdCaptureOutput *o=&outputs->items[i]; cJSON *item=cJSON_CreateObject();
+        if (!item || !cJSON_AddItemToArray(array,item)) { cJSON_Delete(item); return -1; }
+        if (!cJSON_AddStringToObject(item,"id",o->id) || !cJSON_AddStringToObject(item,"name",o->name) ||
+            !cJSON_AddNumberToObject(item,"x",o->rect.x) || !cJSON_AddNumberToObject(item,"y",o->rect.y) ||
+            !cJSON_AddNumberToObject(item,"width",o->rect.width) || !cJSON_AddNumberToObject(item,"height",o->rect.height)) return -1;
+    }
+    return 0;
+}
+int md_session_outputs_read(const cJSON *root,MdCaptureOutputs *out,bool *present) {
+    memset(out,0,sizeof(*out)); *present=false;
+    cJSON *state=cJSON_GetObjectItemCaseSensitive(root,"displays"); if (!state) return 0;
+    cJSON *array=cJSON_GetObjectItemCaseSensitive(state,"outputs");
+    cJSON *selected=cJSON_GetObjectItemCaseSensitive(state,"selected");
+    cJSON *supported=cJSON_GetObjectItemCaseSensitive(state,"switch_supported");
+    if (!cJSON_IsObject(state) || !cJSON_IsArray(array) || cJSON_GetArraySize(array)>MD_CAPTURE_OUTPUTS_MAX ||
+        !cJSON_IsString(selected) || strlen(selected->valuestring)>=sizeof(out->selected) ||
+        (selected->valuestring[0] && !md_capture_output_id_valid(selected->valuestring)) || !cJSON_IsBool(supported)) return -1;
+    out->switch_supported=cJSON_IsTrue(supported); strcpy(out->selected,selected->valuestring);
+    cJSON *item;
+    cJSON_ArrayForEach(item,array) {
+        MdCaptureOutput *o=&out->items[out->count];
+        cJSON *id=cJSON_GetObjectItemCaseSensitive(item,"id"), *name=cJSON_GetObjectItemCaseSensitive(item,"name");
+        if (!cJSON_IsString(id) || strlen(id->valuestring)>=sizeof(o->id) || !md_capture_output_id_valid(id->valuestring) ||
+            !cJSON_IsString(name) || strlen(name->valuestring)>=sizeof(o->name)) return -1;
+        for (size_t i=0;i<out->count;i++) if (!strcmp(out->items[i].id,id->valuestring)) return -1;
+        strcpy(o->id,id->valuestring); strcpy(o->name,name->valuestring);
+        const char *keys[]={"x","y","width","height"};
+        double vals[4];
+        for (size_t k=0;k<4;k++) {
+            cJSON *n=cJSON_GetObjectItemCaseSensitive(item,keys[k]);
+            if (!cJSON_IsNumber(n) || n->valuedouble<(k<2 ? INT32_MIN : 0) ||
+                n->valuedouble>INT32_MAX || n->valuedouble!=(double)(int32_t)n->valuedouble) return -1;
+            vals[k]=n->valuedouble;
+        }
+        o->rect=(MdCaptureRect){(int32_t)vals[0],(int32_t)vals[1],(uint32_t)vals[2],(uint32_t)vals[3]}; out->count++;
+    }
+    *present=true; return 0;
+}
+char *md_session_outputs_json(const MdCaptureOutputs *outputs,const char *error) {
+    cJSON *root=cJSON_CreateObject(); char *s=NULL;
+    if (root && cJSON_AddStringToObject(root,"type","outputs") && !md_session_outputs_write(root,outputs) &&
+        (!error || cJSON_AddStringToObject(root,"error",error))) s=cJSON_PrintUnformatted(root);
+    cJSON_Delete(root); return s;
 }

@@ -45,6 +45,7 @@ MdOverlayAction md_overlay_take_action(MdOverlay *o);
 
 /* Overlay stats shown to user */
 typedef struct {
+    const MdCaptureOutputs *outputs;
     MdQuality quality;
     bool quality_supported;
     float  latency_ms;       /* total pipeline latency             */
@@ -90,6 +91,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats);
 bool md_overlay_wants_mouse(MdOverlay *o);
 bool md_overlay_wants_keyboard(MdOverlay *o);
 
+bool md_overlay_take_output(MdOverlay *o, char output[32]);
 bool md_overlay_take_quality(MdOverlay *o, MdQuality *quality);
 
 /* Destroy overlay and ImGui context. */

@@ -118,6 +118,8 @@ void md_encoder_force_keyframe(MdEncoder *enc);
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
 /* Capture-thread only. Transactional reopen; queued old frames are discarded. */
 int md_encoder_set_fps(MdEncoder *enc, uint32_t fps);
+/* Discard queued old-output frames even when dimensions match. */
+int md_encoder_restart(MdEncoder *enc);
 
 /* Selected backend name (e.g. h264_videotoolbox, h264_mf, openh264). Borrowed static string; NULL for a NULL encoder. */
 const char *md_encoder_get_name(const MdEncoder *enc);

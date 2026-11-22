@@ -404,3 +404,15 @@ void md_capture_destroy(MdCaptureCtx *ctx) {
         ctx->vtable->destroy(ctx);
     free(ctx);
 }
+
+bool md_capture_output_id_valid(const char *id) {
+    if (!id || !*id) return false;
+    if (!strcmp(id,"portal") || !strcmp(id,"all")) return true;
+    if (strncmp(id,"id:",3) || !id[3]) return false;
+    uint64_t n=0;
+    for (const char *p=id+3; *p; p++) {
+        if (*p<'0' || *p>'9') return false;
+        n=n*10+(unsigned)(*p-'0'); if (n>UINT32_MAX) return false;
+    }
+    return n>0;
+}

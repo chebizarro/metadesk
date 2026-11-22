@@ -133,6 +133,9 @@ typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
     MdClientRates rates;
+    bool monitor_control;
+    char requested_output[32];
+    MdCaptureOutputs outputs;
     MdQuality requested_quality, effective_quality;
     bool quality_supported;
     uint32_t      frames_decoded;
@@ -276,6 +279,10 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         ctx->session_accepted = -1; ctx->request_pending = 0;
         ctx->connection_status = "host does not support requested quality; upgrade host";
     } else if (matched) {
+        ctx->outputs=acc.outputs;
+        for (size_t i=0;i<acc.outputs.count;i++)
+            fprintf(stderr,"client: output %s %s%s\n",acc.outputs.items[i].id,acc.outputs.items[i].name,
+                    !strcmp(acc.outputs.selected,acc.outputs.items[i].id) ? " (selected)" : "");
         ctx->quality_supported = acc.quality_present;
         ctx->effective_quality = acc.quality;
         memcpy(ctx->tls_cert_sha256, acc.tls_cert_sha256, sizeof(ctx->tls_cert_sha256));
@@ -319,6 +326,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
+    fprintf(stderr, "  --monitor-control Request monitor switching capability (off by default)\n");
+    fprintf(stderr, "  --output id:N     Select host output at connect (requires monitor grant)\n");
     fprintf(stderr, "  --save-quality    Save requested quality per host (self-encrypted NIP-78)\n");
     fprintf(stderr, "  --max-size WxH    Session resolution cap (0 = host default)\n");
     fprintf(stderr, "  --bitrate BPS     Session bitrate ceiling (0 = host default)\n");
@@ -414,10 +423,11 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         return -1;
 
     MdSessionRequest req = {
-        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
+        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | (ctx->monitor_control ? MD_CAP_MONITOR : 0),
         .tree_format = MD_TREE_FORMAT_COMPACT,
         .quality = ctx->requested_quality, .quality_present = true,
     };
+    strcpy(req.output,ctx->requested_output);
     const char *our_pk = md_nostr_get_npub(nostr);
     if (our_pk)
         strncpy(req.fips_addr, our_pk, sizeof(req.fips_addr) - 1);
@@ -906,6 +916,7 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
         .fps          = (int)rates.fps,
         .bitrate_mbps = (float)rates.mbps,
         .encoder_name = NULL,
+        .outputs = stream ? &ctx->outputs : NULL,
         .quality_supported = stream && ctx->quality_supported,
         .quality = stream ? ctx->effective_quality : (MdQuality){0},
     };
@@ -916,6 +927,14 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
     md_renderer_begin_frame(ctx->renderer);
     md_overlay_new_frame(ctx->overlay);
     md_overlay_render(ctx->overlay, &overlay_stats);
+    char output[32];
+    if (stream && md_overlay_take_output(ctx->overlay,output)) {
+        cJSON *root=cJSON_CreateObject();
+        cJSON_AddStringToObject(root,"type","monitor"); cJSON_AddStringToObject(root,"output",output);
+        char *json=cJSON_PrintUnformatted(root); cJSON_Delete(root);
+        if (json) { if (md_stream_send(stream,MD_PKT_SESSION_CONTROL,ctx->input_seq++,
+            (uint8_t*)json,(uint32_t)strlen(json))) md_stream_close(stream); free(json); }
+    }
     MdQuality changed;
     if (stream && md_overlay_take_quality(ctx->overlay, &changed)) {
         char *json = md_quality_control(&changed);
@@ -1064,6 +1083,8 @@ static int client_run(int argc, char **argv) {
     uint16_t port = MD_STREAM_PORT;
     bool quality_cli = false, save_quality = false;
     bool do_display = true;
+    bool monitor_control=false;
+    char requested_output[32]={0};
     MdQuality requested_quality = {0};
     uint32_t timeout_ms = 5000;
     const char *relay_urls[16];
@@ -1094,6 +1115,14 @@ static int client_run(int argc, char **argv) {
                 fprintf(stderr, "ERROR: bitrate must be 0 or 100000..100000000; fps 0..240\n"); return 1;
             }
         }
+        else if (strcmp(argv[i],"--output")==0 && i+1<argc) {
+            const char *id=argv[++i];
+            if (strlen(id)>=sizeof(requested_output) || !md_capture_output_id_valid(id)) {
+                fprintf(stderr,"ERROR: --output requires a stable id:N selector (Windows also all)\n"); return 1;
+            }
+            strcpy(requested_output,id); monitor_control=true;
+        }
+        else if (!strcmp(argv[i],"--monitor-control")) monitor_control=true;
         else if (strcmp(argv[i], "--save-quality") == 0) save_quality = true;
         else if (strcmp(argv[i], "--no-display") == 0)
             do_display = false;
@@ -1202,6 +1231,8 @@ static int client_run(int argc, char **argv) {
 
     /* Client context (needed before connect for nostr callbacks) */
     ClientCtx ctx = { .owner = account.binding, .requested_quality = requested_quality };
+    ctx.monitor_control=monitor_control;
+    strcpy(ctx.requested_output,requested_output);
     if (account.binding) {
         ctx.owner_watch = md_account_binding_watch(account.binding, client_owner_revoked, &ctx);
         if (!ctx.owner_watch) {
@@ -1550,6 +1581,18 @@ static int client_run(int argc, char **argv) {
             char json[MD_SESSION_JSON_MAX + 1];
             memcpy(json, payload, hdr.payload_len); json[hdr.payload_len] = 0;
             cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+            cJSON *type=cJSON_GetObjectItemCaseSensitive(root,"type");
+            if (cJSON_IsString(type) && !strcmp(type->valuestring,"outputs")) {
+                bool present;
+                if (md_session_outputs_read(root,&ctx.outputs,&present) || !present) md_stream_close(stream);
+                else {
+                    cJSON *error=cJSON_GetObjectItemCaseSensitive(root,"error");
+                    fprintf(stderr,"client: output selected %s%s%s\n",ctx.outputs.selected,
+                        cJSON_IsString(error) ? ": " : "",cJSON_IsString(error) ? error->valuestring : "");
+                    if (!cJSON_IsString(error)) strcpy(ctx.requested_output,ctx.outputs.selected);
+                }
+                cJSON_Delete(root); break;
+            }
             bool present; MdQuality applied;
             if (!root || md_quality_read(root, &applied, &present) || !present) md_stream_close(stream);
             else {
