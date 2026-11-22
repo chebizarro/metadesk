@@ -81,9 +81,27 @@ static void decisions(void) {
     md_host_access_stop(&a);MD_CHECK(md_host_access_enqueue(&a,pk,&r,100)<0);
     md_host_access_destroy(&a);
 }
+static void revoke_peer(void) {
+    MdHostAccess a; MD_CHECK(!md_host_access_init(&a));
+    char first[65], other[65]; peer(1,first); peer(2,other);
+    MdSessionRequest one=req(10,110), two=req(11,110);
+    MD_CHECK(!md_host_access_enqueue(&a,first,&one,100));
+    MD_CHECK(!md_host_access_enqueue(&a,other,&two,100));
+    MdHostAccessSnapshot v=view(&a,100); MdHostRequest selected;
+    MD_CHECK(!md_host_access_decide(&a,v.generation,v.revision,one.request_id,true,true,1,7,100,&selected));
+    md_host_access_revoke_peer(&a,first);
+    MD_CHECK(md_host_access_remembered(&a,one.request_id,true,100)<0);
+    v=view(&a,100); MD_CHECK(v.count==1 && !strcmp(v.requests[0].peer,other));
+    MD_CHECK(!md_host_access_auto(&a,first,&one,1,100));
+    md_host_access_revoke_peer(&a,other); MD_CHECK(md_host_access_valid(&a,one.request_id));
+    md_host_access_revoke_peer(&a,first); MD_CHECK(!md_host_access_valid(&a,one.request_id));
+    MD_CHECK(view(&a,100).revoked); md_host_access_destroy(&a);
+}
 int main(void) {
+    revoke_peer();
     bounds_expiry(); decisions(); decision_race();
     char id[33];MD_CHECK(!md_session_cancel_from_json("{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"00000000000000000000000000000001\"}",id));
     MD_CHECK(md_session_cancel_from_json("{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"bad\"}",id)<0);
     puts("PASS: bounds, strict deadline, caps, stale/duplicate decisions, approve/deny races, remember failure/cancel/expiry, one session, kick");
+    return md_test_report();
 }

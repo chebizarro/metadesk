@@ -15,6 +15,8 @@ int md_management_path(const char *host_key, char *out, size_t size);
 /* Uses real kernel credentials; expected_uid normally geteuid(). Public for
  * credential-rejection testing without changing a test process's privileges. */
 bool md_management_peer_is_user(int fd, uint64_t expected_uid);
+/* Verified nonblocking descriptor for a subscription; caller owns it. */
+int md_management_connect(const char *path);
 /* One request/reply with credential verification in both directions. */
 cJSON *md_management_call(const char *path, const cJSON *request);
 int md_host_management_cli(const char *area, int argc, char **argv);

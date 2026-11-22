@@ -60,5 +60,6 @@ bool md_host_access_valid(MdHostAccess *a, const char *request_id);
 void md_host_access_bound(MdHostAccess *a, const char *request_id, const char *session_id, uint32_t granted);
 void md_host_access_release(MdHostAccess *a);
 void md_host_access_cancel(MdHostAccess *a, const char *peer, const char *id);
+void md_host_access_revoke_peer(MdHostAccess *a, const char *peer);
 int md_host_access_kick(MdHostAccess *a, const char *generation, uint64_t revision, const char *session_id);
 #endif
