@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix="md-w11-display-") as temporary:
 <allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
 </policy></busconfig>""", encoding="utf-8")
     result = subprocess.run([sys.argv[1], "--config-file=" + str(configuration), "--",
-                             sys.argv[2], "-a", sys.argv[3]],
+                             sys.argv[2], "-a", *sys.argv[3:]],
                             env=environment, check=False)
     returncode = result.returncode
 sys.exit(returncode)

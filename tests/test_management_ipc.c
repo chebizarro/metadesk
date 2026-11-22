@@ -34,6 +34,12 @@ int main(void) {
     MD_CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(host,"state")->valuestring,"waiting"));
     cJSON_Delete(v);
     v=call(path,"arbitrary.signer");MD_CHECK(v&&cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok")));cJSON_Delete(v);
+    v=call(path,"access.list");
+    MD_CHECK(v && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"policy_available")));
+    MD_CHECK(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(v,"clients"))); cJSON_Delete(v);
+    // Unknown policy fields and unsupported versions never become commands.
+    cJSON *bad=cJSON_Parse("{\"v\":2,\"method\":\"access.remove\"}");
+    v=md_management_call(path,bad); MD_CHECK(v && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok"))); cJSON_Delete(v); cJSON_Delete(bad);
     struct stat st;MD_CHECK(!lstat(path,&st));MD_CHECK((st.st_mode&0777)==0600);
     // A half-close is a semantic EOF barrier: idle subscribers must release
     // their worker without requiring another state mutation (no sleeps).
@@ -69,4 +75,5 @@ int main(void) {
     char lock[120];snprintf(lock,sizeof(lock),"%s.lock",path);MD_CHECK(!unlink(lock));
     md_host_access_destroy(&a);MD_CHECK(!rmdir(dir));
     puts("PASS: real kernel peer UID accepted/rejected, invalid fd rejected, private endpoint, live-path/symlink/unsafe-parent refusal, cleanup");
+    return md_test_report();
 }

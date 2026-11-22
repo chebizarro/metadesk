@@ -194,6 +194,16 @@ void md_host_access_cancel(MdHostAccess *a, const char *peer, const char *id) {
     }
     pthread_mutex_unlock(&a->mu);
 }
+void md_host_access_revoke_peer(MdHostAccess *a, const char *peer) {
+    pthread_mutex_lock(&a->mu);
+    for (size_t i = 0; i < a->view.count;)
+        if (!strcmp(a->view.requests[i].peer, peer)) remove_at(a, i);
+        else ++i;
+    if (a->view.occupied && !strcmp(a->view.active.peer, peer) && !a->view.revoked) {
+        a->view.revoked = true; changed(a);
+    }
+    pthread_mutex_unlock(&a->mu);
+}
 int md_host_access_kick(MdHostAccess *a, const char *g, uint64_t rev, const char *id) {
     pthread_mutex_lock(&a->mu);
     int rc = -1;

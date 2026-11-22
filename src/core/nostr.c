@@ -1591,7 +1591,7 @@ static NostrEvent *build_allowlist_event(MdNostr *n, const NostrList *list,
 }
 
 static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add,
-                           const MdAllowlistEntry *confirmed, size_t count, bool migrate) {
+                           const MdAllowlistEntry *confirmed, size_t count, bool migrate, const uint64_t *expected) {
     if (!n || !n->signer || (!migrate && (!pk || strlen(pk) != 64 ||
         strspn(pk, "0123456789abcdef") != 64))) return -1;
 
@@ -1609,6 +1609,9 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
      * UNKNOWN with no relay pending (all down/awaiting AUTH) fails at once. */
     while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
         pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    if (expected && *expected != n->acl_version) {
+        pthread_mutex_unlock(&n->allowlist_mu); return -2;
+    }
     if (is_stopped(n) || n->acl_state != MD_NOSTR_ACL_LOADED || n->acl_editing ||
         n->acl_unconfirmed_count == MD_ACL_UNCONFIRMED_MAX || n->acl_decode_failed ||
         (!migrate && n->acl_review_required)) {
@@ -1754,10 +1757,10 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
 }
 
 static int allowlist_add(MdNostr *n, const char *pk, const char *caps) {
-    return allowlist_edit(n, pk, caps, true, NULL, 0, false);
+    return allowlist_edit(n, pk, caps, true, NULL, 0, false, NULL);
 }
 static int allowlist_remove(MdNostr *n, const char *pk) {
-    return allowlist_edit(n, pk, NULL, false, NULL, 0, false);
+    return allowlist_edit(n, pk, NULL, false, NULL, 0, false, NULL);
 }
 
 static int allowlist_count(const MdNostr *n) {
@@ -1800,13 +1803,13 @@ static int allowlist_get_entry(const MdNostr *n, int index,
 
 int md_nostr_allowlist_migrate(MdNostr *n, const MdAllowlistEntry *confirmed, size_t count) {
     if (!owns_host(n) || !operation_begin(n)) return -1;
-    int ret = allowlist_edit(n, NULL, NULL, false, confirmed, count, true);
+    int ret = allowlist_edit(n, NULL, NULL, false, confirmed, count, true, NULL);
     if (is_stopped(n)) ret = -1;
     operation_end(n);
     return ret;
 }
 
-int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *count) {
+int md_nostr_allowlist_snapshot_version(MdNostr *n, MdAllowlistEntry **entries, size_t *count, uint64_t *version) {
     if (!entries || !count) return -1;
     *entries = NULL;
     *count = 0;
@@ -1830,6 +1833,7 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
                 copy[used].review_required = n->acl_review_required;
                 ++used;
             }
+            if (version) *version = n->acl_version;
             ret = 0;
         }
     }
@@ -1838,6 +1842,17 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
     operation_end(n);
     if (ret) free(copy);
     else { *entries = copy; *count = used; }
+    return ret;
+}
+
+int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *count) {
+    return md_nostr_allowlist_snapshot_version(n, entries, count, NULL);
+}
+int md_nostr_allowlist_edit_version(MdNostr *n, const char *pk, const char *caps, uint64_t version) {
+    if (!owns_host(n) || !operation_begin(n)) return -1;
+    int ret = allowlist_edit(n, pk, caps, caps != NULL, NULL, 0, false, &version);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
     return ret;
 }
 

@@ -59,10 +59,32 @@ the window. Standard window decorations are retained.
   `ws` is visibly described as unencrypted. No relay is preselected, contacted,
   or claimed connected. These settings are **not yet consumed** by CLI/core
   relay planning (`md-2l87`); they do not rewrite its legacy defaults.
-- **Hosts / This Computer / Access / Activity:** honest status-page placeholders,
-  not disabled simulations. Saved hosts and launch are `md-vb18`, authenticated
-  host IPC and sessions are `md-trex`, approvals/access are `md-a9f2`. No fake
-  hosts, permissions, sessions, availability, or outcomes are displayed.
+- **Access:** connect to an explicit local host socket (or launch with
+  `metadesk-manager --management-socket /absolute/private/control.sock`). This
+  neither starts a host nor enables attended admission. Kernel peer credentials
+  and private-path checks are shared with the CLI. Missing/untrusted sockets,
+  disconnection, malformed/oversized frames and version mismatch clear authority
+  and are shown honestly; reconnect is an explicit action, not polling.
+  The inbox contains only unexpired requests in this host generation. Review
+  shows the full npub, exact request ID, requested permissions and expiry.
+  No permission is preselected; Input is unavailable under `--no-input`.
+  Approve is once-only unless “Remember this exact grant” is selected. Deny
+  is explicit. A notification only opens the matching current review, never
+  approves; exact generation/request notifications are withdrawn on expiry,
+  cancellation, approval, disconnect and window close. Existing reviews become
+  non-actionable on expiry or a stale host revision. Unknown capability bits
+  remain visible and cannot be granted by this manager version.
+  Remembered clients come from the host's private allowlist. Edit replaces exact
+  caps; Revoke removes the client. Both end existing admission authority after
+  acknowledged publication. Legacy/unknown policy is displayed but not edited; unknown permissions can still be revoked.
+  External policy edits require explicit Refresh Private Policy, with a
+  policy-version writer fence preventing stale overwrites.
+- **Activity:** the real reserved/active session and its effective permissions,
+  with confirmed End Session. A reserved ID is not proof of TCP binding;
+  “Ending” means revocation requested, not completed OS cleanup. The row must
+  disappear to prove host teardown. This is not an invented activity history.
+- **Hosts / This Computer:** lifecycle and managed connection placeholders
+  remain; W16 does not start/stop hosts or launch remote clients.
 
 All account and file operations run on a serialized worker task, with no GTK
 objects accessed from that worker. The account controller is opened per
@@ -100,12 +122,75 @@ for the navigation page's `shown` signal, not an arbitrary animation delay.
 The narrow test asserts a 360px native surface; client content can be narrower
 because window decoration shadows are included in that surface.
 
-A fake host IPC test would currently test an invented protocol: the real
-authenticated host-control contract is not implemented (`md-trex`). This is a
-remaining acceptance boundary, not a passing host-integration claim.
+`manager-host-ipc` uses a private fake Unix server for fragmented full snapshots,
+exact command serialization, policy listing, revision/generation fencing,
+version mismatch, oversized frames, disconnection and canceled-connect cleanup.
+`manager-access-ui` drives the production window, review/permission controls,
+private revoke, keyboard focus and 360px layout. A private
+`org.gtk.Notifications` service observes real GNotification calls, verifies exact
+review targets and no approval actions, and checks withdrawal on cancel/expiry.
+These are isolated fixture tests, not GNOME Shell notification-appearance proof.
+
+For the real-binary test on Linux:
+
+```sh
+python3 tests/test_manager_live.py BUILD/metadesk-host BUILD/metadesk-client \
+  BUILD/access_signer_fixture BUILD/src/manager/test_manager_access
+```
+
+It uses the real attended host, headless client, private WebSocket relay and
+throwaway cryptographic signers. The driver clicks the production manager GTK
+controls under isolated Xvfb/D-Bus: once, deny, remember, kick, exact grant edit,
+and revoke. It checks authenticated TLS binding/disconnection and private-only
+persisted policy. It never creates uinput devices or captures the desktop.
+GNOME was locked during W16 qualification; this is real host/IPC/relay evidence
+through headless UI controls, not live-desktop interaction or Shell appearance.
+Screenshot rendering waits for toolkit presentation/hit-testing and after-paint,
+not guessed animation sleeps. Screenshot-only runs enable GTK’s reduced-motion
+setting; normal test runs retain animations.
+
+Diff-scoped Nostr protocol review A–J: no new relay REQ/filter/reconnect path,
+polling, sleep-based completion or unchecked publication. GUI mutations call
+same-user IPC only. Host edits reuse the positive-OK private writer and its
+unchanged-base fence; the added policy version is checked under that lock.
+Exact authenticated request deadlines only withdraw/disable stale UI, never
+stand in for relay history or publish completion.
 
 The shell follows the GNOME HIG's
 [adaptive sidebar](https://developer.gnome.org/hig/patterns/nav/sidebars.html)
 and [placeholder](https://developer.gnome.org/hig/patterns/feedback/placeholders.html)
 patterns, using a `.ui` resource, AdwNavigationSplitView, a breakpoint, header
 bars, clamped scrollable forms, boxed lists, persistent status, and save toasts.
+
+
+### W16 qualification (2026-11-22)
+
+| Gate | Result |
+|---|---|
+| macOS full configured suite, NIP-5F enabled | 60 passed, 1 native AX live test skipped, 0 failures |
+| Linux ARM64 VM, private W16 source/dependencies, builds at `-j2` | 63 passed, 1 opt-in first-key desktop test skipped, 0 failures |
+| Manager subset (included above) | 4/4 passed, including fake IPC and private headless GTK/notification tests |
+| Real Linux host/client/private relay, production manager controls | Once, deny, remember, kick, exact grant edit, revoke/disconnect all passed |
+
+GNOME remained locked. No uinput devices, desktop capture or native input were
+used. The source/dependency/build scratch under `~/md-w16` and local
+`/private/tmp/md-w16-*` are removed after qualification. No sibling checkout was
+edited or built. Initial Linux transfer failures were missing dependency/source
+files, not product-test retries; the final private dependency snapshot is nostrc
+`cfcb86296068c1e4090bc5ce8a486392dc74eb11`.
+
+Retained screenshots (isolated Xvfb, reduced motion):
+[real pending request](screenshots/w16-access-live.png),
+[real review after explicitly selecting Video](screenshots/w16-review-live.png),
+[real session](screenshots/w16-activity-live.png), and
+[360px fixture](screenshots/w16-access-fixture-360.png).
+These show the production manager against real IPC or explicitly identified fake
+state; they do not show a live GNOME Shell notification.
+
+The second-opinion review received source excerpts after worktree artifact
+routing failed. It found no concrete defect in those excerpts; it was **not** a
+whole-patch review or independent verification of the tests. Source-backed
+review checked the full changed paths and the Nostr boundaries described above.
+Source triage used four Jev find-lines queries (12 requests, 87608 input tokens,
+approximately $0.00368); narrow hits were expanded for mutex/acceptance context.
+No AI relevance judgment controls an approval or policy mutation.
