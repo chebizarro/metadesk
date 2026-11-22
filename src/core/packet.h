@@ -28,6 +28,8 @@ typedef enum {
     MD_PKT_SCREENSHOT    = 0x05,
     MD_PKT_INPUT         = 0x06,  /* raw human mouse/keyboard (client→host);
                                    * payload: input_event.h, frame-tagged */
+    MD_PKT_SESSION_CONTROL = 0x21, /* bound client control, <=8 KiB JSON */
+    MD_PKT_SESSION_STATE = 0x22,   /* host applied state, <=8 KiB JSON */
     MD_PKT_PING          = 0x10,
     MD_PKT_PONG          = 0x11,
     MD_PKT_SESSION_INFO  = 0x20, /* first packet: session_bind proof (<=8 KiB);

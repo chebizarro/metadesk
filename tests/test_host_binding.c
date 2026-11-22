@@ -1152,6 +1152,23 @@ static void test_agent_replacement_failure(void) {
     md_agent_destroy(agent);
 }
 
+static void test_quality_control(void) {
+    Pair p=pair(); MdSession s; MdSessionAccept a=reserve(&s,MD_CAP_VIDEO);
+    s.quality_present=true;
+    send_proof(p,&a); MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_VIDEO);
+    HostCtx ctx=context(&s); ctx.client=p.host;
+    ctx.quality_policy=(MdQuality){1280,720,2000000,30};
+    char *json=md_quality_control(&(MdQuality){1920,1080,8000000,60});
+    MdPacketHeader h={.type=MD_PKT_SESSION_CONTROL,.payload_len=(uint32_t)strlen(json)};
+    handle_client_packet(&ctx,&h,(uint8_t*)json);
+    MD_CHECK(ctx.quality.max_width==1280 && ctx.quality.bitrate==2000000 && ctx.quality.fps==30);
+    MD_CHECK(ctx.quality_state_pending && md_stream_is_connected(p.host));
+    free(json); destroy_pair(p);
+    p=pair(); a=reserve(&s,MD_CAP_AGENT); send_proof(p,&a);
+    MD_CHECK(!md_stream_accept_binding(p.host,&s)); ack(p,MD_CAP_AGENT);
+    ctx=context(&s); ctx.client=p.host;
+    handle_client_packet(&ctx,&h,(const uint8_t*)"{}"); closed(p); destroy_pair(p);
+}
 int main(int argc, char **argv) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -1177,6 +1194,7 @@ int main(int argc, char **argv) {
         test_relay_history(argv[2]);
         return md_test_report();
     }
+    test_quality_control();
     test_capture_admission();
     test_idle_capture_rebind();
     test_request_cache();

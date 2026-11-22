@@ -497,13 +497,14 @@ int md_encoder_flush(MdEncoder *enc, MdEncodeCallback cb, void *userdata) {
 /* Open a complete encoder at the new size through the normal cascade, then
  * swap it into enc so the handle the caller holds stays valid. Building the
  * replacement first leaves enc untouched when the new size cannot open. */
-int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height) {
+static int encoder_reconfigure(MdEncoder *enc, uint32_t width, uint32_t height, uint32_t fps) {
     if (!enc)
         return -1;
-    if (enc->config.width == width && enc->config.height == height)
+    if (enc->config.width == width && enc->config.height == height && enc->config.fps == fps)
         return 0;
 
     MdEncoderConfig cfg = enc->config; /* carries the current bitrate */
+    cfg.fps = fps;
     cfg.width  = width;
     cfg.height = height;
     MdEncoder *fresh = md_encoder_create(&cfg);
@@ -517,6 +518,13 @@ int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height) {
     *fresh = old;
     md_encoder_destroy(fresh); /* frees the old codec state, unflushed */
     return 0;
+}
+
+int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height) {
+    return enc ? encoder_reconfigure(enc, width, height, enc->config.fps) : -1;
+}
+int md_encoder_set_fps(MdEncoder *enc, uint32_t fps) {
+    return enc && fps && fps <= 240 ? encoder_reconfigure(enc, enc->config.width, enc->config.height, fps) : -1;
 }
 
 /* Request that the next submitted frame be encoded as a keyframe (IDR), so a

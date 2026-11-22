@@ -133,6 +133,8 @@ typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
     MdClientRates rates;
+    MdQuality requested_quality, effective_quality;
+    bool quality_supported;
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
@@ -268,7 +270,14 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         ctx->request_pending = 0;
         ctx->connection_status = "host lacks pinned TLS 1.3; upgrade host (no plaintext fallback)";
         OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
+    } else if (matched && !acc.quality_present &&
+        (ctx->pending_req.quality.max_width || ctx->pending_req.quality.max_height ||
+         ctx->pending_req.quality.bitrate || ctx->pending_req.quality.fps)) {
+        ctx->session_accepted = -1; ctx->request_pending = 0;
+        ctx->connection_status = "host does not support requested quality; upgrade host";
     } else if (matched) {
+        ctx->quality_supported = acc.quality_present;
+        ctx->effective_quality = acc.quality;
         memcpy(ctx->tls_cert_sha256, acc.tls_cert_sha256, sizeof(ctx->tls_cert_sha256));
         memcpy(ctx->stream_token, acc.stream_token, sizeof(ctx->stream_token));
         snprintf(ctx->accepted_session_id, sizeof(ctx->accepted_session_id),
@@ -310,6 +319,10 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --dbus-signer      Use NIP-55L D-Bus signer daemon\n");
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer      Auto-detect local signer\n");
+    fprintf(stderr, "  --save-quality    Save requested quality per host (self-encrypted NIP-78)\n");
+    fprintf(stderr, "  --max-size WxH    Session resolution cap (0 = host default)\n");
+    fprintf(stderr, "  --bitrate BPS     Session bitrate ceiling (0 = host default)\n");
+    fprintf(stderr, "  --fps FPS         Session frame rate ceiling (0 = host default)\n");
     fprintf(stderr, "  --relay URL        Relay URL (default: " MD_DEFAULT_RELAY ")\n");
     fprintf(stderr, "  -h, --help         Show this help\n");
 }
@@ -403,6 +416,7 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
     MdSessionRequest req = {
         .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT,
         .tree_format = MD_TREE_FORMAT_COMPACT,
+        .quality = ctx->requested_quality, .quality_present = true,
     };
     const char *our_pk = md_nostr_get_npub(nostr);
     if (our_pk)
@@ -892,6 +906,8 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
         .fps          = (int)rates.fps,
         .bitrate_mbps = (float)rates.mbps,
         .encoder_name = NULL,
+        .quality_supported = stream && ctx->quality_supported,
+        .quality = stream ? ctx->effective_quality : (MdQuality){0},
     };
 
     /* One composite per displayed frame: draw the latest video texture,
@@ -900,6 +916,16 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
     md_renderer_begin_frame(ctx->renderer);
     md_overlay_new_frame(ctx->overlay);
     md_overlay_render(ctx->overlay, &overlay_stats);
+    MdQuality changed;
+    if (stream && md_overlay_take_quality(ctx->overlay, &changed)) {
+        char *json = md_quality_control(&changed);
+        if (json) {
+            if (md_stream_send(stream, MD_PKT_SESSION_CONTROL, ctx->input_seq++,
+                               (uint8_t *)json, (uint32_t)strlen(json))) md_stream_close(stream);
+            else ctx->requested_quality = changed;
+            free(json);
+        }
+    }
     md_renderer_end_frame(ctx->renderer);
     ctx->shown = ctx->uploaded;
 }
@@ -1036,7 +1062,9 @@ static int client_run(int argc, char **argv) {
     bool auto_signer = false;
     bool use_socket_signer = false;
     uint16_t port = MD_STREAM_PORT;
+    bool quality_cli = false, save_quality = false;
     bool do_display = true;
+    MdQuality requested_quality = {0};
     uint32_t timeout_ms = 5000;
     const char *relay_urls[16];
     int relay_count = 0;
@@ -1045,6 +1073,28 @@ static int client_run(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
+            quality_cli = true;
+            char tail;
+            if (sscanf(argv[++i], "%ux%u%c", &requested_quality.max_width,
+                       &requested_quality.max_height, &tail) != 2 ||
+                !md_quality_valid(&requested_quality)) {
+                fprintf(stderr, "ERROR: --max-size requires WxH, each 0 or 2..16384\n"); return 1;
+            }
+        }
+        else if ((strcmp(argv[i], "--bitrate") == 0 || strcmp(argv[i], "--fps") == 0) && i + 1 < argc) {
+            quality_cli = true;
+            bool is_fps = strcmp(argv[i], "--fps") == 0;
+            const char *value = argv[++i]; char *end;
+            unsigned long n = strtoul(value, &end, 10);
+            if (!value[0] || *end || value[0] == '-' || n > UINT32_MAX) return 1;
+            if (is_fps) requested_quality.fps = (uint32_t)n;
+            else requested_quality.bitrate = (uint32_t)n;
+            if (!md_quality_valid(&requested_quality)) {
+                fprintf(stderr, "ERROR: bitrate must be 0 or 100000..100000000; fps 0..240\n"); return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--save-quality") == 0) save_quality = true;
         else if (strcmp(argv[i], "--no-display") == 0)
             do_display = false;
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
@@ -1151,7 +1201,7 @@ static int client_run(int argc, char **argv) {
     md_session_init(&session);
 
     /* Client context (needed before connect for nostr callbacks) */
-    ClientCtx ctx = { .owner = account.binding };
+    ClientCtx ctx = { .owner = account.binding, .requested_quality = requested_quality };
     if (account.binding) {
         ctx.owner_watch = md_account_binding_watch(account.binding, client_owner_revoked, &ctx);
         if (!ctx.owner_watch) {
@@ -1206,6 +1256,7 @@ static int client_run(int argc, char **argv) {
             .owner = account.binding,
             .relay_urls = relay_urls,
             .relay_count = relay_count,
+            .quality_preferences = true,
         };
 
         if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
@@ -1233,6 +1284,14 @@ static int client_run(int argc, char **argv) {
 
     }
 
+    if (nostr) {
+        if (!quality_cli && md_nostr_quality_load(nostr, ctx.expected_host_pk, &ctx.requested_quality) < 0)
+            fprintf(stderr, "client: saved quality unavailable or invalid; using host defaults\n");
+        if (save_quality && md_nostr_quality_save(nostr, ctx.expected_host_pk, &ctx.requested_quality)) {
+            fprintf(stderr, "ERROR: could not save encrypted quality preferences (requires relay OK)\n");
+            cleanup_session_nostr(&nostr,&ctx); md_signer_destroy(signer); md_account_startup_clear(&account); return 1;
+        }
+    }
     /* Create decoder */
     MdDecoder *decoder = md_decoder_create();
     if (!decoder) {
@@ -1485,6 +1544,21 @@ static int client_run(int argc, char **argv) {
             }
             break;
 
+        case MD_PKT_SESSION_STATE: {
+            if (hdr.payload_len > MD_SESSION_JSON_MAX || !hdr.payload_len ||
+                memchr(payload, 0, hdr.payload_len)) { md_stream_close(stream); break; }
+            char json[MD_SESSION_JSON_MAX + 1];
+            memcpy(json, payload, hdr.payload_len); json[hdr.payload_len] = 0;
+            cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+            bool present; MdQuality applied;
+            if (!root || md_quality_read(root, &applied, &present) || !present) md_stream_close(stream);
+            else {
+                ctx.effective_quality = applied;
+                fprintf(stderr, "client: quality applied cap=%ux%u bitrate=%u fps=%u\n",
+                    applied.max_width, applied.max_height, applied.bitrate, applied.fps);
+            }
+            cJSON_Delete(root); break;
+        }
         case MD_PKT_SESSION_INFO:
             fprintf(stderr, "client: received session info\n");
             break;

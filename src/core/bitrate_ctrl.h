@@ -108,6 +108,9 @@ uint32_t md_bitrate_ctrl_get_bitrate(const MdBitrateCtrl *ctrl);
 /* Query what action the controller last took. */
 MdBitrateAction md_bitrate_ctrl_get_action(const MdBitrateCtrl *ctrl);
 
+/* Retarget a negotiated session ceiling; current recommendation is clamped. */
+uint32_t md_bitrate_ctrl_set_max(MdBitrateCtrl *ctrl, uint32_t maximum);
+
 /* Reset controller state (e.g., on reconnection). */
 void md_bitrate_ctrl_reset(MdBitrateCtrl *ctrl);
 

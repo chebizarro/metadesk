@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "quality.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,8 @@ MdOverlayAction md_overlay_take_action(MdOverlay *o);
 
 /* Overlay stats shown to user */
 typedef struct {
+    MdQuality quality;
+    bool quality_supported;
     float  latency_ms;       /* total pipeline latency             */
     float  encode_ms;        /* average encode time                */
     float  decode_ms;        /* average decode time                */
@@ -86,6 +89,8 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats);
  * uses these to avoid forwarding those events to the remote host. */
 bool md_overlay_wants_mouse(MdOverlay *o);
 bool md_overlay_wants_keyboard(MdOverlay *o);
+
+bool md_overlay_take_quality(MdOverlay *o, MdQuality *quality);
 
 /* Destroy overlay and ImGui context. */
 void md_overlay_destroy(MdOverlay *o);

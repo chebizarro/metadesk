@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "quality.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,8 @@ typedef enum {
 
 /* Session context */
 typedef struct {
+    MdQuality quality;
+    bool quality_present;
     MdSessionState state;
     uint32_t       capabilities;   /* bitwise OR of MdCapability   */
     MdTreeFormat   tree_format;
@@ -115,6 +118,8 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 
 /* Parsed session request from client */
 typedef struct {
+    MdQuality quality;
+    bool quality_present;
     uint32_t    capabilities;      /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;
     bool         stream_tls;       /* supports pinned TLS 1.3 */
@@ -126,6 +131,8 @@ typedef struct {
 
 /* Parsed session accept from host */
 typedef struct {
+    MdQuality quality;
+    bool quality_present;
     char         session_id[64];   /* UUID assigned by host      */
     uint32_t     granted;          /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;      /* confirmed tree format       */

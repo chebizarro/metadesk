@@ -116,6 +116,8 @@ void md_encoder_force_keyframe(MdEncoder *enc);
  * (also for an unchanged size), or -1 with the encoder left as it was.
  * Same threading rule as md_encoder_submit. */
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
+/* Capture-thread only. Transactional reopen; queued old frames are discarded. */
+int md_encoder_set_fps(MdEncoder *enc, uint32_t fps);
 
 /* Selected backend name (e.g. h264_videotoolbox, h264_mf, openh264). Borrowed static string; NULL for a NULL encoder. */
 const char *md_encoder_get_name(const MdEncoder *enc);

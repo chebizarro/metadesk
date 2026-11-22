@@ -998,6 +998,7 @@ int md_stream_accept_binding(MdStream *s, MdSession *session) {
     if (ret != 0) goto reject;
     /* No token in the ACK, and no client-supplied grants are echoed. */
     MdSessionAccept ack = {
+        .quality = session->quality, .quality_present = session->quality_present,
         .granted = session->capabilities,
         .tree_format = session->tree_format,
     };

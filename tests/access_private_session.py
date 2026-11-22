@@ -19,8 +19,10 @@ from test_access_cli import Signer, HOST_PK, CLIENT_PK, HOST_NPUB, CLIENT_NPUB
 
 
 def main():
-    host, client, crypto = map(os.path.abspath, sys.argv[1:])
-    with tempfile.TemporaryDirectory(prefix="md-w8-session-") as tmp:
+    live_quality = "--quality-capture" in sys.argv
+    host, client, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a != "--quality-capture"])
+
+    with tempfile.TemporaryDirectory(prefix="md-w15-session-") as tmp:
         root = Path(tmp).resolve()
         relay = Relay()
         servers, threads, children, readers = [relay], [], [], []
@@ -82,16 +84,24 @@ def main():
                 readers.append(t)
                 return p, ready
             hp, ready = launch("host", [host, "--bind", "127.0.0.1", "--port", port,
-                                        "--relay", url, "--no-capture", "--no-input"],
+                                        "--relay", url, "--no-input", *(["--fps", "30", "--bitrate", "2000000",
+                                        "--capture-max-size", "1024x768"] if live_quality else ["--no-capture"])],
                                "nostr bridge ready, waiting for session requests")
             assert ready.wait(20), logs
             cp, connected = launch("client", [client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
-                                               "--relay", url, "--port", port, "--no-display", "--timeout", "15000"],
-                                   "receiving stream...")
+                                               "--relay", url, "--port", port, "--no-display", "--timeout", "15000",
+                                               *(["--max-size", "640x480", "--bitrate", "1000000", "--fps", "15"] if live_quality else [])],
+                                   "decoded frame size" if live_quality else "receiving stream...")
             assert connected.wait(25), logs
             assert hp.poll() is None and cp.poll() is None, logs
+            if live_quality:
+                assert any("cap=640x480 bitrate=1000000 fps=15" in s for s in logs["host"]), logs
+                sizes = [s.split("decoded frame size ")[1].strip() for s in logs["client"] if "decoded frame size " in s]
+                w, h = map(int, sizes[0].split("x"))
+                assert w <= 640 and h <= 480, sizes
+                print(f"PASS: real SCK -> encoder -> pinned TLS -> decoder, {w}x{h}; 1Mbps/15fps quality policy applied")
             print("PASS: real host/client processes; private-only allowlist via external NIP-5F; NIP-17 authorization; loopback TCP session_bind ACK")
-            print("Scope: no capture/input/FIPS qualification; no public relay, desktop devices, user keys, or routing changes")
+            print("Scope: " + ("native quality capture; no input/FIPS;" if live_quality else "no capture/input/FIPS qualification;") + " no public relay, desktop devices, user keys, or routing changes")
         finally:
             for p in reversed(children):
                 if p.poll() is None:

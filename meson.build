@@ -782,6 +782,7 @@ core_sources = files(
   'src/core/a11y_snapshot.c',
   'src/core/input.c',
   'src/core/session.c',
+  'src/core/quality.c',
   'src/core/host_access.c',
   'src/core/management_ipc.c',
   'src/core/jsonrpc.c',
@@ -1266,6 +1267,13 @@ test_session = executable('test_session',
   dependencies : [dep_metadesk],
 )
 test('session JSON + state machine', test_session)
+test_quality = executable('test_quality', 'tests/test_quality.c', dependencies : dep_metadesk)
+test('session quality policy + scaling', test_quality)
+test_quality_preferences = executable('test_quality_preferences', 'tests/test_quality_preferences.c', dependencies : dep_metadesk)
+if host_os != 'windows'
+  test('encrypted quality preferences private relay', find_program('python3'),
+    args : [files('tests/test_quality_preferences.py'), test_quality_preferences], timeout : 60)
+endif
 
 test_jsonrpc = executable('test_jsonrpc',
   files('tests/test_jsonrpc.c'),

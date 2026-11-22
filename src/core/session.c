@@ -356,6 +356,8 @@ char *md_session_request_to_json(const MdSessionRequest *req) {
          !cJSON_AddNumberToObject(root, "expires_at", (double)req->expires_at)))
         goto fail;
 
+    if (req->quality_present && md_quality_write(root, &req->quality)) goto fail;
+
     /* capabilities array */
     caps_arr = cJSON_CreateArray();
     if (!caps_arr)
@@ -403,6 +405,10 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
     if (!cJSON_IsString(type) || strcmp(type->valuestring, "session_request") != 0) {
         cJSON_Delete(root);
         return -1;
+    }
+
+    if (md_quality_read(root, &out->quality, &out->quality_present)) {
+        cJSON_Delete(root); return -1;
     }
 
     /* Correlation fields are optional on the wire (so a legacy request
@@ -476,6 +482,8 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
         !cJSON_AddStringToObject(root, "tls_cert_sha256", acc->tls_cert_sha256))
         goto fail;
 
+    if (acc->quality_present && md_quality_write(root, &acc->quality)) goto fail;
+
     /* granted array */
     granted_arr = cJSON_CreateArray();
     if (!granted_arr)
@@ -518,6 +526,10 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
     if (!cJSON_IsString(type) || strcmp(type->valuestring, "session_accept") != 0) {
         cJSON_Delete(root);
         return -1;
+    }
+
+    if (md_quality_read(root, &out->quality, &out->quality_present)) {
+        cJSON_Delete(root); return -1;
     }
 
     /* tree_format (optional — defaults to JSON for backwards compat) */
