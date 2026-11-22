@@ -126,6 +126,9 @@ class Run:
         self.relay = f"ws://{FIXTURE_IP}:7777"
         self.fixture, self.counters, self.npub_clients = None, {}, 0
         self.sessions = []  # negotiations completed on this relay, oldest first
+        # md-ah9.6 (validate-mesh-video.py) uses real fipsd daemons instead.
+        self.control_fixture = True
+        self.fixture_extra = []
 
     def retire_fixture(self):
         name, self.fixture = self.fixture, None
@@ -134,6 +137,8 @@ class Run:
         counters = self.counters[name] = json.loads(m[1]) if m else None
         podman("rm", "-f", name, check_rc=False)
         self.created.remove(name)
+        if not self.control_fixture:
+            return
         # Every negotiating client must have asked the control endpoint for peer readiness.
         peers = ((counters or {}).get("control:fips") or {}).get("show_peers", 0)
         check(f"{name}: each --npub client queried FIPS peer readiness", peers >= self.npub_clients,
@@ -152,12 +157,14 @@ class Run:
                 "-v", f"{w}/client-fixture.py:/fixture/client-fixture.py:ro",
                 "-v", f"{w}/keys:/fixture/keys:ro", "-v", f"{w}/sock:/fixture/sock:rw", "--entrypoint", "python3"]
         cmd = ["/fixture/client-fixture.py", "--tests", "/fixture/tests", "--crypto", "/fixture/nip5f-crypto",
-               "--relay", f"{FIXTURE_IP}:7777", "--sockets", "/fixture/sock", "--control", "fips",
-               "--local-npub", ids["client"]["npub"], "--peer-npub", ids["host"]["npub"],
+               "--relay", f"{FIXTURE_IP}:7777", "--sockets", "/fixture/sock",
+               *(["--control", "fips", "--local-npub", ids["client"]["npub"], "--peer-npub", ids["host"]["npub"]]
+                 if self.control_fixture else []), *self.fixture_extra,
                "--signer=host=/fixture/keys/host.key", "--bunker-bin", "/fixture/nip46-bunker",
                *[f"--bunker={r}=/fixture/keys/{r}.key" for r in ("host", "client", "stranger")]]
         self.fixture, logs = self.start("fixture", args, self.a.video_image, cmd)
-        if not check("fixture: private retaining relay, bunkers and control listening",
+        services = "relay, bunkers and control" if self.control_fixture else "relay and bunkers (no control fixture)"
+        if not check(f"fixture: private retaining {services} listening",
                      bool(logs.wait(r"^fixture ready$", 30))):
             raise Incomplete
         # Host role + allowlist via Metadesk commands; bind-role verifies the live signer owner.
@@ -194,7 +201,9 @@ class Run:
 
     def account(self, *args):
         """Host account/access CLI with the NIP-5F host signer (signing only)."""
-        return podman("run", "--rm", "--network", self.net, *SANDBOX,
+        self.accounts = getattr(self, "accounts", 0) + 1
+        return podman("run", "--rm", "--name", f"{self.a.prefix}-account-{self.accounts}",
+                      "--network", self.net, *SANDBOX,
                       "-v", f"{self.w}/home-host:/home/metadesk:rw", "-v", f"{self.w}/sock/host:/run/signer:rw",
                       "-e", "NOSTR_SIGNER_SOCK=/run/signer/signer.sock",
                       "-e", "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent",
