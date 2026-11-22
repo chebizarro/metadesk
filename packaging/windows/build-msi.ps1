@@ -52,7 +52,7 @@ if ($LASTEXITCODE) { throw 'WiX build failed' }
 $msi = "$Output\metadesk-$Version-arm64.msi"
 & $Wix msi validate $msi *> "$Output\msi-validation.log"
 if ($LASTEXITCODE) { throw "MSI ICE validation failed; see $Output\msi-validation.log" }
-Write-Host 'MSI ICE validation passed; validation warnings retained in output log.' 
+Write-Host 'MSI ICE validation passed; validation warnings retained in output log.'
 if ($Sign) {
     & $SignTool sign /sha1 $CertificateThumbprint /s My /fd SHA256 /tr $TimestampUrl /td SHA256 $msi
     if ($LASTEXITCODE) { throw 'MSI signing failed' }

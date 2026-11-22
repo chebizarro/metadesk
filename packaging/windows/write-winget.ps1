@@ -17,14 +17,17 @@ $productCode = $view.Fetch().StringData(1)
 $view.Close()
 $hash = (Get-FileHash $Msi -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Force $Output | Out-Null
+$Output = (Resolve-Path $Output).Path
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 $header = "PackageIdentifier: ChrisDaley.Metadesk`nPackageVersion: $Version"
-@"
+$content = @"
 $header
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: 1.6.0
-"@ | Set-Content "$Output\ChrisDaley.Metadesk.yaml" -Encoding UTF8
-@"
+"@
+[IO.File]::WriteAllText((Join-Path $Output 'ChrisDaley.Metadesk.yaml'), $content.Replace("`r`n","`n").TrimEnd() + "`n", $utf8)
+$content = @"
 $header
 PackageLocale: en-US
 Publisher: Chris Daley
@@ -33,8 +36,9 @@ License: MIT
 ShortDescription: Nostr-native remote desktop host and client
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
-"@ | Set-Content "$Output\ChrisDaley.Metadesk.locale.en-US.yaml" -Encoding UTF8
-@"
+"@
+[IO.File]::WriteAllText((Join-Path $Output 'ChrisDaley.Metadesk.locale.en-US.yaml'), $content.Replace("`r`n","`n").TrimEnd() + "`n", $utf8)
+$content = @"
 $header
 InstallerType: wix
 Scope: user
@@ -50,4 +54,5 @@ Installers:
   ProductCode: '$productCode'
 ManifestType: installer
 ManifestVersion: 1.6.0
-"@ | Set-Content "$Output\ChrisDaley.Metadesk.installer.yaml" -Encoding UTF8
+"@
+[IO.File]::WriteAllText((Join-Path $Output 'ChrisDaley.Metadesk.installer.yaml'), $content.Replace("`r`n","`n").TrimEnd() + "`n", $utf8)
