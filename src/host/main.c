@@ -554,7 +554,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
     fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
-    fprintf(stderr, "  --no-nvenc       Disable NVENC, use x264\n");
+    fprintf(stderr, "  --no-nvenc       Skip NVENC; try other hardware, then x264\n");
     fprintf(stderr, "  --no-capture     Skip screen capture (test mode)\n");
     fprintf(stderr, "  --capture-unattended  Portal consent budget <=10s; never auto-forget\n");
     fprintf(stderr, "  --capture-consent-timeout-ms MS  Total portal budget (1..180000)\n");
@@ -1089,7 +1089,8 @@ int main(int argc, char **argv) {
     printf("  port:      %u\n", port);
     printf("  fps:       %u\n", fps);
     printf("  bitrate:   %u bps\n", bitrate);
-    printf("  encoder:   %s\n", use_nvenc ? "NVENC (preferred)" : "x264");
+    printf("  encoder:   %s\n", use_nvenc ? "NVENC preferred; hardware/x264 fallback"
+                                             : "non-NVENC hardware/x264 fallback");
     printf("  capture:   %s\n", do_capture ? "enabled" : "disabled");
     if (fips_npub)
         printf("  fips:      %.*s...\n", 12, fips_npub);
@@ -1395,7 +1396,7 @@ signaling_ready:
         return 1;
     }
     printf("host: encoder ready (%s, %ux%u)\n",
-           md_encoder_is_hw(encoder) ? "NVENC" : "x264",
+           md_encoder_get_name(encoder),
            enc_width, enc_height);
 
     /* Initialize input injection (persistent) */

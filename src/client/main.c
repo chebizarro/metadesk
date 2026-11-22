@@ -21,6 +21,7 @@
 #include "stream.h"
 #include "decode.h"
 #include "render.h"
+#include "rates.h"
 #include "signer.h"
 #include "nostr.h"
 #include "a11y.h"
@@ -59,6 +60,7 @@ typedef struct {
 typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
+    MdClientRates rates;
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
@@ -620,8 +622,7 @@ static void overlay_event_forward(void *event, void *userdata) {
     forward_input_event(ctx, (const SDL_Event *)event);
 }
 
-static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
-                                  uint32_t stats_start_ms) {
+static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
     if (!ctx || !ctx->overlay)
         return;
 
@@ -629,7 +630,12 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
     if (stream)
         md_stream_get_stats(stream, &stream_stats);
 
-    uint32_t now = md_stream_now_ms();
+    MdClientRateValues rates = { 0 };
+    if (stream)
+        rates = md_client_rates_update(&ctx->rates, md_stream_now_ms(),
+                                       ctx->frames_decoded, stream_stats.bytes_recv);
+    else
+        ctx->rates = (MdClientRates){ 0 };
     double avg_decode_ms = ctx->frames_decoded > 0
         ? (double)ctx->total_decode_us / ctx->frames_decoded / 1000.0
         : 0.0;
@@ -643,11 +649,8 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
         .reconnecting = ctx->reconnecting != 0,
         .reconnect_delay_ms = ctx->reconnect_delay_ms,
         .status_message = ctx->connection_status,
-        .fps          = ctx->frames_decoded > 0
-            ? (int)(ctx->frames_decoded * 1000.0 /
-                    (now - stats_start_ms + 1)) : 0,
-        .bitrate_mbps = stream_stats.bytes_recv > 0
-            ? (float)(stream_stats.bytes_recv * 8.0 / 1000000.0) : 0.0f,
+        .fps          = (int)rates.fps,
+        .bitrate_mbps = (float)rates.mbps,
         .encoder_name = NULL,
     };
 
@@ -679,7 +682,7 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
                 g_running = 0;
                 return -1;
             }
-            render_client_overlay(ctx, NULL, start);
+            render_client_overlay(ctx, NULL);
         }
 
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
@@ -992,7 +995,7 @@ int main(int argc, char **argv) {
             ctx.reconnecting = 1;
             ctx.connection_status = "Disconnected — reconnecting...";
             ctx.reconnect_delay_ms = reconnect_delay_ms;
-            render_client_overlay(&ctx, NULL, last_stats_ms);
+            render_client_overlay(&ctx, NULL);
 
             fprintf(stderr, "client: reconnecting in %.1fs\n",
                     (double)reconnect_delay_ms / 1000.0);
@@ -1043,7 +1046,7 @@ int main(int argc, char **argv) {
 
         if (ret == 1) {
             /* Timeout — no data yet, keep UI responsive and loop back. */
-            render_client_overlay(&ctx, stream, last_stats_ms);
+            render_client_overlay(&ctx, stream);
             continue;
         }
         if (ret < 0) {
@@ -1090,7 +1093,7 @@ int main(int argc, char **argv) {
 
             /* Composite the freshly decoded frame + overlay and present now,
              * rather than waiting for the next recv timeout. */
-            render_client_overlay(&ctx, stream, last_stats_ms);
+            render_client_overlay(&ctx, stream);
             break;
         }
 
@@ -1165,7 +1168,7 @@ int main(int argc, char **argv) {
         free(payload);
 
         /* Update and render overlay */
-        render_client_overlay(&ctx, stream, last_stats_ms);
+        render_client_overlay(&ctx, stream);
 
         /* Print stats every 5 seconds */
         uint32_t now = md_stream_now_ms();
