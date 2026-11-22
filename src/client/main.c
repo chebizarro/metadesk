@@ -549,7 +549,7 @@ static const char *sdl_key_name(SDL_Keycode k) {
  * decoded, so queued input is mapped while its frame is still shown. */
 static void send_input(ClientCtx *ctx, uint8_t kind, uint8_t button,
                        int16_t x, int16_t y, const char *text, uint16_t tlen) {
-    if (!ctx->stream) return;
+    if (!ctx->stream || !(ctx->granted_caps & MD_CAP_INPUT)) return;
     uint8_t buf[MD_INPUT_EVENT_MAX_LEN];
     const FrameTag *t = &ctx->shown;
     const bool fits = t->w <= UINT16_MAX && t->h <= UINT16_MAX;

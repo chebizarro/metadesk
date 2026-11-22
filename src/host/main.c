@@ -527,6 +527,8 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
     if (hdr->type == MD_PKT_ACTION) needed = MD_CAP_AGENT | MD_CAP_INPUT;
     if (hdr->type == MD_PKT_SESSION_INFO ||
         !md_stream_has_capability(ctx->client, needed)) {
+        fprintf(stderr, "host: rejecting stream packet type=0x%02x: capability/proof violation\n",
+                hdr->type);
         md_stream_close(ctx->client);
         return;
     }
