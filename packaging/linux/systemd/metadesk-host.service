@@ -2,13 +2,22 @@
 Description=Metadesk desktop host
 Documentation=https://github.com/chebizarro/metadesk
 PartOf=graphical-session.target
-After=graphical-session-pre.target
+Requisite=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/metadesk-host
+ExecStart=/usr/bin/metadesk-host --managed
 Restart=on-failure
 RestartSec=5s
+RestartPreventExitStatus=78
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=metadesk-host
 NoNewPrivileges=yes
 UMask=0077
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+# launchd cannot exclude an individual nonzero status from SuccessfulExit.
+# Preserve the host's structured exit diagnostic, but suppress config loops.
+"$(dirname "$0")/../MacOS/metadesk-host" "$@" &
+host=$!
+trap 'trap "" TERM INT; kill -TERM "$host" 2>/dev/null; wait "$host"; exit 0' TERM INT
+wait "$host"
+status=$?
+[ "$status" -ne 78 ] || status=0
+exit "$status"

@@ -27,6 +27,12 @@ int main(void) {
     MdManagementIpc *server=md_management_start(&a,NULL,NULL,path,7,NULL,NULL);MD_CHECK(server);
     MD_CHECK(!md_management_start(&a,NULL,NULL,path,7,NULL,NULL)); // cannot replace live endpoint
     cJSON *v=call(path,"management.snapshot");MD_CHECK(v&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"ok")));cJSON_Delete(v);
+    md_host_access_lifecycle(&a,true,"waiting");
+    v=call(path,"management.snapshot");
+    cJSON *host=cJSON_GetObjectItemCaseSensitive(v,"host");
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(host,"managed")));
+    MD_CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(host,"state")->valuestring,"waiting"));
+    cJSON_Delete(v);
     v=call(path,"arbitrary.signer");MD_CHECK(v&&cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok")));cJSON_Delete(v);
     struct stat st;MD_CHECK(!lstat(path,&st));MD_CHECK((st.st_mode&0777)==0600);
     // A half-close is a semantic EOF barrier: idle subscribers must release
@@ -46,6 +52,21 @@ int main(void) {
     char link[108];snprintf(link,sizeof(link),"%s/link",dir);MD_CHECK(!symlink(path,link));
     MD_CHECK(!call(link,"management.snapshot"));unlink(link);
     MD_CHECK(!chmod(dir,0755));MD_CHECK(!call(path,"management.snapshot"));MD_CHECK(!chmod(dir,0700));
-    md_management_stop(server);MD_CHECK(lstat(path,&st)<0);md_host_access_destroy(&a);MD_CHECK(!rmdir(dir));
+    md_management_stop(server);MD_CHECK(lstat(path,&st)<0);md_host_access_destroy(&a);
+    MD_CHECK(!md_host_access_init(&a));
+    FILE *regular=fopen(path,"wx");MD_CHECK(regular);fclose(regular);
+    MD_CHECK(!md_management_start_managed(&a,NULL,NULL,path,7,NULL,NULL));
+    MD_CHECK(!lstat(path,&st)&&S_ISREG(st.st_mode));MD_CHECK(!unlink(path));
+    MD_CHECK(!symlink("missing",path));
+    MD_CHECK(!md_management_start_managed(&a,NULL,NULL,path,7,NULL,NULL));
+    MD_CHECK(!lstat(path,&st)&&S_ISLNK(st.st_mode));MD_CHECK(!unlink(path));
+    int stale=socket(AF_UNIX,SOCK_STREAM,0);MD_CHECK(stale>=0);
+    struct sockaddr_un addr={.sun_family=AF_UNIX};strcpy(addr.sun_path,path);
+    MD_CHECK(!bind(stale,(struct sockaddr *)&addr,sizeof(addr)));close(stale);MD_CHECK(!chmod(path,0600));
+    server=md_management_start_managed(&a,NULL,NULL,path,7,NULL,NULL);MD_CHECK(server);
+    MD_CHECK(!md_management_start_managed(&a,NULL,NULL,path,7,NULL,NULL));
+    md_management_stop(server);MD_CHECK(lstat(path,&st)<0);
+    char lock[120];snprintf(lock,sizeof(lock),"%s.lock",path);MD_CHECK(!unlink(lock));
+    md_host_access_destroy(&a);MD_CHECK(!rmdir(dir));
     puts("PASS: real kernel peer UID accepted/rejected, invalid fd rejected, private endpoint, live-path/symlink/unsafe-parent refusal, cleanup");
 }

@@ -51,7 +51,12 @@ class PackagingTests(unittest.TestCase):
         path = package.find('.//w:Environment', N)
         self.assertEqual(path.get('System'), 'no')
         self.assertEqual(path.get('Permanent'), 'no')
-        self.assertEqual(len(package.findall('.//w:Shortcut', N)), 2)
+        self.assertEqual(len(package.findall('.//w:Shortcut', N)), 3)
+        feature = package.find("w:Feature[@Id='HostLogon']", N)
+        self.assertEqual(feature.get('Level'), '2')
+        remove = package.find("w:CustomAction[@Id='RemoveHostTask']", N)
+        self.assertIsNotNone(remove)
+        self.assertIn('-File "[INSTALLDIR]host-task.ps1"', remove.get('ExeCommand'))
 
 
 if __name__ == '__main__':

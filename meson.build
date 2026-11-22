@@ -879,7 +879,7 @@ if host_os == 'windows'
 endif
 host_sources = files('src/core/encode_openh264_fetch.c', 'src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
   'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
-  'src/host/capture_sync.c')
+  'src/host/capture_sync.c', 'src/host/lifecycle.c')
 host_includes = [core_inc]
 host_c_args = []
 
@@ -1237,7 +1237,7 @@ test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
   files('tests/test_host_binding.c', 'src/core/encode_openh264_fetch.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
-    'src/host/capture_sync.c', 'src/host/capture_cli.c'),
+    'src/host/capture_sync.c', 'src/host/lifecycle.c', 'src/host/capture_cli.c'),
   dependencies : [dep_metadesk] + dep_oh_fetch)
 test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
@@ -1413,4 +1413,14 @@ if enable_nip5f and enable_client and (host_os == 'linux' or host_os == 'darwin'
   test('attended real host client private relay', accounts_python,
     args : [files('tests/test_host_approval.py'), metadesk_host, metadesk_client, access_signer_fixture],
     timeout : 180)
+endif
+
+# Native process-level lifecycle fixture; no capture, input or a11y startup.
+test_host_lifecycle = executable('test_host_lifecycle',
+  files('tests/test_host_lifecycle.c', 'src/host/lifecycle.c'),
+  dependencies : dep_metadesk, include_directories : core_inc)
+if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
+  test('managed host signals exits and IPC', accounts_python,
+    args : [files('tests/test_managed_mode.py'), metadesk_host, access_signer_fixture, test_host_lifecycle],
+    timeout : 60)
 endif

@@ -872,6 +872,11 @@ static void admission_release(MdCaptureCtx *cap, MdFrame *frame) {
 static void test_capture_admission(void) {
     const MdCaptureBackend backend = { .start = admission_start,
         .get_frame = admission_frame, .release_frame = admission_release };
+    AdmissionCapture interaction = {.start_result = MD_CAPTURE_INTERACTION_REQUIRED};
+    MdCaptureCtx interaction_cap = {.vtable = &backend, .backend_data = &interaction};
+    uint32_t iw = 0, ih = 0; HostCtx interaction_ctx = {0};
+    MD_CHECK(host_start_capture(&interaction_cap, &iw, &ih, &interaction_ctx) == MD_CAPTURE_INTERACTION_REQUIRED);
+    MD_CHECK(interaction.pulls == 0);
     AdmissionCapture cases[] = {
         {.start_result = -1}, /* portal denial/timeout */
         {.frame_result = MD_CAPTURE_ERROR}, /* broken/never delivered */
