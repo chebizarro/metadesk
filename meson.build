@@ -930,6 +930,7 @@ if host_machine.system() == 'linux'
   test('AT-SPI native hit adapter', test_atspi_hit)
   test('a11y private bus loss', test_atspi,
     args : ['--private-bus-loss', metadesk_host.full_path()],
+    env : {'G_DEBUG' : 'fatal-criticals'},
     depends : metadesk_host,
     timeout : 45,
   )

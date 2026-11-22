@@ -16,6 +16,15 @@ static AtspiAccessible *fake_point(AtspiComponent *component, int x, int y,
     if (point_error) g_set_error_literal(error, g_quark_from_static_string("fixture"), 1, "unavailable");
     return front ? g_object_ref(front) : NULL;
 }
+static bool deferred_drained;
+static gboolean fake_deferred(gpointer data) { (void)data; deferred_drained = true; return G_SOURCE_REMOVE; }
+static int fake_exit(void) {
+    MD_CHECK(g_main_context_is_owner(g_main_context_default()));
+    MD_CHECK(g_main_depth() > 0); /* queued dispatch, not invoke_full inline */
+    MD_CHECK(deferred_drained);
+    return 0;
+}
+#define atspi_exit fake_exit
 #define atspi_get_desktop fake_desktop
 #define atspi_accessible_get_component_iface fake_component
 #define atspi_component_get_accessible_at_point fake_point
@@ -52,6 +61,15 @@ int main(void) {
     MD_CHECK(!md_a11y_target_at_point(&ctx, id, 140, 220));
     atspi_stop_event_thread(&state);
     g_main_loop_unref(state.event_loop); g_mutex_clear(&state.lock);
+    /* Cleanup is queued behind already-deferred cache messages and stops
+     * its dispatcher in the same context callback. No bus is involved. */
+    GSource *deferred = g_idle_source_new();
+    g_source_set_callback(deferred, fake_deferred, NULL, NULL);
+    g_source_attach(deferred, g_main_context_default());
+    atspi_runtime_initialized = TRUE;
+    atspi_runtime_shutdown();
+    g_source_destroy(deferred); g_source_unref(deferred);
+    MD_CHECK(!atspi_runtime_initialized);
     free(id);
     g_object_unref(target); g_object_unref(occluder); g_object_unref(desktop); g_object_unref(app);
     return md_test_report();

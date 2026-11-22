@@ -228,7 +228,8 @@ void md_a11y_delta_free(MdA11yDelta *deltas, int count);
 /* Query whether the a11y context is connected and operational. */
 bool md_a11y_is_connected(const MdA11yCtx *ctx);
 
-/* Destroy a11y context, freeing all resources. */
+/* Destroy per-context resources, listeners and dispatch threads. A backend
+ * may retain a shared OS runtime (libatspi) until final process shutdown. */
 void md_a11y_destroy(MdA11yCtx *ctx);
 
 #ifdef __cplusplus

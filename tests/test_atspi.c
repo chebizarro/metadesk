@@ -870,6 +870,9 @@ static gpointer fixture_teardown_worker(gpointer data) {
     for (int i = 0; i < 32; i++) {
         MdA11yCtx *ctx = md_a11y_create();
         if (!ctx || !md_a11y_is_connected(ctx)) result = 'F';
+        MdA11yNode *tree = md_a11y_walk(ctx);
+        if (!tree) result = 'F';
+        md_a11y_node_free(tree);
         md_a11y_destroy(ctx);
         if (result == 'F') break;
     }
@@ -934,12 +937,12 @@ static void fixture_context_handoff(void) {
 }
 
 static void fixture_backend_child(int fd, bool unsubscribe) {
+    atomic_store(&fixture_notify_calls, 0);
+    atomic_store(&fixture_notify_off_context, 0);
     if (!unsubscribe) {
         fixture_context_handoff();
         fixture_competing_teardown();
     }
-    atomic_store(&fixture_notify_calls, 0);
-    atomic_store(&fixture_notify_off_context, 0);
     MdA11yCtx *ctx = md_a11y_create();
     if (!ctx || !md_a11y_is_connected(ctx)) _exit(2);
     if (unsubscribe && (md_a11y_subscribe_changes(ctx, fixture_change, NULL) != 0 ||
@@ -1013,7 +1016,7 @@ static void test_private_bus_loss(const char *host, bool host_only) {
     /* Activated private services are adopted and reaped by this test, not
      * left as zombies with the VM's init process. */
     if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) { MD_CHECK(false); return; }
-    for (int mode = host_only ? 2 : 0; mode < 3; mode++) {
+    for (int mode = host_only ? 2 : 0; mode < (host_only ? 3 : 4); mode++) {
         pid_t bus_pid = -1, bus_group = -1, child = -1;
         int bus_out[2] = {-1, -1}, in[2] = {-1, -1}, out[2] = {-1, -1};
         char runtime[] = "/tmp/md-atspi-loss-XXXXXX";
@@ -1081,13 +1084,13 @@ static void test_private_bus_loss(const char *host, bool host_only) {
         close(out[1]); out[1] = -1;
         MD_CHECK(child > 0);
         if (child > 0) {
-            if (mode == 2) {
+            if (mode >= 2) {
                 const char init[] = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{}}\n";
                 MD_CHECK(write(in[1], init, sizeof(init)-1) == sizeof(init)-1);
             }
             bool ready = fixture_line(out[0], line, sizeof(line));
             MD_CHECK(ready);
-            if (mode == 2 && ready) {
+            if (mode >= 2 && ready) {
                 cJSON *reply = cJSON_Parse(line);
                 MD_CHECK(cJSON_IsObject(cJSON_GetObjectItem(reply, "result")));
                 cJSON_Delete(reply);
@@ -1102,11 +1105,17 @@ static void test_private_bus_loss(const char *host, bool host_only) {
             int64_t before = md_now_ms();
             /* Only the PID returned by this fixture's fork, never a PID
              * looked up from a shared bus or process-name search. */
-            MD_CHECK(kill(bus_pid, SIGTERM) == 0);
             int status;
-            bool bus_exited = fixture_reap(bus_pid, &status, 1000);
-            MD_CHECK(bus_exited);
-            if (bus_exited) bus_pid = -1;
+            if (mode == 3) {
+                /* Populated caches, bus and providers remain alive through
+                 * native host SIGTERM and its final process-wide AX cleanup. */
+                MD_CHECK(kill(child, SIGTERM) == 0);
+            } else {
+                MD_CHECK(kill(bus_pid, SIGTERM) == 0);
+                bool bus_exited = fixture_reap(bus_pid, &status, 1000);
+                MD_CHECK(bus_exited);
+                if (bus_exited) bus_pid = -1;
+            }
             if (mode < 2) {
                 MD_CHECK(fixture_line(out[0], line, sizeof(line)) && strcmp(line, "D") == 0);
             }

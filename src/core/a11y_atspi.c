@@ -49,6 +49,14 @@ typedef struct {
                                           * itself lives on the MdA11yCtx         */
 } AtspiState;
 
+/* libatspi is a process-wide runtime, not a per-MdA11yCtx connection.
+ * In 2.52, atspi_exit disposes app caches but retains the app-name table;
+ * reinitialization or deferred dispatch then resolves disposed NULL caches.
+ * Keep library caches alive across backend instances and exit once,
+ * at process shutdown, after all instance listeners/filters have detached. */
+static gboolean atspi_runtime_initialized;
+static gboolean atspi_runtime_exit_registered;
+
 /* ── Internal: convert AtspiAccessible to MdA11yNode ─────────── */
 
 static char *atspi_element_id(AtspiAccessible *acc) {
@@ -291,41 +299,69 @@ static void atspi_deregister_change_events(AtspiEventListener *listener) {
 typedef struct {
     GSourceFunc callback;
     gpointer data;
-    GMutex lock;
-    GCond done_cond;
-    gboolean done;
+    pthread_mutex_t lock;
+    pthread_cond_t done_cond;
+    bool done;
+    atomic_bool published;
 } AtspiContextOp;
 
 static gboolean atspi_context_op(gpointer data) {
     AtspiContextOp *op = data;
-    op->callback(op->data);
-    g_mutex_lock(&op->lock);
-    op->done = TRUE;
-    g_cond_signal(&op->done_cond);
-    g_mutex_unlock(&op->lock);
+    /* Explicit publication across the GLib source boundary, before touching
+     * the request's mutex or borrowed stack payload. */
+    if (!atomic_load_explicit(&op->published, memory_order_acquire)) abort();
+    pthread_mutex_lock(&op->lock);
+    GSourceFunc callback = op->callback;
+    gpointer callback_data = op->data;
+    pthread_mutex_unlock(&op->lock);
+    callback(callback_data);
+    pthread_mutex_lock(&op->lock);
+    op->done = true;
+    pthread_cond_signal(&op->done_cond);
+    pthread_mutex_unlock(&op->lock);
     return G_SOURCE_REMOVE;
 }
 
-/* libatspi's sources borrow its connection. Joining our event thread does
- * not exclude another default-context dispatcher from prepare/dispatch while
- * atspi_exit() frees that connection. Serialize lifecycle, listener work and
- * tree walks with the context, including initialization.
- * The owned event thread must exist for every call: invoke_full can queue
- * even on an unowned context (a different thread-default context), or an
- * existing owner can release the context without dispatching the operation.
- * Our thread then acquires it and completes the handoff. Never wait with
- * st->lock held. */
-static void atspi_invoke_sync(GSourceFunc callback, gpointer data) {
+/* The owned dispatcher exists before every handoff. Publish both the request
+ * and its completion through one pthread mutex, including stack-owned data.
+ * Shutdown must enqueue: invoke_full can run inline and ignore priority. */
+static void atspi_invoke_sync_priority(GSourceFunc callback, gpointer data,
+                                        int priority) {
+    GMainContext *context = g_main_context_default();
+    bool owner = g_main_context_is_owner(context);
+    if (owner && priority != G_PRIORITY_LOW) {
+        callback(data);
+        return;
+    }
     AtspiContextOp op = { .callback = callback, .data = data };
-    g_mutex_init(&op.lock);
-    g_cond_init(&op.done_cond);
-    g_main_context_invoke_full(g_main_context_default(), G_PRIORITY_DEFAULT,
-                               atspi_context_op, &op, NULL);
-    g_mutex_lock(&op.lock);
-    while (!op.done) g_cond_wait(&op.done_cond, &op.lock);
-    g_mutex_unlock(&op.lock);
-    g_cond_clear(&op.done_cond);
-    g_mutex_clear(&op.lock);
+    pthread_mutex_init(&op.lock, NULL);
+    pthread_cond_init(&op.done_cond, NULL);
+    atomic_init(&op.published, false);
+    pthread_mutex_lock(&op.lock);
+    GSource *source = g_idle_source_new();
+    g_source_set_priority(source, priority);
+    g_source_set_callback(source, atspi_context_op, &op, NULL);
+    atomic_store_explicit(&op.published, true, memory_order_release);
+    g_source_attach(source, context);
+    g_source_unref(source);
+    while (!op.done) {
+        if (owner) {
+            /* exit() can be called from a context callback. Drain the queued
+             * low-priority operation without waiting on our own ownership. */
+            pthread_mutex_unlock(&op.lock);
+            g_main_context_iteration(context, TRUE);
+            pthread_mutex_lock(&op.lock);
+        } else {
+            pthread_cond_wait(&op.done_cond, &op.lock);
+        }
+    }
+    pthread_mutex_unlock(&op.lock);
+    pthread_cond_destroy(&op.done_cond);
+    pthread_mutex_destroy(&op.lock);
+}
+
+static void atspi_invoke_sync(GSourceFunc callback, gpointer data) {
+    atspi_invoke_sync_priority(callback, data, G_PRIORITY_DEFAULT);
 }
 
 typedef struct {
@@ -399,11 +435,18 @@ static DBusHandlerResult atspi_bus_filter(DBusConnection *bus,
 
 typedef struct { AtspiState *st; int result; } AtspiInitOp;
 
+static void atspi_runtime_shutdown(void);
+
 static gboolean atspi_init_on_context(gpointer data) {
     AtspiInitOp *op = data;
     AtspiState *st = op->st;
-    op->result = atspi_init();
+    op->result = atspi_runtime_initialized ? 1 : atspi_init();
     if (op->result != 0 && op->result != 1) return G_SOURCE_REMOVE;
+    atspi_runtime_initialized = TRUE;
+    if (!atspi_runtime_exit_registered) {
+        if (atexit(atspi_runtime_shutdown) != 0) { op->result = -1; return G_SOURCE_REMOVE; }
+        atspi_runtime_exit_registered = TRUE;
+    }
 
     st->bus = atspi_get_a11y_bus();
     if (!st->bus) goto fail;
@@ -417,50 +460,61 @@ static gboolean atspi_init_on_context(gpointer data) {
     return G_SOURCE_REMOVE;
 
 fail:
-    atspi_exit(); /* already on the dispatch context; no filter installed */
     op->result = -1;
     return G_SOURCE_REMOVE;
 }
 
-static gboolean atspi_exit_on_context(gpointer data) {
+static gboolean atspi_detach_on_context(gpointer data) {
     AtspiState *st = data;
-    dbus_connection_remove_filter(st->bus, atspi_bus_filter, st);
-    atspi_exit();
+    if (st->bus) dbus_connection_remove_filter(st->bus, atspi_bus_filter, st);
+    st->bus = NULL;
     return G_SOURCE_REMOVE;
+}
+
+static gboolean atspi_runtime_exit_on_context(gpointer data) {
+    AtspiState *runtime = data;
+    if (atspi_runtime_initialized) atspi_exit();
+    atspi_runtime_initialized = FALSE;
+    /* No dispatch turn may run after disposing the global caches. The exit
+     * operation runs below deferred-message priority, draining queued work
+     * first, and quits in this same context operation, not a later idle. */
+    g_main_loop_quit(runtime->event_loop);
+    return G_SOURCE_REMOVE;
+}
+
+static void atspi_runtime_shutdown(void) {
+    if (!atspi_runtime_initialized) return;
+    /* Backend instances have detached and joined their dispatchers. Own a
+     * dispatcher for the final context handoff, even when no caller has a
+     * default main loop. Do not leave a thread alive between instances. */
+    AtspiState runtime = {0};
+    g_mutex_init(&runtime.lock);
+    runtime.event_loop = g_main_loop_new(NULL, FALSE);
+    runtime.event_thread = g_thread_new("md-atspi-exit", atspi_event_loop_thread, &runtime);
+    atspi_invoke_sync_priority(atspi_runtime_exit_on_context, &runtime, G_PRIORITY_LOW);
+    atspi_stop_event_thread(&runtime);
+    g_main_loop_unref(runtime.event_loop);
+    g_mutex_clear(&runtime.lock);
 }
 
 /* ── Vtable implementation ───────────────────────────────────── */
 
 static int atspi_init_backend(MdA11yCtx *ctx) {
-    AtspiState *st = calloc(1, sizeof(AtspiState));
+    AtspiState *st = calloc(1, sizeof(*st));
     if (!st) return -1;
-
     g_mutex_init(&st->lock);
     st->event_loop = g_main_loop_new(NULL, FALSE);
     atomic_init(&st->connected, true);
-    /* Own a dispatcher before any synchronous context operation, including
-     * init. A caller may have pushed a different thread-default context. */
-    GError *error = NULL;
-    st->event_thread = g_thread_try_new("md-atspi-events",
-                                        atspi_event_loop_thread, st, &error);
-    if (!st->event_thread) {
-        MD_LOG_E("failed to start AT-SPI event thread: %s",
-                 error ? error->message : "unknown error");
-        if (error) g_error_free(error);
-        goto fail;
-    }
-
+    st->event_thread = g_thread_try_new("md-atspi-events", atspi_event_loop_thread, st, NULL);
+    if (!st->event_thread) goto fail;
     AtspiInitOp op = { .st = st };
     atspi_invoke_sync(atspi_init_on_context, &op);
     if (op.result != 0 && op.result != 1) {
         MD_LOG_E("failed to initialize AT-SPI2 (code %d)", op.result);
         goto fail;
     }
-
-    /* Liveness must work before subscribe and after unsubscribe as well. */
     ctx->backend_data = st;
     return 0;
-
 fail:
     atspi_stop_event_thread(st);
     g_main_loop_unref(st->event_loop);
@@ -631,12 +685,10 @@ static void atspi_destroy_backend(MdA11yCtx *ctx) {
     if (!st) return;
 
     atspi_teardown_subscription(st);
-    /* Joining only our thread would not exclude other context dispatchers.
-     * Release libatspi on the context, keeping our dispatcher available until
-     * the synchronous handoff is complete, then join before freeing userdata. */
-    atspi_invoke_sync(atspi_exit_on_context, st);
+    /* Drain removal on the shared dispatcher before freeing filter userdata.
+     * atspi_exit is process-wide and must not run on instance teardown. */
+    atspi_invoke_sync(atspi_detach_on_context, st);
     atspi_stop_event_thread(st);
-
     g_main_loop_unref(st->event_loop);
     g_mutex_clear(&st->lock);
     free(st);
