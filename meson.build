@@ -811,7 +811,12 @@ if host_os == 'linux' or host_os == 'darwin'
 endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
+# Explicit OpenH264 fetcher only; encoder startup has no downloader.
+dep_oh_fetch = [dep_curl, dependency('openssl'), cc.find_library('bz2')]
+if host_os == 'windows'
+  dep_oh_fetch += cc.find_library('advapi32')
+endif
+host_sources = files('src/core/encode_openh264_fetch.c', 'src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
   'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
   'src/host/capture_sync.c')
 host_includes = [core_inc]
@@ -828,7 +833,7 @@ endif
 
 metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
-  dependencies : [dep_metadesk],
+  dependencies : [dep_metadesk] + dep_oh_fetch,
   c_args : host_c_args,
   install : true,
 )
@@ -1138,9 +1143,9 @@ test_signer = executable('test_signer',
 test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
-  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
+  files('tests/test_host_binding.c', 'src/core/encode_openh264_fetch.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
     'src/host/capture_sync.c', 'src/host/capture_cli.c'),
-  dependencies : [dep_metadesk])
+  dependencies : [dep_metadesk] + dep_oh_fetch)
 test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
   test('NIP-5F host session quoted seal', accounts_python,
@@ -1268,3 +1273,13 @@ test_session_log = executable('test_session_log',
   dependencies : [dep_metadesk],
 )
 test('signed session log', test_session_log)
+
+# Offline fetch fixtures include the implementation to exercise private I/O
+# without adding network overrides or unauthenticated install APIs to the CLI.
+test_oh_fetch = executable('test_openh264_fetch', 'tests/test_openh264_fetch.c',
+  include_directories : [core_inc] + (_sys_inc_dirs.length() > 0 ? [include_directories(_sys_inc_dirs[0])] : []),
+  dependencies : dep_oh_fetch)
+test('OpenH264 offline fetch', test_oh_fetch)
+
+test('OpenH264 explicit fetch CLI offline', find_program('python3'),
+  args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)
