@@ -7,8 +7,8 @@
 # Native builds by default. Cross builds: MD_FFMPEG_TARGET_OS, MD_FFMPEG_ARCH,
 # MD_FFMPEG_CROSS_PREFIX; CC/AR/PKG_CONFIG select the toolchain. Header/library
 # search paths: MD_FFMPEG_CFLAGS / MD_FFMPEG_LDFLAGS. No arbitrary configure flags.
-# Windows needs nv-codec-headers + AMF headers + oneVPL, and Media Foundation SDK.
-# Linux needs nv-codec-headers + AMF headers + libva/libdrm + oneVPL.
+# Windows needs nv-codec-headers + AMF headers + Media Foundation SDK; oneVPL/QSV only on x86/x86_64.
+# Linux needs nv-codec-headers + AMF headers + libva/libdrm; oneVPL/QSV only on x86/x86_64.
 set -eu
 fail() { echo "$*" >&2; exit 1; }
 [ "$#" = 3 ] || fail "usage: $0 macos|windows|container|flatpak SOURCE OUTPUT"
@@ -18,12 +18,8 @@ source=$(cd "$2" && pwd -P)
 [ ! -e "$source/ffbuild/config.mak" ] || fail "use a clean, unconfigured source tree"
 case "$3" in /*) ;; *) fail "OUTPUT must be absolute" ;; esac
 [ ! -e "$3" ] || fail "OUTPUT must not exist: $3"
-case "$profile" in
-    macos) encoders=h264_videotoolbox ;;
-    windows) encoders=h264_nvenc,h264_amf,h264_mf,h264_qsv ;;
-    container|flatpak) encoders=h264_nvenc,h264_amf,h264_vaapi,h264_qsv ;;
-    *) fail "unknown profile (distro packages use system FFmpeg): $profile" ;;
-esac
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+encoders=$("$script_dir/profile-encoders.sh" "$profile")
 # Resolve the parent before creating anything (including symlink components).
 parent=$(cd "$(dirname "$3")" && pwd -P)
 out=$parent/$(basename "$3")
@@ -55,9 +51,13 @@ set -- --prefix="$prefix" --disable-everything --disable-autodetect \
 case "$profile" in
     macos) set -- "$@" --enable-videotoolbox ;;
     windows) set -- "$@" --enable-ffnvcodec --enable-nvenc --enable-amf \
-        --enable-mediafoundation --enable-d3d11va --enable-libvpl ;;
+        --enable-mediafoundation --enable-d3d11va ;;
     container|flatpak) set -- "$@" --enable-ffnvcodec --enable-nvenc --enable-amf \
-        --enable-vaapi --enable-libdrm --enable-libvpl ;;
+        --enable-vaapi --enable-libdrm ;;
+esac
+case ",$encoders," in
+    *,h264_qsv,*) set -- "$@" --enable-libvpl ;;
+    *) set -- "$@" --disable-libvpl ;;
 esac
 [ -z "${MD_FFMPEG_TARGET_OS:-}" ] || set -- "$@" --target-os="$MD_FFMPEG_TARGET_OS"
 [ -z "${MD_FFMPEG_ARCH:-}" ] || set -- "$@" --arch="$MD_FFMPEG_ARCH"
@@ -70,6 +70,7 @@ esac
 # One argument per line, preserving paths with spaces; retain with source package.
 printf '%s\n' "$build_source/configure" "$@" > "$out/configure-args.txt"
 printf '%s\n' "$profile" > "$out/profile.txt"
+printf '%s\n' "$encoders" > "$out/encoders.txt"
 cd "$out/build"
 if ! "$build_source/configure" "$@" > "$out/configure.txt" 2>&1; then
     cat "$out/configure.txt" >&2

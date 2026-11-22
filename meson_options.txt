@@ -23,3 +23,6 @@ option('nostrc_build_dir', type : 'string', value : '',
 
 option('macos_deps_prefix', type : 'string', value : '',
        description : 'Private macOS dependency prefix (instead of Homebrew discovery)')
+
+option('linux_package_rpath', type : 'boolean', value : false,
+       description : 'Native Linux packages: executable-relative private lib/metadesk lookup')

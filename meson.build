@@ -734,9 +734,9 @@ endif
 # and build-tree nostr-json). Meson removes build rpaths at install time.
 # Keep selected dependency directories for an installed prefix, and make the
 # product library discoverable from a relocated DESTDIR tree. Linux producers
-# deliberately retain their existing empty install rpath contract.
+# retain an empty install rpath unless native packaging explicitly opts in.
 _darwin_lib_rpath = ''
-_darwin_exe_rpath = ''
+_product_exe_rpath = ''
 if host_os == 'darwin'
   _install_dep_dirs = _sys_lib_dirs
   _yuv_libdir = dep_yuv.get_variable(pkgconfig : 'libdir', default_value : '')
@@ -749,7 +749,12 @@ if host_os == 'darwin'
   _darwin_lib_rpath = ':'.join(['@loader_path'] + _install_dep_dirs)
   _product_lib_relative = fs.relative_to(get_option('prefix') / get_option('libdir'),
                                          get_option('prefix') / get_option('bindir'))
-  _darwin_exe_rpath = ':'.join(['@loader_path' / _product_lib_relative] + _install_dep_dirs)
+  _product_exe_rpath = ':'.join(['@loader_path' / _product_lib_relative] + _install_dep_dirs)
+elif host_os == 'linux' and get_option('linux_package_rpath')
+  if get_option('libdir') != 'lib/metadesk'
+    error('linux_package_rpath requires --libdir=lib/metadesk')
+  endif
+  _product_exe_rpath = '$ORIGIN/../lib/metadesk'
 endif
 
 # ── libmetadesk (shared core library) ───────────────────────────────────────
@@ -890,7 +895,7 @@ metadesk_host = executable('metadesk-host', host_sources,
   dependencies : [dep_metadesk] + dep_oh_fetch,
   c_args : host_c_args,
   install : true,
-  install_rpath : _darwin_exe_rpath,
+  install_rpath : _product_exe_rpath,
 )
 
 if host_os == 'linux' or host_os == 'darwin'
@@ -942,7 +947,7 @@ if enable_client
     include_directories : [core_inc],
     dependencies : [dep_metadesk, dep_sdl2, dep_imgui],
     install : true,
-    install_rpath : _darwin_exe_rpath,
+    install_rpath : _product_exe_rpath,
   )
 endif
 
