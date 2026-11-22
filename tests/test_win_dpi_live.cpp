@@ -102,6 +102,9 @@ int main(int argc, char **argv) {
     CHECK(SUCCEEDED(output1->DuplicateOutput(device, &duplication)));
     DXGI_OUTDUPL_DESC mode;
     duplication->GetDesc(&mode);
+    /* DXGI permits only one duplication of an output per process. The probe
+     * must release its duplication before the production backend opens one. */
+    duplication->Release();
     /* Rotation needs its own qualification; don't call swapped dimensions a pass. */
     CHECK(mode.Rotation == DXGI_MODE_ROTATION_IDENTITY);
     MdCaptureConfig capture_cfg = {};
@@ -131,7 +134,7 @@ int main(int argc, char **argv) {
     printf("PASS production SendInput click at UIA physical center %d,%d delivered BN_CLICKED\n", x, y);
     md_input_destroy(input);
     md_capture_destroy(capture);
-    duplication->Release(); immediate->Release(); device->Release();
+    immediate->Release(); device->Release();
     output1->Release(); output->Release(); adapter->Release(); factory->Release();
     uia->Release();
     PostMessageW(window, WM_CLOSE, 0, 0);
