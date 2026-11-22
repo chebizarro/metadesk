@@ -63,7 +63,11 @@ def main():
                        DBUS_SESSION_BUS_ADDRESS="unix:path=" + tmp + "/no-bus")
             for offset, (label, tags, expected) in enumerate(cases):
                 event = {"kind": 30000, "pubkey": HOST_PK, "created_at": int(time.time()) + offset,
-                         "tags": [["d", "metadesk-allowlist"], *tags], "content": ""}
+                         "tags": [["d", "metadesk-allowlist"]], "content": ""}
+                cipher = subprocess.run([crypto, "host"], input=json.dumps(
+                    {"method": "nip44_encrypt", "params": {"peer_pub": HOST_PK, "plaintext": json.dumps(tags)}}),
+                    env=env, capture_output=True, text=True, timeout=15, check=True)
+                event["content"] = json.loads(cipher.stdout)
                 signed = subprocess.run([crypto, "host"], input=json.dumps(
                     {"method": "sign_event", "params": {"event": event}}),
                     env=env, capture_output=True, text=True, timeout=15, check=True)

@@ -1,6 +1,6 @@
 # Headless session access
 
-`metadesk-host access` manages the saved **host role** account's public NIP-51
+`metadesk-host access` manages the saved **host role** account's private NIP-51
 kind-30000 list, `d=metadesk-allowlist`. It does not use the client role, a signer
 override, a new identity, or a local allowlist file.
 
@@ -8,13 +8,16 @@ override, a new identity, or a local allowlist file.
 metadesk-host access [--config-dir /absolute/private/directory] [--relay ws://relay ...] list
 metadesk-host access [--config-dir /absolute/private/directory] [--relay ws://relay ...] add CLIENT_NPUB [CAPS]
 metadesk-host access [--config-dir /absolute/private/directory] [--relay ws://relay ...] remove CLIENT_NPUB
+metadesk-host access [--config-dir /absolute/private/directory] [--relay ws://relay ...] migrate [CLIENT_NPUB CAPS ...]
 ```
 
 Options precede the subcommand. Repeat `--relay` for multiple relays; without it,
 the same built-in default relay as host startup is used. Use the same relays for
 administration and hosting. `add`/`remove` accept checksummed NIP-19 **npub** keys;
 `list` prints lowercase **hex** public keys and effective caps, tab-separated, one
-member per line. `none` includes legacy or invalid grant metadata; it never
+member per line. Legacy public or mixed lists add a third column,
+`legacy-public-review-required`, and report `none` for every member.
+`none` also includes invalid grant metadata; it never
 reports an opaque relay hint as authorization.
 Empty successful output means a loaded, empty list, not pending/failed history.
 Invalid syntax exits 2; unavailable accounts/history/signers, failed publication,
@@ -52,18 +55,21 @@ metadesk-host access add "$CLIENT_NPUB" none  # retain membership, revoke all gr
 
 Omitted CAPS gives a **new** member an explicit video-only grant; it does not
 change an existing member (including legacy/denied members). Explicit CAPS is
-required to migrate legacy entries. No name implies other bits: `agent` permits
+required to change an existing private grant. Public entries require the
+explicit `migrate` command below; ordinary add/remove never converts them. No name implies other bits: `agent` permits
 trees but not actions; `input` permits raw input but not actions.
 
-### Public allowlist grant format v1 (md-ikr)
+### Private allowlist grant format v1 (md-bmiw / md-ikr)
 
-The host-author-signed kind-30000 event retains `d=metadesk-allowlist` and ordinary
-[NIP-51](https://github.com/nostr-protocol/nips/blob/master/51.md) public membership:
+The host-author-signed kind-30000 event exposes **only**
+`["d", "metadesk-allowlist"]` in its public tags. `content` contains a NIP-44
+v2 self-encrypted JSON array of NIP-51 private items, for example after decryption:
 
 ```json
-["d", "metadesk-allowlist"]
-["p", "<64 lowercase hex client pubkey>"]
-["metadesk-caps", "<same pubkey>", "v1:video,agent,input"]
+[
+  ["p", "<64 lowercase hex client pubkey>"],
+  ["metadesk-caps", "<same pubkey>", "v1:video,agent,input"]
+]
 ```
 
 `metadesk-caps` is a Metadesk extension, not a standard NIP-51 scope. Each record
@@ -75,7 +81,9 @@ wrong-arity scope records grant **zero**, as do duplicate memberships and orphan
 grant records. Invalid records cannot combine with a valid duplicate to escalate
 privileges. No numeric masks or implicit capability dependencies are accepted.
 
-Metadesk decodes this event from its raw tags (md-jqnz). It does not use nostrc's
+Metadesk decodes public tags and decrypted private policy items with the same
+raw-tag rules (md-jqnz). Unknown private items are retained, inert and encrypted,
+when editing; unknown public event-level tags are never copied to a replacement. It does not use nostrc's
 generic NIP-51 parser, because that parser's tag policy depends on the nostrc
 version:
 
@@ -93,8 +101,9 @@ Metadesk's rules are fixed:
 - **Grants.** A `metadesk-caps` record that does not have exactly three fields
   is an invalid grant for its principal, so that principal gets zero. The record
   is kept rather than dropped, so a valid duplicate cannot override it.
-- **Other tags.** No other tag affects access, and edits do not republish
-  them. Edits publish only `d`, `p` and `metadesk-caps`. This keeps event-level
+- **Other public tags.** No other tag affects access, and edits do not republish
+  them. Unknown private arrays of strings are preserved inside content only. Edits publish only the public `d` tag, with `p` and `metadesk-caps`
+  encrypted in content. This keeps event-level
   tags from a stale event, such as NIP-40 `expiration` or NIP-70 `-`, out of
   the replacement. Older metadesk builds carried forward `e`, `t`, `word`, `a`
   and `r` tags.
@@ -102,30 +111,76 @@ Metadesk's rules are fixed:
 A malformed or unknown tag never rejects or opens the list as a whole. At most,
 it denies the one principal it names.
 
-**Legacy entries default to deny (zero capabilities)**, even if their old `p`
-extra says `video,agent,input`: that field remains opaque metadata/relay hint,
-never enforced policy. Deny is deliberate: upgrading must not silently authorize
-screen disclosure, action execution or input from ambiguous historical metadata.
-A list editor that drops the extension likewise causes denial, not full access.
-List output shows the effective safe result; reviewing the signed event may be
-needed to distinguish an intentional `none` from invalid/legacy metadata.
+Encryption and decryption go through the saved host role's `MdSigner`, using
+the host public key as the peer: local keys use nostrc's NIP-44 API and external
+signers use their NIP-44 operations (including NIP-46 `nip44_encrypt` and
+`nip44_decrypt`). No private key export, signer override, NIP-04 fallback, or
+plaintext fallback is used. Signature/author/address checks precede decryption.
+Ciphertext and plaintext are bounded to 128 KiB; signer/crypto/JSON failures on
+a newer valid envelope deny all access and edits, rather than retaining older
+authority or treating unreadable content as an empty list. A later valid newer
+policy can recover it. Events more than five minutes ahead of the local clock
+are ignored; local edits cannot advance beyond that bound.
 
-Edits retain other members and their parsed metadata; removing a principal drops
-all its membership and scope records. Wrong-arity grant payloads are retained in
-an invalid form so unrelated edits cannot normalize them into authorization.
-The existing newest-replaceable ordering, fail-closed readiness and positive-OK
-staged publication apply to grants as well as membership. A rejected grant edit
-cannot change the local enforced policy.
+NIP-44 does not hide the author, address, timestamps or approximate list size,
+and does not offer forward secrecy if the host key is later compromised.
 
-This is the existing **public** list, not the management plan's future encrypted
-collection/migration or full `MdHostAccess` controller. Keeping membership separate
-from versioned scope and using zero for legacy entries preserves that direction.
+### Legacy public permissions — review required
+
+**Every public membership or capability record requires review**, including
+valid public v1 grants from previous releases. List output labels these records
+`legacy-public-review-required`; sessions and MCP grant them zero capabilities.
+A mixed public/private list is review-only **as a whole**, not a silent union.
+Third-field legacy capability strings remain opaque relay hints, never policy.
+Ordinary `add`/`remove` fail on review-required lists to avoid silently migrating
+other principals.
+
+First list and review every member, then confirm the **complete** membership with
+explicit canonical scopes (use `none` for members that should stay denied):
+
+```sh
+metadesk-host access --relay "$RELAY" list
+metadesk-host access --relay "$RELAY" migrate "$CLIENT_NPUB" video "$OTHER_NPUB" none
+metadesk-host access --relay "$RELAY" list
+```
+
+Each distinct source member must appear exactly once. Partial confirmations,
+new principals, duplicate confirmations, missing scopes and unknown scopes
+fail. Duplicate source membership/scope records are normalized only by this
+explicit review; orphan grants and non-policy public metadata are discarded. Unknown private
+items are preserved, without granting authority. The CLI
+prints the confirmed keys/scopes and disclosure warning to stderr. An empty
+source can be explicitly migrated with `access migrate` (encrypted `[]`).
+Unreadable private content cannot be migrated, because its membership cannot
+be reviewed.
+
+Migration stages and encrypts a replacement with **no public client tags**.
+The source remains the enforced/cache policy until positive relay `OK` and an
+unchanged-base version check; `OK false`, signer failure, stop or conflict
+reports failure without committing the candidate locally. NIP-42 AUTH and
+CLOSED handling remain in the existing relay session path. One positive OK
+suffices, not a relay quorum. A lost OK or concurrent edit may still have
+reached a relay; reread before retrying.
+
+**Historical public copies cannot be erased.** Relays, backups and observers
+may retain every earlier public list. An encrypted replacement only protects
+future list contents; it cannot undo earlier membership/capability disclosure.
+No deletion event or erasure promise is made. Older Metadesk builds cannot
+read the private grants and fail closed; upgrade every consumer, including MCP.
+
+Private edits retain other members and their parsed grant metadata; removing a
+principal drops all its membership and scope records. Wrong-arity grants remain
+invalid so unrelated edits cannot normalize them into authorization. Newest
+replaceable ordering, fail-closed readiness and positive-OK staged publication
+apply to private grants exactly as before.
+
 Grant changes/removal affect the **next session acceptance**, not an active
 stream. Dynamic revocation/renegotiation remains P3.8 work.
 
 The same list can also authorize NIP-98 MCP HTTP agents: run the host with
 `--mcp-http --mcp-allow-host-list`, and an `agent` grant admits that npub live,
-without a restart. As in sessions, MCP action tools also need `input`: an
+without a restart. MCP restores the same host signer to decrypt private items;
+legacy/mixed/unreadable lists fail closed through the same grant API. As in sessions, MCP action tools also need `input`: an
 `agent`-only MCP principal gets the read tools, and its action calls are
 refused with an error naming `input`. Unlike sessions, a grant change applies to the
 next MCP request. See [MCP HTTP authentication](mcp-auth.md#per-principal-tool-capabilities-md-5km).
@@ -253,3 +308,22 @@ scope parsing adds no wire loops, filters, timers or alternate publish path.
 Review recommendations added a platform guard and stateful revocation/republish
 coverage. Existing single-startup negotiation is not dynamic P3.8 revocation. Fixture process deadlines are failure/cleanup bounds, not relay-history
 completion. Review's fixture timeout-cleanup recommendation was applied.
+
+### Private-list validation (W8)
+
+`nostr ACL and AUTH private relays` exercises self-encrypted decoding, legacy and
+mixed review-only policy, complete migration, rejection, reflected pre-OK events,
+MAC tamper, foreign-key ciphertext and stale replay denial. The CLI fixture
+checks migration's source preservation and private-only wire output. Capability,
+MCP proxy and direct-IP fixtures now seed private policies, not public grants.
+
+`private allowlist real host/client loopback` launches the real binaries with
+throwaway NIP-5F signers and accounts, uses `access add`, verifies private-only
+relay policy, negotiates NIP-17 and completes authenticated loopback TCP binding.
+It uses no desktop capture/input, user credentials, public relay, FIPS daemon or
+routing changes. It is a local authorization/binding gate, not FIPS or desktop
+qualification. Run directly with:
+
+```sh
+python3 tests/access_private_session.py BUILD/metadesk-host BUILD/metadesk-client BUILD/access_signer_fixture
+```
