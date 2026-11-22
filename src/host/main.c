@@ -1075,7 +1075,12 @@ int main(int argc, char **argv) {
     /* Video mode only: progress and readiness lines must reach a pipe
      * (container log, supervisor) when printed. MCP returned above with
      * stdout untouched; its stdio transport owns fd 1 via write(2). */
+#ifdef _WIN32
+    /* UCRT treats _IOLBF as full buffering, including redirected output. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 
     if (install_signal_handlers() != 0) {
         fprintf(stderr, "ERROR: cannot install termination handlers\n");

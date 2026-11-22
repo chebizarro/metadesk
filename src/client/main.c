@@ -696,7 +696,12 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 int main(int argc, char **argv) {
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
+#ifdef _WIN32
+    /* UCRT treats _IOLBF as full buffering, including redirected output. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 #ifndef _WIN32
