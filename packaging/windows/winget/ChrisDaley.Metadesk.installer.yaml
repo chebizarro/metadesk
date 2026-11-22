@@ -1,0 +1,16 @@
+﻿PackageIdentifier: ChrisDaley.Metadesk
+PackageVersion: 0.1.0
+InstallerType: wix
+Scope: user
+MinimumOSVersion: 10.0.22000.0
+UpgradeBehavior: install
+Commands:
+- metadesk-host
+- metadesk-client
+Installers:
+- Architecture: arm64
+  InstallerUrl: https://example.invalid/metadesk/metadesk-0.1.0-arm64.msi
+  InstallerSha256: 71E59E765DA85E51ED2FDFAE3DA2ECE4C18EF9437E6ED2F6465699C287E0C146
+  ProductCode: '{8D2FEA4F-1750-471A-B8A3-20E8D5B92DA3}'
+ManifestType: installer
+ManifestVersion: 1.6.0

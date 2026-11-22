@@ -1,0 +1,111 @@
+{
+  "brotli": {
+    "version": "1.2.1-1",
+    "license": "MIT"
+  },
+  "bzip2": {
+    "version": "1.0.8-4",
+    "license": "bzip2-1.0.6"
+  },
+  "cjson": {
+    "version": "1.7.19-1",
+    "license": "MIT"
+  },
+  "curl": {
+    "version": "8.23.0-3",
+    "license": "curl"
+  },
+  "gettext-runtime": {
+    "version": "1.0-1",
+    "license": "LGPL-2.1-or-later"
+  },
+  "jansson": {
+    "version": "2.15.1-1",
+    "license": "MIT and Lucent dtoa notice"
+  },
+  "libc++": {
+    "version": "23.1.5-1",
+    "license": "Apache-2.0 WITH LLVM-exception"
+  },
+  "libiconv": {
+    "version": "1.19.1-1",
+    "license": "LGPL-2.1-or-later (library only)"
+  },
+  "libidn2": {
+    "version": "2.3.8-5",
+    "license": "LGPL-3.0-or-later (library only)",
+    "source_license_fallback": "libidn2"
+  },
+  "libjpeg-turbo": {
+    "version": "3.2.1-1",
+    "license": "BSD-3-Clause, IJG and Zlib"
+  },
+  "libpsl": {
+    "version": "0.21.5-3",
+    "license": "MIT"
+  },
+  "libssh2": {
+    "version": "1.11.1-4",
+    "license": "BSD-3-Clause"
+  },
+  "libunistring": {
+    "version": "1.4.2-1",
+    "license": "LGPL-3.0-or-later (non-GPL alternative)"
+  },
+  "libuv": {
+    "version": "1.53.0-1",
+    "license": "MIT"
+  },
+  "libvpl": {
+    "version": "2.17.0-1",
+    "license": "MIT"
+  },
+  "libwebsockets": {
+    "version": "4.5.8-2",
+    "license": "MIT and upstream per-file notices"
+  },
+  "libwinpthread": {
+    "version": "14.0.0.r598.ge3d18511f-1",
+    "license": "MIT AND BSD-3-Clause"
+  },
+  "libyuv": {
+    "version": "1924.r2921.644251f25-2",
+    "license": "BSD-3-Clause and PATENTS"
+  },
+  "nghttp2": {
+    "version": "1.71.0-1",
+    "license": "MIT"
+  },
+  "nghttp3": {
+    "version": "1.19.0-1",
+    "license": "MIT"
+  },
+  "ngtcp2": {
+    "version": "1.26.0-3",
+    "license": "MIT"
+  },
+  "nsync": {
+    "version": "1.30.0-3",
+    "license": "Apache-2.0"
+  },
+  "openssl": {
+    "version": "4.1.0-1",
+    "license": "Apache-2.0"
+  },
+  "sdl2-compat": {
+    "version": "2.32.74-5",
+    "license": "Zlib"
+  },
+  "sdl3": {
+    "version": "3.4.20-1",
+    "license": "Zlib"
+  },
+  "zlib": {
+    "version": "1.4-2",
+    "license": "Zlib"
+  },
+  "zstd": {
+    "version": "1.5.7-2",
+    "license": "BSD-3-Clause (non-GPL alternative)"
+  }
+}

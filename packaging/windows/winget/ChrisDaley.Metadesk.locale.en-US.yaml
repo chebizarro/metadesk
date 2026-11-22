@@ -1,0 +1,9 @@
+﻿PackageIdentifier: ChrisDaley.Metadesk
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Chris Daley
+PackageName: Metadesk
+License: MIT
+ShortDescription: Nostr-native remote desktop host and client
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,95 @@
+{
+  "nostrc": {
+    "url": "https://codeload.github.com/chebizarro/nostrc/tar.gz/ea5ed954267c2b513eaa0f41acf3166fdc7f4951",
+    "sha256": "2b4ae187af64e8009a8f4ed60ed12501a57d67cd3de90801d2c5c468af0dc922"
+  },
+  "ffmpeg": {
+    "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n9.0.2",
+    "sha256": "6e374ed621e48faa40639307dff48ba6fe574a509977956d2cce9669b7cc27e9"
+  },
+  "nv-codec-headers": {
+    "url": "https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/f2053071ea93137255b6dcf42e9b4c9e0965a44e",
+    "sha256": "84cefa55265740888a269625474eda5bd018955c2302b72cfe7473ddc82f741f"
+  },
+  "secp256k1": {
+    "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.8.0",
+    "sha256": "eb52b0e9239dff7dc26be5f9623567141b8720ec47da29eb3c1e0a660d17c8bb"
+  },
+  "amf": {
+    "base_url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/AMF/57ee0cfb0e1a08d9041f77435653794c1b012be0/",
+    "git_blob_sha1": {
+      "LICENSE.txt": "7e6e2140915b281143e056ff88c941f7d31d64c2",
+      "amf/public/include/components/AMFXInput.h": "92685ad750dcf2962f8c8bffb125bf5c4c4d111d",
+      "amf/public/include/components/Ambisonic2SRenderer.h": "63ac79770626cf7945cc4ccea3779c5930090869",
+      "amf/public/include/components/AudioCapture.h": "af5b4287689dd8265a5bc4d6191a052c2d21687d",
+      "amf/public/include/components/Capture.h": "e0192d95401e705caa66a1a99b2af7345ee661ff",
+      "amf/public/include/components/ChromaKey.h": "82b3516f38b2723ddf2a1faed8952edf18248a1c",
+      "amf/public/include/components/ColorSpace.h": "1c3189c3e423bc6cd3eb8a6ce6ddc5c1f5b4496d",
+      "amf/public/include/components/Component.h": "20a0a0959ce800e7e9c033cb83994a953d0b1498",
+      "amf/public/include/components/ComponentCaps.h": "48197670dac9d464dbedaf1e6418fcba51117f9b",
+      "amf/public/include/components/CursorCapture.h": "e21c169098b7ea2cf50acf0105711b7579fcb430",
+      "amf/public/include/components/DisplayCapture.h": "6e3971e479aacd52d6228bc69c125bd84585b2e8",
+      "amf/public/include/components/FFMPEGAudioConverter.h": "5ce79cab608fbc88f8bf80806765658d7215ecdb",
+      "amf/public/include/components/FFMPEGAudioDecoder.h": "e0c324c6b9c9d9b868ec52f1ff6eedb1d2301dea",
+      "amf/public/include/components/FFMPEGAudioEncoder.h": "872080b1931958cb365f386bfd247988b87d6892",
+      "amf/public/include/components/FFMPEGComponents.h": "a3fbaff2b01d4d6c5bbf7ad4f885dc70f555022f",
+      "amf/public/include/components/FFMPEGEncoderAV1.h": "0e5e3f06d69699ba92311229eac8e72a8da526fa",
+      "amf/public/include/components/FFMPEGEncoderH264.h": "ef5e74629a61b069a784b366df928b618ad8ad07",
+      "amf/public/include/components/FFMPEGEncoderHEVC.h": "a5fec4f23c519a38073e0644e3412c6c52de5397",
+      "amf/public/include/components/FFMPEGFileDemuxer.h": "60fd2934a91bbaf14c1676869c2367c77032c0d0",
+      "amf/public/include/components/FFMPEGFileMuxer.h": "a44676095e68bf7c0321fdece869ba80058af5aa",
+      "amf/public/include/components/FFMPEGVideoDecoder.h": "c844145d814c422ab31d8eb1738574f8e3cdc130",
+      "amf/public/include/components/FRC.h": "921c330c250f36505998581a03680ad2e72f6237",
+      "amf/public/include/components/HQScaler.h": "ad72c16b7bab7ac41d4ab384c2dfc9fadecf05e6",
+      "amf/public/include/components/MediaSource.h": "1afdb6745ef69b2e36a7efc6c60145e6047a78df",
+      "amf/public/include/components/PreAnalysis.h": "cf4de6522406c013ca2e02ea18547a6f560913d9",
+      "amf/public/include/components/PreProcessing.h": "ab59d826b7155e44f27b8e2aab81df29e527805b",
+      "amf/public/include/components/SupportedCodecs.h": "efdd9705371bc349d73e13ecd4839ff0768a2787",
+      "amf/public/include/components/VQEnhancer.h": "6d3468ab80a5b7707516bd2f1cf8f426215dfff4",
+      "amf/public/include/components/VideoCapture.h": "db0f6c0b23fc0fe75111c02a2cc8ad8f643b1505",
+      "amf/public/include/components/VideoConverter.h": "f6d9b112e3bcb88afb1dcf8cfced3bcea395a0f6",
+      "amf/public/include/components/VideoDecoderUVD.h": "9ac8c9a8fabd50e0ccbcdd892acca3bb1f3fb1d4",
+      "amf/public/include/components/VideoEncoderAV1.h": "c0117d2bd5bdd02ae2b2d978d142836b9c94cbb3",
+      "amf/public/include/components/VideoEncoderHEVC.h": "b9fe0175867f36a4310ed92f14d98704307fe277",
+      "amf/public/include/components/VideoEncoderVCE.h": "5bce3ddde563347e0d378b40efb378e8dafbde0e",
+      "amf/public/include/components/VideoStitch.h": "0ae2af5275e7615f8bf7a84f04603ca04ff960e5",
+      "amf/public/include/components/ZCamLiveStream.h": "7f4a6bbee8a2ed4ecf91313513d4ba032b4ca5f7",
+      "amf/public/include/core/AudioBuffer.h": "34f8adcf12889595894bc699351ea5956d946dea",
+      "amf/public/include/core/Buffer.h": "c9d55d12f21bbfb93c8395ad4b9afe17db687457",
+      "amf/public/include/core/Compute.h": "b457e04553bd66a0cb2dd6f740769fda840ad782",
+      "amf/public/include/core/ComputeFactory.h": "e335ee31c0dec4c729fa80744a803b8b20edf1e9",
+      "amf/public/include/core/Context.h": "c6094fd57a3ad0a46020e45304bdda2b0256339f",
+      "amf/public/include/core/CurrentTime.h": "c8a559ad9d8b84453ecf935f370b5de33bd812c0",
+      "amf/public/include/core/D3D12AMF.h": "7ad2d74f121d0386ef26e96638c596b71caebf52",
+      "amf/public/include/core/Data.h": "7067606b51aee5ed783537e0a5ffe9e1fe01bfbb",
+      "amf/public/include/core/Debug.h": "40610b01ce3a276e90f39771939036e344c64d19",
+      "amf/public/include/core/Dump.h": "3c3aabea8a2568e38261bccee43eb49b3db2622e",
+      "amf/public/include/core/Factory.h": "a9f32f5762f38dfe9b169d3b5e00bfada7d08fb1",
+      "amf/public/include/core/Interface.h": "96117f0e80bfa8a81dfc229e588320d961890db3",
+      "amf/public/include/core/Plane.h": "6d3e9f946e9c40dc5fc8e67357a0d657d144705b",
+      "amf/public/include/core/Platform.h": "06b9fdf56569cdb1d7ee52d9d0121ecf83dbfb72",
+      "amf/public/include/core/PropertyStorage.h": "9fb87bec0273de9965796ca6e0aa4df1176dcf80",
+      "amf/public/include/core/PropertyStorageEx.h": "068074e354700f19c74e4d5f8c15831f64267fe2",
+      "amf/public/include/core/Result.h": "350b72f65b7a54d1275c50f959b141e0346c4dc3",
+      "amf/public/include/core/Surface.h": "39da7d8beadccc0fc415ba8499bd5f78d3ffd633",
+      "amf/public/include/core/Trace.h": "69b80739487b03739742537773644e42180df6ff",
+      "amf/public/include/core/Variant.h": "2583c119c19b40b1e1e11ec9bbd7b75a8fa13e27",
+      "amf/public/include/core/Version.h": "9fd3d7a3400549dd0fd58aff3377bb5cb31653ad",
+      "amf/public/include/core/VulkanAMF.h": "1de8bb62722164f3002ebe48fd32b8a4815603f8"
+    }
+  },
+  "libidn2": {
+    "url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+    "sha256": "f557911bf6171621e1f72ff35f5b1825bb35b52ed45325dcdee931e5d3c0787a"
+  },
+  "libyuv-notices": {
+    "base_url": "https://chromium.googlesource.com/libyuv/libyuv/+/644251f25/",
+    "url_suffix": "?format=TEXT",
+    "base64": true,
+    "git_blob_sha1": {
+      "PATENTS": "64aa5c90d8fd97484876870a6722163468e9c0e7",
+      "AUTHORS": "b272adfd2748e670927b5cee6b4232fd54256086",
+      "LICENSE": "c911747a6b53f063503992c3903d932f54cf6c57"
+    }
+  }
+}
