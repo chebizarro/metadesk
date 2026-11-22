@@ -49,6 +49,9 @@ $watcher = $null
 try {
     # Fail before changing the session unless this is a genuinely usable desktop.
     $before = Start-Process -FilePath $exe -ArgumentList '--interactive' -PassThru -NoNewWindow -RedirectStandardOutput "$OutputDirectory\before.log" -RedirectStandardError "$OutputDirectory\before.stderr.log"
+    # Retain the native handle: Windows PowerShell can otherwise return a null
+    # ExitCode after WaitForExit even when a redirected child exited successfully.
+    $null = $before.Handle
     if (-not $before.WaitForExit(45000)) { throw 'Console preflight timed out; no loss action attempted.' }
     if ($before.ExitCode -ne 0) { throw 'Console is not usable; see before.log. No loss action attempted.' }
     $stdout = "$OutputDirectory\loss.stdout.log"
@@ -56,6 +59,7 @@ try {
     $watcher = New-Object System.IO.FileSystemWatcher $OutputDirectory
     $watcher.EnableRaisingEvents = $true
     $process = Start-Process -FilePath $exe -ArgumentList '--wait-for-loss' -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $null = $process.Handle
     $deadline = (Get-Date).AddSeconds(45)
     while ($true) {
         if ((Test-Path $stdout) -and ((Get-Content $stdout -Raw) -match 'READY:')) { break }
@@ -81,6 +85,7 @@ public static class MdSessionLoss {
     if ((Get-Content $stdout -Raw) -notmatch 'ALL UIA LIVENESS TESTS PASSED') { throw 'Harness success receipt missing.' }
     Get-Content $stdout
     $startup = Start-Process -FilePath $exe -ArgumentList '--expect-unavailable' -PassThru -NoNewWindow -RedirectStandardOutput "$OutputDirectory\unavailable-startup.log" -RedirectStandardError "$OutputDirectory\unavailable-startup.stderr.log"
+    $null = $startup.Handle
     if (-not $startup.WaitForExit(45000)) { throw 'Unavailable startup timed out; manual console recovery required.' }
     if ($startup.ExitCode -ne 0) { throw 'Unavailable startup failed; see unavailable-startup.log.' }
     Get-Content "$OutputDirectory\unavailable-startup.log"
