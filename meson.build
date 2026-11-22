@@ -317,7 +317,10 @@ endif
 # installed underscore-named dylibs may still require removed Homebrew ABIs.
 _json_build_lib = ''
 if _nostrc_build != ''
-  foreach name : ['libnostr-json.dylib', 'libnostr-json.so', 'libnostr-json.a']
+  # MinGW CMake builds nostr_json as a DLL even with BUILD_SHARED_LIBS=OFF.
+  # Discover its import library in the selected tree, not an installed copy.
+  foreach name : ['libnostr-json.dylib', 'libnostr-json.so', 'libnostr-json.a',
+                  'libnostr-json.dll.a']
     candidate = _nostrc_build / 'libjson' / name
     if _json_build_lib == '' and fs.exists(candidate)
       _json_build_lib = candidate
