@@ -762,6 +762,8 @@ core_sources += files(
   'src/core/credential_store.c',
   'src/core/credential_store_secret_service.c',
   'src/core/credential_store_keychain.c',
+  'src/core/credential_store_windows.c',
+  'src/core/win_private.c',
 )
 accounts_c_args = []
 if host_os == 'linux'
@@ -769,6 +771,8 @@ if host_os == 'linux'
   accounts_c_args += '-DMD_HAVE_LIBSECRET'
 elif host_os == 'darwin'
   core_deps += dependency('appleframeworks', modules : ['Security', 'CoreFoundation'])
+elif host_os == 'windows'
+  core_deps += cc.find_library('crypt32', required : true)
 endif
 
 # Append platform HAL backend sources
@@ -791,14 +795,14 @@ dep_metadesk = declare_dependency(
 )
 
 # ── Signer account tests ────────────────────────────────────────────────────
-if host_os == 'linux' or host_os == 'darwin'
+if host_os == 'linux' or host_os == 'darwin' or host_os == 'windows'
   test_accounts = executable('test_accounts', 'tests/test_accounts.c',
     dependencies : dep_metadesk, c_args : accounts_c_args)
   test('accounts', test_accounts, timeout : 30)
   accounts_python = import('python').find_installation('python3')
   if host_os == 'darwin'
     test('account_keychain', test_accounts, args : ['--keychain'], timeout : 30, is_parallel : false)
-  else
+  elif host_os == 'linux'
     accounts_dbus = find_program('dbus-run-session', required : false)
     accounts_keyring = find_program('gnome-keyring-daemon', required : false)
     if accounts_dbus.found() and accounts_keyring.found()
@@ -808,6 +812,11 @@ if host_os == 'linux' or host_os == 'darwin'
       message('Private account Secret Service test unavailable: install dbus-run-session and gnome-keyring-daemon')
     endif
   endif
+endif
+
+if host_os == 'windows'
+  test_win_security = executable('test_win_security', 'tests/test_win_security.c', dependencies : dep_metadesk)
+  test('Windows native private storage + DPAPI', test_win_security, timeout : 30)
 endif
 
 # ── metadesk-host ───────────────────────────────────────────────────────────

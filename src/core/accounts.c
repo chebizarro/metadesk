@@ -1,8 +1,10 @@
 #include "accounts.h"
 #include <stdatomic.h>
 #include <pthread.h>
-#ifndef _WIN32
 #include <cjson/cJSON.h>
+#ifdef _WIN32
+#include "win_private.h"
+#else
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -33,7 +35,12 @@ struct MdAccountBinding {
 };
 typedef struct { MdAccount info; MdSigner *signer; } Record;
 struct MdAccounts {
+#ifdef _WIN32
+    MdWinDirectory *directory;
+    HANDLE lock;
+#else
     int dirfd, lockfd;
+#endif
     size_t count;
     Record records[MAX_ACCOUNTS];
     int roles[MD_ACCOUNT_ROLE_COUNT];
@@ -279,6 +286,7 @@ static char *default_directory(void) {
     if (path) snprintf(path, n, "%s%s", base, suffix);
     return path;
 }
+#endif
 static int parse_pair(const cJSON *j, MdSignerType *t, const char **pk) {
     if (!cJSON_IsObject(j)) return MD_ACCOUNTS_INVALID;
     const cJSON *b = cJSON_GetObjectItemCaseSensitive(j, "backend");
@@ -288,6 +296,14 @@ static int parse_pair(const cJSON *j, MdSignerType *t, const char **pk) {
     *pk = p->valuestring; return 0;
 }
 static int load(MdAccounts *a) {
+#ifdef _WIN32
+    HANDLE h = md_win_file(a->directory, METADATA_FILE, GENERIC_READ, OPEN_EXISTING, FILE_SHARE_READ);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : MD_ACCOUNTS_IO;
+    unsigned char *bytes = NULL; size_t size = 0;
+    bool ok = md_win_read(h, &bytes, &size, 65536); CloseHandle(h);
+    if (!ok) return MD_ACCOUNTS_IO;
+    char *text = (char *)bytes; size_t used = size;
+#else
     int fd = openat(a->dirfd, METADATA_FILE, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return errno == ENOENT ? 0 : MD_ACCOUNTS_IO;
     struct stat st;
@@ -304,6 +320,7 @@ static int load(MdAccounts *a) {
         used += (size_t)n;
     }
     close(fd);
+#endif
     cJSON *j = used == size && !memchr(text, 0, size) && !strstr(text, "\\u0000") ?
         cJSON_ParseWithOpts(text, NULL, true) : NULL;
     free(text);
@@ -339,7 +356,23 @@ int md_accounts_open(const char *dir, MdCredentialStore *store, MdAccounts **out
     *out = NULL;
     MdAccounts *a = calloc(1, sizeof(*a));
     if (!a) return MD_ACCOUNTS_IO;
-    a->dirfd = a->lockfd = -1; a->roles[0] = a->roles[1] = -1; a->store = store;
+#ifdef _WIN32
+    a->lock = INVALID_HANDLE_VALUE;
+#else
+    a->dirfd = a->lockfd = -1;
+#endif
+    a->roles[0] = a->roles[1] = -1; a->store = store;
+#ifdef _WIN32
+    char *default_dir = dir ? NULL : md_win_default_directory("/metadesk/accounts");
+    a->directory = md_win_directory(dir ? dir : default_dir, true); free(default_dir);
+    int rc = MD_ACCOUNTS_IO;
+    if (!a->directory) goto failed;
+    a->lock = md_win_file(a->directory, ".management.lock", GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, 0);
+    if (a->lock == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_SHARING_VIOLATION) rc = MD_ACCOUNTS_BUSY;
+        goto failed;
+    }
+#else
     char *default_dir = dir ? NULL : default_directory();
     a->dirfd = private_directory(dir ? dir : default_dir); free(default_dir);
     int rc = MD_ACCOUNTS_IO;
@@ -347,24 +380,20 @@ int md_accounts_open(const char *dir, MdCredentialStore *store, MdAccounts **out
     a->lockfd = openat(a->dirfd, ".management.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
     if (a->lockfd < 0 || !private_file(a->lockfd)) goto failed;
     if (flock(a->lockfd, LOCK_EX | LOCK_NB)) { rc = MD_ACCOUNTS_BUSY; goto failed; }
+#endif
     rc = load(a);
     if (rc) goto failed;
     *out = a; return 0;
 failed:
     md_accounts_destroy(a); return rc;
 }
-#else
-int md_accounts_open(const char *dir, MdCredentialStore *store, MdAccounts **out) {
-    (void)dir; (void)store;
-    if (!out) return MD_ACCOUNTS_INVALID;
-    *out = NULL; return MD_ACCOUNTS_UNSUPPORTED;
-}
-#endif
 int md_accounts_open_snapshot(const char *dir, MdCredentialStore *store, MdAccounts **out) {
     int rc = md_accounts_open(dir, store, out);
     if (rc) return rc;
     (*out)->snapshot = true;
-#ifndef _WIN32
+#ifdef _WIN32
+    CloseHandle((*out)->lock); (*out)->lock = INVALID_HANDLE_VALUE;
+#else
     close((*out)->lockfd); (*out)->lockfd = -1;
 #endif
     return 0;
@@ -388,13 +417,15 @@ void md_accounts_destroy(MdAccounts *a) {
     if (!a) return;
     for (int r = 0; r < MD_ACCOUNT_ROLE_COUNT; ++r) revoke_role(a, r);
     for (size_t i = 0; i < a->count; ++i) md_signer_destroy(a->records[i].signer);
-#ifndef _WIN32
+#ifdef _WIN32
+    if (a->lock != INVALID_HANDLE_VALUE) CloseHandle(a->lock);
+    md_win_directory_close(a->directory);
+#else
     if (a->lockfd >= 0) close(a->lockfd);
     if (a->dirfd >= 0) close(a->dirfd);
 #endif
     free(a);
 }
-#ifndef _WIN32
 static cJSON *pair(const MdAccount *info) {
     cJSON *j = cJSON_CreateObject();
     if (!j) return NULL;
@@ -424,6 +455,10 @@ int md_accounts_save(MdAccounts *a) {
     }
     char *text = ok ? cJSON_PrintUnformatted(j) : NULL; cJSON_Delete(j);
     if (!text) return MD_ACCOUNTS_IO;
+#ifdef _WIN32
+    bool saved = md_win_replace(a->directory, METADATA_FILE, text, strlen(text));
+    free(text); return saved ? 0 : MD_ACCOUNTS_IO;
+#else
     char tmp[80]; int fd = -1;
     for (unsigned i = 0; i < 100; ++i) {
         snprintf(tmp, sizeof(tmp), ".management.%ld.%u.tmp", (long)getpid(), i);
@@ -445,10 +480,8 @@ int md_accounts_save(MdAccounts *a) {
     if (synced && !renameat(a->dirfd, tmp, a->dirfd, METADATA_FILE) && !fsync(a->dirfd)) rc = 0;
     if (rc) unlinkat(a->dirfd, tmp, 0);
     return rc;
-}
-#else
-int md_accounts_save(MdAccounts *a) { (void)a; return MD_ACCOUNTS_UNSUPPORTED; }
 #endif
+}
 const char *md_accounts_error_string(int rc) {
     if (rc <= MD_CREDENTIAL_NOT_FOUND) return md_credential_error_string(rc);
     switch (rc) {
@@ -456,9 +489,9 @@ const char *md_accounts_error_string(int rc) {
     case MD_ACCOUNTS_INVALID: return "invalid account metadata or argument (lowercase 64-character hex pubkey required)";
     case MD_ACCOUNTS_NOT_FOUND: return "account not found";
     case MD_ACCOUNTS_EXISTS: return "account already exists";
-    case MD_ACCOUNTS_IO: return "cannot read/write private account metadata (requires owned 0700 directory and 0600 files)";
+    case MD_ACCOUNTS_IO: return "cannot read/write private account metadata (requires owner-only directory/files: 0700/0600 on POSIX, current-user DACL on Windows)";
     case MD_ACCOUNTS_BUSY: return "account metadata is in use by another process";
-    case MD_ACCOUNTS_UNSUPPORTED: return "account persistence is currently supported on Linux and macOS only";
+    case MD_ACCOUNTS_UNSUPPORTED: return "operation is unsupported (snapshots cannot be saved)";
     case MD_ACCOUNTS_NOT_READY: return "role has no verified signer; supply or unlock its backend";
     case MD_ACCOUNTS_FIPS_KEY_MISMATCH: return "FIPS hosting refused: host-role pubkey differs from the FIPS node key";
     case MD_SIGNER_ERR_KEY_CHANGED: return "signer identity differs from the pinned account; rebinding refused";

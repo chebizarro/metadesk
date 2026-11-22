@@ -1,3 +1,4 @@
+#include "win_private.h"
 /*
  * metadesk — mcp_http.c
  * Minimal HTTP/1.1 + SSE transport for MCP server.
@@ -395,24 +396,32 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
         cfg->allow_npub_count > AUTH_MAX_NPUBS ||
         (cfg->allow_npub_count && !cfg->allow_npubs)) return false;
     if (cfg->token_file) {
+        char token[4096] = {0};
+        ssize_t n = -1;
 #ifdef _WIN32
-        MD_LOG_E("MCP bearer token files require POSIX permission validation; unsupported on Windows (use NIP-98 authorization)");
-        return false;
+        unsigned char *bytes = NULL; size_t size = 0;
+        if (!md_win_read_path(cfg->token_file, &bytes, &size, 4079)) {
+            MD_LOG_E("MCP bearer file must be a current-user-owned regular file in a private directory, with no DACL grants to other SIDs, reparse points or hardlinks");
+            return false;
+        }
+        memcpy(token, bytes, size); n = (ssize_t)size;
+        OPENSSL_cleanse(bytes, size); free(bytes);
 #else
-        int fd = open(cfg->token_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        int fd = open(cfg->token_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) return false;
         struct stat st;
-        char token[4096];
-        ssize_t n = -1;
-        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-            (st.st_mode & 07777) == 0600 && st.st_size > 0 && st.st_size < 4080)
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid() &&
+            st.st_nlink == 1 && (st.st_mode & 07777) == 0600 && st.st_size > 0 && st.st_size < 4080)
             n = read(fd, token, sizeof(token) - 1);
         close(fd);
-        if (n <= 0 || n != st.st_size) return false;
+        if (n <= 0 || n != st.st_size) {
+            OPENSSL_cleanse(token, sizeof(token)); return false;
+        }
+#endif
         if (token[n-1] == '\n') n--;
         if (n && token[n-1] == '\r') n--;
         token[n] = 0;
-        if (!n) return false;
+        if (!n) { OPENSSL_cleanse(token, sizeof(token)); return false; }
         for (ssize_t i = 0; i < n; i++)
             if (!token[i] || (!isalnum((unsigned char)token[i]) && !strchr("-._~+/=", token[i]))) {
                 OPENSSL_cleanse(token, sizeof(token));
@@ -421,7 +430,6 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
         h->token = strdup(token);
         OPENSSL_cleanse(token, sizeof(token));
         if (!h->token) return false;
-#endif
     }
     h->public_urls = calloc(cfg->public_url_count + 1, sizeof(char *));
     if (!h->public_urls) return false;

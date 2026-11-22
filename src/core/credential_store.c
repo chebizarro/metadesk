@@ -134,7 +134,9 @@ int md_credential_store_remove(MdCredentialStore *s, const char *pk) {
     return s ? s->ops.remove(s->context, pk) : MD_CREDENTIAL_UNAVAILABLE;
 }
 MdCredentialStore *md_credential_store_default(void) {
-#ifdef __APPLE__
+#ifdef _WIN32
+    return md_credential_store_windows(NULL);
+#elif defined(__APPLE__)
     return md_credential_store_keychain(NULL);
 #else
     return md_credential_store_secret_service();
