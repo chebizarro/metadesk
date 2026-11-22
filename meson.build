@@ -802,6 +802,12 @@ host_c_args = []
 # Headless host access administration (md-pss).
 host_sources += files('src/host/access_cli.c')
 
+if host_os == 'windows'
+  host_sources += import('windows').compile_resources('tools/win/metadesk.rc',
+    include_directories : include_directories('tools/win'),
+    depend_files : files('tools/win/metadesk.manifest'))
+endif
+
 metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
   dependencies : [dep_metadesk],

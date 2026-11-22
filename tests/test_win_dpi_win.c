@@ -43,6 +43,17 @@ static DWORD WINAPI report_thread(LPVOID out) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const int initial = md_win_dpi_process_awareness();
+#ifdef MD_TEST_MANIFEST
+    CHECK(initial == MD_DPI_PROCESS_PER_MONITOR_V2);
+    MdSetProcessDpiContextFn set_context = (MdSetProcessDpiContextFn)md_win_dpi_proc(
+        L"user32.dll", "SetProcessDpiAwarenessContext");
+    CHECK(set_context);
+    SetLastError(0);
+    CHECK(!set_context(MD_DPI_CONTEXT_PER_MONITOR_V2));
+    CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+    CHECK(md_win_dpi_process_init() == MD_DPI_PROCESS_PER_MONITOR_V2);
+    puts("PASS product manifest PerMonitorV2: init handles ERROR_ACCESS_DENIED");
+#endif
     if (initial != MD_DPI_PROCESS_NOT_PER_MONITOR) {
         /* Preset by the environment (session 0): kept and reported. */
         CHECK(md_win_dpi_process_init() == initial);

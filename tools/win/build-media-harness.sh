@@ -13,6 +13,11 @@
 #                                 a recorder in the test TU (never injects input)
 #   - test_win_dpi_win.exe      : win_dpi.h compiled as C, as src/host/main.c
 #                                 includes it: process per-monitor v2 (md-m5x4)
+#   - test_win_dpi_manifest.exe : same C test with the product manifest;
+#                                 run in the console, including while locked
+#   - test_win_dpi_live.exe [DPI] : opt-in UNLOCKED owned-console test;
+#                                 UIA/DXGI physical rectangles + one real click
+#                                 in its own window. E.g. 144 requires 150%.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-$ROOT/build-win-media}"
@@ -37,5 +42,14 @@ $CXX $CXXFLAGS -o "$OUT/test_sendinput_win.exe" "$ROOT/tests/test_sendinput_win.
   "$OUT/input.o" "$OUT/log.o" -luser32
 echo "== link test_win_dpi_win.exe"
 $CC $CFLAGS -o "$OUT/test_win_dpi_win.exe" "$ROOT/tests/test_win_dpi_win.c" -luser32
+echo "== link test_win_dpi_live.exe (owned window, real input; opt-in console run)"
+windres -I"$ROOT/tools/win" "$ROOT/tools/win/metadesk.rc" "$OUT/metadesk-res.o"
+$CC $CFLAGS -DMD_TEST_MANIFEST -o "$OUT/test_win_dpi_manifest.exe" \
+  "$ROOT/tests/test_win_dpi_win.c" "$OUT/metadesk-res.o" -luser32
+$CXX $CXXFLAGS -o "$OUT/test_win_dpi_live.exe" "$ROOT/tests/test_win_dpi_live.cpp" \
+  "$OUT/capture.o" "$OUT/capture_dxgi.o" "$OUT/input.o" "$OUT/input_sendinput.o" \
+  "$OUT/md_time.o" "$OUT/log.o" "$OUT/metadesk-res.o" \
+  -ld3d11 -ldxgi -lgdi32 -luser32 -lole32 -loleaut32 -luiautomationcore -luuid -lpthread
+
 echo "== done: $OUT"
 ls -la "$OUT"/*.exe
