@@ -230,7 +230,14 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
     const char *name = cfg ? cfg->backend : NULL;
     const MdInputBackend *vtable = NULL;
     if (!name || strcmp(name, "auto") == 0) {
+        /* TODO(md-y8kc): consider preferring portal only after live GNOME
+         * acceptance. Until then auto keeps the established platform backend
+         * (uinput on Linux), with no portal probe or fallback. */
         vtable = md_input_backend_create();
+#ifdef MD_HAVE_PORTAL_INPUT
+    } else if (strcmp(name, "portal") == 0) {
+        vtable = md_input_portal_backend();
+#endif
 #ifdef __linux__
     } else if (strcmp(name, "uinput") == 0) {
         vtable = md_input_backend_create();
