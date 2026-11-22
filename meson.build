@@ -51,15 +51,18 @@ _sys_lib_dirs = []
 _sys_inc_dirs = []
 
 if host_os == 'darwin'
-  _brew = run_command('brew', '--prefix', check : false)
-  if _brew.returncode() == 0
-    _brew_prefix = _brew.stdout().strip()
+  _macos_deps_prefix = get_option('macos_deps_prefix')
+  if _macos_deps_prefix != ''
+    _sys_lib_dirs = [_macos_deps_prefix / 'lib']
+    _sys_inc_dirs = [_macos_deps_prefix / 'include']
+    message('Private macOS dependencies: ' + _macos_deps_prefix)
   else
-    _brew_prefix = '/opt/homebrew'
+    _brew = run_command('brew', '--prefix', check : false)
+    _brew_prefix = _brew.returncode() == 0 ? _brew.stdout().strip() : '/opt/homebrew'
+    _sys_lib_dirs = [_brew_prefix / 'lib']
+    _sys_inc_dirs = [_brew_prefix / 'include']
+    message('Homebrew prefix: ' + _brew_prefix)
   endif
-  _sys_lib_dirs = [_brew_prefix / 'lib']
-  _sys_inc_dirs = [_brew_prefix / 'include']
-  message('Homebrew prefix: ' + _brew_prefix)
 endif
 
 # Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
@@ -117,7 +120,9 @@ if _nostrc_build != ''
   endforeach
 endif
 foreach d : _sys_inc_dirs
-  _nostrc_inc_paths += d / 'nostr'
+  if fs.is_dir(d / 'nostr')
+    _nostrc_inc_paths += d / 'nostr'
+  endif
 endforeach
 nostrc_inc = include_directories(_nostrc_inc_paths)
 
@@ -716,6 +721,28 @@ if enable_client
   )
 endif
 
+# Darwin dependencies may themselves use @rpath install names (notably libyuv
+# and build-tree nostr-json). Meson removes build rpaths at install time.
+# Keep selected dependency directories for an installed prefix, and make the
+# product library discoverable from a relocated DESTDIR tree. Linux producers
+# deliberately retain their existing empty install rpath contract.
+_darwin_lib_rpath = ''
+_darwin_exe_rpath = ''
+if host_os == 'darwin'
+  _install_dep_dirs = _sys_lib_dirs
+  _yuv_libdir = dep_yuv.get_variable(pkgconfig : 'libdir', default_value : '')
+  if _yuv_libdir != ''
+    _install_dep_dirs += _yuv_libdir
+  endif
+  if _nostrc_build != ''
+    _install_dep_dirs += _nostrc_build / 'libjson'
+  endif
+  _darwin_lib_rpath = ':'.join(['@loader_path'] + _install_dep_dirs)
+  _product_lib_relative = fs.relative_to(get_option('prefix') / get_option('libdir'),
+                                         get_option('prefix') / get_option('bindir'))
+  _darwin_exe_rpath = ':'.join(['@loader_path' / _product_lib_relative] + _install_dep_dirs)
+endif
+
 # ── libmetadesk (shared core library) ───────────────────────────────────────
 # Platform-agnostic sources (compiled on all platforms)
 core_sources = files(
@@ -781,6 +808,7 @@ libmetadesk = shared_library('metadesk', core_sources,
   dependencies : core_deps + core_private_deps,
   c_args : signer_c_args + mcp_c_args + accounts_c_args,
   install : true,
+  install_rpath : _darwin_lib_rpath,
   version : meson.project_version(),
 )
 
@@ -831,6 +859,7 @@ metadesk_host = executable('metadesk-host', host_sources,
   dependencies : [dep_metadesk],
   c_args : host_c_args,
   install : true,
+  install_rpath : _darwin_exe_rpath,
 )
 
 if host_os == 'linux' or host_os == 'darwin'
@@ -879,6 +908,7 @@ if enable_client
     include_directories : [core_inc],
     dependencies : [dep_metadesk, dep_sdl2, dep_imgui],
     install : true,
+    install_rpath : _darwin_exe_rpath,
   )
 endif
 
@@ -1261,3 +1291,20 @@ test_session_log = executable('test_session_log',
   dependencies : [dep_metadesk],
 )
 test('signed session log', test_session_log)
+
+if host_os == 'darwin'
+  test('macOS packaging minimum-version parser', import('python').find_installation('python3'),
+    args : [files('packaging/macos/test-packaging.py')])
+endif
+
+if host_os == 'darwin'
+  # Meson installs absolute product install names even with install_rpath.
+  # Rewrite only our library/executables, leaving third-party IDs untouched.
+  _installed_bins = ['metadesk-host']
+  if enable_client
+    _installed_bins += 'metadesk-client'
+  endif
+  meson.add_install_script(import('python').find_installation('python3'),
+    files('packaging/macos/fix-install-names.py'),
+    get_option('libdir'), get_option('bindir'), _installed_bins)
+endif

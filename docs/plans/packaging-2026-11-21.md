@@ -58,6 +58,15 @@ Evidence from the macOS prototype run on 2026-11-21:
 | `libSDL2` is **sdl2-compat**, which `dlopen`s SDL3 | `strings libSDL2-2.0.0.dylib` → `@loader_path/libSDL3.dylib` | the linker view misses a required runtime library; exactly the contract's "enumerate dlopen features" rule |
 | OpenSSL comes from `openssl@4` via libwebsockets | closure | one TLS stack only; bundle it (macOS/Windows) or use the system one (Linux packages) |
 
+**W5 follow-up (2026-11-22):** `packaging/macos/build-deps.py` and
+`build-release.sh` now provide source-pinned native arm64 dependencies and
+nostrc at the 13.0 floor, with real SDL2, minimal LGPL FFmpeg and OpenSSL 3.
+Darwin installation keeps dependency rpaths and relocatable product IDs; the
+staged-prefix check runs before bundling. See [the recipe and qualification](../../packaging/macos/README.md).
+The Homebrew measurements above remain historical prototype evidence, not the
+new profile. x86_64/universal2 is tracked separately as `md-c17b`; Developer ID,
+notarization and the host helper are still release gates.
+
 ### 3.1 License decision (owner, 2026-11-22; `md-2exc`)
 
 metadesk is **MIT**, Copyright (c) 2026 Chris Daley; project started 2026-04-13.

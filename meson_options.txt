@@ -16,3 +16,6 @@ option('nostrc_root', type : 'string', value : '',
        description : 'Path to nostrc project root (for uninstalled libraries and signer headers; leave empty if fully installed)')
 option('nostrc_build_dir', type : 'string', value : '',
        description : 'Path to nostrc CMake build dir (defaults to nostrc_root/build if nostrc_root is set)')
+
+option('macos_deps_prefix', type : 'string', value : '',
+       description : 'Private macOS dependency prefix (instead of Homebrew discovery)')

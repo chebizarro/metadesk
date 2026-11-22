@@ -52,8 +52,9 @@ copyright texts**, including exceptions/NOTICE/PATENTS files, in the artifact's
 legal directory (macOS `Contents/Resources/licenses/`). A summary table is not
 a substitute for those texts. Reconcile against the manifest plus runtime
 loads; fail the release on an unclassified library. Base-owned OS libraries
-are not copied into DMG/MSI. The current macOS prototype does not yet assemble
-this legal directory; production wiring is `md-ouw3` / release-pipeline work.
+are not copied into DMG/MSI. The original macOS prototype did not assemble
+this legal directory; the source-pinned W5 profile below does. Publication and
+corresponding-source gates remain release-pipeline work.
 
 ### L15 macOS verification manifest
 
@@ -90,6 +91,40 @@ are therefore **not** its shipped closure. No GPL codec library or OpenH264
 appears in this manifest. FFmpeg dylibs target macOS 13.0, but the whole app
 still requires 27.2 because of SDL3/libwebsockets. This is a developer
 verification artifact, not a distributable release or a cross-platform BOM.
+
+## W5 source-pinned macOS arm64 profile
+
+The [macOS dependency builder](packaging/macos/README.md) uses the exact URLs
+and SHA256 values in [`deps.lock.json`](packaging/macos/deps.lock.json).
+This replaces Homebrew bottles for this profile, not for distro builds or the
+historical L15 prototype above. All target code, including nostrc, is built
+with a macOS 13.0 deployment target.
+
+| Component | Pin | License / selected configuration |
+|---|---|---|
+| FFmpeg | 8.1.2 | LGPL-2.1-or-later; shared avcodec/avutil, native H.264 decode/parser and VideoToolbox encode only |
+| SDL2 | 2.32.10 | Zlib; real SDL2, no sdl2-compat/SDL3 dlopen |
+| libyuv | `0ec9f68d82634f6f3414aaaf780e03f9edf002b3` (header 1985) | BSD-3-Clause + PATENTS; JPEG disabled |
+| OpenSSL | 3.5.9 | Apache-2.0; shared libssl/libcrypto, no loadable modules |
+| libsodium | 1.0.22 | ISC |
+| cJSON | 1.7.19 | MIT |
+| libwebsockets | 5.1.0 | MIT + upstream per-file notices; OpenSSL, poll, no HTTP/3/GnuTLS/event-loop plugins |
+| jansson | 2.15.1 | MIT + Lucent dtoa notice |
+| libb2 | 0.98.1 | CC0-1.0; native-CPU tuning/OpenMP disabled |
+| secp256k1 | 0.8.0 | MIT; recovery enabled |
+| nsync | 1.30.0 | Apache-2.0; shared |
+| nostrc | `cfcb86296068c1e4090bc5ce8a486392dc74eb11` | MIT; static core/NIPs + shared nostr-json, GLib-free, NIP-46/NIP-5F enabled |
+| Dear ImGui | 1.90.4 (vendored) | MIT; embedded stb notices retained in source |
+
+Apple libcurl, uuid, zlib and platform frameworks are OS-owned. No GLib,
+gettext, PCRE2, JPEG, SDL3, GPL codec or OpenH264 is part of this profile.
+libb2 is built as an explicit dependency but may be dropped from the final
+load closure when unused; consult the actual bundle manifest, not this input
+list. The builder retains source archives, build/config logs, toolchain and
+root upstream legal texts; the app stages those legal texts, the lock file,
+this notice, metadesk's license and ImGui's license under Resources.
+Corresponding-source release publication, attribution UI, Developer ID and
+notarization are still publisher gates; shipping this table is not sufficient.
 
 ## Component licenses (not guessed from package names)
 
