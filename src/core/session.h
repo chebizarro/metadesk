@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "quality.h"
+#include "clipboard.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +30,8 @@ typedef enum {
     MD_CAP_VIDEO = (1 << 0),
     MD_CAP_AGENT = (1 << 1),
     MD_CAP_INPUT = (1 << 2),
+    MD_CAP_MONITOR = (1 << 3),
+    MD_CAP_CLIPBOARD = (1 << 4),
 } MdCapability;
 
 /* Tree format preference */
@@ -44,6 +48,9 @@ typedef enum {
 
 /* Session context */
 typedef struct {
+    uint8_t clipboard_directions;
+    MdQuality quality;
+    bool quality_present;
     MdSessionState state;
     uint32_t       capabilities;   /* bitwise OR of MdCapability   */
     MdTreeFormat   tree_format;
@@ -115,6 +122,10 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 
 /* Parsed session request from client */
 typedef struct {
+    char output[32]; /* optional stable capture selector; requires monitor grant */
+    uint8_t clipboard_directions;
+    MdQuality quality;
+    bool quality_present;
     uint32_t    capabilities;      /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;
     bool         stream_tls;       /* supports pinned TLS 1.3 */
@@ -126,6 +137,11 @@ typedef struct {
 
 /* Parsed session accept from host */
 typedef struct {
+    MdCaptureOutputs outputs;
+    bool outputs_present;
+    uint8_t clipboard_directions;
+    MdQuality quality;
+    bool quality_present;
     char         session_id[64];   /* UUID assigned by host      */
     uint32_t     granted;          /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;      /* confirmed tree format       */
@@ -215,6 +231,11 @@ MdSessionRequestFreshness md_session_request_freshness(const MdSessionRequest *r
 bool md_session_accept_matches_request(const MdSessionAccept *acc,
                                        const MdSessionRequest *req,
                                        int64_t rumor_created_at);
+
+bool md_session_json_strings_safe(const char *json);
+int md_session_outputs_write(cJSON *root, const MdCaptureOutputs *outputs);
+int md_session_outputs_read(const cJSON *root, MdCaptureOutputs *outputs, bool *present);
+char *md_session_outputs_json(const MdCaptureOutputs *outputs, const char *error);
 
 /* Helper: convert capability bitfield to/from JSON array of strings. */
 uint32_t md_caps_from_strings(const char **strs, int count);

@@ -110,7 +110,15 @@ int main(int argc,char **argv) {
         MD_CHECK(video && input);
         MD_CHECK(!gtk_check_button_get_active(video));
 
+
         MD_CHECK(!adw_alert_dialog_get_response_enabled(alert,"once"));
+        if (!live) {
+            GtkCheckButton *monitor=find_check(extra,"_Monitor selection"), *clipboard=find_check(extra,"_Clipboard");
+            MD_CHECK(monitor && clipboard);
+            MD_CHECK(!gtk_check_button_get_active(monitor) && !gtk_check_button_get_active(clipboard));
+            MD_CHECK(gtk_widget_get_sensitive(GTK_WIDGET(monitor)) && gtk_widget_get_sensitive(GTK_WIDGET(clipboard)));
+            gtk_check_button_set_active(monitor,TRUE); gtk_check_button_set_active(clipboard,TRUE);
+        }
         MD_CHECK(!gtk_widget_get_sensitive(GTK_WIDGET(input))); // --no-input or fixture supported mask
         if(live && argc==6) MD_CHECK(!strcmp(argv[5],md_manager_json_string(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(snapshot,"requests"),0),"request_id")));
         if(!strcmp(action,"deny")) response_name="deny";
@@ -133,7 +141,7 @@ int main(int argc,char **argv) {
         MANAGER_WAIT(fake.commands>=2);
         MD_CHECK(!strcmp(md_manager_json_string(fake.last,"method"),"requests.decide"));
         MD_CHECK(!strcmp(md_manager_json_string(fake.last,"request_id"),"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-        MD_CHECK(md_manager_json_uint(fake.last,"caps")==1);
+        MD_CHECK(md_manager_json_uint(fake.last,"caps")==25);
         MD_CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(fake.last,"remember")));
     }
     MANAGER_WAIT(!md_manager_host_busy(host));
@@ -179,6 +187,21 @@ int main(int argc,char **argv) {
         click(find_button(GTK_WIDGET(window),"_Edit Access…"));
         dialog=adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)); MD_CHECK(dialog);
         if(dialog) {
+            MANAGER_WAIT(dialog_has_focus(window,dialog));
+            GtkWidget *extra=adw_alert_dialog_get_extra_child(ADW_ALERT_DIALOG(dialog));
+            MD_CHECK(gtk_check_button_get_active(find_check(extra,"_Monitor selection")));
+            MD_CHECK(gtk_check_button_get_active(find_check(extra,"_Clipboard")));
+            gtk_check_button_set_active(find_check(extra,"_Input"),TRUE);
+            GtkWidget *save=find_button(GTK_WIDGET(dialog),"_Save");
+            MANAGER_WAIT(presented(window,save));
+            guint before_save=fake.commands; click(save); MANAGER_WAIT(fake.commands>before_save);
+            MD_CHECK(!strcmp(md_manager_json_string(fake.last,"method"),"access.set"));
+            MD_CHECK(md_manager_json_uint(fake.last,"caps")==MD_HOST_ACCESS_CAPS);
+            MD_CHECK(md_manager_json_uint(fake.last,"policy_version")==8);
+            MANAGER_WAIT(!md_manager_host_busy(host));
+            MANAGER_WAIT(!adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)));
+            click(find_button(GTK_WIDGET(window),"_Edit Access…"));
+            dialog=adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)); MD_CHECK(dialog);
             MANAGER_WAIT(dialog_has_focus(window,dialog));
             GtkWidget *revoke=find_button(GTK_WIDGET(dialog),"_Revoke Access");
             MANAGER_WAIT(presented(window,revoke));

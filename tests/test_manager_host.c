@@ -34,8 +34,9 @@ int main(void) {
     cJSON *j=fake_snapshot(1,TRUE);
     g_autoptr(GError) error=NULL;
     MD_CHECK(md_manager_host_validate(j,&error));
-    g_autofree char *caps=md_manager_caps(15);
-    MD_CHECK(strstr(caps,"Unknown permissions (0x8)"));
+    g_autofree char *caps=md_manager_caps(MD_HOST_ACCESS_CAPS | 32u);
+    MD_CHECK(strstr(caps,"Unknown permissions (0x20)"));
+    MD_CHECK(strstr(caps,"Monitor selection") && strstr(caps,"Clipboard"));
     cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"revision"),1.5);
     MD_CHECK(!md_manager_host_validate(j,&error)); g_clear_error(&error); cJSON_Delete(j);
     j=cJSON_Parse("{\"v\":1,\"v\":1}"); MD_CHECK(!md_manager_host_validate(j,&error)); g_clear_error(&error); cJSON_Delete(j);

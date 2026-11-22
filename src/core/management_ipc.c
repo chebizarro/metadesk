@@ -210,11 +210,13 @@ static cJSON *policy_snapshot(MdManagementIpc *s, const char *error) {
     free(encoded);
     return j;
 }
-static void caps_text(uint32_t caps, char out[32]) {
+static void caps_text(uint32_t caps, char out[64]) {
     out[0] = 0;
     if (caps & MD_CAP_VIDEO) strcat(out,"video,");
     if (caps & MD_CAP_AGENT) strcat(out,"agent,");
     if (caps & MD_CAP_INPUT) strcat(out,"input,");
+    if (caps & MD_CAP_MONITOR) strcat(out,"monitor,");
+    if (caps & MD_CAP_CLIPBOARD) strcat(out,"clipboard,");
     size_t n = strlen(out); if (n) out[n-1] = 0;
 }
 static const char *dispatch(MdManagementIpc *s, cJSON *j) {
@@ -234,7 +236,7 @@ static const char *dispatch(MdManagementIpc *s, cJSON *j) {
         MdHostAccessSnapshot current; md_host_access_snapshot(s->access,(int64_t)time(NULL),&current);
         if (strcmp(g,current.generation) || rev != current.revision) return "conflict";
         if (!s->nostr || md_nostr_allowlist_state(s->nostr) != MD_NOSTR_ACL_LOADED) return "policy_unavailable";
-        char caps[32]; caps_text((uint32_t)bits,caps); if (!bits) strcpy(caps,"none");
+        char caps[64]; caps_text((uint32_t)bits,caps); if (!bits) strcpy(caps,"none");
         int rc = md_nostr_allowlist_edit_version(s->nostr,peer,remove ? NULL : caps,version);
         if (rc) return rc == -2 ? "conflict" : "publish_failed";
         /* A changed remembered grant applies to future requests, not a silent
@@ -259,7 +261,7 @@ static const char *dispatch(MdManagementIpc *s, cJSON *j) {
         if (md_host_access_decide(s->access,g,rev,id,approve,save,(uint32_t)bits,s->supported,
                                   (int64_t)time(NULL),&q)) return "conflict";
         if (save) {
-            char caps[32]; caps_text(q.granted,caps);
+            char caps[64]; caps_text(q.granted,caps);
             bool published = md_nostr_allowlist_add(s->nostr,q.peer,caps) == 0;
             if (md_host_access_remembered(s->access,id,published,(int64_t)time(NULL)))
                 return published ? "cancelled_or_expired_after_publish" : "publish_failed";
@@ -490,7 +492,7 @@ static int usage(void) {
         "       metadesk-host session [endpoint] kick SESSION_ID GENERATION REVISION\n"
         "       metadesk-host requests [endpoint] approve REQUEST_ID GENERATION REVISION CAPS [--remember]\n"
         "       metadesk-host requests [endpoint] deny REQUEST_ID GENERATION REVISION\n"
-        "Use exact generation/revision from list JSON; caps: canonical video,agent,input subset.\n");
+        "Use exact generation/revision from list JSON; caps: canonical video,agent,input,monitor,clipboard subset.\n");
     return 2;
 }
 int md_host_management_cli(const char *area, int argc, char **argv) {

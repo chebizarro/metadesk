@@ -99,7 +99,7 @@ static void notifications(MdManagerAccess *self,const cJSON *snapshot) {
 typedef struct {
     MdManagerHost *host;
     cJSON *command;
-    GtkCheckButton *checks[3];
+    GtkCheckButton *checks[5];
     gboolean policy;
     GtkCheckButton *remember;
     gboolean valid;
@@ -110,7 +110,7 @@ static void decision_free(gpointer data,GClosure *closure) {
 }
 static guint32 selected(Decision *d) {
     guint32 caps=0;
-    for (guint i=0;i<3;++i) if (gtk_check_button_get_active(d->checks[i])) caps|=1u<<i;
+    for (guint i=0;i<G_N_ELEMENTS(d->checks);++i) if (gtk_check_button_get_active(d->checks[i])) caps|=1u<<i;
     return caps;
 }
 static void selection_changed(GtkCheckButton *button,gpointer data) {
@@ -168,13 +168,13 @@ static void review(MdManagerAccess *self,const cJSON *item,gboolean policy,gbool
         }
         gtk_box_append(GTK_BOX(box),label(policy?"Save replaces the exact grant and ends any current session. Revoke removes the remembered client and ends its session. No permissions are implied by another permission.":
             "Select exact permissions. Accessibility actions need both the tree and input permissions. Remember saves only this selection in the host’s private allowlist."));
-        static const char *names[]={"_Video","_Accessibility tree","_Input"};
+        static const char *names[]={"_Video","_Accessibility tree","_Input","_Monitor selection","_Clipboard"};
         guint32 current=0;
         if (policy) {
             editable=md_nostr_parse_caps(md_manager_json_string(item,"caps"),&current)==0;
             if (!editable) gtk_box_append(GTK_BOX(box),label("This manager cannot edit unknown permissions. Revoke Access is still available."));
         }
-        for (guint i=0;i<3;++i) {
+        for (guint i=0;i<G_N_ELEMENTS(d->checks);++i) {
             d->checks[i]=GTK_CHECK_BUTTON(gtk_check_button_new_with_mnemonic(names[i]));
             gtk_widget_set_sensitive(GTK_WIDGET(d->checks[i]),policy || (requested & supported & (1u<<i)));
             gtk_check_button_set_active(d->checks[i],policy && (current&(1u<<i)));
@@ -184,7 +184,7 @@ static void review(MdManagerAccess *self,const cJSON *item,gboolean policy,gbool
             d->remember=GTK_CHECK_BUTTON(gtk_check_button_new_with_mnemonic("_Remember this exact grant"));
             gtk_box_append(GTK_BOX(box),GTK_WIDGET(d->remember));
         }
-        if (!policy && (requested&~7u)) gtk_box_append(GTK_BOX(box),label("Unknown permissions are shown but cannot be granted by this manager version"));
+        if (!policy && (requested&~MD_HOST_ACCESS_CAPS)) gtk_box_append(GTK_BOX(box),label("Unknown permissions are shown but cannot be granted by this manager version"));
     }
     adw_alert_dialog_set_extra_child(alert,box);
     adw_alert_dialog_add_response(alert,"cancel","_Cancel");
@@ -198,7 +198,7 @@ static void review(MdManagerAccess *self,const cJSON *item,gboolean policy,gbool
         adw_alert_dialog_add_responses(alert,"deny","_Deny","once","_Approve",NULL);
         adw_alert_dialog_set_response_enabled(alert,"once",FALSE);
 
-        for (guint i=0;i<3;++i) g_signal_connect_object(d->checks[i],"toggled",G_CALLBACK(selection_changed),alert,0);
+        for (guint i=0;i<G_N_ELEMENTS(d->checks);++i) g_signal_connect_object(d->checks[i],"toggled",G_CALLBACK(selection_changed),alert,0);
     }
     g_object_set_data(G_OBJECT(alert),"decision",d);
     g_weak_ref_set(&self->dialog,alert);

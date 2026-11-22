@@ -85,8 +85,14 @@ typedef struct {
     /* Optional checked owner. Retained until destroy; signer must be NULL or
      * the binding's signer. Revocation stops this bridge, never the signer. */
     MdAccountBinding *owner;
+    bool quality_preferences; /* client-only encrypted NIP-78 preferences */
     bool allowlist_open; /* explicit opt-out of ACL enforcement; default false */
 } MdNostrConfig;
+
+/* Preferences carry no authority. Load waits for EOSE; save requires positive OK.
+ * One encrypted document preserves other hosts and unknown fields. */
+int md_nostr_quality_load(MdNostr *n, const char *host_hex, MdQuality *out);
+int md_nostr_quality_save(MdNostr *n, const char *host_hex, const MdQuality *quality);
 
 /* ── Event callbacks ──────────────────────────────────────────
  * Nostr is event-driven. These callbacks are invoked asynchronously

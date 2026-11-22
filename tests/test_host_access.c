@@ -81,6 +81,17 @@ static void decisions(void) {
     md_host_access_stop(&a);MD_CHECK(md_host_access_enqueue(&a,pk,&r,100)<0);
     md_host_access_destroy(&a);
 }
+static void clipboard_exact_caps(void) {
+    MdHostAccess a; MD_CHECK(!md_host_access_init(&a)); char pk[65]; peer(1,pk);
+    MdSessionRequest r=req(20,110); r.capabilities=MD_CAP_VIDEO|MD_CAP_CLIPBOARD; r.clipboard_directions=MD_CLIPBOARD_SEND;
+    MD_CHECK(!md_host_access_enqueue(&a,pk,&r,100)); MdHostAccessSnapshot v=view(&a,100); MdHostRequest q;
+    MD_CHECK(!md_host_access_decide(&a,v.generation,v.revision,r.request_id,true,false,MD_CAP_CLIPBOARD,MD_HOST_ACCESS_CAPS,100,&q));
+    MD_CHECK(md_host_access_take(&a,100,&q) && q.granted==MD_CAP_CLIPBOARD && q.request.clipboard_directions==MD_CLIPBOARD_SEND);
+    md_host_access_release(&a); r=req(21,110); r.capabilities=MD_CAP_VIDEO;
+    MD_CHECK(!md_host_access_enqueue(&a,pk,&r,100)); v=view(&a,100);
+    MD_CHECK(md_host_access_decide(&a,v.generation,v.revision,r.request_id,true,false,MD_CAP_VIDEO|MD_CAP_CLIPBOARD,MD_HOST_ACCESS_CAPS,100,&q)<0);
+    md_host_access_destroy(&a);
+}
 static void revoke_peer(void) {
     MdHostAccess a; MD_CHECK(!md_host_access_init(&a));
     char first[65], other[65]; peer(1,first); peer(2,other);
@@ -99,6 +110,7 @@ static void revoke_peer(void) {
 }
 int main(void) {
     revoke_peer();
+    clipboard_exact_caps();
     bounds_expiry(); decisions(); decision_race();
     char id[33];MD_CHECK(!md_session_cancel_from_json("{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"00000000000000000000000000000001\"}",id));
     MD_CHECK(md_session_cancel_from_json("{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"bad\"}",id)<0);

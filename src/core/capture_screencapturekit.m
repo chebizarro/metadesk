@@ -788,3 +788,20 @@ const MdCaptureBackend *md_capture_backend_create(void) {
     MD_LOG_I("ScreenCaptureKit requires macOS 12.3+");
     return NULL;
 }
+
+int md_capture_outputs(MdCaptureOutputs *out) {
+    if (!out) return -1;
+    memset(out,0,sizeof(*out));
+    CGDirectDisplayID ids[MD_CAPTURE_OUTPUTS_MAX]; uint32_t count=0;
+    if (CGGetActiveDisplayList(MD_CAPTURE_OUTPUTS_MAX,ids,&count)!=kCGErrorSuccess) return -1;
+    for (uint32_t i=0;i<count;i++) {
+        MdCaptureOutput *o=&out->items[out->count++];
+        snprintf(o->id,sizeof(o->id),"id:%u",ids[i]);
+        snprintf(o->name,sizeof(o->name),"Display %u%s",ids[i],CGDisplayIsMain(ids[i]) ? " (primary)" : "");
+        CGRect r=CGDisplayBounds(ids[i]);
+        o->rect=(MdCaptureRect){(int32_t)r.origin.x,(int32_t)r.origin.y,(uint32_t)r.size.width,(uint32_t)r.size.height};
+        o->primary=CGDisplayIsMain(ids[i]);
+        if (o->primary) strcpy(out->selected,o->id);
+    }
+    out->switch_supported=true; return out->count ? 0 : -1;
+}

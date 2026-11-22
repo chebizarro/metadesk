@@ -13,7 +13,7 @@ static int usage(void) {
         "  remove <npub>\n"
         "  migrate [<npub> <caps> ...]  (confirm EVERY source member)\n"
         "Uses the saved host role; no signer override or open mode.\n"
-        "caps: none or a comma-separated subset in video,agent,input order (no spaces).\n"
+        "caps: none or a comma-separated subset in video,agent,input,monitor,clipboard order (no spaces).\n"
         "Explicit caps replaces the grant; omitted caps preserves existing, defaults new to video.\n"
         "Legacy/mixed lists deny access and require explicit migration.\n"
         "Migration cannot erase historical public copies on relays or observers.\n"

@@ -84,6 +84,26 @@ typedef struct {
     /* Encoder + input bounds follow the capture; the capture thread owns
      * the encoder, other threads go through its request calls. */
     HostCaptureSync sync;
+    MdClipboard *clipboard; /* stream thread only, destroyed on disconnect */
+    uint8_t clipboard_policy; /* local directions; grant still required */
+    MdCaptureOutputs outputs;         /* client_mu */
+    char desired_output[32], startup_output[32];
+    bool output_pending;
+    uint32_t control_epoch;
+    uint64_t output_revision;
+    pthread_cond_t capture_control_cv;
+    MdQuality quality_policy, quality; /* client_mu; policy immutable */
+    uint32_t applied_quality_epoch; /* capture thread only */
+    uint64_t quality_revision, applied_quality_revision;
+    uint32_t native_width, native_height; /* client_mu, current capture size */
+    MdQuality applied_quality;         /* capture thread only */
+    bool quality_error;               /* client_mu; reject this admission, keep host alive */
+    bool quality_pending;             /* client_mu; admission waits for codec */
+    bool quality_state_pending;       /* client_mu */
+    uint8_t *quality_pixels;           /* capture thread only */
+    size_t quality_capacity;
+    uint64_t last_quality_frame_ns;
+
 
     /* Session log for agent monitoring (M2.4) */
     MdSessionLog *session_log;
@@ -106,20 +126,27 @@ typedef struct {
 
 /* ── Encode callback: send encoded packet to client ──────────── */
 
+static uint64_t host_frame_tag(uint32_t epoch,uint64_t geometry) {
+    return ((uint64_t)epoch<<32) | (uint32_t)geometry;
+}
+
 static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
     HostCtx *ctx = userdata;
 
     pthread_mutex_lock(&ctx->client_mu);
     MdStream *client = ctx->client;
-    if ((ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
-        !md_stream_has_capability(client, MD_CAP_VIDEO)) {
+    if (!md_stream_has_capability(client, MD_CAP_VIDEO) ||
+        (uint32_t)(pkt->tag>>32)!=ctx->control_epoch ||
+        (ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id))) {
         pthread_mutex_unlock(&ctx->client_mu);
         return;
     }
 
-    /* Attributed to the geometry its frame was captured under, which an
+    /* The upper tag word fences a frame to the session that captured it;
+     * the lower word still attributes geometry by capture frame (md-f7uc).
+     * Attributed to the geometry its frame was captured under, which an
      * asynchronous encoder may have left behind by now (md-f7uc). */
-    host_capture_sync_packet_sent(&ctx->sync, pkt->tag, ctx->pkt_seq);
+    host_capture_sync_packet_sent(&ctx->sync, (uint32_t)pkt->tag, ctx->pkt_seq);
     int ret = md_stream_send(client, MD_PKT_VIDEO_FRAME,
                              ctx->pkt_seq++,
                              pkt->data, (uint32_t)pkt->size);
@@ -378,19 +405,97 @@ static int host_start_capture(MdCaptureCtx *capture,
 typedef struct {
     HostCtx      *host;
     MdCaptureCtx *capture;
+    char *owned_output;
 } CaptureThread;
 
+static void host_quality_failed(HostCtx *ctx,const MdQuality *q,uint64_t revision,uint32_t epoch) {
+    pthread_mutex_lock(&ctx->client_mu);
+    bool current=ctx->control_epoch==epoch && ctx->quality_revision==revision;
+    if (current && ctx->applied_quality.fps &&
+        ((ctx->applied_quality_epoch==epoch && memcmp(q,&ctx->applied_quality,sizeof(*q))) || ctx->quality_pending)) {
+        bool admission=ctx->quality_pending;
+        ctx->quality_error=admission;
+        ctx->quality=ctx->applied_quality; ctx->quality_revision++;
+        ctx->applied_quality_revision=ctx->quality_revision;
+        ctx->applied_quality_epoch=epoch;
+        ctx->quality_state_pending=false;
+        if (ctx->client && !admission) {
+            char *json=md_quality_state(&ctx->applied_quality,"quality unsupported by capture/encoder; previous settings retained");
+            if (json) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                (uint8_t*)json,(uint32_t)strlen(json))) md_stream_close(ctx->client); free(json); }
+        }
+        atomic_store(&ctx->initial_frame_requested,true);
+    } else if (current) {
+        fprintf(stderr,"host: capture/encoder cannot honor negotiated quality; refusing video session\n");
+        atomic_store(&ctx->capture_failed,true);
+    }
+    if (current && ctx->quality_pending) { ctx->quality_pending=false; pthread_cond_broadcast(&ctx->capture_control_cv); }
+    pthread_mutex_unlock(&ctx->client_mu);
+}
 static void host_encode_frame(HostCtx *ctx, MdCaptureCtx *cap,
-                               const MdFrame *frame, bool has_client) {
-    if (!host_capture_sync_frame(&ctx->sync, cap, frame) || !has_client)
-        return;
+                               const MdFrame *frame, bool has_client, bool force) {
+    pthread_mutex_lock(&ctx->client_mu);
+    ctx->native_width=frame->width; ctx->native_height=frame->height;
+    uint32_t epoch=ctx->control_epoch;
+    uint64_t revision=ctx->quality_revision;
+    MdQuality q = md_quality_clamp(&ctx->quality, &ctx->quality_policy);
+    pthread_mutex_unlock(&ctx->client_mu);
+    MdFrame scaled;
+    if (md_quality_scale(&q,frame,&scaled,&ctx->quality_pixels,&ctx->quality_capacity)) {
+        host_quality_failed(ctx,&q,revision,epoch); return;
+    }
+    if (epoch!=ctx->applied_quality_epoch || revision!=ctx->applied_quality_revision || memcmp(&q, &ctx->applied_quality, sizeof(q))) {
+        if (md_encoder_set_quality(ctx->sync.encoder,scaled.width&~1u,scaled.height&~1u,q.fps,q.bitrate)) {
+            host_quality_failed(ctx,&q,revision,epoch); return;
+        }
+        atomic_store(&ctx->sync.bitrate_req, 0);
+        ctx->applied_quality = q;
+        ctx->applied_quality_revision=revision;
+        if (epoch!=ctx->applied_quality_epoch) ctx->last_quality_frame_ns=0;
+        ctx->applied_quality_epoch=epoch;
+        pthread_mutex_lock(&ctx->client_mu);
+        if (ctx->control_epoch==epoch && ctx->quality_revision==revision && ctx->quality_pending) {
+            ctx->quality_pending=false; pthread_cond_broadcast(&ctx->capture_control_cv);
+        }
+        pthread_mutex_unlock(&ctx->client_mu);
+    }
     uint64_t start_ns = md_monotonic_ns();
+    if (!md_quality_frame_due(q.fps,ctx->last_quality_frame_ns,start_ns)) {
+        /* A live control cannot bypass the host/session FPS ceiling. Keep
+         * an initial/changed-frame request pending until the media cadence. */
+        if (force) atomic_store(&ctx->initial_frame_requested,true);
+        return;
+    }
+    if (!host_capture_sync_frame(&ctx->sync, cap, &scaled)) {
+        fprintf(stderr,"host: captured geometry cannot be encoded/mapped safely\n");
+        atomic_store(&ctx->capture_failed,true); return;
+    }
+    frame = &scaled;
+    if (!has_client) return;
+    ctx->last_quality_frame_ns = start_ns;
+    pthread_mutex_lock(&ctx->client_mu);
+    if (ctx->client && ctx->quality_state_pending && ctx->quality_revision==revision && ctx->control_epoch==epoch) {
+        char *json = md_quality_control(&q);
+        if (json) {
+            if (md_stream_send(ctx->client, MD_PKT_SESSION_STATE, ctx->pkt_seq++,
+                               (uint8_t *)json, (uint32_t)strlen(json))) md_stream_close(ctx->client);
+            free(json);
+        }
+        ctx->quality_state_pending = false;
+        fprintf(stderr, "host: quality applied cap=%ux%u bitrate=%u fps=%u frame=%ux%u\n",
+            q.max_width, q.max_height, q.bitrate, q.fps, frame->width, frame->height);
+    }
+    pthread_mutex_unlock(&ctx->client_mu);
     int ret = md_encoder_submit_tagged(ctx->sync.encoder, frame->data,
-        frame->stride, capture_fmt_to_enc(frame->format), (int64_t)frame->seq,
-        host_capture_sync_frame_tag(&ctx->sync), on_encoded, ctx);
+        /* Native sequence gaps are not codec time: FPS follows paced submits.
+         * The opaque tag still identifies this captured frame's geometry. */
+        frame->stride, capture_fmt_to_enc(frame->format), -1,
+        host_frame_tag(epoch,host_capture_sync_frame_tag(&ctx->sync)), on_encoded, ctx);
     if (ret == 0) {
+        pthread_mutex_lock(&ctx->client_mu);
         ctx->total_encode_us += (int64_t)((md_monotonic_ns() - start_ns) / 1000u);
         ctx->frames_encoded++;
+        pthread_mutex_unlock(&ctx->client_mu);
     }
     ctx->frame_seq++;
 }
@@ -400,6 +505,48 @@ static void host_request_initial_frame(HostCtx *ctx) {
     atomic_store(&ctx->initial_frame_requested, true);
 }
 
+/* Only the capture owner switches sources. Startup of the replacement is
+ * transactional; late completion from a disconnected session cannot retarget it. */
+static void host_switch_output(CaptureThread *ct) {
+    HostCtx *ctx=ct->host; char id[32]; uint64_t epoch, revision;
+    pthread_mutex_lock(&ctx->client_mu);
+    if (!ctx->output_pending) { pthread_mutex_unlock(&ctx->client_mu); return; }
+    strcpy(id,ctx->desired_output); epoch=ctx->control_epoch; revision=ctx->output_revision;
+    pthread_mutex_unlock(&ctx->client_mu);
+    char *owned=strdup(id); MdCaptureConfig cfg=ct->capture->config; cfg.output=owned;
+    MdCaptureCtx *next=owned ? md_capture_create(&cfg) : NULL;
+    HostCtx staging={0}; uint32_t w=0,h=0;
+    bool ok=next && !host_start_capture(next,&w,&h,&staging);
+    pthread_mutex_lock(&ctx->client_mu);
+    bool current=ctx->control_epoch==epoch && ctx->output_revision==revision;
+    MdFrame scaled;
+    if (ok && current && (md_quality_scale(&ctx->quality,&staging.cached_frame,&scaled,
+        &staging.quality_pixels,&staging.quality_capacity) ||
+        md_encoder_set_quality(ctx->sync.encoder,scaled.width&~1u,scaled.height&~1u,
+            ctx->quality.fps,md_encoder_get_bitrate(ctx->sync.encoder)<ctx->quality.bitrate ?
+                md_encoder_get_bitrate(ctx->sync.encoder) : ctx->quality.bitrate))) ok=false;
+    if (ok && current) {
+        MdCaptureCtx *old=ct->capture; ct->capture=next; next=old;
+        char *old_id=ct->owned_output; ct->owned_output=owned; owned=old_id;
+        free(ctx->cached_frame.data); ctx->cached_frame=staging.cached_frame;
+        ctx->cached_capacity=staging.cached_capacity; staging.cached_frame.data=NULL;
+        strcpy(ctx->outputs.selected,id);
+        /* New source identity matters even for identical rects and sizes. */
+        host_capture_sync_reset_sequence(&ctx->sync);
+        atomic_store(&ctx->initial_frame_requested,true);
+    }
+    if (current) {
+        ctx->output_pending=false;
+        if (ctx->client) {
+            char *json=md_session_outputs_json(&ctx->outputs, ok ? NULL : "output unavailable; previous output retained");
+            if (json) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                (uint8_t*)json,(uint32_t)strlen(json))) md_stream_close(ctx->client); free(json); }
+        }
+        pthread_cond_broadcast(&ctx->capture_control_cv);
+    }
+    pthread_mutex_unlock(&ctx->client_mu);
+    free(staging.quality_pixels); free(staging.cached_frame.data); if (next) md_capture_destroy(next); free(owned);
+}
 static void *capture_thread_func(void *arg) {
     CaptureThread *ct  = arg;
     HostCtx       *ctx = ct->host;
@@ -411,20 +558,28 @@ static void *capture_thread_func(void *arg) {
 
     while (!atomic_load(&ctx->capture_stopping) &&
            !atomic_load(&ctx->capture_failed)) {
+        host_switch_output(ct);
+        cap=ct->capture;
         pthread_mutex_lock(&ctx->client_mu);
         bool has_client = (ctx->client != NULL);
+        bool negotiating_quality=ctx->quality_pending;
         pthread_mutex_unlock(&ctx->client_mu);
         MdFrame frame;
         int capture_result = md_capture_get_frame(cap, &frame,
                                                   HOST_CAPTURE_FRAME_WAIT_MS);
         MdCaptureRecovery recovery = md_capture_watchdog_step(&watchdog,
-            capture_result, has_client, md_stream_now_ms(),
+            capture_result, has_client || negotiating_quality, md_stream_now_ms(),
             HOST_CAPTURE_STALL_MS, HOST_CAPTURE_MAX_RESTARTS);
         if (capture_result != 0) {
+            pthread_mutex_lock(&ctx->client_mu);
+            bool quality_pending=ctx->quality_pending;
+            pthread_mutex_unlock(&ctx->client_mu);
+            if (capture_result==MD_CAPTURE_IDLE && quality_pending && ctx->cached_frame.data_size)
+                host_encode_frame(ctx,cap,&ctx->cached_frame,false,false);
             if (capture_result == MD_CAPTURE_IDLE && has_client &&
                 ctx->cached_frame.data_size &&
                 atomic_exchange(&ctx->initial_frame_requested, false))
-                host_encode_frame(ctx, cap, &ctx->cached_frame, true);
+                host_encode_frame(ctx, cap, &ctx->cached_frame, true, true);
             if (capture_result == MD_CAPTURE_ERROR)
                 ctx->cached_frame.data_size = 0; /* never replay a broken capture */
             if (recovery != MD_CAPTURE_RECOVERY_NONE) {
@@ -459,9 +614,13 @@ static void *capture_thread_func(void *arg) {
             atomic_store(&ctx->capture_failed, true);
             break;
         }
-        if (has_client) atomic_store(&ctx->initial_frame_requested, false);
-        host_encode_frame(ctx, cap, &ctx->cached_frame, has_client);
+        bool force = has_client && atomic_exchange(&ctx->initial_frame_requested, false);
+        host_encode_frame(ctx, cap, &ctx->cached_frame, has_client, force);
     }
+    pthread_mutex_lock(&ctx->client_mu);
+    ctx->output_pending=false; ctx->quality_pending=false;
+    pthread_cond_broadcast(&ctx->capture_control_cv);
+    pthread_mutex_unlock(&ctx->client_mu);
     return NULL;
 }
 
@@ -499,6 +658,37 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
                                    (uint64_t)md_now_ms()) != 0)
         return -1;
     /* Correlate the answer with exactly the request it grants (md-6ns). */
+    MdCaptureOutputs inventory;
+    bool have_inventory=ctx->capture_required && !md_capture_outputs(&inventory);
+    uint64_t deadline=md_monotonic_ns()+(uint64_t)HOST_CAPTURE_FIRST_FRAME_WAIT_MS*1000000u;
+    pthread_mutex_lock(&ctx->client_mu);
+    while ((ctx->output_pending || ctx->quality_pending) && !atomic_load(&ctx->capture_failed) && host_running()) {
+        if (md_cond_timedwait_until(&ctx->capture_control_cv,&ctx->client_mu,deadline)) {
+            /* Failure watchdog, never successful negotiation by elapsed time.
+             * Fence late work; keep a healthy policy baseline for the next peer. */
+            ctx->control_epoch++; ctx->output_revision++; ctx->quality_revision++;
+            ctx->quality=md_quality_clamp(&(MdQuality){0},&ctx->quality_policy);
+            ctx->quality_pending=ctx->output_pending=false; ctx->quality_error=true;
+            break;
+        }
+    }
+    if (have_inventory) {
+        if (ctx->outputs.selected[0]) strcpy(inventory.selected,ctx->outputs.selected);
+        ctx->outputs=inventory;
+    }
+    acc.outputs=ctx->outputs;
+    acc.outputs.switch_supported &= (ctx->session->capabilities & MD_CAP_MONITOR)!=0;
+    acc.outputs_present=ctx->capture_required;
+    bool selected_ok=(!ctx->pending_req.output[0] || !strcmp(ctx->pending_req.output,ctx->outputs.selected)) &&
+        !ctx->quality_error && !atomic_load(&ctx->capture_failed) && (int64_t)time(NULL)<ctx->pending_req.expires_at;
+    pthread_mutex_unlock(&ctx->client_mu);
+    if (!selected_ok || !host_running() || (owner && !md_account_binding_is_current(owner)) ||
+        (ctx->access && !md_host_access_valid(ctx->access,ctx->pending_req.request_id))) {
+        OPENSSL_cleanse(acc.stream_token,sizeof(acc.stream_token)); return -1;
+    }
+    acc.clipboard_directions=ctx->session->clipboard_directions;
+    acc.quality = ctx->session->quality;
+    acc.quality_present = ctx->session->quality_present;
     memcpy(acc.request_id, ctx->pending_req.request_id, sizeof(acc.request_id));
     memcpy(acc.tls_cert_sha256, ctx->tls_cert_sha256, sizeof(acc.tls_cert_sha256));
     char *json = md_session_accept_to_json(&acc);
@@ -546,6 +736,8 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
     /* Only the published, proven stream can dispatch. Rebinding is always a
      * protocol violation, even on the stream that consumed the token. */
     uint32_t needed = 0;
+    if (hdr->type == MD_PKT_CLIPBOARD) needed=MD_CAP_CLIPBOARD;
+    /* Each control operation checks its own independent capability below. */
     if (hdr->type == MD_PKT_INPUT) needed = MD_CAP_INPUT;
     if (hdr->type == MD_PKT_ACTION) needed = MD_CAP_AGENT | MD_CAP_INPUT;
     if ((ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id)) ||
@@ -557,6 +749,65 @@ static void handle_client_packet(HostCtx *ctx, const MdPacketHeader *hdr,
         return;
     }
     switch (hdr->type) {
+    case MD_PKT_CLIPBOARD:
+        if (md_clipboard_receive(ctx->clipboard,payload,hdr->payload_len)) {
+            fprintf(stderr,"host: clipboard update rejected (direction, size, UTF-8 or platform error)\n");
+            md_stream_close(ctx->client);
+        } else fprintf(stderr,"host: clipboard received (%u bytes)\n",hdr->payload_len);
+        break;
+    case MD_PKT_SESSION_CONTROL: {
+        if (!payload || !hdr->payload_len ||
+            hdr->payload_len > MD_SESSION_JSON_MAX || memchr(payload, 0, hdr->payload_len)) {
+            md_stream_close(ctx->client); break;
+        }
+        char json[MD_SESSION_JSON_MAX + 1];
+        memcpy(json, payload, hdr->payload_len); json[hdr->payload_len] = 0;
+        cJSON *root = md_session_json_strings_safe(json) ? cJSON_ParseWithOpts(json, NULL, true) : NULL;
+        cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+        if (cJSON_IsString(type) && !strcmp(type->valuestring,"monitor")) {
+            cJSON *output=cJSON_GetObjectItemCaseSensitive(root,"output");
+            bool allowed=md_stream_has_capability(ctx->client,MD_CAP_MONITOR) &&
+                cJSON_GetArraySize(root)==2 && cJSON_IsString(output) &&
+                strlen(output->valuestring)<sizeof(ctx->desired_output) &&
+                md_capture_output_id_valid(output->valuestring) && !strstr(json,"\\u0000");
+            bool known=false;
+            for (size_t i=0;allowed && i<ctx->outputs.count;i++)
+                if (!strcmp(output->valuestring,ctx->outputs.items[i].id)) known=true;
+            if (!allowed) md_stream_close(ctx->client);
+            else if (!known || !ctx->outputs.switch_supported) {
+                char *reply=md_session_outputs_json(&ctx->outputs,
+                    "switch unavailable; Linux portal selection requires new local consent");
+                if (reply) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                    (uint8_t*)reply,(uint32_t)strlen(reply))) md_stream_close(ctx->client); free(reply); }
+            } else {
+                strcpy(ctx->desired_output,output->valuestring);
+                ctx->output_revision++; ctx->output_pending=true;
+            }
+            cJSON_Delete(root); break;
+        }
+        MdQuality requested; bool present;
+        if (!ctx->session->quality_present || !md_stream_has_capability(ctx->client,MD_CAP_VIDEO) ||
+            !cJSON_IsObject(root) || cJSON_GetArraySize(root) != 2 ||
+            !cJSON_IsString(type) || strcmp(type->valuestring, "quality") ||
+            md_quality_read(root, &requested, &present) || !present) {
+            cJSON_Delete(root); md_stream_close(ctx->client); break;
+        }
+        MdQuality next=md_quality_clamp(&requested,&ctx->quality_policy);
+        uint32_t w,h;
+        if (ctx->native_width && !md_capture_fit_size(ctx->native_width,ctx->native_height,
+            next.max_width,next.max_height,&w,&h) && ((w&~1u)<2 || (h&~1u)<2)) {
+            char *reply=md_quality_state(&ctx->quality,"resolution cap too small for current output aspect ratio");
+            if (reply) { if (md_stream_send(ctx->client,MD_PKT_SESSION_STATE,ctx->pkt_seq++,
+                (uint8_t*)reply,(uint32_t)strlen(reply))) md_stream_close(ctx->client); free(reply); }
+            cJSON_Delete(root); break;
+        }
+        ctx->quality=next;
+        ctx->quality_revision++;
+        ctx->quality_state_pending = true;
+        host_request_initial_frame(ctx);
+        cJSON_Delete(root);
+        break;
+    }
     case MD_PKT_PING:
         /* Reply with pong */
         md_stream_send(ctx->client, MD_PKT_PONG, ctx->pkt_seq++, NULL, 0);
@@ -694,6 +945,7 @@ static void usage(const char *argv0) {
                     "                   action tools also need their 'input' grant\n");
     fprintf(stderr, "  --mcp-http [PORT] Start MCP HTTP+SSE server (default: 7710)\n");
     fprintf(stderr, "  --mcp-http-bind ADDR  HTTP listen address (default: ::1)\n");
+    fprintf(stderr, "  --clipboard MODE Restrict granted clipboard: off|send|receive|both (default both; grant required)\n");
     fprintf(stderr, "  --no-input       Disable input injection and omit MCP action tools\n");
     fprintf(stderr, "  --input-backend auto|uinput|wayland  Explicit input backend (default: auto)\n");
     fprintf(stderr, "  --input-wayland-display PATH  Absolute private Wayland socket; no ambient display\n");
@@ -867,11 +1119,40 @@ static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
         ctx->pending_client_pk, ctx->pending_req.capabilities);
     if (ctx->access && (!md_host_access_valid(ctx->access, ctx->pending_req.request_id) ||
         (int64_t)time(NULL) >= ctx->pending_req.expires_at)) return -1;
+    if (ctx->pending_req.output[0]) {
+        if (!(granted & MD_CAP_MONITOR)) return -1;
+        MdCaptureOutputs outputs;
+        if (md_capture_outputs(&outputs) || !outputs.switch_supported) return -1;
+        bool known=false;
+        for (size_t i=0;i<outputs.count;i++) if (!strcmp(outputs.items[i].id,ctx->pending_req.output)) known=true;
+        if (!known) return -1;
+    }
+    uint8_t clipboard_directions=ctx->pending_req.clipboard_directions & md_clipboard_reverse(ctx->clipboard_policy);
+    if (!md_clipboard_backend() || !clipboard_directions) granted &= ~MD_CAP_CLIPBOARD;
+    if (!(granted&MD_CAP_CLIPBOARD)) clipboard_directions=0;
     if (no_input) granted &= ~MD_CAP_INPUT;
     if (!granted) return -1;
     if (md_session_request(ctx->session, ctx->pending_client_pk,
             ctx->pending_req.capabilities, ctx->pending_req.tree_format)) return -1;
     int rc = md_session_accept(ctx->session, session_id, granted);
+    if (!rc) {
+        pthread_mutex_lock(&ctx->client_mu);
+        ctx->session->clipboard_directions=clipboard_directions;
+        ctx->control_epoch++;
+        if (ctx->capture_ready && ctx->pending_req.output[0] &&
+            strcmp(ctx->pending_req.output,ctx->outputs.selected)) {
+            strcpy(ctx->desired_output,ctx->pending_req.output);
+            ctx->output_revision++; ctx->output_pending=true;
+        }
+        ctx->quality_error=false;
+        ctx->quality_pending=ctx->capture_ready;
+        ctx->quality_revision++;
+        ctx->quality = md_quality_clamp(&ctx->pending_req.quality, &ctx->quality_policy);
+        ctx->session->quality = ctx->quality;
+        ctx->session->quality_present = ctx->pending_req.quality_present;
+        ctx->quality_state_pending = ctx->pending_req.quality_present;
+        pthread_mutex_unlock(&ctx->client_mu);
+    }
     if (!rc && ctx->access) md_host_access_bound(ctx->access, ctx->pending_req.request_id, session_id, granted);
     return rc;
 }
@@ -911,7 +1192,7 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
     while (host_wait_request(ctx)) {
         if (owner && !md_account_binding_is_current(owner)) return -1;
         if (host_accept_fresh_request(ctx, nostr, no_input) != 0) {
-            host_reject_request(ctx, ctx->pending_req.stream_tls ? "request_refused" : "tls_required");
+            host_reject_request(ctx, ctx->pending_req.output[0] ? "output_unavailable" : ctx->pending_req.stream_tls ? "request_refused" : "tls_required");
             host_rearm_request(ctx);
             continue;
         }
@@ -920,7 +1201,7 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
             return -1;
         }
         if (host_publish_session_accept(ctx, owner) != 0) {
-            host_reject_request(ctx, "request_refused");
+            host_reject_request(ctx, ctx->quality_error ? "quality_unsupported" : "request_refused");
             if (!ctx->access || !host_running() || atomic_load(&ctx->capture_failed) ||
                 (owner && !md_account_binding_is_current(owner))) return -1;
             host_rearm_request(ctx);
@@ -942,7 +1223,10 @@ static bool host_binding_pending(HostCtx *ctx, uint64_t now_ms) {
 static void host_finish_client(HostCtx *ctx, MdStream *client) {
     pthread_mutex_lock(&ctx->client_mu);
     ctx->client = NULL;
+    ctx->control_epoch++;
+    if (ctx->output_pending) { ctx->output_pending=false; pthread_cond_broadcast(&ctx->capture_control_cv); }
     pthread_mutex_unlock(&ctx->client_mu);
+    md_clipboard_destroy(ctx->clipboard); ctx->clipboard=NULL;
     md_stream_destroy(client);
     host_rearm_request(ctx);
 }
@@ -1039,6 +1323,7 @@ static int host_run(int argc, char **argv) {
     const char *mcp_public_urls[32], *mcp_allow_npubs[32];
     size_t mcp_public_url_count = 0, mcp_allow_npub_count = 0;
     bool mcp_allow_host_list = false;
+    uint8_t clipboard_policy=MD_CLIPBOARD_BOTH;
     bool no_input = false;
     bool attended = false;
     const char *management_socket = NULL;
@@ -1173,6 +1458,11 @@ static int host_run(int argc, char **argv) {
             if (backend) input_options.backend = argv[++i];
             else input_options.wayland_display = argv[++i];
         }
+        else if (!strcmp(argv[i],"--clipboard") && i+1<argc) {
+            int d=md_clipboard_directions_parse(argv[++i]);
+            if (d<0) { fprintf(stderr,"ERROR: --clipboard requires off|send|receive|both\n"); return 1; }
+            clipboard_policy=(uint8_t)d;
+        }
         else if (strcmp(argv[i], "--no-input") == 0)
             no_input = true;
         else if (strcmp(argv[i], "--mcp-http-bind") == 0) {
@@ -1294,6 +1584,11 @@ static int host_run(int argc, char **argv) {
 #endif
 
     md_host_lifecycle_event("starting", 0);
+    if (bitrate<MD_ENCODER_MIN_BITRATE || bitrate>MD_ENCODER_MAX_BITRATE ||
+        !fps || fps>MD_QUALITY_MAX_FPS || capture_max_w>MD_QUALITY_MAX_DIMENSION || capture_max_h>MD_QUALITY_MAX_DIMENSION) {
+        fprintf(stderr,"ERROR: host quality policy exceeds capture/encoder limits (bitrate 100000..100000000, fps 1..240, size <=16384)\n");
+        return MD_HOST_EXIT_CONFIG;
+    }
     if (managed && (mcp_stdio || mcp_http || bunker_uri || auto_signer ||
         use_dbus_signer || use_socket_signer)) {
         fprintf(stderr, "ERROR: --managed requires a pre-bound host account, not interactive/auto signer or MCP options\n");
@@ -1443,11 +1738,15 @@ static int host_run(int argc, char **argv) {
         .session     = &session,
         .session_log = session_log,
         .capture_required = do_capture,
+        .quality_policy = {capture_max_w, capture_max_h, bitrate, fps},
         .access = &access,
         .attended = attended,
+        .clipboard_policy=clipboard_policy,
         .supported_caps = MD_HOST_ACCESS_CAPS & (no_input ? ~MD_CAP_INPUT : MD_HOST_ACCESS_CAPS),
     };
+    if (!md_clipboard_backend() || !clipboard_policy) ctx.supported_caps &= ~MD_CAP_CLIPBOARD;
     pthread_mutex_init(&ctx.client_mu, NULL);
+    md_cond_init_monotonic(&ctx.capture_control_cv);
     if (expected_client_pk[0])
         strncpy(ctx.expected_client_pk, expected_client_pk, sizeof(ctx.expected_client_pk) - 1);
 
@@ -1529,7 +1828,7 @@ static int host_run(int argc, char **argv) {
                 }
 
                 if (host_accept_fresh_request(&ctx, nostr, no_input) == 0) break;
-                host_reject_request(&ctx, ctx.pending_req.stream_tls ? "request_refused" : "tls_required");
+                host_reject_request(&ctx, ctx.pending_req.output[0] ? "output_unavailable" : ctx.pending_req.stream_tls ? "request_refused" : "tls_required");
                 host_rearm_request(&ctx);
             }
         } else {
@@ -1547,6 +1846,7 @@ static int host_run(int argc, char **argv) {
     }
     goto signaling_ready;
 signaling_failed:
+    free(ctx.quality_pixels);
     md_host_access_lifecycle(&access, managed, "stopping");
     free(ctx.cached_frame.data);
     md_nostr_stop(nostr);
@@ -1560,6 +1860,7 @@ signaling_failed:
     md_signer_destroy(signer);
     md_account_startup_clear(&account);
     md_host_access_destroy(&access);
+    pthread_cond_destroy(&ctx.capture_control_cv);
     pthread_mutex_destroy(&ctx.client_mu);
     return startup_status;
 signaling_ready:
@@ -1588,6 +1889,7 @@ signaling_ready:
     uint32_t display_height = 0;
 
     if (do_capture) {
+        strcpy(ctx.startup_output,ctx.pending_req.output);
         MdCaptureConfig cap_cfg = {
             .no_interaction = managed,
             .target_fps  = fps,
@@ -1595,7 +1897,7 @@ signaling_ready:
             .unattended = capture_unattended,
             .forget_authorization_on_stall = capture_forget_on_stall,
             .consent_timeout_ms = capture_consent_timeout_ms,
-            .output = capture_output,
+            .output = ctx.startup_output[0] ? ctx.startup_output : capture_output,
             .max_width = capture_max_w,
             .max_height = capture_max_h,
         };
@@ -1614,6 +1916,14 @@ signaling_ready:
             md_stream_server_destroy(srv);
             goto signaling_failed;
         }
+        md_capture_outputs(&ctx.outputs);
+        MdCaptureRect selected_rect={0};
+        if (ctx.pending_req.output[0]) strcpy(ctx.outputs.selected,ctx.pending_req.output);
+        else if (capture_output && !strcmp(capture_output,"all")) strcpy(ctx.outputs.selected,"all");
+        else if (!md_capture_get_output_rect(capture,&selected_rect)) {
+            for (size_t i=0;i<ctx.outputs.count;i++) if (!memcmp(&selected_rect,&ctx.outputs.items[i].rect,sizeof(selected_rect)))
+                strcpy(ctx.outputs.selected,ctx.outputs.items[i].id);
+        }
         printf("host: capture ready (%ux%u, first frame received)\n",
                display_width, display_height);
     }
@@ -1628,13 +1938,17 @@ signaling_ready:
      * NV12/H.264 need even dimensions; a display with an odd edge (e.g. a
      * 1512x909 VM screen) is cropped by one row/column at encode time, while
      * input injection keeps the true display size. */
-    uint32_t enc_width  = display_width  & ~1u;
-    uint32_t enc_height = display_height & ~1u;
+    MdQuality baseline=do_capture ? md_quality_clamp(&(MdQuality){0},&ctx.quality_policy) : ctx.quality;
+    uint32_t quality_w, quality_h;
+    md_capture_fit_size(display_width, display_height, baseline.max_width,
+        baseline.max_height, &quality_w, &quality_h);
+    uint32_t enc_width  = quality_w & ~1u;
+    uint32_t enc_height = quality_h & ~1u;
     MdEncoderConfig enc_cfg = {
         .width        = enc_width,
         .height       = enc_height,
-        .bitrate      = bitrate,
-        .fps          = fps,
+        .bitrate      = baseline.bitrate,
+        .fps          = baseline.fps,
         .prefer_nvenc = use_nvenc,
         .openh264_path = openh264_path,
         .encoder_name = encoder_name,
@@ -1699,6 +2013,10 @@ signaling_ready:
                            &ctx.pkt_seq,
                            display_width, display_height, &output_rect);
 
+    ctx.applied_quality=baseline;
+    ctx.applied_quality_epoch=ctx.control_epoch;
+    ctx.quality_pending=do_capture && memcmp(&baseline,&ctx.quality,sizeof(baseline));
+    if (!ctx.quality_pending) ctx.applied_quality_revision=ctx.quality_revision;
     /* Capture thread starts only after encoder/input are ready. */
     if (capture) {
         cap_thr_ctx.host    = &ctx;
@@ -1716,7 +2034,7 @@ signaling_ready:
     ctx.capture_ready = cap_thread_started;
     if (host_publish_session_accept(&ctx, account.binding) != 0) {
         fprintf(stderr, "ERROR: session acceptance failed or host role revoked\n");
-        host_reject_request(&ctx, ctx.capture_required &&
+        host_reject_request(&ctx, ctx.quality_error ? "quality_unsupported" : ctx.capture_required &&
             (!ctx.capture_ready || atomic_load(&ctx.capture_failed))
             ? "capture_unavailable" : "request_refused");
         if (host_running() && !atomic_load(&ctx.capture_failed) &&
@@ -1787,6 +2105,10 @@ signaling_ready:
          * all host sends with capture so headers/payloads cannot interleave. */
         pthread_mutex_lock(&ctx.client_mu);
         ctx.client     = client;
+        ctx.clipboard=md_clipboard_create(session.capabilities,md_clipboard_reverse(session.clipboard_directions));
+        if ((session.capabilities&MD_CAP_CLIPBOARD) && !ctx.clipboard) {
+            fprintf(stderr,"host: %s\n",md_clipboard_unavailable_reason()); md_stream_close(client);
+        }
         ctx.pkt_seq    = 0;
         host_capture_sync_reset_sequence(&ctx.sync);
         ctx.frames_sent = 0;
@@ -1821,6 +2143,17 @@ signaling_ready:
         while (host_running() && !atomic_load(&ctx.capture_failed) &&
                (!ctx.access || md_host_access_valid(ctx.access, ctx.pending_req.request_id)) &&
                md_stream_is_connected(client)) {
+            char *clipboard_text=NULL; size_t clipboard_size=0;
+            int clipboard_result=md_clipboard_poll(ctx.clipboard,&clipboard_text,&clipboard_size);
+            if (clipboard_result==1) {
+                pthread_mutex_lock(&ctx.client_mu);
+                if ((!ctx.access || md_host_access_valid(ctx.access,ctx.pending_req.request_id)) &&
+                    md_stream_has_capability(client,MD_CAP_CLIPBOARD)) {
+                    if (md_stream_send(client,MD_PKT_CLIPBOARD,ctx.pkt_seq++,(uint8_t*)clipboard_text,(uint32_t)clipboard_size)) md_stream_close(client);
+                    else fprintf(stderr,"host: clipboard sent (%zu bytes)\n",clipboard_size);
+                }
+                pthread_mutex_unlock(&ctx.client_mu); free(clipboard_text);
+            } else if (clipboard_result<0) fprintf(stderr,"host: clipboard read rejected (size, UTF-8 or platform unavailable)\n");
             char *tree = NULL;
             if (initial_tree && md_agent_tree_take(initial_tree, &tree) == 1) {
                 free(md_agent_tree_finish(initial_tree));
@@ -1877,6 +2210,9 @@ signaling_ready:
                     MdStreamStats st;
                     md_stream_get_stats(client, &st);
                     if (st.avg_rtt_ms > 0) {
+                        pthread_mutex_lock(&ctx.client_mu);
+                        md_bitrate_ctrl_set_max(br_ctrl, ctx.quality.bitrate);
+                        pthread_mutex_unlock(&ctx.client_mu);
                         uint32_t new_br = md_bitrate_ctrl_update(
                             br_ctrl, st.avg_rtt_ms, now);
                         if (new_br != last_br) {
@@ -1901,14 +2237,17 @@ signaling_ready:
                 MdStreamStats stats;
                 md_stream_get_stats(client, &stats);
 
+                pthread_mutex_lock(&ctx.client_mu);
+                uint32_t encoded=ctx.frames_encoded, sent=ctx.frames_sent;
                 double avg_encode_ms = ctx.frames_encoded > 0
                     ? (double)ctx.total_encode_us / ctx.frames_encoded / 1000.0
                     : 0.0;
+                pthread_mutex_unlock(&ctx.client_mu);
 
                 printf("host: [#%u] frames=%u sent=%u encode_avg=%.1fms "
                        "rtt=%ums rtt_avg=%ums tx=%.1fMB rx=%.1fKB\n",
                        client_num,
-                       ctx.frames_encoded, ctx.frames_sent,
+                       encoded, sent,
                        avg_encode_ms,
                        stats.last_rtt_ms, stats.avg_rtt_ms,
                        (double)stats.bytes_sent / (1024.0 * 1024.0),
@@ -1927,8 +2266,8 @@ signaling_ready:
         md_bitrate_ctrl_destroy(br_ctrl);
         br_ctrl = NULL;
 
-        /* Restore original bitrate for next connection */
-        host_capture_sync_request_bitrate(&ctx.sync, bitrate);
+        /* The next session's quality revision retunes the persistent encoder.
+         * Never restore a host ceiling over a still-applied client ceiling. */
 
         /* Log disconnection */
         if (session_log) {
@@ -1967,12 +2306,15 @@ signaling_ready:
     atomic_store(&ctx.capture_stopping, true);
 
     if (capture) {
-        md_capture_stop(capture);
-        if (cap_thread_started)
+        if (cap_thread_started) {
             pthread_join(cap_thread, NULL);
+            capture=cap_thr_ctx.capture;
+        }
         md_capture_destroy(capture);
+        free(cap_thr_ctx.owned_output);
     }
 
+    free(ctx.quality_pixels);
     free(ctx.cached_frame.data);
     md_encoder_destroy(encoder);
 
@@ -1999,6 +2341,7 @@ signaling_ready:
     md_account_startup_clear(&account);
 
     md_host_access_destroy(&access);
+    pthread_cond_destroy(&ctx.capture_control_cv);
     pthread_mutex_destroy(&ctx.client_mu);
 
     printf("host: done. served %u client(s)\n", client_num);

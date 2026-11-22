@@ -3,7 +3,7 @@
 #include "session.h"
 #include <pthread.h>
 #define MD_HOST_ACCESS_LIMIT 16
-#define MD_HOST_ACCESS_CAPS (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT)
+#define MD_HOST_ACCESS_CAPS (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | MD_CAP_MONITOR | MD_CAP_CLIPBOARD)
 typedef enum { MD_HOST_PENDING, MD_HOST_REMEMBERING, MD_HOST_APPROVED } MdHostRequestState;
 typedef struct {
     char peer[65];

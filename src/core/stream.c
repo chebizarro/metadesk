@@ -854,7 +854,10 @@ MdStream *md_stream_connect_fips(const char *npub, uint16_t port,
 
 int md_stream_send(MdStream *s, uint8_t type, uint32_t seq,
                    const uint8_t *payload, uint32_t payload_len) {
-    if (!s || !RLX_LOAD(s->connected))
+    if (!s || !RLX_LOAD(s->connected) || (payload_len && !payload) ||
+        payload_len>MD_STREAM_MAX_PAYLOAD ||
+        (type==MD_PKT_CLIPBOARD && payload_len>MD_CLIPBOARD_MAX_UTF8) ||
+        ((type==MD_PKT_SESSION_CONTROL || type==MD_PKT_SESSION_STATE) && payload_len>MD_SESSION_JSON_MAX))
         return -1;
 
     /* Build header */
@@ -904,7 +907,10 @@ int md_stream_recv(MdStream *s, MdPacketHeader *hdr,
         if (ret != 0) goto incomplete;
         if (md_packet_header_read(&s->recv_header, s->recv_header_buf,
                                   sizeof(s->recv_header_buf)) < 0 ||
-            s->recv_header.payload_len > MD_STREAM_MAX_PAYLOAD) {
+            s->recv_header.payload_len > MD_STREAM_MAX_PAYLOAD ||
+            (s->recv_header.type==MD_PKT_CLIPBOARD && s->recv_header.payload_len>MD_CLIPBOARD_MAX_UTF8) ||
+            ((s->recv_header.type==MD_PKT_SESSION_CONTROL || s->recv_header.type==MD_PKT_SESSION_STATE) &&
+             s->recv_header.payload_len>MD_SESSION_JSON_MAX)) {
             ret = -1;
             goto incomplete;
         }
@@ -998,6 +1004,8 @@ int md_stream_accept_binding(MdStream *s, MdSession *session) {
     if (ret != 0) goto reject;
     /* No token in the ACK, and no client-supplied grants are echoed. */
     MdSessionAccept ack = {
+        .clipboard_directions = session->clipboard_directions,
+        .quality = session->quality, .quality_present = session->quality_present,
         .granted = session->capabilities,
         .tree_format = session->tree_format,
     };

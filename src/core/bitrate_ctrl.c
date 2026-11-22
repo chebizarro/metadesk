@@ -75,6 +75,16 @@ static uint32_t clamp(uint32_t val, uint32_t lo, uint32_t hi) {
     return val;
 }
 
+uint32_t md_bitrate_ctrl_set_max(MdBitrateCtrl *c, uint32_t maximum) {
+    if (!c) return 0;
+    maximum = clamp(maximum, MD_ENCODER_MIN_BITRATE, MD_ENCODER_MAX_BITRATE);
+    c->cfg.max_bitrate = maximum;
+    c->cfg.min_bitrate = maximum / 16;
+    if (c->cfg.min_bitrate < MD_ENCODER_MIN_BITRATE) c->cfg.min_bitrate = MD_ENCODER_MIN_BITRATE;
+    c->current_bitrate = clamp(c->current_bitrate, c->cfg.min_bitrate, maximum);
+    return c->current_bitrate;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 MdBitrateCtrl *md_bitrate_ctrl_create(const MdBitrateCtrlConfig *cfg) {

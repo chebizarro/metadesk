@@ -1,5 +1,6 @@
 #pragma once
 #include <gio/gio.h>
+#include "host_access.h"
 #include <cjson/cJSON.h>
 #define MD_TYPE_MANAGER_HOST (md_manager_host_get_type())
 G_DECLARE_FINAL_TYPE(MdManagerHost, md_manager_host, MD, MANAGER_HOST, GObject)

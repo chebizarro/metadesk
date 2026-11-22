@@ -79,7 +79,9 @@ char *md_manager_caps(guint32 bits) {
     if (bits&1) g_string_append(text,"Video, ");
     if (bits&2) g_string_append(text,"Accessibility tree, ");
     if (bits&4) g_string_append(text,"Input, ");
-    if (bits&~7u) g_string_append_printf(text,"Unknown permissions (0x%x), ",bits&~7u);
+    if (bits&MD_CAP_MONITOR) g_string_append(text,"Monitor selection, ");
+    if (bits&MD_CAP_CLIPBOARD) g_string_append(text,"Clipboard, ");
+    if (bits&~MD_HOST_ACCESS_CAPS) g_string_append_printf(text,"Unknown permissions (0x%x), ",bits&~MD_HOST_ACCESS_CAPS);
     if (text->len) g_string_truncate(text,text->len-2); else g_string_append(text,"None");
     return g_string_free(text,FALSE);
 }

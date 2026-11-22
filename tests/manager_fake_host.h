@@ -17,10 +17,10 @@ typedef struct {
     gboolean wrong_version, hold, unknown_caps;
 } ManagerFakeHost;
 static cJSON *fake_snapshot(guint revision,gboolean pending) {
-    cJSON *j=cJSON_Parse("{\"v\":1,\"ok\":true,\"generation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":1,\"supported\":3,\"requests\":[],\"session\":null}");
+    cJSON *j=cJSON_Parse("{\"v\":1,\"ok\":true,\"generation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":1,\"supported\":27,\"requests\":[],\"session\":null}");
     cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"revision"),revision);
     if (pending) {
-        cJSON *q=cJSON_Parse("{\"request_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"peer\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"requested\":15,\"granted\":0,\"expires_at\":0,\"state\":\"pending\"}");
+        cJSON *q=cJSON_Parse("{\"request_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"peer\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"requested\":63,\"granted\":0,\"expires_at\":0,\"state\":\"pending\"}");
         cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(q,"expires_at"),(double)time(NULL)+120);
         cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(j,"requests"),q);
     }
@@ -53,8 +53,8 @@ static void fake_line(GObject *source,GAsyncResult *result,gpointer data) {
         if (!strcmp(md_manager_json_string(j,"method"),"access.list")) {
             cJSON_AddBoolToObject(reply,"policy_available",TRUE); cJSON_AddNumberToObject(reply,"policy_version",8);
             cJSON *clients=cJSON_AddArrayToObject(reply,"clients");
-            cJSON_AddItemToArray(clients,cJSON_Parse("{\"peer\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"caps\":\"video,agent\",\"review_required\":false}"));
-            if (fake->unknown_caps) cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(clients,0),"caps"),"video,clipboard");
+            cJSON_AddItemToArray(clients,cJSON_Parse("{\"peer\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"caps\":\"video,agent,monitor,clipboard\",\"review_required\":false}"));
+            if (fake->unknown_caps) cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(clients,0),"caps"),"video,unknown_future_cap");
         }
         if (!fake->hold) MD_CHECK(fake_write(connection,reply));
         cJSON_Delete(reply);

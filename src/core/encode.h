@@ -116,6 +116,10 @@ void md_encoder_force_keyframe(MdEncoder *enc);
  * (also for an unchanged size), or -1 with the encoder left as it was.
  * Same threading rule as md_encoder_submit. */
 int md_encoder_resize(MdEncoder *enc, uint32_t width, uint32_t height);
+/* Capture owner only: atomically open all negotiated settings before replacing
+ * the old codec. Failure leaves it intact; success discards queued old frames. */
+int md_encoder_set_quality(MdEncoder *enc, uint32_t width, uint32_t height,
+                            uint32_t fps, uint32_t bitrate);
 
 /* Selected backend name (e.g. h264_videotoolbox, h264_mf, openh264). Borrowed static string; NULL for a NULL encoder. */
 const char *md_encoder_get_name(const MdEncoder *enc);
