@@ -2,8 +2,9 @@
 
 This is an attended acceptance procedure, not an unattended input bot. The
 [owning matrix](e2e-matrix.md) includes all **32** host/client/transport combinations,
-including same-platform pairs. [L7's first run](results/2026-11-21-l7.md) records
-prerequisite blockers and component results, **not successful pairing runs**.
+including same-platform pairs. [L7's results](results/2026-11-21-l7.md) retain
+Round 1 blockers and Round 2 native streaming/failures. Neither partial streaming
+nor component results are complete pairing acceptance.
 
 ## Safety and reproducibility
 
@@ -19,7 +20,7 @@ prerequisite blockers and component results, **not successful pairing runs**.
   relay. A bunker URI contains a secret: do not commit it or raw argv/logs containing
   it; restrict credential files to 0600 and fixture directories to 0700.
 - The host signer identity must equal the FIPS daemon identity. Save the host role
-  and grant only the test client's required capabilities (`video,input,agent` for
+  and grant only the test client's required capabilities (`video,agent,input` for
   the complete matrix); verify membership/scope by reading the allowlist back.
   Keep an unlisted signer for negative checks. Never bypass authorization to make
   direct IP work.
@@ -60,7 +61,7 @@ No screenshot is retained. The negative host check uses loopback relay port 9,
 no signer, no capture and no input. Its expected exit 1 is a security PASS, **not
 successful direct-IP streaming**. Test timeouts kill/reap the owned process group.
 The current probe is Unix-only. The default suite leaves live subchecks gated;
-42 passing test programs do not mean all live subchecks ran.
+Passing default test programs do not mean all live subchecks ran.
 
 Windows: copy the worktree's `src`, `tests`, `tools`, `imgui_vendor`, `meson.build`
 and `meson_options.txt` into a **new** `$env:USERPROFILE\md-l7` directory, plus a
@@ -115,7 +116,7 @@ PowerShell 5.1 shell redirection can emit UTF-16 while Set-Content/native
 forwarding uses other encodings; detect the BOM when collecting and normalize
 local receipts to UTF-8 if needed. Do not commit raw receipts.
 
-Linux: **ask the VM owner whether lane L3b is finished first**. Only then copy
+Linux: **obtain the VM owner's explicit availability confirmation first**. Only then copy
 into `~/md-l7`, set `NOSTRC_ROOT` and `NOSTRC_BUILD_DIR` to the approved read-only
 dedicated source/build trees, and use `-j2` on this 3 GB VM. Never modify `~/nostrc`,
 `~/nostrc-master`, or `~/metadesk`. Enable only the current session's display,
@@ -130,12 +131,25 @@ not Omarchy. With no machine, record NOT_RUN; no VM creation is required.
 
 ## Pairing launch gate
 
-**Direct IP is currently blocked by md-p4tl.** `metadesk-client HOST` connects
-without Nostr negotiation/session proof, whereas the host requires negotiated
-authorization. `--bunker` alone does not fix that branch. Do not publish a
-fictional working direct-IP recipe: after md-p4tl lands, run its identity-pinned
-negotiation/endpoint-selection recipe over native IPv4 and IPv6, verify no TUN
-route, and record the exact command. The current refusal is reproduced by `probe`.
+**Authenticated direct IP (md-p4tl, merged):** provision the private signer,
+host-role account and signed allowlist first; see [accounts](../accounts.md) and
+[client CLI](../../src/client/README.md). Each process uses its endpoint's private
+HOME/XDG config/state. A transport address alone is not an authenticated identity.
+
+```sh
+# Run host/client on their respective machines. Variables contain public IDs,
+# private signer socket paths, and a controlled relay URL, never secret keys.
+build/metadesk-host --bind "$HOST_IP" --port "$PORT" \
+  --relay "$PRIVATE_RELAY" --socket-signer "$HOST_SIGNER" \
+  --no-input --no-nvenc --fps 10 --capture-max-size 1280x720
+build/metadesk-client --host "$HOST_IP" --npub "$HOST_NPUB" --port "$PORT" \
+  --relay "$PRIVATE_RELAY" --socket-signer "$CLIENT_SIGNER" --timeout 10000
+```
+
+The client negotiates with the pinned npub, proves the one-use token on native
+TCP and waits for ACK. Verify correlated request/session IDs, history rejection,
+the actual IPv4/IPv6 endpoint and no TUN. Run an unlisted signer negative first;
+never bypass authorization. Round 2 exercised IPv4 only, not IPv6.
 
 FIPS commands below are the **planned attended procedure**, not commands exercised
 by this run. First provision two real daemons using task-private identities,
@@ -166,6 +180,103 @@ owned-window HUMAN/AGENT checks. On live GNOME leave input disabled until the sa
 portal path is demonstrated. GUI and `--no-display` are separate runs; displayed=0
 in decode-only mode is not GUI success. Record x264 separately from hardware
 encoding; then repeat with hardware selection if available.
+
+## Native observation helpers (Round 2)
+
+These helpers generate ignored receipts, not automatic E2E verdicts. Run their
+non-desktop tests with `python3 tools/e2e/test_observe.py -v` and
+`python3 tools/e2e/test_mcp_probe.py -v` in addition to `test_matrix.py`.
+
+Private NIP-5F setup, on each endpoint, using the existing cryptographic fixture:
+
+```sh
+umask 077
+# Short, resolved path avoids Unix-domain socket path-length limits.
+R=$(python3 -c 'import tempfile,os; print(os.path.realpath(tempfile.mkdtemp(prefix="md-l7-")))')
+mkdir "$R/self" "$R/home"
+python3 deploy/containers/reference/mesh-peer.py --generate-key "$R/self.key"
+python3 deploy/containers/reference/mesh-peer.py --identity "$R/self.key" > "$R/identity.json"
+cc -O2 -Wall -o build/nip5f-crypto deploy/containers/reference/nip5f-crypto.c \
+  -Isrc/core $(pkg-config --cflags --libs libcjson) -Lbuild -lmetadesk \
+  -Wl,-rpath,"$PWD/build"
+python3 -u -B deploy/containers/reference/client-fixture.py --tests tests \
+  --crypto "$PWD/build/nip5f-crypto" --relay "$RELAY_BIND" --sockets "$R" \
+  --signer "self=$R/self.key"
+```
+
+Wait for `fixture ready`. One endpoint binds the controlled LAN relay; the other
+may bind an unused loopback relay for its signer, while all product commands
+explicitly select the first endpoint's `PRIVATE_RELAY`. **Omit `--control`: this
+is only relay/signer plumbing, never evidence of a FIPS mesh.** Record the Python
+PID and stop/reap it during cleanup. Repeat with a separate unlisted identity for
+negative authorization checks. Keep keys, token files and raw trees untracked.
+
+In a separate terminal set endpoint-specific public IDs and isolated account env:
+
+```sh
+export HOME="$R/home" XDG_CONFIG_HOME="$R/home/.config" XDG_STATE_HOME="$R/home/.local/state"
+export NOSTR_SIGNER_SOCK="$R/self/signer.sock"
+# SELF_HEX comes from identity.json; PEER_NPUB is the other endpoint's public ID.
+build/metadesk-host account add nip5f "$SELF_HEX" 'L7 throwaway'
+build/metadesk-host account bind-role host nip5f "$SELF_HEX"
+build/metadesk-host access --relay "$PRIVATE_RELAY" add "$PEER_NPUB" video,agent
+build/metadesk-host access --relay "$PRIVATE_RELAY" list
+```
+
+Use the current real session's `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and
+`WAYLAND_DISPLAY` on GNOME; do not manufacture another bus. Set input capability
+only where the owned-fixture safety preconditions are satisfied; capability
+grants do not override `--no-input`. Account commands use no relay; all access
+commands above do. Pass the same socket explicitly to native host/client launches.
+
+Timestamp any native launch without exposing secret argv:
+
+```sh
+python3 tools/e2e/observe.py --name host-unique-run --pid-file "$R/host.pid" \
+  --deadline 600 -- build/metadesk-host --bind "$HOST_IP" --port "$PORT" \
+  --relay "$PRIVATE_RELAY" --socket-signer "$HOST_SIGNER" --no-input --no-nvenc
+# Another terminal: signal the runner PID (not an arbitrary process-name match).
+kill -TERM "$(cat "$R/host.pid")"
+```
+
+Choose a unique receipt name and an unused PID file for each invocation. The
+runner rejects both collisions; it timestamps lines/spawn/exit, forwards stop to
+its owned group and reaps descendants. Deadline/forced termination returns 124;
+signal termination is normalized to 128+signal. These are failure/safety outcomes,
+not capture readiness or successful teardown. A setup run without any client may
+hit the host's initial admission timeout; label it setup, not a video sample.
+
+Owned fixture windows:
+
+```sh
+clang tools/e2e/macos-fixture.m -fobjc-arc -Wall -Wextra -Werror \
+  -framework Cocoa -o build/macos-fixture
+build/macos-fixture
+# GNOME: only this owned process loads the accessibility bridge.
+GTK_MODULES=atk-bridge python3 tools/e2e/gnome-fixture.py
+# Synthetic owned solid frame, native SDL/Metal readback; no desktop pixels.
+build/render_probe
+```
+
+`render_probe` builds with client support and `-Dtools=true`; resize/readback
+checks and pure `test_video_geometry` do not establish live remote input mapping.
+The animated fixture timer only generates damage; it is not relay polling.
+
+For a separately configured bearer MCP endpoint, run `mcp-target.py --url URL
+--token FILE --window EXACT_OWNED_TITLE --button EXACT_OWNED_LABEL`. Its default
+checks unauthorized 401, initialize/initialized/tools, a unique owned tree/button,
+and input-disabled rejection. This is supplemental MCP HTTP evidence, **not** the
+binary stream's MCP/session integration. It rejects redirects and optimized Python
+does not disable safety checks. **md-ixkl:** an action may hit an occluding window;
+`--click` is only for the macOS fixture's `--occlusion-test` (both receivers owned),
+never an operator window. Stop ordinary input tests on target mismatch.
+
+GNOME consent: use an attended chooser, stop and ask for a human click when needed.
+Do not repeatedly ask while a response is pending. Record the private token file's
+mode/length, never its contents. Restore is not guaranteed: locked/inhibited
+sessions may fall back to a chooser or reject creation. Read-only session/journal
+checks are appropriate; never unlock, replace services or restart the bus to turn
+a failure green. A token file is not proof of unattended first-frame restoration.
 
 ## Per-cell attended checks and recording
 

@@ -7,8 +7,9 @@ tests were run for that documentation task. Container client cells were added by
 `66c1886` plus their fix, and md-cdz/md-rnc against `85af248` plus theirs. This
 is the owning matrix. L7 now supplies a [native runbook](e2e-runbook.md),
 [receipt harness](../../tools/e2e/matrix.py), and
-[2026-11-21 results](results/2026-11-21-l7.md) at product commit
-`3f66fcc46a0dcc1b56931f8803aee813f9bf09cc`. No general pairing passed.
+[2026-11-21 results](results/2026-11-21-l7.md). Round 1 tested `3f66fcc`;
+Round 2 tested `d9fbdfe817114337b6710727f1a81f284606e62b` and local fixes
+`e07e03f` on real macOS ↔ GNOME. No general pairing passed.
 
 ## Status and counting
 
@@ -25,9 +26,9 @@ checks, not full E2E passes. Counts exclude the checklist and summary tables.
 
 | Scope | PASS | FAIL | not yet run | pending | BLOCKED | N/A | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| General host/client pairings | 0 | 0 | 28 | 0 | 4 | 0 | 32 |
+| General host/client pairings | 0 | 2 | 24 | 0 | 6 | 0 | 32 |
 | Containers (historical receipts below) | 93 | 4 | 4 | 5 | 0 | 1 | 107 |
-| Total | 93 | 4 | 32 | 5 | 4 | 1 | 139 |
+| Total | 93 | 6 | 28 | 5 | 6 | 1 | 139 |
 
 ## General roles × platforms × transports
 
@@ -41,8 +42,8 @@ promoted to PASS. Container component checks below do not qualify these cells.
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
 | Windows | not yet run | not yet run | BLOCKED: md-z9pd | not yet run |
-| GNOME/Linux | not yet run | not yet run | not yet run | not yet run |
-| macOS | BLOCKED: md-z9pd, md-p4tl | not yet run | not yet run | not yet run |
+| GNOME/Linux | not yet run | not yet run | FAIL: streamed; md-a4ne, md-2pi2, md-op7n, md-r65z | not yet run |
+| macOS | BLOCKED: md-z9pd | FAIL: streamed; md-ixkl, md-rbyb, md-k3jg | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
 
 ### FIPS mesh (npub, NIP-44 session negotiation, TCP over FIPS TUN)
@@ -50,18 +51,19 @@ promoted to PASS. Container component checks below do not qualify these cells.
 | Host / Client | Windows | GNOME/Linux | macOS | Omarchy (Hyprland/Wayland Linux) |
 |---|---|---|---|---|
 | Windows | not yet run | not yet run | BLOCKED: md-z9pd, md-m1we | not yet run |
-| GNOME/Linux | not yet run | not yet run | not yet run | not yet run |
-| macOS | BLOCKED: md-z9pd, md-m1we | not yet run | not yet run | not yet run |
+| GNOME/Linux | not yet run | not yet run | BLOCKED: native mesh provisioning | not yet run |
+| macOS | BLOCKED: md-z9pd, md-m1we | BLOCKED: native mesh provisioning | not yet run | not yet run |
 | Omarchy (Hyprland/Wayland Linux) | not yet run | not yet run | not yet run | not yet run |
 
-The four BLOCKED entries are the prioritized macOS↔Windows attempts in both
-transports, not failed video sessions. Native component passes do not qualify
-any of the ten per-cell checks end-to-end. See the dated results for per-check
-NOT_RUN/BLOCKED status, exact evidence and cleanup. All Linux entries await VM
-owner approval; all Omarchy entries lack hardware. Other pairings are unattempted,
-even where the same prerequisite would block them. Direct-IP authorization
-is unavailable in the current CLI (md-p4tl); Windows FIPS control is explicitly
-unsupported (md-m1we). These are not bypassed by the harness.
+Four BLOCKED entries retain Round 1 Windows prerequisites; no Windows access
+occurred in Round 2. Both macOS↔GNOME IP directions genuinely negotiated and
+streamed, but observed failures and unperformed input/permission checks prevent
+acceptance. The two corresponding FIPS attempts are BLOCKED: no provisioned
+daemons and unprivileged macOS utun creation was denied. Other Linux pairings
+remain unattempted; Omarchy lacks hardware. See the dated results for all ten
+checks, measured values, local fixes and cleanup. md-p4tl is merged: direct IP
+now negotiates with an explicit pinned host identity. Windows mesh control
+remains md-m1we; neither native transport is replaced by a control fixture.
 
 General platform runs remain md-5zi work. Container FIPS cells are pending
 **md-ah9.5**; its results doc is **to be added by md-ah9.5**. Future container
@@ -93,8 +95,8 @@ Record pass/fail and notes for each check, not just connection success:
    establish control readiness and the route before connecting. Record actual
    launch commands and endpoint/identities without secrets. Use the
    [native runbook](e2e-runbook.md) and dated receipts; its planned mesh launch
-   procedure is clearly separated from exercised native commands. There is no
-   working authenticated direct-IP recipe until md-p4tl is fixed.
+   procedure is clearly separated from exercised native commands. Authenticated
+   direct IP uses `--host ADDRESS --npub HOST_NPUB --port PORT --relay URL`.
 3. Connect and execute every check above, including authorization negatives,
    reconnect/restore and teardown. Observe events/state, not arbitrary sleeps.
 4. Attach dated results, exact commands/versions, per-check observations,
@@ -104,9 +106,11 @@ Record pass/fail and notes for each check, not just connection success:
    introduce a competing harness.
 
 Known-flaky areas: **GNOME screencast restore (md-3nv)** must be exercised,
-not inferred from a saved token. **md-atg remains OPEN**: cleared-state and
-same-context reopen can reject invalid backend allocations and deliver zero
-frames. Later passes do not erase these failures.
+not inferred from a saved token. md-3nv/md-atg fixes and the PipeWire 1.4.10
+reference pin are merged at `d9fbdfe`; historical container failures below are
+not requalified by that merge. Round 2's live VM still runs PipeWire 1.0.5;
+a locked desktop inhibited restore, followed by portal-backend SEGV (md-8gzk)
+and incorrect zero-video admission (md-r65z). Later passes do not erase failures.
 
 ## Containers
 
