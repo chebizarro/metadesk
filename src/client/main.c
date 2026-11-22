@@ -155,6 +155,7 @@ typedef struct {
     MdSessionRequest pending_req;     /* current request (g_negotiation_mu) */
     int           request_pending;    /* accepting an answer to pending_req */
     char          accepted_session_id[64]; /* from session_accept DM     */
+    char          tls_cert_sha256[65]; /* authenticated DM pin, never an address-derived identity */
     char          stream_token[65];       /* ephemeral DM-only proof    */
     atomic_uint   granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
@@ -262,7 +263,13 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
     bool matched = ctx->request_pending && !ctx->session_accepted &&
         md_session_accept_matches_request(&acc, &ctx->pending_req,
                                           info->rumor_created_at);
-    if (matched) {
+    if (matched && !acc.tls_cert_sha256[0]) {
+        ctx->session_accepted = -1;
+        ctx->request_pending = 0;
+        ctx->connection_status = "host lacks pinned TLS 1.3; upgrade host (no plaintext fallback)";
+        OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
+    } else if (matched) {
+        memcpy(ctx->tls_cert_sha256, acc.tls_cert_sha256, sizeof(ctx->tls_cert_sha256));
         memcpy(ctx->stream_token, acc.stream_token, sizeof(ctx->stream_token));
         snprintf(ctx->accepted_session_id, sizeof(ctx->accepted_session_id),
                  "%s", acc.session_id);
@@ -377,6 +384,7 @@ static void reset_session_accept_state(ClientCtx *ctx) {
     if (!ctx) return;
     ctx->request_pending = 0;
     memset(&ctx->pending_req, 0, sizeof(ctx->pending_req));
+    ctx->tls_cert_sha256[0] = '\0';
     ctx->accepted_session_id[0] = '\0';
     OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
     ctx->granted_caps = 0;
@@ -676,6 +684,11 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
                           timeout_ms, &req) != 0 || !client_owner_current(ctx))
         return NULL;
 
+    if (!ctx->tls_cert_sha256[0]) {
+        fprintf(stderr, "ERROR: pinned TLS 1.3 required; host acceptance has no certificate pin; upgrade host\n");
+        OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
+        return NULL;
+    }
     ctx->phase = MD_CLIENT_CONNECTING;
     if (host) {
         printf("client: connecting to %s:%u...\n", host, port);
@@ -687,6 +700,13 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     }
     if (!stream) {
         fprintf(stderr, "ERROR: %s connect failed\n", host ? "direct TCP" : "FIPS");
+        return NULL;
+    }
+    MdStreamTlsConfig tls = { .enabled = true, .cert_sha256 = ctx->tls_cert_sha256 };
+    if (md_stream_start_tls(stream, timeout_ms, &tls) != 0) {
+        fprintf(stderr, "ERROR: pinned TLS 1.3 failed; no token sent, no plaintext fallback\n");
+        OPENSSL_cleanse(ctx->stream_token, sizeof(ctx->stream_token));
+        md_stream_destroy(stream);
         return NULL;
     }
     ctx->phase = MD_CLIENT_BINDING;

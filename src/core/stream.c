@@ -465,6 +465,43 @@ static SSL_CTX *tls_client_ctx(bool verify_peer) {
     return ctx;
 }
 
+static int cert_fingerprint(X509 *cert, char out[65]) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (!cert || X509_digest(cert, EVP_sha256(), digest, &len) != 1 || len != 32)
+        return -1;
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned int i = 0; i < len; i++) {
+        out[2 * i] = hex[digest[i] >> 4];
+        out[2 * i + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
+    return 0;
+}
+
+/* Candidates are not published to another I/O owner until this finishes.
+ * Nonblocking handshake + absolute deadline also bounds silent/slow peers. */
+static int tls_handshake(SSL *ssl, MdSocket fd, bool server, uint32_t timeout_ms) {
+    if (set_nonblocking(fd) != 0) return -1;
+    uint64_t deadline = md_monotonic_ns() / 1000000u +
+        (timeout_ms ? timeout_ms : MD_SESSION_BIND_TIMEOUT_MS);
+    for (;;) {
+        ERR_clear_error();
+        int rc = server ? SSL_accept(ssl) : SSL_connect(ssl);
+        if (rc == 1) return 0;
+        int err = SSL_get_error(ssl, rc);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) return -1;
+        uint64_t now = md_monotonic_ns() / 1000000u;
+        if (now >= deadline) return -1;
+        uint64_t left = deadline - now;
+        MdPollFd pfd = { .fd = fd,
+            .events = err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT };
+        int ready = md_socket_poll(&pfd, 1, left > INT_MAX ? INT_MAX : (int)left);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return -1;
+    }
+}
+
 /* ── Server API ──────────────────────────────────────────────── */
 
 MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port) {
@@ -586,7 +623,7 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
             return NULL;
         }
         int ssl_fd = ssl_socket_fd(client_fd);
-        if (ssl_fd < 0 || SSL_set_fd(ssl, ssl_fd) != 1 || SSL_accept(ssl) != 1 || set_nonblocking(client_fd) != 0) {
+        if (ssl_fd < 0 || SSL_set_fd(ssl, ssl_fd) != 1 || tls_handshake(ssl, client_fd, true, timeout_ms) != 0) {
             MD_LOG_E("TLS handshake failed for %s", addr_str);
             SSL_free(ssl);
             md_socket_close(client_fd);
@@ -596,6 +633,13 @@ MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms) {
     }
 
     return stream_from_fd(client_fd, ssl);
+}
+
+int md_stream_server_tls_fingerprint(const MdStreamServer *srv, char out[65]) {
+    if (!out) return -1;
+    out[0] = '\0';
+    return srv && srv->ssl_ctx
+        ? cert_fingerprint(SSL_CTX_get0_certificate(srv->ssl_ctx), out) : -1;
 }
 
 uint16_t md_stream_server_port(const MdStreamServer *srv) {
@@ -702,6 +746,9 @@ MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms
     return stream_from_fd(fd, NULL);
 }
 
+static int stream_start_tls(MdStream *s, const char *host, uint32_t timeout_ms,
+                            const MdStreamTlsConfig *tls);
+
 MdStream *md_stream_connect_tls(const char *host, uint16_t port,
                                 uint32_t timeout_ms,
                                 const MdStreamTlsConfig *tls) {
@@ -712,43 +759,73 @@ MdStream *md_stream_connect_tls(const char *host, uint16_t port,
     if (!tls || !tls->enabled)
         return s;
 
+    if (stream_start_tls(s, host, timeout_ms, tls) != 0) {
+        md_stream_destroy(s);
+        return NULL;
+    }
+    return s;
+}
+
+int md_stream_start_tls(MdStream *s, uint32_t timeout_ms, const MdStreamTlsConfig *tls) {
+    return stream_start_tls(s, NULL, timeout_ms, tls);
+}
+
+static int stream_start_tls(MdStream *s, const char *host, uint32_t timeout_ms,
+                            const MdStreamTlsConfig *tls) {
+    if (!s || s->ssl || !tls || !tls->enabled || !md_stream_is_connected(s)) return -1;
+    if (tls->cert_sha256 && (strlen(tls->cert_sha256) != 64 ||
+        strspn(tls->cert_sha256, "0123456789abcdef") != 64)) {
+        md_stream_close(s);
+        return -1;
+    }
+    if (tls->verify_peer && !host) { md_stream_close(s); return -1; }
     /* Set up client TLS context */
     SSL_CTX *ctx = tls_client_ctx(tls->verify_peer);
     if (!ctx) {
-        md_stream_destroy(s);
-        return NULL;
+        md_stream_close(s);
+        return -1;
     }
 
     SSL *ssl = SSL_new(ctx);
     SSL_CTX_free(ctx); /* SSL retains a ref; ctx can be freed */
     if (!ssl) {
-        md_stream_destroy(s);
-        return NULL;
+        md_stream_close(s);
+        return -1;
     }
 
     int ssl_fd = ssl_socket_fd(s->fd);
     if (ssl_fd < 0 || SSL_set_fd(ssl, ssl_fd) != 1) {
         SSL_free(ssl);
-        md_stream_destroy(s);
-        return NULL;
+        md_stream_close(s);
+        return -1;
     }
-    /* SNI for name-based virtual hosting */
-    SSL_set_tlsext_host_name(ssl, host);
-    /* Verify the certificate matches the host we dialed (SNI alone
-     * does no verification) */
-    if (tls->verify_peer)
-        SSL_set1_host(ssl, host);
 
-    if (SSL_connect(ssl) != 1 || set_nonblocking(s->fd) != 0) {
-        MD_LOG_E("TLS handshake failed connecting to %s:%u", host, port);
+    if (host) SSL_set_tlsext_host_name(ssl, host);
+    if (tls->verify_peer && SSL_set1_host(ssl, host) != 1) {
+        SSL_free(ssl); md_stream_close(s); return -1;
+    }
+    if (tls_handshake(ssl, s->fd, false, timeout_ms) != 0) {
+        MD_LOG_E("TLS 1.3 handshake failed (no plaintext fallback)");
         SSL_free(ssl);
-        md_stream_destroy(s);
-        return NULL;
+        md_stream_close(s);
+        return -1;
     }
 
+    if (tls->cert_sha256) {
+        char actual[65];
+        X509 *cert = SSL_get1_peer_certificate(ssl);
+        int rc = cert_fingerprint(cert, actual);
+        X509_free(cert);
+        if (rc != 0 || CRYPTO_memcmp(actual, tls->cert_sha256, 64) != 0) {
+            MD_LOG_E("TLS certificate pin mismatch; refusing stream (no token sent)");
+            SSL_free(ssl);
+            md_stream_close(s);
+            return -1;
+        }
+    }
     s->ssl = ssl;
     MD_LOG_I("TLS connected (%s)", SSL_get_version(ssl));
-    return s;
+    return 0;
 }
 
 /* ── FIPS-aware connect ──────────────────────────────────────── */

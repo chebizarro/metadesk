@@ -295,10 +295,35 @@ done:
     md_stream_server_destroy(server);
 }
 
+static void test_tls_acceptance_gate(void) {
+    for (unsigned supported = 0; supported < 2; supported++) {
+        ClientCtx ctx = {0};
+        snprintf(ctx.expected_host_pk, sizeof(ctx.expected_host_pk), "%s", host_pk);
+        MD_CHECK(md_session_request_prepare(&ctx.pending_req, time(NULL), 30) == 0);
+        ctx.pending_req.capabilities = MD_CAP_VIDEO;
+        ctx.request_pending = 1;
+        MdSessionAccept acc = {.session_id = "tls-session", .granted = MD_CAP_VIDEO};
+        memcpy(acc.request_id, ctx.pending_req.request_id, sizeof(acc.request_id));
+        memset(acc.stream_token, 'a', 64);
+        if (supported) memset(acc.tls_cert_sha256, 'b', 64);
+        char *json = md_session_accept_to_json(&acc);
+        MdNostrDmInfo info = {.live = true, .rumor_created_at = ctx.pending_req.issued_at};
+        on_session_dm(host_pk, json, &info, &ctx);
+        MD_CHECK(ctx.session_accepted == (supported ? 1 : -1));
+        MD_CHECK(!ctx.request_pending);
+        if (supported) MD_CHECK(!strcmp(ctx.tls_cert_sha256, acc.tls_cert_sha256));
+        else MD_CHECK(!ctx.stream_token[0] && strstr(ctx.connection_status, "TLS 1.3"));
+        free(json);
+        reset_session_accept_state(&ctx);
+        MD_CHECK(!ctx.tls_cert_sha256[0] && !ctx.stream_token[0]);
+    }
+}
+
 int main(void) {
+    test_tls_acceptance_gate();
     test_input_grants();
-    const char *reasons[] = {"capture_unavailable", "request_refused"};
-    for (unsigned i = 0; i < 2; i++) {
+    const char *reasons[] = {"capture_unavailable", "request_refused", "tls_required"};
+    for (unsigned i = 0; i < sizeof(reasons) / sizeof(reasons[0]); i++) {
         ClientCtx ctx = {0};
         snprintf(ctx.expected_host_pk, sizeof(ctx.expected_host_pk), "%s", host_pk);
         ctx.session_ch = go_channel_create(1);

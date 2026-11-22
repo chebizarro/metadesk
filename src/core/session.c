@@ -285,6 +285,7 @@ int md_session_request_prepare(MdSessionRequest *req, int64_t now_unix,
         req->request_id[i * 2 + 1] = hex[random[i] & 15];
     }
     req->request_id[MD_SESSION_REQUEST_ID_LEN] = '\0';
+    req->stream_tls = true;
     req->issued_at = now_unix;
     req->expires_at = now_unix + (int64_t)lifetime_s;
     return 0;
@@ -342,6 +343,8 @@ char *md_session_request_to_json(const MdSessionRequest *req) {
 
     cJSON *caps_arr = NULL;
     char *json = NULL;
+    if (req->stream_tls && !cJSON_AddStringToObject(root, "stream_tls", "tls13-sha256"))
+        goto fail;
 
     if (!cJSON_AddStringToObject(root, "type", "session_request") ||
         !cJSON_AddNumberToObject(root, "v", 1))
@@ -412,6 +415,13 @@ int md_session_request_from_json(const char *json, MdSessionRequest *out) {
         return -1;
     }
 
+    cJSON *tls = cJSON_GetObjectItemCaseSensitive(root, "stream_tls");
+    if (tls && (!cJSON_IsString(tls) || strcmp(tls->valuestring, "tls13-sha256"))) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    out->stream_tls = tls != NULL;
+
     /* capabilities */
     cJSON *caps = cJSON_GetObjectItem(root, "capabilities");
     if (parse_capability_array(caps, &out->capabilities) < 0) {
@@ -460,6 +470,10 @@ char *md_session_accept_to_json(const MdSessionAccept *acc) {
 
     if (acc->stream_token[0] &&
         !cJSON_AddStringToObject(root, "stream_token", acc->stream_token))
+        goto fail;
+
+    if (acc->tls_cert_sha256[0] &&
+        !cJSON_AddStringToObject(root, "tls_cert_sha256", acc->tls_cert_sha256))
         goto fail;
 
     /* granted array */
@@ -535,6 +549,16 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
         memcpy(out->stream_token, token->valuestring, 65);
     }
 
+    cJSON *pin = cJSON_GetObjectItemCaseSensitive(root, "tls_cert_sha256");
+    if (pin) {
+        if (!cJSON_IsString(pin) || strlen(pin->valuestring) != 64 ||
+            strspn(pin->valuestring, "0123456789abcdef") != 64) {
+            cJSON_Delete(root);
+            return -1;
+        }
+        memcpy(out->tls_cert_sha256, pin->valuestring, 65);
+    }
+
     /* granted */
     cJSON *granted = cJSON_GetObjectItem(root, "granted");
     if (parse_capability_array(granted, &out->granted) < 0) {
@@ -550,6 +574,8 @@ int md_session_accept_from_json(const char *json, MdSessionAccept *out) {
 
 const char *md_session_reject_message(const MdSessionReject *reject) {
     if (!reject) return NULL;
+    if (!strcmp(reject->reason, "tls_required"))
+        return "Pinned TLS 1.3 required; upgrade both host and client";
     if (!strcmp(reject->reason, "capture_unavailable"))
         return "host screen capture unavailable; authorize screen sharing on the host and retry";
     if (!strcmp(reject->reason, "request_refused"))

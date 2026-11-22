@@ -49,13 +49,41 @@ runs a fresh negotiation. The previous request ID is fenced, and a new session
 ID/token replaces the consumed reservation. Policy is rechecked; a removed
 client cannot reuse its old token. There is no unauthenticated reconnect.
 
-**Threat boundary:** this binds a TCP stream to possession of the DM secret,
-not to a TCP source address or a cryptographic transport identity. Native TCP
-is plaintext: an on-path observer or a substituted endpoint can steal/race the
-bearer proof, and the ACK does not authenticate the TCP server independently.
-Use direct TCP only on a trusted network or inside a separately authenticated,
-encrypted tunnel. FIPS remains the encrypted mesh transport. This change does
-not claim TLS, channel binding or protection against an on-path attacker.
+## Transport encryption (md-lp7i)
+
+The client advertises `stream_tls: "tls13-sha256"` in its encrypted request.
+The host creates an in-memory ephemeral P-256 certificate at listener startup
+and includes `tls_cert_sha256` (64 lowercase hex, SHA-256 of the DER leaf
+certificate) in every encrypted `session_accept`. The identity-pinned NIP-17 /
+NIP-44 negotiation authenticates this pin, request ID, session ID, token and
+grant together. The client completes TLS 1.3 and compares the exact certificate
+digest **before any application packet**, including `session_bind`. Web PKI,
+DNS, the transport IP and the self-signed certificate's CN are not identity
+authorities. No certificate private key or TLS traffic key leaves the host.
+
+**Threat model:** a passive observer cannot read the token, ACK or media. An
+active endpoint-substituting MITM has a different certificate and is rejected
+before the token is sent. A transparent TCP forwarder can relay encrypted
+records, but cannot decrypt or change them. TLS record/transcript replay cannot
+authenticate a new channel; a decrypted proof replay by an authorized client
+also fails the existing one-use token gate. Reconnects negotiate fresh request
+IDs, session IDs and tokens; the listener certificate is reused only for that
+host process and is reauthenticated in each acceptance. TLS early data is not
+enabled ([OpenSSL's default](https://docs.openssl.org/master/man3/SSL_read_early_data/)).
+Endpoint/signing-key compromise, traffic analysis and denial of service
+are outside this protection; silent TLS candidates have a bounded handshake.
+
+**Compatibility: fail closed.** Upgrade both ends. Hosts refuse requests without
+the exact TLS capability before minting a token (`tls_required`); clients refuse
+an acceptance without a valid pin, and report missing-pin or TLS/pin failures.
+There is no plaintext fallback, TOFU prompt, insecure flag or automatic downgrade.
+Old clients may display only a generic refusal or disconnect.
+
+FIPS retains its daemon/peer-readiness checks and identity-derived TUN routing.
+TLS is deliberately layered over its existing encryption: one listener and one
+binding policy cannot accidentally authorize a plaintext direct connection by
+trusting a claimed route or source address. The cost is redundant encryption,
+not a change to FIPS identity, authorization or routing semantics.
 
 ## Local regression gates
 
@@ -64,8 +92,13 @@ also runs `tests/direct_ip_session.py` against the real host/client binaries,
 private throwaway signers/relay and native 127.0.0.1 TCP. It covers identity-free
 host refusal, unauthorized client refusal, allowlisted binding/ACK, a replaying
 second TCP peer, and same-process disconnect/reconnect with fresh secrets.
-The in-memory TCP proxy is a fixture for forced disconnect/replay observation,
-not a substitute for production Nostr negotiation or native sockets. No public
+The in-memory TCP proxy is a transparent ciphertext capture fixture for forced disconnect/replay observation,
+not a substitute for production Nostr negotiation or native sockets. The private
+client signer observes the decrypted acceptance only to assert that its token
+never appears in captured TCP bytes; the proxy does not possess TLS keys.
+`test_stream` also checks correct pins, a substituted certificate, malformed
+pins, silent TLS candidates and one-use proof replay over fresh pinned channels.
+No public
 relays, real credentials, FIPS daemon or capture/input are used. The host
 may initialize the native accessibility backend (this is not a video test).
 `host_binding`, `session JSON + state machine`, and `session correlation

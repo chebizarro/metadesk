@@ -633,7 +633,33 @@ static void test_session_reject(void) {
     MD_CHECK(md_session_reject_from_json("{\"type\":\"session_accept\"}", &parsed) < 0);
 }
 
+static void test_tls_signaling(void) {
+    MdSessionRequest req = {0}, parsed;
+    MD_CHECK(md_session_request_prepare(&req, 1000, 30) == 0);
+    MD_CHECK(req.stream_tls);
+    char *json = md_session_request_to_json(&req);
+    MD_CHECK(md_session_request_from_json(json, &parsed) == 0 && parsed.stream_tls);
+    free(json);
+    MD_CHECK(md_session_request_from_json("{\"type\":\"session_request\",\"capabilities\":[]}", &parsed) == 0);
+    MD_CHECK(!parsed.stream_tls); /* parse legacy for explicit policy refusal */
+    MD_CHECK(md_session_request_from_json("{\"type\":\"session_request\",\"stream_tls\":true}", &parsed) < 0);
+    MdSessionAccept acc = {.session_id = "pin-test"}, answer;
+    memset(acc.tls_cert_sha256, 'a', 64);
+    json = md_session_accept_to_json(&acc);
+    MD_CHECK(md_session_accept_from_json(json, &answer) == 0);
+    MD_CHECK(!strcmp(answer.tls_cert_sha256, acc.tls_cert_sha256));
+    free(json);
+    const char *bad[] = {"null", "false", "123", "\"abcd\"",
+        "\"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\""};
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        char input[256];
+        snprintf(input, sizeof(input), "{\"type\":\"session_accept\",\"tls_cert_sha256\":%s}", bad[i]);
+        MD_CHECK(md_session_accept_from_json(input, &answer) < 0);
+    }
+}
+
 int main(void) {
+    test_tls_signaling();
     printf("test_session (JSON + state machine):\n");
 
     /* JSON serialization tests */
