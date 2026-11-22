@@ -211,7 +211,9 @@ def startup_contracts(host, client, home, env, nip5f):
     metadata.chmod(0o600)
     binaries = [(host, [], "host")]
     if client:
-        binaries.append((client, ["127.0.0.1", "--no-display"], "client"))
+        binaries.append((client, ["--host", "127.0.0.1", "--npub",
+                                 "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+                                 "--no-display"], "client"))
     for binary, args, role in binaries:
         result = subprocess.run([binary, *args], env=env, capture_output=True, text=True, timeout=15)
         assert result.returncode == 1 and f"{role} account restore" in result.stderr, result.stderr
@@ -245,12 +247,13 @@ def startup_contracts(host, client, home, env, nip5f):
                         assert "differs from the FIPS node key" in result.stderr, result.stderr
                 # Selected client role is checked against the actual socket owner.
                 if backend == "nip5f" and client:
-                    with socket.socket() as closed_port:
-                        closed_port.bind(("127.0.0.1", 0))
-                        result = subprocess.run([client, "127.0.0.1", "--port", str(closed_port.getsockname()[1]), "--no-display", "--timeout", "100"], env=env, capture_output=True, text=True, timeout=15)
-                        assert result.returncode == 1 and "client: signer ready" in result.stdout and "account restore" not in result.stderr, result.stderr
+                    # A malformed destination fails after role restoration but
+                    # before signing/encryption (this signer is identity-only).
+                    result = subprocess.run([client, "--npub", "invalid-fixture-npub", "--no-display"], env=env, capture_output=True, text=True, timeout=15)
+                    assert result.returncode == 1 and "client: signer ready" in result.stdout and "account restore" not in result.stderr, result.stderr
+                    assert "--npub must be a valid" in result.stderr, result.stderr
                     signer.pubkey = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
-                    result = subprocess.run([client, "127.0.0.1", "--no-display"], env=env, capture_output=True, text=True, timeout=15)
+                    result = subprocess.run([client, "--host", "127.0.0.1", "--npub", npub, "--no-display"], env=env, capture_output=True, text=True, timeout=15)
                     assert result.returncode == 1 and "client account restore" in result.stderr and "pinned account" in result.stderr, result.stderr
                     signer.pubkey = pk
             assert fips.commands.count("show_status") == 12, fips.commands
