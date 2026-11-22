@@ -717,7 +717,7 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 
 /* ── Main ────────────────────────────────────────────────────── */
 
-int main(int argc, char **argv) {
+static int client_run(int argc, char **argv) {
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
 #ifdef _WIN32
@@ -1237,4 +1237,12 @@ int main(int argc, char **argv) {
     printf("client: done. decoded %u frames, displayed %u, tree updates %u\n",
            ctx.frames_decoded, ctx.frames_displayed, ctx.tree_updates);
     return 0;
+}
+
+int main(int argc, char **argv) {
+    int status = client_run(argc, argv);
+    /* Drain the process-wide network runtime before ExitProcess kills its
+     * threads. DLL atexit handlers run too late to join them on Windows. */
+    md_nostr_shutdown();
+    return status;
 }

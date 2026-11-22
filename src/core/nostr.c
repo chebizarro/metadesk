@@ -22,6 +22,7 @@
  * provided by nostrc (github.com/chebizarro/nostrc).
  */
 #include "nostr.h"
+#include <nostr-connection.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1197,6 +1198,11 @@ void md_nostr_destroy(MdNostr *n) {
 
     free(n->pk_hex);
     free(n);
+}
+
+void md_nostr_shutdown(void) {
+    /* Run in the module that owns nostrc's statically linked runtime. */
+    nostr_connection_shutdown();
 }
 
 /* ── Key utilities ────────────────────────────────────────── */

@@ -912,7 +912,7 @@ static void host_finish_client(HostCtx *ctx, MdStream *client) {
 #include "win_dpi.h"
 #endif
 
-int main(int argc, char **argv) {
+static int host_run(int argc, char **argv) {
 #ifdef _WIN32
     /* md-m5x4: per-monitor DPI aware before any window, UIA, DXGI or input
      * call, so UIA rectangles, capture and SendInput share physical pixels. */
@@ -1851,4 +1851,12 @@ signaling_ready:
 
     printf("host: done. served %u client(s)\n", client_num);
     return exit_status;
+}
+
+int main(int argc, char **argv) {
+    int status = host_run(argc, argv);
+    /* Drain the process-wide network runtime before ExitProcess kills its
+     * threads. DLL atexit handlers run too late to join them on Windows. */
+    md_nostr_shutdown();
+    return status;
 }
