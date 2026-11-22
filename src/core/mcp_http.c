@@ -17,8 +17,9 @@
 #define MD_LOG_TAG "mcp-http"
 #include "log.h"
 #include <fcntl.h>
-#include <poll.h>
 #include "io_util.h"
+#include "md_socket.h"
+#include "md_compat.h"
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,10 +27,6 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <go.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -61,7 +58,7 @@ typedef struct {
 /* ── Server struct ───────────────────────────────────────────── */
 
 typedef struct {
-    int fd;
+    MdSocket fd;
     bool ready; /* false while the handler owns the header write */
     size_t sent;
     bool failed;
@@ -85,7 +82,7 @@ typedef struct {
 
 struct MdMcpHttp {
     MdMcpServer    *mcp_server;
-    int             listen_fd;
+    MdSocket             listen_fd;
     uint16_t        port;
     atomic_bool     shutdown;
 
@@ -213,7 +210,7 @@ int md_mcp_http_write(const char *json, size_t len, void *userdata)
 
 /* ── HTTP response helpers ───────────────────────────────────── */
 
-static void send_http_response(MdMcpHttp *h, int fd, int status, const char *status_text,
+static void send_http_response(MdMcpHttp *h, MdSocket fd, int status, const char *status_text,
                                const char *content_type,
                                const char *body, size_t body_len)
 {
@@ -236,14 +233,14 @@ static void send_http_response(MdMcpHttp *h, int fd, int status, const char *sta
 }
 
 /* Plain-text error/short response — length computed, never hand-counted. */
-static void send_http_text(MdMcpHttp *h, int fd, int status, const char *status_text,
+static void send_http_text(MdMcpHttp *h, MdSocket fd, int status, const char *status_text,
                            const char *msg)
 {
     send_http_response(h, fd, status, status_text, "text/plain",
                        msg, strlen(msg));
 }
 
-static int send_sse_headers(int fd, int64_t deadline)
+static int send_sse_headers(MdSocket fd, int64_t deadline)
 {
     const char *headers =
         "HTTP/1.1 200 OK\r\n"
@@ -398,6 +395,10 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
         cfg->allow_npub_count > AUTH_MAX_NPUBS ||
         (cfg->allow_npub_count && !cfg->allow_npubs)) return false;
     if (cfg->token_file) {
+#ifdef _WIN32
+        MD_LOG_E("MCP bearer token files require POSIX permission validation; unsupported on Windows (use NIP-98 authorization)");
+        return false;
+#else
         int fd = open(cfg->token_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) return false;
         struct stat st;
@@ -420,6 +421,7 @@ static bool auth_init(MdMcpHttp *h, const MdMcpHttpConfig *cfg)
         h->token = strdup(token);
         OPENSSL_cleanse(token, sizeof(token));
         if (!h->token) return false;
+#endif
     }
     h->public_urls = calloc(cfg->public_url_count + 1, sizeof(char *));
     if (!h->public_urls) return false;
@@ -697,21 +699,23 @@ static int parse_http_request(const char *buf, size_t buf_len, HttpRequest *req)
 
 /* ── Handle a client connection ──────────────────────────────── */
 
-static void sse_regrant_locked(MdMcpHttp *h, int only_fd);
+static void sse_regrant_locked(MdMcpHttp *h, MdSocket only_fd);
 static void sse_evict_held_locked(MdMcpHttp *h);
 
-static void handle_client(MdMcpHttp *h, int client_fd)
+static void handle_client(MdMcpHttp *h, MdSocket client_fd)
 {
     /* Bound read waits so idle connections cannot park a handler */
-    struct timeval rcv_timeout = { .tv_sec = CLIENT_READ_TIMEOUT_SEC,
-                                   .tv_usec = 0 };
-    struct timeval snd_timeout = { .tv_sec = h->sse_write_timeout_ms / 1000,
-        .tv_usec = (h->sse_write_timeout_ms % 1000) * 1000 };
-    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
-                   &rcv_timeout, sizeof(rcv_timeout)) < 0 ||
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
-                   &snd_timeout, sizeof(snd_timeout)) < 0) {
-        close(client_fd);
+#ifdef _WIN32
+    /* Winsock lacks per-call MSG_DONTWAIT. This handler owns the socket;
+     * configure it before reads or deadline-bounded response writes. */
+    if (md_socket_nonblocking(client_fd, true) != 0) {
+        md_socket_close(client_fd);
+        return;
+    }
+#endif
+    if (md_socket_timeout(client_fd, SO_RCVTIMEO, CLIENT_READ_TIMEOUT_SEC * 1000) < 0 ||
+        md_socket_timeout(client_fd, SO_SNDTIMEO, h->sse_write_timeout_ms) < 0) {
+        md_socket_close(client_fd);
         return;
     }
 
@@ -719,7 +723,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     size_t buf_cap = READ_BUF_SIZE * 4;
     char *buf = malloc(buf_cap);
     if (!buf) {
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
     size_t total = 0;
@@ -730,11 +734,17 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     while (total < buf_cap - 1) {
         int64_t remaining = read_deadline - md_now_ms();
         if (remaining <= 0 || atomic_load(&h->shutdown)) break;
-        struct pollfd pfd = { .fd = client_fd, .events = POLLIN };
-        int ready = poll(&pfd, 1, (int)remaining);
+        MdPollFd pfd = { .fd = client_fd, .events = POLLIN };
+        int ready = md_socket_poll(&pfd, 1, (int)remaining);
         if (ready < 0 && errno == EINTR) continue;
         if (ready <= 0) break;
-        ssize_t n = recv(client_fd, buf + total, buf_cap - 1 - total, MSG_DONTWAIT);
+        ssize_t n = md_socket_recv(client_fd, buf + total, buf_cap - 1 - total,
+#ifdef _WIN32
+            0
+#else
+            MSG_DONTWAIT
+#endif
+        );
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
         if (n <= 0) break;
         total += (size_t)n;
@@ -749,7 +759,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
                 send_http_text(h, client_fd, 400, "Bad Request",
                                "Invalid Content-Length\n");
                 free(buf);
-                close(client_fd);
+                md_socket_close(client_fd);
                 return;
             }
 
@@ -758,7 +768,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
                 send_http_text(h, client_fd, 413, "Content Too Large",
                                "Request body too large\n");
                 free(buf);
-                close(client_fd);
+                md_socket_close(client_fd);
                 return;
             }
 
@@ -770,7 +780,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
                 char *new_buf = realloc(buf, buf_cap);
                 if (!new_buf) {
                     free(buf);
-                    close(client_fd);
+                    md_socket_close(client_fd);
                     return;
                 }
                 buf = new_buf;
@@ -785,7 +795,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     if (parse_http_request(buf, total, &req) != 0) {
         send_http_text(h, client_fd, 400, "Bad Request", "Bad request\n");
         free(buf);
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
     free(buf);
@@ -793,7 +803,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     if (req.origin || !host_allowed(h, &req)) {
         send_http_text(h, client_fd, 403, "Forbidden", "Forbidden\n");
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
     if (strcmp(req.path, "/healthz") == 0 && strcmp(req.method, "GET") == 0) {
@@ -801,7 +811,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         send_http_text(h, client_fd, stopping ? 503 : 200,
                        stopping ? "Service Unavailable" : "OK", stopping ? "stopping\n" : "ok\n");
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
     AuthResult who = {0};
@@ -810,7 +820,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         !authenticate(h, &req, &who)) {
         send_http_text(h, client_fd, 401, "Unauthorized", "Unauthorized\n");
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
 
@@ -820,7 +830,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         send_http_text(h, client_fd, 415, "Unsupported Media Type",
                        "Unsupported media type\n");
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
         return;
     }
 
@@ -854,7 +864,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             }
         }
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
 
     } else if (strcmp(req.path, "/mcp") == 0 && strcmp(req.method, "GET") == 0) {
         pthread_mutex_lock(&h->sse_mu);
@@ -866,7 +876,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
             pthread_mutex_unlock(&h->sse_mu);
             send_http_text(h, client_fd, 503, "Service Unavailable", "SSE capacity exhausted\n");
             free(req.body);
-            close(client_fd);
+            md_socket_close(client_fd);
             return;
         }
         /* Reserve capacity, but broadcasts skip this fd until headers finish.
@@ -877,12 +887,11 @@ static void handle_client(MdMcpHttp *h, int client_fd)
         h->sse_clients[h->sse_count++] = reserved;
         pthread_mutex_unlock(&h->sse_mu);
 
-        int flags = fcntl(client_fd, F_GETFL);
-        bool ready = flags >= 0 && fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+        bool ready = md_socket_nonblocking(client_fd, true) == 0 &&
             send_sse_headers(client_fd, md_now_ms() + h->sse_write_timeout_ms) == 0;
         /* 0 = never touched; verified by inspection, kernel autotuning makes a behavioural check non-deterministic. */
         if (ready && h->sse_sndbuf > 0)
-            ready = setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
+            ready = md_socket_setopt(client_fd, SOL_SOCKET, SO_SNDBUF,
                                &h->sse_sndbuf, sizeof(h->sse_sndbuf)) == 0;
         pthread_mutex_lock(&h->sse_mu);
         for (int i = 0; i < h->sse_count; i++) {
@@ -894,7 +903,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
                 if (h->sse_clients[i].live_auth && h->grant_watch)
                     sse_regrant_locked(h, client_fd);
             } else {
-                close(client_fd);
+                md_socket_close(client_fd);
                 h->sse_clients[i] = h->sse_clients[--h->sse_count];
             }
             break;
@@ -905,7 +914,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
     } else {
         send_http_text(h, client_fd, 404, "Not Found", "Not found\n");
         free(req.body);
-        close(client_fd);
+        md_socket_close(client_fd);
     }
 }
 
@@ -913,7 +922,7 @@ static void handle_client(MdMcpHttp *h, int client_fd)
 
 typedef struct {
     MdMcpHttp   *http;
-    int          client_fd;
+    MdSocket          client_fd;
     GoWaitGroup *wg;
 } HandlerArg;
 
@@ -969,7 +978,7 @@ static char *make_sse_frame(const char *event, const char *data, size_t len,
  * misses a frame; returns -1 then. */
 static int sse_deliver_locked(MdMcpHttp *h, const char *frame, size_t frame_len)
 {
-    struct pollfd *fds = frame ? calloc((size_t)h->sse_max_clients, sizeof(*fds)) : NULL;
+    MdPollFd *fds = frame ? calloc((size_t)h->sse_max_clients, sizeof(*fds)) : NULL;
     int64_t deadline = md_now_ms() + h->sse_write_timeout_ms;
     int pending = 0, revoked = 0, unserved = 0;
     for (int i = 0; i < h->sse_count; i++) {
@@ -979,18 +988,18 @@ static int sse_deliver_locked(MdMcpHttp *h, const char *frame, size_t frame_len)
         c->failed = c->revoked || (c->ready && c->target && !fds);
         if (c->revoked) revoked++;
         bool deliver = c->ready && c->target && !c->failed;
-        if (fds) fds[i] = (struct pollfd){ .fd = deliver ? c->fd : -1, .events = POLLOUT };
+        if (fds) fds[i] = (MdPollFd){ .fd = deliver ? c->fd : -1, .events = POLLOUT };
         if (deliver) pending++;
     }
     if (revoked) MD_LOG_W("dropping %d SSE client(s) no longer authorized by the live allowlist", revoked);
     while (pending > 0) {
         int64_t remaining = deadline - md_now_ms();
         if (remaining <= 0) break;
-        int rc = poll(fds, (nfds_t)h->sse_count, (int)remaining);
+        int rc = md_socket_poll(fds, (size_t)h->sse_count, (int)remaining);
         if (rc < 0 && errno == EINTR) continue;
         if (rc <= 0) break;
         for (int i = 0; i < h->sse_count; i++) {
-            if (fds[i].fd < 0 || !fds[i].revents) continue;
+            if ((MdSocket)fds[i].fd == -1 || !fds[i].revents) continue;
             SseClient *c = &h->sse_clients[i];
             ssize_t n = md_socket_write(c->fd, frame + c->sent, frame_len - c->sent);
             if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
@@ -1007,7 +1016,7 @@ static int sse_deliver_locked(MdMcpHttp *h, const char *frame, size_t frame_len)
         SseClient *c = &h->sse_clients[i];
         if (c->ready && (c->failed || (c->target && c->sent != frame_len))) {
             if (!c->revoked) MD_LOG_W("dropping SSE client after failed or timed-out write");
-            close(c->fd);
+            md_socket_close(c->fd);
             *c = h->sse_clients[--h->sse_count];
         } else {
             c->target = c->revoked = false;
@@ -1051,7 +1060,7 @@ int md_mcp_http_send_sse(MdMcpHttp *http, const char *event,
  * often this runs, and other streams are untouched. md-554: an UNKNOWN
  * answer leaves the stream held and its record alone, so the first known
  * answer is compared with the last known one (one list_changed at most). */
-static void sse_regrant_locked(MdMcpHttp *h, int only_fd)
+static void sse_regrant_locked(MdMcpHttp *h, MdSocket only_fd)
 {
     int changed = 0, revoked = 0;
     for (int i = 0; i < h->sse_count; i++) {
@@ -1093,7 +1102,7 @@ static void sse_evict_held_locked(MdMcpHttp *h)
         if (!c->ready || !c->live_auth || live_grant(h, c->pubkey) != MD_MCP_GRANT_UNKNOWN)
             continue;
         MD_LOG_W("SSE capacity: closing a stream held while the live allowlist is unknown");
-        close(c->fd);
+        md_socket_close(c->fd);
         *c = h->sse_clients[--h->sse_count];
         return;
     }
@@ -1127,7 +1136,7 @@ int md_mcp_http_sse_client_sndbuf(MdMcpHttp *http, int index)
     for (int i = 0; i < http->sse_count; i++) {
         if (!http->sse_clients[i].ready || index-- != 0) continue;
         socklen_t len = sizeof(sndbuf);
-        if (getsockopt(http->sse_clients[i].fd, SOL_SOCKET, SO_SNDBUF,
+        if (md_socket_getopt(http->sse_clients[i].fd, SOL_SOCKET, SO_SNDBUF,
                        &sndbuf, &len) < 0)
             sndbuf = -1;
         break;
@@ -1143,7 +1152,7 @@ static void close_sse_clients(MdMcpHttp *http)
     pthread_mutex_lock(&http->sse_mu);
     for (int i = 0; i < http->sse_count; ) {
         if (http->sse_clients[i].ready) {
-            close(http->sse_clients[i].fd);
+            md_socket_close(http->sse_clients[i].fd);
             http->sse_clients[i] = http->sse_clients[--http->sse_count];
         } else {
             i++; /* header writer owns this fd and observes shutdown */
@@ -1158,7 +1167,7 @@ static void close_sse_clients(MdMcpHttp *http)
 static void http_free(MdMcpHttp *h)
 {
     if (h->listen_fd >= 0)
-        close(h->listen_fd);
+        md_socket_close(h->listen_fd);
     go_wait_group_destroy(&h->handler_wg);
     pthread_mutex_destroy(&h->sse_mu);
     pthread_mutex_destroy(&h->auth_mu);
@@ -1201,18 +1210,20 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
     go_wait_group_init(&h->handler_wg);
 
     /* Create listening socket */
-    h->listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    h->listen_fd = md_socket_open(AF_INET6, SOCK_STREAM, 0);
     if (h->listen_fd < 0) {
         http_free(h);
         return NULL;
     }
 
-    int opt = 1;
-    setsockopt(h->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (md_socket_listener_reuse(h->listen_fd) != 0) {
+        http_free(h);
+        return NULL;
+    }
 
     /* Dual-stack: allow IPv4 connections on IPv6 socket */
     int off = 0;
-    setsockopt(h->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    md_socket_setopt(h->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
     struct sockaddr_in6 addr = {0};
     addr.sin6_family = AF_INET6;
@@ -1235,15 +1246,15 @@ MdMcpHttp *md_mcp_http_create(const MdMcpHttpConfig *config)
         addr.sin6_addr = in6addr_loopback;  /* localhost only by default */
     }
 
-    if (bind(h->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (md_socket_bind(h->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         http_free(h);
         return NULL;
     }
 
     socklen_t addr_len = sizeof(addr);
     if ((config->ephemeral_port &&
-         getsockname(h->listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) ||
-        listen(h->listen_fd, 8) < 0) {
+         md_socket_getname(h->listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) ||
+        md_socket_listen(h->listen_fd, 8) < 0) {
         http_free(h);
         return NULL;
     }
@@ -1274,28 +1285,22 @@ int md_mcp_http_run(MdMcpHttp *http)
     if (!http) return -1;
 
     while (!atomic_load(&http->shutdown)) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(http->listen_fd, &readfds);
-
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int nfds = http->listen_fd + 1;
-
-        int ret = select(nfds, &readfds, NULL, NULL, &tv);
+        MdPollFd pfd = { .fd = http->listen_fd, .events = POLLIN };
+        int ret = md_socket_poll(&pfd, 1, 1000);
         if (ret < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
         if (ret == 0) continue;  /* timeout — check shutdown flag */
 
-        if (FD_ISSET(http->listen_fd, &readfds)) {
-            int client = accept(http->listen_fd, NULL, NULL);
+        if (pfd.revents & POLLIN) {
+            MdSocket client = md_socket_accept(http->listen_fd, NULL, NULL);
             if (client >= 0) {
 #ifdef SO_NOSIGPIPE
                 int no_sigpipe = 1;
-                if (setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE,
+                if (md_socket_setopt(client, SOL_SOCKET, SO_NOSIGPIPE,
                                &no_sigpipe, sizeof(no_sigpipe)) < 0) {
-                    close(client);
+                    md_socket_close(client);
                     continue;
                 }
 #endif
@@ -1309,7 +1314,7 @@ int md_mcp_http_run(MdMcpHttp *http)
                     go_wait_group_add(&http->handler_wg, 1);
                     go(handle_client_thread, ha);
                 } else {
-                    close(client);
+                    md_socket_close(client);
                 }
             }
         }

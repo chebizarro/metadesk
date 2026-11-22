@@ -1,3 +1,4 @@
+#include "md_socket.h"
 /* Private loopback tests of real host admission/capture/dispatch. No desktop. */
 #define main md_host_main_not_run
 #define md_agent_send_tree test_send_tree
@@ -177,8 +178,8 @@ static void test_candidate_and_second_client(void) {
     MdEncodedPacket pkt = { .data = &byte, .size = 1 };
     on_encoded(&pkt, &ctx); host_send_initial_tree(&ctx);
     MD_CHECK(tree_calls == 0);
-    struct pollfd fd = { .fd = md_stream_get_fd(first.peer), .events = POLLIN };
-    MD_CHECK(poll(&fd, 1, 0) == 0);
+    MdPollFd fd = { .fd = md_stream_get_fd(first.peer), .events = POLLIN };
+    MD_CHECK(md_socket_poll(&fd, 1, 0) == 0);
     send_proof(first, &acc);
     MD_CHECK(host_bind_candidate(&ctx, first.host) == 0);
     MD_CHECK(ctx.client == NULL); /* ACK precedes publication. */
@@ -251,7 +252,7 @@ static void test_bad_proofs(void) {
     MdPacketHeader hdr = { .version = MD_PROTOCOL_VERSION, .type = MD_PKT_SESSION_INFO,
                           .payload_len = MD_SESSION_JSON_MAX + 1 };
     MD_CHECK(md_packet_header_write(&hdr, header, sizeof(header)) > 0);
-    MD_CHECK(write(md_stream_get_fd(wrong.peer), header, sizeof(header)) == sizeof(header));
+    MD_CHECK(md_socket_send(md_stream_get_fd(wrong.peer), header, sizeof(header), 0) == sizeof(header));
     MD_CHECK(host_bind_candidate(&ctx, wrong.host) < 0);
     closed(wrong); destroy_pair(wrong);
     wrong = pair(); send_proof(wrong, &acc); s.stream_deadline_ms = 0;
@@ -270,8 +271,8 @@ static void test_denied_capabilities(void) {
         ctx.client = p.host;
         uint8_t byte = 0; MdEncodedPacket pkt = { .data = &byte, .size = 1 };
         on_encoded(&pkt, &ctx);
-        struct pollfd fd = { .fd = md_stream_get_fd(p.peer), .events = POLLIN };
-        MD_CHECK(poll(&fd, 1, 0) == 0);
+        MdPollFd fd = { .fd = md_stream_get_fd(p.peer), .events = POLLIN };
+        MD_CHECK(md_socket_poll(&fd, 1, 0) == 0);
         unsigned trees = tree_calls; host_send_initial_tree(&ctx);
         MD_CHECK(tree_calls == trees + 1);
         uint8_t input[MD_INPUT_EVENT_HDR_LEN + MD_INPUT_EVENT_TAG_LEN];
@@ -743,7 +744,9 @@ static void test_agent_replacement_failure(void) {
 }
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     if (argc == 4 && !strcmp(argv[1], "--nip5f-fixture")) {
         hist_nip5f_socket = argv[3];
         hist_session(argv[2], "nip5f-quoted-seal", 0, 0, false);

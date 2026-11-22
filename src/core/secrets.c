@@ -1,3 +1,4 @@
+#include "md_compat.h"
 /*
  * metadesk — secrets.c
  * 1Password Connect REST API integration.

@@ -9,7 +9,6 @@
 #define MD_LOG_TAG "mcp-stdio"
 #include "log.h"
 #include "io_util.h"
-#include <poll.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +62,11 @@ int md_mcp_stdio_write(const char *json, size_t len, void *userdata)
     if (rc < 0) {
         /* Do not append another JSON message to a truncated frame. Input
          * dispatch remains live, but this output channel is no longer usable. */
-        if (total > 0) ctx->output_failed = true;
+        if (total > 0
+#ifdef _WIN32
+            || errno == ETIMEDOUT /* CancelSynchronousIo may have committed unknown bytes. */
+#endif
+        ) ctx->output_failed = true;
         if (!ctx->write_error_logged) {
             MD_LOG_W("dropping stdio message after failed or timed-out write");
             ctx->write_error_logged = true;
@@ -89,7 +92,12 @@ MdMcpStdio *md_mcp_stdio_create_ex(MdMcpServer *server, int in_fd, int out_fd,
     MdMcpStdio *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
 
+#ifdef _WIN32
+    /* The public stdio API takes CRT descriptors, never Winsock handles. */
+    ctx->out_is_socket = false;
+#else
     ctx->out_is_socket = S_ISSOCK(st.st_mode);
+#endif
     ctx->write_timeout_ms = write_timeout_ms > 0
         ? write_timeout_ms : MD_MCP_STDIO_WRITE_TIMEOUT_MS;
 
@@ -132,20 +140,8 @@ int md_mcp_stdio_run(MdMcpStdio *ctx)
         /* Blocking stdin must not strand a shutdown request. Do not change
          * descriptor flags: dup'd stdin may share its open-file description
          * with the launcher. This transport is the sole reader. */
-        struct pollfd pfd = { .fd = ctx->in_fd, .events = POLLIN };
-        int ready = poll(&pfd, 1, 100);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            free(buf);
-            return -1;
-        }
-        if (ready == 0 || atomic_load(&ctx->shutdown)) continue;
-        if (pfd.revents & POLLNVAL) {
-            free(buf);
-            return -1;
-        }
-
-        ssize_t n = read(ctx->in_fd, buf + buf_len, buf_cap - buf_len - 1);
+        ssize_t n = md_fd_read_timeout(ctx->in_fd, buf + buf_len,
+                                       buf_cap - buf_len - 1, 100);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             /* Nonblocking launchers can race readiness; retry the poll. */
             continue;

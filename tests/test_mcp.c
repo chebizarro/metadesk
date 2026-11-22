@@ -16,11 +16,17 @@
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
+#ifndef _WIN32
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#else
+#include <io.h>
+#include <fcntl.h>
+#define pipe(fds) _pipe(fds, 4096, _O_BINARY | _O_NOINHERIT)
+#endif
 #include "md_test.h"
 
 
@@ -2403,6 +2409,7 @@ static void test_subscribe_refuses_second_owner(void)
     PASS("second subscriber is refused; identical re-subscribe is a no-op; loser bridge does not detach winner");
 }
 
+#ifndef _WIN32
 /* Optional live host-process gate (requires an accessible desktop):
  * test_mcp --host-lifecycle /path/to/metadesk-host */
 static cJSON *host_test_response(int fd)
@@ -2771,10 +2778,13 @@ static void test_live_host_lifecycle(const char *host)
     }
 }
 
+#endif
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
+#ifndef _WIN32
     if (argc == 3 && strcmp(argv[1], "--host-cli") == 0) {
         test_host_cli_rejections(argv[2]);
         return md_test_report();
@@ -2785,6 +2795,7 @@ int main(int argc, char **argv)
         test_live_host_lifecycle(argv[2]);
         return md_test_report();
     }
+#endif
     if (argc == 2 && strcmp(argv[1], "--a11y-queries") == 0) {
         test_a11y_read_tools();
         test_a11y_modal_and_label_queries();
@@ -2836,9 +2847,13 @@ int main(int argc, char **argv)
     test_resources_with_session();
     test_bridge_null_a11y_fails_create();
     test_bridge_create_destroy_with_stub_a11y();
+#ifndef _WIN32
     test_supervised_desktop_loss();
     test_supervised_in_flight(false);
     test_supervised_in_flight(true);
+#else
+    puts("SKIP: POSIX fork/signal lifecycle fixtures (native pipe lifecycle has separate Windows coverage)");
+#endif
 
     printf("\nAll MCP server tests passed.\n");
     clear_responses();

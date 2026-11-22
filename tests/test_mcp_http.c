@@ -24,13 +24,15 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/socket.h>
 #include "md_test_net.h"
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include "md_test.h"
+#include "md_socket.h"
+#ifdef _WIN32
+#define read(fd, buf, n) md_socket_recv(fd, buf, n, 0)
+#define write(fd, buf, n) md_socket_send(fd, buf, n, 0)
+#endif
 
 
 /* Creation failures are prerequisites, not permission to run a case against
@@ -65,14 +67,14 @@ static void wire_server_to_http(MdMcpServer *mcp, MdMcpHttp *http)
 
 /* ── Helper: raw TCP connect to localhost ─────────────────────── */
 
-static int tcp_connect_opts(uint16_t port, int rcvbuf)
+static MdSocket tcp_connect_opts(uint16_t port, int rcvbuf)
 {
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    MdSocket fd = md_socket_open(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     /* Set the receive window before TCP negotiates window scaling. */
     if (rcvbuf > 0 &&
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-        close(fd);
+        md_socket_setopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        md_socket_close(fd);
         return -1;
     }
 
@@ -81,21 +83,21 @@ static int tcp_connect_opts(uint16_t port, int rcvbuf)
     addr.sin6_port   = htons(port);
     addr.sin6_addr   = in6addr_loopback;
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
+    if (md_socket_connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        md_socket_close(fd);
         return -1;
     }
     /* macOS may enlarge SO_RCVBUF during connect. Keep the negotiated small
      * window scaling, then restore the requested limit before sending HTTP. */
     if (rcvbuf > 0 &&
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-        close(fd);
+        md_socket_setopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        md_socket_close(fd);
         return -1;
     }
     return fd;
 }
 
-static int tcp_connect(uint16_t port)
+static MdSocket tcp_connect(uint16_t port)
 {
     return tcp_connect_opts(port, 0);
 }
@@ -105,9 +107,9 @@ static void shutdown_http(MdMcpHttp *http)
     md_mcp_http_shutdown(http);
     /* Wake the accept loop's one-second select after setting shutdown. This
      * is a test-owned connection, not a change to production shutdown policy. */
-    int fd = tcp_connect(md_mcp_http_port(http));
+    MdSocket fd = tcp_connect(md_mcp_http_port(http));
     MD_CHECK(fd >= 0);
-    if (fd >= 0) close(fd);
+    if (fd >= 0) md_socket_close(fd);
 }
 
 /* ── Helper: send HTTP request, read response ────────────────── */
@@ -115,17 +117,17 @@ static void shutdown_http(MdMcpHttp *http)
 static int http_request(uint16_t port, const char *request,
                         char *resp_buf, size_t resp_buf_len)
 {
-    int fd = tcp_connect(port);
+    MdSocket fd = tcp_connect(port);
     if (fd < 0) return -1;
 
     ssize_t w = write(fd, request, strlen(request));
-    if (w <= 0) { close(fd); return -1; }
+    if (w <= 0) { md_socket_close(fd); return -1; }
 
     /* Read response with timeout. The server writes headers and body in
      * separate write() calls and then closes (Connection: close), so read
      * until EOF rather than trusting a single read() to see both. */
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    md_socket_timeout(fd, SO_RCVTIMEO, (int)(tv.tv_sec * 1000 + tv.tv_usec / 1000));
 
     size_t total = 0;
     for (;;) {
@@ -135,33 +137,33 @@ static int http_request(uint16_t port, const char *request,
         total += (size_t)n;
         if (total >= resp_buf_len - 1) break;
     }
-    close(fd);
+    md_socket_close(fd);
 
     if (total == 0) return -1;
     resp_buf[total] = '\0';
     return (int)total;
 }
 
-static int sse_connect_opts(uint16_t port, int rcvbuf, char *headers_buf,
+static MdSocket sse_connect_opts(uint16_t port, int rcvbuf, char *headers_buf,
                             size_t headers_buf_len)
 {
-    int fd = tcp_connect_opts(port, rcvbuf);
+    MdSocket fd = tcp_connect_opts(port, rcvbuf);
     if (fd < 0) return -1;
 
     const char *request = "GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n";
     ssize_t w = write(fd, request, strlen(request));
-    if (w <= 0) { close(fd); return -1; }
+    if (w <= 0) { md_socket_close(fd); return -1; }
 
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    md_socket_timeout(fd, SO_RCVTIMEO, (int)(tv.tv_sec * 1000 + tv.tv_usec / 1000));
 
     ssize_t n = read(fd, headers_buf, headers_buf_len - 1);
-    if (n <= 0) { close(fd); return -1; }
+    if (n <= 0) { md_socket_close(fd); return -1; }
     headers_buf[n] = '\0';
     return fd;
 }
 
-static int sse_connect(uint16_t port, char *headers_buf,
+static MdSocket sse_connect(uint16_t port, char *headers_buf,
                        size_t headers_buf_len)
 {
     return sse_connect_opts(port, 0, headers_buf, headers_buf_len);
@@ -169,7 +171,7 @@ static int sse_connect(uint16_t port, char *headers_buf,
 
 /* Headers may arrive before ready=true. Wait for publication before sending
  * exactly one probe; resending on a read timeout can leave duplicate frames. */
-static void wait_sse_ready(MdMcpHttp *http, int fd, int expected_clients)
+static void wait_sse_ready(MdMcpHttp *http, MdSocket fd, int expected_clients)
 {
     int64_t deadline = md_now_ms() + 5000;
     int clients;
@@ -500,7 +502,7 @@ static void test_sse_multiline_data(void)
     pthread_create(&tid, NULL, server_thread, &sa);
 
     char headers[1024];
-    int fd = sse_connect(port, headers, sizeof(headers));
+    MdSocket fd = sse_connect(port, headers, sizeof(headers));
     MD_CHECK(fd >= 0);
     MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
@@ -523,7 +525,7 @@ static void test_sse_multiline_data(void)
     MD_CHECK(strstr(event, "data: line2\n") != NULL);
     MD_CHECK(strstr(event, "data: line1\nline2") == NULL);
 
-    close(fd);
+    md_socket_close(fd);
     shutdown_http(http);
     pthread_join(tid, NULL);
 
@@ -553,13 +555,13 @@ static void test_sse_max_clients_config(void)
     pthread_create(&tid, NULL, server_thread, &sa);
 
     char headers1[1024];
-    int fd1 = sse_connect(port, headers1, sizeof(headers1));
+    MdSocket fd1 = sse_connect(port, headers1, sizeof(headers1));
     MD_CHECK(fd1 >= 0);
     MD_CHECK(strstr(headers1, "text/event-stream") != NULL);
     MD_CHECK(strstr(headers1, "Access-Control-Allow-Origin") == NULL);
 
     char headers2[1024];
-    int fd2 = sse_connect(port, headers2, sizeof(headers2));
+    MdSocket fd2 = sse_connect(port, headers2, sizeof(headers2));
     MD_CHECK(fd2 >= 0);
     MD_CHECK(strstr(headers2, "503 Service Unavailable") != NULL);
     MD_CHECK(strstr(headers2, "text/event-stream") == NULL);
@@ -589,8 +591,8 @@ static void test_sse_max_clients_config(void)
         MD_CHECK(n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
     }
 
-    close(fd1);
-    close(fd2);
+    md_socket_close(fd1);
+    md_socket_close(fd2);
     shutdown_http(http);
     pthread_join(tid, NULL);
 
@@ -601,7 +603,7 @@ static void test_sse_max_clients_config(void)
 }
 
 typedef struct {
-    int fd;
+    MdSocket fd;
     const char *frame;
     size_t frame_len;
     size_t count; /* zero: read until the done sentinel */
@@ -664,23 +666,23 @@ static void test_sse_stalled_client(void)
     MD_CHECK(pthread_create(&server_tid, NULL, server_thread, &sa) == 0);
 
     char headers[1024];
-    int stalled[4];
+    MdSocket stalled[4];
     int stalled_rcvbuf = 0;
     for (int i = 0; i < 4; i++) {
         stalled[i] = sse_connect_opts(port, 1024, headers, sizeof(headers));
         MD_CHECK(stalled[i] >= 0);
         int actual = 0;
         socklen_t optlen = sizeof(actual);
-        MD_CHECK(getsockopt(stalled[i], SOL_SOCKET, SO_RCVBUF, &actual, &optlen) == 0);
+        MD_CHECK(md_socket_getopt(stalled[i], SOL_SOCKET, SO_RCVBUF, &actual, &optlen) == 0);
         MD_CHECK(actual > 0);
         if (actual > stalled_rcvbuf) stalled_rcvbuf = actual;
         wait_sse_ready(http, stalled[i], i + 1);
     }
-    int healthy = sse_connect_opts(port, 8 * 1024 * 1024, headers, sizeof(headers));
+    MdSocket healthy = sse_connect_opts(port, 8 * 1024 * 1024, headers, sizeof(headers));
     MD_CHECK(healthy >= 0);
     int healthy_rcvbuf = 0;
     socklen_t optlen = sizeof(healthy_rcvbuf);
-    MD_CHECK(getsockopt(healthy, SOL_SOCKET, SO_RCVBUF, &healthy_rcvbuf, &optlen) == 0);
+    MD_CHECK(md_socket_getopt(healthy, SOL_SOCKET, SO_RCVBUF, &healthy_rcvbuf, &optlen) == 0);
     MD_CHECK(healthy_rcvbuf > 0);
     wait_sse_ready(http, healthy, 5);
     MD_CHECK(md_mcp_http_sse_client_count(http) == 5);
@@ -708,9 +710,15 @@ static void test_sse_stalled_client(void)
     /* Discard readiness leftovers on every socket before the data reader
      * starts; no further readiness probes are sent during the broadcast. */
     for (int i = 0; i < 5; i++) {
-        int fd = i < 4 ? stalled[i] : healthy;
+        MdSocket fd = i < 4 ? stalled[i] : healthy;
         char buf[1024];
-        while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {}
+#ifdef _WIN32
+        MD_CHECK(md_socket_nonblocking(fd, true) == 0);
+        while (md_socket_recv(fd, buf, sizeof(buf), 0) > 0) {}
+        MD_CHECK(md_socket_nonblocking(fd, false) == 0);
+#else
+        while (md_socket_recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {}
+#endif
     }
     MD_CHECK(pthread_create(&reader_tid, NULL, read_sse_frames, &reader) == 0);
     size_t sent = 0;
@@ -775,8 +783,8 @@ static void test_sse_stalled_client(void)
 
     free(frame);
     free(json);
-    for (int i = 0; i < 4; i++) close(stalled[i]);
-    close(healthy);
+    for (int i = 0; i < 4; i++) md_socket_close(stalled[i]);
+    md_socket_close(healthy);
     shutdown_http(http);
     MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
     MD_CHECK(pthread_join(server_tid, NULL) == 0);
@@ -814,9 +822,9 @@ static void test_stalled_post_destroy(void)
     ServerArgs sa = { .http = http, .result = -1 };
     pthread_t tid;
     MD_CHECK(pthread_create(&tid, NULL, server_thread, &sa) == 0);
-    int fd = tcp_connect(port), rcvbuf = 1024;
+    MdSocket fd = tcp_connect(port), rcvbuf = 1024;
     MD_CHECK(fd >= 0);
-    MD_CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+    MD_CHECK(md_socket_setopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
     const char *body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\","
                        "\"params\":{\"uri\":\"test://large\"}}";
     char request[512], headers[1024] = {0};
@@ -837,7 +845,7 @@ static void test_stalled_post_destroy(void)
     MD_CHECK(sa.result == 0);
     /* Completion is the assertion; Meson's suite timeout guards liveness. */
     md_mcp_http_destroy(http); /* must drain the stalled POST handler */
-    close(fd);
+    md_socket_close(fd);
     md_mcp_server_destroy(mcp);
     PASS("stalled large POST response cannot wedge transport destroy");
 }
@@ -891,7 +899,7 @@ static void test_shutdown_closes_sse_clients(void)
     pthread_create(&tid, NULL, server_thread, &sa);
 
     char headers[1024];
-    int fd = sse_connect(port, headers, sizeof(headers));
+    MdSocket fd = sse_connect(port, headers, sizeof(headers));
     MD_CHECK(fd >= 0);
     MD_CHECK(strstr(headers, "text/event-stream") != NULL);
 
@@ -902,7 +910,7 @@ static void test_shutdown_closes_sse_clients(void)
     char buf[32];
     ssize_t n = read(fd, buf, sizeof(buf));
     MD_CHECK(n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET)));
-    close(fd);
+    md_socket_close(fd);
 
     md_mcp_http_destroy(http);
     md_mcp_server_destroy(mcp);
@@ -1018,7 +1026,7 @@ static int auth_status(uint16_t port, const char *method, const char *path,
         memcpy(request + offset, extra, added);
         len += (int)added;
     }
-    int fd = tcp_connect(port);
+    MdSocket fd = tcp_connect(port);
     MD_CHECK(fd >= 0);
     if (fd < 0) return -1;
     int64_t deadline = md_now_ms() + 3000;
@@ -1032,12 +1040,13 @@ static int auth_status(uint16_t port, const char *method, const char *path,
         total += (size_t)n;
         response[total] = 0;
     }
-    close(fd);
+    md_socket_close(fd);
     int status = -1;
     MD_CHECK(sscanf(response, "HTTP/1.1 %d", &status) == 1);
     return status;
 }
 
+#ifndef _WIN32
 static void test_auth_configuration(void)
 {
     MdMcpServer *mcp = make_mcp_server();
@@ -1047,10 +1056,10 @@ static void test_auth_configuration(void)
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
     cfg.bind_addr = NULL;
     char token_path[] = "/tmp/md-http-token-XXXXXX";
-    int fd = mkstemp(token_path);
+    MdSocket fd = mkstemp(token_path);
     MD_CHECK(fd >= 0);
     MD_CHECK(write(fd, "test-secret\n", 12) == 12);
-    close(fd);
+    md_socket_close(fd);
     cfg.token_file = token_path;
     MD_CHECK(chmod(token_path, 0644) == 0);
     MD_CHECK(md_mcp_http_create(&cfg) == NULL);
@@ -1093,7 +1102,7 @@ static void test_auth_configuration(void)
     char allow_path[] = "/tmp/md-http-allow-XXXXXX";
     fd = mkstemp(allow_path);
     MD_CHECK(fd >= 0);
-    close(fd);
+    md_socket_close(fd);
     cfg.allow_file = allow_path;
     MD_CHECK(md_mcp_http_create(&cfg) == NULL); /* explicit empty list fails closed */
     FILE *file = fopen(allow_path, "w");
@@ -1109,15 +1118,17 @@ static void test_auth_configuration(void)
     md_mcp_server_destroy(mcp);
     PASS("auth startup credentials, permissions, URL validation and allow-file");
 }
+#endif
 
+#ifndef _WIN32
 static void test_http_auth(void)
 {
     MdMcpServer *mcp = make_mcp_server();
     char token_path[] = "/tmp/md-http-auth-XXXXXX";
-    int fd = mkstemp(token_path);
+    MdSocket fd = mkstemp(token_path);
     MD_CHECK(fd >= 0);
     MD_CHECK(write(fd, "test-secret\n", 12) == 12);
-    close(fd);
+    md_socket_close(fd);
     char *npub = test_npub();
     const char *npubs[] = {npub};
     const char *urls[] = {"https://agent.example/mcp", "http://proxy.example:8000/mcp"};
@@ -1205,6 +1216,7 @@ static void test_http_auth(void)
     md_mcp_server_destroy(mcp);
     PASS("bearer and NIP-98 POST/SSE authentication, replay, payload, Host/Origin, healthz");
 }
+#endif
 
 /* ── Live NIP-98 authorizer (md-ah9.3) ───────────────────────── */
 
@@ -1276,9 +1288,9 @@ static char *loopback_auth(uint16_t port, const char *method, bool key2, bool ba
 
 /* GET /mcp with Authorization; returns an fd positioned after the headers
  * of a 200 response, or -1. */
-static int sse_connect_auth(uint16_t port, const char *auth)
+static MdSocket sse_connect_auth(uint16_t port, const char *auth)
 {
-    int fd = tcp_connect(port);
+    MdSocket fd = tcp_connect(port);
     if (fd < 0) return -1;
     char request[4096];
     int len = snprintf(request, sizeof(request),
@@ -1286,7 +1298,7 @@ static int sse_connect_auth(uint16_t port, const char *auth)
     int64_t deadline = md_now_ms() + 3000;
     if (len <= 0 || len >= (int)sizeof(request) ||
         md_fd_write_deadline(fd, request, (size_t)len, deadline, true, NULL) != 0) {
-        close(fd);
+        md_socket_close(fd);
         return -1;
     }
     char headers[1024] = {0};
@@ -1298,12 +1310,12 @@ static int sse_connect_auth(uint16_t port, const char *auth)
         if (n <= 0) break;
         total += (size_t)n;
     }
-    if (strncmp(headers, "HTTP/1.1 200", 12) != 0) { close(fd); return -1; }
+    if (strncmp(headers, "HTTP/1.1 200", 12) != 0) { md_socket_close(fd); return -1; }
     return fd;
 }
 
 /* Read one SSE frame (to the blank line); false on EOF/timeout. */
-static bool sse_read_frame(int fd, char *buf, size_t cap)
+static bool sse_read_frame(MdSocket fd, char *buf, size_t cap)
 {
     size_t total = 0;
     buf[0] = 0;
@@ -1380,7 +1392,7 @@ static void test_live_authorizer(void)
     /* SSE admitted by the live source is dropped at the next broadcast after
      * revocation; the notification itself is withheld. */
     h = loopback_auth(port, "GET", false, false);
-    int sse = sse_connect_auth(port, h);
+    MdSocket sse = sse_connect_auth(port, h);
     free(h);
     MD_CHECK(sse >= 0);
     if (sse >= 0) {
@@ -1392,7 +1404,7 @@ static void test_live_authorizer(void)
         MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":2}", 7) == 0);
         MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
         MD_CHECK(!sse_read_frame(sse, frame, sizeof(frame)) && !strstr(frame, "n\":2"));
-        close(sse);
+        md_socket_close(sse);
     }
     h = loopback_auth(port, "POST", false, false);
     MD_CHECK(auth_status(port, "POST", "/mcp", "localhost", h, NULL) == 401);
@@ -1437,7 +1449,7 @@ static void test_live_authorizer(void)
         MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":3}", 7) == 0);
         MD_CHECK(sse_read_frame(sse, frame, sizeof(frame)) && strstr(frame, "{\"n\":3}"));
         MD_CHECK(md_mcp_http_sse_client_count(http) == 1);
-        close(sse);
+        md_socket_close(sse);
     }
     shutdown_http(http);
     pthread_join(tid, NULL);
@@ -1560,16 +1572,17 @@ static MdMcpServer *make_caps_server(void)
     return mcp;
 }
 
+#ifndef _WIN32
 static void test_per_principal_tool_caps(void)
 {
     char *pk1 = nostr_key_get_public(auth_sk);
     char *npub2 = npub_for(auth_sk2);
     MD_CHECK(pk1 && npub2);
     char token_path[] = "/tmp/md-http-caps-XXXXXX";
-    int fd = mkstemp(token_path);
+    MdSocket fd = mkstemp(token_path);
     MD_CHECK(fd >= 0);
     MD_CHECK(write(fd, "caps-secret\n", 12) == 12);
-    close(fd);
+    md_socket_close(fd);
     LiveAcl acl = { .mu = PTHREAD_MUTEX_INITIALIZER };
     MdMcpServer *mcp = make_caps_server();
     const char *npubs[] = { npub2 };
@@ -1635,7 +1648,7 @@ static void test_per_principal_tool_caps(void)
      * grant keeps agent, dropped once it does not. */
     live_acl_set_caps(&acl, pk1, MD_CAP_AGENT | MD_CAP_INPUT);
     char *h = loopback_auth(port, "GET", false, false);
-    int sse = sse_connect_auth(port, h);
+    MdSocket sse = sse_connect_auth(port, h);
     free(h);
     MD_CHECK(sse >= 0);
     if (sse >= 0) {
@@ -1648,7 +1661,7 @@ static void test_per_principal_tool_caps(void)
         MD_CHECK(md_mcp_http_send_sse(http, "message", "{\"n\":2}", 7) == 0);
         MD_CHECK(md_mcp_http_sse_client_count(http) == 0);
         MD_CHECK(!sse_read_frame(sse, frame, sizeof(frame)) && !strstr(frame, "n\":2"));
-        close(sse);
+        md_socket_close(sse);
     }
     shutdown_http(http);
     pthread_join(tid, NULL);
@@ -1670,6 +1683,7 @@ static void test_per_principal_tool_caps(void)
     PASS("per-principal caps: live agent-only hides/refuses actions, grant changes apply "
          "next request, static/bearer/open full, SSE recheck needs agent");
 }
+#endif
 
 static void test_unauthenticated_guards_and_read_budget(void)
 {
@@ -1687,7 +1701,7 @@ static void test_unauthenticated_guards_and_read_budget(void)
     MD_CHECK(auth_status(port, "GET", "/healthz", "localhost", NULL, NULL) == 200);
     /* No Host hidden inside X-Host; no Content-Length hidden in X-* either. */
     MD_CHECK(auth_status(port, "POST", "/mcp", NULL, NULL, "X-Host: localhost\r\n") == 403);
-    int fd = tcp_connect(port);
+    MdSocket fd = tcp_connect(port);
     MD_CHECK(fd >= 0);
     const char *partial = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{";
     int64_t start = md_now_ms();
@@ -1697,7 +1711,7 @@ static void test_unauthenticated_guards_and_read_budget(void)
     ssize_t n = read(fd, response, sizeof(response)-1);
     MD_CHECK(n > 0 && strstr(response, "400 Bad Request") != NULL);
     MD_CHECK(md_now_ms() - start < 3000);
-    close(fd);
+    md_socket_close(fd);
     shutdown_http(http);
     pthread_join(tid, NULL);
     md_mcp_http_destroy(http);
@@ -1766,7 +1780,7 @@ static void watch_acl_readiness(WatchAcl *acl, bool known)
 }
 
 /* Exactly one SSE frame, read byte-wise so a queued next frame stays put. */
-static bool sse_next_frame(int fd, char *buf, size_t cap)
+static bool sse_next_frame(MdSocket fd, char *buf, size_t cap)
 {
     size_t total = 0;
     buf[0] = 0;
@@ -1781,7 +1795,7 @@ static bool sse_next_frame(int fd, char *buf, size_t cap)
 }
 
 /* The server closed fd: EOF/reset with nothing before it; a timeout fails. */
-static bool sse_closed(int fd)
+static bool sse_closed(MdSocket fd)
 {
     char c;
     return md_test_wait_readable(fd, 3000) == 1 && read(fd, &c, 1) <= 0;
@@ -1789,7 +1803,7 @@ static bool sse_closed(int fd)
 
 /* Broadcast sync frame n; stream i must have received exactly want[i]
  * list_changed frames since the previous sync (they precede this one). */
-static void expect_list_changes(MdMcpHttp *http, const int *fds, const int *want,
+static void expect_list_changes(MdMcpHttp *http, const MdSocket *fds, const int *want,
                                 int count, int n)
 {
     char sync[32], frame[512];
@@ -1809,13 +1823,14 @@ static void expect_list_changes(MdMcpHttp *http, const int *fds, const int *want
     }
 }
 
+#ifndef _WIN32
 static void test_grant_change_list_changed(void)
 {
     char token_path[] = "/tmp/md-http-watch-XXXXXX";
     int tfd = mkstemp(token_path);
     MD_CHECK(tfd >= 0);
     MD_CHECK(write(tfd, "watch-secret\n", 13) == 13);
-    close(tfd);
+    md_socket_close(tfd);
     char *pk1 = nostr_key_get_public(auth_sk);
     char *pk2 = nostr_key_get_public(auth_sk2);
     MD_CHECK(pk1 && pk2);
@@ -1851,7 +1866,7 @@ static void test_grant_change_list_changed(void)
     cJSON_Delete(resp);
 
     /* Streams: A (pk1, agent+input), B (pk2, agent), T (bearer). */
-    int fds[3];
+    MdSocket fds[3];
     for (int i = 0; i < 2; i++) {
         char *h = loopback_auth(port, "GET", i == 1, false);
         fds[i] = sse_connect_auth(port, h);
@@ -1860,7 +1875,7 @@ static void test_grant_change_list_changed(void)
     fds[2] = sse_connect_auth(port, "Bearer watch-secret");
     MD_CHECK(fds[0] >= 0 && fds[1] >= 0 && fds[2] >= 0);
     if (fds[0] < 0 || fds[1] < 0 || fds[2] < 0) {
-        for (int i = 0; i < 3; i++) if (fds[i] >= 0) close(fds[i]);
+        for (int i = 0; i < 3; i++) if (fds[i] >= 0) md_socket_close(fds[i]);
         shutdown_http(http);
         pthread_join(tid, NULL);
         md_mcp_http_destroy(http);
@@ -1894,7 +1909,7 @@ static void test_grant_change_list_changed(void)
     watch_acl_change(&acl, 1, MD_CAP_INPUT);
     MD_CHECK(md_mcp_http_sse_client_count(http) == 2);
     MD_CHECK(sse_closed(fds[1]));
-    int live[2] = { fds[0], fds[2] };
+    MdSocket live[2] = { fds[0], fds[2] };
     expect_list_changes(http, live, (int[]){0, 0}, 2, 6);
 
     /* Quiesced (teardown): no new notification, but revocation still closes. */
@@ -1906,7 +1921,7 @@ static void test_grant_change_list_changed(void)
     MD_CHECK(sse_closed(fds[0]));
     expect_list_changes(http, &fds[2], (int[]){0}, 1, 8);
 
-    for (int i = 0; i < 3; i++) close(fds[i]);
+    for (int i = 0; i < 3; i++) md_socket_close(fds[i]);
     shutdown_http(http);
     pthread_join(tid, NULL);
     md_mcp_http_destroy(http);
@@ -1932,6 +1947,7 @@ static void test_grant_change_list_changed(void)
     PASS("grant change: one targeted list_changed per tool-set change, none for no-op/"
          "bearer/other principals, revocation closes, quiesce/teardown safe");
 }
+#endif
 
 static void wait_sse_count(MdMcpHttp *http, int want)
 {
@@ -1944,13 +1960,14 @@ static void wait_sse_count(MdMcpHttp *http, int want)
 /* md-554: while the live source cannot answer, its streams are held (open,
  * sent nothing) and its principals refused; the first known answer closes,
  * notifies or silently resumes each one. Bearer streams are unaffected. */
+#ifndef _WIN32
 static void test_grant_outage_holds_streams(void)
 {
     char token_path[] = "/tmp/md-http-hold-XXXXXX";
     int tfd = mkstemp(token_path);
     MD_CHECK(tfd >= 0);
     MD_CHECK(write(tfd, "hold-secret\n", 12) == 12);
-    close(tfd);
+    md_socket_close(tfd);
     char *pk1 = nostr_key_get_public(auth_sk);
     char *pk2 = nostr_key_get_public(auth_sk2);
     MD_CHECK(pk1 && pk2);
@@ -1978,7 +1995,7 @@ static void test_grant_outage_holds_streams(void)
     MD_CHECK(status == 200);
 
     /* Streams: A (pk1, agent+input), B (pk2, agent), T (bearer). */
-    int fds[5] = { -1, -1, -1, -1, -1 };
+    MdSocket fds[5] = { -1, -1, -1, -1, -1 };
     for (int i = 0; i < 2; i++) {
         char *h = loopback_auth(port, "GET", i == 1, false);
         fds[i] = sse_connect_auth(port, h);
@@ -2026,7 +2043,7 @@ static void test_grant_outage_holds_streams(void)
     watch_acl_readiness(&acl, true);
     MD_CHECK(md_mcp_http_sse_client_count(http) == 2);
     MD_CHECK(sse_closed(fds[1]));
-    int live[3] = { fds[0], fds[2], -1 };
+    MdSocket live[3] = { fds[0], fds[2], -1 };
     expect_list_changes(http, live, (int[]){1, 0}, 2, 2);
     /* Another wake-up with the same answer: nothing more. */
     watch_acl_readiness(&acl, true);
@@ -2037,20 +2054,20 @@ static void test_grant_outage_holds_streams(void)
     fds[3] = sse_connect_auth(port, "Bearer hold-secret");
     MD_CHECK(fds[3] >= 0);
     wait_sse_count(http, 3);
-    int extra = sse_connect_auth(port, "Bearer hold-secret");
+    MdSocket extra = sse_connect_auth(port, "Bearer hold-secret");
     MD_CHECK(extra < 0);
-    if (extra >= 0) close(extra);
+    if (extra >= 0) md_socket_close(extra);
     watch_acl_readiness(&acl, false);
     fds[4] = sse_connect_auth(port, "Bearer hold-secret");
     MD_CHECK(fds[4] >= 0);
     MD_CHECK(sse_closed(fds[0]));
     wait_sse_count(http, 3);
     watch_acl_readiness(&acl, true);
-    int bearers[3] = { fds[2], fds[3], fds[4] };
+    MdSocket bearers[3] = { fds[2], fds[3], fds[4] };
     expect_list_changes(http, bearers, (int[]){0, 0, 0}, 3, 4);
 
 out:
-    for (int i = 0; i < 5; i++) if (fds[i] >= 0) close(fds[i]);
+    for (int i = 0; i < 5; i++) if (fds[i] >= 0) md_socket_close(fds[i]);
     shutdown_http(http);
     pthread_join(tid, NULL);
     md_mcp_http_destroy(http);
@@ -2059,6 +2076,7 @@ out:
     PASS("allowlist outage: live streams held (no frames, no close), live requests refused; "
          "recovery resumes, notifies once or closes; held slots yield to bearer");
 }
+#endif
 
 /* ── Main ────────────────────────────────────────────────────── */
 
@@ -2066,12 +2084,39 @@ int main(void)
 {
     printf("test_mcp_http: HTTP+SSE transport tests\n");
 
+#ifndef _WIN32
     test_auth_configuration();
+#else
+    puts("SKIP: test_auth_configuration requires POSIX bearer-token permissions");
+#endif
+#ifndef _WIN32
     test_http_auth();
+#else
+    puts("SKIP: test_http_auth requires POSIX bearer-token permissions");
+#endif
+#ifdef _WIN32
+    MdMcpServer *token_server = make_mcp_server();
+    MdMcpHttpConfig token_config = { .server = token_server,
+        .token_file = __FILE__, .ephemeral_port = true };
+    MD_CHECK(md_mcp_http_create(&token_config) == NULL);
+    md_mcp_server_destroy(token_server);
+#endif
     test_live_authorizer();
+#ifndef _WIN32
     test_per_principal_tool_caps();
+#else
+    puts("SKIP: test_per_principal_tool_caps requires POSIX bearer-token permissions");
+#endif
+#ifndef _WIN32
     test_grant_change_list_changed();
+#else
+    puts("SKIP: test_grant_change_list_changed requires POSIX bearer-token permissions");
+#endif
+#ifndef _WIN32
     test_grant_outage_holds_streams();
+#else
+    puts("SKIP: test_grant_outage_holds_streams requires POSIX bearer-token permissions");
+#endif
     test_unauthenticated_guards_and_read_budget();
     test_create_null();
     test_create_invalid_bind_addr();

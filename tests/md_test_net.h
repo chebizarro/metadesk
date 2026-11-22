@@ -10,15 +10,15 @@
 #define MD_TEST_NET_H
 
 #include <errno.h>
-#include <poll.h>
+#include "md_socket.h"
 #include <unistd.h>
 
-static int md_test_wait_readable(int fd, int timeout_ms)
+static int md_test_wait_readable(MdSocket fd, int timeout_ms)
 {
     int waited = 0;
     for (;;) {
-        struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 50);
+        MdPollFd pfd = { .fd = fd, .events = POLLIN };
+        int pr = md_socket_poll(&pfd, 1, 50);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return -1;

@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <arpa/inet.h>
+#include "md_socket.h"
 #include "md_test.h"
 typedef struct FipsAddrVector {
     const char *name;

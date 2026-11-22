@@ -1,3 +1,4 @@
+#include "md_compat.h"
 /*
  * metadesk — mcp_proxy.c
  * `metadesk-host mcp-proxy`: stdio <-> Streamable-HTTP MCP shim that signs
@@ -518,7 +519,9 @@ int md_host_mcp_proxy_cli(int argc, char **argv) {
     int signer_flags = !!key_file + socket_signer + dbus_signer + !!bunker;
     if (!url || signer_flags > 1 || !valid_url(url)) return usage();
 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     MdAccountStartup account = {0};
     MdSigner *signer = NULL;
     if (key_file) signer = key_file_signer(key_file);

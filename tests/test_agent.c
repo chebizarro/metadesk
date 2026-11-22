@@ -3,7 +3,7 @@
  * Agent action handler tests.
  *
  * Tests the action parsing → target resolution → injection → delta pipeline.
- * AT-SPI2 and uinput may not be available in CI, so tests degrade gracefully.
+ * Live accessibility requires explicit opt-in; unit tests never create input devices.
  */
 #include "agent.h"
 #include "action.h"
@@ -164,22 +164,26 @@ static int test_handle_action_no_deps(void) {
 
 /* ── Test: action count tracking ─────────────────────────────── */
 
-static int test_with_live_deps(void) {
-    printf("  test_with_live_deps... ");
+static int test_with_live_a11y(void) {
+    printf("  test_with_live_a11y... ");
 
-    /* Try to create real a11y and input contexts */
+    const char *live = getenv("MD_A11Y_LIVE_TESTS");
+    if (!live || strcmp(live, "1")) {
+        printf("SKIP (requires explicit live accessibility opt-in)\n");
+        return 0;
+    }
+
+    /* This tree-only check never needs a platform input device. */
     MdA11yCtx *a11y = md_a11y_create();
-    MdInput *input = md_input_create(NULL);
 
     if (!a11y) {
         printf("SKIP (no accessibility bus)\n");
-        if (input) md_input_destroy(input);
         return 0;
     }
 
     MdAgentConfig cfg = {
         .a11y        = a11y,
-        .input       = input,
+        .input       = NULL,
         .tree_format = MD_TREE_FORMAT_COMPACT,
         .settle_ms   = 10,
     };
@@ -195,7 +199,6 @@ static int test_with_live_deps(void) {
 
     md_agent_destroy(agent);
     md_a11y_destroy(a11y);
-    if (input) md_input_destroy(input);
 
     printf("OK\n");
     return 0;
@@ -648,7 +651,7 @@ int main(void) {
     failures += test_create_destroy();
     failures += test_null_config();
     failures += test_handle_action_no_deps();
-    failures += test_with_live_deps();
+    failures += test_with_live_a11y();
     failures += test_tree_format_config();
     failures += test_send_tree_delta_null_stream();
     failures += test_handle_various_actions();

@@ -13,17 +13,15 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
 #include "md_test.h"
+#include "md_socket.h"
 typedef struct {
-    int listen_fd;
+    MdSocket listen_fd;
     int failures;
     int requests;
 } MockSecretsServer;
 
-static void mock_write_response(int fd, const char *body) {
+static void mock_write_response(MdSocket fd, const char *body) {
     char header[256];
     int hlen = snprintf(header, sizeof(header),
                         "HTTP/1.1 200 OK\r\n"
@@ -32,8 +30,8 @@ static void mock_write_response(int fd, const char *body) {
                         "Connection: close\r\n"
                         "\r\n",
                         strlen(body));
-    write(fd, header, (size_t)hlen);
-    write(fd, body, strlen(body));
+    md_socket_send(fd, header, (size_t)hlen, 0);
+    md_socket_send(fd, body, strlen(body), 0);
 }
 
 static void *mock_secrets_server_thread(void *arg) {
@@ -59,17 +57,17 @@ static void *mock_secrets_server_thread(void *arg) {
             break;
         }
 
-        int fd = accept(srv->listen_fd, NULL, NULL);
+        MdSocket fd = md_socket_accept(srv->listen_fd, NULL, NULL);
         if (fd < 0) {
             srv->failures++;
             break;
         }
 
         char req[2048];
-        ssize_t n = read(fd, req, sizeof(req) - 1);
+        ssize_t n = md_socket_recv(fd, req, sizeof(req) - 1, 0);
         if (n <= 0) {
             srv->failures++;
-            close(fd);
+            md_socket_close(fd);
             continue;
         }
         req[n] = '\0';
@@ -81,24 +79,24 @@ static void *mock_secrets_server_thread(void *arg) {
         }
         srv->requests++;
         mock_write_response(fd, bodies[i]);
-        close(fd);
+        md_socket_close(fd);
     }
 
-    close(srv->listen_fd);
+    md_socket_close(srv->listen_fd);
     return NULL;
 }
 
 static int run_mock_secret_fetch(uint8_t *buf, size_t buf_len,
                                  int *server_failures) {
     MockSecretsServer srv = { .listen_fd = -1, .failures = 0, .requests = 0 };
-    srv.listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    srv.listen_fd = md_socket_open(AF_INET6, SOCK_STREAM, 0);
     if (srv.listen_fd < 0)
         return -999;
 
     int opt = 1;
-    setsockopt(srv.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    md_socket_setopt(srv.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     int off = 0;
-    setsockopt(srv.listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    md_socket_setopt(srv.listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
     struct sockaddr_in6 addr = {0};
     addr.sin6_family = AF_INET6;
@@ -106,19 +104,19 @@ static int run_mock_secret_fetch(uint8_t *buf, size_t buf_len,
     addr.sin6_addr = in6addr_loopback;
     if (bind(srv.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
         listen(srv.listen_fd, 4) < 0) {
-        close(srv.listen_fd);
+        md_socket_close(srv.listen_fd);
         return -999;
     }
 
     socklen_t addr_len = sizeof(addr);
     if (getsockname(srv.listen_fd, (struct sockaddr *)&addr, &addr_len) < 0) {
-        close(srv.listen_fd);
+        md_socket_close(srv.listen_fd);
         return -999;
     }
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, mock_secrets_server_thread, &srv) != 0) {
-        close(srv.listen_fd);
+        md_socket_close(srv.listen_fd);
         return -999;
     }
 
@@ -130,7 +128,7 @@ static int run_mock_secret_fetch(uint8_t *buf, size_t buf_len,
         ret = md_secrets_get(s, "op://Vault/my item/password", buf, buf_len);
         md_secrets_destroy(s);
     } else {
-        close(srv.listen_fd);
+        md_socket_close(srv.listen_fd);
     }
 
     pthread_join(tid, NULL);
