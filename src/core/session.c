@@ -628,3 +628,20 @@ bool md_session_reject_matches_request(const MdSessionReject *reject,
         md_session_reject_message(reject) && req->issued_at > 0 &&
         rumor_created_at >= req->issued_at - MD_SESSION_CLOCK_SKEW_S;
 }
+
+int md_session_cancel_from_json(const char *json, char request_id[MD_SESSION_REQUEST_ID_LEN + 1]) {
+    if (!json || !request_id || strlen(json) > MD_SESSION_JSON_MAX) return -1;
+    request_id[0] = 0;
+    cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
+    if (!root) return -1;
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+    bool ok = cJSON_IsObject(root) && cJSON_GetArraySize(root) == 3 &&
+        cJSON_IsString(type) && !strcmp(type->valuestring, "session_cancel") &&
+        cJSON_IsNumber(v) && v->valuedouble == 1 &&
+        cJSON_IsString(id) && is_request_id(id->valuestring);
+    if (ok) memcpy(request_id, id->valuestring, MD_SESSION_REQUEST_ID_LEN + 1);
+    cJSON_Delete(root);
+    return ok ? 0 : -1;
+}

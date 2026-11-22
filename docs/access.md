@@ -244,8 +244,8 @@ metadesk-client --npub "$HOST_NPUB" --relay "$RELAY" --port 7400
 Use `--no-capture --no-input` on a test host and `--no-display` on a headless
 client to validate authorization/binding without a desktop. Do not replace the
 client's `--npub` with a direct IP: the inherited direct-IP client path does not
-negotiate the required session proof. A new host negotiation/startup is needed
-for a new stream after disconnect. Direct unauthenticated TCP remains disabled.
+negotiate the required session proof. A fresh host negotiation is needed for every new stream; the host rearms its
+existing subscription after disconnect. Direct unauthenticated TCP remains disabled.
 
 ## Private validation
 
@@ -327,3 +327,14 @@ qualification. Run directly with:
 ```sh
 python3 tests/access_private_session.py BUILD/metadesk-host BUILD/metadesk-client BUILD/access_signer_fixture
 ```
+
+## Attended approval and session management
+
+Explicit `--attended` adds bounded local approve-once / approve-and-remember /
+deny decisions without opening the default policy. `metadesk-host requests` and
+`metadesk-host session` use same-user, credential-verified management IPC; they
+never export stream tokens. Remember reuses the private acknowledged writer
+described above. See [host management](host-management.md) for startup, CLI,
+request expiry/cancellation, kick completion, protocol version 1 for md-a9f2,
+platform support, and validation boundaries. Windows attended management fails
+unsupported pending md-wmo6; there is no insecure fallback.

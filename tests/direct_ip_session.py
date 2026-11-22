@@ -166,14 +166,33 @@ def run(host, client, crypto):
             print("PASS: signer-equipped host has no direct listener before negotiation")
             args = [client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
                     "--port", str(proxy.server_address[1]), "--no-display", "--relay", url]
+            def assert_unauthorized_no_tcp():
+                # This is the fail-closed/no-dial gate, not denial-delivery
+                # qualification. The deliberately short watchdog can win while
+                # the signer drains retained history under sanitizers. Require
+                # the host's correlated refusal AND no TCP attempt/traffic;
+                # test_host_approval.py separately requires delivered denial.
+                with proxy.lock:
+                    before = len(proxy.proofs)
+                denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
+                                         str(root / "host.sock")], env=env,
+                                        capture_output=True, text=True, timeout=20)
+                assert denied.returncode == 1, denied
+                assert any(reason in denied.stderr for reason in (
+                    "host refused session", "timed out waiting for session accept")), denied
+                request_line = next(line for line in denied.stdout.splitlines()
+                                    if "sending session request DM (request_id=" in line)
+                prefix = request_line.split("request_id=", 1)[1][:8]
+                assert len(prefix) == 8 and all(c in "0123456789abcdef" for c in prefix)
+                hp.wait("refused session request " + prefix)
+                assert f"client: connecting to 127.0.0.1:{proxy.server_address[1]}" not in denied.stdout, denied
+                assert "client: receiving stream" not in denied.stdout, denied
+                with proxy.lock:
+                    assert len(proxy.proofs) == before, "unauthorized client reached TCP"
+                assert hp.p.poll() is None
             # Host identity itself is not in its allowlist: signed != authorized.
-            denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
-                                     str(root / "host.sock")], env=env,
-                                    capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "timed out waiting for session accept" in denied.stderr, denied
-            hp.wait("non-allowlisted pubkey")
-            assert not proxy.proofs, "unauthorized client reached TCP"
-            print("PASS: non-allowlisted signed client is refused before TCP")
+            assert_unauthorized_no_tcp()
+            print("PASS: correlated host refusal; non-allowlisted signed client never dials TCP")
             cp = Process([*args, "--timeout", "5000", "--socket-signer", str(root / "client.sock")], env)
             children.append(cp)
             cp.wait("client: receiving stream")
@@ -218,13 +237,8 @@ def run(host, client, crypto):
             assert cp.p.poll() is None and hp.p.poll() is None
             cp.stop()
             hp.wait("ready for next authorized session request", count=2)
-            # Keep admission idle across multiple shutdown-check wakeups;
-            # unauthenticated activity cannot expire or consume the next grant.
-            denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
-                                     str(root / "host.sock")], env=env,
-                                    capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "timed out waiting for session accept" in denied.stderr, denied
-            assert hp.p.poll() is None
+            # A correlated unauthorized request cannot consume the next grant.
+            assert_unauthorized_no_tcp()
             # Also exercise positional syntax straight to the native host
             # listener, with no fault proxy anywhere in this connection.
             cp2 = Process([client, "127.0.0.1", "--npub", HOST_NPUB,
