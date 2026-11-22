@@ -97,13 +97,18 @@ static void *retry_control(void *data) {
     RetryControl *srv = data;
     for (unsigned i = 0; i < srv->count; i++) {
         struct pollfd pfd = {.fd = srv->fd, .events = POLLIN};
-        MD_CHECK(poll(&pfd, 1, 5000) > 0);
+        int ready = poll(&pfd, 1, 5000);
+        MD_CHECK(ready > 0);
+        if (ready <= 0) return NULL;
         int fd = accept(srv->fd, NULL, NULL);
         MD_CHECK(fd >= 0);
+        if (fd < 0) return NULL;
         char request[1024] = {0};
         size_t n = 0;
         while (n + 1 < sizeof(request)) {
-            MD_CHECK(read(fd, request + n, 1) == 1);
+            ssize_t received = read(fd, request + n, 1);
+            MD_CHECK(received == 1);
+            if (received != 1) { close(fd); return NULL; }
             if (request[n++] == '\n') break;
         }
         MD_CHECK(strstr(request, "show_peers"));
@@ -149,6 +154,91 @@ MdStream *test_fips_dial(const char *npub, uint16_t port, uint32_t timeout) {
 }
 #endif
 
+typedef struct { MdStream *peer; ClientCtx *ctx; } BindCancel;
+static void *cancel_after_bind(void *data) {
+    BindCancel *job = data;
+    MdPacketHeader hdr;
+    uint8_t *payload = NULL;
+    MD_CHECK(md_stream_recv(job->peer, &hdr, &payload, 2000) == 0);
+    MD_CHECK(hdr.type == MD_PKT_SESSION_INFO);
+    free(payload);
+    cancel_client_connect(job->ctx);
+    return NULL;
+}
+static void test_bind_cancel(void) {
+    MdStreamServer *server = md_stream_server_create("::1", 0);
+    MD_CHECK(server);
+    MdStream *client = md_stream_connect("::1", md_stream_server_port(server), 1000);
+    MD_CHECK(client);
+    MdStream *peer = md_stream_server_accept(server, 1000);
+    MD_CHECK(peer);
+    md_stream_server_destroy(server);
+    ClientCtx ctx = {.cancel_ch = go_channel_create(1),
+                     .request_started_us = now_us(), .granted_caps = MD_CAP_VIDEO};
+    snprintf(ctx.accepted_session_id, sizeof(ctx.accepted_session_id), "w6-binding");
+    memset(ctx.stream_token, 'a', 64);
+    BindCancel job = {peer, &ctx};
+    pthread_t thread;
+    MD_CHECK(pthread_create(&thread, NULL, cancel_after_bind, &job) == 0);
+    int64_t start = now_us();
+    MD_CHECK(bind_client_stream(client, &ctx) < 0);
+    MD_CHECK(now_us() - start < 2000000); /* cancellation, not five-second ACK timeout */
+    pthread_join(thread, NULL);
+    MD_CHECK(ctx.cancel_connect && !ctx.binding_stream);
+    md_stream_destroy(client); md_stream_destroy(peer);
+    go_channel_unref(ctx.cancel_ch);
+}
+
+static void test_overlay_controls(void) {
+    /* Real SDL + ImGui, isolated software window, no host input backend. */
+    SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    MD_CHECK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) == 0);
+    SDL_Window *window = SDL_CreateWindow("W6 overlay test", 0, 0, 640, 480, SDL_WINDOW_HIDDEN);
+    MD_CHECK(window);
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    MD_CHECK(renderer);
+    MdOverlay *overlay = md_overlay_create(window, renderer);
+    MD_CHECK(overlay);
+    SDL_Event key = {.type = SDL_KEYDOWN};
+    key.key.keysym.sym = SDLK_F1;
+    key.key.keysym.scancode = SDL_SCANCODE_F1;
+    MD_CHECK(md_overlay_handle_sdl_event(overlay, &key));
+    key.key.repeat = 1;
+    MD_CHECK(md_overlay_handle_sdl_event(overlay, &key));
+    key.key.repeat = 0; key.key.keysym.sym = SDLK_ESCAPE;
+    key.key.keysym.scancode = SDL_SCANCODE_ESCAPE;
+    MD_CHECK(md_overlay_handle_sdl_event(overlay, &key));
+    key.type = SDL_KEYUP;
+    MD_CHECK(md_overlay_handle_sdl_event(overlay, &key));
+    key.key.keysym.sym = SDLK_a;
+    key.key.keysym.scancode = SDL_SCANCODE_A;
+    MD_CHECK(!md_overlay_handle_sdl_event(overlay, &key));
+    MD_CHECK(md_overlay_take_action(overlay) == MD_OVERLAY_NONE);
+    for (unsigned phase = MD_CLIENT_IDLE; phase <= MD_CLIENT_BACKOFF; phase++) {
+        MdOverlayStats stats = {.phase = phase, .error = MD_CLIENT_ERROR_TRANSPORT,
+            .connected = phase == MD_CLIENT_STREAMING,
+            .granted_caps = MD_CAP_VIDEO | MD_CAP_INPUT};
+        md_overlay_new_frame(overlay);
+        md_overlay_render(overlay, &stats);
+        MD_CHECK(md_client_phase_label(phase)[0]);
+    }
+    MD_CHECK(strstr(md_client_error_label(MD_CLIENT_ERROR_ADMISSION), "authorization"));
+    ClientCtx ctx = {.stream = (MdStream *)(uintptr_t)1,
+        .shown = {640, 480, 99}, .uploaded = {640, 480, 99}, .input_seq = 12,
+        .ui_tree_json = strdup("old tree"), .ui_tree_len = 8};
+    reset_client_video(&ctx);
+    MD_CHECK(!ctx.stream && !ctx.shown.w && !ctx.uploaded.w && !ctx.input_seq);
+    MD_CHECK(!ctx.ui_tree_json && !ctx.ui_tree_len);
+    /* Pending UI cancellation wakes the exact same select as shutdown. */
+    ctx.cancel_ch = go_channel_create(1);
+    ctx.cancel_connect = true;
+    go_channel_close(ctx.cancel_ch);
+    MD_CHECK(wait_client_backoff(&ctx, 30000) < 0);
+    go_channel_unref(ctx.cancel_ch);
+    md_overlay_destroy(overlay);
+    SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();
+}
+
 int main(void) {
     const char *reasons[] = {"capture_unavailable", "request_refused"};
     for (unsigned i = 0; i < 2; i++) {
@@ -173,5 +263,7 @@ int main(void) {
     test_pending_shutdown();
     test_fips_retry();
 #endif
+    test_bind_cancel();
+    test_overlay_controls();
     return md_test_report();
 }

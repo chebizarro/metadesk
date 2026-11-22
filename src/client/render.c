@@ -360,6 +360,13 @@ int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
     return 0;
 }
 
+void md_renderer_reset_frame(MdRenderer *r) {
+    if (!r) return;
+    SDL_DestroyTexture(r->texture);
+    r->texture = NULL;
+    r->tex_width = r->tex_height = 0;
+}
+
 int md_renderer_poll_events(MdRenderer *r) {
     if (!r || !r->open)
         return -1;
@@ -377,7 +384,7 @@ int md_renderer_poll_events(MdRenderer *r) {
 
         case SDL_KEYDOWN:
         case SDL_KEYUP:
-            if (event.key.keysym.sym == SDLK_ESCAPE && event.type == SDL_KEYDOWN) {
+            if (!r->event_cb && event.key.keysym.sym == SDLK_ESCAPE && event.type == SDL_KEYDOWN) {
                 r->open = false;
                 return -1;
             }
