@@ -486,7 +486,8 @@ int (*Uninitialize) (ISVCEncoder*);
 int (*EncodeFrame) (ISVCEncoder*, const SSourcePicture* kpSrcPic, SFrameBSInfo* pBsInfo);
 int (*EncodeParameterSets) (ISVCEncoder*, SFrameBSInfo* pBsInfo);
 
-int (*ForceIntraFrame) (ISVCEncoder*, bool bIDR);
+/* Local ABI correction: match the C++ declaration above (OpenH264 2.7.0). */
+int (*ForceIntraFrame) (ISVCEncoder*, bool bIDR, int iLayerId);
 
 int (*SetOption) (ISVCEncoder*, ENCODER_OPTION eOptionId, void* pOption);
 int (*GetOption) (ISVCEncoder*, ENCODER_OPTION eOptionId, void* pOption);

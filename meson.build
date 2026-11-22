@@ -374,6 +374,7 @@ dep_curl = dependency('libcurl', version : '>=7.80', required : true)
 # Each platform provides: capture, a11y, and input backend source files + deps.
 
 platform_hal_sources = []
+core_private_deps = []
 platform_hal_deps = []
 
 if host_os == 'linux'
@@ -405,19 +406,17 @@ elif host_os == 'darwin'
     'src/core/input_cgevent.m',
     'src/core/ipc_unix.c',
   )
-  # macOS uses system frameworks — link via add_project_link_arguments
+  # macOS HAL uses system frameworks, linked privately below.
   # ObjC files use ARC for correct memory management of SCK/Foundation objects
   add_project_arguments('-fobjc-arc', language : 'objc')
 
-  add_project_link_arguments(
-    '-framework', 'ScreenCaptureKit',
-    '-framework', 'CoreGraphics',
-    '-framework', 'AppKit',
-    '-framework', 'CoreMedia',
-    '-framework', 'CoreVideo',
-    '-framework', 'ApplicationServices',
-    language : ['c', 'cpp', 'objc'],
-  )
+  # These frameworks implement the private HAL, not the public C interface.
+  # Do not inject them into every consumer's link command: doing so changes
+  # Darwin's symbol-provider selection and can bind clocks to libnsync.
+  core_private_deps += dependency('appleframeworks', modules : [
+    'ScreenCaptureKit', 'CoreGraphics', 'AppKit', 'CoreMedia', 'CoreVideo',
+    'ApplicationServices',
+  ])
 
 elif host_os == 'windows'
   platform_hal_sources += files(
@@ -734,7 +733,7 @@ core_sources = files(
   'src/core/capture.c',
   'src/core/encode.c',
   'src/core/encoder_chain.c',
-  'src/core/encode_openh264.cpp',
+  'src/core/encode_openh264.c',
     'src/core/bitrate_ctrl.c',
     'src/core/decode.c',
   'src/core/a11y.c',
@@ -778,11 +777,8 @@ core_sources += platform_hal_sources
 mcp_c_args = ['-DMD_MCP_BRIDGE_VERSION="' + meson.project_version() + '"']
 
 libmetadesk = shared_library('metadesk', core_sources,
-  # Preserve Darwin's C link driver: its C++ driver moves -lSystem
-  # behind nsync, reintroducing md-5aua's wall-clock symbol interposition.
-  link_language : host_os == 'darwin' ? 'c' : 'cpp',
   include_directories : core_inc,
-  dependencies : core_deps,
+  dependencies : core_deps + core_private_deps,
   c_args : signer_c_args + mcp_c_args + accounts_c_args,
   install : true,
   version : meson.project_version(),
@@ -1020,12 +1016,17 @@ test_encoder_chain = executable('test_encoder_chain',
   files('tests/test_encoder_chain.c', 'src/core/encoder_chain.c'),
   include_directories : core_inc)
 test('encoder chain policy', test_encoder_chain)
-fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.cpp',
+fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.c',
   include_directories : core_inc, install : false)
 test_encoder_loader = executable('test_encoder_loader', 'tests/test_encoder_loader.c',
   dependencies : dep_metadesk)
 test('OpenH264 rejects incompatible ABI', test_encoder_loader, args : [fake_openh264.full_path()])
 test('OpenH264 rejects missing explicit library', test_encoder_loader)
+if host_os != 'windows'
+  test('FFmpeg Windows patch wiring (fixtures)', find_program('python3'),
+    args : [files('tests/test_ffmpeg_packaging.py')], timeout : 30)
+endif
+
 
 # md-ezto/md-pvlj: encoder size + input bounds follow capture restarts.
 test_capture_sync = executable('test_capture_sync',
@@ -1187,7 +1188,7 @@ test('action parse/encode', test_action)
 
 test_capture = executable('test_capture',
   files('tests/test_capture.c'),
-  dependencies : [dep_metadesk],
+  dependencies : [dep_metadesk] + core_private_deps,
 )
 test('capture convenience API', test_capture)
 
@@ -1195,14 +1196,14 @@ test('capture convenience API', test_capture)
 if host_os == 'darwin'
   test_capture_sck = executable('test_capture_sck',
     files('tests/test_capture_sck.m'),
-    dependencies : [dep_metadesk],
+    dependencies : [dep_metadesk] + core_private_deps,
   )
   test('ScreenCaptureKit system stop', test_capture_sck, timeout : 30)
   test_axui_hit = executable('test_axui_hit', files('tests/test_axui_hit.m'),
-    dependencies : [dep_metadesk])
+    dependencies : [dep_metadesk] + core_private_deps)
   test('AX native hit adapter', test_axui_hit)
   test_agent_axui = executable('test_agent_axui',
-    files('tests/test_agent_axui.m'), dependencies : [dep_metadesk])
+    files('tests/test_agent_axui.m'), dependencies : [dep_metadesk] + core_private_deps)
   test('AX owned clicks and native video', test_agent_axui,
     timeout : 300, suite : 'live')
 endif

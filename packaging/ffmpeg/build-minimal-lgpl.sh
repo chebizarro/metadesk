@@ -31,6 +31,20 @@ repo=$(cd "$(dirname "$0")/../.." && pwd -P)
 case "$out/" in "$source/"*|"$repo/"*) fail "OUTPUT must be outside both source trees" ;; esac
 mkdir "$out"
 mkdir "$out/build"
+# Patch a private source copy, never the caller's pristine pinned source tree.
+# Keep the applied patch alongside the build receipt for source redistribution.
+build_source=$source
+if [ "$profile" = windows ]; then
+    cp -R "$source" "$out/source"
+    mkdir "$out/patches"
+    cp "$repo/packaging/ffmpeg/patches/0001-mf-low-latency-vt-bool.patch" "$out/patches/"
+    if ! patch --batch --forward --fuzz=0 -p1 -d "$out/source" \
+        < "$out/patches/0001-mf-low-latency-vt-bool.patch" > "$out/patches.txt" 2>&1; then
+        cat "$out/patches.txt" >&2
+        fail "MF low-latency patch failed; use the vetted FFmpeg revision or review the patch"
+    fi
+    build_source=$out/source
+fi
 prefix=$out/install
 set -- --prefix="$prefix" --disable-everything --disable-autodetect \
     --disable-gpl --disable-nonfree --disable-version3 \
@@ -41,7 +55,7 @@ set -- --prefix="$prefix" --disable-everything --disable-autodetect \
 case "$profile" in
     macos) set -- "$@" --enable-videotoolbox ;;
     windows) set -- "$@" --enable-ffnvcodec --enable-nvenc --enable-amf \
-        --enable-mediafoundation --enable-libvpl ;;
+        --enable-mediafoundation --enable-d3d11va --enable-libvpl ;;
     container|flatpak) set -- "$@" --enable-ffnvcodec --enable-nvenc --enable-amf \
         --enable-vaapi --enable-libdrm --enable-libvpl ;;
 esac
@@ -54,10 +68,10 @@ esac
 [ -z "${MD_FFMPEG_CFLAGS:-}" ] || set -- "$@" --extra-cflags="$MD_FFMPEG_CFLAGS"
 [ -z "${MD_FFMPEG_LDFLAGS:-}" ] || set -- "$@" --extra-ldflags="$MD_FFMPEG_LDFLAGS"
 # One argument per line, preserving paths with spaces; retain with source package.
-printf '%s\n' "$source/configure" "$@" > "$out/configure-args.txt"
+printf '%s\n' "$build_source/configure" "$@" > "$out/configure-args.txt"
 printf '%s\n' "$profile" > "$out/profile.txt"
 cd "$out/build"
-if ! "$source/configure" "$@" > "$out/configure.txt" 2>&1; then
+if ! "$build_source/configure" "$@" > "$out/configure.txt" 2>&1; then
     cat "$out/configure.txt" >&2
     fail "configure failed; see $out/build/ffbuild/config.log"
 fi

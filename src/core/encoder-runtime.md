@@ -28,8 +28,10 @@ FFmpeg 9.0.2's `mfenc.c` passes `CODECAPI_AVLowLatencyMode` as `VT_UI4`.
 OS software MFT opened/decoded but buffered ten frames, failing the unchanged
 geometry-tag test's maximum pending-depth assertion. Do not relax that assertion.
 
-Apply the adjacent **`ffmpeg-mf-low-latency.patch`** when building Windows
-FFmpeg, pending an upstream fix (`md-gml8`). With the property changed to
+The Windows profile of `packaging/ffmpeg/build-minimal-lgpl.sh` applies
+`packaging/ffmpeg/patches/0001-mf-low-latency-vt-bool.patch` to a private source
+copy, preserving the caller's clean FFmpeg tree and retaining a patch receipt.
+Upstreaming remains pending (`md-gml8`). With the property changed to
 `VT_BOOL(VARIANT_TRUE)`, a private minimal LGPL FFmpeg 9.0.2 build passed all
 1,771 encode/decode checks: 24 tagged packets, none late or discarded at resize,
 and 20 independent reconnect decoders. Stock MSYS2 FFmpeg is **not qualified**
@@ -40,22 +42,28 @@ For this MSYS2 SDK, the minimal FFmpeg build also requires
 `--enable-d3d11va` with `--enable-mediafoundation` (otherwise `mfenc.c` refers to
 undeclared D3D11 types), plus normal build tools including `make` and `cmp`
 (`diffutils`). This does not require GPU encoding; `hw_encoding=0` still uses
-the OS software MFT. Only the private test dependency was patched; packaging
-integration is L15-owned. No GPL codec was enabled in that dependency build.
+the OS software MFT. The Windows packaging profile enables D3D11VA explicitly. No GPL codec was enabled in that dependency build.
 
 ## Direct OpenH264, not FFmpeg's libopenh264
 
 No OpenH264 library is linked, bundled, installed or downloaded by metadesk.
 Only Cisco's public BSD-licensed headers are vendored in `openh264_headers/`,
-unmodified from [v2.7.0](https://github.com/cisco/openh264/tree/v2.7.0/codec/api/wels)
-with their `COPYING`. The adapter uses the public C++ API behind a C interface;
-the upstream C vtable's `ForceIntraFrame` declaration omits the C++ layer argument.
+from [v2.7.0](https://github.com/cisco/openh264/tree/v2.7.0/codec/api/wels)
+with their `COPYING`. The backend and loader fake are plain C, using
+`ISVCEncoderVtbl`; no C++ source or link-language override is added to the core.
+The sole local header correction restores the omitted `ForceIntraFrame` layer
+argument to match the actual ABI; see `openh264_headers/README.md`.
 
 This adapter pins **OpenH264 2.7.0.2610, ABI soname 8**. It resolves
 `WelsGetCodecVersionEx`, `WelsCreateSVCEncoder`, `WelsDestroySVCEncoder` and checks
 all four version fields **before creating or invoking an encoder**. Other
 versions, missing symbols and wrong-architecture libraries are rejected; ABI
 updates require a header/version review, not an unversioned library guess.
+This exact pin also rejects distro/Homebrew OpenH264 builds of **other versions**,
+including ABI-soname-compatible builds: a shared soname alone is insufficient.
+The vetted version-range follow-up (`md-7xx2`) requires header/layout and per-platform
+round-trip validation before widening this allowlist. Source-built distro codecs
+also do not acquire Cisco binary patent coverage through version compatibility.
 Version checking is compatibility validation, **not binary authentication**.
 
 Search order:
