@@ -200,8 +200,8 @@ cc -O2 -Wall -o build/nip5f-crypto deploy/containers/reference/nip5f-crypto.c \
   -Isrc/core $(pkg-config --cflags --libs libcjson) -Lbuild -lmetadesk \
   -Wl,-rpath,"$PWD/build"
 python3 -u -B deploy/containers/reference/client-fixture.py --tests tests \
-  --crypto "$PWD/build/nip5f-crypto" --relay "$RELAY_BIND" --sockets "$R" \
-  --signer "self=$R/self.key"
+--crypto "$PWD/build/nip5f-crypto" --relay "$RELAY_BIND" --sockets "$R" \
+    --signer "self=$R/self.key" --no-store-ephemeral
 ```
 
 Wait for `fixture ready`. One endpoint binds the controlled LAN relay; the other
@@ -295,7 +295,12 @@ clang++ -std=c++17 -Wall -Wextra -Werror tools/e2e/windows-fixture.cpp \
 ```
 
 In a **separate task-owned interactive console**, launch
-`windows-fixture.exe PRIVATE_COMMAND_FILE OWNED_STOP_FILE`. The command file is
+`windows-fixture.exe PRIVATE_COMMAND_FILE OWNED_STOP_FILE [OWNED_DONE_FILE]`.
+Use a fresh optional done path for automated runs: after actual child exit and
+job cleanup the helper atomically publishes JSON containing `native_exit`,
+`helper_result` and `deadline`. All must indicate success; CMD's own trailing
+commands can be skipped by Ctrl+C, so do not depend on a CMD marker alone.
+The command file is
 a private UTF-8 CreateProcess command line, possibly containing a throwaway
 bunker URI: restrict its ACL and never print/commit it. Its child is the real
 host/client, not a video fixture. Run the enclosing `.cmd` with
@@ -319,6 +324,33 @@ After an actual NIP-46 startup diagnostic, it uses `PeekNamedPipe` to prove the
 already-printed progress is readable while the child still awaits the signer,
 then terminates/reaps the test process. `--expect-buffered` reproduces the old
 Windows baseline. This is not an authenticated pairing or graceful-exit test.
+
+### Windows progress observer
+
+Use a fresh run prefix inside an **untracked, task-owned output directory**.
+Start this alongside the interactive fixture, with the same stop/done paths:
+
+```powershell
+powershell -NoProfile -File tools/e2e/windows-observe.ps1 `
+  -Log "$OutputDir\client.log" -StopFile "$OutputDir\client.stop" `
+  -DoneFile "$OutputDir\client.done" -TargetFrames 6000 -TimeoutSeconds 1200
+powershell -NoProfile -File tools/e2e/test_windows_observe.ps1
+```
+
+The observer writes `client.log.observed.jsonl`, waits for real decoded/displayed
+counters, creates only its owned stop marker, drains the final log after native
+completion, and rejects losses, stale receipts, nonzero exits and deadlines.
+It watches changed/created/renamed files; unread-file tail checks are local file
+I/O, not relay polling or success sleeps. Check its final `pass` record as well
+as the native completion receipt. Five synthetic cases test the observer, not
+product acceptance. For human checks keep the viewer running until the answer;
+do not use the automated frame goal to close it prematurely.
+
+For private NIP-46/long runs, the existing relay/signer fixture must use
+`--no-store-ephemeral`: NIP-46 ephemeral RPCs must not consume retained history.
+This retains session/grant history and the unchanged stored-event cap; it does
+not emulate FIPS or permit public-relay test publication. Stop and diagnose a
+saturated fixture; do not increase its cap or call its failure an auth rejection.
 
 ## Per-cell attended checks and recording
 

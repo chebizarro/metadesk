@@ -1,5 +1,5 @@
 // Owned Win32 damage/input target and native child supervisor for attended E2E.
-// Usage: windows-fixture.exe COMMAND_FILE STOP_FILE
+// Usage: windows-fixture.exe COMMAND_FILE STOP_FILE [DONE_FILE]
 // COMMAND_FILE is private UTF-8 CreateProcess argv, never printed. STOP_FILE is
 // an owned cancellation marker, not a readiness/completion signal. Run in an
 // isolated interactive scheduled-task console, never in an operator terminal.
@@ -15,7 +15,7 @@ static HWND label, clicks_label;
 static HANDLE child, job;
 static DWORD child_pid;
 static unsigned frames, clicks;
-static std::wstring stop_file;
+static std::wstring stop_file, done_file;
 static bool stopping, expired;
 static ULONGLONG stopped_at, started_at;
 // Attended checks may wait on an external person; this is only a leak guard.
@@ -98,12 +98,14 @@ static std::wstring widen(const std::string &s) {
 }
 
 int main(int argc,char **argv) {
-    if (argc!=3) return 2;
+    if (argc!=3 && argc!=4) return 2;
     setvbuf(stdout,nullptr,_IONBF,0);
     std::ifstream file(argv[1],std::ios::binary);
     std::string text((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
     auto command=widen(text); stop_file=widen(argv[2]);
-    if (command.empty() || stop_file.empty() || GetFileAttributesW(stop_file.c_str())!=INVALID_FILE_ATTRIBUTES) return 2;
+    if (argc==4) done_file=widen(argv[3]);
+    if (command.empty() || stop_file.empty() || GetFileAttributesW(stop_file.c_str())!=INVALID_FILE_ATTRIBUTES ||
+        (argc==4 && (done_file.empty() || GetFileAttributesW(done_file.c_str())!=INVALID_FILE_ATTRIBUTES))) return 2;
     started_at=GetTickCount64();
     WNDCLASSW wc{};wc.lpfnWndProc=window_proc;wc.hInstance=GetModuleHandleW(nullptr);
     wc.lpszClassName=L"md-l7-owned-window";wc.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
@@ -128,8 +130,28 @@ int main(int argc,char **argv) {
     std::printf("fixture: ready owned-window child-pid=%lu\n",child_pid);
     MSG message{};int result;
     while ((result=GetMessageW(&message,nullptr,0,0))>0) { TranslateMessage(&message);DispatchMessageW(&message); }
-    CloseHandle(job);WaitForSingleObject(child,INFINITE);CloseHandle(child);
+    CloseHandle(job);WaitForSingleObject(child,INFINITE);
+    DWORD child_code=STILL_ACTIVE;
+    bool have_code=GetExitCodeProcess(child,&child_code)!=FALSE;
+    CloseHandle(child);
     if (notify) UnregisterPowerSettingNotification(notify);
     DestroyWindow(w);SetThreadExecutionState(ES_CONTINUOUS);
-    return result<0 ? 1 : static_cast<int>(message.wParam);
+    int code=have_code ? (result<0 ? 1 : static_cast<int>(message.wParam)) : 126;
+    // Ctrl+C may abort the enclosing batch before it can write a done marker.
+    // Publish after child exit and cleanup, independently of that batch.
+    if (!done_file.empty()) {
+        std::wstring temporary=done_file+L".tmp";
+        HANDLE f=CreateFileW(temporary.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,
+                             CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if (f==INVALID_HANDLE_VALUE) return 126;
+        std::string body="{\"native_exit\":"+std::to_string(have_code ? child_code : STILL_ACTIVE)+
+            ",\"helper_result\":"+std::to_string(code)+",\"deadline\":"+(expired ? "true" : "false")+"}\n";
+        DWORD written=0;
+        bool ok=WriteFile(f,body.data(),static_cast<DWORD>(body.size()),&written,nullptr)!=FALSE && written==body.size();
+        CloseHandle(f);
+        if (!ok || !MoveFileExW(temporary.c_str(),done_file.c_str(),MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporary.c_str());return 126;
+        }
+    }
+    return code;
 }
