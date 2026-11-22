@@ -1,0 +1,86 @@
+[
+  {
+    "name": "ffmpeg",
+    "version": "8.1.2",
+    "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+    "archive": "ffmpeg.tar.xz",
+    "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+  },
+  {
+    "name": "sdl2",
+    "version": "2.32.10",
+    "url": "https://www.libsdl.org/release/SDL2-2.32.10.tar.gz",
+    "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+    "archive": "sdl2.tar.gz"
+  },
+  {
+    "name": "libyuv",
+    "version": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
+    "url": "https://chromium.googlesource.com/libyuv/libyuv/+archive/0ec9f68d82634f6f3414aaaf780e03f9edf002b3.tar.gz",
+    "sha256": "654e377d8e06f45c215aec06237037e289eb6be8a2c3a427c83c0ee8fcff0d71",
+    "archive": "libyuv.tar.gz"
+  },
+  {
+    "name": "openssl",
+    "version": "3.5.9",
+    "url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+    "archive": "openssl.tar.gz",
+    "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+  },
+  {
+    "name": "libsodium",
+    "version": "1.0.22",
+    "url": "https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz",
+    "sha256": "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349",
+    "archive": "libsodium.tar.gz"
+  },
+  {
+    "name": "cjson",
+    "version": "1.7.19",
+    "url": "https://codeload.github.com/DaveGamble/cJSON/tar.gz/refs/tags/v1.7.19",
+    "sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
+    "archive": "cjson.tar.gz"
+  },
+  {
+    "name": "libwebsockets",
+    "version": "5.1.0",
+    "url": "https://codeload.github.com/warmcat/libwebsockets/tar.gz/refs/tags/v5.1.0",
+    "sha256": "9acbba00aaa9e6178ae09c6f920d95449b527c1417e81d2cdd4103bc6d64d13f",
+    "archive": "libwebsockets.tar.gz"
+  },
+  {
+    "name": "jansson",
+    "version": "2.15.1",
+    "url": "https://codeload.github.com/akheron/jansson/tar.gz/refs/tags/v2.15.1",
+    "sha256": "dbf95cb0af903f4fb8b61507d96b45b67db7d1479688ede352e1d571394d06f7",
+    "archive": "jansson.tar.gz"
+  },
+  {
+    "name": "libb2",
+    "version": "0.98.1",
+    "url": "https://github.com/BLAKE2/libb2/releases/download/v0.98.1/libb2-0.98.1.tar.gz",
+    "sha256": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e",
+    "archive": "libb2.tar.gz"
+  },
+  {
+    "name": "secp256k1",
+    "version": "0.8.0",
+    "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.8.0",
+    "sha256": "eb52b0e9239dff7dc26be5f9623567141b8720ec47da29eb3c1e0a660d17c8bb",
+    "archive": "secp256k1.tar.gz"
+  },
+  {
+    "name": "nsync",
+    "version": "1.30.0",
+    "url": "https://codeload.github.com/google/nsync/tar.gz/refs/tags/1.30.0",
+    "sha256": "883a0b3f8ffc1950670425df3453c127c1a3f6ed997719ca1bbe7f474235b6cc",
+    "archive": "nsync.tar.gz"
+  },
+  {
+    "name": "nostrc",
+    "version": "cfcb86296068c1e4090bc5ce8a486392dc74eb11",
+    "url": "https://github.com/chebizarro/nostrc.git",
+    "archive": "nostrc.tar",
+    "sha256": "4bb6a3a355479eabbfe2297e87beee10c025f126f90df545928a77d23b7c2e0e"
+  }
+]

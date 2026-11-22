@@ -51,15 +51,18 @@ _sys_lib_dirs = []
 _sys_inc_dirs = []
 
 if host_os == 'darwin'
-  _brew = run_command('brew', '--prefix', check : false)
-  if _brew.returncode() == 0
-    _brew_prefix = _brew.stdout().strip()
+  _macos_deps_prefix = get_option('macos_deps_prefix')
+  if _macos_deps_prefix != ''
+    _sys_lib_dirs = [_macos_deps_prefix / 'lib']
+    _sys_inc_dirs = [_macos_deps_prefix / 'include']
+    message('Private macOS dependencies: ' + _macos_deps_prefix)
   else
-    _brew_prefix = '/opt/homebrew'
+    _brew = run_command('brew', '--prefix', check : false)
+    _brew_prefix = _brew.returncode() == 0 ? _brew.stdout().strip() : '/opt/homebrew'
+    _sys_lib_dirs = [_brew_prefix / 'lib']
+    _sys_inc_dirs = [_brew_prefix / 'include']
+    message('Homebrew prefix: ' + _brew_prefix)
   endif
-  _sys_lib_dirs = [_brew_prefix / 'lib']
-  _sys_inc_dirs = [_brew_prefix / 'include']
-  message('Homebrew prefix: ' + _brew_prefix)
 endif
 
 # Optional: libyuv has no pkg-config on most distros — try system, fallback to find_library
@@ -117,7 +120,9 @@ if _nostrc_build != ''
   endforeach
 endif
 foreach d : _sys_inc_dirs
-  _nostrc_inc_paths += d / 'nostr'
+  if fs.is_dir(d / 'nostr')
+    _nostrc_inc_paths += d / 'nostr'
+  endif
 endforeach
 nostrc_inc = include_directories(_nostrc_inc_paths)
 
@@ -716,6 +721,28 @@ if enable_client
   )
 endif
 
+# Darwin dependencies may themselves use @rpath install names (notably libyuv
+# and build-tree nostr-json). Meson removes build rpaths at install time.
+# Keep selected dependency directories for an installed prefix, and make the
+# product library discoverable from a relocated DESTDIR tree. Linux producers
+# deliberately retain their existing empty install rpath contract.
+_darwin_lib_rpath = ''
+_darwin_exe_rpath = ''
+if host_os == 'darwin'
+  _install_dep_dirs = _sys_lib_dirs
+  _yuv_libdir = dep_yuv.get_variable(pkgconfig : 'libdir', default_value : '')
+  if _yuv_libdir != ''
+    _install_dep_dirs += _yuv_libdir
+  endif
+  if _nostrc_build != ''
+    _install_dep_dirs += _nostrc_build / 'libjson'
+  endif
+  _darwin_lib_rpath = ':'.join(['@loader_path'] + _install_dep_dirs)
+  _product_lib_relative = fs.relative_to(get_option('prefix') / get_option('libdir'),
+                                         get_option('prefix') / get_option('bindir'))
+  _darwin_exe_rpath = ':'.join(['@loader_path' / _product_lib_relative] + _install_dep_dirs)
+endif
+
 # ── libmetadesk (shared core library) ───────────────────────────────────────
 # Platform-agnostic sources (compiled on all platforms)
 core_sources = files(
@@ -762,6 +789,8 @@ core_sources += files(
   'src/core/credential_store.c',
   'src/core/credential_store_secret_service.c',
   'src/core/credential_store_keychain.c',
+  'src/core/credential_store_windows.c',
+  'src/core/win_private.c',
 )
 accounts_c_args = []
 if host_os == 'linux'
@@ -769,6 +798,8 @@ if host_os == 'linux'
   accounts_c_args += '-DMD_HAVE_LIBSECRET'
 elif host_os == 'darwin'
   core_deps += dependency('appleframeworks', modules : ['Security', 'CoreFoundation'])
+elif host_os == 'windows'
+  core_deps += cc.find_library('crypt32', required : true)
 endif
 
 # Append platform HAL backend sources
@@ -781,6 +812,7 @@ libmetadesk = shared_library('metadesk', core_sources,
   dependencies : core_deps + core_private_deps,
   c_args : signer_c_args + mcp_c_args + accounts_c_args,
   install : true,
+  install_rpath : _darwin_lib_rpath,
   version : meson.project_version(),
 )
 
@@ -791,14 +823,14 @@ dep_metadesk = declare_dependency(
 )
 
 # ── Signer account tests ────────────────────────────────────────────────────
-if host_os == 'linux' or host_os == 'darwin'
+if host_os == 'linux' or host_os == 'darwin' or host_os == 'windows'
   test_accounts = executable('test_accounts', 'tests/test_accounts.c',
     dependencies : dep_metadesk, c_args : accounts_c_args)
   test('accounts', test_accounts, timeout : 30)
   accounts_python = import('python').find_installation('python3')
   if host_os == 'darwin'
     test('account_keychain', test_accounts, args : ['--keychain'], timeout : 30, is_parallel : false)
-  else
+  elif host_os == 'linux'
     accounts_dbus = find_program('dbus-run-session', required : false)
     accounts_keyring = find_program('gnome-keyring-daemon', required : false)
     if accounts_dbus.found() and accounts_keyring.found()
@@ -810,8 +842,18 @@ if host_os == 'linux' or host_os == 'darwin'
   endif
 endif
 
+if host_os == 'windows'
+  test_win_security = executable('test_win_security', 'tests/test_win_security.c', dependencies : dep_metadesk)
+  test('Windows native private storage + DPAPI', test_win_security, timeout : 30)
+endif
+
 # ── metadesk-host ───────────────────────────────────────────────────────────
-host_sources = files('src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
+# Explicit OpenH264 fetcher only; encoder startup has no downloader.
+dep_oh_fetch = [dep_curl, dependency('openssl'), cc.find_library('bz2')]
+if host_os == 'windows'
+  dep_oh_fetch += cc.find_library('advapi32')
+endif
+host_sources = files('src/core/encode_openh264_fetch.c', 'src/host/main.c', 'src/host/capture_cli.c', 'src/host/account_cli.c',
   'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
   'src/host/capture_sync.c')
 host_includes = [core_inc]
@@ -828,9 +870,10 @@ endif
 
 metadesk_host = executable('metadesk-host', host_sources,
   include_directories : host_includes,
-  dependencies : [dep_metadesk],
+  dependencies : [dep_metadesk] + dep_oh_fetch,
   c_args : host_c_args,
   install : true,
+  install_rpath : _darwin_exe_rpath,
 )
 
 if host_os == 'linux' or host_os == 'darwin'
@@ -848,6 +891,9 @@ if host_os == 'linux' or host_os == 'darwin'
   if get_option('signer_nip5f')
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
+      timeout : 120)
+    test('access migration private relay', accounts_python,
+      args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture, '--migration-only'],
       timeout : 120)
     # md-ah9.14/md-ah9.3: real mcp-proxy <-> NIP-98 MCP HTTP + live host allowlist.
     mcp_proxy_host_fixture = executable('mcp_proxy_host_fixture',
@@ -879,6 +925,7 @@ if enable_client
     include_directories : [core_inc],
     dependencies : [dep_metadesk, dep_sdl2, dep_imgui],
     install : true,
+    install_rpath : _darwin_exe_rpath,
   )
 endif
 
@@ -1021,6 +1068,13 @@ fake_openh264 = shared_library('fake_openh264', 'tests/fake_openh264.c',
 test_encoder_loader = executable('test_encoder_loader', 'tests/test_encoder_loader.c',
   dependencies : dep_metadesk)
 test('OpenH264 rejects incompatible ABI', test_encoder_loader, args : [fake_openh264.full_path()])
+foreach rejected : [['unvetted_build', '2,7,0,2611'], ['older_layout', '2,5,1,2501']]
+  fake_rejected = shared_library('fake_openh264_' + rejected[0], 'tests/fake_openh264.c',
+    include_directories : core_inc, install : false,
+    c_args : ['-DMD_FAKE_OPENH264_VERSION=' + rejected[1]])
+  test('OpenH264 rejects ' + rejected[0] + ' before create', test_encoder_loader,
+    args : [fake_rejected.full_path()])
+endforeach
 test('OpenH264 rejects missing explicit library', test_encoder_loader)
 if host_os != 'windows'
   test('FFmpeg Windows patch wiring (fixtures)', find_program('python3'),
@@ -1131,13 +1185,18 @@ test_signer = executable('test_signer',
 test('signer abstraction', test_signer)
 
 test_host_binding = executable('test_host_binding',
-  files('tests/test_host_binding.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
+  files('tests/test_host_binding.c', 'src/core/encode_openh264_fetch.c', 'src/host/mcp_nostr_acl.c', 'src/host/mcp_proxy.c',
     'src/host/capture_sync.c', 'src/host/capture_cli.c'),
-  dependencies : [dep_metadesk])
+  dependencies : [dep_metadesk] + dep_oh_fetch)
 test('host_binding', test_host_binding, timeout : 30)
 if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
   test('NIP-5F host session quoted seal', accounts_python,
     args : [files('tests/test_nip5f_session.py'), test_host_binding, access_signer_fixture],
+    timeout : 90)
+endif
+if enable_nip5f and enable_client and (host_os == 'linux' or host_os == 'darwin')
+  test('private allowlist real host/client loopback', accounts_python,
+    args : [files('tests/access_private_session.py'), metadesk_host, metadesk_client, access_signer_fixture],
     timeout : 90)
 endif
 test('session correlation retaining private relay', find_program('python3'),
@@ -1261,3 +1320,30 @@ test_session_log = executable('test_session_log',
   dependencies : [dep_metadesk],
 )
 test('signed session log', test_session_log)
+
+if host_os == 'darwin'
+  test('macOS packaging minimum-version parser', import('python').find_installation('python3'),
+    args : [files('packaging/macos/test-packaging.py')])
+endif
+
+if host_os == 'darwin'
+  # Meson installs absolute product install names even with install_rpath.
+  # Rewrite only our library/executables, leaving third-party IDs untouched.
+  _installed_bins = ['metadesk-host']
+  if enable_client
+    _installed_bins += 'metadesk-client'
+  endif
+  meson.add_install_script(import('python').find_installation('python3'),
+    files('packaging/macos/fix-install-names.py'),
+    get_option('libdir'), get_option('bindir'), _installed_bins)
+endif
+
+# Offline fetch fixtures include the implementation to exercise private I/O
+# without adding network overrides or unauthenticated install APIs to the CLI.
+test_oh_fetch = executable('test_openh264_fetch', 'tests/test_openh264_fetch.c',
+  include_directories : [core_inc] + (_sys_inc_dirs.length() > 0 ? [include_directories(_sys_inc_dirs[0])] : []),
+  dependencies : dep_oh_fetch)
+test('OpenH264 offline fetch', test_oh_fetch)
+
+test('OpenH264 explicit fetch CLI offline', find_program('python3'),
+  args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)

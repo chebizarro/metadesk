@@ -1,5 +1,6 @@
 #include "accounts.h"
 #include "md_test.h"
+#include "md_test_win_private.h"
 #include <pthread.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -20,10 +21,14 @@ static const char *sk2 = "000000000000000000000000000000000000000000000000000000
 static const char *pk1 = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 static const char *pk2 = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
 static char *tempdir(void) {
+#ifdef _WIN32
+    char *path = md_test_win_directory(); MD_CHECK(path != NULL); return path;
+#else
     char *base = realpath("/tmp", NULL), *path = malloc(PATH_MAX);
     MD_CHECK(base && path);
     snprintf(path, PATH_MAX, "%s/md-accounts-XXXXXX", base); free(base);
     MD_CHECK(mkdtemp(path) != NULL); return path;
+#endif
 }
 static void cleanup(char *dir) {
     char path[PATH_MAX];
@@ -33,9 +38,15 @@ static void cleanup(char *dir) {
 }
 static void write_metadata(const char *dir, const char *text) {
     char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/management.json", dir);
+#ifdef _WIN32
+    MdWinDirectory *d = md_win_directory(dir, false);
+    MD_CHECK(d && md_win_replace(d, "management.json", text, strlen(text)));
+    md_win_directory_close(d);
+#else
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
     MD_CHECK(fd >= 0);
     MD_CHECK(write(fd, text, strlen(text)) == (ssize_t)strlen(text)); close(fd);
+#endif
 }
 static MdNip46Credentials *credentials(void) {
     const char *json = "{\"version\":1,\"user_pubkey\":\"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\","
@@ -188,7 +199,12 @@ static void test_roles_and_persistence(void) {
     free(out);
     MD_CHECK(md_accounts_save(a) == 0);
     char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/management.json", dir);
+#ifdef _WIN32
+    unsigned char *metadata = NULL; size_t metadata_size = 0;
+    MD_CHECK(md_win_read_path(path, &metadata, &metadata_size, 65536)); free(metadata);
+#else
     struct stat st; MD_CHECK(!stat(path, &st) && (st.st_mode & 0777) == 0600);
+#endif
     FILE *file = fopen(path, "r"); char text[8192] = {0};
     MD_CHECK(file != NULL); if (file) { fread(text, 1, sizeof(text) - 1, file); fclose(file); }
     MD_CHECK(!strstr(text, sk1) && !strstr(text, sk2) && !strstr(text, "client_secret"));
@@ -312,6 +328,7 @@ static void test_remove_credentials(void) {
     MD_CHECK(md_accounts_count(a) == 1);
     md_accounts_destroy(a); md_credential_store_destroy(store); md_nip46_credentials_free(c); cleanup(dir);
 }
+#ifndef _WIN32
 static void test_storage_rejection(void) {
     char *dir = tempdir(), path[PATH_MAX], linkpath[PATH_MAX]; MdAccounts *a = NULL;
     MD_CHECK(md_accounts_open("relative", NULL, &a) == MD_ACCOUNTS_IO && !a);
@@ -337,6 +354,7 @@ static void test_storage_rejection(void) {
     while ((entry = readdir(d))) MD_CHECK(!strstr(entry->d_name, ".tmp"));
     closedir(d); md_accounts_destroy(a); cleanup(dir);
 }
+#endif
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--secret-service")) {
         if (!getenv("MD_PRIVATE_KEYRING_FIXTURE")) { fprintf(stderr, "Private fixture required\n"); return 1; }
@@ -368,7 +386,15 @@ int main(int argc, char **argv) {
 #pragma clang diagnostic pop
     }
 #endif
+#ifdef _WIN32
+    char *dir = tempdir();
+    MdCredentialStore *native = md_credential_store_windows(dir);
+    credential_roundtrip(native); md_credential_store_destroy(native); cleanup(dir);
+#endif
     RUN_TEST(test_credentials); RUN_TEST(test_roles_and_persistence);
-    RUN_TEST(test_inflight_switch); RUN_TEST(test_remove_credentials); RUN_TEST(test_storage_rejection);
+    RUN_TEST(test_inflight_switch); RUN_TEST(test_remove_credentials);
+#ifndef _WIN32
+    RUN_TEST(test_storage_rejection);
+#endif
     return md_test_report();
 }

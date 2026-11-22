@@ -1,0 +1,39 @@
+From a48e6efa411260e5991503417d44e3d28873e3b1 Mon Sep 17 00:00:00 2001
+From: Chris Daley <chebizarro@gmail.com>
+Date: Sun, 22 Nov 2026 00:30:15 -0800
+Subject: [PATCH] avcodec/mfenc: use VT_BOOL for low-latency encoder mode
+X-Unsent: 1
+To: ffmpeg-devel@ffmpeg.org
+
+CODECAPI_AVLowLatencyMode expects VT_BOOL for encoders. VT_UI4 is the
+decoder-specific exception. Passing the wrong variant leaves the Windows
+H.264 software encoder buffering frames despite AV_CODEC_FLAG_LOW_DELAY.
+
+Use VARIANT_TRUE with the existing VT_BOOL helper, matching the documented
+encoder property type.
+
+https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avlowlatencymode
+
+Tested with the Windows ARM64 H.264 software MFT: the downstream
+encode/decode geometry-tag test changes from ten buffered frames to passing
+its unchanged maximum pending-depth bound.
+---
+ libavcodec/mfenc.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/mfenc.c b/libavcodec/mfenc.c
+index 27476bd..71233a9 100644
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -907,7 +907,7 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
+             ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVScenarioInfo, FF_VAL_VT_UI4(c->opt_enc_scenario));
+ 
+         if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
+-            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_UI4(1));
++            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_BOOL(VARIANT_TRUE));
+     }
+ 
+     return 0;
+-- 
+2.54.0
+

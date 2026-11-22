@@ -25,12 +25,33 @@ extern "C" {
 /* Opaque overlay context */
 typedef struct MdOverlay MdOverlay;
 
+typedef enum {
+    MD_CLIENT_IDLE, MD_CLIENT_FIPS, MD_CLIENT_NEGOTIATING,
+    MD_CLIENT_CONNECTING, MD_CLIENT_BINDING, MD_CLIENT_STREAMING,
+    MD_CLIENT_BACKOFF,
+} MdClientPhase;
+typedef enum {
+    MD_CLIENT_ERROR_NONE, MD_CLIENT_ERROR_FIPS, MD_CLIENT_ERROR_ADMISSION,
+    MD_CLIENT_ERROR_TRANSPORT, MD_CLIENT_ERROR_BINDING,
+} MdClientError;
+typedef enum {
+    MD_OVERLAY_NONE, MD_OVERLAY_DISCONNECT, MD_OVERLAY_RETRY, MD_OVERLAY_QUIT,
+} MdOverlayAction;
+
+const char *md_client_phase_label(MdClientPhase phase);
+const char *md_client_error_label(MdClientError error);
+MdOverlayAction md_overlay_take_action(MdOverlay *o);
+
 /* Overlay stats shown to user */
 typedef struct {
     float  latency_ms;       /* total pipeline latency             */
     float  encode_ms;        /* average encode time                */
     float  decode_ms;        /* average decode time                */
     float  rtt_ms;           /* network round-trip time            */
+    MdClientPhase phase;
+    MdClientError error;
+    uint32_t granted_caps;
+    bool   paused;
     bool   connected;        /* true if stream is active           */
     bool   reconnecting;     /* true while client is retrying      */
     uint32_t reconnect_delay_ms; /* next retry delay, if reconnecting */
@@ -53,7 +74,8 @@ void md_overlay_new_frame(MdOverlay *o);
 
 /* Handle one SDL event (fed by the renderer's event pump).
  * `event` is an SDL_Event*. Handles ImGui input + the F1 toggle. */
-void md_overlay_handle_sdl_event(MdOverlay *o, void *event);
+/* Returns true for reserved F1/Escape keys (including key releases). */
+bool md_overlay_handle_sdl_event(MdOverlay *o, void *event);
 
 /* Render the overlay with current stats.
  * Call between md_overlay_new_frame() and the SDL_RenderPresent(). */

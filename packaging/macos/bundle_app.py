@@ -15,6 +15,7 @@ deploy/containers/reference/bundle-contract.md, translated to Mach-O:
 Only run this on trusted, locally built binaries.
 """
 import argparse
+from macho import minimums, version_key
 import json
 import os
 import plistlib
@@ -143,20 +144,23 @@ def rewrite(image, changes, is_exe, new_id=None):
     for old, new in changes.items():
         if old != new:
             args += ['-change', old, new]
-    for rp in dict.fromkeys(load_commands(image)[1]):
-        args += ['-delete_rpath', rp]
-    args += ['-add_rpath', FRAMEWORKS_RPATH_EXE if is_exe else FRAMEWORKS_RPATH_LIB, str(image)]
+    desired_rpath = FRAMEWORKS_RPATH_EXE if is_exe else FRAMEWORKS_RPATH_LIB
+    rpaths = list(dict.fromkeys(load_commands(image)[1]))
+    for rp in rpaths:
+        if rp != desired_rpath:
+            args += ['-delete_rpath', rp]
+    # install_name_tool rejects deleting and adding the same rpath in one call.
+    if desired_rpath not in rpaths:
+        args += ['-add_rpath', desired_rpath]
+    args += [str(image)]
     subprocess.run(args, check=True, capture_output=True)
 
 
 def minos(image):
-    out = run('otool', '-l', str(image)).splitlines()
-    for i, line in enumerate(out):
-        if 'LC_BUILD_VERSION' in line:
-            for nxt in out[i:i + 6]:
-                if nxt.strip().startswith('minos '):
-                    return nxt.split()[1]
-    return None
+    values = minimums(image)
+    if not values:
+        raise SystemExit(f'{image}: missing macOS minimum load command')
+    return max(values, key=version_key)
 
 
 def sign(app, identity, hardened, entitlements):

@@ -54,7 +54,9 @@ JSON follows the same build-tree preference as libnostr and the signer adapters.
    library dependency includes Jansson and lets Meson manage the build rpath, so
    the current shared library loads without `DYLD_LIBRARY_PATH` or
    `LD_LIBRARY_PATH`. Meson removes this build-tree rpath during installation;
-   no raw rpath linker flags or install rpath are added.
+   no raw rpath linker flags are added. Darwin keeps selected dependency paths
+   as install rpaths and rewrites product IDs to `@rpath`; see
+   [macOS packaging](../packaging/macos/README.md). Linux install rpaths remain empty.
 2. Installed `libnostr-json` pkg-config metadata (the current nostrc module name),
    then the `nostr-json` module alias, then the `nostr-json` library directly.
 3. On Linux, the old `nostr_json` library with a deprecation warning.
@@ -309,8 +311,10 @@ because neither platform needed them for this matrix.
 The build-tree JSON dependency uses `cc.find_library()`, not raw library/rpath
 `link_args`. Meson therefore tracks the JSON directory as a removable build
 rpath, including when the dependency propagates to `metadesk-host` and the client.
-The default empty install rpath is preserved. This keeps the installed producer
-ELFs compatible with the [Tier A bundle contract](../deploy/containers/reference/bundle-contract.md);
+Linux keeps the default empty install rpath. Darwin instead retains selected
+dependency rpaths and rewrites the product install name for runnable staged
+prefixes (`md-v314`); `packaging/macos/check-install.sh` gates that path. This
+keeps the installed producer ELFs compatible with the [Tier A bundle contract](../deploy/containers/reference/bundle-contract.md);
 it does not replace the producer's dependency-closure or in-image checks.
 
 On Linux, stage using the bundle prefix/libdir and inspect the installed files

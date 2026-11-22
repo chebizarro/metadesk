@@ -635,6 +635,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --bind ADDR      Bind address (default: any)\n");
     fprintf(stderr, "  --fps FPS        Target framerate (default: 60)\n");
     fprintf(stderr, "  --bitrate BPS    Encoder bitrate (default: 8000000)\n");
+    fprintf(stderr, "  --fetch-openh264 Download verified Cisco binary after displaying its license (standalone)\n");
     fprintf(stderr, "  --openh264-path FILE  Load an explicitly installed Cisco OpenH264 library\n");
     fprintf(stderr, "  --encoder NAME   Require this backend (e.g. openh264, h264_mf); no fallback\n");
     fprintf(stderr, "  --no-nvenc       Skip NVENC; try HW/OS, OpenH264, optional x264\n");
@@ -915,6 +916,17 @@ static void host_finish_client(HostCtx *ctx, MdStream *client) {
 #endif
 
 static int host_run(int argc, char **argv) {
+    /* Standalone explicit action, before capture, signer, relay or threads. */
+    if (argc > 1 && strcmp(argv[1], "--fetch-openh264") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "--fetch-openh264 must be used alone\n");
+            return 1;
+        }
+        extern int md_openh264_fetch(void);
+        return md_openh264_fetch();
+    }
+
+
 #ifdef _WIN32
     /* md-m5x4: per-monitor DPI aware before any window, UIA, DXGI or input
      * call, so UIA rectangles, capture and SendInput share physical pixels. */

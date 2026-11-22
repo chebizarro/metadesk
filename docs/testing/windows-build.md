@@ -273,6 +273,16 @@ on macOS/Linux and avoiding a silently selected system library.
 
 ## Configure, build and run metadesk
 
+**Media Foundation prerequisite:** the stock MSYS2 FFmpeg 9.0.2 package above
+is a compilation dependency, not a qualified low-latency runtime. Its
+`mfenc.c` sends `CODECAPI_AVLowLatencyMode` as `VT_UI4(1)`; the H.264 encoder
+requires `VT_BOOL(VARIANT_TRUE)`. The resulting buffered output also fails
+`capture geometry sync` and `host_binding`, not just `encode/decode round-trip`.
+Use the corrected task-local FFmpeg runtime described in
+[Windows FFmpeg integration requirement](../../src/core/encoder-runtime.md#windows-ffmpeg-integration-requirement)
+before qualifying those tests. Do not force another encoder, submit extra
+frames, relax assertions or extend timeouts to hide this dependency bug.
+
 Export the assigned metadesk tree, including `imgui_vendor`, this port's `src`
 and `tests`, and Meson files, to `md-l9/metadesk`; omit `.git`, `.beads` and
 local build directories. Do not install nostrc globally or use a sibling tree.
@@ -289,6 +299,25 @@ meson test -C metadesk/build-product --print-errorlogs -j2
 ./metadesk/build-product/metadesk-host.exe --help
 ./metadesk/build-product/metadesk-client.exe --help
 ```
+
+For an already compiled build, a controlled MF runtime comparison can use
+ABI-matching corrected DLLs beside the test/product executables. In the native
+MSYS2 shell, set `MD_FFMPEG_PREFIX` to the private corrected FFmpeg install:
+
+```sh
+: "${MD_FFMPEG_PREFIX:?set the corrected task-local FFmpeg install prefix}"
+cp "$MD_FFMPEG_PREFIX/bin/avcodec-63.dll" \
+   "$MD_FFMPEG_PREFIX/bin/avutil-61.dll" metadesk/build-product/
+meson test -C metadesk/build-product --print-errorlogs -j2
+```
+
+Use only the assigned build directory; never replace the shared MSYS2 DLLs.
+Setting PATH alone is insufficient to establish which runtime was tested:
+Meson prepends dependency directories, and Windows searches the executable's
+directory first. Record the loaded module paths, DLL hashes and
+`avcodec_configuration()`/`avcodec_license()` with the test result. A private
+MF-only runtime comparison does not qualify the full GPU-enabled packaging
+profile or distribution of those DLLs.
 
 Both products are enabled by default. Runtime lookup needs native MSYS2 bin,
 the metadesk build directory, and the selected nostrc `build/libjson` on PATH;

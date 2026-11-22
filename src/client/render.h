@@ -78,6 +78,9 @@ int md_renderer_present(MdRenderer *r, const uint8_t *rgba,
 int md_renderer_update_frame(MdRenderer *r, const uint8_t *rgba,
                              uint32_t width, uint32_t height);
 
+/* Forget the old session texture before reconnecting. */
+void md_renderer_reset_frame(MdRenderer *r);
+
 /* Begin a composite frame: reset scale to 1:1, clear, and draw the latest
  * video texture to fill the window. Draw the overlay after this, then call
  * md_renderer_end_frame() to present — exactly one present per displayed
@@ -89,7 +92,7 @@ void md_renderer_end_frame(MdRenderer *r);
 
 /* Process window events (close, resize).
  * Returns 0 if should continue, -1 if quit requested (window closed,
- * Escape pressed, or SDL_QUIT event). */
+ * or SDL_QUIT event; Escape opens overlay controls when attached). */
 int md_renderer_poll_events(MdRenderer *r);
 
 /* Get the current window dimensions (may differ from stream resolution). */

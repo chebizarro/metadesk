@@ -36,7 +36,11 @@ class Signer(socketserver.StreamRequestHandler):
             if "name" in rpc:
                 continue
             result = subprocess.run([self.server.crypto, self.server.role], input=json.dumps(rpc),
-                                    capture_output=True, text=True, timeout=10, check=True)
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode:
+                assert result.returncode == 1 and "Sanitizer" not in result.stderr, (result.returncode, result.stderr)
+                send({"id": rpc["id"], "error": "fixture crypto operation rejected", "result": None})
+                continue
             value = json.loads(result.stdout)
             observer = getattr(self.server, "observe_result", None)
             if observer:
@@ -70,7 +74,7 @@ class AccessPeer(Peer):
         super().dispatch(msg)
 
 
-def run_contracts(host, crypto, root, env, relay):
+def run_contracts(host, crypto, root, env, relay, migration_only=False):
     url = f"ws://127.0.0.1:{relay.server_address[1]}"
     config = root / "accounts"
     config.mkdir(mode=0o700)
@@ -88,7 +92,7 @@ def run_contracts(host, crypto, root, env, relay):
     access("list", ok=False)
     for args in [[], ["add"], ["remove"], ["add", "npub1bad"], ["add", CLIENT_PK],
                  ["add", CLIENT_NPUB, "video,bad"], ["add", CLIENT_NPUB, "input,video"],
-                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["--open", "list"]]:
+                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["migrate", CLIENT_NPUB], ["migrate", CLIENT_NPUB, "all"], ["--open", "list"]]:
         p = access(*args, ok=False)
         assert p.returncode == 2, p.stderr
     account("add", "nip5f", HOST_PK, "private host")
@@ -96,61 +100,125 @@ def run_contracts(host, crypto, root, env, relay):
     access("list", ok=False)  # Never borrow the client role.
     account("bind-role", "host", "nip5f", HOST_PK)
 
-    relay.history_release.clear()
-    relay.history_seen.clear()
-    p = subprocess.Popen(command("list"), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        assert relay.history_seen.wait(10), "no allowlist REQ"
-        assert p.poll() is None, "list returned before EOSE"
-    finally:
-        relay.history_release.set()
-    stdout, stderr = p.communicate(timeout=20)
-    assert p.returncode == 0 and stdout == "", (stdout, stderr)
+    if not migration_only:
+        relay.history_release.clear()
+        relay.history_seen.clear()
+        p = subprocess.Popen(command("list"), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert relay.history_seen.wait(10), "no allowlist REQ"
+            assert p.poll() is None, "list returned before EOSE"
+        finally:
+            relay.history_release.set()
+        stdout, stderr = p.communicate(timeout=20)
+        assert p.returncode == 0 and stdout == "", (stdout, stderr)
 
-    access("add", HOST_NPUB)
-    relay.publish_release.clear()
-    relay.publish_seen.clear()
-    p = subprocess.Popen(command("add", CLIENT_NPUB), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        assert relay.publish_seen.wait(10), "no allowlist EVENT"
-        assert p.poll() is None, "add returned before OK"
-    finally:
-        relay.publish_release.set()
-    stdout, stderr = p.communicate(timeout=20)
-    assert p.returncode == 0, (stdout, stderr)
-    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo"}
-    assert set(access("list").stdout.splitlines()) == expected
-    count = relay.oks
-    access("add", CLIENT_NPUB)
-    assert relay.oks == count, "idempotent add republished"
-    access("add", CLIENT_NPUB, "video,agent,input")
-    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo,agent,input"}
-    assert set(access("list").stdout.splitlines()) == expected
-    access("add", CLIENT_NPUB)  # Omission must not silently narrow/regrant.
-    assert set(access("list").stdout.splitlines()) == expected
-    relay.reject = True
-    access("add", CLIENT_NPUB, "none", ok=False)
-    assert set(access("list").stdout.splitlines()) == expected
-    access("remove", CLIENT_NPUB, ok=False)
-    relay.reject = False
-    assert set(access("list").stdout.splitlines()) == expected
-    access("add", CLIENT_NPUB, "none")
-    expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tnone"}
-    assert set(access("list").stdout.splitlines()) == expected
-    count = relay.oks
-    access("add", CLIENT_NPUB, "none")
-    assert relay.oks == count, "idempotent revoke republished"
-    relay.closed = True
-    access("list", ok=False)
-    access("add", CLIENT_NPUB, ok=False)
-    relay.closed = False
-    access("remove", CLIENT_NPUB)
-    assert access("list").stdout.strip() == HOST_PK + "\tvideo"
-    count = relay.oks
-    access("remove", CLIENT_NPUB)
-    assert relay.oks == count
-    access("remove", HOST_NPUB)
-    assert access("list").stdout == ""
+        access("add", HOST_NPUB)
+        relay.publish_release.clear()
+        relay.publish_seen.clear()
+        p = subprocess.Popen(command("add", CLIENT_NPUB), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert relay.publish_seen.wait(10), "no allowlist EVENT"
+            assert p.poll() is None, "add returned before OK"
+        finally:
+            relay.publish_release.set()
+        stdout, stderr = p.communicate(timeout=20)
+        assert p.returncode == 0, (stdout, stderr)
+        expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo"}
+        assert set(access("list").stdout.splitlines()) == expected
+        count = relay.oks
+        access("add", CLIENT_NPUB)
+        assert relay.oks == count, "idempotent add republished"
+        access("add", CLIENT_NPUB, "video,agent,input")
+        expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tvideo,agent,input"}
+        assert set(access("list").stdout.splitlines()) == expected
+        access("add", CLIENT_NPUB)  # Omission must not silently narrow/regrant.
+        assert set(access("list").stdout.splitlines()) == expected
+        relay.reject = True
+        access("add", CLIENT_NPUB, "none", ok=False)
+        assert set(access("list").stdout.splitlines()) == expected
+        access("remove", CLIENT_NPUB, ok=False)
+        relay.reject = False
+        assert set(access("list").stdout.splitlines()) == expected
+        access("add", CLIENT_NPUB, "none")
+        expected = {HOST_PK + "\tvideo", CLIENT_PK + "\tnone"}
+        assert set(access("list").stdout.splitlines()) == expected
+        count = relay.oks
+        access("add", CLIENT_NPUB, "none")
+        assert relay.oks == count, "idempotent revoke republished"
+        relay.closed = True
+        access("list", ok=False)
+        access("add", CLIENT_NPUB, ok=False)
+        relay.closed = False
+        access("remove", CLIENT_NPUB)
+        assert access("list").stdout.strip() == HOST_PK + "\tvideo"
+        count = relay.oks
+        access("remove", CLIENT_NPUB)
+        assert relay.oks == count
+        access("remove", HOST_NPUB)
+        assert access("list").stdout == ""
+    if migration_only:
+        def policy(public, private=None, cipher=None):
+            event = {"kind": 30000, "pubkey": HOST_PK, "created_at": 1,
+                     "tags": [["d", "metadesk-allowlist"], *public], "content": cipher or ""}
+            if private is not None:
+                result = subprocess.run([crypto, "host"], input=json.dumps(
+                    {"method": "nip44_encrypt", "params": {"peer_pub": HOST_PK, "plaintext": json.dumps(private)}}),
+                    env=env, capture_output=True, text=True, timeout=15, check=True)
+                event["content"] = json.loads(result.stdout)
+            result = subprocess.run([crypto, "host"], input=json.dumps(
+                {"method": "sign_event", "params": {"event": event}}),
+                env=env, capture_output=True, text=True, timeout=15, check=True)
+            event = json.loads(result.stdout)
+            with relay.lock:
+                relay.events = {event["id"]: event}
+            return event
+        public = [["p", CLIENT_PK, "video,agent,input"],
+                  ["metadesk-caps", CLIENT_PK, "v1:video,agent,input"], ["p", HOST_PK]]
+        source = policy(public)
+        review = {key + "\tnone\tlegacy-public-review-required" for key in (CLIENT_PK, HOST_PK)}
+        assert set(access("list").stdout.splitlines()) == review
+        access("add", CLIENT_NPUB, "video", ok=False)
+        access("remove", CLIENT_NPUB, ok=False)
+        access("migrate", CLIENT_NPUB, "video", ok=False)  # no partial confirmations
+        access("migrate", CLIENT_NPUB, "video", CLIENT_NPUB, "agent", HOST_NPUB, "none", ok=False)
+        relay.reject = True
+        access("migrate", CLIENT_NPUB, "video,agent", HOST_NPUB, "none", ok=False)
+        with relay.lock:
+            assert relay.events == {source["id"]: source}, "rejected migration replaced source"
+        assert set(access("list").stdout.splitlines()) == review
+        relay.reject = False
+        relay.publish_seen.clear()
+        relay.publish_release.clear()
+        p = subprocess.Popen(command("migrate", CLIENT_NPUB, "video,agent", HOST_NPUB, "none"),
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert relay.publish_seen.wait(15)
+            assert p.poll() is None, "migration returned before OK"
+            with relay.lock:
+                assert source["id"] in relay.events, "source lost before OK"
+        finally:
+            relay.publish_release.set()
+        stdout, stderr = p.communicate(timeout=20)
+        assert p.returncode == 0, (stdout, stderr)
+        assert "historical public copies cannot be erased" in stderr
+        assert set(access("list").stdout.splitlines()) == {CLIENT_PK + "\tvideo,agent", HOST_PK + "\tnone"}
+        with relay.lock:
+            private_event = max(relay.events.values(), key=lambda e: e["created_at"])
+        assert private_event["tags"] == [["d", "metadesk-allowlist"]]
+        assert CLIENT_PK not in private_event["content"] and "v1:" not in private_event["content"]
+        # Mixed policy never silently unions public and private authorization.
+        policy([["p", HOST_PK]], [["p", CLIENT_PK], ["metadesk-caps", CLIENT_PK, "v1:agent"]])
+        assert set(access("list").stdout.splitlines()) == review
+        access("migrate", HOST_NPUB, "none", CLIENT_NPUB, "agent")
+        assert set(access("list").stdout.splitlines()) == {HOST_PK + "\tnone", CLIENT_PK + "\tagent"}
+        policy([], cipher="tampered")
+        access("list", ok=False)
+        access("add", CLIENT_NPUB, "video", ok=False)
+        access("migrate", ok=False)  # unreadable is not empty
+        policy([])
+        access("migrate")  # explicit empty migration still writes encrypted []
+        assert access("list").stdout == ""
+        print("PASS: explicit complete scope migration, OK/rejection/source preservation, private-only wire, mixed review, unreadable denial")
     # Saved host selection must be checked against the actual signer owner.
     relay.server_role = None
     metadata = config / "management.json"
@@ -166,7 +234,8 @@ def run_contracts(host, crypto, root, env, relay):
 
 def main():
     syntax_only = "--syntax-only" in sys.argv
-    host, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a != "--syntax-only"])
+    migration_only = "--migration-only" in sys.argv
+    host, crypto = map(os.path.abspath, [a for a in sys.argv[1:] if a not in ("--syntax-only", "--migration-only")])
     with tempfile.TemporaryDirectory(prefix="md-pss-") as tmp:
         root = Path(tmp).resolve()
         home = root / "home"
@@ -180,7 +249,7 @@ def main():
             base = [host, "access", "--config-dir", str(root / "syntax")]
             for args in [[], ["add"], ["remove"], ["add", "npub1bad"], ["add", CLIENT_PK],
                          ["add", CLIENT_NPUB, "video,bad"], ["add", CLIENT_NPUB, "input,video"],
-                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["--open", "list"]]:
+                 ["add", CLIENT_NPUB, ""], ["add", CLIENT_NPUB, "video,video"], ["list", "extra"], ["migrate", CLIENT_NPUB], ["migrate", CLIENT_NPUB, "all"], ["--open", "list"]]:
                 p = subprocess.run([*base, *args], env=env, capture_output=True, text=True, timeout=10)
                 assert p.returncode == 2, (args, p.stdout, p.stderr)
             p = subprocess.run([*base, "list"], env=env, capture_output=True, text=True, timeout=10)
@@ -200,7 +269,7 @@ def main():
         for t in threads:
             t.start()
         try:
-            run_contracts(host, crypto, root, env, relay)
+            run_contracts(host, crypto, root, env, relay, migration_only)
             print(f"access CLI: private relay history/OK gates, rejection, CLOSED, host-role ownership, membership and idempotency passed ({relay.oks} OK)")
         finally:
             for s in (signer, relay):

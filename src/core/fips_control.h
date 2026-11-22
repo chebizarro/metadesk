@@ -127,11 +127,18 @@ MdFipsControlResult md_fips_control_request(const char *socket_override,
                                             uint32_t timeout_ms,
                                             MdFipsControlResponse *resp);
 
+/* One readiness snapshot, without waiting or sleeping. READY requires a
+ * usable peer link: an established session alone does not prove a route. */
+MdFipsPeerReadinessState
+md_fips_control_check_peer_ready(const char *socket_override,
+                                 const char *peer_npub, uint32_t timeout_ms,
+                                 MdFipsPeerReadiness *out);
+
 /*
  * Poll FIPS daemon control state until a peer is safe to dial over the TUN.
  *
  * This intentionally uses the generic control seam (`show_peers`, then
- * `show_sessions` fallback) rather than parsing FIPS overlay adverts or
+ * `show_sessions` diagnostics) rather than parsing FIPS overlay adverts or
  * traversal offers in metadesk. `peer_npub` must be the bech32 npub identity
  * known to the local FIPS daemon.
  */

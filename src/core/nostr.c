@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <json.h>
+#include <cjson/cJSON.h>
+#include "platform.h"
 #include <go.h>
 #include <nostr-kinds.h>
 #include "log.h"
@@ -90,10 +92,12 @@ struct MdNostr {
     char              *pk_hex;       /* our public key, hex                 */
     NostrSimplePool   *pool;         /* nostrc relay pool — persistent conns */
     NostrList         *allowlist;    /* cached NIP-51 allowlist             */
+    cJSON             *acl_private_unknown; /* inert private items, preserved on edit */
     pthread_mutex_t    allowlist_mu;
     pthread_cond_t     allowlist_cv;
     MdNostrAclState    acl_state;
     bool               acl_open, acl_editing;
+    bool               acl_review_required, acl_decode_failed;
     bool               acl_sub_failed; /* no REQ was ever issued: FAILED for good */
     uint64_t           acl_version;
     int64_t            acl_created_at;
@@ -759,26 +763,39 @@ static bool list_append_copy(NostrList *list, const char *tag,
     return true;
 }
 
-/* Decode our kind:30000 allowlist from the raw tags (md-jqnz). This is access
- * control, so it does not inherit nostr_nip51_parse_list()'s tag policy, which
- * changed in nostrc 5d1283a7c from "drop application tags" to "keep every tag,
- * reject the whole list on any tag of more than three fields". Rules:
- *  - The first d tag is the address (NIP-01). Not metadesk-allowlist: not ours.
- *  - ["p", pk, ...]: one membership. Field 2 is an opaque relay hint, never
- *    policy; fields 3+ (e.g. a NIP-02 petname) are ignored.
- *  - ["metadesk-caps", pk, ...]: one grant record. Exactly three fields keeps
- *    the payload; any other arity that names a pk is retained as "" so it
- *    stays an invalid record for pk (deny) and an edit cannot normalize it
- *    into a grant. A tag that names no pk has no principal to affect.
- *  - Every other tag is ignored and not republished by edits: the address is
- *    ours and its schema is d/p/metadesk-caps, and event-level tags (NIP-40
- *    expiration, NIP-70 "-", client, ...) must not be copied from a stale
- *    event into a new one.
- * So no single tag can reject the list or affect another principal.
- * Encrypted content is not decoded: the policy is public. Returns false and
- * leaves *out NULL if the event is not our allowlist or memory runs out. */
-static bool allowlist_from_event(NostrEvent *ev, NostrList **out) {
+/* Both public tags and decrypted NIP-51 items use the md-jqnz raw-tag
+ * policy. Wrong-arity grants stay invalid across unrelated edits. */
+static bool allowlist_item(NostrList *list, const char *name, const char *value,
+                           const char *third, size_t arity) {
+    if (!name || !value) return true;
+    if (!strcmp(name, "p")) return list_append_copy(list, name, value, third);
+    if (!strcmp(name, "metadesk-caps"))
+        return list_append_copy(list, name, value, arity == 3 && third ? third : "");
+    return true;
+}
+
+/* cJSON exposes NUL-terminated values, so a JSON U+0000 escape could turn
+ * "v1:video\\u0000junk" into a valid grant. Skip escaped backslashes correctly;
+ * reject U+0000 before any JSON field crosses into a C-string policy API. */
+static bool allowlist_json_strings_safe(const char *json) {
+    for (const char *p = json; *p; p++) {
+        if (*p != '\\') continue;
+        if (!*++p) break;
+        if (*p == 'u' && !strncmp(p + 1, "0000", 4)) return false;
+    }
+    return true;
+}
+
+#define MD_ALLOWLIST_MAX_CONTENT 131072
+
+/* Envelope author/id/signature are checked before this function. A valid newer
+ * envelope with unreadable content replaces old authority with denial, not a
+ * fallback to its public tags or an older grant. Only a foreign address is ignored. */
+static bool allowlist_from_event(MdNostr *n, NostrEvent *ev, NostrList **out,
+                                 bool *review, bool *failed, cJSON **unknown_out) {
     *out = NULL;
+    *unknown_out = NULL;
+    *review = *failed = false;
     NostrTags *tags = nostr_event_get_tags(ev);
     size_t count = tags ? nostr_tags_size(tags) : 0;
     const char *identifier = NULL;
@@ -788,7 +805,6 @@ static bool allowlist_from_event(NostrEvent *ev, NostrList **out) {
         if (name && !strcmp(name, "d")) { identifier = nostr_tag_get(tag, 1); break; }
     }
     if (!identifier || strcmp(identifier, "metadesk-allowlist")) return false;
-
     NostrList *list = nostr_nip51_list_new();
     bool ok = list != NULL;
     if (ok) {
@@ -801,17 +817,53 @@ static bool allowlist_from_event(NostrEvent *ev, NostrList **out) {
         const char *name = arity >= 2 ? nostr_tag_get(tag, 0) : NULL;
         const char *value = name ? nostr_tag_get(tag, 1) : NULL;
         const char *third = arity >= 3 ? nostr_tag_get(tag, 2) : NULL;
-        if (!name || !value) continue;
-        if (!strcmp(name, "p"))
-            ok = list_append_copy(list, name, value, third);
-        else if (!strcmp(name, "metadesk-caps"))
-            ok = list_append_copy(list, name, value, arity == 3 && third ? third : "");
+        if (name && (!strcmp(name, "p") || !strcmp(name, "metadesk-caps")))
+            *review = true; /* Mixed lists are review-only as a whole. */
+        ok = allowlist_item(list, name, value, third, arity);
     }
+    const char *content = nostr_event_get_content(ev);
+    char *plain = NULL;
+    cJSON *items = NULL, *unknown = NULL;
+    if (ok && content && *content) {
+        ok = strlen(content) <= MD_ALLOWLIST_MAX_CONTENT &&
+            md_signer_nip44_decrypt_cancellable(n->signer, n->pk_hex, content,
+                                               &plain, n->signer_cancel) == 0 && plain;
+        if (ok) {
+            ok = strlen(plain) <= MD_ALLOWLIST_MAX_CONTENT && allowlist_json_strings_safe(plain);
+            if (ok) items = cJSON_ParseWithOpts(plain, NULL, true);
+            unknown = cJSON_CreateArray();
+            ok = cJSON_IsArray(items) && unknown;
+        }
+        cJSON *item;
+        cJSON_ArrayForEach(item, items) {
+            if (!ok) break;
+            ok = cJSON_IsArray(item);
+            cJSON *field;
+            cJSON_ArrayForEach(field, item) if (!cJSON_IsString(field)) ok = false;
+            if (!ok) break;
+            size_t arity = (size_t)cJSON_GetArraySize(item);
+            const char *name = cJSON_GetStringValue(cJSON_GetArrayItem(item, 0));
+            const char *value = cJSON_GetStringValue(cJSON_GetArrayItem(item, 1));
+            const char *third = cJSON_GetStringValue(cJSON_GetArrayItem(item, 2));
+            ok = allowlist_item(list, name, value, third, arity);
+            if (ok && (!name || (strcmp(name, "p") && strcmp(name, "metadesk-caps")))) {
+                cJSON *copy = cJSON_Duplicate(item, true);
+                if (!copy || !cJSON_AddItemToArray(unknown, copy)) {
+                    cJSON_Delete(copy); ok = false;
+                }
+            }
+        }
+    }
+    if (plain) { md_secure_zero(plain, strlen(plain)); free(plain); }
+    cJSON_Delete(items);
     if (!ok) {
-        MD_LOG_W("allowlist event dropped: out of memory while decoding");
+        MD_LOG_W("allowlist private content unavailable/invalid; denying access");
         nostr_nip51_list_free(list);
-        return false;
+        list = NULL;
+        *failed = true;
+        cJSON_Delete(unknown); unknown = NULL;
     }
+    *unknown_out = unknown;
     *out = list;
     return true;
 }
@@ -855,8 +907,11 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             return;
         }
 
+        if (nostr_event_get_created_at(ev) > (int64_t)time(NULL) + 300) return;
         NostrList *list = NULL;
-        if (allowlist_from_event(ev, &list)) {
+        bool review = false, failed = false;
+        cJSON *unknown = NULL;
+        if (allowlist_from_event(n, ev, &list, &review, &failed, &unknown)) {
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_PROCESSING);
             pthread_mutex_lock(&n->allowlist_mu);
             bool pending = false;
@@ -868,6 +923,10 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             if (newer && !pending) {
                 nostr_nip51_list_free(n->allowlist);
                 n->allowlist = list;
+                cJSON_Delete(n->acl_private_unknown);
+                n->acl_private_unknown = unknown; unknown = NULL;
+                n->acl_review_required = review;
+                n->acl_decode_failed = failed;
                 list = NULL;
                 n->acl_created_at = created;
                 memcpy(n->acl_id, canon, sizeof(n->acl_id));
@@ -876,6 +935,7 @@ static void handle_incoming_event(NostrIncomingEvent *incoming,
             }
             pthread_mutex_unlock(&n->allowlist_mu);
             nostr_nip51_list_free(list);
+            cJSON_Delete(unknown);
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_RECEIVED);
         } else {
             test_point(n, MD_NOSTR_TEST_ALLOWLIST_IGNORED);
@@ -1177,6 +1237,7 @@ void md_nostr_destroy(MdNostr *n) {
     if (n->pool) nostr_simple_pool_free(n->pool);
     if (n->allowlist)
         nostr_nip51_list_free(n->allowlist);
+    cJSON_Delete(n->acl_private_unknown);
 
     /* Free cached relay snapshot */
     if (n->relay_urls) {
@@ -1430,7 +1491,8 @@ uint32_t md_nostr_granted_capabilities_known(MdNostr *n, const char *pk,
         settled = n->acl_state != MD_NOSTR_ACL_UNKNOWN;
         grant = n->acl_state == MD_NOSTR_ACL_OPEN
             ? MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT
-            : n->acl_state == MD_NOSTR_ACL_LOADED ? entry_grant(n->allowlist, pk) : 0;
+            : n->acl_state == MD_NOSTR_ACL_LOADED && !n->acl_review_required &&
+              !n->acl_decode_failed ? entry_grant(n->allowlist, pk) : 0;
         pthread_mutex_unlock(&n->allowlist_mu);
         if (is_stopped(n)) { grant = 0; settled = true; }
         operation_end(n);
@@ -1450,7 +1512,8 @@ static bool is_allowed(MdNostr *n, const char *pubkey_hex) {
 
     pthread_mutex_lock(&n->allowlist_mu);
     bool allowed = n->acl_state == MD_NOSTR_ACL_OPEN;
-    if (n->acl_state == MD_NOSTR_ACL_LOADED && n->allowlist) {
+    if (n->acl_state == MD_NOSTR_ACL_LOADED && !n->acl_review_required &&
+        !n->acl_decode_failed && n->allowlist) {
         for (size_t i = 0; i < n->allowlist->count; i++) {
             NostrListEntry *entry = n->allowlist->entries[i];
             if (entry && entry->tag_name && strcmp(entry->tag_name, "p") == 0
@@ -1482,55 +1545,55 @@ static int refresh_allowlist(MdNostr *n) {
     return 0;
 }
 
-/* Build an unsigned kind:30000 event from the staged candidate.
- * Caller holds allowlist_mu while copying the authoritative base. */
-static NostrEvent *build_allowlist_event(const MdNostr *n, const NostrList *list,
-                                        int64_t created) {
-    NostrEvent *list_event = nostr_event_new();
-    if (!list_event) return NULL;
-
-    nostr_event_set_kind(list_event, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
-    nostr_event_set_pubkey(list_event, n->pk_hex);
-    nostr_event_set_created_at(list_event, created);
-    nostr_event_set_content(list_event, "");
-
-    /* Serialize allowlist entries as NIP-51 tags:
-     *   ["d", "metadesk-allowlist"]  — addressable d-tag
-     *   ["p", "<pubkey>"] — membership (extra is only a relay hint)
-     *   ["metadesk-caps", "<pubkey>", "v1:video,agent,input"] — policy */
-    NostrTags *tags = nostr_tags_new(0);
-    if (!tags) { nostr_event_free(list_event); return NULL; }
-
-    NostrTag *d_tag = nostr_tag_new("d", "metadesk-allowlist", NULL);
-    if (!d_tag) { nostr_tags_free(tags); nostr_event_free(list_event); return NULL; }
-    nostr_tags_append(tags, d_tag);
-    if (nostr_tags_size(tags) != 1) {
-        nostr_tag_free(d_tag); nostr_tags_free(tags); nostr_event_free(list_event); return NULL;
+/* No signer calls under allowlist_mu: external signers may block. The edit
+ * reservation and version fence cover encryption, signing and publish together. */
+static NostrEvent *build_allowlist_event(MdNostr *n, const NostrList *list,
+                                        int64_t created, cJSON *items) {
+    bool ok = items != NULL;
+    if (list) for (size_t i = 0; ok && i < list->count; i++) {
+        NostrListEntry *e = list->entries[i];
+        if (!e || !e->tag_name || !e->value) continue;
+        const char *fields[] = {e->tag_name, e->value, e->extra};
+        cJSON *item = cJSON_CreateStringArray(fields, e->extra ? 3 : 2);
+        if (!item || !cJSON_AddItemToArray(items, item)) {
+            cJSON_Delete(item); ok = false;
+        }
     }
-
-    if (list) {
-        for (size_t i = 0; i < list->count; i++) {
-            NostrListEntry *e = list->entries[i];
-            if (!e || !e->tag_name || !e->value) continue;
-            NostrTag *t = e->extra
-                ? nostr_tag_new(e->tag_name, e->value, e->extra, NULL)
-                : nostr_tag_new(e->tag_name, e->value, NULL);
-            if (!t) { nostr_tags_free(tags); nostr_event_free(list_event); return NULL; }
-            size_t before = nostr_tags_size(tags);
-            nostr_tags_append(tags, t);
-            if (nostr_tags_size(tags) != before + 1) {
-                nostr_tag_free(t); nostr_tags_free(tags); nostr_event_free(list_event); return NULL;
+    char *plain = ok ? cJSON_PrintUnformatted(items) : NULL;
+    char *cipher = NULL;
+    ok = plain && strlen(plain) <= MD_ALLOWLIST_MAX_CONTENT &&
+        md_signer_nip44_encrypt_cancellable(n->signer, n->pk_hex, plain,
+                                           &cipher, n->signer_cancel) == 0 && cipher &&
+        strlen(cipher) <= MD_ALLOWLIST_MAX_CONTENT;
+    if (plain) { md_secure_zero(plain, strlen(plain)); free(plain); }
+    cJSON_Delete(items);
+    NostrEvent *ev = ok ? nostr_event_new() : NULL;
+    if (ev) {
+        NostrTags *tags = nostr_tags_new(0);
+        NostrTag *d = nostr_tag_new("d", "metadesk-allowlist", NULL);
+        if (!tags || !d) {
+            nostr_tags_free(tags); nostr_tag_free(d); nostr_event_free(ev); ev = NULL;
+        } else {
+            nostr_tags_append(tags, d);
+            if (nostr_tags_size(tags) != 1) {
+                nostr_tag_free(d); nostr_tags_free(tags); nostr_event_free(ev); ev = NULL;
+            } else {
+                nostr_event_set_tags(ev, tags);
+                nostr_event_set_kind(ev, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
+                nostr_event_set_pubkey(ev, n->pk_hex);
+                nostr_event_set_created_at(ev, created);
+                nostr_event_set_content(ev, cipher);
             }
         }
     }
-
-    nostr_event_set_tags(list_event, tags); /* takes ownership */
-    return list_event;
+    free(cipher);
+    return ev;
 }
 
-static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add) {
-    if (!n || !n->signer || !pk || strlen(pk) != 64 ||
-        strspn(pk, "0123456789abcdef") != 64) return -1;
+static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add,
+                           const MdAllowlistEntry *confirmed, size_t count, bool migrate) {
+    if (!n || !n->signer || (!migrate && (!pk || strlen(pk) != 64 ||
+        strspn(pk, "0123456789abcdef") != 64))) return -1;
 
     uint32_t parsed = MD_CAP_VIDEO;
     if (add && caps && md_nostr_parse_caps(caps, &parsed)) return -1;
@@ -1538,6 +1601,7 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     snprintf(wire, sizeof(wire), "v1:%s", cap_names[parsed]);
     int ret = -1;
     NostrList *candidate = NULL;
+    cJSON *private_items = NULL;
     NostrEvent *ev = NULL, *signed_ev = NULL;
     pthread_mutex_lock(&n->allowlist_mu);
     /* Existing callers may edit immediately after create. Wait for an actual
@@ -1546,13 +1610,43 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
         pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
     if (is_stopped(n) || n->acl_state != MD_NOSTR_ACL_LOADED || n->acl_editing ||
-        n->acl_unconfirmed_count == MD_ACL_UNCONFIRMED_MAX) {
+        n->acl_unconfirmed_count == MD_ACL_UNCONFIRMED_MAX || n->acl_decode_failed ||
+        (!migrate && n->acl_review_required)) {
         pthread_mutex_unlock(&n->allowlist_mu);
         return -1;
     }
+    /* Migration confirms the complete membership, not a partial union. Duplicate
+     * source records normalize only through this explicit per-principal review. */
+    if (migrate) {
+        bool valid = count == 0 || confirmed;
+        for (size_t i = 0; valid && i < count; i++) {
+            const char *key = confirmed[i].pubkey_hex;
+            uint32_t mask;
+            valid = strlen(key) == 64 && strspn(key, "0123456789abcdef") == 64 &&
+                !md_nostr_parse_caps(confirmed[i].caps, &mask);
+            for (size_t j = 0; j < i; j++)
+                if (!strcmp(key, confirmed[j].pubkey_hex)) valid = false;
+            bool found = false;
+            if (n->allowlist) for (size_t j = 0; j < n->allowlist->count; j++) {
+                NostrListEntry *e = n->allowlist->entries[j];
+                if (e && e->tag_name && e->value && !strcmp(e->tag_name, "p") &&
+                    !strcmp(e->value, key)) found = true;
+            }
+            if (!found) valid = false;
+        }
+        if (n->allowlist) for (size_t i = 0; valid && i < n->allowlist->count; i++) {
+            NostrListEntry *e = n->allowlist->entries[i];
+            if (!e || !e->tag_name || !e->value || strcmp(e->tag_name, "p")) continue;
+            bool found = false;
+            for (size_t j = 0; j < count; j++)
+                if (!strcmp(e->value, confirmed[j].pubkey_hex)) found = true;
+            if (!found) valid = false;
+        }
+        if (!valid) { pthread_mutex_unlock(&n->allowlist_mu); return -1; }
+    }
     unsigned members = 0, scopes = 0;
     bool same = false;
-    if (n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+    if (!migrate && n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
         NostrListEntry *e = n->allowlist->entries[i];
         if (!e || !e->tag_name || !e->value || strcmp(e->value, pk)) continue;
         if (!strcmp(e->tag_name, "p")) members++;
@@ -1561,8 +1655,8 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
             same = e->extra && !strcmp(e->extra, wire);
         }
     }
-    if ((!add && !members && !scopes) || (add && members &&
-        (!caps || (members == 1 && scopes == 1 && same)))) {
+    if (!migrate && ((!add && !members && !scopes) || (add && members &&
+        (!caps || (members == 1 && scopes == 1 && same))))) {
         /* Omitted caps preserves existing policy; explicit caps is an upsert. */
         pthread_mutex_unlock(&n->allowlist_mu);
         return 0;
@@ -1573,7 +1667,7 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
         nostr_nip51_list_set_identifier(candidate, "metadesk-allowlist");
         built = candidate->identifier != NULL;
     }
-    if (built && n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
+    if (built && !migrate && n->allowlist) for (size_t i = 0; i < n->allowlist->count; i++) {
         NostrListEntry *e = n->allowlist->entries[i];
         if (!e || !e->tag_name || !e->value) continue;
         if ((!strcmp(e->tag_name, "p") || !strcmp(e->tag_name, "metadesk-caps")) &&
@@ -1582,7 +1676,12 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
             built = false; break;
         }
     }
-    if (built && add) built = list_append_copy(candidate, "p", pk, NULL) &&
+    if (migrate) for (size_t i = 0; built && i < count; i++) {
+        snprintf(wire, sizeof(wire), "v1:%s", confirmed[i].caps);
+        built = list_append_copy(candidate, "p", confirmed[i].pubkey_hex, NULL) &&
+                list_append_copy(candidate, "metadesk-caps", confirmed[i].pubkey_hex, wire);
+    }
+    if (built && !migrate && add) built = list_append_copy(candidate, "p", pk, NULL) &&
                              list_append_copy(candidate, "metadesk-caps", pk, wire);
     uint64_t version = n->acl_version;
     int64_t created = (int64_t)time(NULL);
@@ -1592,10 +1691,27 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
         if (n->acl_created_at == INT64_MAX) built = false;
         else created = n->acl_created_at + 1;
     }
-    if (built) ev = build_allowlist_event(n, candidate, created);
-    if (ev) n->acl_editing = true;
+    if (created > (int64_t)time(NULL) + 300) built = false;
+    if (built) {
+        private_items = n->acl_private_unknown ? cJSON_Duplicate(n->acl_private_unknown, true) : cJSON_CreateArray();
+        built = private_items != NULL;
+    }
+    if (built) n->acl_editing = true;
     pthread_mutex_unlock(&n->allowlist_mu);
-    if (!ev) { nostr_nip51_list_free(candidate); return -1; }
+    if (built) {
+        ev = build_allowlist_event(n, candidate, created, private_items); /* consumes items */
+        private_items = NULL;
+    }
+    cJSON_Delete(private_items);
+    if (!ev) {
+        nostr_nip51_list_free(candidate);
+        if (built) {
+            pthread_mutex_lock(&n->allowlist_mu);
+            n->acl_editing = false;
+            pthread_mutex_unlock(&n->allowlist_mu);
+        }
+        return -1;
+    }
 
     signed_ev = sign_event_cancellable(n->signer, ev, n->signer_cancel);
     nostr_event_free(ev);
@@ -1617,6 +1733,7 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
                 n->acl_state == MD_NOSTR_ACL_LOADED && !is_stopped(n)) {
                 nostr_nip51_list_free(n->allowlist);
                 n->allowlist = candidate;
+                n->acl_review_required = n->acl_decode_failed = false;
                 candidate = NULL;
                 n->acl_created_at = nostr_event_get_created_at(signed_ev);
                 memcpy(n->acl_id, id, 65);
@@ -1637,10 +1754,10 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
 }
 
 static int allowlist_add(MdNostr *n, const char *pk, const char *caps) {
-    return allowlist_edit(n, pk, caps, true);
+    return allowlist_edit(n, pk, caps, true, NULL, 0, false);
 }
 static int allowlist_remove(MdNostr *n, const char *pk) {
-    return allowlist_edit(n, pk, NULL, false);
+    return allowlist_edit(n, pk, NULL, false, NULL, 0, false);
 }
 
 static int allowlist_count(const MdNostr *n) {
@@ -1671,12 +1788,21 @@ static int allowlist_get_entry(const MdNostr *n, int index,
             snprintf(out->pubkey_hex, sizeof(out->pubkey_hex), "%s",
                      entry->value ? entry->value : "");
             snprintf(out->caps, sizeof(out->caps), "%s",
-                     cap_names[entry_grant(n->allowlist, entry->value)]);
+                     cap_names[n->acl_review_required ? 0 : entry_grant(n->allowlist, entry->value)]);
+            out->review_required = n->acl_review_required;
             ret = 0;
             break;
         }
     }
     pthread_mutex_unlock((pthread_mutex_t *)&n->allowlist_mu);
+    return ret;
+}
+
+int md_nostr_allowlist_migrate(MdNostr *n, const MdAllowlistEntry *confirmed, size_t count) {
+    if (!owns_host(n) || !operation_begin(n)) return -1;
+    int ret = allowlist_edit(n, NULL, NULL, false, confirmed, count, true);
+    if (is_stopped(n)) ret = -1;
+    operation_end(n);
     return ret;
 }
 
@@ -1691,7 +1817,7 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
     pthread_mutex_lock(&n->allowlist_mu);
     while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
         pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
-    if (n->acl_state == MD_NOSTR_ACL_LOADED && !is_stopped(n)) {
+    if (n->acl_state == MD_NOSTR_ACL_LOADED && !n->acl_decode_failed && !is_stopped(n)) {
         size_t capacity = n->allowlist ? n->allowlist->count : 0;
         copy = capacity ? calloc(capacity, sizeof(*copy)) : NULL;
         if (!capacity || copy) {
@@ -1700,7 +1826,8 @@ int md_nostr_allowlist_snapshot(MdNostr *n, MdAllowlistEntry **entries, size_t *
                 if (!e || !e->tag_name || strcmp(e->tag_name, "p") || !e->value) continue;
                 snprintf(copy[used].pubkey_hex, sizeof(copy[used].pubkey_hex), "%s", e->value);
                 snprintf(copy[used].caps, sizeof(copy[used].caps), "%s",
-                         cap_names[entry_grant(n->allowlist, e->value)]);
+                         cap_names[n->acl_review_required ? 0 : entry_grant(n->allowlist, e->value)]);
+                copy[used].review_required = n->acl_review_required;
                 ++used;
             }
             ret = 0;

@@ -23,6 +23,7 @@
 #include <backends/imgui_impl_sdlrenderer2.h>
 
 #include <SDL2/SDL.h>
+#include "session.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -31,7 +32,7 @@
 
 struct MdOverlay {
     bool           visible;
-    bool           disconnect_requested;
+    MdOverlayAction action;
     SDL_Window    *window;
     SDL_Renderer  *renderer;
 
@@ -120,8 +121,8 @@ void md_overlay_new_frame(MdOverlay *o) {
     ImGui::NewFrame();
 }
 
-void md_overlay_handle_sdl_event(MdOverlay *o, void *event) {
-    if (!o || !event) return;
+bool md_overlay_handle_sdl_event(MdOverlay *o, void *event) {
+    if (!o || !event) return false;
 
     SDL_Event *ev = static_cast<SDL_Event *>(event);
     ImGui_ImplSDL2_ProcessEvent(ev);
@@ -132,6 +133,37 @@ void md_overlay_handle_sdl_event(MdOverlay *o, void *event) {
         !ev->key.repeat) {
         o->visible = !o->visible;
     }
+    if (ev->type == SDL_KEYDOWN && ev->key.keysym.sym == SDLK_ESCAPE && !ev->key.repeat)
+        o->visible = true; /* Escape opens controls, never silently quits. */
+    return (ev->type == SDL_KEYDOWN || ev->type == SDL_KEYUP) &&
+        (ev->key.keysym.sym == SDLK_F1 || ev->key.keysym.sym == SDLK_ESCAPE);
+}
+
+const char *md_client_phase_label(MdClientPhase phase) {
+    switch (phase) {
+    case MD_CLIENT_FIPS: return "FIPS readiness / route";
+    case MD_CLIENT_NEGOTIATING: return "Negotiating (relay / authorization)";
+    case MD_CLIENT_CONNECTING: return "Connecting";
+    case MD_CLIENT_BINDING: return "Verifying session binding";
+    case MD_CLIENT_STREAMING: return "Streaming";
+    case MD_CLIENT_BACKOFF: return "Reconnect countdown";
+    default: return "Disconnected";
+    }
+}
+const char *md_client_error_label(MdClientError error) {
+    switch (error) {
+    case MD_CLIENT_ERROR_FIPS: return "FIPS route / daemon";
+    case MD_CLIENT_ERROR_ADMISSION: return "Session authorization / relay";
+    case MD_CLIENT_ERROR_TRANSPORT: return "Transport connection";
+    case MD_CLIENT_ERROR_BINDING: return "Session binding / ACK";
+    default: return "None";
+    }
+}
+MdOverlayAction md_overlay_take_action(MdOverlay *o) {
+    if (!o) return MD_OVERLAY_NONE;
+    MdOverlayAction action = o->action;
+    o->action = MD_OVERLAY_NONE;
+    return action;
 }
 
 void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
@@ -143,6 +175,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
         return;
     }
 
+    if (!stats->connected) o->visible = true;
     if (!o->visible) {
         /* Render a minimal "F1 for stats" hint in the corner */
         ImGui::SetNextWindowPos(ImVec2(10, 10));
@@ -195,6 +228,16 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
                            "[-] Disconnected");
     }
 
+    ImGui::TextWrapped("Phase: %s", md_client_phase_label(stats->phase));
+    if (stats->error != MD_CLIENT_ERROR_NONE)
+        ImGui::TextWrapped("Error: %s", md_client_error_label(stats->error));
+    if (stats->connected) {
+        ImGui::Text("Granted capabilities:");
+        ImGui::Text("Video: %s  Agent: %s  Input: %s",
+                    stats->granted_caps & MD_CAP_VIDEO ? "yes" : "no",
+                    stats->granted_caps & MD_CAP_AGENT ? "yes" : "no",
+                    stats->granted_caps & MD_CAP_INPUT ? "yes" : "no");
+    }
     if (stats->status_message && stats->status_message[0]) {
         ImGui::TextWrapped("%s", stats->status_message);
     }
@@ -241,21 +284,21 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.5f, 0.05f, 0.05f, 1.0f));
 
-    float button_width = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button("Disconnect", ImVec2(button_width, 0))) {
-        o->disconnect_requested = true;
-        /* Post a quit event so the main loop exits cleanly */
-        SDL_Event quit_event;
-        quit_event.type = SDL_QUIT;
-        SDL_PushEvent(&quit_event);
+    if (stats->paused) {
+        if (ImGui::Button("Connect / Retry")) o->action = MD_OVERLAY_RETRY;
+    } else {
+        if (ImGui::Button(stats->connected ? "Disconnect" : "Cancel connection"))
+            o->action = MD_OVERLAY_DISCONNECT;
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Quit")) o->action = MD_OVERLAY_QUIT;
 
     ImGui::PopStyleColor(3);
 
     /* ── Footer hint ─────────────────────────────────────── */
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, 0.7f),
-                       "F1: toggle overlay");
+                       "F1: toggle overlay | Escape: controls");
 
     ImGui::End();
 
