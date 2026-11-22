@@ -757,6 +757,74 @@ static int test_tags_follow_frames(void) {
     return 0;
 }
 
+/* ── Persistent encoder across client reconnects (md-3nv) ────── */
+
+typedef struct {
+    MdDecoder *decoder;
+    uint64_t first_tag;
+    int packets, decoded;
+} ReconnectClient;
+
+static void on_reconnect_decode(const MdDecodedFrame *frame, void *userdata) {
+    ReconnectClient *client = userdata;
+    MD_CHECK(frame->data != NULL);
+    MD_CHECK(frame->width == TEST_W && frame->height == TEST_H);
+    client->decoded++;
+}
+
+static void on_reconnect_packet(const MdEncodedPacket *pkt, void *userdata) {
+    ReconnectClient *client = userdata;
+    /* An asynchronous encoder may still emit the departed client's frames. */
+    if (pkt->tag < client->first_tag) return;
+    if (client->packets++ == 0) {
+        MD_CHECK(pkt->tag == client->first_tag);
+        MD_CHECK(pkt->is_key);
+    }
+    MD_CHECK(md_decoder_submit(client->decoder, pkt->data, pkt->size, pkt->pts) == 0);
+    MD_CHECK(md_decoder_poll(client->decoder, on_reconnect_decode, client) >= 0);
+}
+
+static int test_encoder_reuse_after_client_leaves(void) {
+    printf("  test_encoder_reuse_after_client_leaves... ");
+    int failures_before = atomic_load(&md_test_failures);
+    MdEncoderConfig cfg = {
+        .width = TEST_W, .height = TEST_H, .bitrate = 4000000, .fps = 30,
+    };
+    MdEncoder *enc = md_encoder_create(&cfg);
+    MD_CHECK(enc != NULL);
+    if (!enc) return 1;
+    uint8_t *buf = malloc((size_t)TEST_W * 4u * TEST_H);
+    MD_CHECK(buf != NULL);
+    if (!buf) { md_encoder_destroy(enc); return 1; }
+    fill_solid(buf, TEST_W, TEST_H, TEST_W * 4u, 40, 80, 120);
+
+    for (int session = 0; session < 20; session++) {
+        ReconnectClient client = {
+            .decoder = md_decoder_create(),
+            .first_tag = (uint64_t)session * 12u + 1u,
+        };
+        MD_CHECK(client.decoder != NULL);
+        if (!client.decoder) { free(buf); md_encoder_destroy(enc); return 1; }
+        md_encoder_force_keyframe(enc);
+        for (int frame = 0; frame < 12; frame++) {
+            MD_CHECK(md_encoder_submit_tagged(enc, buf, TEST_W * 4u,
+                MD_PIX_FMT_BGRX, session * 12 + frame, client.first_tag + frame,
+                on_reconnect_packet, &client) == 0);
+        }
+        /* Client teardown must not send EOF to the persistent encoder. The
+         * next client must decode independently, including in-band headers. */
+        MD_CHECK(md_decoder_flush(client.decoder, on_reconnect_decode, &client) >= 0);
+        MD_CHECK(client.packets > 0);
+        MD_CHECK(client.decoded > 0);
+        md_decoder_destroy(client.decoder);
+    }
+    free(buf);
+    md_encoder_destroy(enc);
+    printf("%s (20 clients, independent decoders, no encoder EOF)\n",
+           atomic_load(&md_test_failures) == failures_before ? "OK" : "FAILED");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -782,8 +850,10 @@ int main(void) {
     failures += test_encode_after_bitrate_change();
     failures += test_bitrate_rapid_changes();
     failures += test_tags_follow_frames();
+    failures += test_encoder_reuse_after_client_leaves();
 
-    printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     md_test_failures += failures;
+    printf("\n%s\n", atomic_load(&md_test_failures) == 0
+           ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return md_test_report();
 }
