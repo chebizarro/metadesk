@@ -865,6 +865,7 @@ endif
 if enable_client
   client_sources = files(
     'src/client/main.c',
+    'src/client/rates.c',
     'src/client/render.c',
     'src/client/ui.cpp',
   )
@@ -897,6 +898,12 @@ if enable_client
     include_directories : [core_inc, include_directories('src/client')],
     dependencies : [dep_metadesk, dep_sdl2])
   test('client render driver selection', test_render_select)
+  test_client_session = executable('test_client_session',
+    files('tests/test_client_session.c', 'src/client/rates.c',
+          'src/client/render.c', 'src/client/ui.cpp'),
+    include_directories : [core_inc, include_directories('src/client')],
+    dependencies : [dep_metadesk, dep_sdl2, dep_imgui])
+  test('client session refusal', test_client_session)
 endif
 
 # Client process contracts without a TTY or display (md-rk4, md-33e).
@@ -911,6 +918,12 @@ if enable_nip46 and enable_client and host_os == 'linux'
     args : [files('tests/access_session_e2e.py'), metadesk_host, metadesk_client, access_bunker_fixture],
     timeout : 200)
 endif
+
+test_client_rates = executable('test_client_rates',
+  files('tests/test_client_rates.c', 'src/client/rates.c'),
+  include_directories : [core_inc, include_directories('src/client')],
+)
+test('client sliding-window rates', test_client_rates)
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 test_packet = executable('test_packet',

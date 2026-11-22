@@ -21,6 +21,7 @@
 #include "stream.h"
 #include "decode.h"
 #include "render.h"
+#include "rates.h"
 #include "signer.h"
 #include "nostr.h"
 #include "a11y.h"
@@ -59,6 +60,7 @@ typedef struct {
 typedef struct {
     MdRenderer   *renderer;
     MdOverlay    *overlay;
+    MdClientRates rates;
     uint32_t      frames_decoded;
     uint32_t      frames_displayed;
     int64_t       total_decode_us;
@@ -84,7 +86,7 @@ typedef struct {
     char          stream_token[65];       /* ephemeral DM-only proof    */
     uint32_t      granted_caps;       /* from session_accept DM          */
     MdTreeFormat  accepted_tree_format; /* confirmed tree format          */
-    volatile int  session_accepted;   /* set by on_dm callback           */
+    volatile int  session_accepted;   /* 1 accepted, -1 refused; under mutex */
     GoChannel      *session_ch;       /* signaled on session accepted    */
     MdAccountWatch *owner_watch;      /* also guards direct-IP sessions  */
     MdAccountBinding *owner;          /* borrowed from startup until drain */
@@ -151,6 +153,22 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
         return;
     }
 
+    MdSessionReject reject;
+    if (md_session_reject_from_json(content, &reject) == 0) {
+        pthread_mutex_lock(&g_negotiation_mu);
+        bool matched = ctx->request_pending && !ctx->session_accepted &&
+            md_session_reject_matches_request(&reject, &ctx->pending_req,
+                                               info->rumor_created_at);
+        if (matched) {
+            ctx->session_accepted = -1;
+            ctx->request_pending = 0;
+            ctx->connection_status = md_session_reject_message(&reject);
+        }
+        pthread_mutex_unlock(&g_negotiation_mu);
+        if (matched && ctx->session_ch)
+            go_channel_try_send(ctx->session_ch, (void *)(uintptr_t)1);
+        return;
+    }
     MdSessionAccept acc;
     if (md_session_accept_from_json(content, &acc) != 0) {
         OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
@@ -284,6 +302,7 @@ static void reset_session_accept_state(ClientCtx *ctx) {
     ctx->granted_caps = 0;
     ctx->accepted_tree_format = MD_TREE_FORMAT_COMPACT;
     ctx->session_accepted = 0;
+    ctx->connection_status = NULL;
 }
 
 static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
@@ -360,6 +379,10 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
 
     if (!client_owner_current(ctx)) {
         fprintf(stderr, "ERROR: client role revoked during session negotiation\n");
+        return -1;
+    }
+    if (accepted < 0) {
+        fprintf(stderr, "ERROR: %s\n", ctx->connection_status);
         return -1;
     }
     if (!accepted) {
@@ -620,8 +643,7 @@ static void overlay_event_forward(void *event, void *userdata) {
     forward_input_event(ctx, (const SDL_Event *)event);
 }
 
-static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
-                                  uint32_t stats_start_ms) {
+static void render_client_overlay(ClientCtx *ctx, MdStream *stream) {
     if (!ctx || !ctx->overlay)
         return;
 
@@ -629,7 +651,12 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
     if (stream)
         md_stream_get_stats(stream, &stream_stats);
 
-    uint32_t now = md_stream_now_ms();
+    MdClientRateValues rates = { 0 };
+    if (stream)
+        rates = md_client_rates_update(&ctx->rates, md_stream_now_ms(),
+                                       ctx->frames_decoded, stream_stats.bytes_recv);
+    else
+        ctx->rates = (MdClientRates){ 0 };
     double avg_decode_ms = ctx->frames_decoded > 0
         ? (double)ctx->total_decode_us / ctx->frames_decoded / 1000.0
         : 0.0;
@@ -643,11 +670,8 @@ static void render_client_overlay(ClientCtx *ctx, MdStream *stream,
         .reconnecting = ctx->reconnecting != 0,
         .reconnect_delay_ms = ctx->reconnect_delay_ms,
         .status_message = ctx->connection_status,
-        .fps          = ctx->frames_decoded > 0
-            ? (int)(ctx->frames_decoded * 1000.0 /
-                    (now - stats_start_ms + 1)) : 0,
-        .bitrate_mbps = stream_stats.bytes_recv > 0
-            ? (float)(stream_stats.bytes_recv * 8.0 / 1000000.0) : 0.0f,
+        .fps          = (int)rates.fps,
+        .bitrate_mbps = (float)rates.mbps,
         .encoder_name = NULL,
     };
 
@@ -679,7 +703,7 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
                 g_running = 0;
                 return -1;
             }
-            render_client_overlay(ctx, NULL, start);
+            render_client_overlay(ctx, NULL);
         }
 
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
@@ -990,9 +1014,10 @@ int main(int argc, char **argv) {
             md_session_reset(&session);
 
             ctx.reconnecting = 1;
-            ctx.connection_status = "Disconnected — reconnecting...";
+            if (ctx.session_accepted >= 0)
+                ctx.connection_status = "Disconnected — reconnecting...";
             ctx.reconnect_delay_ms = reconnect_delay_ms;
-            render_client_overlay(&ctx, NULL, last_stats_ms);
+            render_client_overlay(&ctx, NULL);
 
             fprintf(stderr, "client: reconnecting in %.1fs\n",
                     (double)reconnect_delay_ms / 1000.0);
@@ -1043,7 +1068,7 @@ int main(int argc, char **argv) {
 
         if (ret == 1) {
             /* Timeout — no data yet, keep UI responsive and loop back. */
-            render_client_overlay(&ctx, stream, last_stats_ms);
+            render_client_overlay(&ctx, stream);
             continue;
         }
         if (ret < 0) {
@@ -1090,7 +1115,7 @@ int main(int argc, char **argv) {
 
             /* Composite the freshly decoded frame + overlay and present now,
              * rather than waiting for the next recv timeout. */
-            render_client_overlay(&ctx, stream, last_stats_ms);
+            render_client_overlay(&ctx, stream);
             break;
         }
 
@@ -1165,7 +1190,7 @@ int main(int argc, char **argv) {
         free(payload);
 
         /* Update and render overlay */
-        render_client_overlay(&ctx, stream, last_stats_ms);
+        render_client_overlay(&ctx, stream);
 
         /* Print stats every 5 seconds */
         uint32_t now = md_stream_now_ms();

@@ -81,7 +81,10 @@ class Proxy(socketserver.BaseRequestHandler):
                 proof = header + exact(self.request, length)
                 with self.server.lock:
                     self.server.proofs.append(proof)
-                    self.server.connections.append((self.request, upstream))
+                    # Own only the client-facing fault handle. Shutting it
+                    # wakes this handler, whose context closes the upstream;
+                    # retaining an upstream dup would mask natural client EOF.
+                    self.server.connections.append((self.request.dup(),))
                 upstream.sendall(proof)
                 while True:
                     for source in select.select([self.request, upstream], [], [])[0]:
@@ -229,6 +232,8 @@ def run(host, client, crypto):
                             sock.shutdown(socket.SHUT_RDWR)
                         except OSError:
                             pass
+                        finally:
+                            sock.close()
             for server in servers:
                 server.shutdown()
                 server.server_close()
