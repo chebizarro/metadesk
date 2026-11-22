@@ -108,7 +108,7 @@ static void closed(Pair p) {
 #define TEST_FRAME_H 360
 static const uint32_t test_pkt_seq = 1;
 static HostCtx context(MdSession *s) {
-    HostCtx ctx = { .session = s, .agent = (MdAgent *)(uintptr_t)1,
+    HostCtx ctx = { .pending_req = {.stream_tls = true}, .tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = s, .agent = (MdAgent *)(uintptr_t)1,
                     .input = (MdInput *)(uintptr_t)1 };
     host_capture_sync_init(&ctx.sync, NULL, NULL, NULL, &test_pkt_seq,
                            TEST_FRAME_W, TEST_FRAME_H, NULL);
@@ -318,6 +318,99 @@ static void test_denied_capabilities(void) {
     handle_client_packet(&ctx, &hdr, NULL);
     MD_CHECK(action_calls == actions); closed(p); destroy_pair(p);
 }
+typedef struct { MdStreamServer *server; MdStream *stream; } AttendedTlsAccept;
+static void *attended_tls_accept(void *data) {
+    AttendedTlsAccept *accept = data;
+    accept->stream = md_stream_server_accept(accept->server, 5000);
+    return NULL;
+}
+
+/* Exercise the real human-grant branch with the listener's actual certificate,
+ * then bind and tear down pinned TLS through both revocation paths. No desktop,
+ * relay, fabricated fingerprint or token-before-pin shortcut in this case. */
+static void test_attended_tls_revocation(void) {
+    for (unsigned cancel = 0; cancel < 2; ++cancel) {
+        MdHostAccess access;
+        MD_CHECK(md_host_access_init(&access) == 0);
+        MdSession session; md_session_init(&session);
+        HostCtx ctx = {.session = &session, .access = &access};
+        pthread_mutex_init(&ctx.client_mu, NULL);
+        ctx.session_req_ch = go_channel_create(1);
+        const char *peer = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        MdSessionRequest request = {.capabilities = MD_CAP_VIDEO | MD_CAP_INPUT,
+                                    .tree_format = MD_TREE_FORMAT_COMPACT};
+        MD_CHECK(md_session_request_prepare(&request, time(NULL), 60) == 0);
+        MD_CHECK(md_host_access_enqueue(&access, peer, &request, time(NULL)) == 0);
+        MdHostAccessSnapshot v;
+        md_host_access_snapshot(&access, time(NULL), &v);
+        MD_CHECK(md_host_access_decide(&access, v.generation, v.revision,
+            request.request_id, true, false, MD_CAP_VIDEO, MD_HOST_ACCESS_CAPS,
+            time(NULL), NULL) == 0);
+        MD_CHECK(host_has_request(&ctx) && ctx.human_approved);
+        ctx.pending_req.stream_tls = false;
+        MD_CHECK(host_accept_request(&ctx, NULL, "legacy-attended", true) < 0);
+        MD_CHECK(session.state == MD_SESSION_IDLE && !session.stream_token[0]);
+        ctx.pending_req.stream_tls = true;
+        MdStreamTlsConfig tls = {.enabled = true};
+        MdStreamServer *server = md_stream_server_create_tls("::1", 0, &tls);
+        MD_CHECK(server);
+        MD_CHECK(md_stream_server_tls_fingerprint(server, ctx.tls_cert_sha256) == 0);
+        MD_CHECK(host_accept_request(&ctx, NULL, "negotiated-id", true) == 0);
+        MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
+        MD_CHECK(!strcmp(published.tls_cert_sha256, ctx.tls_cert_sha256));
+        MD_CHECK(!strcmp(published.request_id, request.request_id));
+        MD_CHECK(published.granted == MD_CAP_VIDEO && published.stream_token[0]);
+        AttendedTlsAccept accept = {.server = server};
+        pthread_t thread;
+        MD_CHECK(pthread_create(&thread, NULL, attended_tls_accept, &accept) == 0);
+        tls.cert_sha256 = published.tls_cert_sha256;
+        Pair p = {.peer = md_stream_connect_tls("::1", md_stream_server_port(server), 5000, &tls)};
+        pthread_join(thread, NULL); p.host = accept.stream;
+        MD_CHECK(p.peer && p.host && md_stream_is_tls(p.peer) && md_stream_is_tls(p.host));
+        send_proof(p, &published); /* only after the pinned handshake above */
+        MD_CHECK(host_bind_candidate(&ctx, p.host) == 0);
+        ack(p, MD_CAP_VIDEO);
+        MD_CHECK(!session.stream_token[0]);
+        ctx.client = p.host;
+        if (cancel) {
+            char json[128];
+            snprintf(json, sizeof(json),
+                "{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"%s\"}", request.request_id);
+            MdNostrDmInfo info = {.live = true};
+            host_on_dm(peer, json, &info, &ctx);
+        } else {
+            md_host_access_snapshot(&access, time(NULL), &v);
+            MD_CHECK(md_host_access_kick(&access, v.generation, v.revision, session.session_id) == 0);
+        }
+        MD_CHECK(!md_host_access_valid(&access, request.request_id));
+        /* Revocation blocks even a harmless queued packet and closes TLS. */
+        MdPacketHeader hdr = {.type = MD_PKT_PING};
+        handle_client_packet(&ctx, &hdr, NULL);
+        closed(p);
+        host_finish_client(&ctx, p.host);
+        MD_CHECK(!ctx.client && session.state == MD_SESSION_IDLE && !session.stream_token[0]);
+        md_host_access_snapshot(&access, time(NULL), &v);
+        MD_CHECK(!v.occupied && !ctx.session_requested);
+        md_stream_destroy(p.peer);
+        md_stream_server_destroy(server);
+        go_channel_close(ctx.session_req_ch); go_channel_unref(ctx.session_req_ch);
+        pthread_mutex_destroy(&ctx.client_mu);
+        md_host_access_destroy(&access);
+    }
+}
+
+static void test_legacy_tls_refusal(void) {
+    MdSession session; md_session_init(&session);
+    HostCtx ctx = context(&session);
+    MD_CHECK(md_session_request_prepare(&ctx.pending_req, time(NULL), 30) == 0);
+    ctx.pending_req.stream_tls = false;
+    unsigned before = publish_calls;
+    MD_CHECK(host_accept_request(&ctx, (MdNostr *)(uintptr_t)1, "legacy", true) < 0);
+    MD_CHECK(!session.stream_token[0]);
+    MD_CHECK(host_publish_session_accept(&ctx, NULL) < 0);
+    MD_CHECK(publish_calls == before && !session.stream_token[0]);
+}
+
 static void test_late_publication(void) {
     MdSession s; md_session_init(&s);
     MD_CHECK(md_session_accept(&s, "negotiated-id", MD_CAP_VIDEO) == 0);
@@ -796,7 +889,7 @@ static void test_capture_admission(void) {
         MD_CHECK(cases[i].releases == (i >= 3 ? 1 : 0));
         if (i) MD_CHECK(cases[i].timeout == HOST_CAPTURE_FIRST_FRAME_WAIT_MS);
         MdSession session; md_session_init(&session);
-        HostCtx ctx = {.session = &session, .capture_required = true,
+        HostCtx ctx = {.tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = &session, .capture_required = true,
                        .capture_ready = ready};
         MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
         MD_CHECK(md_session_accept(&session, "capture-admission", MD_CAP_VIDEO) == 0);
@@ -820,7 +913,7 @@ static void test_capture_admission(void) {
     uint32_t w = 0, h = 0;
     MD_CHECK(host_start_capture(NULL, &w, &h, NULL) < 0);
     MdSession session; md_session_init(&session);
-    HostCtx ctx = {.session = &session}; /* explicit --no-capture fixture */
+    HostCtx ctx = {.tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = &session}; /* explicit --no-capture fixture */
     MD_CHECK(md_session_request_prepare(&ctx.pending_req, (int64_t)time(NULL), 30) == 0);
     MD_CHECK(md_session_accept(&session, "no-capture-fixture", MD_CAP_VIDEO) == 0);
     MD_CHECK(host_publish_session_accept(&ctx, NULL) == 0);
@@ -861,7 +954,7 @@ static void idle_decoded(const MdDecodedFrame *frame, void *data) {
 static void test_idle_capture_rebind(void) {
     MdSession session;
     md_session_init(&session);
-    HostCtx ctx = {.session = &session};
+    HostCtx ctx = {.tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = &session};
     pthread_mutex_init(&ctx.client_mu, NULL);
     AdmissionCapture source = {.width = 640, .height = 360};
     const MdCaptureBackend startup = {.start = admission_start,
@@ -958,7 +1051,7 @@ static void *next_session_thread(void *data) {
  * Replay the first request/token after two disconnects, not only the last. */
 static void test_relay_rebind(const char *url) {
     MdSession session; md_session_init(&session);
-    HostCtx ctx = {.session = &session};
+    HostCtx ctx = {.tls_cert_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .session = &session};
     pthread_mutex_init(&ctx.client_mu, NULL);
     ctx.session_req_ch = go_channel_create(1);
     HistProbe hp, cp; hist_init(&hp, &ctx); hist_init(&cp, NULL);
@@ -1091,6 +1184,8 @@ int main(int argc, char **argv) {
     test_rearm_request();
     test_agent_replacement_failure();
     test_candidate_and_second_client(); test_unbound_dispatch(); test_bad_proofs();
+    test_attended_tls_revocation();
+    test_legacy_tls_refusal();
     test_denied_capabilities(); test_late_publication(); test_expiry_and_strict_json();
     return md_test_report();
 }

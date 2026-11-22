@@ -246,3 +246,60 @@ Source discovery used five Jev find-lines calls (27 requests, 212188 input token
 approximately $0.008912). Partial client-lifecycle hits were widened to confirm
 that kick closes the stream but the inherited client may reconnect; the fixture
 now waits for actual connection loss and explicitly stops its test client.
+
+### W12 TLS integration (master `8f10366`, including W12 `15aa94c`)
+
+The master merge keeps both admission paths behind the pinned-TLS requirement.
+An attended decision cannot authorize a legacy non-TLS client. Once approved,
+the host publishes the **actual listener certificate SHA-256 pin** in the same
+correlated, encrypted `session_accept` DM as the one-use token. W12's client
+verifies TLS 1.3 and that exact pin before sending the token; missing/wrong pins
+never fall back to plaintext. See [stream binding](stream-binding.md).
+
+The initial admission loop keeps W13's rearming behavior, including cancellation
+and stale decisions, with W12's `tls_required` refusal for legacy peers. The TLS
+listener and its pin persist across rearming. Kick/cancel only revoke admission
+from callback/IPC threads; the host thread gates stream use, closes it, joins
+per-session work, destroys TLS, then resets the session and token. No management
+protocol change or cross-thread SSL teardown was introduced.
+
+`host_binding` now exercises a real human-approved capability subset with a real
+TLS listener certificate, checks the emitted acceptance pin against that
+listener, performs pinned TLS before binding, then checks both kick and live
+`session_cancel` close the TLS peer and clear session/token/slot state. It also
+checks a human-approved request without TLS support is refused before a token
+or negotiating session exists. The real host/client approval fixture explicitly
+requires the TLS 1.3 connection transition before stream activation and observes
+connection loss after kick.
+
+The direct-IP negative fixture retains its short 1500-ms watchdog, but no longer
+confuses refusal **delivery latency** with fail-closed authorization. It requires
+the host's correlated refusal, a terminal client failure, no TCP dial transition,
+and unchanged proxy traffic. A refusal response or the client's watchdog may
+win while retained signer history drains under TSan; neither is treated as a
+successful stream or as proof of delivered denial. Delivered denial remains a
+strict separate assertion in the real attended fixture and client refusal tests.
+No timeout was increased, no retry added, and no sanitizer suppression used.
+
+Diff-scoped Nostr A-J integration review found no introduced relay mismatch:
+publication still checks positive OK, acceptance keeps request correlation,
+replay fences and one-use binding, and TLS negotiation adds no relay polling,
+filter broadening or elapsed-time history completion. The second-opinion merge
+review was limited to supplied source excerpts and found no concrete defect;
+it is not a whole-patch approval.
+
+Merged-tree reruns: macOS full suite **60 passed, 1 native AX live skip**;
+ASan+UBSan **9/9 passed**; TSan **9/9 passed**, without suppressions; Linux ARM64
+`~/md-w13` compile at `-j2` and full suite **58 passed, 1 first-key desktop opt-in
+skip**. Sanitizers covered stream pinning, session/client refusal, host binding
+(including attended TLS kick/cancel), state machine, IPC, retained correlation,
+NIP-5F direct-IP integration and real attended host/client flow. The Mac real
+process fixture passed TLS approve-once/kick, strict delivered denial, private
+remember and restart. No capture, input or FIPS routing qualification is implied.
+
+Master advanced during validation only in Windows packaging and Beads metadata.
+The final merge includes that newer tip; Git object IDs for `src/`, `tests/`,
+`meson.build` and `meson_options.txt` were checked identical to the tested tree.
+Inherited master Beads metadata is unchanged; no lane-authored Beads file edit
+was included. Linux validation and local scratch directories were removed after
+recording these results. Windows was not requalified by this merge-only run.

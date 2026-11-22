@@ -14,7 +14,12 @@ framing remains version 1. Both host and client must be upgraded together.
    Startup cannot spend the client's bind/ACK budget. Entropy failure denies
    access; there is no fallback.
 2. The existing NIP-17 `session_accept` DM additionally carries `stream_token`
-   (64 lowercase hex characters). It is ephemeral: never log or persist it.
+   and `tls_cert_sha256` (64 lowercase hex characters each). The request must
+   advertise `stream_tls: "tls13-sha256"`; otherwise the host refuses before
+   reserving any token. Secrets are ephemeral: never log or persist the token.
+   The client completes TLS 1.3 and pins the SHA-256 DER certificate digest
+   before sending any application bytes. See the [transport threat model and
+   compatibility policy](../src/client/README.md#transport-encryption-md-lp7i).
 3. A candidate TCP connection's first application packet must be
    `MD_PKT_SESSION_INFO` with exactly
    `{"type":"session_bind","v":1,"session_id":"...","stream_token":"..."}`.
@@ -32,18 +37,17 @@ framing remains version 1. Both host and client must be upgraded together.
 Legacy clients that echo `session_accept` as their stream handshake are
 incompatible and fail closed. Legacy hosts without tokens are not accepted by
 the updated managed client. Direct unauthenticated TCP hosting is disabled,
-including fallback after absent/failed signaling. FIPS provides transport
-confidentiality for the bearer proof; this is not a new public-Internet TLS
-identity protocol.
+including fallback after absent/failed signaling. Pinned TLS protects the bearer
+proof and media on both direct TCP and FIPS. The identity authority is the
+authenticated Nostr acceptance, not a public CA or the IP address.
 
-The host still has a single startup negotiation: a disconnect does not restore
-or remint a consumed grant. A new host negotiation/startup is required for a new
-stream. Wrong candidates do not consume an otherwise unexpired reservation;
+On disconnect the host rearms admission: a fresh Nostr negotiation is required
+for a new stream, with a new session ID and token. It never restores a consumed
+grant. Wrong candidates do not consume an otherwise unexpired reservation;
 only successful binding consumes it. Admission handles one candidate at a time
 with a bounded wait, not P3.8's future asynchronous four-candidate controller.
-Request IDs (as correlation only, see below), request/result deduplication,
-attended approvals, dynamic grant revocation and renegotiation remain the
-planned P3.8 work. The token deadline
+Attended approvals, dynamic active-stream grant revocation and richer session
+management remain separate P3.8 work. The token deadline
 starts at acceptance creation, after capture/backend startup.
 
 ## Request correlation (md-6ns)

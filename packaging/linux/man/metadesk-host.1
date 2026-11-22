@@ -1,0 +1,23 @@
+.TH METADESK-HOST 1 "November 2026" "Metadesk 0.1.0" "User Commands"
+.SH NAME
+metadesk-host \- desktop accessibility and remote video host
+.SH SYNOPSIS
+.B metadesk-host
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+Metadesk uses Nostr identities to authorize desktop sessions.
+Configure an account and signer before starting a session.
+Native packages use the distribution's FFmpeg libraries.
+Optional Cisco OpenH264 must be obtained separately and is never bundled.
+.SH OPTIONS
+.TP
+.B \-\-help
+Print the complete command-line options and exit without starting a session.
+.SH FILES
+Configuration and account state are stored in the user's XDG configuration directory.
+No keys or account state are installed by this package.
+.SH SECURITY
+Do not expose an unauthenticated session or grant device access globally.
+The systemd user unit is not enabled automatically.
+.SH SEE ALSO
+.BR metadesk-client (1)

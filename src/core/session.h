@@ -93,12 +93,13 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
  * Request (client → host DM):
  *   {"type":"session_request","v":1,"request_id":"<32 hex>",
  *    "issued_at":<unix s>,"expires_at":<unix s>,
- *    "capabilities":["video","agent","input"],
+ *    "stream_tls":"tls13-sha256","capabilities":["video","agent","input"],
  *    "tree_format":"compact","fips_addr":"npub1..."}
  *
  * Accept (host → client DM):
  *   {"type":"session_accept","v":1,"request_id":"<32 hex>",
  *    "session_id":"<uuid>","stream_token":"<64 hex>",
+ *    "tls_cert_sha256":"<64 lowercase hex>",
  *    "granted":["video","agent"],"tree_format":"compact"}
  *
  * request_id/issued_at/expires_at are the request-correlation extension
@@ -116,6 +117,7 @@ bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 typedef struct {
     uint32_t    capabilities;      /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;
+    bool         stream_tls;       /* supports pinned TLS 1.3 */
     char         fips_addr[128];   /* client's npub / FIPS addr  */
     char         request_id[MD_SESSION_REQUEST_ID_LEN + 1]; /* "" if absent */
     int64_t      issued_at;        /* unix seconds; 0 if absent  */
@@ -128,6 +130,7 @@ typedef struct {
     uint32_t     granted;          /* bitwise OR of MdCapability */
     MdTreeFormat tree_format;      /* confirmed tree format       */
     char         stream_token[65]; /* DM-only 256-bit binding secret */
+    char         tls_cert_sha256[65]; /* DM-only lowercase DER certificate digest */
     char         request_id[MD_SESSION_REQUEST_ID_LEN + 1]; /* echoed; "" if absent */
 } MdSessionAccept;
 
@@ -135,7 +138,7 @@ typedef struct {
  * Unknown reasons fail closed; display only the local, actionable text below. */
 typedef struct {
     char request_id[MD_SESSION_REQUEST_ID_LEN + 1];
-    char reason[32]; /* capture_unavailable or request_refused */
+    char reason[32]; /* capture_unavailable, request_refused or tls_required */
 } MdSessionReject;
 char *md_session_reject_to_json(const MdSessionReject *reject);
 int md_session_reject_from_json(const char *json, MdSessionReject *out);
@@ -181,7 +184,8 @@ int md_session_consume_binding(MdSession *s, const uint8_t *payload, size_t len,
  * Each negotiation instead carries a fresh CSPRNG request_id and an
  * authenticated validity window inside the encrypted rumor. */
 
-/* Fill a fresh request_id and issued_at/expires_at window for `req`.
+/* Fill a fresh request_id and issued_at/expires_at window for `req`,
+ * and advertise support for pinned TLS 1.3.
  * lifetime_s is clamped to [1, MD_SESSION_REQUEST_MAX_LIFETIME_S].
  * Returns -1 (and leaves no id) if the CSPRNG fails; never falls back. */
 int md_session_request_prepare(MdSessionRequest *req, int64_t now_unix,

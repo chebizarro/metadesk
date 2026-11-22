@@ -10,7 +10,6 @@ from pathlib import Path
 import select
 import socket
 import socketserver
-import struct
 import subprocess
 import sys
 import tempfile
@@ -59,38 +58,34 @@ class Process:
         assert not self.reader.is_alive()
 
 
-def exact(sock, n):
-    data = b""
-    while len(data) < n:
-        part = sock.recv(n - len(data))
-        if not part:
-            raise EOFError()
-        data += part
-    return data
+def reject_replay(port, transcript):
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as attacker:
+        attacker.sendall(transcript)
+        try:
+            # EOF/reset is refusal; a watchdog timeout is a failure, not proof.
+            while attacker.recv(65536):
+                pass
+        except ConnectionResetError:
+            pass
 
 
 class Proxy(socketserver.BaseRequestHandler):
-    """Records only the first proof in private memory; can sever one stream."""
+    """Transparent byte capture; never terminates TLS or learns its keys."""
     def handle(self):
         try:
             with socket.create_connection(("127.0.0.1", self.server.target), timeout=10) as upstream:
                 self.request.settimeout(10)
-                header = exact(self.request, 16)
-                length = struct.unpack_from("<I", header, 4)[0]
-                assert header[1] == 0x20 and 0 < length <= 8192
-                proof = header + exact(self.request, length)
                 with self.server.lock:
-                    self.server.proofs.append(proof)
-                    # Own only the client-facing fault handle. Shutting it
-                    # wakes this handler, whose context closes the upstream;
-                    # retaining an upstream dup would mask natural client EOF.
+                    captured = [bytearray(), bytearray()]
+                    self.server.proofs.append(captured)
                     self.server.connections.append((self.request.dup(),))
-                upstream.sendall(proof)
                 while True:
                     for source in select.select([self.request, upstream], [], [])[0]:
                         data = source.recv(65536)
                         if not data:
                             return
+                        with self.server.lock:
+                            captured[0 if source is self.request else 1].extend(data)
                         (upstream if source is self.request else self.request).sendall(data)
         except (EOFError, OSError):
             pass
@@ -101,7 +96,7 @@ class ProxyServer(socketserver.ThreadingTCPServer):
 
 
 def run(host, client, crypto):
-    with tempfile.TemporaryDirectory(prefix="md-l8-direct-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="md-w12-direct-") as tmp:
         root = Path(tmp).resolve()
         config = "Library/Application Support" if sys.platform == "darwin" else ".config"
         (root / config).mkdir(mode=0o700, parents=True)
@@ -125,6 +120,22 @@ def run(host, client, crypto):
                    for role in ("host", "client")]
         for server, role in zip(signers, ("host", "client")):
             server.crypto, server.role = crypto, role
+        acceptances = []
+        acceptance_lock = threading.Lock()
+        def observe(rpc, value):
+            if rpc.get("method") != "nip44_decrypt":
+                return
+            try:
+                obj = json.loads(value) if isinstance(value, str) else value
+                if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+                    obj = json.loads(obj["content"])
+                if isinstance(obj, dict) and obj.get("type") == "session_accept":
+                    with acceptance_lock:
+                        if obj not in acceptances:
+                            acceptances.append(obj)
+            except (ValueError, TypeError):
+                pass
+        signers[1].observe_result = observe
         with socket.socket() as port_socket:
             port_socket.bind(("127.0.0.1", 0))
             port = port_socket.getsockname()[1]
@@ -155,14 +166,33 @@ def run(host, client, crypto):
             print("PASS: signer-equipped host has no direct listener before negotiation")
             args = [client, "--host", "127.0.0.1", "--npub", HOST_NPUB,
                     "--port", str(proxy.server_address[1]), "--no-display", "--relay", url]
+            def assert_unauthorized_no_tcp():
+                # This is the fail-closed/no-dial gate, not denial-delivery
+                # qualification. The deliberately short watchdog can win while
+                # the signer drains retained history under sanitizers. Require
+                # the host's correlated refusal AND no TCP attempt/traffic;
+                # test_host_approval.py separately requires delivered denial.
+                with proxy.lock:
+                    before = len(proxy.proofs)
+                denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
+                                         str(root / "host.sock")], env=env,
+                                        capture_output=True, text=True, timeout=20)
+                assert denied.returncode == 1, denied
+                assert any(reason in denied.stderr for reason in (
+                    "host refused session", "timed out waiting for session accept")), denied
+                request_line = next(line for line in denied.stdout.splitlines()
+                                    if "sending session request DM (request_id=" in line)
+                prefix = request_line.split("request_id=", 1)[1][:8]
+                assert len(prefix) == 8 and all(c in "0123456789abcdef" for c in prefix)
+                hp.wait("refused session request " + prefix)
+                assert f"client: connecting to 127.0.0.1:{proxy.server_address[1]}" not in denied.stdout, denied
+                assert "client: receiving stream" not in denied.stdout, denied
+                with proxy.lock:
+                    assert len(proxy.proofs) == before, "unauthorized client reached TCP"
+                assert hp.p.poll() is None
             # Host identity itself is not in its allowlist: signed != authorized.
-            denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
-                                     str(root / "host.sock")], env=env,
-                                    capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "host refused session" in denied.stderr, denied
-            hp.wait("refused session request")
-            assert not proxy.proofs, "unauthorized client reached TCP"
-            print("PASS: non-allowlisted signed client is refused before TCP")
+            assert_unauthorized_no_tcp()
+            print("PASS: correlated host refusal; non-allowlisted signed client never dials TCP")
             cp = Process([*args, "--timeout", "5000", "--socket-signer", str(root / "client.sock")], env)
             children.append(cp)
             cp.wait("client: receiving stream")
@@ -172,14 +202,18 @@ def run(host, client, crypto):
             print("PASS: allowlisted binary client negotiates over private Nostr, binds IPv4 TCP and receives ACK")
             # After a valid bind the same bytes cannot authorize a second peer.
             with proxy.lock:
-                proof = proxy.proofs[0]
-            with socket.create_connection(("127.0.0.1", port), timeout=5) as attacker:
-                attacker.sendall(proof)
-                try:
-                    assert not attacker.recv(16), "replayed proof received data/ACK"
-                except ConnectionResetError:
-                    pass
-            print("PASS: second native TCP peer cannot replay a consumed stream proof")
+                proof = bytes(proxy.proofs[0][0])
+                wire = b"".join(bytes(v) for v in proxy.proofs[0])
+            with acceptance_lock:
+                assert len(acceptances) == 1
+                first = acceptances[0]
+            assert len(first["tls_cert_sha256"]) == 64
+            assert first["stream_token"].encode() not in wire
+            assert b"session_bind" not in wire and b"stream_token" not in wire
+            assert proof[:2] == b"\x16\x03", "expected TLS handshake, not plaintext framing"
+            print("PASS: captured native TCP bytes contain TLS, never the negotiated token or binding JSON")
+            reject_replay(port, proof)
+            print("PASS: second native TCP peer cannot replay a consumed TLS transcript")
             # Force a real transport loss. The SAME client and host renegotiate;
             # success is a new correlated Nostr exchange, never a replayed token.
             with proxy.lock:
@@ -190,29 +224,21 @@ def run(host, client, crypto):
             hp.wait("host: streaming to client #2")  # active-stream extras do not increment this counter
             with proxy.lock:
                 assert len(proxy.proofs) == 2
-                first, second = [json.loads(p[16:]) for p in proxy.proofs]
+            with acceptance_lock:
+                assert len(acceptances) == 2
+                first, second = acceptances
             assert first["session_id"] != second["session_id"]
             assert first["stream_token"] != second["stream_token"]
             requests = [line for line in cp.lines if "sending session request DM" in line]
             assert len(requests) == 2 and requests[0] != requests[1], requests
             print("PASS: same-process reconnect negotiates fresh request ID, session ID and one-use token")
             # Exact old proof must also fail against the newly negotiated session.
-            with socket.create_connection(("127.0.0.1", port), timeout=5) as attacker:
-                attacker.sendall(proof)
-                try:
-                    assert not attacker.recv(16)
-                except ConnectionResetError:
-                    pass
+            reject_replay(port, proof)
             assert cp.p.poll() is None and hp.p.poll() is None
             cp.stop()
             hp.wait("ready for next authorized session request", count=2)
-            # Keep admission idle across multiple shutdown-check wakeups;
-            # unauthenticated activity cannot expire or consume the next grant.
-            denied = subprocess.run([*args, "--timeout", "1500", "--socket-signer",
-                                     str(root / "host.sock")], env=env,
-                                    capture_output=True, text=True, timeout=20)
-            assert denied.returncode == 1 and "host refused session" in denied.stderr, denied
-            assert hp.p.poll() is None
+            # A correlated unauthorized request cannot consume the next grant.
+            assert_unauthorized_no_tcp()
             # Also exercise positional syntax straight to the native host
             # listener, with no fault proxy anywhere in this connection.
             cp2 = Process([client, "127.0.0.1", "--npub", HOST_NPUB,

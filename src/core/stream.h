@@ -58,13 +58,15 @@ typedef struct {
 /* ── Server API ──────────────────────────────────────────────── */
 
 /* TLS configuration for stream server/client.
- * Pass NULL for plaintext (localhost/FIPS tunnel mode).
+ * Pass NULL for low-level plaintext use. Negotiated host/client sessions use
+ * pinned TLS on both direct TCP and FIPS; never pass NULL for those sessions.
  * The server generates a self-signed cert at startup if
  * cert_path/key_path are NULL. */
 typedef struct {
     bool         enabled;      /* true to enable TLS on this stream       */
     const char  *cert_path;    /* PEM certificate path (server, optional) */
     const char  *key_path;     /* PEM private key path (server, optional) */
+    const char  *cert_sha256;  /* client: exact lowercase SHA-256 DER cert pin, checked before I/O */
     bool         verify_peer;  /* client: verify server certificate       */
 } MdStreamTlsConfig;
 
@@ -83,6 +85,10 @@ MdStreamServer *md_stream_server_create(const char *bind_addr, uint16_t port);
  * Returns a connected MdStream, or NULL on timeout/error. */
 MdStream *md_stream_server_accept(MdStreamServer *srv, uint32_t timeout_ms);
 
+/* Copy the server certificate SHA-256 digest (64 lowercase hex + NUL).
+ * Returns -1 for plaintext servers. Safe while the server is alive. */
+int md_stream_server_tls_fingerprint(const MdStreamServer *srv, char out[65]);
+
 /* Actual listening port, including an ephemeral port requested with 0. */
 uint16_t md_stream_server_port(const MdStreamServer *srv);
 
@@ -98,10 +104,17 @@ MdStream *md_stream_connect(const char *host, uint16_t port, uint32_t timeout_ms
 
 /* Connect to a host with TLS.
  * tls: TLS configuration (must have enabled=true).
+ * cert_sha256, when set, must match before any application I/O.
  * Returns a connected + TLS-wrapped MdStream, or NULL on failure. */
 MdStream *md_stream_connect_tls(const char *host, uint16_t port,
                                 uint32_t timeout_ms,
                                 const MdStreamTlsConfig *tls);
+
+/* Upgrade an idle connected stream before any packet I/O. TLS must be enabled.
+ * Intended for negotiated certificate pins; CA/hostname verification requires
+ * md_stream_connect_tls(), which also knows the dialed hostname.
+ * On failure closes the transport, caller still destroys the stream. */
+int md_stream_start_tls(MdStream *s, uint32_t timeout_ms, const MdStreamTlsConfig *tls);
 
 /* ── Stream I/O ──────────────────────────────────────────────── */
 

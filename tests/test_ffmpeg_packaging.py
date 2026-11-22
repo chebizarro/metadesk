@@ -52,9 +52,43 @@ echo 'License: LGPL version 2.1 or later'
         make.chmod(0o755)
         self.env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"])
 
-    def run_profile(self, profile):
-        return subprocess.run([SH, str(SCRIPT), profile, str(self.source), str(self.root / "output")],
-                              env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    def run_profile(self, profile, arch=None, output="output"):
+        env = dict(self.env)
+        if arch:
+            env["MD_FFMPEG_ARCH"] = arch
+        return subprocess.run([SH, str(SCRIPT), profile, str(self.source), str(self.root / output)],
+                              env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def test_arch_correct_qsv_inventory_and_flags(self):
+        for profile in ('windows', 'container', 'flatpak'):
+            for arch in ('aarch64', 'arm64', 'x86_64', 'x86', 'i686'):
+                with self.subTest(profile=profile, arch=arch):
+                    output = profile + '-' + arch
+                    result = self.run_profile(profile, arch, output)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    args = (self.root / output / 'configure-args.txt').read_text().splitlines()
+                    encoders = (self.root / output / 'encoders.txt').read_text().strip().split(',')
+                    intel = arch in ('x86_64', 'x86', 'i686')
+                    self.assertEqual('--enable-libvpl' in args, intel)
+                    self.assertEqual('--disable-libvpl' in args, not intel)
+                    self.assertEqual('h264_qsv' in encoders, intel)
+                    self.assertIn('h264_nvenc', encoders)
+                    self.assertIn('h264_amf', encoders)
+                    self.assertIn('h264_mf' if profile == 'windows' else 'h264_vaapi', encoders)
+
+    def test_target_compiler_inference_and_explicit_override(self):
+        helper = SCRIPT.with_name('profile-encoders.sh')
+        compiler = self.root / 'target-cc'
+        compiler.write_text('#!/bin/sh\nprintf \'%s\\n\' x86_64-w64-mingw32\n')
+        compiler.chmod(0o755)
+        env = dict(self.env, CC=str(compiler))
+        env.pop('MD_FFMPEG_ARCH', None)
+        encoders = subprocess.check_output([SH, str(helper), 'windows'], env=env, text=True)
+        self.assertIn('h264_qsv', encoders)
+        env['MD_FFMPEG_ARCH'] = 'aarch64'
+        compiler.write_text('#!/bin/sh\nexit 99\n')
+        encoders = subprocess.check_output([SH, str(helper), 'windows'], env=env, text=True)
+        self.assertNotIn('h264_qsv', encoders)
 
     def test_windows_patches_private_copy_and_retains_receipt(self):
         result = self.run_profile("windows")

@@ -4,6 +4,16 @@
 This is the md-kb7 handoff. `throwaway-bundle.sh` is a **throwaway local producer**,
 not supported packaging, a release pipeline, or a reproducible-build claim.
 
+## Production handoff (W9)
+
+Release tooling now lives in `packaging/linux/`: separate native/system-FFmpeg
+and OCI/minimal-LGPL modes, pinned-base producer recipe, consumer checks and an
+inert-by-default signed-publish command. `throwaway-bundle.sh` below remains
+historical fixture tooling and is **not a release path**. See
+`packaging/linux/README.md` and `packaging/linux/VALIDATION.md`; W9's local ARM64
+build/closure results and unqualified desktop/CI cells are separated. Earlier spike
+validation is not inherited as production acceptance.
+
 ## Producer and input
 
 Build on Ubuntu 24.04 with the same architecture as the runtime base. Validation

@@ -1,12 +1,14 @@
-# validated on Docker 29.1.3 (build/run), rootless Podman 4.9.3 (loaded/run), fixture + live GNOME + accessibility-loss restart recovery cells; see reference/validation.md.
-# Podman-native build unvalidated; see reference/validation.md.
+# Earlier throwaway-input consumer evidence: reference/validation.md.
+# W9 production-input guards require requalification; see packaging/linux/VALIDATION.md.
+# Production input: packaging/linux/{build.sh,produce.py}; see packaging/linux/README.md.
 # Runtime only: produce runtime-bundle outside this image. Pin BASE for validation.
-ARG BASE=ubuntu:24.04
+ARG BASE=docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
 FROM ${BASE}
+ARG BASE
 ARG MD_UID=1000
 ARG MD_GID=1000
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 libglib2.0-bin libgcc-s1 libstdc++6 ca-certificates \
+      python3 binutils libglib2.0-bin libgcc-s1 libstdc++6 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi \
     && if getent group ubuntu >/dev/null; then groupdel ubuntu; fi \
@@ -16,7 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY runtime-bundle/opt/metadesk/ /opt/metadesk/
 COPY entrypoint.sh /opt/metadesk/entrypoint.sh
 COPY reference/probe.py reference/smoke_mcp.py /opt/metadesk/reference/
-RUN printf '/opt/metadesk/lib\n' > /etc/ld.so.conf.d/metadesk.conf \
+RUN cd /opt/metadesk && sha256sum -c --quiet SHA256SUMS \
+    && MD_EXPECTED_BASE="$BASE" python3 -c 'import json,os,platform,sys; m=json.load(open("metadesk-bundle.json")); sys.exit(not (m.get("mode")=="oci" and m.get("ffmpeg")=="private-minimal-LGPL" and m.get("base")==os.environ["MD_EXPECTED_BASE"] and m.get("arch")==platform.machine()))' \
+    && find bin lib -type f -exec sh -c 'for f do if readelf -h "$f" >/dev/null 2>&1; then readelf -d "$f" | grep -E "\\((RPATH|RUNPATH)\\)" && exit 1; fi; done; exit 0' sh {} + \
+    && printf '/opt/metadesk/lib\n' > /etc/ld.so.conf.d/metadesk.conf \
     && ldconfig && chmod 0755 /opt/metadesk/entrypoint.sh /opt/metadesk/reference/probe.py \
     && ldd /opt/metadesk/bin/metadesk-host > /tmp/closure \
     && ! grep -q 'not found' /tmp/closure && rm /tmp/closure

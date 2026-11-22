@@ -433,6 +433,66 @@ static int test_tls_roundtrip(void) {
     return 0;
 }
 
+/* A terminating MITM has its own valid TLS certificate but not the host's key.
+ * A transparent forwarder can relay TLS, but cannot decrypt it (Python gate). */
+static int test_tls_pinning(void) {
+    printf("  test_tls_pinning... ");
+    MdStreamTlsConfig cfg = { .enabled = true };
+    MdStreamServer *host = md_stream_server_create_tls("127.0.0.1", 0, &cfg);
+    MdStreamServer *mitm = md_stream_server_create_tls("127.0.0.1", 0, &cfg);
+    REQUIRE(host && mitm);
+    char pin[65], attacker_pin[65];
+    REQUIRE(md_stream_server_tls_fingerprint(host, pin) == 0);
+    REQUIRE(md_stream_server_tls_fingerprint(mitm, attacker_pin) == 0);
+    REQUIRE(strlen(pin) == 64 && strcmp(pin, attacker_pin));
+    MdSession session; md_session_init(&session);
+    REQUIRE(md_session_accept(&session, "pinned-session", MD_CAP_VIDEO) == 0);
+    MdSessionAccept acceptance;
+    REQUIRE(md_session_prepare_binding(&session, &acceptance, md_monotonic_ns() / 1000000u) == 0);
+    char *proof = md_session_bind_to_json(&acceptance);
+    REQUIRE(proof);
+    const char *pins[] = {pin, pin, pin, "not-a-sha256-digest"};
+    for (unsigned i = 0; i < 4; i++) {
+        MdStreamServer *endpoint = i == 2 ? mitm : host;
+        ServerThread st = { .srv = endpoint };
+        pthread_t tid;
+        /* Malformed pins fail before ClientHello, so do not start an accept. */
+        if (i != 3) REQUIRE(pthread_create(&tid, NULL, server_thread, &st) == 0);
+        cfg.cert_sha256 = pins[i];
+        MdStream *client = md_stream_connect_tls("127.0.0.1", md_stream_server_port(endpoint), 1000, &cfg);
+        if (i != 3) REQUIRE(pthread_join(tid, NULL) == 0);
+        if (i < 2) {
+            REQUIRE(client && st.client);
+            REQUIRE(md_stream_is_tls(client));
+            REQUIRE(md_stream_send(client, MD_PKT_SESSION_INFO, 0,
+                (const uint8_t *)proof, (uint32_t)strlen(proof)) == 0);
+            int bound = md_stream_accept_binding(st.client, &session);
+            REQUIRE(i == 0 ? bound == 0 : bound < 0);
+            REQUIRE(md_stream_has_capability(st.client, MD_CAP_VIDEO) == (i == 0));
+            REQUIRE(!session.stream_token[0]);
+        } else {
+            REQUIRE(!client);
+            if (st.client) {
+                MdPacketHeader h; uint8_t *payload = NULL;
+                REQUIRE(md_stream_recv(st.client, &h, &payload, 1000) < 0);
+                REQUIRE(payload == NULL); /* no binding token reaches wrong cert */
+            }
+        }
+        md_stream_destroy(client);
+        md_stream_destroy(st.client);
+    }
+    free(proof);
+    /* Plaintext/silent peers cannot strand the single host accept thread. */
+    MdStream *silent = md_stream_connect("127.0.0.1", md_stream_server_port(mitm), 1000);
+    REQUIRE(silent);
+    REQUIRE(md_stream_server_accept(mitm, 20) == NULL);
+    md_stream_destroy(silent);
+    md_stream_server_destroy(mitm);
+    md_stream_server_destroy(host);
+    printf("OK\n");
+    return 0;
+}
+
 /* ── Test: plaintext stream reports no TLS ───────────────────── */
 
 static int test_plaintext_no_tls(void) {
@@ -751,6 +811,7 @@ int main(void) {
     failures += test_recv_timeout();
     failures += test_partial_recv_timeout();
     failures += test_tls_roundtrip();
+    failures += test_tls_pinning();
     failures += test_plaintext_no_tls();
     failures += test_concurrent_send_recv_peer_close(false);
     failures += test_concurrent_send_recv_peer_close(true);

@@ -100,7 +100,7 @@ def main():
             assert listed['requests'][0]['request_id'] == q['request_id']
             approved = command('requests','approve',listed,q['request_id'],['video'])
             assert approved['ok']
-            cp.wait('receiving stream...')
+            cp.wait('TLS connected (TLSv1.3)'); cp.wait('receiving stream...')
             active = sub.until(lambda v: v['session'] is not None and v['session']['session_id'])
             listed = command('session','list'); sid = listed['session']['session_id']
             assert listed['session']['granted'] == 1
@@ -111,7 +111,7 @@ def main():
             assert command('session','kick',listed,sid)['ok']
             cp.wait('connection lost'); cp.stop()
             sub.until(lambda v: v['session'] is None)
-            print('PASS: attended approve-once (video only), request/session list, stale decision, kick, no remembered grant')
+            print('PASS: attended pinned TLS 1.3 approve-once (video only), request/session list, stale decision, kick, no remembered grant')
             cp = start_client()
             v = sub.until(lambda v: bool(v['requests']))
             assert command('requests','deny',v,v['requests'][0]['request_id'])['ok']
@@ -122,7 +122,7 @@ def main():
             cp = start_client()
             v = sub.until(lambda v: bool(v['requests']))
             assert command('requests','approve',v,v['requests'][0]['request_id'],['video','--remember'])['ok']
-            cp.wait('receiving stream...')
+            cp.wait('TLS connected (TLSv1.3)'); cp.wait('receiving stream...')
             sub.until(lambda v: v['session'] is not None and v['session']['session_id'])
             listed = command('session','list')
             assert checked([host,'access','--relay',url,'list']).stdout.strip() == CLIENT_PK+'\tvideo'
@@ -137,7 +137,7 @@ def main():
             assert not path.exists(), 'host leaked control socket'
             # A fresh allowlist-only host restores private policy and auto-admits.
             hp = start_host(False)
-            cp = start_client(); cp.wait('receiving stream...')
+            cp = start_client(); cp.wait('TLS connected (TLSv1.3)'); cp.wait('receiving stream...')
             listed = command('session','list'); assert listed['session']['granted']==1
             assert command('session','kick',listed,listed['session']['session_id'])['ok']
             cp.wait('connection lost'); cp.stop()
