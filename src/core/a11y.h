@@ -81,6 +81,13 @@ typedef struct MdA11yBackend {
     /* Unlike capture's active / input's ready, a11y reports backend liveness.
      * Optional for fixture/legacy backends: NULL uses backend_data != NULL. */
     bool  (*is_connected)(const MdA11yCtx *ctx);
+    /* Global, z-order-aware native hit test. Return an owned stable node id,
+     * or NULL if the platform cannot establish the hit. Never enumerate
+     * overlapping windows and guess. Coordinates are global desktop units. */
+    char *(*hit_test)(MdA11yCtx *ctx, int x, int y);
+    /* Optional semantic primary click. Must revalidate the native hit and
+     * activate that exact element; failure must never fall back to input. */
+    int (*click_target)(MdA11yCtx *ctx, const char *id, int x, int y);
 } MdA11yBackend;
 
 /* ── A11y context ────────────────────────────────────────────── */
@@ -123,6 +130,9 @@ MdA11yCtx *md_a11y_create(void);
 /* Walk the full accessibility tree. Returns root node; caller must
  * free with md_a11y_node_free(). Returns NULL on failure. */
 MdA11yNode *md_a11y_walk(MdA11yCtx *ctx);
+
+/* Fail closed if a native hit test cannot identify this exact target. */
+bool md_a11y_target_at_point(MdA11yCtx *ctx, const char *id, int x, int y);
 
 /* Compute delta between previous and current tree state.
  * Returns delta array (caller frees with md_a11y_delta_free()).
@@ -218,7 +228,8 @@ void md_a11y_delta_free(MdA11yDelta *deltas, int count);
 /* Query whether the a11y context is connected and operational. */
 bool md_a11y_is_connected(const MdA11yCtx *ctx);
 
-/* Destroy a11y context, freeing all resources. */
+/* Destroy per-context resources, listeners and dispatch threads. A backend
+ * may retain a shared OS runtime (libatspi) until final process shutdown. */
 void md_a11y_destroy(MdA11yCtx *ctx);
 
 #ifdef __cplusplus

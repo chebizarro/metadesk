@@ -217,6 +217,48 @@ static char *batch_get_string(CFArrayRef values, CFIndex idx) {
     return buf;
 }
 
+static char *axui_element_id(AXUIElementRef elem) {
+    pid_t pid = 0;
+    if (!elem || AXUIElementGetPid(elem, &pid) != kAXErrorSuccess) return NULL;
+    char id[64];
+    snprintf(id, sizeof(id), "ax%ld:%lx", (long)pid, (unsigned long)CFHash(elem));
+    return strdup(id);
+}
+
+static AXUIElementRef axui_element_at_point(MdA11yCtx *ctx, int x, int y) {
+    AXUIState *st = ctx ? ctx->backend_data : NULL;
+    if (!st || !st->connected || !AXIsProcessTrusted()) return NULL;
+    AXUIElementRef desktop = AXUIElementCreateSystemWide();
+    if (!desktop) return NULL;
+    AXUIElementRef hit = NULL;
+    AXError error = AXUIElementCopyElementAtPosition(desktop, x, y, &hit);
+    CFRelease(desktop);
+    if (error != kAXErrorSuccess) {
+        if (hit) CFRelease(hit);
+        return NULL;
+    }
+    return hit;
+}
+
+static char *axui_hit_test(MdA11yCtx *ctx, int x, int y) {
+    AXUIElementRef hit = axui_element_at_point(ctx, x, y);
+    char *id = axui_element_id(hit);
+    if (hit) CFRelease(hit);
+    return id;
+}
+
+static int axui_click_target(MdA11yCtx *ctx, const char *id, int x, int y) {
+    AXUIElementRef hit = axui_element_at_point(ctx, x, y);
+    char *hit_id = axui_element_id(hit);
+    int result = -1;
+    if (hit_id && id && strcmp(hit_id, id) == 0 &&
+        AXUIElementPerformAction(hit, kAXPressAction) == kAXErrorSuccess)
+        result = 0;
+    free(hit_id);
+    if (hit) CFRelease(hit);
+    return result;
+}
+
 static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
     if (!elem || depth > MD_AX_MAX_DEPTH)
         return NULL;
@@ -226,18 +268,10 @@ static MdA11yNode *walk_element(AXUIState *st, AXUIElementRef elem, int depth) {
 
     node->id = make_node_id(st);
 
-    /* Prefer a stable element identity over DFS position. AXUIElement
-     * has no public stable id; CFHash combined with the owning pid is
-     * the closest available and survives across walks for live elements. */
-    {
-        pid_t pid = 0;
-        if (AXUIElementGetPid(elem, &pid) == kAXErrorSuccess) {
-            char idbuf[64];
-            snprintf(idbuf, sizeof(idbuf), "ax%ld:%lx",
-                     (long)pid, (unsigned long)CFHash(elem));
-            free(node->id);
-            node->id = strdup(idbuf);
-        }
+    char *stable_id = axui_element_id(elem);
+    if (stable_id) {
+        free(node->id);
+        node->id = stable_id;
     }
 
     /* Batch-request all scalar attributes in one IPC call.
@@ -851,6 +885,8 @@ static bool axui_is_connected(const MdA11yCtx *ctx) {
 
 static const MdA11yBackend axui_backend = {
     .is_connected      = axui_is_connected,
+    .hit_test          = axui_hit_test,
+    .click_target      = axui_click_target,
     .init              = axui_init,
     .get_tree          = axui_get_tree,
     .subscribe_changes   = axui_subscribe_changes,

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <limits.h>
 #include <pthread.h>
 #include "log.h"
 #define MD_LOG_TAG "agent"
@@ -51,8 +52,11 @@ static int resolve_target(MdAgent *agent, const char *target_id,
     if (!target_id || target_id[0] == '\0')
         return -1;
 
-    /* Ensure we have a cached tree */
-    if (!agent->cached_tree && agent->a11y) {
+    /* Bounds and native identity must come from a current walk, not a stale
+     * snapshot after the user moved a window or another app covered it. */
+    md_a11y_node_free(agent->cached_tree);
+    agent->cached_tree = NULL;
+    if (agent->a11y) {
         agent->cached_tree = md_a11y_walk(agent->a11y);
     }
 
@@ -60,13 +64,17 @@ static int resolve_target(MdAgent *agent, const char *target_id,
         return -1;
 
     const MdA11yNode *node = md_a11y_find_node_by_id(agent->cached_tree, target_id);
-    if (!node)
+    if (!node || node->w <= 0 || node->h <= 0)
         return -1;
 
     /* Return center of bounding box */
-    *x_out = node->x + node->w / 2;
-    *y_out = node->y + node->h / 2;
-    return 0;
+    int64_t x = (int64_t)node->x + node->w / 2;
+    int64_t y = (int64_t)node->y + node->h / 2;
+    if (x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX) return -1;
+    *x_out = (int)x;
+    *y_out = (int)y;
+    return md_a11y_target_at_point(agent->a11y, target_id, *x_out, *y_out)
+        ? 0 : -1;
 }
 
 /* ── Sleep helper ────────────────────────────────────────────── */
@@ -91,6 +99,68 @@ static char *serialize_tree(const MdA11yNode *root, MdTreeFormat fmt) {
         return md_a11y_to_compact(root);
     }
     return NULL; /* MdTreeFormat is exhaustive */
+}
+
+struct MdAgentTreeJob {
+    MdA11yCtx *a11y;
+    MdTreeFormat format;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    bool done;
+    char *data;
+};
+
+static void *agent_tree_worker(void *data) {
+    MdAgentTreeJob *job = data;
+    MdA11yNode *root = md_a11y_walk(job->a11y);
+    char *tree = serialize_tree(root, job->format);
+    md_a11y_node_free(root);
+    pthread_mutex_lock(&job->mu);
+    job->data = tree;
+    job->done = true;
+    pthread_mutex_unlock(&job->mu);
+    return NULL;
+}
+
+MdAgentTreeJob *md_agent_tree_start(MdAgent *agent) {
+    if (!agent || !agent->a11y) return NULL;
+    MdAgentTreeJob *job = calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    job->a11y = agent->a11y;
+    job->format = agent->tree_format;
+    if (pthread_mutex_init(&job->mu, NULL) != 0) {
+        free(job);
+        return NULL;
+    }
+    if (pthread_create(&job->thread, NULL, agent_tree_worker, job) != 0) {
+        pthread_mutex_destroy(&job->mu);
+        free(job);
+        return NULL;
+    }
+    return job;
+}
+
+int md_agent_tree_take(MdAgentTreeJob *job, char **out) {
+    if (!out) return -1;
+    *out = NULL;
+    if (!job) return -1;
+    pthread_mutex_lock(&job->mu);
+    bool done = job->done;
+    if (done) {
+        *out = job->data;
+        job->data = NULL;
+    }
+    pthread_mutex_unlock(&job->mu);
+    return done ? 1 : 0;
+}
+
+char *md_agent_tree_finish(MdAgentTreeJob *job) {
+    if (!job) return NULL;
+    pthread_join(job->thread, NULL);
+    char *data = job->data;
+    pthread_mutex_destroy(&job->mu);
+    free(job);
+    return data;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -180,7 +250,12 @@ static int agent_execute_locked(MdAgent *agent,
         return -1;
     }
 
-    ret = md_input_execute_action(agent->input, &action);
+    if (action.type == MD_ACTION_CLICK && action.target_id[0] &&
+        agent->a11y && agent->a11y->vtable->click_target)
+        ret = agent->a11y->vtable->click_target(agent->a11y, action.target_id,
+                                               action.region[0], action.region[1]);
+    else
+        ret = md_input_execute_action(agent->input, &action);
     if (ret < 0) {
         MD_LOG_I("action injection failed");
         md_action_cleanup(&action);

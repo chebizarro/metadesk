@@ -642,6 +642,159 @@ static int test_format_aware_updates(void) {
     return 0;
 }
 
+typedef struct {
+    const char *target, *front;
+    int hit_calls, target_clicks, occluder_clicks;
+} HitFixture;
+
+static int hit_fixture_tree(MdA11yCtx *ctx, MdA11yNode **out) {
+    HitFixture *f = ctx->backend_data;
+    MdA11yNode *node = calloc(1, sizeof(*node));
+    node->id = strdup(f->target);
+    node->role = strdup("button");
+    node->label = strdup("Owned target");
+    node->x = 100; node->y = 200; node->w = 80; node->h = 40;
+    *out = node;
+    return 0;
+}
+
+static char *hit_fixture_point(MdA11yCtx *ctx, int x, int y) {
+    HitFixture *f = ctx->backend_data;
+    MD_CHECK(x == 140 && y == 220);
+    f->hit_calls++;
+    return f->front ? strdup(f->front) : NULL;
+}
+
+static int hit_fixture_move(MdInputCtx *ctx, int x, int y) {
+    (void)ctx;
+    MD_CHECK(x == 140 && y == 220);
+    return 0;
+}
+static int hit_fixture_button(MdInputCtx *ctx, int button, int pressed) {
+    HitFixture *f = ctx->backend_data;
+    (void)button;
+    if (!pressed) {
+        if (strcmp(f->front, f->target) == 0) f->target_clicks++;
+        else f->occluder_clicks++;
+    }
+    return 0;
+}
+
+static int test_target_hit_verification(void) {
+    const char *ids[] = {"ax123:abc", "atspi::1.23:/org/a11y/atspi/accessible/42", "u:2a.101b0.4"};
+    const char *actions[] = {"click", "dbl_click", "right_click", "focus"};
+    const MdInputBackend input_backend = { .mouse_move = hit_fixture_move,
+                                            .mouse_button = hit_fixture_button };
+    for (size_t platform = 0; platform < 3; platform++) {
+        for (size_t action = 0; action < 4; action++) {
+            HitFixture f = { .target = ids[platform], .front = "owned-occluder" };
+            MdA11yBackend backend = { .get_tree = hit_fixture_tree, .hit_test = hit_fixture_point };
+            MdA11yCtx a11y = { .vtable = &backend, .backend_data = &f,
+                               .snapshot_mu = PTHREAD_MUTEX_INITIALIZER };
+            MdInput input = { .vtable = &input_backend, .backend_data = &f, .ready = true };
+            MdAgentConfig cfg = { .a11y = &a11y, .input = &input,
+                                  .tree_format = MD_TREE_FORMAT_COMPACT, .settle_ms = 1 };
+            MdAgent *agent = md_agent_create(&cfg);
+            char json[512];
+            snprintf(json, sizeof(json), "{\"v\":1,\"action\":\"%s\",\"target_id\":\"%s\",\"payload\":{}}",
+                     actions[action], f.target);
+            /* Occluded and unsupported hit tests must not inject at all. */
+            char *result = md_agent_handle_action_mcp(agent, (const uint8_t *)json, strlen(json));
+            MD_CHECK(!result && f.target_clicks == 0 && f.occluder_clicks == 0);
+            MD_CHECK(md_agent_get_action_count(agent) == 0);
+            free(result);
+            f.front = NULL;
+            result = md_agent_handle_action_mcp(agent, (const uint8_t *)json, strlen(json));
+            MD_CHECK(!result && f.target_clicks == 0 && f.occluder_clicks == 0);
+            free(result);
+            backend.hit_test = NULL;
+            result = md_agent_handle_action_mcp(agent, (const uint8_t *)json, strlen(json));
+            MD_CHECK(!result && f.target_clicks == 0 && f.occluder_clicks == 0);
+            free(result);
+            backend.hit_test = hit_fixture_point;
+            f.front = f.target;
+            result = md_agent_handle_action_mcp(agent, (const uint8_t *)json, strlen(json));
+            MD_CHECK(result && f.target_clicks == (action == 1 ? 2 : 1));
+            MD_CHECK(f.occluder_clicks == 0 && md_agent_get_action_count(agent) == 1);
+            free(result);
+            md_agent_destroy(agent);
+            md_a11y_node_free(a11y.last_snapshot);
+            pthread_mutex_destroy(&a11y.snapshot_mu);
+        }
+    }
+    puts("  PASS: AX/AT-SPI/UIA identity fakes reject occluders, allow actual hits");
+    return 0;
+}
+
+/* A tree walk held on an event, not a guessed sleep, must not hold the
+ * transport. Both JSON and compact must still return a complete tree. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered, release;
+} BlockedTree;
+
+static int agent_blocked_tree(MdA11yCtx *ctx, MdA11yNode **out) {
+    BlockedTree *state = ctx->backend_data;
+    pthread_mutex_lock(&state->mu);
+    state->entered = true;
+    pthread_cond_broadcast(&state->cv);
+    while (!state->release) pthread_cond_wait(&state->cv, &state->mu);
+    pthread_mutex_unlock(&state->mu);
+    int walks = 0;
+    MdA11yCtx fake = { .backend_data = &walks };
+    return agent_fake_tree(&fake, out);
+}
+
+static int test_initial_tree_does_not_block_video(void) {
+    const MdA11yBackend backend = { .get_tree = agent_blocked_tree };
+    MdStreamServer *server = md_stream_server_create(NULL, 0);
+    MD_CHECK(server);
+    MdStream *client = md_stream_connect("127.0.0.1",
+                                         md_stream_server_port(server), 3000);
+    MdStream *host = md_stream_server_accept(server, 3000);
+    MD_CHECK(client && host);
+    for (int compact = 0; compact < 2; compact++) {
+        BlockedTree state = { .mu = PTHREAD_MUTEX_INITIALIZER,
+                              .cv = PTHREAD_COND_INITIALIZER };
+        MdA11yCtx a11y = { .vtable = &backend, .backend_data = &state };
+        MdAgentConfig cfg = { .a11y = &a11y,
+            .tree_format = compact ? MD_TREE_FORMAT_COMPACT : MD_TREE_FORMAT_JSON };
+        MdAgent *agent = md_agent_create(&cfg);
+        MdAgentTreeJob *job = md_agent_tree_start(agent);
+        MD_CHECK(job);
+        pthread_mutex_lock(&state.mu);
+        while (!state.entered) pthread_cond_wait(&state.cv, &state.mu);
+        pthread_mutex_unlock(&state.mu);
+        char *tree = NULL;
+        MD_CHECK(md_agent_tree_take(job, &tree) == 0 && !tree);
+        /* A frame is delivered while the accessibility provider is blocked. */
+        const uint8_t frame[] = {1, 2, 3};
+        MD_CHECK(md_stream_send(host, MD_PKT_VIDEO_FRAME, 1, frame, sizeof(frame)) == 0);
+        MdPacketHeader hdr;
+        uint8_t *payload = NULL;
+        MD_CHECK(md_stream_recv(client, &hdr, &payload, 3000) == 0);
+        MD_CHECK(hdr.type == MD_PKT_VIDEO_FRAME && hdr.payload_len == sizeof(frame));
+        MD_CHECK(payload && memcmp(payload, frame, sizeof(frame)) == 0);
+        free(payload);
+        pthread_mutex_lock(&state.mu);
+        state.release = true;
+        pthread_cond_broadcast(&state.cv);
+        pthread_mutex_unlock(&state.mu);
+        tree = md_agent_tree_finish(job);
+        MD_CHECK(tree && strstr(tree, "btn1") && strstr(tree, "Before"));
+        free(tree);
+        md_agent_destroy(agent);
+        pthread_cond_destroy(&state.cv);
+        pthread_mutex_destroy(&state.mu);
+    }
+    md_stream_destroy(host);
+    md_stream_destroy(client);
+    md_stream_server_destroy(server);
+    puts("  PASS: initial tree worker preserves video and complete snapshots");
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -663,6 +816,8 @@ int main(void) {
     failures += test_handle_action_mcp();
     failures += test_missing_input_never_acknowledges();
     failures += test_format_aware_updates();
+    failures += test_initial_tree_does_not_block_video();
+    failures += test_target_hit_verification();
 
     clear_agent_mcp_response();
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");

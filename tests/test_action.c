@@ -3,6 +3,7 @@
  * Unit tests for action JSON parse/encode and type mapping.
  */
 #include "action.h"
+#include <cjson/cJSON.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -387,6 +388,28 @@ static void test_parse_no_payload(void)
     PASS("parse no payload");
 }
 
+static void test_target_id_is_not_truncated(void) {
+    char id[600];
+    memset(id, 'x', sizeof(id) - 1); id[sizeof(id) - 1] = 0;
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "v", 1);
+    cJSON_AddStringToObject(json, "action", "click");
+    cJSON_AddStringToObject(json, "target_id", id);
+    char *encoded = cJSON_PrintUnformatted(json);
+    MdAction action = {0};
+    MD_CHECK(md_action_parse(&action, encoded, strlen(encoded)) == -1);
+    free(encoded); cJSON_Delete(json);
+    id[200] = 0; /* native bus/path IDs need not fit the old 64-byte buffer */
+    json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "v", 1);
+    cJSON_AddStringToObject(json, "action", "click");
+    cJSON_AddStringToObject(json, "target_id", id);
+    encoded = cJSON_PrintUnformatted(json);
+    MD_CHECK(md_action_parse(&action, encoded, strlen(encoded)) == 0);
+    MD_CHECK(strcmp(action.target_id, id) == 0);
+    free(encoded); cJSON_Delete(json); md_action_cleanup(&action);
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(void)
@@ -409,6 +432,7 @@ int main(void)
     test_parse_max_keys();
     test_parse_no_payload();
     test_parse_errors();
+    test_target_id_is_not_truncated();
 
     /* Encode */
     test_encode_click();
