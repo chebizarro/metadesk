@@ -93,6 +93,7 @@ typedef struct {
 } HostRequestSeen;
 
 typedef struct {
+    char          tls_cert_sha256[65]; /* listener cert, bound into each acceptance DM */
     MdStream     *client;
     pthread_mutex_t client_mu;  /* protects client pointer lifetime */
     MdAgent      *agent;
@@ -478,6 +479,7 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
     if (md_session_request_freshness(&ctx->pending_req, (int64_t)time(NULL),
                                      ctx->pending_req.issued_at) != MD_SESSION_REQUEST_FRESH)
         return -1;
+    if (!ctx->pending_req.stream_tls || !ctx->tls_cert_sha256[0]) return -1;
     MdSessionAccept acc;
     /* Same clock as md_stream_accept_binding()'s deadline checks. */
     if (!ctx->pending_req.request_id[0] ||
@@ -486,6 +488,7 @@ static int host_publish_session_accept(HostCtx *ctx, MdAccountBinding *owner) {
         return -1;
     /* Correlate the answer with exactly the request it grants (md-6ns). */
     memcpy(acc.request_id, ctx->pending_req.request_id, sizeof(acc.request_id));
+    memcpy(acc.tls_cert_sha256, ctx->tls_cert_sha256, sizeof(acc.tls_cert_sha256));
     char *json = md_session_accept_to_json(&acc);
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
     if (!json) return -1;
@@ -832,6 +835,10 @@ cleanup:
  * Read the latest winning grant immediately before recording negotiation. */
 static int host_accept_request(HostCtx *ctx, MdNostr *nostr,
                                const char *session_id, bool no_input) {
+    if (!ctx->pending_req.stream_tls) {
+        fprintf(stderr, "ERROR: pinned TLS 1.3 required; upgrade both host and client\n");
+        return -1;
+    }
     uint32_t granted = md_nostr_granted_capabilities(nostr,
         ctx->pending_client_pk, ctx->pending_req.capabilities);
     if (no_input) granted &= ~MD_CAP_INPUT;
@@ -876,7 +883,7 @@ static int host_next_session(HostCtx *ctx, MdNostr *nostr, bool no_input,
     while (host_wait_request(ctx)) {
         if (owner && !md_account_binding_is_current(owner)) return -1;
         if (host_accept_fresh_request(ctx, nostr, no_input) != 0) {
-            host_reject_request(ctx, "request_refused");
+            host_reject_request(ctx, ctx->pending_req.stream_tls ? "request_refused" : "tls_required");
             host_rearm_request(ctx);
             continue;
         }
@@ -1418,8 +1425,10 @@ static int host_run(int argc, char **argv) {
                     printf("host: FIPS peer ready: %s\n", ready.detail);
                 }
 
-                if (host_accept_fresh_request(&ctx, nostr, no_input) != 0)
+                if (host_accept_fresh_request(&ctx, nostr, no_input) != 0) {
+                    host_reject_request(&ctx, ctx.pending_req.stream_tls ? "request_refused" : "tls_required");
                     goto signaling_failed;
+                }
 
             } else if (g_running) {
                 if (fips_npub || account.binding) {
@@ -1457,12 +1466,17 @@ signaling_failed:
 signaling_ready:
     ;
     /* Create TCP server */
-    MdStreamServer *srv = md_stream_server_create(bind_addr, port);
+    MdStreamTlsConfig stream_tls = { .enabled = true };
+    MdStreamServer *srv = md_stream_server_create_tls(bind_addr, port, &stream_tls);
     if (!srv) {
         fprintf(stderr, "ERROR: failed to bind TCP server on port %u\n", port);
         goto signaling_failed;
     }
-    printf("host: listening on port %u\n", port);
+    if (md_stream_server_tls_fingerprint(srv, ctx.tls_cert_sha256) != 0) {
+        md_stream_server_destroy(srv);
+        goto signaling_failed;
+    }
+    printf("host: listening on port %u (pinned TLS 1.3 required)\n", port);
 
     /* Start capture first so encoder/input dimensions match the negotiated
      * capture size instead of assuming a fixed desktop resolution. */
