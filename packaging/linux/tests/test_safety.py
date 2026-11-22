@@ -86,6 +86,11 @@ class Safety(unittest.TestCase):
             root = Path(d)
             podman = root / 'podman'
             podman.write_text("""#!/bin/sh
+if [ "$1" = rm ]; then
+    [ "$#" -eq 3 ] || exit 1
+    printf '%s\\n' "$3" >> "$MD_FAKE_REMOVALS"
+    exit 0
+fi
 if [ "$1" = run ]; then
     case " $* " in
         *" md-w9-fixture-direct "*)
@@ -101,13 +106,16 @@ exit 0
                      (1, 'host[mcp]: accessibility backend unavailable')]
             for status, diagnostic in cases:
                 with self.subTest(status=status, diagnostic=diagnostic):
-                    env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                    removals = root / 'removals'
+                    removals.unlink(missing_ok=True)
+                    env = dict(os.environ, MD_FAKE_REMOVALS=str(removals), PATH=str(root) + ':' + os.environ['PATH'],
                                MD_RECEIPT_DIR=str(root / 'receipts'), MD_FAKE_DIRECT_STATUS=str(status),
                                MD_FAKE_DIRECT_DIAGNOSTIC=diagnostic)
                     result = subprocess.run(['sh', str(LINUX / 'verify-image.sh'), 'image', 'md-w9-fixture'],
                                             env=env, capture_output=True)
                     expected = status == 1 and diagnostic.startswith('host[mcp]: accessibility backend unavailable')
                     self.assertEqual(result.returncode == 0, expected)
+                    self.assertEqual(removals.read_text().splitlines(), ['md-w9-fixture', 'md-w9-fixture-hash', 'md-w9-fixture-direct'])
 
     def test_staged_ffmpeg_preserves_verified_origin(self):
         spec = importlib.util.spec_from_file_location('linux_produce', LINUX / 'produce.py')

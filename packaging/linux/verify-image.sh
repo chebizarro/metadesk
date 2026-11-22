@@ -10,7 +10,13 @@ case "$name" in md-w9-*) ;; *) echo 'private md-w9- name required' >&2; exit 2;;
 mkdir -p "$receipts"
 echo "Receipts: $receipts/$name.txt"
 exec > "$receipts/$name.txt" 2>&1
-trap 'podman rm -f "$name" "${name}-hash" "${name}-direct" >/dev/null 2>&1 || :' EXIT
+cleanup() {
+    # Missing --rm helpers must not prevent removal of the inspected container.
+    for container in "$name" "${name}-hash" "${name}-direct"; do
+        podman rm -f "$container" >/dev/null 2>&1 || :
+    done
+}
+trap cleanup EXIT
 podman run --rm --name "${name}-hash" --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid --cap-drop=all --security-opt=no-new-privileges \
   --entrypoint sh "$image" -ec '
   cd /opt/metadesk

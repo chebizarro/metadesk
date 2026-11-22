@@ -10,8 +10,8 @@ Release tooling now lives in `packaging/linux/`: separate native/system-FFmpeg
 and OCI/minimal-LGPL modes, pinned-base producer recipe, consumer checks and an
 inert-by-default signed-publish command. `throwaway-bundle.sh` below remains
 historical fixture tooling and is **not a release path**. See
-`packaging/linux/README.md` and `packaging/linux/VALIDATION.md`; W9's ARM64 SDK
-and prohibited desktop-attach cells are explicitly unqualified. Earlier spike
+`packaging/linux/README.md` and `packaging/linux/VALIDATION.md`; W9's local ARM64
+build/closure results and unqualified desktop/CI cells are separated. Earlier spike
 validation is not inherited as production acceptance.
 
 ## Producer and input

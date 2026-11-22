@@ -1,5 +1,6 @@
-417cd5fe019c848e4e2fcab3aa650e6c0bfb52e46a986428ecebd84700f71b15  /home/bizarro/md-w9/deb/metadesk_0.1.0-1_arm64.deb
-e67808d7b37d01a8e1e5c0767fb86b15c1271e6fc8d8ac0a9ab8af07f397ca3c  /home/bizarro/md-w9/rpmbuild/RPMS/aarch64/metadesk-0.1.0-1.fc44.aarch64.rpm
-167355eca02c79dd937fc5d3391b3b81c03bede41af5dfe472040c405f32fbaf  /home/bizarro/md-w9/rpmbuild/RPMS/aarch64/metadesk-debuginfo-0.1.0-1.fc44.aarch64.rpm
-df87b362237f8af91dfdf28894f6720b6d2fd2bdf98ae74679423343b584a70c  /home/bizarro/md-w9/rpmbuild/RPMS/aarch64/metadesk-debugsource-0.1.0-1.fc44.aarch64.rpm
-2b9e5c262d5e63320c8b6d4dccf03c4beb9718c17b5ad43c9bcef96769dddc7a  /home/bizarro/md-w9/rpmbuild/SRPMS/metadesk-0.1.0-1.fc44.src.rpm
+417cd5fe019c848e4e2fcab3aa650e6c0bfb52e46a986428ecebd84700f71b15  metadesk_0.1.0-1_arm64.deb
+e67808d7b37d01a8e1e5c0767fb86b15c1271e6fc8d8ac0a9ab8af07f397ca3c  metadesk-0.1.0-1.fc44.aarch64.rpm
+167355eca02c79dd937fc5d3391b3b81c03bede41af5dfe472040c405f32fbaf  metadesk-debuginfo-0.1.0-1.fc44.aarch64.rpm
+df87b362237f8af91dfdf28894f6720b6d2fd2bdf98ae74679423343b584a70c  metadesk-debugsource-0.1.0-1.fc44.aarch64.rpm
+2b9e5c262d5e63320c8b6d4dccf03c4beb9718c17b5ad43c9bcef96769dddc7a  metadesk-0.1.0-1.fc44.src.rpm
+645ce74573e44d9335012e04aa2f56348a0aa61a06d2a738c9c3f6679e046759  oci/metadesk-agent-arm64.oci.tar

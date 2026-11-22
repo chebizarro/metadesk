@@ -126,7 +126,9 @@ contract validation. Supply a complete private context containing `src/`,
 `nostrc/`, `ffmpeg-prefix/` from the unchanged W3 container-profile build and a
 curated `legal/` tree containing **each private dependency's exact notices,
 corresponding source/patches/build instructions and LGPL replacement/relink
-instructions**. The producer refuses a system/wrong-license/wrong-codec FFmpeg.
+instructions**. The producer refuses a system/wrong-license/wrong-codec FFmpeg. Copied
+pkg-config prefix/libdir/includedir fields are relocated and validated before
+compilation; already-staged FFmpeg copies must byte-match their verified inputs.
 
 ```sh
 podman build --layers=false -t localhost/md-w9-producer:local \

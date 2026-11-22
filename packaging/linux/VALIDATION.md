@@ -70,23 +70,82 @@ Podman's SIGKILL escalation; this was not a product SIGTERM qualification.
 - Fresh macOS client/tools build against the dedicated nostrc pin: **51 pass,
   0 fail, 1 opt-in AX owned-clicks/native-video skip (77)**. Homebrew dependency
   deployment-target linker warnings remain; this is not a signed Mac release.
-- Linux safety tests: pending follow-up VM run. macOS: **7 pass, 1 ELF-fixture
-  skip**. FFmpeg packaging fixtures: **5 pass**, including 15 profile/arch cells.
+- Linux safety tests: **10 pass**. macOS: **9 pass, 1 ELF-fixture skip**.
+  FFmpeg packaging fixtures: **6 pass**, including 15 profile/arch cells and
+  compiler-target inference/explicit-override coverage.
 
-Production OCI build and contract results will be recorded after qualification.
-The producer relocates copied FFmpeg pkg-config metadata before compiling;
-it never substitutes system FFmpeg for the private profile. Build/test receipts
-are ignored; `verify-image.sh` uses ignored `output/receipts/` by default or
-`MD_RECEIPT_DIR`, without writing into a caller's tracked working directory.
+## Production ARM64 OCI result
+
+**Pinned producer and production agent image built successfully**, not the
+native-package substitute used in the first demonstration. Source snapshot:
+`0e5ce45ea11ada3c268382a999092712d5951363`; nostrc pin unchanged.
+Ubuntu 24.04 base:
+`sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8`.
+The producer rebuilt nostrc and the host inside that same-architecture base,
+with -j2 and a 1500 MB build limit, then staged 71 private dependency DSOs.
+The runtime image was independently assembled from that bundle and pinned base.
+
+- **Gates 1–3 PASS locally:** architecture/source/nostrc/base manifest, complete
+  SHA256SUMS, no ELF RPATH/RUNPATH, and no missing runtime DT_NEEDED dependency.
+- **Gate 4 PASS:** direct MCP invocation without a desktop exits **1**, with
+  `host[mcp]: accessibility backend unavailable`; the entrypoint also fails
+  closed without a session socket. Launch errors/crashes do not count as passes.
+- Actual runtime-image codec probe: **LGPL-2.1-or-later**, one H.264 decoder and
+  parser, exactly **NVENC/AMF/VAAPI** encoders; no QSV or bundled OpenH264/x264/x265.
+  Host help and payload audit passed; no C/C++ compiler, build orchestration
+  tools, source/object/archive payload. readelf/binutils remain for auditing.
+- **Gate 5 NOT RUN** (authorized real desktop HTTP/stdio tree).
+  **Gate 6 only configuration checked:** no desktop/device/display mounts,
+  network none, capabilities dropped, read-only root and no-new-privileges.
+  Authenticated-session tool surface/listeners and preparation/session SIGTERM
+  are **NOT qualified**. No live GNOME/AT-SPI/uinput access or GPU claim.
+
+OCI manifest digest:
+`sha256:169e84d3ffa79fb5e957bd3a0653a0ad62ea4a657e1e6c266e0620a822a4980e`.
+Image config ID:
+`2758423be6c8cfa68b56c6e6ad8ba509af199a358dc5be22ecb9828644f8fbb0`.
+Local archive retained ignored at `artifacts/oci/metadesk-agent-arm64.oci.tar`,
+SHA256 `645ce74573e44d9335012e04aa2f56348a0aa61a06d2a738c9c3f6679e046759`.
+All six retained artifact hashes were verified after copying. This image was
+**not pushed or signed**; the earlier ephemeral-key demo proves plumbing only,
+not a signature on this new candidate or a release/owner identity.
+
+Actual clean builds exposed and fixed producer issues rather than relaxing
+coverage: relocated FFmpeg **prefix/libdir/includedir** are checked before
+linking; merged master's mandatory XInput and bzip2 dependencies are declared;
+later dependency walks accept an already-staged FFmpeg DSO only if it byte-
+matches the verified input. Tests reject system paths, altered staged copies,
+unexpected FFmpeg components, launch failures and wrong failure diagnostics.
+Verification cleanup removes names individually: an absent --rm helper cannot
+prevent removal of an existing inspected container. Fake-command regression
+coverage and an actual Podman create/remove check passed.
+Oracle reviewed supplied excerpts only; its no-desktop classification finding
+was fixed, not presented as full-tree or release approval.
+
+Raw receipts now use ignored `output/receipts/` or `MD_RECEIPT_DIR` (other
+captures under `output/followup/`); only the summary/hash receipt stays in Git.
+The image's local qualification legal corpus contains licenses/source pointers
+and replacement guidance, **not a reviewed complete release source offer**.
+Public distribution still requires owner-curated exact source/version mapping
+and corresponding-source/replacement-rights material for private dependencies.
+
+Cleanup independently verified after copying/rehashing artifacts: **0 W9
+containers/images/volumes/networks**, `~/md-w9` absent, and
+`/private/tmp/md-w9-*` absent. No host packages installed/removed, global prune,
+shared checkout mutation, live desktop/device access or new signing keys.
+Only assigned-worktree ignored artifacts/receipts are retained.
 
 ## Closure / owner prerequisites
 
-Neither bead is closed. md-x7wk still requires actual production-image results,
-the x86_64+aarch64 CI matrix, authorized authenticated desktop gates 5/6, and
-owner registry/signing/promotion policy. Native md-xs90 additionally retains its
+Neither bead is closed. md-x7wk **cannot close yet**: local ARM64 gates above pass, but the
+x86_64+aarch64 hosted CI matrix, authorized authenticated desktop gates 5/6, and
+owner registry/signing/promotion policy remain outstanding. Native md-xs90 additionally retains its
 cross-distro/architecture, Arch artifact/checksum and lint-review gates.
 
 Owners must provide apt/Copr hosting and signing keys, immutable source/release
 URLs, Arch-native binaries/checksums, a reviewed private-dependency legal/source
 and replacement-rights corpus, and the isolated authorized desktop needed for
 remaining runtime tests. No synthetic or local-only result replaces these gates.
+
+Tool scope: Jev narrowed flags/dependency context (4 requests, 23,049 input
+tokens, about USD 0.00097); direct source reads/builds verified the findings.
