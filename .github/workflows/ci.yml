@@ -100,4 +100,11 @@ jobs:
       - name: Compile
         run: meson compile -C build
       - name: Test
-        run: meson test -C build --print-errorlogs
+        run: |
+          # test_mcp_http requests an 8 MiB SO_RCVBUF for the healthy SSE reader.
+          maxsockbuf=$(sysctl -n kern.ipc.maxsockbuf)
+          echo "Initial kern.ipc.maxsockbuf: $maxsockbuf"
+          if [ "$maxsockbuf" -lt 8388608 ]; then
+            sudo sysctl -w kern.ipc.maxsockbuf=8388608
+          fi
+          meson test -C build --print-errorlogs
