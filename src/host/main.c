@@ -931,6 +931,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --socket-signer [PATH]  Use NIP-5F Unix socket signer\n");
     fprintf(stderr, "  --auto-signer    Auto-detect local signer (NIP-5F, NIP-55L)\n");
     fprintf(stderr, "  --relay URL      Relay URL (default: " MD_DEFAULT_RELAY ")\n");
+    fprintf(stderr, "  --publish-session-log  Opt in to encrypted session log copies on configured relays\n");
     fprintf(stderr, "\nMCP agent interface:\n");
     fprintf(stderr, "  --mcp            Start MCP server on stdio (JSON-RPC 2.0)\n");
     fprintf(stderr, "  --mcp-token-file PATH  MCP HTTP bearer token file (mode 0600)\n");
@@ -1310,6 +1311,7 @@ static int host_run(int argc, char **argv) {
     bool use_nvenc = true;
     const char *openh264_path = NULL, *encoder_name = NULL;
     bool managed = false;
+    bool publish_session_log = false;
     bool do_capture = true;
     /* Capture policy options: keep this block independent of input selection. */
     bool capture_unattended = false;
@@ -1364,6 +1366,8 @@ static int host_run(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--managed") == 0)
             managed = true;
+        else if (strcmp(argv[i], "--publish-session-log") == 0)
+            publish_session_log = true;
         else if (strcmp(argv[i], "--attended") == 0)
             attended = true;
         else if (strcmp(argv[i], "--management-socket") == 0 && i + 1 < argc)
@@ -1728,7 +1732,7 @@ static int host_run(int argc, char **argv) {
     /* Session log for agent monitoring (M2.4) */
     MdSessionLogConfig slog_cfg = {
         .signer  = signer,
-        .publish = (signer != NULL),  /* publish if signer available */
+        .publish = publish_session_log,
     };
     MdSessionLog *session_log = md_session_log_create(&slog_cfg);
     if (session_log)
@@ -1851,6 +1855,7 @@ signaling_failed:
     md_host_access_lifecycle(&access, managed, "stopping");
     free(ctx.cached_frame.data);
     md_nostr_stop(nostr);
+    md_session_log_set_nostr(session_log, NULL);
     md_management_stop(management);
     md_nostr_destroy(nostr);
     if (ctx.session_req_ch) {
@@ -2360,6 +2365,7 @@ signaling_ready:
     md_stream_server_destroy(srv);
 
     md_nostr_stop(nostr);
+    md_session_log_set_nostr(session_log, NULL);
     md_management_stop(management);
     md_nostr_destroy(nostr);
     if (ctx.session_req_ch) {

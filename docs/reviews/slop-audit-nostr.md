@@ -308,6 +308,8 @@ free(ev->sig);    ev->sig    = sig;                  /* nip55l_sign_event  */
 ---
 
 ### F18 — kind 1078 with a `d` tag on a non-addressable event
+
+> Historical finding: kind 1078 is now local-only. Opt-in relay copies use encrypted kind 1079; see [the session log design](../metadesk-spec.md#83-phase-2-milestones).
 **drift · C1 · `session_log.h:60`, `session_log.c:124-140`**
 
 **Observed.** `#define MD_SESSION_LOG_KIND 1078` — an unassigned kind, absent from `nostr-kinds.h` — carrying `["d","metadesk-session-log"]` with the comment *"not an addressable event but useful for filtering"*, i.e. the author knew the tag's defined semantics do not apply here.

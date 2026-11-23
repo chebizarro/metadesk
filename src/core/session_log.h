@@ -4,8 +4,8 @@
  *
  * Records session lifecycle events (connect, disconnect, action, etc.)
  * as signed Nostr events (kind:1078). Each entry is signed with the
- * host's signer for non-repudiation. When a Nostr bridge is available,
- * entries are optionally published to configured relays for auditability.
+ * host's signer for non-repudiation. Relay publication is off by default;
+ * opting in publishes separate encrypted copies, never the local events.
  *
  * The log maintains a fixed-size ring buffer of recent entries in memory.
  * Oldest entries are overwritten when the buffer is full.
@@ -55,8 +55,9 @@ typedef struct {
 
 typedef struct MdSessionLog MdSessionLog;
 
-/* Nostr event kind for session log entries */
+/* Local signed record and app-specific NIP-44 encrypted relay copy. */
 #define MD_SESSION_LOG_KIND 1078
+#define MD_SESSION_LOG_RELAY_KIND 1079
 
 /* Default ring buffer capacity */
 #define MD_SESSION_LOG_DEFAULT_CAP 128
@@ -82,10 +83,9 @@ MdSessionLog *md_session_log_create(const MdSessionLogConfig *cfg);
 /* Destroy session log, freeing all entries. */
 void md_session_log_destroy(MdSessionLog *log);
 
-/* Update the Nostr bridge reference (for deferred initialization).
- * The Nostr bridge may not be available at session_log creation time
- * (e.g. host creates log before connecting to relays). Call this
- * once the bridge is ready to enable relay publishing. */
+/* Attach a bridge after deferred initialization. NULL detaches, discards
+ * pending copies and joins the worker. Lifecycle calls must be serialized;
+ * stop and detach a borrowed bridge before destroying it. */
 void md_session_log_set_nostr(MdSessionLog *log, MdNostr *nostr);
 
 /* ── Logging ─────────────────────────────────────────────────── */
@@ -98,7 +98,9 @@ void md_session_log_set_nostr(MdSessionLog *log, MdNostr *nostr);
  *   detail:      human-readable detail (may be NULL)
  *
  * If a signer is configured, the entry is signed as a kind:1078 event.
- * If nostr + publish are configured, the signed event is published.
+ * If opted in and attached, enqueue a best-effort encrypted relay copy.
+ * The caller never waits for relay delivery; the local signing result is
+ * independent of relay delivery.
  *
  * Returns 0 on success, -1 on error.
  */
