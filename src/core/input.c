@@ -230,6 +230,12 @@ MdInput *md_input_create(const MdInputConfig *cfg) {
     const char *name = cfg ? cfg->backend : NULL;
     const MdInputBackend *vtable = NULL;
     bool portal_auto = false;
+#ifdef MD_HAVE_PORTAL_INPUT
+    if (cfg && cfg->portal_session) {
+        if (name && strcmp(name, "auto") && strcmp(name, "portal")) return NULL;
+        vtable = md_input_portal_backend();
+    } else
+#endif
     if (!name || strcmp(name, "auto") == 0) {
 #if defined(__linux__) && defined(MD_HAVE_PORTAL_INPUT)
         const char *session = getenv("XDG_SESSION_TYPE");

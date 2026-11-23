@@ -1,6 +1,6 @@
-/* RemoteDesktop v2 input-only session. No ScreenCast permission is needed for
- * EIS global regions; capture keeps its separate session/restore token. Never
- * fall back to privileged injection after consent denial or session loss. */
+/* RemoteDesktop v2 session owner and EIS input adapter. An input-only grant
+ * has no ScreenCast authority. A paired grant binds its single video stream
+ * to an EIS region before either consumer can use the session. */
 #include "input.h"
 #include "log.h"
 #include "md_time.h"
@@ -20,15 +20,34 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include "portal_session.h"
+#include <stdatomic.h>
+
 #define MD_LOG_TAG "input_portal"
 #define PORTAL "org.freedesktop.portal.Desktop"
 #define OBJECT "/org/freedesktop/portal/desktop"
 #define REMOTE "org.freedesktop.portal.RemoteDesktop"
+#define SCREENCAST "org.freedesktop.portal.ScreenCast"
 #define REQUEST "org.freedesktop.portal.Request"
 #define SESSION "org.freedesktop.portal.Session"
 
-typedef struct {
+typedef struct MappedDevice {
+    struct ei_device *device;
+    struct MappedDevice *next;
+} MappedDevice;
+
+struct MdPortalSession {
     DBusConnection *bus;
+    atomic_uint refs;
+    atomic_bool dead;
+    char *mapping_id;
+    uint32_t node;
+    int capture_fd;
+    MappedDevice *mapped;
+    struct ei_region *region; /* borrowed from the uniquely matched device */
+    struct ei_device *mapped_pointer; /* borrowed from mapped */
+    void (*capture_wake)(void *);
+    void *capture_wake_data;
     char owner[256], sender[256], session[512];
     unsigned serial;
     int64_t deadline;
@@ -37,20 +56,21 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_t thread;
     int wake[2];
-    bool started, dead;
+    bool started, input_attached;
+    bool mouse_held[3];
     uint32_t sequence;
     uint32_t depressed, latched, locked, group;
     bool held[KEY_MAX + 1];
-} PortalInput;
+};
 
-static int remaining(PortalInput *p) {
+static int remaining(MdPortalSession *p) {
     int64_t ms = p->deadline - md_now_ms();
     return ms > 0 ? (int)ms : 0;
 }
 
 /* All startup calls, authentication, responses and EIS negotiation share a
  * monotonic budget. A private bus connection never drains the host's bus. */
-static DBusMessage *call(PortalInput *p, DBusMessage *msg) {
+static DBusMessage *call(MdPortalSession *p, DBusMessage *msg) {
     DBusMessage *reply = NULL;
     if (msg && remaining(p)) {
         DBusError err = DBUS_ERROR_INIT;
@@ -75,12 +95,9 @@ static void option(DBusMessageIter *dict, const char *key, int type, const void 
     dbus_message_iter_close_container(dict, &entry);
 }
 
-static bool lookup(DBusMessage *msg, const char *key, int type, void *value) {
-    DBusMessageIter args, array;
-    if (!dbus_message_has_signature(msg, "ua{sv}")) return false;
-    dbus_message_iter_init(msg, &args);
-    dbus_message_iter_next(&args);
-    dbus_message_iter_recurse(&args, &array);
+static bool lookup_variant(DBusMessageIter *dict, const char *key, DBusMessageIter *value) {
+    DBusMessageIter array;
+    dbus_message_iter_recurse(dict, &array);
     while (dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_DICT_ENTRY) {
         DBusMessageIter entry, variant;
         const char *name;
@@ -88,8 +105,8 @@ static bool lookup(DBusMessage *msg, const char *key, int type, void *value) {
         dbus_message_iter_get_basic(&entry, &name);
         dbus_message_iter_next(&entry);
         dbus_message_iter_recurse(&entry, &variant);
-        if (!strcmp(name, key) && dbus_message_iter_get_arg_type(&variant) == type) {
-            dbus_message_iter_get_basic(&variant, value);
+        if (!strcmp(name, key)) {
+            *value = variant;
             return true;
         }
         dbus_message_iter_next(&array);
@@ -97,7 +114,42 @@ static bool lookup(DBusMessage *msg, const char *key, int type, void *value) {
     return false;
 }
 
-static void close_object(PortalInput *p, const char *path, const char *interface) {
+static bool lookup(DBusMessage *msg, const char *key, int type, void *value) {
+    DBusMessageIter args, variant;
+    if (!dbus_message_has_signature(msg, "ua{sv}")) return false;
+    dbus_message_iter_init(msg, &args);
+    dbus_message_iter_next(&args);
+    if (!lookup_variant(&args, key, &variant) || dbus_message_iter_get_arg_type(&variant) != type)
+        return false;
+    dbus_message_iter_get_basic(&variant, value);
+    return true;
+}
+
+/* This capture backend publishes one stream. Never silently choose among
+ * multiple grants, or accept an unbound stream as paired authority. */
+static bool read_stream(MdPortalSession *p, DBusMessage *response) {
+    DBusMessageIter args, variant, streams, fields, mapping;
+    dbus_message_iter_init(response, &args);
+    dbus_message_iter_next(&args);
+    if (!lookup_variant(&args, "streams", &variant)) return false;
+    char *sig = dbus_message_iter_get_signature(&variant);
+    bool valid = sig && !strcmp(sig, "a(ua{sv})");
+    dbus_free(sig);
+    if (!valid) return false;
+    dbus_message_iter_recurse(&variant, &streams);
+    if (dbus_message_iter_get_arg_type(&streams) != DBUS_TYPE_STRUCT) return false;
+    dbus_message_iter_recurse(&streams, &fields);
+    if (dbus_message_iter_next(&streams)) return false;
+    dbus_message_iter_get_basic(&fields, &p->node);
+    dbus_message_iter_next(&fields);
+    if (!p->node || p->node == UINT32_MAX || !lookup_variant(&fields, "mapping_id", &mapping) ||
+        dbus_message_iter_get_arg_type(&mapping) != DBUS_TYPE_STRING) return false;
+    const char *id;
+    dbus_message_iter_get_basic(&mapping, &id);
+    return *id && (p->mapping_id = strdup(id));
+}
+
+static void close_object(MdPortalSession *p, const char *path, const char *interface) {
     if (!p->bus || !path[0]) return;
     DBusMessage *msg = dbus_message_new_method_call(p->owner[0] ? p->owner : PORTAL,
                                                    path, interface, "Close");
@@ -114,7 +166,7 @@ static void close_object(PortalInput *p, const char *path, const char *interface
 static pthread_once_t dbus_once = PTHREAD_ONCE_INIT;
 static void init_dbus_threads(void) { dbus_threads_init_default(); }
 
-static DBusConnection *connect_bus(PortalInput *p) {
+static DBusConnection *connect_bus(MdPortalSession *p) {
     pthread_once(&dbus_once, init_dbus_threads);
     const char *address = getenv("DBUS_SESSION_BUS_ADDRESS");
     if (!address || strncmp(address, "unix:", 5) || strchr(address, ';')) return NULL;
@@ -139,7 +191,7 @@ static DBusConnection *connect_bus(PortalInput *p) {
     return ok ? p->bus : NULL;
 }
 
-static bool add_match(PortalInput *p, const char *rule) {
+static bool add_match(MdPortalSession *p, const char *rule) {
     DBusMessage *msg = dbus_message_new_method_call(DBUS_SERVICE_DBUS,
         DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "AddMatch");
     if (!msg) return false;
@@ -152,7 +204,7 @@ static bool add_match(PortalInput *p, const char *rule) {
 
 /* Capability discovery is not authorization; init must still succeed. */
 bool md_input_portal_available(void) {
-    PortalInput p = { .deadline = md_now_ms() + 1000 };
+    MdPortalSession p = { .deadline = md_now_ms() + 1000 };
     bool found = false;
     if (connect_bus(&p)) {
         DBusMessage *msg = dbus_message_new_method_call(PORTAL, OBJECT,
@@ -237,17 +289,32 @@ static void token_save(const char *token) {
 }
 static pthread_mutex_t token_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Successful Start may consume the old token even with a partial grant.
+ * Do not overwrite a token rotated by another in-process session. */
+static void token_update(const char *previous, const char *replacement) {
+    char current[1024] = {0};
+    token_load(current);
+    if (strcmp(current, previous)) return;
+    if (replacement && *replacement && strlen(replacement) < sizeof(current)) {
+        token_save(replacement);
+    } else if (*previous) {
+        int dir = token_dir();
+        if (dir >= 0) { if (!unlinkat(dir, "remote-desktop.token", 0)) fsync(dir); close(dir); }
+    }
+}
+
 /* Precompute request/session paths before sending so early Response and
  * cancellation both have an owned object to close. Pin the unique owner. */
-static void lifecycle(PortalInput *p, DBusMessage *msg);
+static void lifecycle(MdPortalSession *p, DBusMessage *msg);
 
-static DBusMessage *request(PortalInput *p, const char *method, const char *restore) {
+static DBusMessage *request(MdPortalSession *p, const char *method, const char *restore,
+                            const MdCaptureConfig *capture) {
     char token[40], path[512];
     snprintf(token, sizeof(token), "md_input_%u", ++p->serial);
     snprintf(path, sizeof(path), OBJECT "/request/%s/%s", p->sender, token);
     const char *handle = token;
     DBusMessage *msg = dbus_message_new_method_call(p->owner[0] ? p->owner : PORTAL,
-                                                   OBJECT, REMOTE, method);
+                                                   OBJECT, capture ? SCREENCAST : REMOTE, method);
     if (!msg) return NULL;
     DBusMessageIter args, dict;
     dbus_message_iter_init_append(msg, &args);
@@ -261,6 +328,12 @@ static DBusMessage *request(PortalInput *p, const char *method, const char *rest
         const char *st = "md_input_session";
         option(&dict, "session_handle_token", DBUS_TYPE_STRING, &st);
         snprintf(p->session, sizeof(p->session), OBJECT "/session/%s/%s", p->sender, st);
+    } else if (capture) {
+        uint32_t types = 1, cursor = capture->show_cursor ? 2 : 1;
+        dbus_bool_t multiple = FALSE;
+        option(&dict, "types", DBUS_TYPE_UINT32, &types);
+        option(&dict, "cursor_mode", DBUS_TYPE_UINT32, &cursor);
+        option(&dict, "multiple", DBUS_TYPE_BOOLEAN, &multiple);
     } else if (!start) {
         uint32_t types = 3, persist = 2;
         option(&dict, "types", DBUS_TYPE_UINT32, &types);
@@ -301,12 +374,65 @@ cancelled:
     return NULL;
 }
 
+/* The startup caller or the session mutex serializes publishers. The
+ * atomic flag fences capture acquisitions without taking the session lock
+ * under the PipeWire frame lock (the wake callback takes it in reverse). */
+static void revoke_session(MdPortalSession *p) {
+    if (!atomic_exchange(&p->dead, true) && p->capture_wake)
+        p->capture_wake(p->capture_wake_data);
+}
+
+bool md_portal_session_revoked(const MdPortalSession *session) {
+    return atomic_load(&session->dead);
+}
+
+void md_portal_session_watch(MdPortalSession *p, void (*wake)(void *), void *data) {
+    pthread_mutex_lock(&p->mutex);
+    p->capture_wake = wake;
+    p->capture_wake_data = data;
+    if (wake && atomic_load(&p->dead)) wake(data);
+    pthread_mutex_unlock(&p->mutex);
+}
+
+static void update_mapping(MdPortalSession *p, struct ei_device *device, bool resumed) {
+    if (!p->mapping_id || !ei_device_has_capability(device, EI_DEVICE_CAP_POINTER_ABSOLUTE)) return;
+    MappedDevice **link = &p->mapped;
+    while (*link && (*link)->device != device) link = &(*link)->next;
+    if (resumed && !*link) {
+        *link = calloc(1, sizeof(**link));
+        if (!*link) { revoke_session(p); return; }
+        (*link)->device = ei_device_ref(device);
+    } else if (!resumed && *link) {
+        MappedDevice *old = *link;
+        *link = old->next;
+        ei_device_unref(old->device);
+        free(old);
+    }
+    p->region = NULL;
+    p->mapped_pointer = NULL;
+    for (MappedDevice *candidate = p->mapped; candidate; candidate = candidate->next) {
+        struct ei_region *region;
+        for (size_t i = 0; (region = ei_device_get_region(candidate->device, i)); i++) {
+            const char *id = ei_region_get_mapping_id(region);
+            if (!id || strcmp(id, p->mapping_id) || !ei_region_get_width(region) ||
+                !ei_region_get_height(region)) continue;
+            if (p->region) { /* ambiguous during a resize or malformed grant */
+                p->region = NULL;
+                p->mapped_pointer = NULL;
+                return;
+            }
+            p->region = region;
+            p->mapped_pointer = candidate->device;
+        }
+    }
+}
+
 static void device_clear(struct ei_device **slot, struct ei_device *device) {
     if (*slot && (!device || *slot == device)) *slot = ei_device_unref(*slot);
 }
 
 /* Called under mutex after init; all libei operations share that lock. */
-static void dispatch(PortalInput *p) {
+static void dispatch(MdPortalSession *p) {
     ei_dispatch(p->ei);
     struct ei_event *event;
     while ((event = ei_get_event(p->ei))) {
@@ -320,7 +446,8 @@ static void dispatch(PortalInput *p) {
             ei_device_start_emulating(device, ++p->sequence);
 #define BIND(slot, cap) if (!p->slot && ei_device_has_capability(device, cap)) p->slot = ei_device_ref(device)
             BIND(keyboard, EI_DEVICE_CAP_KEYBOARD);
-            BIND(pointer, EI_DEVICE_CAP_POINTER_ABSOLUTE);
+            if (!p->mapping_id) { BIND(pointer, EI_DEVICE_CAP_POINTER_ABSOLUTE); }
+            update_mapping(p, device, true);
             BIND(button, EI_DEVICE_CAP_BUTTON);
             BIND(scroll, EI_DEVICE_CAP_SCROLL);
 #undef BIND
@@ -339,35 +466,38 @@ static void dispatch(PortalInput *p) {
                 memset(p->held, 0, sizeof(p->held));
                 p->depressed = p->latched = p->locked = p->group = 0;
             }
+            if (device == p->button) memset(p->mouse_held, 0, sizeof(p->mouse_held));
+            update_mapping(p, device, false);
             device_clear(&p->keyboard, device); device_clear(&p->pointer, device);
             device_clear(&p->button, device); device_clear(&p->scroll, device);
             break;
-        case EI_EVENT_DISCONNECT: p->dead = true; break;
+        case EI_EVENT_DISCONNECT: revoke_session(p); break;
         default: break;
         }
         ei_event_unref(event);
     }
 }
 
-static bool ready(PortalInput *p) {
-    return !p->dead && p->keyboard && p->pointer && p->button && p->scroll;
+static bool ready(MdPortalSession *p) {
+    return !atomic_load(&p->dead) && p->keyboard && (p->mapping_id ? !!p->region : !!p->pointer) &&
+        p->button && p->scroll;
 }
 
-static void lifecycle(PortalInput *p, DBusMessage *msg) {
+static void lifecycle(MdPortalSession *p, DBusMessage *msg) {
     if ((dbus_message_is_signal(msg, SESSION, "Closed") &&
          dbus_message_has_sender(msg, p->owner) && dbus_message_has_path(msg, p->session)) ||
-        dbus_message_is_signal(msg, DBUS_INTERFACE_LOCAL, "Disconnected")) p->dead = true;
+        dbus_message_is_signal(msg, DBUS_INTERFACE_LOCAL, "Disconnected")) revoke_session(p);
     if (dbus_message_is_signal(msg, DBUS_INTERFACE_DBUS, "NameOwnerChanged") &&
         dbus_message_has_sender(msg, DBUS_SERVICE_DBUS)) {
         const char *name, *old, *new_owner;
         if (dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &name, DBUS_TYPE_STRING, &old,
             DBUS_TYPE_STRING, &new_owner, DBUS_TYPE_INVALID) && !strcmp(name, PORTAL) &&
-            strcmp(new_owner, p->owner)) p->dead = true;
+            strcmp(new_owner, p->owner)) revoke_session(p);
     }
 }
 
-static void bus_dispatch(PortalInput *p) {
-    if (!dbus_connection_read_write(p->bus, 0)) p->dead = true;
+static void bus_dispatch(MdPortalSession *p) {
+    if (!dbus_connection_read_write(p->bus, 0)) revoke_session(p);
     DBusMessage *msg;
     while ((msg = dbus_connection_pop_message(p->bus))) {
         lifecycle(p, msg);
@@ -376,7 +506,7 @@ static void bus_dispatch(PortalInput *p) {
 }
 
 static void *worker(void *data) {
-    PortalInput *p = data;
+    MdPortalSession *p = data;
     int busfd = -1;
     dbus_connection_get_unix_fd(p->bus, &busfd);
     struct pollfd fds[] = {{ei_get_fd(p->ei), POLLIN, 0}, {busfd, POLLIN, 0}, {p->wake[0], POLLIN, 0}};
@@ -388,19 +518,30 @@ static void *worker(void *data) {
         if (dead) break;
         int n = poll(fds, 3, -1);
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 || fds[2].revents) break;
-        if ((fds[0].revents | fds[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
-            pthread_mutex_lock(&p->mutex); p->dead = true; pthread_mutex_unlock(&p->mutex);
+        if (fds[2].revents) break;
+        if (n < 0 || ((fds[0].revents | fds[1].revents) & (POLLERR | POLLHUP | POLLNVAL))) {
+            pthread_mutex_lock(&p->mutex); revoke_session(p); pthread_mutex_unlock(&p->mutex);
             break;
         }
     }
     return NULL;
 }
 
-static void portal_destroy(MdInputCtx *ctx) {
-    PortalInput *p = ctx->backend_data;
-    if (!p) return;
-    if (p->started) { char c = 1; (void)write(p->wake[1], &c, 1); pthread_join(p->thread, NULL); }
+void md_portal_session_unref(MdPortalSession *p) {
+    if (!p || atomic_fetch_sub(&p->refs, 1) != 1) return;
+    if (p->started) {
+        close(p->wake[1]); /* POLLHUP wakes the worker even if already exiting. */
+        p->wake[1] = -1;
+        pthread_join(p->thread, NULL);
+    }
+    while (p->mapped) {
+        MappedDevice *node = p->mapped;
+        p->mapped = node->next;
+        ei_device_unref(node->device);
+        free(node);
+    }
+    free(p->mapping_id);
+    if (p->capture_fd >= 0) close(p->capture_fd);
     device_clear(&p->keyboard, NULL); device_clear(&p->pointer, NULL);
     device_clear(&p->button, NULL); device_clear(&p->scroll, NULL);
     if (p->ei) ei_unref(p->ei);
@@ -409,67 +550,102 @@ static void portal_destroy(MdInputCtx *ctx) {
     if (p->wake[0] >= 0) close(p->wake[0]);
     if (p->wake[1] >= 0) close(p->wake[1]);
     pthread_mutex_destroy(&p->mutex);
-    free(p); ctx->backend_data = NULL; ctx->ready = false;
+    free(p);
 }
 
-static int portal_init(MdInputCtx *ctx) {
-    /* Invalid/revoked restore tokens may prompt normally. The protocol has
-     * no no-prompt Start flag, so even an existing token is not sufficient. */
-    if (ctx->config.no_interaction) {
-        MD_LOG_E("managed input requires interaction: RemoteDesktop cannot guarantee prompt-free consent; use an interactive host");
-        return -1;
+/* Return the caller-owned CLOEXEC descriptor produced by libdbus. */
+static int call_fd(MdPortalSession *p, const char *interface, const char *method) {
+    DBusMessage *msg = dbus_message_new_method_call(p->owner, OBJECT, interface, method);
+    if (!msg) return -1;
+    DBusMessageIter args, dict;
+    dbus_message_iter_init_append(msg, &args);
+    const char *session = p->session;
+    dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &session);
+    dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
+    dbus_message_iter_close_container(&args, &dict);
+    DBusMessage *reply = call(p, msg);
+    int fd = -1;
+    if (reply && dbus_message_has_sender(reply, p->owner) && dbus_message_has_signature(reply, "h"))
+        dbus_message_get_args(reply, NULL, DBUS_TYPE_UNIX_FD, &fd, DBUS_TYPE_INVALID);
+    if (reply) dbus_message_unref(reply);
+    return fd;
+}
+
+int md_portal_session_open_capture(MdPortalSession *p, uint32_t *node) {
+    int fd = -1;
+    pthread_mutex_lock(&p->mutex);
+    bus_dispatch(p);
+    if (p->mapping_id && !atomic_load(&p->dead)) {
+        fd = p->capture_fd;
+        p->capture_fd = -1;
+        if (fd < 0) {
+            p->deadline = md_now_ms() + 5000;
+            fd = call_fd(p, SCREENCAST, "OpenPipeWireRemote");
+        }
+        bus_dispatch(p);
+        if (fd >= 0 && atomic_load(&p->dead)) { close(fd); fd = -1; }
+        if (fd >= 0) *node = p->node;
     }
-    PortalInput *p = calloc(1, sizeof(*p));
-    if (!p) return -1;
-    p->wake[0] = p->wake[1] = -1;
-    pthread_mutex_init(&p->mutex, NULL);
-    ctx->backend_data = p;
-    uint32_t timeout = ctx->config.portal_timeout_ms ? ctx->config.portal_timeout_ms : 30000;
+    pthread_mutex_unlock(&p->mutex);
+    return fd;
+}
+
+MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32_t timeout_ms) {
+    if (capture && capture->no_interaction) return NULL;
+    MdPortalSession *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->wake[0] = p->wake[1] = p->capture_fd = -1;
+    atomic_init(&p->refs, 1);
+    atomic_init(&p->dead, false);
+    if (pthread_mutex_init(&p->mutex, NULL)) { free(p); return NULL; }
+    uint32_t timeout = timeout_ms ? timeout_ms : 30000;
     if (timeout > 180000) timeout = 180000;
     p->deadline = md_now_ms() + timeout;
+    char token[1024] = {0}, replacement_token[1024] = {0};
+    bool start_accepted = false;
     const char *stage = "session-bus setup";
     if (!connect_bus(p) || !add_match(p, "type='signal',sender='" PORTAL "',interface='" REQUEST "'") ||
         !add_match(p, "type='signal',sender='" PORTAL "',interface='" SESSION "'") ||
         !add_match(p, "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='" PORTAL "'")) goto fail;
     stage = "CreateSession";
-    DBusMessage *resp = request(p, "CreateSession", NULL);
+    DBusMessage *resp = request(p, "CreateSession", NULL, NULL);
     const char *session = NULL;
     bool ok = resp && lookup(resp, "session_handle", DBUS_TYPE_STRING, &session) && !strcmp(session, p->session);
     if (resp) dbus_message_unref(resp);
     if (!ok) goto fail;
-    char token[1024] = {0};
     pthread_mutex_lock(&token_mutex); token_load(token); pthread_mutex_unlock(&token_mutex);
     stage = "SelectDevices";
-    resp = request(p, "SelectDevices", token);
+    resp = request(p, "SelectDevices", token, NULL);
     if (!resp) goto fail;
     dbus_message_unref(resp);
-    MD_LOG_I("Awaiting RemoteDesktop consent (input only, no uinput)");
+    if (capture) {
+        stage = "SelectSources";
+        resp = request(p, "SelectSources", NULL, capture);
+        if (!resp) goto fail;
+        dbus_message_unref(resp);
+    }
+    MD_LOG_I("Awaiting RemoteDesktop consent (%s)", capture ? "capture and input" : "input only");
     stage = "Start consent";
-    resp = request(p, "Start", NULL);
+    resp = request(p, "Start", NULL, NULL);
     uint32_t devices = 0;
     ok = resp && lookup(resp, "devices", DBUS_TYPE_UINT32, &devices) && (devices & 3) == 3;
+    if (ok && capture) ok = read_stream(p, resp);
+    start_accepted = resp != NULL;
     const char *replacement = NULL;
-    if (ok && lookup(resp, "restore_token", DBUS_TYPE_STRING, &replacement)) {
-        pthread_mutex_lock(&token_mutex); token_save(replacement); pthread_mutex_unlock(&token_mutex);
-    }
+    if (ok && lookup(resp, "restore_token", DBUS_TYPE_STRING, &replacement) &&
+        strlen(replacement) < sizeof(replacement_token))
+        strcpy(replacement_token, replacement);
     if (resp) dbus_message_unref(resp);
     if (!ok) goto fail;
+    if (capture) {
+        stage = "OpenPipeWireRemote";
+        p->capture_fd = call_fd(p, SCREENCAST, "OpenPipeWireRemote");
+        if (p->capture_fd < 0) goto fail;
+    }
+    bus_dispatch(p);
+    if (atomic_load(&p->dead)) goto fail;
     stage = "ConnectToEIS";
-    DBusMessage *msg = dbus_message_new_method_call(p->owner, OBJECT, REMOTE, "ConnectToEIS");
-    if (!msg) goto fail;
-    DBusMessageIter args, dict;
-    dbus_message_iter_init_append(msg, &args);
-    session = p->session;
-    dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &session);
-    dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-    dbus_message_iter_close_container(&args, &dict);
-    resp = call(p, msg);
-    int fd = -1;
-    if (resp && dbus_message_has_sender(resp, p->owner))
-        dbus_message_get_args(resp, NULL, DBUS_TYPE_UNIX_FD, &fd, DBUS_TYPE_INVALID);
-    /* libdbus owns its fd; libei takes ownership of a separate CLOEXEC fd. */
-    int owned = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;
-    if (resp) dbus_message_unref(resp);
+    int owned = call_fd(p, REMOTE, "ConnectToEIS");
     if (owned < 0) goto fail;
     p->ei = ei_new_sender(p);
     if (!p->ei) { close(owned); goto fail; }
@@ -488,16 +664,80 @@ static int portal_init(MdInputCtx *ctx) {
     }
     if (!ready(p) || pipe2(p->wake, O_CLOEXEC | O_NONBLOCK)) goto fail;
     if (pthread_create(&p->thread, NULL, worker, p)) goto fail;
-    p->started = true; ctx->ready = true;
-    return 0;
+    p->started = true;
+    pthread_mutex_lock(&token_mutex);
+    token_update(token, replacement_token);
+    pthread_mutex_unlock(&token_mutex);
+    return p;
 fail:
+    if (start_accepted) {
+        pthread_mutex_lock(&token_mutex);
+        token_update(token, NULL);
+        pthread_mutex_unlock(&token_mutex);
+    }
     MD_LOG_W("RemoteDesktop %s unavailable or consent not granted (no fallback)", stage);
-    portal_destroy(ctx);
-    return -1;
+    md_portal_session_unref(p);
+    return NULL;
+}
+
+static int portal_init(MdInputCtx *ctx) {
+    /* RemoteDesktop has no prompt-free Start, even with a restore token. */
+    if (ctx->config.no_interaction) return -1;
+    MdPortalSession *p = ctx->config.portal_session;
+    if (p) {
+        pthread_mutex_lock(&p->mutex);
+        dispatch(p); bus_dispatch(p);
+        bool attach = p->mapping_id && !p->input_attached && ready(p);
+        if (attach) {
+            p->input_attached = true;
+            atomic_fetch_add(&p->refs, 1);
+        }
+        pthread_mutex_unlock(&p->mutex);
+        if (!attach) return -1;
+    } else {
+        p = md_portal_session_create(NULL, ctx->config.portal_timeout_ms);
+        if (!p) return -1;
+    }
+    ctx->backend_data = p;
+    ctx->ready = true;
+    return 0;
+}
+
+static const uint32_t buttons[] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
+
+static void portal_destroy(MdInputCtx *ctx) {
+    MdPortalSession *p = ctx->backend_data;
+    if (!p) return;
+    if (p->mapping_id) {
+        pthread_mutex_lock(&p->mutex);
+        dispatch(p); bus_dispatch(p);
+        /* Capture may still retain the EIS connection. Release this input
+         * consumer's pressed keys/buttons instead of relying on disconnect. */
+        if (!atomic_load(&p->dead)) {
+            if (p->keyboard) {
+                for (uint32_t key = 0; key <= KEY_MAX; key++)
+                    if (p->held[key]) ei_device_keyboard_key(p->keyboard, key, false);
+                ei_device_frame(p->keyboard, ei_now(p->ei));
+            }
+            if (p->button) {
+                for (size_t i = 0; i < sizeof(buttons)/sizeof(buttons[0]); i++)
+                    if (p->mouse_held[i]) ei_device_button_button(p->button, buttons[i], false);
+                ei_device_frame(p->button, ei_now(p->ei));
+            }
+            ei_dispatch(p->ei);
+        }
+        memset(p->held, 0, sizeof(p->held));
+        memset(p->mouse_held, 0, sizeof(p->mouse_held));
+        p->input_attached = false;
+        pthread_mutex_unlock(&p->mutex);
+    }
+    ctx->backend_data = NULL;
+    ctx->ready = false;
+    md_portal_session_unref(p);
 }
 
 static bool portal_ready(const MdInputCtx *ctx) {
-    PortalInput *p = ctx->backend_data;
+    MdPortalSession *p = ctx->backend_data;
     if (!p) return false;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);
@@ -507,7 +747,7 @@ static bool portal_ready(const MdInputCtx *ctx) {
 }
 
 static int portal_key(MdInputCtx *ctx, uint32_t key, int pressed) {
-    PortalInput *p = ctx->backend_data;
+    MdPortalSession *p = ctx->backend_data;
     if (!p || key > KEY_MAX) return -1;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);
@@ -522,13 +762,26 @@ static int portal_key(MdInputCtx *ctx, uint32_t key, int pressed) {
 }
 
 static int portal_move(MdInputCtx *ctx, int x, int y) {
-    PortalInput *p = ctx->backend_data;
+    MdPortalSession *p = ctx->backend_data;
     if (!p) return -1;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);
     int rc = -1;
     if (ready(p)) {
         double gx, gy;
+        if (p->mapping_id) {
+            /* Frame pixels may be scaled for transport; EIS uses logical
+             * desktop coordinates. Do not multiply by physical_scale. */
+            uint32_t w = ctx->config.screen_width, h = ctx->config.screen_height;
+            uint32_t px = x < 0 ? 0 : (uint32_t)x >= w ? w - 1 : (uint32_t)x;
+            uint32_t py = y < 0 ? 0 : (uint32_t)y >= h ? h - 1 : (uint32_t)y;
+            gx = ei_region_get_x(p->region) + (double)px * ei_region_get_width(p->region) / w;
+            gy = ei_region_get_y(p->region) + (double)py * ei_region_get_height(p->region) / h;
+            ei_device_pointer_motion_absolute(p->mapped_pointer, gx, gy);
+            ei_device_frame(p->mapped_pointer, ei_now(p->ei));
+            rc = 0;
+            goto done;
+        }
         if (ctx->config.output_width) md_input_map_to_output(&ctx->config, x, y, &gx, &gy);
         else {
             struct ei_region *region = ei_device_get_region(p->pointer, 0);
@@ -551,19 +804,22 @@ done:
 }
 
 static int portal_button(MdInputCtx *ctx, int button, int pressed) {
-    PortalInput *p = ctx->backend_data;
-    static const uint32_t buttons[] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
+    MdPortalSession *p = ctx->backend_data;
     if (!p || button < 0 || button > 2) return -1;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);
     int rc = ready(p) ? 0 : -1;
-    if (!rc) { ei_device_button_button(p->button, buttons[button], !!pressed); ei_device_frame(p->button, ei_now(p->ei)); }
+    if (!rc) {
+        ei_device_button_button(p->button, buttons[button], !!pressed);
+        ei_device_frame(p->button, ei_now(p->ei));
+        p->mouse_held[button] = !!pressed;
+    }
     pthread_mutex_unlock(&p->mutex);
     return rc;
 }
 
 static int portal_scroll(MdInputCtx *ctx, int dx, int dy) {
-    PortalInput *p = ctx->backend_data;
+    MdPortalSession *p = ctx->backend_data;
     if (!p || dx > INT32_MAX / 120 || dx < INT32_MIN / 120 || dy > INT32_MAX / 120 || dy < INT32_MIN / 120) return -1;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);
@@ -577,7 +833,7 @@ static int portal_scroll(MdInputCtx *ctx, int dx, int dy) {
  * Never assume a US desktop, override held modifiers, or partially type an
  * unsupported string. Unicode composition is deliberately not claimed. */
 static int portal_text(MdInputCtx *ctx, const char *text) {
-    PortalInput *p = ctx->backend_data;
+    MdPortalSession *p = ctx->backend_data;
     if (!p || !text || strnlen(text, 4097) > 4096) return -1;
     pthread_mutex_lock(&p->mutex);
     dispatch(p); bus_dispatch(p);

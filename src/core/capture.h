@@ -70,6 +70,7 @@ typedef struct {
     uint32_t target_fps;   /* desired framerate, 0 = backend default     */
     bool     show_cursor;  /* include cursor in captured frames          */
     bool     no_interaction; /* Never trigger OS consent UI; fail if not guaranteed. */
+    bool     portal_input; /* Linux: require paired RemoteDesktop input and capture. */
     bool     unattended;   /* Linux: consent budget capped at 10 seconds */
     bool     forget_authorization_on_stall; /* opt-in, ignored unattended */
     uint32_t consent_timeout_ms; /* 0 = 180s interactive / 10s unattended */
