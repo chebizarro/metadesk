@@ -91,7 +91,14 @@ typedef struct {
      * and remembered without queueing or decrypting; the first live copy
      * remains eligible. Default false also decrypts and delivers history. */
     bool live_only_dms;
+    /* Snapshot/edit history wait budget in milliseconds; zero keeps the
+     * event-driven wait unbounded. Does not bound signing/publication or
+     * change authorization, the subscription, or allowlist_wait_change. */
+    uint32_t acl_history_timeout_ms;
 } MdNostrConfig;
+
+/* Snapshot/edit stopped waiting while ACL history was still pending. */
+#define MD_NOSTR_ACL_HISTORY_TIMEOUT (-3)
 
 /* Preferences carry no authority. Load waits for EOSE; save requires positive OK.
  * One encrypted document preserves other hosts and unknown fields. */
@@ -222,6 +229,10 @@ void md_nostr_drain_dm(MdNostr *n);
  * delivered EOSE, -1 on timeout, all-failed or stop. A readiness bound only:
  * subscriptions stay open either way. */
 int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms);
+
+/* Point-in-time, comma-separated URLs whose history is still pending.
+ * Free the returned string; NULL means none pending or unavailable. */
+char *md_nostr_pending_history_relays(MdNostr *n);
 
 /* Deterministic lifecycle diagnostics for tests. Configure only while idle;
  * hooks run outside bridge locks and must not re-enter bridge APIs. NULL is

@@ -1805,9 +1805,13 @@ static int host_run(int argc, char **argv) {
 
             /* Only live (post-EOSE) requests are answered; announce readiness
              * at the catch-up -> live boundary, not before it. */
-            if (md_nostr_wait_history(nostr, 10000) != 0)
+            if (md_nostr_wait_history(nostr, 10000) != 0) {
+                char *pending = md_nostr_pending_history_relays(nostr);
                 fprintf(stderr, "host: WARNING: relay history catch-up (EOSE) not "
-                        "confirmed; answering live session requests only\n");
+                        "confirmed; answering live session requests only%s%s\n",
+                        pending ? "; still pending: " : "", pending ? pending : "");
+                free(pending);
+            }
 
             md_host_access_lifecycle(&access, managed, "waiting");
             md_host_lifecycle_event("waiting", 0);

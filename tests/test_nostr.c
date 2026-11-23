@@ -910,20 +910,24 @@ static void acl_unused_dm(const char *pk, const char *content,
     (void)pk; (void)content; (void)info; (void)data;
     MD_CHECK(false); /* The AUTH fixture must not leak protected DMs. */
 }
-static void acl_bridge_start(AclTest *s, const char **urls, int count, bool open, bool dm) {
+static void acl_bridge_start_configured(AclTest *s, const char **urls, int count,
+                                        bool open, bool dm, uint32_t history_timeout_ms) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL); pthread_cond_init(&s->cv, NULL);
     atomic_init(&s->fail_sign, false); atomic_init(&s->signs, 0);
     s->direct = md_signer_create_direct(dm_recipient_sk);
     MdSigner *signer = md_signer_create_custom(MD_SIGNER_NIP46, &acl_ops, s);
     MdNostrConfig cfg = { .signer = signer, .relay_urls = urls, .relay_count = count,
-                          .allowlist_open = open };
+                          .allowlist_open = open, .acl_history_timeout_ms = history_timeout_ms };
     MdNostrCallbacks callbacks = { .on_dm = dm ? acl_unused_dm : NULL };
     s->bridge = md_nostr_create(&cfg, &callbacks);
     MD_CHECK(s->bridge != NULL);
     s->state = md_nostr_allowlist_state(s->bridge);
     md_nostr_set_test_hook(s->bridge, acl_hook, s);
     md_signer_destroy(signer);
+}
+static void acl_bridge_start(AclTest *s, const char **urls, int count, bool open, bool dm) {
+    acl_bridge_start_configured(s, urls, count, open, dm, 0);
 }
 static void acl_bridge(AclTest *s, const char **urls, int count, bool open, bool dm) {
     acl_bridge_start(s, urls, count, open, dm);
@@ -2020,6 +2024,53 @@ static void test_constructor_revocation(const char **urls) {
     printf("  PASS: role revoked during construction unwinds all AUTH registrations\n");
 }
 
+static int test_acl_silent_relay(const char **urls) {
+    AclTest s;
+    acl_reset();
+    acl_bridge_start_configured(&s, urls, 2, false, false, 100);
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"req\",\"relay\":%d}", i);
+
+    char *peer = md_nostr_get_pubkey(dm_sender_sk);
+    int64_t created = time(NULL) - 100;
+    char *grant = acl_event(&s, created, peer);
+    acl_deliver(&s, 0, grant);
+    acl_eose(&s, 0);
+    free(grant);
+
+    /* Relay 1 accepted the REQ but has sent neither EOSE nor CLOSED. */
+    MdAllowlistEntry *entries = NULL;
+    size_t count = 0;
+    MD_CHECK(md_nostr_allowlist_snapshot(s.bridge, &entries, &count) == MD_NOSTR_ACL_HISTORY_TIMEOUT);
+    MD_CHECK(entries == NULL && count == 0);
+    char *pending = md_nostr_pending_history_relays(s.bridge);
+    MD_CHECK(pending && !strcmp(pending, urls[1]));
+    free(pending);
+    MD_CHECK(md_nostr_allowlist_remove(s.bridge, peer) == MD_NOSTR_ACL_HISTORY_TIMEOUT);
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, peer, "video") == MD_NOSTR_ACL_HISTORY_TIMEOUT);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, peer));
+    MD_CHECK(atomic_load(&s.signs) == 0);
+
+    /* The original REQ remains active, so late history can still revoke. */
+    char *revocation = acl_event(&s, created + 1, NULL);
+    acl_deliver(&s, 1, revocation);
+    free(revocation);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_UNKNOWN);
+    acl_eose(&s, 1);
+    MD_CHECK(md_nostr_allowlist_state(s.bridge) == MD_NOSTR_ACL_LOADED);
+    MD_CHECK(!md_nostr_is_allowed(s.bridge, peer));
+    MD_CHECK(md_nostr_allowlist_snapshot(s.bridge, &entries, &count) == 0 && count == 0);
+    free(entries);
+    pending = md_nostr_pending_history_relays(s.bridge);
+    MD_CHECK(pending == NULL);
+    free(pending);
+    acl_control("{\"op\":\"mode\",\"value\":\"accept\"}");
+    MD_CHECK(md_nostr_allowlist_add(s.bridge, peer, "video") == 0);
+    free(peer);
+    acl_finish(&s);
+    return md_test_report();
+}
+
 static int acl_fixture_tests(const char **urls) {
     test_dm_history_policy(urls, false);
     test_dm_history_policy(urls, true);
@@ -2044,6 +2095,8 @@ static int acl_fixture_tests(const char **urls) {
 }
 
 static int run_tests(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--silent-relay"))
+        return test_acl_silent_relay((const char **)&argv[2]);
     if (argc == 4 && !strcmp(argv[1], "--acl-fixture"))
         return acl_fixture_tests((const char **)&argv[2]);
     printf("test_nostr (nostrc bridge):\n");
