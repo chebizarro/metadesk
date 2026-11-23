@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Match the host's startup history budget; this is not a publish timeout. */
+#define ACCESS_HISTORY_TIMEOUT_MS 10000u
+
 static int usage(void) {
     fprintf(stderr,
         "Usage: metadesk-host access [--config-dir ABSOLUTE_DIRECTORY] [--relay URL ...] COMMAND\n"
@@ -79,6 +82,7 @@ int md_host_access_cli(int argc, char **argv) {
     MdNostrConfig cfg = {
         .signer = md_account_binding_signer(binding), .owner = binding,
         .relay_urls = relays, .relay_count = relay_count,
+        .acl_history_timeout_ms = ACCESS_HISTORY_TIMEOUT_MS,
     };
     nostr = md_nostr_create(&cfg, NULL);
     if (!nostr) {
@@ -104,7 +108,13 @@ int md_host_access_cli(int argc, char **argv) {
         rc = add ? md_nostr_allowlist_add(nostr, pk, caps)
                  : md_nostr_allowlist_remove(nostr, pk);
     }
-    if (rc) fprintf(stderr, "access: operation failed (history unavailable, signer/publish failure, concurrent replacement, or review-required policy: use migrate with every member and explicit caps); reread list before retrying\n");
+    if (rc == MD_NOSTR_ACL_HISTORY_TIMEOUT) {
+        char *pending = md_nostr_pending_history_relays(nostr);
+        fprintf(stderr, "access %s: timed out waiting for relay history (%u ms)%s%s\n",
+                cmd, ACCESS_HISTORY_TIMEOUT_MS, pending ? "; still pending: " : "",
+                pending ? pending : "");
+        free(pending);
+    } else if (rc) fprintf(stderr, "access: operation failed (history unavailable, signer/publish failure, concurrent replacement, or review-required policy: use migrate with every member and explicit caps); reread list before retrying\n");
 done:
     md_nostr_destroy(nostr);
     md_account_binding_release(binding);

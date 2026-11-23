@@ -1049,6 +1049,10 @@ test('nostr ACL and AUTH private relays', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr],
   env : nostr_test_env, timeout : 120,
 )
+test('nostr ACL silent relay deadline', find_program('python3'),
+  args : [files('tests/nostr_acl_fixture.py'), test_nostr, '--silent-relay'],
+  env : nostr_test_env, timeout : 20,
+)
 
 test_encode = executable('test_encode',
   files('tests/test_encode.c'),

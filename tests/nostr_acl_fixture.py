@@ -173,7 +173,8 @@ def main():
                    "XDG_DATA_HOME": home, "XDG_CACHE_HOME": home,
                    "PYTHONDONTWRITEBYTECODE": "1"}
             urls = [f"ws://127.0.0.1:{s.server_address[1]}" for s in servers]
-            child = subprocess.Popen([sys.argv[1], "--acl-fixture", *urls],
+            test_mode = sys.argv[2] if len(sys.argv) > 2 else "--acl-fixture"
+            child = subprocess.Popen([sys.argv[1], test_mode, *urls],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      text=True, env=env)
             for line in child.stdout:

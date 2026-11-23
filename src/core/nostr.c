@@ -23,6 +23,7 @@
  */
 #include "nostr.h"
 #include <nostr-connection.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -89,6 +90,7 @@ typedef struct PublishBatch PublishBatch;
 struct MdNostr {
     bool quality_preferences;
     bool live_only_dms;
+    uint32_t acl_history_timeout_ms;
     char *quality_cipher; /* allowlist_mu; bounded encrypted NIP-78 winner */
     int64_t quality_created;
     char quality_id[65];
@@ -343,6 +345,19 @@ static bool history_pending_locked(const MdNostr *n) {
     for (size_t i = 0; i < n->relay_count; i++)
         if (!n->relay_states[i].history_done) return true;
     return false;
+}
+
+/* Caller holds allowlist_mu. A deadline only ends this operation's wait. */
+static int wait_acl_history_locked(MdNostr *n) {
+    const uint32_t timeout_ms = n->acl_history_timeout_ms;
+    const uint64_t deadline = timeout_ms ? md_monotonic_ns() + (uint64_t)timeout_ms * 1000000u : 0;
+    int rc = 0;
+    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n)) {
+        if (rc) return rc == ETIMEDOUT ? MD_NOSTR_ACL_HISTORY_TIMEOUT : -1;
+        rc = timeout_ms ? md_cond_timedwait_until(&n->allowlist_cv, &n->allowlist_mu, deadline) :
+                          pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    }
+    return 0;
 }
 
 /* Recompute readiness only at protocol/connection boundaries. A relay that
@@ -822,6 +837,31 @@ int md_nostr_wait_history(MdNostr *n, uint32_t timeout_ms) {
     return ret;
 }
 
+char *md_nostr_pending_history_relays(MdNostr *n) {
+    if (!operation_begin(n)) return NULL;
+    char *urls = NULL;
+    pthread_mutex_lock(&n->allowlist_mu);
+    size_t len = 1;
+    for (size_t i = 0; i < n->relay_count; i++) {
+        if (n->relay_states[i].history_done) continue;
+        size_t url_len = strlen(n->relay_urls[i]);
+        size_t separator = len > 1 ? 2 : 0;
+        if (separator > SIZE_MAX - len || url_len > SIZE_MAX - len - separator) goto done;
+        len += url_len + separator;
+    }
+    if (len > 1 && (urls = malloc(len))) {
+        size_t used = 0;
+        for (size_t i = 0; i < n->relay_count; i++) {
+            if (n->relay_states[i].history_done) continue;
+            used += (size_t)snprintf(urls + used, len - used, "%s%s", used ? ", " : "", n->relay_urls[i]);
+        }
+    }
+done:
+    pthread_mutex_unlock(&n->allowlist_mu);
+    operation_end(n);
+    return urls;
+}
+
 /* ── Allowlist decoding ───────────────────────────────────────── */
 
 /* Append a copy, leaving the list intact on failure. Deliberately not
@@ -1152,6 +1192,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     pthread_cond_init(&n->work_cv, NULL);
     n->quality_preferences = cfg->quality_preferences;
     n->live_only_dms = cfg->live_only_dms;
+    n->acl_history_timeout_ms = cfg->acl_history_timeout_ms;
     n->acl_open = cfg->allowlist_open;
     n->acl_state = cfg->allowlist_open ? MD_NOSTR_ACL_OPEN : MD_NOSTR_ACL_UNKNOWN;
     n->signer_cancel = md_signer_cancel_new();
@@ -1766,8 +1807,11 @@ static int allowlist_edit(MdNostr *n, const char *pk, const char *caps, bool add
     /* Existing callers may edit immediately after create. Wait for an actual
      * history/failure boundary, never build from a partially received list.
      * UNKNOWN with no relay pending (all down/awaiting AUTH) fails at once. */
-    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
-        pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
+    int wait = wait_acl_history_locked(n);
+    if (wait) {
+        pthread_mutex_unlock(&n->allowlist_mu);
+        return wait;
+    }
     if (expected && *expected != n->acl_version) {
         pthread_mutex_unlock(&n->allowlist_mu); return -2;
     }
@@ -1973,13 +2017,12 @@ int md_nostr_allowlist_snapshot_version(MdNostr *n, MdAllowlistEntry **entries, 
     *entries = NULL;
     *count = 0;
     if (!owns_host(n) || !operation_begin(n)) return -1;
-    int ret = -1;
     MdAllowlistEntry *copy = NULL;
     size_t used = 0;
     pthread_mutex_lock(&n->allowlist_mu);
-    while (n->acl_state == MD_NOSTR_ACL_UNKNOWN && history_pending_locked(n) && !is_stopped(n))
-        pthread_cond_wait(&n->allowlist_cv, &n->allowlist_mu);
-    if (n->acl_state == MD_NOSTR_ACL_LOADED && !n->acl_decode_failed && !is_stopped(n)) {
+    int wait = wait_acl_history_locked(n);
+    int ret = wait ? wait : -1;
+    if (!wait && n->acl_state == MD_NOSTR_ACL_LOADED && !n->acl_decode_failed && !is_stopped(n)) {
         size_t capacity = n->allowlist ? n->allowlist->count : 0;
         copy = capacity ? calloc(capacity, sizeof(*copy)) : NULL;
         if (!capacity || copy) {
