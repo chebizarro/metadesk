@@ -4,7 +4,9 @@ Two independent application manifests, GNOME Platform/SDK 49:
 `org.metadesk.Client.json` and `org.metadesk.Manager.json`. The manager consumes
 merged md-fbg4 with `-Dmanager=true`; it does not embed or start a host daemon.
 
-Dependencies are pinned in `modules.json`; SDK supplies GNOME/GLib, PipeWire,
+Dependencies are pinned in `modules.json`. nostrc
+`6f7a8d025768d497bef700fe55eea1c687dac328` is installed to a private SDK
+prefix during the build. The runtime SDK supplies GNOME/GLib, PipeWire,
 AT-SPI headers, OpenSSL and system integration libraries. Own modules supply
 SDL2, libyuv, cJSON, libb2, Jansson, secp256k1, nsync, libwebsockets and nostrc.
 Legacy dependency CMake projects explicitly use the CMake 4 compatibility

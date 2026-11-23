@@ -60,16 +60,16 @@ Both modes connect to the same host daemon and can run simultaneously.
 
 ### Build
 
+Choose one nostrc source, then build and test:
+
 ```bash
-# Linux
-meson setup build -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build
-ninja -C build
+# Installed SDK
+PKG_CONFIG_PATH=/path/to/sdk/lib/pkgconfig meson setup build -Dnostrc_discovery=installed
 
-# macOS (Homebrew)
+# Or: dedicated CMake build tree
 meson setup build -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build
-ninja -C build
 
-# Run tests
+meson compile -C build
 meson test -C build
 ```
 

@@ -4,10 +4,10 @@ All backends default to off. Enable any combination with
 `-Dsigner_nip46=true`, `-Dsigner_nip55l=true`, and `-Dsigner_nip5f=true`.
 No local pkg-config descriptors are needed for signer discovery.
 
-The bridge requires nostrc's library-owned NIP-42 session API (master
-`6f7a8d025` or later). Use a dedicated master build, not the retired shared
-build tree. Older trees may still configure, but are not supported build/test
-targets for this bridge.
+Metadesk requires nostrc `6f7a8d025` or newer. Configure checks for the
+context-aware relay publish and unsigned NIP-17 relay-list APIs in addition to
+the APIs used by enabled signers. Use a dedicated developer tree or a single
+installed SDK prefix, not a mixture.
 
 With no nostrc paths Meson uses installed pkg-config modules (`nostr`,
 `libnostrgo`, `libnostr-json`, `nip11`, `nip17`, `nip44`, `nip51`, `nip98`,
@@ -33,16 +33,11 @@ nostrc's key-store fallback from consulting the user's store.
 
 ## Dependency discovery
 
-When a nostrc build tree is selected, Meson prefers its signer libraries under
-`nostrc_build_dir/nips/<component>` over installed libraries, even when their
-symbols are ABI-compatible. Otherwise an old installed NIP-5F adapter can mask
-the upstream JSON-unescaping fix. Installed libraries are a fallback when no
-build-tree library exists. Link checks verify the entry points Metadesk uses
-and include the selected sanitizer runtime for instrumented builds. Source include paths,
-generated export-header paths, and nested installed adapter include paths are
-added only for enabled backends. Like the core nostrc headers, they are target
-include directories, so they win over installed headers (see
-[Core nostrc library discovery](#core-nostrc-library-discovery-md-r4ia)).
+Build-tree mode looks for the signer archives under
+`nostrc_build_dir/nips/<component>`. Installed mode uses `nip04` and `nip46`
+via pkg-config and looks for legacy adapter libraries under the SDK libdir.
+Link checks include the selected sanitizer runtime. Build-tree headers are
+target include directories so they win over unrelated system headers.
 
 | Option | nostrc targets beyond the common core | System dependencies |
 | --- | --- | --- |
@@ -57,36 +52,15 @@ naming the nostrc target to build. Build missing targets with
 
 ### Common JSON library
 
-JSON follows the same build-tree preference as libnostr and the signer adapters. Meson selects, in order:
-
-1. `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a}`, when present. The typed
-   library dependency includes Jansson and lets Meson manage the build rpath, so
-   the current shared library loads without `DYLD_LIBRARY_PATH` or
-   `LD_LIBRARY_PATH`. Meson removes this build-tree rpath during installation;
-   no raw rpath linker flags are added. Darwin keeps selected dependency paths
-   as install rpaths and rewrites product IDs to `@rpath`; see
-   [macOS packaging](../packaging/macos/README.md). Linux install rpaths remain empty.
-2. Installed `libnostr-json` pkg-config metadata (the current nostrc module name),
-   then the `nostr-json` module alias, then the `nostr-json` library directly.
-3. On Linux, the old `nostr_json` library with a deprecation warning.
-
-macOS deliberately rejects legacy-only discovery with an actionable configure
-error. The old `/opt/homebrew/lib/libnostr_json.dylib` can retain dependencies on
-removed Homebrew SONAMEs; rebuilding the canonical library does not replace it.
-Build only the missing target if necessary:
-
-```sh
-cmake --build /path/to/nostrc/_build --target nostr_json --parallel 2
-```
-
-No compatibility symlinks, loader overrides, generated-manifest edits, or local
-pkg-config shims are needed. Removing the stale underscore-named Homebrew library
-is recommended after checking its other consumers; Metadesk does not remove or
-modify it.
+Installed mode requires the current `libnostr-json` pkg-config module.
+Build-tree mode uses `nostrc_build_dir/libjson/libnostr-json.{dylib,so,a,dll.a}`
+and Jansson. A typed library dependency lets Meson manage the build RPATH;
+macOS also preserves selected dependency paths at install time. The legacy
+underscore-named library is not used in either mode.
 
 ## Core nostrc library discovery (md-r4ia)
 
-Metadesk always links these nostrc components besides the JSON library above:
+Build-tree mode links these nostrc components besides the JSON library above:
 
 | Component | CMake target | Kind on nostrc master |
 | --- | --- | --- |
@@ -99,9 +73,8 @@ Metadesk always links these nostrc components besides the JSON library above:
 | NIP-17 | `nostr_nip17_core` | **OBJECT library**: no archive |
 | NIP-11 | `nip11` | library |
 
-libnostr and libgo prefer `nostrc_build_dir` (they must match the source
-headers). libnostr falls back to an installed copy. Each NIP component is
-discovered in this order:
+libnostr and libgo come from `nostrc_build_dir` and must match the source
+headers. Each NIP component is discovered in this order:
 
 1. The library CMake built for the target, by file name under
    `nostrc_build_dir/nips/<component>`. `lib<target>.a` is linked by path;
@@ -112,9 +85,6 @@ discovered in this order:
    `nips/<component>/CMakeFiles/<target>.dir/build.make`. Ninja lists them as
    `build nips/<component>/CMakeFiles/<target>.dir/...o:` edges in the
    top-level `build.ninja`.
-
-3. An installed library (the Homebrew prefix on macOS, the linker's default
-   path elsewhere), only if the selected build tree has no library or objects.
 
 Why step 2 reads the generator's manifest:
 
@@ -154,10 +124,6 @@ were missing. The libyuv fallback adds the bare Homebrew prefix
 *installed* nostrc while the objects came from the build tree. Check with
 `ninja -C <build> -t deps | grep 'nostr/nip'`: no `/opt/homebrew/include/nostr`
 path should appear when `nostrc_root` is set.
-
-On macOS, Homebrew still carries installed `nip11`, `nostr_nip98`, `nip19` and
-`nostr_nip44_core` archives. Installed-first discovery keeps selecting them over
-the build tree, as before md-r4ia.
 
 ### Validation (md-r4ia, 2026-11-20)
 
