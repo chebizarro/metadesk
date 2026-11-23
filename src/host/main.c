@@ -1776,6 +1776,7 @@ static int host_run(int argc, char **argv) {
             .owner = account.binding,
             .relay_urls = relay_urls,
             .relay_count = relay_count,
+            .live_only_dms = true,
         };
 
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);

@@ -437,7 +437,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     bool block, entered, released, draining, hold_admission, admitted;
-    int delivered, rejected;
+    int delivered, delivered_live, rejected, boundaries;
     unsigned signer_waiting;
     MdNostrDmResult last_error;
     atomic_int decrypts, signed_events, serializations, destroyed;
@@ -480,25 +480,38 @@ static const MdSignerOps dm_test_ops = {
 static void dm_received(const char *pk, const char *content,
                         const MdNostrDmInfo *info, void *ud) {
     DmState *st = ud;
-    /* Direct ingress is outside a pool callback: never live (md-6ns). */
-    MD_CHECK(info && !info->live && info->rumor_created_at > 0);
+    MD_CHECK(info && info->rumor_created_at > 0);
     char *expected = md_nostr_get_pubkey(dm_sender_sk);
     MD_CHECK(strcmp(pk, expected) == 0); free(expected);
     MD_CHECK(strcmp(content, "session-control") == 0);
     MD_CHECK(atomic_load(&st->destroyed) == 0);
     /* A consumer callback can still safely access bridge-owned state. */
     MD_CHECK(md_nostr_allowlist_count(st->bridge) == 0);
+    pthread_mutex_lock(&st->mu);
     st->delivered++;
+    st->delivered_live += info->live;
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->mu);
+}
+static void dm_received_history(const char *pk, const char *content,
+                                const MdNostrDmInfo *info, void *ud) {
+    /* Direct ingress is outside a pool callback: never live (md-6ns). */
+    MD_CHECK(info && !info->live);
+    dm_received(pk, content, info, ud);
 }
 static void dm_rejected(MdNostrDmResult result, void *ud) {
     DmState *st = ud;
     MD_CHECK(atomic_load(&st->destroyed) == 0);
+    pthread_mutex_lock(&st->mu);
     st->last_error = result; st->rejected++;
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->mu);
 }
 static void dm_test_hook(MdNostrTestPoint point, void *ud) {
     DmState *st = ud;
     pthread_mutex_lock(&st->mu);
     if (point == MD_NOSTR_TEST_SERIALIZING) atomic_fetch_add(&st->serializations, 1);
+    if (point == MD_NOSTR_TEST_SUBSCRIPTION_QUEUED) st->boundaries++;
     if (point == MD_NOSTR_TEST_DRAINING) st->draining = true;
     if (point == MD_NOSTR_TEST_ADMITTED && st->hold_admission) {
         st->admitted = true; pthread_cond_broadcast(&st->cv);
@@ -508,13 +521,17 @@ static void dm_test_hook(MdNostrTestPoint point, void *ud) {
     pthread_mutex_unlock(&st->mu);
 }
 
-static MdNostr *dm_bridge_owned(DmState *st, MdAccounts *accounts) {
+static MdSigner *dm_counting_signer(DmState *st) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL); pthread_cond_init(&st->cv, NULL);
     atomic_init(&st->decrypts, 0); atomic_init(&st->destroyed, 0);
     atomic_init(&st->signed_events, 0); atomic_init(&st->serializations, 0);
     st->direct = md_signer_create_direct(dm_recipient_sk);
-    MdSigner *s = md_signer_create_custom(MD_SIGNER_NIP46, &dm_test_ops, st);
+    return md_signer_create_custom(MD_SIGNER_NIP46, &dm_test_ops, st);
+}
+
+static MdNostr *dm_bridge_owned(DmState *st, MdAccounts *accounts) {
+    MdSigner *s = dm_counting_signer(st);
     const char *relays[] = { "ws://127.0.0.1:1" };
     MdAccountBinding *owner = NULL;
     if (accounts) {
@@ -527,7 +544,7 @@ static MdNostr *dm_bridge_owned(DmState *st, MdAccounts *accounts) {
         free(pk);
     }
     MdNostrConfig cfg = { .signer = s, .owner = owner, .relay_urls = relays, .relay_count = 1 };
-    MdNostrCallbacks cbs = { .on_dm = dm_received, .on_dm_error = dm_rejected,
+    MdNostrCallbacks cbs = { .on_dm = dm_received_history, .on_dm_error = dm_rejected,
                              .dm_userdata = st };
     st->bridge = md_nostr_create(&cfg, &cbs);
     md_account_binding_release(owner);
@@ -969,6 +986,80 @@ static void acl_eose(AclTest *s, int relay) {
 static void acl_reset(void) {
     acl_control("{\"op\":\"reset\"}");
     acl_control("{\"op\":\"reset\",\"relay\":1}");
+}
+
+static void dm_wait_count(DmState *st, const int *counter, int count) {
+    struct timespec until;
+    timespec_get(&until, TIME_UTC); until.tv_sec += 15;
+    pthread_mutex_lock(&st->mu);
+    while (*counter < count) {
+        int rc = pthread_cond_timedwait(&st->cv, &st->mu, &until);
+        MD_CHECK(rc == 0);
+        if (rc) exit(1);
+    }
+    pthread_mutex_unlock(&st->mu);
+}
+
+static void test_dm_history_policy(const char **urls, bool live_only) {
+    acl_reset();
+    DmState st;
+    MdSigner *signer = dm_counting_signer(&st);
+    MdNostrConfig cfg = { .signer = signer, .relay_urls = urls, .relay_count = 2 };
+    if (live_only) cfg.live_only_dms = true;
+    MdNostrCallbacks callbacks = { .on_dm = dm_received, .on_dm_error = dm_rejected,
+                                   .dm_userdata = &st };
+    MdNostr *n = st.bridge = md_nostr_create(&cfg, &callbacks);
+    MD_CHECK(n != NULL);
+    md_nostr_set_test_hook(n, dm_test_hook, &st);
+    md_signer_destroy(signer);
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"req\",\"relay\":%d}", i);
+
+    NostrEvent *wrap = dm_fixture(DM_GOOD, "session-control");
+    char *json = nostr_event_serialize(wrap);
+    MD_CHECK(json != NULL);
+    acl_control("{\"op\":\"event_eose\",\"relay\":0,\"event\":%s}", json);
+    /* This relay's ordered EOSE callback fences history ingress; drain only
+     * then, so the zero-decrypt assertion cannot race a late history event. */
+    dm_wait_count(&st, &st.boundaries, 1);
+    md_nostr_drain_dm(n);
+    MD_CHECK(atomic_load(&st.decrypts) == (live_only ? 0 : 2));
+    MD_CHECK(atomic_load(&st.serializations) == (live_only ? 0 : 1));
+    MD_CHECK(st.delivered == (live_only ? 0 : 1) && st.delivered_live == 0);
+    MD_CHECK(st.rejected == 0);
+    if (live_only) {
+        MD_CHECK(md_nostr_receive_dm(n, wrap) == MD_NOSTR_DM_DUPLICATE);
+        NostrEvent *invalid = dm_fixture(DM_WRAP_SIG, "session-control");
+        MD_CHECK(md_nostr_receive_dm(n, invalid) == MD_NOSTR_DM_INVALID_WRAP);
+        nostr_event_free(invalid);
+        invalid = dm_fixture(DM_WRAP_RECIPIENT, "session-control");
+        MD_CHECK(md_nostr_receive_dm(n, invalid) == MD_NOSTR_DM_WRONG_RECIPIENT);
+        nostr_event_free(invalid);
+        MD_CHECK(atomic_load(&st.decrypts) == 0);
+        MD_CHECK(atomic_load(&st.serializations) == 0);
+    }
+
+    acl_control("{\"op\":\"eose\",\"relay\":1}");
+    acl_control("{\"op\":\"event\",\"relay\":1,\"event\":%s}", json);
+    dm_wait_count(&st, &st.delivered_live, 1);
+    md_nostr_drain_dm(n);
+    MD_CHECK(atomic_load(&st.decrypts) == (live_only ? 2 : 4));
+    MD_CHECK(st.delivered == (live_only ? 1 : 2) && st.delivered_live == 1);
+    MD_CHECK(st.rejected == 0);
+    if (live_only) MD_CHECK(md_nostr_receive_dm(n, wrap) == MD_NOSTR_DM_DUPLICATE);
+
+    /* Relay 0 is now live too. A second live copy is rejected at the wrap
+     * cache (not the rumor cache after another two signer decrypts). */
+    acl_control("{\"op\":\"event\",\"relay\":0,\"event\":%s}", json);
+    dm_wait_count(&st, &st.rejected, 1);
+    md_nostr_drain_dm(n);
+    MD_CHECK(st.last_error == MD_NOSTR_DM_DUPLICATE);
+    MD_CHECK(atomic_load(&st.decrypts) == (live_only ? 2 : 4));
+    MD_CHECK(st.delivered_live == 1);
+
+    free(json); nostr_event_free(wrap);
+    md_nostr_destroy(n); dm_state_fini(&st);
+    printf("  PASS: %s DM bridge delivers the first live copy after history\n",
+           live_only ? "live-only" : "default");
 }
 
 static void test_acl_history(const char **urls, const char *a, const char *b) {
@@ -1930,6 +2021,8 @@ static void test_constructor_revocation(const char **urls) {
 }
 
 static int acl_fixture_tests(const char **urls) {
+    test_dm_history_policy(urls, false);
+    test_dm_history_policy(urls, true);
     char *a = md_nostr_get_pubkey(dm_sender_sk);
     char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     test_acl_history(urls, a, b);
