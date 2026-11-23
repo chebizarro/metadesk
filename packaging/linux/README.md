@@ -2,7 +2,7 @@
 
 W9 tooling, **not a qualified release**. See [VALIDATION.md](VALIDATION.md) for
 actual results and remaining gates. The application is MIT. Native packages link
-**system** FFmpeg; OCI requires W3's `packaging/ffmpeg` **container** profile and
+**system** FFmpeg; OCI requires the [FFmpeg](../ffmpeg/README.md) **container** profile and
 its exact codec inventory. Cisco OpenH264 is never copied/downloaded by any tool
 here. Do not substitute distro FFmpeg into a production OCI tree.
 
@@ -125,7 +125,7 @@ live capture, AT-SPI, or uinput.
 
 `Containerfile.producer` uses the pinned Ubuntu 24.04 multiarch digest from the
 contract validation. Supply a complete private context containing `src/`,
-`nostrc/`, `ffmpeg-prefix/` from the unchanged W3 container-profile build and a
+`nostrc/`, `ffmpeg-prefix/` from the architecture-specific container-profile build and a
 curated `legal/` tree containing **each private dependency's exact notices,
 corresponding source/patches/build instructions and LGPL replacement/relink
 instructions**. The producer refuses a system/wrong-license/wrong-codec FFmpeg. Copied
@@ -155,9 +155,9 @@ Runtime probe expectations use the same target-architecture encoder selector as
 the FFmpeg builder; QSV/libvpl are x86/x86_64-only. `verify-image.sh` writes
 receipts under ignored `packaging/linux/output/receipts/`, or `MD_RECEIPT_DIR`.
 Keep build/test command captures in that ignored output tree, not in Git.
-Run both x86_64 and aarch64 matrices in owner CI; this lane cannot invent
-ARM-incompatible SDK profiles or override W3's requested encoder gates.
-`reference/throwaway-bundle.sh` remains historical fixture tooling, **not a
+Run both x86_64 and aarch64 matrices in owner CI without overriding the
+architecture-specific encoder gates.
+[`throwaway-bundle.sh`](../../deploy/containers/reference/throwaway-bundle.sh) remains historical fixture tooling, **not a
 release producer**. Existing spike consumer/compose instructions stay historical.
 
 `Containerfile.native-smoke` installs a real native .deb in a disposable image.
