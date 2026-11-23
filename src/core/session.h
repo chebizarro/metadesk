@@ -84,12 +84,16 @@ int md_session_disconnect(MdSession *s);
 void md_session_reset(MdSession *s);
 
 /* Process a keepalive ping; returns true if pong should be sent */
-bool md_session_on_ping(MdSession *s, uint32_t timestamp_ms);
+bool md_session_on_ping(MdSession *s, uint64_t timestamp_ms);
 
-/* Record a pong response */
-void md_session_on_pong(MdSession *s, uint32_t timestamp_ms);
+/* Record proof the peer is alive: a pong, or any packet received from it.
+ * Timestamps are md_now_ms() monotonic milliseconds. Call once when the
+ * stream binds so a peer that never answers is also detected. */
+void md_session_on_pong(MdSession *s, uint64_t timestamp_ms);
 
-/* Check if the session has timed out (missed keepalives) */
+/* True once an ACTIVE session has heard nothing from its peer for more than
+ * keepalive_ms * MD_SESSION_KEEPALIVE_TIMEOUT_MULT; the caller must then
+ * treat the connection as lost (a silent partition sends no FIN/RST). */
 bool md_session_is_timed_out(const MdSession *s, uint64_t now_ms);
 
 /* ── Session signaling JSON payloads (spec §4, Phase 2.1) ──────

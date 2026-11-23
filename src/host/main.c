@@ -2153,6 +2153,13 @@ signaling_ready:
         MdBitrateCtrl *br_ctrl = md_bitrate_ctrl_create(&br_cfg);
         uint32_t last_br = bitrate;
 
+        /* Liveness: the client answers the 1 s pings below. A silent
+         * partition delivers no FIN/RST, so missed traffic is the only
+         * signal that frees this session for the next authorized peer. */
+        pthread_mutex_lock(&ctx.client_mu);
+        md_session_on_pong(ctx.session, (uint64_t)md_now_ms());
+        pthread_mutex_unlock(&ctx.client_mu);
+
         while (host_running() && !atomic_load(&ctx.capture_failed) &&
                (!ctx.access || md_host_access_valid(ctx.access, ctx.pending_req.request_id)) &&
                md_stream_is_connected(client)) {
@@ -2200,6 +2207,7 @@ signaling_ready:
                     initial_tree = NULL;
                 }
                 pthread_mutex_lock(&ctx.client_mu);
+                md_session_on_pong(ctx.session, (uint64_t)md_now_ms());
                 handle_client_packet(&ctx, &hdr, payload);
                 pthread_mutex_unlock(&ctx.client_mu);
                 free(payload);
@@ -2243,6 +2251,15 @@ signaling_ready:
                         }
                     }
                 }
+            }
+
+            pthread_mutex_lock(&ctx.client_mu);
+            bool silent = md_session_is_timed_out(ctx.session, (uint64_t)md_now_ms());
+            pthread_mutex_unlock(&ctx.client_mu);
+            if (silent) {
+                fprintf(stderr, "host: client silent for over %u ms; dropping connection\n",
+                        ctx.session->keepalive_ms * MD_SESSION_KEEPALIVE_TIMEOUT_MULT);
+                break;
             }
 
             /* Print stats every 5 seconds */
