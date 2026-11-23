@@ -1,5 +1,6 @@
 [
   {
+    "type": "archive",
     "name": "ffmpeg",
     "version": "8.1.2",
     "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
@@ -9,20 +10,22 @@
   {
     "name": "sdl2",
     "version": "2.32.10",
+    "type": "archive",
     "url": "https://www.libsdl.org/release/SDL2-2.32.10.tar.gz",
-    "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
-    "archive": "sdl2.tar.gz"
+    "archive": "sdl2.tar.gz",
+    "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165"
   },
   {
     "name": "libyuv",
-    "version": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
-    "url": "https://chromium.googlesource.com/libyuv/libyuv/+archive/0ec9f68d82634f6f3414aaaf780e03f9edf002b3.tar.gz",
-    "sha256": "654e377d8e06f45c215aec06237037e289eb6be8a2c3a427c83c0ee8fcff0d71",
-    "archive": "libyuv.tar.gz"
+    "type": "git",
+    "url": "https://chromium.googlesource.com/libyuv/libyuv",
+    "commit": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
+    "tree": "c225f84f094e36c7d68d5e8006b407345f50a0f4"
   },
   {
     "name": "openssl",
     "version": "3.5.9",
+    "type": "archive",
     "url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
     "archive": "openssl.tar.gz",
     "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
@@ -30,57 +33,64 @@
   {
     "name": "libsodium",
     "version": "1.0.22",
+    "type": "archive",
     "url": "https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz",
-    "sha256": "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349",
-    "archive": "libsodium.tar.gz"
+    "archive": "libsodium.tar.gz",
+    "sha256": "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349"
   },
   {
     "name": "cjson",
     "version": "1.7.19",
-    "url": "https://codeload.github.com/DaveGamble/cJSON/tar.gz/refs/tags/v1.7.19",
-    "sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
-    "archive": "cjson.tar.gz"
+    "type": "git",
+    "url": "https://github.com/DaveGamble/cJSON.git",
+    "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+    "tree": "9c7b88a72ea9f3658c7f08c26b5cb09470f51761"
   },
   {
     "name": "libwebsockets",
     "version": "5.1.0",
-    "url": "https://codeload.github.com/warmcat/libwebsockets/tar.gz/refs/tags/v5.1.0",
-    "sha256": "9acbba00aaa9e6178ae09c6f920d95449b527c1417e81d2cdd4103bc6d64d13f",
-    "archive": "libwebsockets.tar.gz"
+    "type": "git",
+    "url": "https://github.com/warmcat/libwebsockets.git",
+    "commit": "5f39aa483715b813f4d85a692fcb361b5d8d0c1b",
+    "tree": "82f743eebe4f5ad3e38329709138adbef147db7c"
   },
   {
     "name": "jansson",
     "version": "2.15.1",
-    "url": "https://codeload.github.com/akheron/jansson/tar.gz/refs/tags/v2.15.1",
-    "sha256": "dbf95cb0af903f4fb8b61507d96b45b67db7d1479688ede352e1d571394d06f7",
-    "archive": "jansson.tar.gz"
+    "type": "git",
+    "url": "https://github.com/akheron/jansson.git",
+    "commit": "dbb5fb3636e155fccfce4cd215de752779bd6971",
+    "tree": "42a393f9dd6520fb191d3e301630cdf245d3e504"
   },
   {
     "name": "libb2",
     "version": "0.98.1",
+    "type": "archive",
     "url": "https://github.com/BLAKE2/libb2/releases/download/v0.98.1/libb2-0.98.1.tar.gz",
-    "sha256": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e",
-    "archive": "libb2.tar.gz"
+    "archive": "libb2.tar.gz",
+    "sha256": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e"
   },
   {
     "name": "secp256k1",
     "version": "0.8.0",
-    "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.8.0",
-    "sha256": "eb52b0e9239dff7dc26be5f9623567141b8720ec47da29eb3c1e0a660d17c8bb",
-    "archive": "secp256k1.tar.gz"
+    "type": "git",
+    "url": "https://github.com/bitcoin-core/secp256k1.git",
+    "commit": "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d",
+    "tree": "ad8f91b605a0bc4ad4df97059c4131792abca5ed"
   },
   {
     "name": "nsync",
     "version": "1.30.0",
-    "url": "https://codeload.github.com/google/nsync/tar.gz/refs/tags/1.30.0",
-    "sha256": "883a0b3f8ffc1950670425df3453c127c1a3f6ed997719ca1bbe7f474235b6cc",
-    "archive": "nsync.tar.gz"
+    "type": "git",
+    "url": "https://github.com/google/nsync.git",
+    "commit": "5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4",
+    "tree": "09ab97e196a687fda0c8157000ff2ab7353ca8bd"
   },
   {
     "name": "nostrc",
-    "version": "6f7a8d025768d497bef700fe55eea1c687dac328",
+    "type": "git",
     "url": "https://github.com/chebizarro/nostrc.git",
-    "archive": "nostrc.tar",
-    "sha256": "cab4f6ce1303ee01d060f99d2c8d5ef5a50fa0f824c110feadf5e2f5e1399b5f"
+    "commit": "6f7a8d025768d497bef700fe55eea1c687dac328",
+    "tree": "a1d397b194616cf10689f60e0ae8261ca83a717e"
   }
 ]

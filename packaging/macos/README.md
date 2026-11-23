@@ -1,20 +1,27 @@
 # Native arm64 macOS 13.0 dependency profile
 
-Requires Python >= 3.12, Xcode/SDK, CMake, Meson, Ninja, pkg-config, make and Perl.
+Requires Python >= 3.12, Git, Xcode/SDK, CMake, Meson, Ninja, pkg-config, make and Perl.
 
 ```sh
-/path/to/metadesk/packaging/macos/build-release.sh \
+MD_DMG=1 /path/to/metadesk/packaging/macos/build-release.sh \
   /path/to/nostrc-git-repository /private/tmp/md-release-new
 ```
 
-The nostrc repository is read-only: `git archive` of the locked commit, with
-prefix `nostrc/`, must match its SHA256. Working-tree files and submodules are
-not consumed. The current pin is `6f7a8d025768d497bef700fe55eea1c687dac328`.
-The GLib-free bundle keeps explicit build-tree discovery: upstream's full
-install at this revision also builds NIP-55L, whose macOS Keychain code needs
-GLib headers. Other archives are downloaded from `deps.lock.json` and checked
-before extraction. `build-deps.py OUTPUT --downloads CACHE --nostrc-repo REPO`
-can reuse cached archives; cached bytes are always rechecked, never trusted.
+In `deps.lock.json`, `type: git` pins the repository URL and full `commit`
+and `tree` object IDs. The builder shallow-fetches the exact commit and checks
+both IDs before exporting a clean source tree with local `git archive`; the
+archive bytes are not part of the lock. For nostrc it reads the objects from
+the supplied repository without modifying it or using its working tree. The
+current nostrc pin is `6f7a8d025768d497bef700fe55eea1c687dac328`. Submodules
+are not fetched. GLib-free builds keep explicit build-tree discovery: upstream's
+full install at this revision also builds NIP-55L, whose macOS Keychain code
+needs GLib headers.
+
+`type: archive` is reserved for published release assets, with an `archive`
+cache filename and `sha256`. `build-deps.py OUTPUT --downloads CACHE
+--nostrc-repo REPO` can reuse these archives but always rechecks their bytes
+before extraction. Do not use Gitiles or GitHub-generated source archives as
+release assets.
 
 For iterative packaging against an already-built private dependency tree:
 

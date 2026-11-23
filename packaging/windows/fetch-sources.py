@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch hash-locked source archives into a NEW directory (no package installs)."""
+"""Fetch object- or hash-locked sources into a NEW directory (no package installs)."""
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -7,8 +7,13 @@ import shutil
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tarfile
 import urllib.request
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from git_source import export_git_source
 
 
 def fetch(output, cache=None):
@@ -16,7 +21,10 @@ def fetch(output, cache=None):
     lockfile = Path(__file__).with_name('sources.lock.json')
     lock = json.loads(lockfile.read_text())
     for name, spec in lock.items():
-        if 'git_blob_sha1' in spec:
+        if spec['type'] == 'git':
+            export_git_source(spec, output / name)
+            continue
+        if spec['type'] == 'git-blobs':
             def get_file(item):
                 relative, expected = item
                 with urllib.request.urlopen(spec['base_url'] + relative + spec.get('url_suffix', '')) as src:
@@ -33,6 +41,8 @@ def fetch(output, cache=None):
                 list(workers.map(get_file, spec['git_blob_sha1'].items()))
             print(name + ': pinned Git blob hashes verified')
             continue
+        if spec['type'] != 'archive':
+            raise ValueError(f"{name}: unknown source type {spec['type']}")
         archive = output / (name + '.tar.gz')
         cached = cache / archive.name if cache else None
         if cached and cached.is_file():

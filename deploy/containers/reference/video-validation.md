@@ -892,8 +892,10 @@ floor based on the tested stack, not a claim that 1.2.7 was the first fixed
 upstream release or a qualification of every Linux compositor.
 
 `reference/build-pipewire.sh` pins upstream **1.4.10**, commit
-`ced36a5315135044a22c4b373be44368d312f9c8`, archive SHA-256
-`3c3460f6fa93036f108e9576d1ba1c43de74f593a33b8ced0fad7747e316ac33`.
+`ced36a5315135044a22c4b373be44368d312f9c8`. It now verifies that commit and
+tree `bf76e6d580ede8a1e9f268182874f1f22974cb03` via Git (recorded in
+`source.git`), rather than hashing the GitHub-generated archive used during the
+qualification below.
 `reference/Dockerfile.pipewire` overlays that complete userspace runtime on the
 legacy image and replaces the bundle's old PipeWire client-library copy too.
 The build checks both compiled and linked versions against its default 1.4.10
