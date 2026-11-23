@@ -24,7 +24,8 @@ static int usage(void) {
         "Backends: direct, nip46, nip55l, nip5f. Pubkeys are lowercase hex.\n"
         "Direct binding requires --secret-stdin (explicit integration only).\n"
         "Credentials/keys must be piped on stdin, never placed in argv.\n"
-        "Bindings are saved selections only; live startup adoption is not implemented.\n");
+        "Bound roles are restored at the next host/client startup unless an explicit\n"
+        "signer option (--bunker, --dbus-signer, --socket-signer, --auto-signer) overrides them.\n");
     return 2;
 }
 static int parse_role(const char *s, MdAccountRole *role) {

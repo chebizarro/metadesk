@@ -22,6 +22,12 @@ with tempfile.TemporaryDirectory(prefix="md-account-cli-") as root:
         assert sk not in result.stdout + result.stderr
         return result
 
+    # Help must describe the real startup contract (docs/accounts.md): bound
+    # roles are restored at the next host/client start unless a signer flag
+    # overrides them. It once claimed adoption was unimplemented.
+    usage = run("--help", success=False).stderr
+    assert "not implemented" not in usage, usage
+    assert "restored at the next" in usage, usage
     run("list")
     run("add", "direct", pk, "Test")
     run("add", "direct", pk, success=False)
