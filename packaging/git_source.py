@@ -22,11 +22,18 @@ def git_fields(pin):
 
 def verify_git_source(repo, ref, pin):
     commit, tree = git_fields(pin)
-    for field, suffix, expected in [('commit', 'commit', commit), ('tree', 'tree', tree)]:
-        actual = git(repo, 'rev-parse', '--verify', f'{ref}^{{{suffix}}}',
-                     capture_output=True, text=True).stdout.strip()
-        if actual != expected:
-            raise ValueError(f'Git {field} mismatch: expected {expected}, got {actual}')
+    # MSYS2 Git launched by native Windows Python does not preserve ^{...}.
+    actual = git(repo, 'rev-parse', '--verify', '--end-of-options', ref,
+                 capture_output=True, text=True).stdout.strip()
+    kind = git(repo, 'cat-file', '-t', actual, capture_output=True, text=True).stdout.strip()
+    if kind != 'commit':
+        raise ValueError(f'Git object {actual} is not a commit (got {kind})')
+    if actual != commit:
+        raise ValueError(f'Git commit mismatch: expected {commit}, got {actual}')
+    actual_tree = git(repo, 'show', '-s', '--no-notes', '--no-show-signature', '--format=%T',
+                      actual, capture_output=True, text=True).stdout.strip()
+    if actual_tree != tree:
+        raise ValueError(f'Git tree mismatch: expected {tree}, got {actual_tree}')
 
 
 def export_git_source(pin, dest, *, local_repo=None):

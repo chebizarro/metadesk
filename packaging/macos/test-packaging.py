@@ -24,7 +24,8 @@ class GitSourceTests(unittest.TestCase):
         self.git('add', 'file')
         self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
                  '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'fixture')
-        self.pin = {key: self.git('rev-parse', f'HEAD^{{{key}}}') for key in ('commit', 'tree')}
+        self.pin = {'commit': self.git('rev-parse', 'HEAD'),
+                    'tree': self.git('show', '-s', '--format=%T', 'HEAD')}
 
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True).strip()
@@ -33,8 +34,12 @@ class GitSourceTests(unittest.TestCase):
         (self.repo / 'file').write_text('uncommitted')
         dest = self.root / 'source'
         export_git_source(self.pin, dest, local_repo=self.repo)
-        self.assertEqual(list(dest.iterdir()), [dest / 'file'])
+        self.assertEqual([entry.name for entry in dest.iterdir()], ['file'])
         self.assertEqual((dest / 'file').read_text(), 'locked')
+
+    def test_rejects_non_commit_object(self):
+        with self.assertRaisesRegex(ValueError, 'not a commit'):
+            verify_git_source(self.repo, self.pin['tree'], self.pin | {'commit': self.pin['tree']})
 
     def test_commit_mismatch_with_matching_tree(self):
         with self.assertRaisesRegex(ValueError, 'Git commit mismatch'):
