@@ -87,6 +87,10 @@ typedef struct {
     MdAccountBinding *owner;
     bool quality_preferences; /* client-only encrypted NIP-78 preferences */
     bool allowlist_open; /* explicit opt-out of ACL enforcement; default false */
+    /* Opt in to post-EOSE DM delivery only. History envelopes are validated
+     * and remembered without queueing or decrypting; the first live copy
+     * remains eligible. Default false also decrypts and delivers history. */
+    bool live_only_dms;
 } MdNostrConfig;
 
 /* Preferences carry no authority. Load waits for EOSE; save requires positive OK.
@@ -177,8 +181,8 @@ typedef struct {
  * All subscriptions persist until md_nostr_destroy().
  */
 
-/* Create Nostr bridge. Connects to relays, probes NIP-11 relay info,
- * derives pubkey, subscribes to kind:1059 gift-wraps if on_dm is set. */
+/* Create a Nostr bridge: obtain the signer's pubkey, connect to relays,
+ * and subscribe to kind:1059 gift-wraps if on_dm is set. */
 MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs);
 
 /* Get the local pubkey hex string (owned by MdNostr, do not free). */
@@ -205,7 +209,8 @@ void md_nostr_shutdown(void);
  * call. Does not shut down a signer shared with another bridge/role. */
 void md_nostr_stop(MdNostr *n);
 
-/* Bounded ingress used by relay middleware; copies the event on acceptance.
+/* Bounded ingress used by relay middleware; copies accepted events for the
+ * worker, except for live-only history, which is validated in place.
  * Duplicate delivery is suppressed within bounded recent-ID windows, including
  * rewrapping the same rumor. Queue-full is explicit backpressure, not a retry
  * timer. Callers may use drain to await accepted work, not relay history. */

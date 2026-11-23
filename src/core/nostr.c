@@ -88,6 +88,7 @@ typedef struct PublishBatch PublishBatch;
 
 struct MdNostr {
     bool quality_preferences;
+    bool live_only_dms;
     char *quality_cipher; /* allowlist_mu; bounded encrypted NIP-78 winner */
     int64_t quality_created;
     char quality_id[65];
@@ -134,6 +135,8 @@ struct MdNostr {
     char              *dm_queue[MD_NOSTR_DM_QUEUE_CAPACITY];
     bool               dm_live[MD_NOSTR_DM_QUEUE_CAPACITY];
     size_t             dm_head, dm_count, dm_reserved;
+    /* Wrap replay state is shared by history ingress and the DM worker
+     * under work_mu. Rumor replay state is worker-only. */
     char               wrap_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
     char               rumor_ids[MD_NOSTR_DM_DEDUP_CAPACITY][65];
     /* Whether each id has been delivered live (post-EOSE) yet. */
@@ -573,19 +576,35 @@ static bool addressed_to(NostrEvent *ev, const char *pk) {
     return recipients == 1;
 }
 
+static MdNostrDmResult validate_wrap(MdNostr *n, NostrEvent *wrap, char id[65]) {
+    if (!nostr_nip17_validate_gift_wrap(wrap) ||
+        nostr_event_validate(wrap, id) != NOSTR_EVENT_VALIDATION_OK)
+        return MD_NOSTR_DM_INVALID_WRAP;
+    return addressed_to(wrap, n->pk_hex) ? MD_NOSTR_DM_OK : MD_NOSTR_DM_WRONG_RECIPIENT;
+}
+
+static MdNostrDmResult check_wrap_replay(MdNostr *n, const char *id, bool live) {
+    int slot;
+    MdNostrDmResult result = MD_NOSTR_DM_OK;
+    pthread_mutex_lock(&n->work_mu);
+    if (n->closing) result = MD_NOSTR_DM_STOPPED;
+    else if (seen_before(n->wrap_ids, n->wrap_live, id, live, &slot))
+        result = MD_NOSTR_DM_DUPLICATE;
+    else if (n->live_only_dms && !live)
+        remember_id(n->wrap_ids, n->wrap_live, &n->wrap_next, slot, id, false);
+    pthread_mutex_unlock(&n->work_mu);
+    return result;
+}
+
 static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap, bool live) {
-    MdNostrDmResult result = MD_NOSTR_DM_INVALID_WRAP;
+    char wrap_id[65], rumor_id[65];
+    MdNostrDmResult result = validate_wrap(n, wrap, wrap_id);
+    if (result != MD_NOSTR_DM_OK) return result;
+    result = check_wrap_replay(n, wrap_id, live);
+    if (result != MD_NOSTR_DM_OK) return result;
     NostrEvent *seal = NULL, *rumor = NULL;
     char *seal_json = NULL, *rumor_json = NULL;
-    char wrap_id[65], rumor_id[65];
-    int wrap_slot = -1, rumor_slot = -1;
-    if (!nostr_nip17_validate_gift_wrap(wrap) ||
-        nostr_event_validate(wrap, wrap_id) != NOSTR_EVENT_VALIDATION_OK)
-        goto done;
-    result = MD_NOSTR_DM_WRONG_RECIPIENT;
-    if (!addressed_to(wrap, n->pk_hex)) goto done;
-    result = MD_NOSTR_DM_DUPLICATE;
-    if (seen_before(n->wrap_ids, n->wrap_live, wrap_id, live, &wrap_slot)) goto done;
+    int rumor_slot;
     result = MD_NOSTR_DM_DECRYPT_FAILED;
     if (md_signer_nip44_decrypt_cancellable(n->signer, nostr_event_get_pubkey(wrap),
                               nostr_event_get_content(wrap), &seal_json, n->signer_cancel) != 0)
@@ -619,7 +638,11 @@ static MdNostrDmResult unwrap_dm(MdNostr *n, NostrEvent *wrap, bool live) {
     result = MD_NOSTR_DM_DUPLICATE;
     if (seen_before(n->rumor_ids, n->rumor_live, rumor_id, live, &rumor_slot)) goto done;
     /* Never use the randomized seal/wrap timestamps for freshness. */
-    remember_id(n->wrap_ids, n->wrap_live, &n->wrap_next, wrap_slot, wrap_id, live);
+    pthread_mutex_lock(&n->work_mu);
+    /* History ingress may have changed the ring while the signer ran. */
+    remember_id(n->wrap_ids, n->wrap_live, &n->wrap_next,
+                recent_id(n->wrap_ids, wrap_id), wrap_id, live);
+    pthread_mutex_unlock(&n->work_mu);
     remember_id(n->rumor_ids, n->rumor_live, &n->rumor_next, rumor_slot, rumor_id, live);
     result = MD_NOSTR_DM_STOPPED;
     if (is_stopped(n)) goto done;
@@ -712,6 +735,16 @@ MdNostrDmResult md_nostr_receive_dm(MdNostr *n, NostrEvent *wrap) {
     /* Ordered post-EOSE fact for this delivery; zero (history) outside the
      * pool's single-event callback, e.g. for direct test ingress. */
     bool live = nostr_simple_pool_get_callback_live_since(n->pool) > 0;
+    if (n->live_only_dms && !live) {
+        /* Keep only the validated outer ID, not a copy of the ciphertext.
+         * History neither reserves a queue slot nor marks the ID live. */
+        char wrap_id[65];
+        result = MD_NOSTR_DM_TOO_LARGE;
+        if (!dm_event_fits(wrap)) goto done;
+        result = validate_wrap(n, wrap, wrap_id);
+        if (result == MD_NOSTR_DM_OK) result = check_wrap_replay(n, wrap_id, false);
+        goto done;
+    }
     pthread_mutex_lock(&n->work_mu);
     if (n->closing) result = MD_NOSTR_DM_STOPPED;
     else if (n->dm_count + n->dm_reserved >= MD_NOSTR_DM_QUEUE_CAPACITY)
@@ -1118,6 +1151,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     pthread_mutex_init(&n->work_mu, NULL);
     pthread_cond_init(&n->work_cv, NULL);
     n->quality_preferences = cfg->quality_preferences;
+    n->live_only_dms = cfg->live_only_dms;
     n->acl_open = cfg->allowlist_open;
     n->acl_state = cfg->allowlist_open ? MD_NOSTR_ACL_OPEN : MD_NOSTR_ACL_UNKNOWN;
     n->signer_cancel = md_signer_cancel_new();
