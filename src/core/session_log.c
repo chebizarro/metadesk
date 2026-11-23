@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <time.h>
 #include <cjson/cJSON.h>
+#include <json.h>
+#include <openssl/crypto.h>
+#include <pthread.h>
 #include "log.h"
 #define MD_LOG_TAG "session_log"
 
@@ -35,16 +38,104 @@ const char *md_session_log_event_name(MdSessionLogEventType type) {
 
 /* ── Internal structure ──────────────────────────────────────── */
 
+#define RELAY_QUEUE_CAP 32
+#define RELAY_RECORD_MAX 32768
+
 struct MdSessionLog {
     MdSigner *signer;
-    MdNostr  *nostr;
     bool      publish;
+    MdNostr  *nostr; /* protected by relay_mu; borrowed through worker join */
+    pthread_t relay_thread;
+    pthread_mutex_t relay_mu;
+    pthread_cond_t relay_cv;
+    char *relay_queue[RELAY_QUEUE_CAP];
+    unsigned relay_head;
+    unsigned relay_count;
 
     MdSessionLogEntry *entries;
     int capacity;
     int count;     /* total entries ever written */
     int head;      /* next write position in ring */
 };
+
+static int publish_private_copy(MdSessionLog *log, MdNostr *nostr, const char *record) {
+    NostrEvent *ev = nostr_event_new();
+    if (!ev) return -1;
+    char *cipher = NULL, *wire = NULL;
+    int rc = -1;
+    /* Use the author of the verified local record as the recipient. The
+     * signer pins its identity and refuses key drift across these calls. */
+    if (nostr_event_deserialize(ev, record) == 0 &&
+        md_signer_nip44_encrypt(log->signer, nostr_event_get_pubkey(ev),
+                                record, &cipher) == MD_SIGNER_OK) {
+        NostrEvent *outer = nostr_event_new();
+        NostrTags *tags = outer ? nostr_tags_new(0) : NULL;
+        if (tags) {
+            nostr_event_set_tags(outer, tags);
+            nostr_tags_append(tags, nostr_tag_new("t", "metadesk-encrypted-session-log", NULL));
+            nostr_event_set_kind(outer, MD_SESSION_LOG_RELAY_KIND);
+            nostr_event_set_pubkey(outer, nostr_event_get_pubkey(ev));
+            nostr_event_set_created_at(outer, (int64_t)time(NULL));
+            nostr_event_set_content(outer, cipher);
+            if (md_nostr_sign_event_json(log->signer, outer, &wire) == 0)
+                rc = md_nostr_publish_signed_json(nostr, wire);
+        }
+        if (outer) nostr_event_free(outer);
+    }
+    free(wire);
+    free(cipher);
+    nostr_event_free(ev);
+    return rc;
+}
+
+static void free_relay_record(char *record) {
+    OPENSSL_cleanse(record, strlen(record));
+    free(record);
+}
+
+static void *relay_worker(void *data) {
+    MdSessionLog *log = data;
+    pthread_mutex_lock(&log->relay_mu);
+    while (log->nostr) {
+        if (!log->relay_count) {
+            pthread_cond_wait(&log->relay_cv, &log->relay_mu);
+            continue;
+        }
+        MdNostr *nostr = log->nostr;
+        char *record = log->relay_queue[log->relay_head];
+        log->relay_head = (log->relay_head + 1) % RELAY_QUEUE_CAP;
+        log->relay_count--;
+        pthread_mutex_unlock(&log->relay_mu);
+
+        if (publish_private_copy(log, nostr, record) != 0)
+            MD_LOG_W("encrypted session log copy not published");
+        free_relay_record(record);
+
+        pthread_mutex_lock(&log->relay_mu);
+    }
+    pthread_mutex_unlock(&log->relay_mu);
+    return NULL;
+}
+
+static void enqueue_relay_copy(MdSessionLog *log, const char *record) {
+    bool dropped = false;
+    pthread_mutex_lock(&log->relay_mu);
+    if (log->nostr) {
+        char *copy = NULL;
+        if (log->relay_count < RELAY_QUEUE_CAP && strlen(record) <= RELAY_RECORD_MAX)
+            copy = strdup(record);
+        if (copy) {
+            unsigned tail = (log->relay_head + log->relay_count) % RELAY_QUEUE_CAP;
+            log->relay_queue[tail] = copy;
+            log->relay_count++;
+            pthread_cond_signal(&log->relay_cv);
+        } else {
+            dropped = true;
+        }
+    }
+    pthread_mutex_unlock(&log->relay_mu);
+    if (dropped) MD_LOG_W("encrypted session log copy dropped (queue full or record unavailable)");
+}
 
 /* ── Lifecycle ───────────────────────────────────────────────── */
 
@@ -63,9 +154,19 @@ MdSessionLog *md_session_log_create(const MdSessionLogConfig *cfg) {
     }
 
     if (cfg) {
-        log->signer  = cfg->signer;
-        log->nostr   = cfg->nostr;
-        log->publish = cfg->publish;
+        log->signer = cfg->signer;
+        if (cfg->publish && cfg->signer) {
+            if (pthread_mutex_init(&log->relay_mu, NULL) == 0) {
+                if (pthread_cond_init(&log->relay_cv, NULL) == 0)
+                    log->publish = true;
+                else
+                    pthread_mutex_destroy(&log->relay_mu);
+            }
+            if (log->publish)
+                md_session_log_set_nostr(log, cfg->nostr);
+            else
+                MD_LOG_W("failed to initialize session log relay queue");
+        }
     }
 
     return log;
@@ -73,6 +174,12 @@ MdSessionLog *md_session_log_create(const MdSessionLogConfig *cfg) {
 
 void md_session_log_destroy(MdSessionLog *log) {
     if (!log) return;
+
+    if (log->publish) {
+        md_session_log_set_nostr(log, NULL);
+        pthread_cond_destroy(&log->relay_cv);
+        pthread_mutex_destroy(&log->relay_mu);
+    }
 
     /* Free signed_json strings */
     int n = log->count < log->capacity ? log->count : log->capacity;
@@ -84,7 +191,28 @@ void md_session_log_destroy(MdSessionLog *log) {
 }
 
 void md_session_log_set_nostr(MdSessionLog *log, MdNostr *nostr) {
-    if (log) log->nostr = nostr;
+    if (!log || !log->publish) return;
+    pthread_mutex_lock(&log->relay_mu);
+    MdNostr *previous = log->nostr;
+    log->nostr = NULL;
+    pthread_cond_signal(&log->relay_cv);
+    pthread_mutex_unlock(&log->relay_mu);
+    if (previous) {
+        pthread_join(log->relay_thread, NULL);
+        while (log->relay_count) {
+            free_relay_record(log->relay_queue[log->relay_head]);
+            log->relay_head = (log->relay_head + 1) % RELAY_QUEUE_CAP;
+            log->relay_count--;
+        }
+    }
+    if (nostr) {
+        pthread_mutex_lock(&log->relay_mu);
+        log->nostr = nostr;
+        bool failed = pthread_create(&log->relay_thread, NULL, relay_worker, log) != 0;
+        if (failed) log->nostr = NULL;
+        pthread_mutex_unlock(&log->relay_mu);
+        if (failed) MD_LOG_W("failed to start session log relay worker");
+    }
 }
 
 /* ── Content builder ─────────────────────────────────────────── */
@@ -189,15 +317,8 @@ int md_session_log_event(MdSessionLog *log, MdSessionLogEventType type,
 
     entry->signed_json = signed_json;
 
-    /* Publish to relays if configured. Publish failures are logged, but the
-     * return value reflects signing status so callers can distinguish audit
-     * signing failures from best-effort relay delivery. */
-    if (log->publish && log->nostr && signed_json) {
-        int pret = md_nostr_publish_signed_json(log->nostr, signed_json);
-        if (pret != 0) {
-            MD_LOG_W("WARNING: failed to publish signed %s event", md_session_log_event_name(type));
-        }
-    }
+    if (log->publish && signed_json)
+        enqueue_relay_copy(log, signed_json);
 
     /* Advance ring buffer */
     log->head = (log->head + 1) % log->capacity;

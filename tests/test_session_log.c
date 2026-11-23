@@ -1,17 +1,17 @@
 /*
  * test_session_log.c — tests for signed Nostr session log (M2.4).
  *
- * Tests the session log module in isolation (no real signer or relay).
- * Validates content JSON building, ring buffer behaviour, event naming,
- * and null-safety of all public APIs.
+ * Unit tests for the local ring and a controlled loopback relay integration test.
  */
 #include "session_log.h"
 #include "nostr.h"
+#include "signer.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <cjson/cJSON.h>
+#include <json.h>
 #include "md_test.h"
 
 /* ── Helper: parse and validate content JSON ─────────────────── */
@@ -298,7 +298,93 @@ static void test_nostr_publish_null_safety(void) {
 
 /* ── Main ───────────────────���────────────────────────────────── */
 
-int main(void) {
+static cJSON *relay_control(const char *command) {
+    char reply[16384];
+    printf("CONTROL %s\n", command);
+    fflush(stdout);
+    if (!fgets(reply, sizeof(reply), stdin)) exit(1);
+    cJSON *result = cJSON_Parse(reply);
+    if (!result) exit(1);
+    return result;
+}
+
+static void relay_command(const char *command) {
+    cJSON *result = relay_control(command);
+    MD_CHECK(cJSON_IsString(result) && strcmp(result->valuestring, "OK") == 0);
+    cJSON_Delete(result);
+}
+
+static void check_relay_copy(MdSigner *signer, const char *pk, const char *local) {
+    cJSON *wire = relay_control("{\"op\":\"published\"}");
+    char *json = cJSON_PrintUnformatted(wire);
+    NostrEvent *ev = nostr_event_new();
+    char id[65];
+    if (!json || !ev || nostr_event_deserialize(ev, json) != 0 ||
+        nostr_event_validate(ev, id) != NOSTR_EVENT_VALIDATION_OK) exit(1);
+    MD_CHECK(nostr_event_get_kind(ev) == 1079);
+    MD_CHECK(strcmp(nostr_event_get_pubkey(ev), pk) == 0);
+    MD_CHECK(!strstr(json, "test-peer-pubkey"));
+    MD_CHECK(!strstr(json, "test-private-session"));
+    MD_CHECK(!strstr(json, "test-private-detail"));
+    NostrTags *tags = nostr_event_get_tags(ev);
+    if (nostr_tags_size(tags) != 1) exit(1);
+    NostrTag *tag = nostr_tags_get(tags, 0);
+    if (nostr_tag_size(tag) != 2) exit(1);
+    MD_CHECK(strcmp(nostr_tag_get(tag, 0), "t") == 0);
+    MD_CHECK(strcmp(nostr_tag_get(tag, 1), "metadesk-encrypted-session-log") == 0);
+    char *plain = NULL;
+    if (md_signer_nip44_decrypt(signer, pk, nostr_event_get_content(ev), &plain) != MD_SIGNER_OK) exit(1);
+    MD_CHECK(strcmp(plain, local) == 0);
+    free(plain);
+    nostr_event_free(ev);
+    free(json);
+    cJSON_Delete(wire);
+}
+
+static void test_relay_publishing(const char *url) {
+    MdSigner *signer = md_signer_create_direct(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    char *pk = NULL;
+    if (!signer || md_signer_get_pubkey(signer, &pk) != MD_SIGNER_OK) exit(1);
+    MdNostrConfig cfg = { .signer = signer, .relay_urls = &url, .relay_count = 1 };
+    MdNostr *nostr = md_nostr_create(&cfg, NULL);
+    if (!nostr) exit(1);
+    relay_command("{\"op\":\"req\"}");
+    relay_command("{\"op\":\"eose\"}");
+    MdSessionLogConfig log_cfg = { .signer = signer, .nostr = nostr, .publish = true, .capacity = 1 };
+    MdSessionLog *log = md_session_log_create(&log_cfg);
+    if (!log) exit(1);
+
+    /* The test driver is the only code that can release the relay's OK.
+     * Synchronous publication cannot return to reach the ACK below. */
+    MD_CHECK(md_session_log_event(log, MD_SESSION_LOG_REQUEST, "test-private-session",
+                                  "test-peer-pubkey", "test-private-detail") == 0);
+    const MdSessionLogEntry *first = md_session_log_get(log, 0);
+    if (!first || !first->signed_json) exit(1);
+    char *local = strdup(first->signed_json);
+    if (!local) exit(1);
+    relay_command("{\"op\":\"held\"}");
+
+    /* Wrap the local ring while OK is still held. The queued copy owns its data. */
+    MD_CHECK(md_session_log_event(log, MD_SESSION_LOG_ACCEPT, "test-private-session",
+                                  "test-peer-pubkey", "test-private-detail") == 0);
+    check_relay_copy(signer, pk, local);
+    free(local);
+    relay_command("{\"op\":\"ack\",\"ok\":false}");
+    relay_command("{\"op\":\"held\"}");
+    check_relay_copy(signer, pk, md_session_log_get(log, 0)->signed_json);
+    relay_command("{\"op\":\"ack\",\"ok\":true}");
+    md_session_log_destroy(log);
+    md_nostr_destroy(nostr);
+    free(pk);
+    md_signer_destroy(signer);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "--acl-fixture") == 0) {
+        test_relay_publishing(argv[2]);
+        return md_test_report();
+    }
     printf("test_session_log:\n");
 
     test_event_names();

@@ -1367,6 +1367,10 @@ test_session_log = executable('test_session_log',
   dependencies : [dep_metadesk],
 )
 test('signed session log', test_session_log)
+test('private session log relay publishing', find_program('python3'),
+  args : [files('tests/nostr_acl_fixture.py'), test_session_log],
+  env : nostr_test_env, timeout : 20,
+)
 
 if host_os == 'darwin'
   test('macOS packaging minimum-version parser', import('python').find_installation('python3'),

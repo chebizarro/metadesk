@@ -687,7 +687,11 @@ All Phase 1 milestones are complete.
 - ✅ **2.1** Nostr session signaling — NIP-44 request/accept, NIP-51 allowlist, CLI connect tool. Pluggable signer abstraction with NIP-46, NIP-55L, and NIP-5F backends.
 - ✅ **2.2** ~~legacy fips-nat daemon~~ — superseded by FIPS-owned discovery/traversal; removed from the tree (2026-09)
 - ✅ **2.3** MCP agent interface — JSON-RPC 2.0 tool/resource server, stdio + HTTP+SSE transports
-- ✅ **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, signed Nostr session log (kind:1078)
+- ✅ **2.4** Agent monitoring mode — headless host, auto-accept allowlisted npubs, local signed session log (kind 1078). Relay copies are off by default.
+
+  `metadesk-host --publish-session-log` opts in to best-effort copies on the configured relays. A relay copy is a host-signed, application-specific [NIP-01 regular event](https://github.com/nostr-protocol/nips/blob/master/01.md) (kind 1079), so entries are stored independently, not replaced or addressed with a `d` tag. Its only tag is `["t","metadesk-encrypted-session-log"]`; it has no `p` or session tags. The entire local signed kind-1078 record is [NIP-44 v2](https://github.com/nostr-protocol/nips/blob/master/44.md) encrypted to the host's own key in `content`. To read, filter on kind, host author, and topic; verify the outer signature before decrypting and the inner signature before using the record.
+
+  Relays still see the host author, topic, publication time and padded payload size. Encryption does not remove earlier plaintext records from relays. A dedicated worker prepares copies and checks relay `OK` independently of session admission. The bounded queue drops new copies on overflow and discards pending copies at shutdown; neither relay delivery nor relay failure changes the local audit ring.
 - ✅ **2.5** Adaptive bitrate — AIMD RTT feedback loop to encoder bitrate target
 - ✅ **2.6** UI session manager — peer list, allowlist management, approval popup, compact tree format + delta patching, tree format negotiation
 - ⏳ **2.7** Dogfood gate — 30 days on OpenClaw fleet, all discovered bugs resolved
