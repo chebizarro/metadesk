@@ -58,7 +58,7 @@ fi
 
 meson setup "$out/build" "$src" --buildtype=release --prefix=/opt/metadesk \
     -Dclient=true -Dsigner_nip5f=true -Dsigner_nip46=true \
-    -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nostrc_build" "$@"
+    -Dnostrc_discovery=build-tree -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nostrc_build" "$@"
 meson compile -C "$out/build"
 meson install -C "$out/build" --destdir "$out/stage" --quiet
 "$here/check-install.sh" "$out/stage/opt/metadesk"

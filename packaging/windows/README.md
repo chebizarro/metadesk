@@ -20,6 +20,8 @@ listed in `docs/testing/windows-build.md` plus libvpl. The VM qualification
 extracts the three missing MSYS tools privately, without altering its package
 database. All compile commands are bounded to `-j2`. Sources for FFmpeg, AMF,
 nv-codec-headers, nostrc and secp256k1 are hash-locked in `sources.lock.json`.
+The current nostrc pin is `6f7a8d025768d497bef700fe55eea1c687dac328`; Windows
+uses the selected CMake archives and the build-tree nostr-json import library.
 AMF fetches only its pinned header subtree and license (58 Git-blob-hash-verified
 files), not its multi-gigabyte repository containing unrelated SDK binaries.
 Runtime DLL package versions are also pinned by the reviewed license policy.
@@ -45,7 +47,8 @@ MF `VT_BOOL` patch, then builds nostrc and both products. It never modifies
 closure, with an explicit SDL3 dlopen edge for sdl2-compat, not an indiscriminate
 copy of MSYS2 bin. DLLs resolve only from the private FFmpeg/nostrc/product output and
 CLANGARM64 prefix; API-set/System32 imports are OS-owned and not copied. Driver
-DLLs dynamically loaded by NVENC/AMF/QSV are OS/user-owned, not bundled.
+DLLs dynamically loaded by NVENC/AMF are OS/user-owned, not bundled.
+The ARM64 profile contains NVENC, AMF, and Media Foundation; QSV is x86-only.
 Unknown runtime packages/versions, unresolved imports, non-ARM64 objects, forbidden codec
 DLL names, unexpected FFmpeg codecs/configuration or MF patch drift fail.
 The runtime inventory executable checks **the staged** avcodec/avutil DLLs.

@@ -9,7 +9,10 @@ Requires Python >= 3.12, Xcode/SDK, CMake, Meson, Ninja, pkg-config, make and Pe
 
 The nostrc repository is read-only: `git archive` of the locked commit, with
 prefix `nostrc/`, must match its SHA256. Working-tree files and submodules are
-not consumed. Other archives are downloaded from `deps.lock.json` and checked
+not consumed. The current pin is `6f7a8d025768d497bef700fe55eea1c687dac328`.
+The GLib-free bundle keeps explicit build-tree discovery: upstream's full
+install at this revision also builds NIP-55L, whose macOS Keychain code needs
+GLib headers. Other archives are downloaded from `deps.lock.json` and checked
 before extraction. `build-deps.py OUTPUT --downloads CACHE --nostrc-repo REPO`
 can reuse cached archives; cached bytes are always rechecked, never trusted.
 
@@ -68,8 +71,7 @@ replacement/re-signing rights per `THIRD_PARTY_NOTICES.md`.
 
 On arm64 macOS 27.0.1 (26A434), base metadesk `9791779`, Xcode/SDK 27.0:
 
-* A fresh `build-deps.py` source build exited 0. All 12 pins/checksums are in
-  `deps.lock.json`; nostrc was archived at `cfcb86296068c1e4090bc5ce8a486392dc74eb11`.
+* A fresh `build-deps.py` source build exited 0. The then-current lock contained 12 pins; nostrc was archived at `cfcb86296068c1e4090bc5ce8a486392dc74eb11`.
   The runtime FFmpeg inventory probe exited 0: LGPL-2.1-or-later, exactly H.264
   decoder/parser and `h264_videotoolbox` encoder.
 * `build-app.sh` with only `MD_DEPS_PREFIX` (no caller-supplied minimum) exited

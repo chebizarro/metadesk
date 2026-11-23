@@ -152,7 +152,7 @@ rootless Podman, TUN and the isolated render-node grant available. Keep all
 names task-prefixed; do not use or modify another lane's checkout. Build the
 host/decode images and fixture binaries as in
 [client-validation.md §Reproduce](client-validation.md#reproduce), but use
-`nostrc-master` at **cfcb86296 or newer**, not the historical `~/nostrc` example.
+`nostrc-master` at **6f7a8d025 or newer**, not the historical `~/nostrc` example.
 The producer reads `NOSTRC_ROOT/_build`. Include `-Dclient=true
 -Dsigner_nip5f=true -Dsigner_nip46=true`; no GUI image is needed.
 

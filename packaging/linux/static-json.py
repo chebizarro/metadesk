@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Make a private nostrc build overlay with static JSON from CMake's own objects.
 
-Upstream cfcb86296068 forces nostr_json SHARED even with BUILD_SHARED_LIBS=OFF.
+Upstream 6f7a8d025768 forces nostr_json SHARED even with BUILD_SHARED_LIBS=OFF.
 Use its trusted link manifest, not a wildcard/stale-object scan. No upstream edits.
 """
 from pathlib import Path

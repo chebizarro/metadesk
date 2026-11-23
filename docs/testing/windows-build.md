@@ -201,7 +201,7 @@ No CLANGARM64 secp256k1 package was found in the configured repository; an initi
 transaction including that nonexistent package failed without installing
 anything. The corrected transaction above succeeded. For a clean VM, use the
 source-build fallback in nostrc's
-[Windows validation workflow](https://github.com/chebizarro/nostrc/blob/ea5ed954267c2b513eaa0f41acf3166fdc7f4951/.github/workflows/windows-validation.yml),
+[Windows validation workflow](https://github.com/chebizarro/nostrc/blob/6f7a8d025768d497bef700fe55eea1c687dac328/.github/workflows/windows-validation.yml),
 adapting `/ucrt64` to `/clangarm64`. That source fallback was **not** rerun or
 qualified by L9; the provenance of the pre-existing secp256k1 source was not
 established. The VM also had `SigLevel = Never` before L9; L9 did not change
@@ -225,16 +225,14 @@ openssl        4.1.0
 
 ## Build nostrc from source
 
-L9 downloaded the GitHub source archive for pinned revision
-`ea5ed954267c2b513eaa0f41acf3166fdc7f4951` into `md-l9/nostrc` (not a shared
-checkout). GitHub's compare API reported it 61 commits ahead of `cfcb86296`,
-zero behind. No nostrc source changes were made. With nostrdb disabled and
-system nsync available, none of the source submodules was needed for the
-selected targets. To reproduce the source extraction:
+Use the current packaging pin, `6f7a8d025768d497bef700fe55eea1c687dac328`,
+in a private directory. The L9 results above are historical and used a
+different revision. With nostrdb disabled, the selected targets do not need
+source submodules.
 
 ```sh
-cd /c/Users/bizarro/md-l9
-rev=ea5ed954267c2b513eaa0f41acf3166fdc7f4951
+cd /c/Users/bizarro/md-6u0a
+rev=6f7a8d025768d497bef700fe55eea1c687dac328
 curl -fL "https://github.com/chebizarro/nostrc/archive/$rev.tar.gz" -o nostrc.tar.gz
 mkdir nostrc
 tar -xzf nostrc.tar.gz --strip-components=1 -C nostrc
@@ -284,17 +282,18 @@ before qualifying those tests. Do not force another encoder, submit extra
 frames, relax assertions or extend timeouts to hide this dependency bug.
 
 Export the assigned metadesk tree, including `imgui_vendor`, this port's `src`
-and `tests`, and Meson files, to `md-l9/metadesk`; omit `.git`, `.beads` and
+and `tests`, and Meson files, to `md-6u0a/metadesk`; omit `.git`, `.beads` and
 local build directories. Do not install nostrc globally or use a sibling tree.
 
 ```sh
-cd /c/Users/bizarro/md-l9
+cd /c/Users/bizarro/md-6u0a
 meson setup metadesk/build-product metadesk \
-  -Dnostrc_root=C:/Users/bizarro/md-l9/nostrc \
-  -Dnostrc_build_dir=C:/Users/bizarro/md-l9/nostrc/build \
+  -Dnostrc_discovery=build-tree \
+  -Dnostrc_root=C:/Users/bizarro/md-6u0a/nostrc \
+  -Dnostrc_build_dir=C:/Users/bizarro/md-6u0a/nostrc/build \
   -Dtools=true
 meson compile -C metadesk/build-product -j2
-export PATH="/c/Users/bizarro/md-l9/nostrc/build/libjson:$PATH"
+export PATH="/c/Users/bizarro/md-6u0a/nostrc/build/libjson:$PATH"
 meson test -C metadesk/build-product --print-errorlogs -j2
 ./metadesk/build-product/metadesk-host.exe --help
 ./metadesk/build-product/metadesk-client.exe --help

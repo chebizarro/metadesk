@@ -18,7 +18,7 @@ the operator; `$SRC`, `$WORK` and `$NOSTRC` must not overlap output directories.
 
 Pin metadesk and nostrc by full Git SHA. An exported source tree must contain
 `.metadesk-commit` / `.nostrc-commit`, respectively (40 hex characters). Native
-spec pins nostrc `cfcb86296068c1e4090bc5ce8a486392dc74eb11` and includes the
+spec pins nostrc `6f7a8d025768d497bef700fe55eea1c687dac328` and includes the
 complete upstream source export **with its pinned submodules**, not a GitHub
 archive with empty submodule directories. Record the archive hashes in release
 provenance. Manifests include per-packaging-file hashes, source/nostrc revisions,
@@ -29,7 +29,9 @@ shared even with `BUILD_SHARED_LIBS=OFF`. `static-json.py` creates a **private**
 build overlay, archiving precisely the objects in CMake's trusted link manifest
 (no globbing of stale objects, no editing upstream). Native staging rejects
 nostrc/NIP shared dependencies. This overlay currently requires the Unix
-Makefiles generator, which `build-nostrc.sh` selects.
+Makefiles generator, which `build-nostrc.sh` selects for the two-argument
+native/OCI profile. Portable producers can pass a third argument (a new
+absolute install prefix) for the installed pkg-config SDK instead.
 
 Ubuntu/Debian provide nsync; Fedora 44 aarch64 did not resolve `nsync-devel`.
 The RPM builds pinned `third_party/nsync` 1.30.0 statically (commit

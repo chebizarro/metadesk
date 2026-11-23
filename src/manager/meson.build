@@ -1,15 +1,26 @@
 dep_manager_gio = dependency('gio-2.0', version : '>=2.76')
 dep_manager_gtk = dependency('gtk4', version : '>=4.14')
 dep_manager_adw = dependency('libadwaita-1', version : '>=1.5')
+dep_manager_control = dependency('grotto-control-client-0', method : 'pkg-config',
+  version : '>=0.1.0', required : get_option('grotto_control'))
+manager_status_deps = []
+manager_status_args = []
+if dep_manager_control.found()
+  manager_status_deps += dep_manager_control
+  manager_status_args += '-DMD_HAVE_GROTTO_CONTROL'
+endif
+message('Manager Grotto Control1 SDK: ' + (dep_manager_control.found() ? 'enabled' : 'not used'))
 manager_inc = include_directories('.')
 # Consume the shared core API, not its private raw nostrc OBJECT link inputs.
 dep_manager_core = declare_dependency(link_with : libmetadesk,
   include_directories : core_inc)
 manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c'],
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson])
+  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson] + manager_status_deps,
+  c_args : manager_status_args)
 dep_manager_model = declare_dependency(link_with : manager_model,
   include_directories : manager_inc,
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson])
+  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson] + manager_status_deps,
+  compile_args : manager_status_args)
 gnome = import('gnome')
 manager_resources = gnome.compile_resources('manager-resources', 'manager.gresource.xml',
   source_dir : meson.current_source_dir(), c_name : 'md_manager')

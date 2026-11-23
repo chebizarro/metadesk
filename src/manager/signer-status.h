@@ -11,3 +11,5 @@ const char *md_signer_status_connection(MdSignerStatus *self);
 const char *md_signer_status_key(MdSignerStatus *self);
 const char *md_signer_status_session(MdSignerStatus *self);
 const char *md_signer_status_signing(MdSignerStatus *self);
+/* Optional SDK snapshot; NULL when no supported status is available. */
+const char *md_signer_status_remote(MdSignerStatus *self);

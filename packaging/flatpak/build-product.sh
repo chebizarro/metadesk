@@ -1,13 +1,14 @@
 #!/bin/sh
 # Build only selected frontends, never install a host into the sandbox.
 set -eu
-[ "$#" = 6 ] || { echo 'usage: build-product.sh SOURCE NOSTRC NOSTRC_BUILD NEW_BUILD PREFIX client|manager' >&2; exit 2; }
-src=$(realpath "$1") nr=$(realpath "$2") nb=$(realpath "$3") build=$4 prefix=$5 product=$6
+[ "$#" = 5 ] || { echo 'usage: build-product.sh SOURCE NOSTRC_PREFIX NEW_BUILD PREFIX client|manager' >&2; exit 2; }
+src=$(realpath "$1") nostrc=$(realpath "$2") build=$3 prefix=$4 product=$5
 case "$product" in client) client=true; manager=false ;; manager) client=false; manager=true ;; *) exit 2 ;; esac
 [ ! -e "$build" ] || { echo 'build must be new' >&2; exit 2; }
+export PKG_CONFIG_PATH="$nostrc/lib/pkgconfig:$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 meson setup "$build" "$src" --prefix="$prefix" --libdir=lib --buildtype=release \
   -Dclient="$client" -Dmanager="$manager" -Dsigner_nip5f=true -Dsigner_nip46=true \
-  -Dportal_input=disabled -Dnostrc_root="$nr" -Dnostrc_build_dir="$nb"
+  -Dportal_input=disabled -Dnostrc_discovery=installed
 meson compile -C "$build" -j2 "metadesk-$product"
 install -d "$prefix/bin" "$prefix/lib" "$prefix/libexec/metadesk" "$prefix/share/licenses/metadesk"
 install -m755 "$build/$( [ "$product" = manager ] && printf 'src/manager/' )metadesk-$product" "$prefix/bin/"
@@ -15,7 +16,7 @@ install -m755 "$build/$( [ "$product" = manager ] && printf 'src/manager/' )meta
 for file in "$build"/libmetadesk.so*; do
   [ -d "$file" ] || cp -P "$file" "$prefix/lib/"
 done
-cp -P "$nb"/libjson/libnostr-json.so* "$prefix/lib/"
+cp -P "$nostrc"/lib/libnostr-json.so* "$prefix/lib/"
 python3 - "$src" "$prefix" <<'PYCODE'
 import os, shlex, subprocess, sys
 # Meson supplies its own pkg-config search environment; direct probes must too.

@@ -16,8 +16,12 @@ option('signer_nip55l', type : 'boolean', value : false,
        description : 'Enable NIP-55L D-Bus local signer backend (requires nostr_nip55l_core, NIP-04/06/19/49, GIO and platform key storage)')
 option('signer_nip5f', type : 'boolean', value : false,
        description : 'Enable NIP-5F Unix socket signer backend (requires nostr_nip5f_core)')
+option('nostrc_discovery', type : 'combo', choices : ['auto', 'installed', 'build-tree'], value : 'auto',
+       description : 'Use installed nostrc pkg-config packages or an explicit CMake build tree (auto selects the tree when paths are set)')
+option('grotto_control', type : 'feature', value : 'auto',
+       description : 'Use the optional Grotto Control1 SDK in the Linux manager')
 option('nostrc_root', type : 'string', value : '',
-       description : 'Path to nostrc project root (for uninstalled libraries and signer headers; leave empty if fully installed)')
+       description : 'Path to the nostrc source tree for build-tree discovery')
 option('nostrc_build_dir', type : 'string', value : '',
        description : 'Path to nostrc CMake build dir (defaults to nostrc_root/build if nostrc_root is set)')
 

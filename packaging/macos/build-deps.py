@@ -187,6 +187,8 @@ Cflags: -I${{includedir}}
         REPO / 'packaging/ffmpeg/verify-codecs.c', '-o', out / 'build/verify-codecs', *codec_flags])
     run('codec-inventory', [out / 'build/verify-codecs', 'h264_videotoolbox'])
     (sources['nostrc'] / 'SOURCE_REVISION').write_text(next(p['version'] for p in pins if p['name'] == 'nostrc') + '\n')
+    # Keep a targeted, GLib-free build: the full install also builds NIP-55L,
+    # whose Keychain implementation at this pin requires GLib headers.
     cmake('nostrc', '-DBUILD_SHARED_LIBS=OFF', '-DNOSTR_WITH_GLIB=OFF',
           '-DNOSTR_USE_SYSTEM_NSYNC=ON', '-DBUILD_TESTING=OFF', '-DBUILD_TESTING_FRAMEWORK=OFF',
           '-DWITH_NOSTRDB=OFF', '-DLIBNOSTR_WITH_NOSTRDB=OFF', '-DBUILD_APPS=OFF',

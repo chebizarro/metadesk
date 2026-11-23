@@ -78,9 +78,9 @@
   },
   {
     "name": "nostrc",
-    "version": "cfcb86296068c1e4090bc5ce8a486392dc74eb11",
+    "version": "6f7a8d025768d497bef700fe55eea1c687dac328",
     "url": "https://github.com/chebizarro/nostrc.git",
     "archive": "nostrc.tar",
-    "sha256": "4bb6a3a355479eabbfe2297e87beee10c025f126f90df545928a77d23b7c2e0e"
+    "sha256": "cab4f6ce1303ee01d060f99d2c8d5ef5a50fa0f824c110feadf5e2f5e1399b5f"
   }
 ]
