@@ -52,8 +52,7 @@ The stop/newline is an explicit human barrier, not a timer-driven close.
 Remove the task-private state directory after the session is closed. Do not
 delete another application's tokens or alter AT-SPI. Native Xwayland target
 delivery on GNOME is evidence for portal input, not Flatpak or paired capture
-acceptance. Capture and input currently use separate portal sessions; shared
-consent, lifecycle and `mapping_id` work is tracked by md-kmoa.
+acceptance. This input-only test does not exercise the paired host-video path.
 
 ## Native GNOME acceptance, 2026-11-22 (md-y8kc)
 
@@ -69,7 +68,7 @@ approved Remote Interaction and remember once. No uinput devices were created.
 | Ordinary session/window teardown | PASS |
 | External compositor-side stop, then not-ready and rejected key press | PASS |
 | Managed portal refuses without session calls, including saved token | PASS (private fixture) |
-| Paired capture/input consent | NOT IMPLEMENTED; md-kmoa |
+| Paired capture/input consent | NOT EXERCISED by md-y8kc |
 | Flatpak / native Wayland target / literal Shell indicator click | NOT QUALIFIED |
 
 The stop was **compositor-initiated stop (same path as the Shell indicator),
@@ -94,3 +93,40 @@ Full suites at `-j2`: macOS 55 pass / 0 fail / 1 opt-in skip; Linux 53 pass /
 by that fixture and both full suites after live consent had been revoked; the
 live matrix above predates that last preflight-only change. These counts do
 not turn native acceptance into Flatpak evidence.
+
+## Attended paired video qualification (md-kmoa; not run)
+
+A Linux video host requesting portal input uses one RemoteDesktop session. It
+selects one monitor and requires both input devices plus a unique EIS region
+matching the stream's `mapping_id`. Capture-only and input-only hosts do not
+claim paired consent. The private fixture exercises the portal and EIS wire
+flow; its PipeWire socket is a stand-in, not a video producer.
+
+1. An operator must unlock the GNOME Wayland desktop and approve this test.
+   Record GNOME/Mutter, portal, libei and PipeWire versions. Use a disposable,
+   unlocked session or an owner-approved test desktop; open a test window on a
+   known monitor, ideally a scaled monitor with nonzero desktop origin.
+2. Prepare the private signer, signed allowlist, controlled relay, and native
+   direct TCP client as in [Pairing launch gate](e2e-runbook.md#pairing-launch-gate).
+   On the host use a fresh owned `XDG_STATE_HOME`, omit `--no-input` and
+   `--managed`, and add `--input-backend portal`. Start host and client, select
+   the intended monitor, and approve remote interaction plus Remember. Record
+   exactly one chooser/approval and one RemoteDesktop Start. If collecting a
+   bus trace, retain only method names, handle paths and result codes, never
+   token values. Verify CreateSession → SelectDevices → SelectSources → Start
+   → OpenPipeWireRemote → ConnectToEIS; all handle-bearing calls must use the
+   CreateSession handle, and there must be no ScreenCast Start.
+3. Verify real video from the selected monitor. Move/click near the corners
+   of the owned window through the client; confirm the desktop offset and
+   scale are correct and a second output is never targeted. Check a key,
+   a button and a scroll event on the owned target. Repeat a host/client run
+   with the same private state; record whether it restores with no prompt.
+   Verify only the RemoteDesktop token file is used; do not assume a token
+   value must change on this compositor.
+4. During an active run, stop sharing using the GNOME indicator. Verify video
+   stops, the host rejects new input, and there is no replacement chooser or
+   fallback injection. Separately verify managed startup with the saved state
+   reports `needs_interaction` without a chooser or Start. Stop the test
+   processes; remove only test-private state and its matching portal permission
+   if one was remembered. Do not restart desktop services. Flatpak qualification
+   is separate.

@@ -18,6 +18,9 @@
  * confirmed on T7610/P40.
  */
 #include "capture.h"
+#ifdef MD_HAVE_PORTAL_INPUT
+#include "portal_session.h"
+#endif
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -632,6 +635,8 @@ static void portal_screencast_close(PortalScreencast *portal) {
 typedef struct {
     /* PipeWire state */
     struct pw_main_loop    *loop;
+    struct spa_source      *stop_event;
+    bool                    loop_exit; /* under frame_lock */
     struct pw_context      *pw_ctx;
     struct pw_core         *core;
     struct pw_stream       *stream;
@@ -682,6 +687,9 @@ typedef struct {
     /* Portal state (cleaned up on destroy) */
     PortalScreencast        portal;
     bool                    portal_active;
+#ifdef MD_HAVE_PORTAL_INPUT
+    MdPortalSession        *paired;
+#endif
 } PipewireState;
 
 /* ── PipeWire stream events ──────────────────────────────────── */
@@ -933,9 +941,9 @@ static void on_core_error(void *userdata, uint32_t id, int seq, int res, const c
     pthread_mutex_lock(&pw->frame_lock);
     pw->broken = true;
     pw->received_frame = false;
+    pw->loop_exit = true;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
-    pw_main_loop_quit(pw->loop);
 }
 
 static const struct pw_core_events core_events = {
@@ -954,9 +962,24 @@ static const struct pw_stream_events stream_events = {
 
 /* ── PipeWire thread ─────────────────────────────────────────── */
 
+static void on_stop_event(void *data, uint64_t count) {
+    (void)data;
+    (void)count;
+}
+
 static void *pw_thread_func(void *arg) {
     PipewireState *pw = arg;
-    pw_main_loop_run(pw->loop);
+    struct pw_loop *loop = pw_main_loop_get_loop(pw->loop);
+    pw_loop_enter(loop);
+    for (;;) {
+        pthread_mutex_lock(&pw->frame_lock);
+        bool stop = pw->loop_exit;
+        pthread_mutex_unlock(&pw->frame_lock);
+        if (stop) break;
+        int rc = pw_loop_iterate(loop, -1);
+        if (rc < 0 && rc != -EINTR) break;
+    }
+    pw_loop_leave(loop);
     pthread_mutex_lock(&pw->frame_lock);
     pw->broken = true;
     pw->received_frame = false;
@@ -995,7 +1018,10 @@ static int pw_backend_init(MdCaptureCtx *ctx) {
     pw->loop = pw_main_loop_new(NULL);
     if (!pw->loop) goto fail;
 
-    pw->pw_ctx = pw_context_new(pw_main_loop_get_loop(pw->loop), NULL, 0);
+    struct pw_loop *loop = pw_main_loop_get_loop(pw->loop);
+    pw->stop_event = pw_loop_add_event(loop, on_stop_event, NULL);
+    if (!pw->stop_event) goto fail;
+    pw->pw_ctx = pw_context_new(loop, NULL, 0);
     if (!pw->pw_ctx) goto fail;
 
     ctx->backend_data = pw;
@@ -1003,6 +1029,7 @@ static int pw_backend_init(MdCaptureCtx *ctx) {
 
 fail:
     if (pw->pw_ctx) pw_context_destroy(pw->pw_ctx);
+    if (pw->stop_event) pw_loop_destroy_source(pw_main_loop_get_loop(pw->loop), pw->stop_event);
     if (pw->loop) pw_main_loop_destroy(pw->loop);
     pthread_mutex_destroy(&pw->frame_lock);
     pthread_cond_destroy(&pw->frame_cond);
@@ -1040,6 +1067,30 @@ static void pw_cleanup_start_resources(PipewireState *pw) {
     }
 }
 
+static bool pw_capture_revoked(const PipewireState *pw) {
+#ifdef MD_HAVE_PORTAL_INPUT
+    return pw->paired && md_portal_session_revoked(pw->paired);
+#else
+    (void)pw;
+    return false;
+#endif
+}
+
+#ifdef MD_HAVE_PORTAL_INPUT
+MdPortalSession *md_capture_portal_session(const MdCaptureCtx *ctx) {
+    if (!ctx || !ctx->backend_data) return NULL;
+    const PipewireState *pw = ctx->backend_data;
+    return pw->paired;
+}
+
+static void pw_wake_revoked(void *data) {
+    PipewireState *pw = data;
+    pthread_mutex_lock(&pw->frame_lock);
+    pthread_cond_broadcast(&pw->frame_cond);
+    pthread_mutex_unlock(&pw->frame_lock);
+}
+#endif
+
 static int pw_start(MdCaptureCtx *ctx) {
     /* ScreenCast has no no-prompt contract, even with a restore token. Do
      * not call Start and hope the compositor silently restores consent. */
@@ -1062,7 +1113,19 @@ static int pw_start(MdCaptureCtx *ctx) {
     pw->stopping = false;
     uint32_t stream_node_id = PW_ID_ANY;
 
-    if (portal_screencast_open(&pw->portal, &ctx->config) == 0) {
+    if (ctx->config.portal_input) {
+#ifdef MD_HAVE_PORTAL_INPUT
+        if (!pw->paired) {
+            pw->paired = md_portal_session_create(&ctx->config,
+                                                  md_capture_consent_timeout_ms(&ctx->config));
+            if (pw->paired) md_portal_session_watch(pw->paired, pw_wake_revoked, pw);
+        }
+        if (pw->paired) {
+            int fd = md_portal_session_open_capture(pw->paired, &stream_node_id);
+            if (fd >= 0) pw->core = pw_context_connect_fd(pw->pw_ctx, fd, NULL, 0);
+        }
+#endif
+    } else if (portal_screencast_open(&pw->portal, &ctx->config) == 0) {
         /* Portal succeeded — connect using the portal's PipeWire fd */
         pw->portal_active = true;
         pw->core = pw_context_connect_fd(pw->pw_ctx,
@@ -1138,7 +1201,9 @@ static int pw_start(MdCaptureCtx *ctx) {
     /* Consent can take arbitrarily long. Start the first-frame deadline only
      * once the authorized stream is ready to run, not before the portal UI. */
     pw->started_ns = md_monotonic_ns();
-    /* Start PipeWire loop on its own thread */
+    /* The stop predicate is set before waking the loop; unlike calling
+     * pw_main_loop_quit before run(), a stop before the thread enters is not lost. */
+    pw->loop_exit = false;
     if (pthread_create(&pw->thread, NULL, pw_thread_func, pw) != 0) {
         pw_cleanup_start_resources(pw);
         return -1;
@@ -1200,7 +1265,7 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
      * nodes can enter those states without delivering any buffers. Require a
      * valid first frame within the startup deadline. After that, damage-driven
      * capture can legitimately remain idle indefinitely. */
-    while (!pw->frame_ready && !pw->broken && !pw->stopping) {
+    while (!pw->frame_ready && !pw->broken && !pw->stopping && !pw_capture_revoked(pw)) {
         uint64_t limit = until;
         if (!pw->received_frame && pw->started_ns + PW_FIRST_FRAME_DEADLINE_NS < limit)
             limit = pw->started_ns + PW_FIRST_FRAME_DEADLINE_NS;
@@ -1209,6 +1274,10 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
         pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &ts);
     }
 
+    if (pw_capture_revoked(pw)) {
+        pthread_mutex_unlock(&pw->frame_lock);
+        return MD_CAPTURE_ERROR;
+    }
     if (pw->stopping || !pw->frame_ready) {
         bool first_frame_expired = !pw->received_frame &&
             md_monotonic_ns() - pw->started_ns >= PW_FIRST_FRAME_DEADLINE_NS;
@@ -1227,7 +1296,12 @@ static int pw_get_frame(MdCaptureCtx *ctx, MdFrame *out, uint32_t timeout_ms) {
     *out = pw->pending_frame;
     pw->frame_ready = false;
     pthread_mutex_unlock(&pw->frame_lock);
-    return pw_scale_frame(ctx, pw, out);
+    int rc = pw_scale_frame(ctx, pw, out);
+    if (!rc && pw_capture_revoked(pw)) {
+        pw_release_frame(ctx, out);
+        return MD_CAPTURE_ERROR;
+    }
+    return rc;
 }
 
 /* Format negotiation (on_param_changed) publishes the size asynchronously. */
@@ -1239,9 +1313,9 @@ static int pw_wait_size(MdCaptureCtx *ctx, uint32_t timeout_ms,
     struct timespec deadline = monotonic_timespec(md_monotonic_ns() +
                                                   (uint64_t)timeout_ms * 1000000ULL);
     pthread_mutex_lock(&pw->frame_lock);
-    while ((!ctx->width || !ctx->height) && !pw->broken && !pw->stopping &&
+    while ((!ctx->width || !ctx->height) && !pw->broken && !pw->stopping && !pw_capture_revoked(pw) &&
            pthread_cond_timedwait(&pw->frame_cond, &pw->frame_lock, &deadline) != ETIMEDOUT) {}
-    int rc = ctx->width && ctx->height && !pw->broken && !pw->stopping ? 0 : -1;
+    int rc = ctx->width && ctx->height && !pw->broken && !pw->stopping && !pw_capture_revoked(pw) ? 0 : -1;
     if (rc == 0) {
         *width  = ctx->width;
         *height = ctx->height;
@@ -1272,14 +1346,13 @@ static void pw_stop(MdCaptureCtx *ctx) {
     pthread_mutex_lock(&pw->frame_lock);
     ctx->active = false;
     pw->stopping = true;
+    pw->loop_exit = true;
     pw->broken = true;
     pthread_cond_broadcast(&pw->frame_cond);
     pthread_mutex_unlock(&pw->frame_lock);
 
-    if (pw->loop)
-        pw_main_loop_quit(pw->loop);
-
     if (pw->thread_started) {
+        pw_loop_signal_event(pw_main_loop_get_loop(pw->loop), pw->stop_event);
         pthread_join(pw->thread, NULL);
         pw->thread_started = false;
     }
@@ -1303,7 +1376,7 @@ static void pw_stop(MdCaptureCtx *ctx) {
 /* Delete the persisted screencast restore_token so the next pw_start() shows
  * the consent dialog again (used after repeated capture failures). */
 static void pw_forget_authorization(MdCaptureCtx *ctx) {
-    (void)ctx;
+    if (ctx->config.portal_input) return; /* Never touch the independent ScreenCast token. */
     if (md_capture_restore_token_forget() == 0)
         MD_LOG_I("cleared screencast restore_token");
 }
@@ -1320,13 +1393,19 @@ static void pw_destroy(MdCaptureCtx *ctx) {
         pw_core_disconnect(pw->core);
     if (pw->pw_ctx)
         pw_context_destroy(pw->pw_ctx);
-    if (pw->loop)
-        pw_main_loop_destroy(pw->loop);
+    pw_loop_destroy_source(pw_main_loop_get_loop(pw->loop), pw->stop_event);
+    pw_main_loop_destroy(pw->loop);
 
     /* Release portal resources (D-Bus session, fd) */
     if (pw->portal_active)
         portal_screencast_close(&pw->portal);
 
+#ifdef MD_HAVE_PORTAL_INPUT
+    if (pw->paired) {
+        md_portal_session_watch(pw->paired, NULL, NULL);
+        md_portal_session_unref(pw->paired);
+    }
+#endif
     pthread_mutex_destroy(&pw->frame_lock);
     pthread_cond_destroy(&pw->frame_cond);
 

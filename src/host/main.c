@@ -13,6 +13,9 @@
  *   6. Clean shutdown on SIGINT/SIGTERM
  */
 #include "capture.h"
+#ifdef MD_HAVE_PORTAL_INPUT
+#include "portal_session.h"
+#endif
 #include "encode.h"
 #include "a11y.h"
 #include "input.h"
@@ -69,6 +72,9 @@ typedef struct {
     pthread_mutex_t client_mu;  /* protects client pointer lifetime */
     MdAgent      *agent;
     MdInput      *input;        /* raw human input injection (MD_PKT_INPUT) */
+#ifdef MD_HAVE_PORTAL_INPUT
+    MdPortalSession *portal_session; /* borrowed from input, which outlives the encoder */
+#endif
     MdNostr      *nostr;
     MdSession    *session;
     MdHostAccess *access;
@@ -135,7 +141,11 @@ static void on_encoded(const MdEncodedPacket *pkt, void *userdata) {
 
     pthread_mutex_lock(&ctx->client_mu);
     MdStream *client = ctx->client;
-    if (!md_stream_has_capability(client, MD_CAP_VIDEO) ||
+    if (
+#ifdef MD_HAVE_PORTAL_INPUT
+        (ctx->portal_session && md_portal_session_revoked(ctx->portal_session)) ||
+#endif
+        !md_stream_has_capability(client, MD_CAP_VIDEO) ||
         (uint32_t)(pkt->tag>>32)!=ctx->control_epoch ||
         (ctx->access && !md_host_access_valid(ctx->access, ctx->pending_req.request_id))) {
         pthread_mutex_unlock(&ctx->client_mu);
@@ -567,6 +577,14 @@ static void *capture_thread_func(void *arg) {
         MdFrame frame;
         int capture_result = md_capture_get_frame(cap, &frame,
                                                   HOST_CAPTURE_FRAME_WAIT_MS);
+#ifdef MD_HAVE_PORTAL_INPUT
+        if (ctx->portal_session && md_portal_session_revoked(ctx->portal_session)) {
+            if (!capture_result) md_capture_release_frame(cap, &frame);
+            fprintf(stderr, "host: paired portal session revoked; ending capture and input\n");
+            atomic_store(&ctx->capture_failed, true);
+            break;
+        }
+#endif
         MdCaptureRecovery recovery = md_capture_watchdog_step(&watchdog,
             capture_result, has_client || negotiating_quality, md_stream_now_ms(),
             HOST_CAPTURE_STALL_MS, HOST_CAPTURE_MAX_RESTARTS);
@@ -585,11 +603,11 @@ static void *capture_thread_func(void *arg) {
             if (recovery != MD_CAPTURE_RECOVERY_NONE) {
                 md_capture_stop(cap);
                 if (recovery == MD_CAPTURE_RECOVERY_EXHAUSTED) {
-                    bool forget = md_capture_stall_may_forget(&cap->config);
+                    bool forget = !cap->config.portal_input && md_capture_stall_may_forget(&cap->config);
                     if (forget) md_capture_forget_authorization(cap);
                     fprintf(stderr,
                         "host: capture unrecoverable after %u restarts; "
-                        "screencast authorization %s — operator action required\n",
+                        "capture authorization %s; operator action required\n",
                         watchdog.restarts, forget ? "cleared" : "retained");
                     atomic_store(&ctx->capture_failed, true);
                     break;
@@ -1522,8 +1540,15 @@ static int host_run(int argc, char **argv) {
         }
     }
 
+#ifndef MD_HAVE_PORTAL_INPUT
+    if (input_options.backend && !strcmp(input_options.backend, "portal")) {
+        fprintf(stderr, "ERROR: portal input backend is not available in this build\n");
+        return 1;
+    }
+#endif
     if ((input_options.backend && strcmp(input_options.backend, "auto") &&
-         strcmp(input_options.backend, "uinput") && strcmp(input_options.backend, "wayland")) ||
+         strcmp(input_options.backend, "uinput") && strcmp(input_options.backend, "portal") &&
+         strcmp(input_options.backend, "wayland")) ||
         (input_options.backend && !strcmp(input_options.backend, "wayland") &&
          (!input_options.wayland_display || input_options.wayland_display[0] != '/')) ||
         (input_options.wayland_display &&
@@ -1899,10 +1924,28 @@ signaling_ready:
     uint32_t display_width = 0;
     uint32_t display_height = 0;
 
+    bool pair_portal = false;
+    MdInputConfig input_cfg = input_options;
     if (do_capture) {
+#ifdef MD_HAVE_PORTAL_INPUT
+        if (!no_input) {
+            const char *backend = input_cfg.backend;
+            if (backend && !strcmp(backend, "portal")) {
+                pair_portal = true;
+            } else if (!backend || !strcmp(backend, "auto")) {
+                const char *session_type = getenv("XDG_SESSION_TYPE");
+                pair_portal = !managed && session_type && !strcmp(session_type, "wayland") &&
+                    md_input_portal_available();
+                /* Resolve auto once before ScreenCast starts. Do not discover
+                 * RemoteDesktop later and establish an independent grant. */
+                input_cfg.backend = pair_portal ? "portal" : "uinput";
+            }
+        }
+#endif
         strcpy(ctx.startup_output,ctx.pending_req.output);
         MdCaptureConfig cap_cfg = {
             .no_interaction = managed,
+            .portal_input = pair_portal,
             .target_fps  = fps,
             .show_cursor = true,
             .unattended = capture_unattended,
@@ -1978,7 +2021,9 @@ signaling_ready:
            enc_width, enc_height);
 
     /* Initialize input injection (persistent) */
-    MdInputConfig input_cfg = input_options;
+#ifdef MD_HAVE_PORTAL_INPUT
+    if (pair_portal) input_cfg.portal_session = md_capture_portal_session(capture);
+#endif
     input_cfg.screen_width = display_width;
     input_cfg.screen_height = display_height;
     MdCaptureRect output_rect = {0};
@@ -1990,11 +2035,13 @@ signaling_ready:
     }
     MdInput *input = no_input ? NULL : md_input_create(&input_cfg);
     if (!input || !md_input_is_ready(input)) {
-        if (managed && !no_input) {
-            fprintf(stderr, "ERROR: managed input unavailable; use --no-input for a read-only host or authorize an interactive host\n");
+        if ((managed && !no_input) || pair_portal) {
+            fprintf(stderr, "ERROR: required input unavailable; use --no-input for a read-only host or authorize an interactive host\n");
             startup_status = MD_HOST_EXIT_CONFIG;
-            md_host_access_lifecycle(&access, managed, "needs_interaction");
-            md_host_lifecycle_event("needs_interaction", startup_status);
+            if (managed) {
+                md_host_access_lifecycle(&access, managed, "needs_interaction");
+                md_host_lifecycle_event("needs_interaction", startup_status);
+            }
             md_input_destroy(input);
             md_encoder_destroy(encoder);
             if (capture) md_capture_destroy(capture);
@@ -2030,6 +2077,9 @@ signaling_ready:
     /* Set persistent host context fields */
     ctx.agent   = agent;
     ctx.input   = input;  /* raw human input injection for MD_PKT_INPUT */
+#ifdef MD_HAVE_PORTAL_INPUT
+    ctx.portal_session = input_cfg.portal_session;
+#endif
     /* Packet dispatch (and the agent's actions) run under client_mu, so the
      * capture thread retargets input under it too. */
     host_capture_sync_init(&ctx.sync, encoder, input, &ctx.client_mu,

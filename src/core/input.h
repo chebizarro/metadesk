@@ -46,6 +46,8 @@ typedef struct {
     const char *wayland_display;
     /* Portal consent + EIS startup failure bound; 0 = 30s, max = 180s. */
     uint32_t portal_timeout_ms;
+    /* Borrowed during md_input_create; attached portal input retains it. */
+    struct MdPortalSession *portal_session;
     /* Never present consent UI. RemoteDesktop cannot guarantee silent token
      * restoration, so portal input fails before opening a session. */
     bool no_interaction;
