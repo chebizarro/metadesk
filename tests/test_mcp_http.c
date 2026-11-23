@@ -17,6 +17,9 @@
 #include <nostr/nip19/nip19.h>
 #include <openssl/sha.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 
 #include <stdio.h>
@@ -679,7 +682,18 @@ static void test_sse_stalled_client(void)
         if (actual > stalled_rcvbuf) stalled_rcvbuf = actual;
         wait_sse_ready(http, stalled[i], i + 1);
     }
-    MdSocket healthy = sse_connect_opts(port, 8 * 1024 * 1024, headers, sizeof(headers));
+    int healthy_window = 8 * 1024 * 1024;
+#ifdef __APPLE__
+    /* Darwin rejects requests above its socket-buffer ceiling instead of
+     * clamping them. The healthy reader still needs room for a full frame. */
+    int ceiling = 0;
+    size_t ceiling_size = sizeof(ceiling);
+    int ceiling_rc = sysctlbyname("kern.ipc.maxsockbuf", &ceiling, &ceiling_size, NULL, 0);
+    MD_CHECK(ceiling_rc == 0 && ceiling_size == sizeof(ceiling) && ceiling > 0);
+    if (ceiling_rc == 0 && ceiling_size == sizeof(ceiling) && ceiling > 0 && ceiling < healthy_window)
+        healthy_window = ceiling;
+#endif
+    MdSocket healthy = sse_connect_opts(port, healthy_window, headers, sizeof(headers));
     MD_CHECK(healthy >= 0);
     int healthy_rcvbuf = 0;
     socklen_t optlen = sizeof(healthy_rcvbuf);
@@ -698,6 +712,9 @@ static void test_sse_stalled_client(void)
     char *frame = malloc(len + 32);
     MD_CHECK(frame != NULL);
     int frame_len = snprintf(frame, len + 32, "event: message\ndata: %s\n\n", json);
+#ifdef __APPLE__
+    MD_CHECK(healthy_rcvbuf >= frame_len);
+#endif
     int server_sndbuf = 0;
     /* Allow kernel rounding/doubling, but bound every socket well below one
      * frame, including the healthy client's, via locked getsockopt readback. */

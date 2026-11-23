@@ -1,0 +1,103 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+env:
+  NOSTRC_REVISION: 6f7a8d025768d497bef700fe55eea1c687dac328
+  NOSTRC_TEST_ISOLATION: '1'
+
+jobs:
+  linux:
+    name: Linux (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake meson ninja-build pkg-config \
+            libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev \
+            libgtk-4-dev libadwaita-1-dev libglib2.0-dev libsecret-1-dev \
+            libpipewire-0.3-dev libatspi2.0-dev libudev-dev libdbus-1-dev \
+            libxcb-xinput-dev libxcb1-dev libxau-dev libx11-dev libei-dev libxkbcommon-dev \
+            uuid-dev libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev \
+            libjansson-dev libbz2-dev libcjson-dev libb2-dev libnsync-dev libsodium-dev \
+            libevent-dev dbus-x11 xvfb xauth at-spi2-core pipewire-bin
+      - name: Cache nostrc SDK
+        id: nostrc
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nostrc-sdk
+          key: nostrc-sdk-ubuntu-24.04-${{ runner.arch }}-${{ env.NOSTRC_REVISION }}-${{ hashFiles('packaging/linux/build-nostrc.sh', '.github/workflows/ci.yml') }}
+      - name: Build pinned nostrc SDK
+        if: steps.nostrc.outputs.cache-hit != 'true'
+        run: |
+          git init "$RUNNER_TEMP/nostrc"
+          git -C "$RUNNER_TEMP/nostrc" fetch --depth=1 https://github.com/chebizarro/nostrc.git "$NOSTRC_REVISION"
+          git -C "$RUNNER_TEMP/nostrc" checkout --detach FETCH_HEAD
+          packaging/linux/build-nostrc.sh "$RUNNER_TEMP/nostrc" "$RUNNER_TEMP/nostrc-build" "$RUNNER_TEMP/nostrc-sdk"
+      - name: Configure
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/nostrc-sdk/lib/pkgconfig"
+          meson setup build -Dnostrc_discovery=installed -Dsigner_nip5f=true -Dmanager=true
+      - name: Compile
+        run: meson compile -C build
+      - name: Test
+        run: dbus-run-session -- xvfb-run -a meson test -C build --print-errorlogs
+
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: brew install cmake meson ninja pkgconf
+      - name: Identify macOS toolchain
+        id: toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          echo "version=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache native dependencies and nostrc build
+        id: nostrc
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/md-deps/prefix
+            ${{ runner.temp }}/md-deps/sources/nostrc
+            ${{ runner.temp }}/md-deps/build/nostrc
+          key: nostrc-macos-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ env.NOSTRC_REVISION }}-${{ hashFiles('packaging/macos/build-deps.py', 'packaging/macos/deps.lock.json', 'packaging/git_source.py', 'packaging/ffmpeg/build-minimal-lgpl.sh', '.github/workflows/ci.yml') }}
+      - name: Build pinned native dependencies and nostrc
+        if: steps.nostrc.outputs.cache-hit != 'true'
+        run: |
+          git init "$RUNNER_TEMP/nostrc"
+          git -C "$RUNNER_TEMP/nostrc" fetch --depth=1 https://github.com/chebizarro/nostrc.git "$NOSTRC_REVISION"
+          # Use the documented GLib-free macOS build-tree profile.
+          python3 packaging/macos/build-deps.py "$RUNNER_TEMP/md-deps" --nostrc-repo "$RUNNER_TEMP/nostrc" || {
+            tail -n 30 "$RUNNER_TEMP"/md-deps/logs/*.log
+            exit 1
+          }
+      - name: Configure
+        run: |
+          deps="$RUNNER_TEMP/md-deps"
+          prefix="$deps/prefix"
+          export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
+          export MACOSX_DEPLOYMENT_TARGET=13.0
+          export CFLAGS="-I$prefix/include" CXXFLAGS="-I$prefix/include" OBJCFLAGS="-I$prefix/include"
+          export LDFLAGS="-L$prefix/lib"
+          meson setup build -Dmacos_deps_prefix="$prefix" \
+            -Dnostrc_root="$deps/sources/nostrc" -Dnostrc_build_dir="$deps/build/nostrc" \
+            -Dsigner_nip5f=true
+      - name: Compile
+        run: meson compile -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
