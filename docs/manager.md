@@ -194,3 +194,15 @@ review checked the full changed paths and the Nostr boundaries described above.
 Source triage used four Jev find-lines queries (12 requests, 87608 input tokens,
 approximately $0.00368); narrow hits were expanded for mutex/acceptance context.
 No AI relevance judgment controls an approval or policy mutation.
+
+
+## Optional Grotto Control1 SDK
+
+On Linux, `-Dmanager=true` uses `grotto-control-client-0` when found by
+pkg-config. Set `-Dgrotto_control=enabled` to require it, or `disabled` to
+build without it. With a compatible Control1 manager snapshot the Identity
+page shows the remote signer state. That row stays hidden without the SDK,
+without a signer owner, or if the peer does not report a recognized state.
+The read-only key/session lock and pause rows still use Control1's existing
+fields; missing fields remain unknown. The SDK integration invokes no
+commands and grants no signer permissions.

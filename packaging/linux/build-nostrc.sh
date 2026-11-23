@@ -1,9 +1,21 @@
 #!/bin/sh
 # Build a complete, pinned nostrc source export with system dependencies.
 set -eu
-[ "$#" = 2 ] || { echo 'usage: build-nostrc.sh NOSTRC_SOURCE NEW_BUILD' >&2; exit 2; }
+[ "$#" = 2 ] || [ "$#" = 3 ] || { echo 'usage: build-nostrc.sh NOSTRC_SOURCE NEW_BUILD [NEW_INSTALL_PREFIX]' >&2; exit 2; }
 src=$(realpath "$1") out=$2
 [ ! -e "$out" ] || exit 2
+# Installed SDK for portable producers. Native packages and OCI use the
+# build-tree profile below because their staging rejects shared nostrc-json.
+if [ "$#" = 3 ]; then
+  [ ! -e "$3" ] || { echo 'nostrc install prefix must be new' >&2; exit 2; }
+  cmake -S "$src" -B "$out" -G Ninja -C "$src/tests/packaging/nip-subset.cmake" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$3" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_WITH_GLIB=OFF \
+    -DBUILD_TESTING=OFF -DENABLE_NIP5F=ON
+  cmake --build "$out" -j2
+  cmake --install "$out"
+  exit
+fi
 cmake -S "$src" -B "$out" -G 'Unix Makefiles' \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
   -DBUILD_APPS=OFF -DBUILD_GNOSTR_APP=OFF -DBUILD_NOSTR_GOBJECT=OFF -DBUILD_NOSTR_GTK=OFF \

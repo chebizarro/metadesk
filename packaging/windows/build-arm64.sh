@@ -46,7 +46,7 @@ cmake -S "$out/nostrc" -B "$out/nostrc/build" -G Ninja \
 cmake --build "$out/nostrc/build" --target nostr nostr_json go_fiber \
   nostr_nip44_core nip19 nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core -j2
 meson setup "$out/product" "$repo" --buildtype=release \
-  -Dnostrc_root="$(cygpath -m "$out/nostrc")" \
+  -Dnostrc_discovery=build-tree -Dnostrc_root="$(cygpath -m "$out/nostrc")" \
   -Dnostrc_build_dir="$(cygpath -m "$out/nostrc/build")" -Dtools=true \
   "-Dc_args=['-DSECP256K1_STATIC','-I$(cygpath -m "$out/secp-install/include")']" \
   "-Dcpp_args=['-DSECP256K1_STATIC','-I$(cygpath -m "$out/secp-install/include")']" \

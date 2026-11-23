@@ -5,9 +5,18 @@ All backends default to off. Enable any combination with
 No local pkg-config descriptors are needed for signer discovery.
 
 The bridge requires nostrc's library-owned NIP-42 session API (master
-`cfcb86296` or later). Use a dedicated master build, not the retired shared
+`6f7a8d025` or later). Use a dedicated master build, not the retired shared
 build tree. Older trees may still configure, but are not supported build/test
 targets for this bridge.
+
+With no nostrc paths Meson uses installed pkg-config modules (`nostr`,
+`libnostrgo`, `libnostr-json`, `nip11`, `nip17`, `nip44`, `nip51`, `nip98`,
+and `nip04`/`nip46` when enabled). Set `PKG_CONFIG_PATH` to the installed SDK
+prefix's pkg-config directory. Package builds can require this path with
+`-Dnostrc_discovery=installed`. Supplying explicit nostrc paths in `auto`
+selects the developer build tree instead. The tested installed static profile
+uses shared system dependencies and disables nostrdb; native Linux/OCI use
+their static JSON overlay instead.
 
 ```sh
 meson setup build-signers \
@@ -391,3 +400,13 @@ Result: **100/100**, zero failures. The shared-tree cache warning was separately
 verified against the untouched shared build; the current header/library probe
 passed. At that point md-dpl remained open pending md-66n and an unmodified macOS
 test gate; see the current qualification below.
+
+
+## Future SDK consumers
+
+md-v3oh can use per-subscription pool handles and relay-state snapshots when
+wiring manager discovery; cancelling one view must release only its own
+subscription. Use cancellable, acknowledged publishes rather than treating a
+socket send as success. md-vb18 can use the NIP-78 builder/parser for the saved
+host records, scoped to the account and addressable record identity. Neither
+feature is wired by the SDK upgrade.

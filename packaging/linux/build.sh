@@ -33,7 +33,7 @@ PYCODE
 esac
 meson setup "$build" "$src" --prefix="$prefix" --libdir="$libdir" \
   --buildtype=release -Dclient="$client" -Dsigner_nip5f=true -Dsigner_nip46=true \
-  -Dlinux_package_rpath="$native_rpath" -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nb"
+  -Dlinux_package_rpath="$native_rpath" -Dnostrc_discovery=build-tree -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nb"
 if [ "$client" = true ]; then
     meson compile -C "$build" -j2 metadesk-host metadesk-client
 else

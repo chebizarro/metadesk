@@ -37,7 +37,7 @@
       "name": "metadesk-client",
       "buildsystem": "simple",
       "build-commands": [
-        "sh packaging/flatpak/build-product.sh \"$PWD\" /app/lib/metadesk-nostrc/source /app/lib/metadesk-nostrc/build \"$PWD/_build\" /app client",
+        "sh packaging/flatpak/build-product.sh \"$PWD\" /app/lib/metadesk-nostrc \"$PWD/_build\" /app client",
         "sh packaging/flatpak/wrap-runtime.sh client",
         "install -Dm644 packaging/flatpak/assets/org.metadesk.Client.desktop /app/share/applications/org.metadesk.Client.desktop",
         "install -Dm644 packaging/flatpak/assets/org.metadesk.Client.metainfo.xml /app/share/metainfo/org.metadesk.Client.metainfo.xml",

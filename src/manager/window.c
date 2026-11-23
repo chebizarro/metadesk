@@ -15,7 +15,7 @@ struct _MdManagerWindow {
     GtkStack *pages;
     GtkListBox *navigation, *account_list, *relay_list;
     GtkWidget *identity_form, *relay_form, *refresh;
-    AdwActionRow *key_status, *session_status, *signing_status;
+    AdwActionRow *key_status, *session_status, *signing_status, *remote_status;
     AdwComboRow *client_role, *host_role, *backend;
     AdwEntryRow *public_key, *account_label, *relay_url;
     GtkButton *save_client, *save_host, *add_account, *add_relay;
@@ -53,6 +53,9 @@ static void status_changed(MdSignerStatus *status, gpointer data) {
     adw_action_row_set_subtitle(self->key_status, md_signer_status_key(status));
     adw_action_row_set_subtitle(self->session_status, md_signer_status_session(status));
     adw_action_row_set_subtitle(self->signing_status, md_signer_status_signing(status));
+    const char *remote = md_signer_status_remote(status);
+    adw_action_row_set_subtitle(self->remote_status, remote);
+    gtk_widget_set_visible(GTK_WIDGET(self->remote_status), remote != NULL);
     update_banner(self);
 }
 static void set_busy(MdManagerWindow *self, gboolean busy) {
@@ -319,7 +322,7 @@ static void md_manager_window_class_init(MdManagerWindowClass *klass) {
 #define BIND(name) gtk_widget_class_bind_template_child(widget, MdManagerWindow, name)
     BIND(split); BIND(content_page); BIND(toasts); BIND(banner); BIND(pages); BIND(navigation);
     BIND(account_list); BIND(relay_list); BIND(identity_form); BIND(relay_form); BIND(refresh);
-    BIND(key_status); BIND(session_status); BIND(signing_status); BIND(client_role); BIND(host_role);
+    BIND(key_status); BIND(session_status); BIND(signing_status); BIND(remote_status); BIND(client_role); BIND(host_role);
     BIND(backend); BIND(public_key); BIND(account_label); BIND(relay_url); BIND(save_client);
     BIND(save_host); BIND(add_account); BIND(add_relay); BIND(account_error); BIND(relay_error);
 #undef BIND

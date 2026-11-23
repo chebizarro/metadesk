@@ -20,6 +20,8 @@ listed in `docs/testing/windows-build.md` plus libvpl. The VM qualification
 extracts the three missing MSYS tools privately, without altering its package
 database. All compile commands are bounded to `-j2`. Sources for FFmpeg, AMF,
 nv-codec-headers, nostrc and secp256k1 are hash-locked in `sources.lock.json`.
+The current nostrc pin is `6f7a8d025768d497bef700fe55eea1c687dac328`; Windows
+uses the selected CMake archives and the build-tree nostr-json import library.
 AMF fetches only its pinned header subtree and license (58 Git-blob-hash-verified
 files), not its multi-gigabyte repository containing unrelated SDK binaries.
 Runtime DLL package versions are also pinned by the reviewed license policy.

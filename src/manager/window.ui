@@ -95,6 +95,7 @@
                                                 <child><object class="AdwActionRow" id="key_status"><property name="title">Key lock</property></object></child>
                                                 <child><object class="AdwActionRow" id="session_status"><property name="title">Desktop session lock</property></object></child>
                                                 <child><object class="AdwActionRow" id="signing_status"><property name="title">Signing</property></object></child>
+                                                <child><object class="AdwActionRow" id="remote_status"><property name="title">Remote Signing</property><property name="visible">False</property></object></child>
                                               </object>
                                             </child>
                                             <child>

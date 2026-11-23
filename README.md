@@ -51,7 +51,7 @@ Both modes connect to the same host daemon and can run simultaneously.
 
 ### Prerequisites
 
-**All platforms:** FFmpeg (≥6.0), libyuv, libsecp256k1, libwebsockets, cJSON, libb2, [nostrc](https://github.com/chebizarro/nostrc)
+**All platforms:** FFmpeg (≥6.0), libyuv, libsecp256k1, libwebsockets, cJSON, libb2, [nostrc](https://github.com/chebizarro/nostrc) (minimum `6f7a8d025`)
 
 **FIPS runtime:** A current external FIPS daemon, tested against FIPS v0.3.x and v0.4.0, with TUN enabled, `.fips` DNS/address derivation available, the control socket enabled, and peer discovery/reachability owned by FIPS.
 
@@ -62,11 +62,11 @@ Both modes connect to the same host daemon and can run simultaneously.
 
 ```bash
 # Linux
-meson setup build -Dnostrc_root=/path/to/nostrc
+meson setup build -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build
 ninja -C build
 
 # macOS (Homebrew)
-meson setup build -Dnostrc_root=/path/to/nostrc
+meson setup build -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/_build
 ninja -C build
 
 # Run tests
@@ -81,6 +81,7 @@ meson test -C build
 | `signer_nip46` | `false` | NIP-46 Nostr Connect remote signer |
 | `signer_nip55l` | `false` | NIP-55L D-Bus local signer |
 | `signer_nip5f` | `false` | NIP-5F Unix socket signer |
+| `nostrc_discovery` | `auto` | Use installed nostrc pkg-config packages, or select `build-tree` and supply source/build paths |
 | `nostrc_root` | `""` | Path to nostrc source tree (for uninstalled components) |
 
 ## FIPS Runtime Setup

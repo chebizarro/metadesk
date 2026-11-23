@@ -1,7 +1,7 @@
 {
   "nostrc": {
-    "url": "https://codeload.github.com/chebizarro/nostrc/tar.gz/ea5ed954267c2b513eaa0f41acf3166fdc7f4951",
-    "sha256": "2b4ae187af64e8009a8f4ed60ed12501a57d67cd3de90801d2c5c468af0dc922"
+    "url": "https://codeload.github.com/chebizarro/nostrc/tar.gz/6f7a8d025768d497bef700fe55eea1c687dac328",
+    "sha256": "10001ff07fc3c28ed57f4fb691feaed940697d4420a70b2e1ec1f736c1115f09"
   },
   "ffmpeg": {
     "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n9.0.2",

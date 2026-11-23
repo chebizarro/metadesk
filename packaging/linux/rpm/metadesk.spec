@@ -4,7 +4,7 @@
 %global _smp_build_ncpus 2
 %global _smp_mflags -j2
 %global _lto_cflags -flto=2 -ffat-lto-objects
-%global nostrc_revision cfcb86296068c1e4090bc5ce8a486392dc74eb11
+%global nostrc_revision 6f7a8d025768d497bef700fe55eea1c687dac328
 Name:           metadesk
 Version:        0.1.0
 Release:        1%{?dist}

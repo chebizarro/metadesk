@@ -11,9 +11,9 @@ At metadesk `887b62d`, **there is no `subprojects/` directory or wrap file**.
 The vendored client dependency is `imgui_vendor/` (Dear ImGui 1.90.4;
 `LICENSE.txt`, MIT, Copyright 2014–2024 Omar Cornut). Its embedded stb headers
 carry their own MIT/public-domain alternatives; retain those header notices.
-nostrc is an external build-tree dependency, not an in-tree subproject. Its
-root `LICENSE` is MIT (Chris Daley); the dedicated dependency tree inspected
-was `cfcb86296068` and its `third_party/nsync/LICENSE` is Apache-2.0.
+nostrc is an external dependency (installed SDK or separate build tree).
+Current producers pin `6f7a8d025768d497bef700fe55eea1c687dac328`. Its root
+`LICENSE` is MIT (Chris Daley); `third_party/nsync/LICENSE` is Apache-2.0.
 
 The [macOS prototype](packaging/macos/bundle_app.py) writes
 `Contents/Resources/metadesk-bundle.json`: `private_libraries` records origins,
@@ -113,7 +113,7 @@ with a macOS 13.0 deployment target.
 | libb2 | 0.98.1 | CC0-1.0; native-CPU tuning/OpenMP disabled |
 | secp256k1 | 0.8.0 | MIT; recovery enabled |
 | nsync | 1.30.0 | Apache-2.0; shared |
-| nostrc | `cfcb86296068c1e4090bc5ce8a486392dc74eb11` | MIT; static core/NIPs + shared nostr-json, GLib-free, NIP-46/NIP-5F enabled |
+| nostrc | `6f7a8d025768d497bef700fe55eea1c687dac328` | MIT; static core/NIPs + shared nostr-json, GLib-free, NIP-46/NIP-5F enabled |
 | Dear ImGui | 1.90.4 (vendored) | MIT; embedded stb notices retained in source |
 
 Apple libcurl, uuid, zlib and platform frameworks are OS-owned. No GLib,

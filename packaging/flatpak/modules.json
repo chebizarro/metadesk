@@ -263,17 +263,15 @@
       "name": "nostrc",
       "buildsystem": "simple",
       "build-commands": [
-        "cmake -S . -B _build -G \"Unix Makefiles\" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_USE_SYSTEM_NSYNC=ON -DWITH_NOSTRDB=OFF -DLIBNOSTR_WITH_NOSTRDB=OFF -DNOSTR_WITH_GLIB=OFF -DBUILD_APPS=OFF -DBUILD_GNOSTR_APP=OFF -DBUILD_NOSTR_GOBJECT=OFF -DBUILD_NOSTR_GTK=OFF -DBUILD_TESTING=OFF -DBUILD_TESTING_FRAMEWORK=OFF -DBUILD_SIGNER_TESTS=OFF -DBUILD_FIPS=OFF -DBUILD_RELAYD=OFF -DBUILD_LIBHANAMI=OFF -DBUILD_LIBBLOSSOM=OFF -DBUILD_LIBMARMOT=OFF -DBUILD_LIBPORTHOME=OFF -DBUILD_LIBVAULT=OFF -DBUILD_LIBVAULT_MARMOT=OFF -DBUILD_MARMOT_GOBJECT=OFF -DSIGNET_ENABLE=OFF -DCMAKE_PREFIX_PATH=/app",
-        "cmake --build _build -j2 --target nostr nostr_json go_fiber nostr_nip44_core nostr_nip46_core nostr_nip5f_core nip04 nip19 nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core",
-        "install -d /app/lib/metadesk-nostrc/source",
-        "cp -a libnostr libgo nips /app/lib/metadesk-nostrc/source/",
-        "cp -a _build /app/lib/metadesk-nostrc/build"
+        "cmake -S . -B _build -G Ninja -C tests/packaging/nip-subset.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app/lib/metadesk-nostrc -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_WITH_GLIB=OFF -DENABLE_NIP5F=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH=/app",
+        "cmake --build _build -j2",
+        "cmake --install _build"
       ],
       "sources": [
         {
           "type": "git",
           "url": "https://github.com/chebizarro/nostrc.git",
-          "commit": "cfcb86296068c1e4090bc5ce8a486392dc74eb11",
+          "commit": "6f7a8d025768d497bef700fe55eea1c687dac328",
           "disable-submodules": true
         }
       ]

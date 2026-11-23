@@ -1,5 +1,8 @@
 #include "signer-status.h"
 #include <string.h>
+#ifdef MD_HAVE_GROTTO_CONTROL
+#include <grotto-panels-control1-service.h>
+#endif
 
 #define CONTROL_NAME "org.nostr.Signer"
 #define CONTROL_PATH "/org/nostr/signer/grotto"
@@ -9,6 +12,10 @@ struct _MdSignerStatus {
     GObject parent_instance;
     GDBusProxy *proxy;
     GCancellable *cancel;
+#ifdef MD_HAVE_GROTTO_CONTROL
+    GrottoPanelsService *control;
+    const char *remote;
+#endif
     guint64 serial;
     char *connection;
     const char *key, *session, *signing;
@@ -75,6 +82,39 @@ static void status_signal(GDBusProxy *proxy, const char *sender, const char *nam
     (void)proxy; (void)sender; (void)args;
     if (!strcmp(name, "StatusChanged")) md_signer_status_refresh(data);
 }
+#ifdef MD_HAVE_GROTTO_CONTROL
+static void remote_status_changed(MdSignerStatus *self) {
+    const char *remote = NULL;
+    if (grotto_panels_service_is_available(self->control)) {
+        GListModel *model = grotto_panels_service_get_model(self->control, GROTTO_PANELS_STATUS);
+        g_autoptr(GrottoPanelsItem) item = model ? g_list_model_get_item(model, 0) : NULL;
+        if (item) {
+            const char *state = grotto_panels_item_get_metadata(item)->state;
+            static const struct { const char *state, *label; } states[] = {
+                {"DISABLED", "Disabled"}, {"STARTING", "Starting"},
+                {"LISTENING", "Listening"}, {"DEGRADED", "Degraded"},
+                {"OFFLINE", "Offline"}, {"STOPPING", "Stopping"}, {"ERROR", "Error"},
+            };
+            for (guint i = 0; i < G_N_ELEMENTS(states); ++i)
+                if (!g_strcmp0(state, states[i].state)) { remote = states[i].label; break; }
+        }
+    }
+    if (self->remote != remote) {
+        self->remote = remote;
+        g_signal_emit_by_name(self, "changed");
+    }
+}
+static void control_availability_changed(GrottoPanelsService *service, MdSignerStatus *self) {
+    (void)service;
+    remote_status_changed(self);
+}
+static void control_status_changed(GListModel *model, guint position, guint removed,
+                                   guint added, MdSignerStatus *self) {
+    (void)model; (void)position; (void)removed; (void)added;
+    remote_status_changed(self);
+}
+#endif
+
 static void proxy_done(GObject *source, GAsyncResult *result, gpointer data) {
     (void)source;
     MdSignerStatus *self = data;
@@ -83,6 +123,16 @@ static void proxy_done(GObject *source, GAsyncResult *result, gpointer data) {
     else {
         g_signal_connect_object(self->proxy, "notify::g-name-owner", G_CALLBACK(owner_changed), self, 0);
         g_signal_connect_object(self->proxy, "g-signal", G_CALLBACK(status_signal), self, 0);
+#ifdef MD_HAVE_GROTTO_CONTROL
+        /* The SDK normalizes remote signer status, but not the lock fields.
+         * Keep read-only GetStatus for those fields and older daemons. */
+        self->control = grotto_panels_control1_service_new_manager(self->proxy);
+        g_signal_connect_object(self->control, "availability-changed",
+                                G_CALLBACK(control_availability_changed), self, 0);
+        GListModel *model = grotto_panels_service_get_model(self->control, GROTTO_PANELS_STATUS);
+        g_signal_connect_object(model, "items-changed",
+                                G_CALLBACK(control_status_changed), self, 0);
+#endif
         md_signer_status_refresh(self);
     }
     g_object_unref(self);
@@ -90,6 +140,9 @@ static void proxy_done(GObject *source, GAsyncResult *result, gpointer data) {
 static void md_signer_status_finalize(GObject *object) {
     MdSignerStatus *self = MD_SIGNER_STATUS(object);
     g_cancellable_cancel(self->cancel);
+#ifdef MD_HAVE_GROTTO_CONTROL
+    g_clear_object(&self->control);
+#endif
     g_clear_object(&self->cancel); g_clear_object(&self->proxy); g_free(self->connection);
     G_OBJECT_CLASS(md_signer_status_parent_class)->finalize(object);
 }
@@ -112,3 +165,11 @@ const char *md_signer_status_connection(MdSignerStatus *self) { return self->con
 const char *md_signer_status_key(MdSignerStatus *self) { return self->key; }
 const char *md_signer_status_session(MdSignerStatus *self) { return self->session; }
 const char *md_signer_status_signing(MdSignerStatus *self) { return self->signing; }
+const char *md_signer_status_remote(MdSignerStatus *self) {
+#ifdef MD_HAVE_GROTTO_CONTROL
+    return self->remote;
+#else
+    (void)self;
+    return NULL;
+#endif
+}

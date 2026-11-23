@@ -37,7 +37,7 @@
       "name": "metadesk-manager",
       "buildsystem": "simple",
       "build-commands": [
-        "sh packaging/flatpak/build-product.sh \"$PWD\" /app/lib/metadesk-nostrc/source /app/lib/metadesk-nostrc/build \"$PWD/_build\" /app manager",
+        "sh packaging/flatpak/build-product.sh \"$PWD\" /app/lib/metadesk-nostrc \"$PWD/_build\" /app manager",
         "sh packaging/flatpak/wrap-runtime.sh manager",
         "install -Dm644 packaging/flatpak/assets/org.metadesk.Manager.desktop /app/share/applications/org.metadesk.Manager.desktop",
         "install -Dm644 packaging/flatpak/assets/org.metadesk.Manager.metainfo.xml /app/share/metainfo/org.metadesk.Manager.metainfo.xml",

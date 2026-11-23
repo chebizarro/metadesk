@@ -9,7 +9,7 @@ an offline help/decode smoke; see `VALIDATION.md` for the exact matrix.
 ## Producer
 
 Use a private directory, a clean metadesk export, and complete nostrc source at
-`cfcb86296068c1e4090bc5ce8a486392dc74eb11` (including its pinned submodules if
+`6f7a8d025768d497bef700fe55eea1c687dac328` (including its pinned submodules if
 using `packaging/linux/build-nostrc.sh`). Never consume a shared build tree.
 Ubuntu native build dependencies are listed in `packaging/linux/Containerfile.producer`;
 add VAAPI/DRM, NV codec and AMF **headers**, not vendor GPU runtimes. The canonical
@@ -20,10 +20,10 @@ additionally needs oneVPL, ARM64 must not acquire QSV.
 # All variables below are absolute, private paths. FFmpeg output must be absent.
 PKG_CONFIG_PATH="$HEADERS/lib/pkgconfig" MD_FFMPEG_CFLAGS="-I$HEADERS/include" \
   sh "$SRC/packaging/ffmpeg/build-minimal-lgpl.sh" container "$FFMPEG_SOURCE" "$FFMPEG_OUT"
-sh "$SRC/packaging/linux/build-nostrc.sh" "$NOSTRC" "$NOSTRC_BUILD"
+sh "$SRC/packaging/linux/build-nostrc.sh" "$NOSTRC" "$NOSTRC_BUILD" "$NOSTRC_PREFIX"
 export PKG_CONFIG_PATH="$FFMPEG_OUT/install/lib/pkgconfig"
-export LD_LIBRARY_PATH="$FFMPEG_OUT/install/lib:$NOSTRC_BUILD/libjson"
-sh "$SRC/packaging/flatpak/build-product.sh" "$SRC" "$NOSTRC" "$NOSTRC_BUILD" "$BUILD" "$PREFIX" client
+export LD_LIBRARY_PATH="$FFMPEG_OUT/install/lib:$NOSTRC_PREFIX/lib"
+sh "$SRC/packaging/flatpak/build-product.sh" "$SRC" "$NOSTRC_PREFIX" "$BUILD" "$PREFIX" client
 python3 "$SRC/packaging/appimage/assemble.py" "$PREFIX" "$FFMPEG_OUT/install" "$APPDIR" --arch aarch64
 sh "$SRC/packaging/appimage/make-image.sh" "$APPDIR" "$IMAGE" "$APPIMAGETOOL" "$TYPE2_RUNTIME"
 sh "$SRC/packaging/appimage/dry-sign.sh" "$IMAGE" "$NEW_PRIVATE_SIGNING_DIR"

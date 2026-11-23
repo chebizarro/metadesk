@@ -32,6 +32,12 @@ static GVariant *status_reply(FakeControl *fake) {
         g_variant_builder_add(&values, "{sv}", "session_lock_available", g_variant_new_boolean(TRUE));
         g_variant_builder_add(&values, "{sv}", "session_locked", g_variant_new_boolean(fake->locked));
         g_variant_builder_add(&values, "{sv}", "paused", g_variant_new_boolean(fake->paused));
+        GVariantBuilder caps;
+        g_variant_builder_init(&caps, G_VARIANT_TYPE("a{sb}"));
+        g_variant_builder_add(&values, "{sv}", "management-capabilities", g_variant_builder_end(&caps));
+        g_variant_builder_add(&values, "{sv}", "management-role", g_variant_new_string("manager"));
+        g_variant_builder_add(&values, "{sv}", "bunker_state",
+                              g_variant_new_string(fake->paused ? "DISABLED" : "LISTENING"));
     }
     return g_variant_new("(a{sv})", &values);
 }
@@ -39,7 +45,14 @@ static void call(GDBusConnection *bus, const char *sender, const char *path,
     const char *interface, const char *method, GVariant *args, GDBusMethodInvocation *inv, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)args;
     FakeControl *fake = data;
-    MD_CHECK(!strcmp(method, "GetStatus")); /* No signer-control mutations. */
+    /* The SDK manager may read public snapshots, but never mutate. */
+    if (!strcmp(method, "ListIdentities") || !strcmp(method, "ListClients") ||
+        !strcmp(method, "ListActivity")) {
+        g_dbus_method_invocation_return_value(inv,
+            g_variant_new("(@aa{sv})", g_variant_new_array(G_VARIANT_TYPE("a{sv}"), NULL, 0)));
+        return;
+    }
+    MD_CHECK(!strcmp(method, "GetStatus"));
     ++fake->reads;
     if (fake->hold) { fake->held = g_object_ref(inv); fake->hold = FALSE; }
     else g_dbus_method_invocation_return_value(inv, status_reply(fake));
@@ -47,6 +60,10 @@ static void call(GDBusConnection *bus, const char *sender, const char *path,
 static const GDBusInterfaceVTable vtable = {.method_call = call};
 static const char xml[] = "<node><interface name='org.nostr.Grotto.Control1'>"
     "<method name='GetStatus'><arg type='a{sv}' direction='out'/></method>"
+    "<method name='ListIdentities'><arg type='aa{sv}' direction='out'/></method>"
+    "<method name='ListClients'><arg type='aa{sv}' direction='out'/></method>"
+    "<method name='ListActivity'><arg type='t' direction='in'/><arg type='u' direction='in'/>"
+    "<arg type='aa{sv}' direction='out'/></method>"
     "<signal name='StatusChanged'><arg type='t'/></signal></interface></node>";
 static void name_call(FakeControl *fake, const char *method) {
     g_autoptr(GError) error = NULL;
@@ -152,15 +169,24 @@ int main(void) {
     WAIT_UNTIL(!strcmp(md_signer_status_key(status), "Locked"));
     MD_CHECK(!strcmp(md_signer_status_session(status), "Locked"));
     MD_CHECK(!strcmp(md_signer_status_signing(status), "Paused"));
+#ifdef MD_HAVE_GROTTO_CONTROL
+    WAIT_UNTIL(!g_strcmp0(md_signer_status_remote(status), "Disabled"));
+#else
+    MD_CHECK(!md_signer_status_remote(status));
+#endif
     fake.locked = FALSE; fake.paused = FALSE; changed(&fake);
     WAIT_UNTIL(!strcmp(md_signer_status_key(status), "Unlocked"));
     MD_CHECK(!strcmp(md_signer_status_session(status), "Unlocked"));
     MD_CHECK(!strcmp(md_signer_status_signing(status), "Not paused"));
+#ifdef MD_HAVE_GROTTO_CONTROL
+    WAIT_UNTIL(!g_strcmp0(md_signer_status_remote(status), "Listening"));
+#endif
     fake.enforce = FALSE; changed(&fake);
     WAIT_UNTIL(g_str_has_prefix(md_signer_status_key(status), "Unknown"));
     fake.unknown = TRUE; changed(&fake);
     WAIT_UNTIL(!strcmp(md_signer_status_session(status), "Unknown"));
     MD_CHECK(!strcmp(md_signer_status_signing(status), "Unknown"));
+    WAIT_UNTIL(!md_signer_status_remote(status));
 
     /* A superseded response cannot resurrect stale lock state. */
     fake.unknown = FALSE; fake.enforce = TRUE; fake.hold = TRUE;
@@ -208,6 +234,13 @@ int main(void) {
     MD_CHECK(!gtk_list_box_get_row_at_index(navigation, 6));
     g_signal_emit_by_name(navigation, "row-activated", gtk_list_box_get_row_at_index(navigation, 3));
     WAIT_UNTIL(content_shown);
+    AdwActionRow *remote_row = ADW_ACTION_ROW(child(window, "remote_status"));
+#ifdef MD_HAVE_GROTTO_CONTROL
+    WAIT_UNTIL(gtk_widget_get_visible(GTK_WIDGET(remote_row)));
+    MD_CHECK(!g_strcmp0(adw_action_row_get_subtitle(remote_row), "Listening"));
+#else
+    MD_CHECK(!gtk_widget_get_visible(GTK_WIDGET(remote_row)));
+#endif
     gtk_editable_set_text(GTK_EDITABLE(child(window, "public_key")), "not a key");
     activate_button(window, "add_account");
     MD_CHECK(*gtk_label_get_text(GTK_LABEL(child(window, "account_error"))));
@@ -263,6 +296,7 @@ int main(void) {
         if (keyboard("shift+Tab")) WAIT_UNTIL(gtk_window_get_focus(window) == before);
     }
     name_call(&fake, "ReleaseName");
+    WAIT_UNTIL(!gtk_widget_get_visible(GTK_WIDGET(remote_row)));
     WAIT_UNTIL(g_str_has_prefix(md_signer_status_connection(status), "Grotto is unavailable"));
     WAIT_UNTIL(g_str_has_prefix(adw_action_row_get_subtitle(ADW_ACTION_ROW(child(window, "key_status"))), "Unknown"));
 
