@@ -759,6 +759,9 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
                        ctx->accepted_tree_format);
     md_session_accept(session, ctx->accepted_session_id, ctx->granted_caps);
     md_session_activate(session);
+    /* The host pings every second; silence beyond the keepalive bound means
+     * the path is gone even though no FIN/RST arrived. */
+    md_session_on_pong(session, (uint64_t)md_now_ms());
 
     if (!client_owner_current(ctx)) {
         md_stream_destroy(stream);
@@ -1498,10 +1501,19 @@ static int client_run(int argc, char **argv) {
         int ret = md_stream_recv(stream, &hdr, &payload, 16 /* ~1 frame at 60fps */);
 
         if (ret == 1) {
-            /* Timeout — no data yet, keep UI responsive and loop back. */
-            render_client_overlay(&ctx, stream);
-            continue;
+            if (!md_session_is_timed_out(&session, (uint64_t)md_now_ms())) {
+                /* Timeout — no data yet, keep UI responsive and loop back. */
+                render_client_overlay(&ctx, stream);
+                continue;
+            }
+            fprintf(stderr, "client: host silent for over %u ms; treating connection as lost\n",
+                    session.keepalive_ms * MD_SESSION_KEEPALIVE_TIMEOUT_MULT);
+            free(payload);
+            payload = NULL;
+            ret = -1;
         }
+        if (ret == 0)
+            md_session_on_pong(&session, (uint64_t)md_now_ms());
         if (ret < 0) {
             /* Unexpected connection loss — enter reconnect loop. */
                 fprintf(stderr, "client: connection lost\n");

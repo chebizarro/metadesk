@@ -69,7 +69,7 @@ void md_session_reset(MdSession *s) {
     md_session_init(s);
 }
 
-bool md_session_on_ping(MdSession *s, uint32_t timestamp_ms) {
+bool md_session_on_ping(MdSession *s, uint64_t timestamp_ms) {
     if (!s || s->state != MD_SESSION_ACTIVE)
         return false;
 
@@ -77,7 +77,7 @@ bool md_session_on_ping(MdSession *s, uint32_t timestamp_ms) {
     return true; /* caller should send pong */
 }
 
-void md_session_on_pong(MdSession *s, uint32_t timestamp_ms) {
+void md_session_on_pong(MdSession *s, uint64_t timestamp_ms) {
     if (!s) return;
     s->last_pong_ms = timestamp_ms;
 }

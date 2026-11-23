@@ -77,10 +77,17 @@ class Proxy(socketserver.BaseRequestHandler):
                 self.request.settimeout(10)
                 with self.server.lock:
                     captured = [bytearray(), bytearray()]
+                    index = len(self.server.proofs)
                     self.server.proofs.append(captured)
                     self.server.connections.append((self.request.dup(),))
                 while True:
-                    for source in select.select([self.request, upstream], [], [])[0]:
+                    readable = select.select([self.request, upstream], [], [])[0]
+                    if index in self.server.blackholed:
+                        # Silent partition: stop forwarding but hold both
+                        # sockets open, so no FIN/RST ever reaches a peer.
+                        self.server.release.wait()
+                        return
+                    for source in readable:
                         data = source.recv(65536)
                         if not data:
                             return
@@ -142,6 +149,7 @@ def run(host, client, crypto):
         proxy = ProxyServer(("127.0.0.1", 0), Proxy)
         proxy.target, proxy.lock = port, threading.Lock()
         proxy.proofs, proxy.connections = [], []
+        proxy.blackholed, proxy.release = set(), threading.Event()
         servers = [relay, *signers, proxy]
         threads = [threading.Thread(target=s.serve_forever) for s in servers]
         children = []
@@ -235,8 +243,23 @@ def run(host, client, crypto):
             # Exact old proof must also fail against the newly negotiated session.
             reject_replay(port, proof)
             assert cp.p.poll() is None and hp.p.poll() is None
-            cp.stop()
+            # Silent partition: the path stops carrying bytes but neither
+            # socket closes. Both peers must declare the session dead from
+            # missed keepalives and renegotiate, not hang on a stale stream.
+            with proxy.lock:
+                proxy.blackholed.add(1)
+            hp.wait("host: client silent")
+            cp.wait("client: host silent")
             hp.wait("ready for next authorized session request", count=2)
+            cp.wait("client: reconnected", count=2)
+            hp.wait("host: streaming to client #3")
+            with proxy.lock:
+                assert len(proxy.proofs) == 3
+            assert cp.p.poll() is None and hp.p.poll() is None
+            print("PASS: silent partition is detected by keepalive on both sides; client renegotiates")
+            proxy.release.set()
+            cp.stop()
+            hp.wait("ready for next authorized session request", count=3)
             # A correlated unauthorized request cannot consume the next grant.
             assert_unauthorized_no_tcp()
             # Also exercise positional syntax straight to the native host
@@ -246,12 +269,13 @@ def run(host, client, crypto):
                            "--socket-signer", str(root / "client.sock")], env)
             children.append(cp2)
             cp2.wait("client: receiving stream")
-            hp.wait("host: streaming to client #3")
+            hp.wait("host: streaming to client #4")
             assert cp2.p.poll() is None and hp.p.poll() is None
             print("PASS: idle host survives unauthorized requests; positional direct TCP binds native host listener without proxy")
             assert relay.oks >= 4 and relay.reqs == relay.eoses
             print(f"Private relay: {relay.reqs} REQ/EOSE, {relay.oks} OK; native 127.0.0.1; no public relays")
         finally:
+            proxy.release.set()
             for child in reversed(children):
                 child.stop()
             with proxy.lock:
