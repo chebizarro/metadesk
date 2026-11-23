@@ -8,10 +8,11 @@
       "buildsystem": "cmake-ninja",
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/DaveGamble/cJSON/tar.gz/refs/tags/v1.7.19",
-          "sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/DaveGamble/cJSON.git",
+          "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+          "disable-submodules": true,
+          "tag": "v1.7.19"
         }
       ],
       "config-opts": [
@@ -43,10 +44,11 @@
       "buildsystem": "cmake-ninja",
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/akheron/jansson/tar.gz/refs/tags/v2.14",
-          "sha256": "c739578bf6b764aa0752db9a2fdadcfe921c78f1228c7ec0bb47fa804c55d17b",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/akheron/jansson.git",
+          "commit": "684e18c927e89615c2d501737e90018f4930d6c5",
+          "disable-submodules": true,
+          "tag": "v2.14"
         }
       ],
       "config-opts": [
@@ -62,10 +64,11 @@
       "buildsystem": "cmake-ninja",
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.6.0",
-          "sha256": "785bb98e7d6705c51c8dfa8ac3af6aa2ccfa3774714d51c0b9e28fac1146e9f1",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/bitcoin-core/secp256k1.git",
+          "commit": "0cdc758a56360bf58a851fe91085a327ec97685a",
+          "disable-submodules": true,
+          "tag": "v0.6.0"
         }
       ],
       "config-opts": [
@@ -83,10 +86,11 @@
       "buildsystem": "cmake-ninja",
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/google/nsync/tar.gz/refs/tags/1.30.0",
-          "sha256": "883a0b3f8ffc1950670425df3453c127c1a3f6ed997719ca1bbe7f474235b6cc",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/google/nsync.git",
+          "commit": "5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4",
+          "disable-submodules": true,
+          "tag": "1.30.0"
         }
       ],
       "config-opts": [
@@ -101,10 +105,11 @@
       "buildsystem": "cmake-ninja",
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/warmcat/libwebsockets/tar.gz/refs/tags/v4.3.3",
-          "sha256": "6fd33527b410a37ebc91bb64ca51bdabab12b076bc99d153d7c5dd405e4bdf90",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/warmcat/libwebsockets.git",
+          "commit": "4415e84c095857629863804e941b9e1c2e9347ef",
+          "disable-submodules": true,
+          "tag": "v4.3.3"
         }
       ],
       "config-opts": [
@@ -171,10 +176,11 @@
       ],
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/refs/tags/n13.0.19.0",
-          "sha256": "86d15d1a7c0ac73a0eafdfc57bebfeba7da8264595bf531cf4d8db1c22940116",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/FFmpeg/nv-codec-headers.git",
+          "commit": "e844e5b26f46bb77479f063029595293aa8f812d",
+          "disable-submodules": true,
+          "tag": "n13.0.19.0"
         }
       ]
     },
@@ -187,10 +193,10 @@
       ],
       "sources": [
         {
-          "type": "archive",
-          "url": "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/AMF/tar.gz/16f7d73e0b45c473e903e46981ed0b91efc4c091",
-          "sha256": "4718172ea414a8219ef0e0c7863e127ee0ee6f3094662008f44bfd73ab77a23a",
-          "archive-type": "tar-gzip"
+          "type": "git",
+          "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+          "commit": "16f7d73e0b45c473e903e46981ed0b91efc4c091",
+          "disable-submodules": true
         }
       ]
     },

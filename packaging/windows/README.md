@@ -15,11 +15,15 @@ implied by `--help` smoke tests.
 
 Use a CLANGARM64 shell in a private tree, **never** a sibling's build/install
 paths. Prerequisites: MSYS2 clang, Python >=3.12, CMake, Meson, Ninja, pkgconf;
-MSYS make/patch/diffutils; installed CLANGARM64 development/runtime packages
+MSYS git/make/patch/diffutils; installed CLANGARM64 development/runtime packages
 listed in `docs/testing/windows-build.md` plus libvpl. The VM qualification
 extracts the three missing MSYS tools privately, without altering its package
-database. All compile commands are bounded to `-j2`. Sources for FFmpeg, AMF,
-nv-codec-headers, nostrc and secp256k1 are hash-locked in `sources.lock.json`.
+database. All compile commands are bounded to `-j2`. In `sources.lock.json`,
+`type: git` (FFmpeg, nv-codec-headers, nostrc and secp256k1) shallow-fetches
+the full `commit`, verifies it and its `tree`, and exports only the locked
+source. `type: git-blobs` verifies individual files by Git blob ID (AMF and
+libyuv notices). `type: archive` verifies a published asset by `sha256`
+(libidn2); `--cache` only applies to that type.
 The current nostrc pin is `6f7a8d025768d497bef700fe55eea1c687dac328`; Windows
 uses the selected CMake archives and the build-tree nostr-json import library.
 AMF fetches only its pinned header subtree and license (58 Git-blob-hash-verified

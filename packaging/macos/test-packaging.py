@@ -2,8 +2,60 @@
 """Portable parser regressions; real installed/bundle checks run on macOS."""
 import unittest
 import plistlib
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 import macho as m
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from git_source import export_git_source, verify_git_source
+
+
+class GitSourceTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / 'repo'
+        self.repo.mkdir()
+        self.git('init', '--quiet', '--template=', '--object-format=sha1')
+        (self.repo / 'file').write_text('locked')
+        self.git('add', 'file')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                 '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'fixture')
+        self.pin = {key: self.git('rev-parse', f'HEAD^{{{key}}}') for key in ('commit', 'tree')}
+
+    def git(self, *args):
+        return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True).strip()
+
+    def test_export_ignores_working_tree(self):
+        (self.repo / 'file').write_text('uncommitted')
+        dest = self.root / 'source'
+        export_git_source(self.pin, dest, local_repo=self.repo)
+        self.assertEqual(list(dest.iterdir()), [dest / 'file'])
+        self.assertEqual((dest / 'file').read_text(), 'locked')
+
+    def test_commit_mismatch_with_matching_tree(self):
+        with self.assertRaisesRegex(ValueError, 'Git commit mismatch'):
+            verify_git_source(self.repo, 'HEAD', self.pin | {'commit': '0' * 40})
+
+    def test_tree_mismatch(self):
+        dest = self.root / 'source'
+        with self.assertRaisesRegex(ValueError, 'Git tree mismatch'):
+            export_git_source(self.pin | {'tree': '0' * 40}, dest, local_repo=self.repo)
+        self.assertFalse(dest.exists())
+
+    def test_missing_or_short_object_ids(self):
+        for field in ('commit', 'tree'):
+            with self.subTest(field=field):
+                pin = dict(self.pin)
+                del pin[field]
+                with self.assertRaisesRegex(ValueError, field):
+                    verify_git_source(self.repo, 'HEAD', pin)
+                with self.assertRaisesRegex(ValueError, field):
+                    verify_git_source(self.repo, 'HEAD', self.pin | {field: '0123456'})
+
 
 class MinimumTests(unittest.TestCase):
     def test_agent_layout(self):

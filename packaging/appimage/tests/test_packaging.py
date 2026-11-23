@@ -37,6 +37,7 @@ class Packaging(unittest.TestCase):
         for module in mods:
             for source in module['sources']:
                 if source['type']=='archive':
+                    self.assertNotRegex(source['url'], r'codeload\.github\.com|/\+archive/|/archive/')
                     self.assertRegex(source['sha256'],r'^[0-9a-f]{64}$')
                     self.assertIn(source['archive-type'], ('tar-gzip','tar-bzip2','tar-xz'))
                 if source['type']=='git': self.assertRegex(source['commit'],r'^[0-9a-f]{40}$')

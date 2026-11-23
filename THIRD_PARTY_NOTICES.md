@@ -94,8 +94,8 @@ verification artifact, not a distributable release or a cross-platform BOM.
 
 ## W5 source-pinned macOS arm64 profile
 
-The [macOS dependency builder](packaging/macos/README.md) uses the exact URLs
-and SHA256 values in [`deps.lock.json`](packaging/macos/deps.lock.json).
+The [macOS dependency builder](packaging/macos/README.md) verifies Git commit/tree IDs
+or published release archive SHA-256 values in [`deps.lock.json`](packaging/macos/deps.lock.json).
 This replaces Homebrew bottles for this profile, not for distro builds or the
 historical L15 prototype above. All target code, including nostrc, is built
 with a macOS 13.0 deployment target.

@@ -23,6 +23,10 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
 
+sys.path.insert(0, str(HERE.parent))
+from git_source import export_git_source
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('output', type=Path)
@@ -73,29 +77,26 @@ def main():
     sources = {}
     for pin in pins:
         name = pin['name']
-        archive = downloads / pin['archive']
-        if name == 'nostrc' and not archive.exists():
-            with archive.open('wb') as f:
-                subprocess.run(['git', '-C', str(a.nostrc_repo), 'archive', '--format=tar',
-                                '--prefix=nostrc/', pin['version']], stdout=f, check=True)
-        if not archive.exists():
-            partial = archive.with_suffix(archive.suffix + '.partial')
-            run('download-' + name, ['/usr/bin/curl', '--fail', '--location', '--proto', '=https',
-                                    '--tlsv1.2', '--output', partial, pin['url']])
-            partial.rename(archive)
-        if hashlib.sha256(archive.read_bytes()).hexdigest() != pin['sha256']:
-            raise SystemExit(f'SHA256 mismatch: {archive}')
         dest = out / 'sources' / name
-        dest.mkdir()
-        # Strip the archive's top directory except googlesource's flat libyuv archive.
-        with tarfile.open(archive) as tar:
-            members = tar.getmembers()
-            for m in members:
-                if name != 'libyuv':
-                    m.name = m.name.partition('/')[2]
-                if not m.name:
-                    continue
-                tar.extract(m, dest, filter='data')
+        if pin['type'] == 'git':
+            export_git_source(pin, dest, local_repo=a.nostrc_repo if name == 'nostrc' else None)
+        elif pin['type'] == 'archive':
+            archive = downloads / pin['archive']
+            if not archive.exists():
+                partial = archive.with_suffix(archive.suffix + '.partial')
+                run('download-' + name, ['/usr/bin/curl', '--fail', '--location', '--proto', '=https',
+                                        '--tlsv1.2', '--output', partial, pin['url']])
+                partial.rename(archive)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != pin['sha256']:
+                raise SystemExit(f'SHA256 mismatch: {archive}')
+            dest.mkdir()
+            with tarfile.open(archive) as tar:
+                for member in tar.getmembers():
+                    member.name = member.name.partition('/')[2]
+                    if member.name:
+                        tar.extract(member, dest, filter='data')
+        else:
+            raise ValueError(f"{name}: unknown source type {pin['type']}")
         sources[name] = dest
         legal = out / 'licenses' / name
         legal.mkdir()
@@ -186,7 +187,7 @@ Cflags: -I${{includedir}}
     run('codec-inventory', [env['CC'], *shlex.split(env['CFLAGS']),
         REPO / 'packaging/ffmpeg/verify-codecs.c', '-o', out / 'build/verify-codecs', *codec_flags])
     run('codec-inventory', [out / 'build/verify-codecs', 'h264_videotoolbox'])
-    (sources['nostrc'] / 'SOURCE_REVISION').write_text(next(p['version'] for p in pins if p['name'] == 'nostrc') + '\n')
+    (sources['nostrc'] / 'SOURCE_REVISION').write_text(next(p['commit'] for p in pins if p['name'] == 'nostrc') + '\n')
     # Keep a targeted, GLib-free build: the full install also builds NIP-55L,
     # whose Keychain implementation at this pin requires GLib headers.
     cmake('nostrc', '-DBUILD_SHARED_LIBS=OFF', '-DNOSTR_WITH_GLIB=OFF',

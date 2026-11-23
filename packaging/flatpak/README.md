@@ -1,5 +1,10 @@
 # Flatpak client and manager (md-lxxz)
 
+`modules.json` uses Flatpak Builder's Git sources with full commit IDs for
+dependencies without published release assets. Where a tag is also listed,
+it must resolve to the pinned commit. SHA-256 archive pins are for published
+release assets, not auto-generated Git snapshots.
+
 Two independent application manifests, GNOME Platform/SDK 49:
 `org.metadesk.Client.json` and `org.metadesk.Manager.json`. The manager consumes
 merged md-fbg4 with `-Dmanager=true`; it does not embed or start a host daemon.

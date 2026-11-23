@@ -1,21 +1,30 @@
 {
   "nostrc": {
-    "url": "https://codeload.github.com/chebizarro/nostrc/tar.gz/6f7a8d025768d497bef700fe55eea1c687dac328",
-    "sha256": "10001ff07fc3c28ed57f4fb691feaed940697d4420a70b2e1ec1f736c1115f09"
+    "type": "git",
+    "url": "https://github.com/chebizarro/nostrc.git",
+    "commit": "6f7a8d025768d497bef700fe55eea1c687dac328",
+    "tree": "a1d397b194616cf10689f60e0ae8261ca83a717e"
   },
   "ffmpeg": {
-    "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n9.0.2",
-    "sha256": "6e374ed621e48faa40639307dff48ba6fe574a509977956d2cce9669b7cc27e9"
+    "type": "git",
+    "url": "https://github.com/FFmpeg/FFmpeg.git",
+    "commit": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+    "tree": "f314f188666de54687c464fc975e5ee43fae26e1"
   },
   "nv-codec-headers": {
-    "url": "https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/f2053071ea93137255b6dcf42e9b4c9e0965a44e",
-    "sha256": "84cefa55265740888a269625474eda5bd018955c2302b72cfe7473ddc82f741f"
+    "type": "git",
+    "url": "https://github.com/FFmpeg/nv-codec-headers.git",
+    "commit": "f2053071ea93137255b6dcf42e9b4c9e0965a44e",
+    "tree": "73f2a16b3ba9269a4835c2439e85dc8aa26bad8a"
   },
   "secp256k1": {
-    "url": "https://codeload.github.com/bitcoin-core/secp256k1/tar.gz/refs/tags/v0.8.0",
-    "sha256": "eb52b0e9239dff7dc26be5f9623567141b8720ec47da29eb3c1e0a660d17c8bb"
+    "type": "git",
+    "url": "https://github.com/bitcoin-core/secp256k1.git",
+    "commit": "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d",
+    "tree": "ad8f91b605a0bc4ad4df97059c4131792abca5ed"
   },
   "amf": {
+    "type": "git-blobs",
     "base_url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/AMF/57ee0cfb0e1a08d9041f77435653794c1b012be0/",
     "git_blob_sha1": {
       "LICENSE.txt": "7e6e2140915b281143e056ff88c941f7d31d64c2",
@@ -79,10 +88,12 @@
     }
   },
   "libidn2": {
+    "type": "archive",
     "url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
     "sha256": "f557911bf6171621e1f72ff35f5b1825bb35b52ed45325dcdee931e5d3c0787a"
   },
   "libyuv-notices": {
+    "type": "git-blobs",
     "base_url": "https://chromium.googlesource.com/libyuv/libyuv/+/644251f25/",
     "url_suffix": "?format=TEXT",
     "base64": true,
