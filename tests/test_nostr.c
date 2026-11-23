@@ -1174,6 +1174,64 @@ static void *acl_destroy_thread(void *data) {
 static void acl_mode(const char *mode) {
     for (int i = 0; i < 2; i++) acl_control("{\"op\":\"mode\",\"relay\":%d,\"value\":\"%s\"}", i, mode);
 }
+typedef struct {
+    AclTest *test;
+    AclEdit edit;
+    bool destroy;
+    unsigned completed;
+} HeldPublish;
+
+static void held_publish_complete(HeldPublish *job) {
+    pthread_mutex_lock(&job->test->mu);
+    job->completed++;
+    pthread_cond_broadcast(&job->test->cv);
+    pthread_mutex_unlock(&job->test->mu);
+}
+
+static void *held_publish_edit(void *data) {
+    HeldPublish *job = data;
+    acl_edit_thread(&job->edit);
+    held_publish_complete(job);
+    return NULL;
+}
+
+static void *held_publish_shutdown(void *data) {
+    HeldPublish *job = data;
+    if (job->destroy) {
+        md_nostr_destroy(job->edit.n);
+        job->test->bridge = NULL;
+    } else {
+        md_nostr_stop(job->edit.n);
+    }
+    held_publish_complete(job);
+    return NULL;
+}
+
+static void test_publish_first_ok(const char **urls, const char *peer) {
+    for (int destroy = 0; destroy < 2; destroy++) {
+        AclTest s;
+        acl_reset(); acl_bridge(&s, urls, 2, false, false);
+        acl_eose(&s, 0); acl_eose(&s, 1);
+        acl_mode("hold");
+        HeldPublish job = { .test = &s, .edit = { s.bridge, peer, false, -2 },
+                            .destroy = destroy != 0 };
+        pthread_t worker;
+        MD_CHECK(pthread_create(&worker, NULL, held_publish_edit, &job) == 0);
+        for (int i = 0; i < 2; i++) acl_control("{\"op\":\"held\",\"relay\":%d}", i);
+        acl_control("{\"op\":\"ack\",\"relay\":0,\"ok\":true}");
+        /* The deadline only guards failure: completion must come from OK,
+         * and relay 1 never sends its OK, even during teardown. */
+        acl_wait(&s, &job.completed, 1);
+        pthread_join(worker, NULL);
+        MD_CHECK(job.edit.result == 0 && md_nostr_is_allowed(s.bridge, peer));
+        MD_CHECK(pthread_create(&worker, NULL, held_publish_shutdown, &job) == 0);
+        acl_wait(&s, &job.completed, 2);
+        pthread_join(worker, NULL);
+        acl_finish(&s);
+    }
+    printf("  PASS: first OK commits with a held relay; stop and destroy drain the held wait\n");
+}
+
 static void test_acl_edits(const char **urls, const char *a, const char *b) {
     AclTest s;
     acl_reset(); acl_bridge(&s, urls, 2, false, false); acl_eose(&s, 0); acl_eose(&s, 1);
@@ -1199,6 +1257,9 @@ static void test_acl_edits(const char **urls, const char *a, const char *b) {
     MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "video,agent,input") == 0);
     MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, UINT32_MAX) ==
              (MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT));
+    /* First-OK can return before the other relay sees the EVENT. Keep
+     * each fixture mode in place until its publications reach both relays. */
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"published\",\"relay\":%d,\"count\":2}", i);
     acl_mode("reject");
     MD_CHECK(md_nostr_allowlist_add(s.bridge, a, "none") == -1);
     MD_CHECK(md_nostr_granted_capabilities(s.bridge, a, MD_CAP_INPUT) == MD_CAP_INPUT);
@@ -1212,6 +1273,7 @@ static void test_acl_edits(const char **urls, const char *a, const char *b) {
     MD_CHECK(md_nostr_is_allowed(s.bridge, a));
     atomic_store(&s.fail_sign, false);
 
+    for (int i = 0; i < 2; i++) acl_control("{\"op\":\"published\",\"relay\":%d,\"count\":5}", i);
     acl_mode("hold");
     AclEdit edit = { s.bridge, b, false, -2 };
     pthread_t worker;
@@ -1872,6 +1934,7 @@ static int acl_fixture_tests(const char **urls) {
     char *b = md_nostr_get_pubkey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     test_acl_history(urls, a, b);
     test_acl_refusals(urls, a);
+    test_publish_first_ok(urls, a);
     test_acl_edits(urls, a, b);
     test_acl_tag_shapes(urls, a, b);
     test_acl_private(urls, a, b);

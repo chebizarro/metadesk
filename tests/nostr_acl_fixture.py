@@ -150,6 +150,8 @@ def control(servers, command):
             peer, event = s.last_auth
             peer.send(["OK", event["id"], command["ok"], "" if command["ok"] else "restricted: fixture"])
         elif op == "published":
+            if "count" in command:
+                s.wait(lambda: s.publishes >= command["count"])
             assert s.published
             return s.published[-1]
         elif op == "protected":

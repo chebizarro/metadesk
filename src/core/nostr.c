@@ -84,6 +84,8 @@ typedef struct {
  * guard. Successful edits release their slot. */
 #define MD_ACL_UNCONFIRMED_MAX 256
 
+typedef struct PublishBatch PublishBatch;
+
 struct MdNostr {
     bool quality_preferences;
     char *quality_cipher; /* allowlist_mu; bounded encrypted NIP-78 winner */
@@ -124,6 +126,8 @@ struct MdNostr {
     pthread_cond_t     work_cv;
     bool               closing;
     unsigned           active_ops;
+    CancelContextResult publish_cancel;
+    PublishBatch      *publishes;    /* work_mu; holds joinable relay waits */
     pthread_t          dm_thread;
     bool               dm_started;
     bool               dm_busy;
@@ -192,65 +196,106 @@ static void operation_end(MdNostr *n) {
 
 /* ── Parallel relay publishing ──────────────────────────────── */
 typedef struct {
-    NostrRelay  *relay;
-    NostrEvent  *event;
-    GoWaitGroup *wg;
-    bool        *accepted; /* per-relay result slot (owned by publish_all) */
+    PublishBatch *batch;
+    NostrRelay *relay;
+    pthread_t thread;
 } PublishArg;
+
+/* Mutable batch state and list membership are protected by work_mu. The
+ * event copy outlives the caller and is read-only for all relay workers. */
+struct PublishBatch {
+    PublishBatch *next;
+    MdNostr *bridge;
+    NostrEvent *event;
+    size_t started, pending;
+    bool waiting, accepted;
+    PublishArg jobs[];
+};
 
 static void *publish_one_thread(void *arg) {
     PublishArg *pa = arg;
-    /* Wait for the relay's NIP-01 OK so publish success is observed,
-     * not assumed. */
-    *pa->accepted = nostr_relay_publish_and_wait(pa->relay, pa->event,
-                                                 0, NULL);
-    go_wait_group_done(pa->wg);
-    free(pa);
+    PublishBatch *batch = pa->batch;
+    MdNostr *n = batch->bridge;
+    bool accepted = nostr_relay_publish_and_wait_with_context(
+        pa->relay, batch->event, 0, n->publish_cancel.context, NULL);
+
+    pthread_mutex_lock(&n->work_mu);
+    batch->accepted |= accepted;
+    if (--batch->pending == 0) {
+        nostr_event_free(batch->event);
+        batch->event = NULL;
+    }
+    pthread_cond_broadcast(&n->work_cv);
+    pthread_mutex_unlock(&n->work_mu);
     return NULL;
 }
 
-/* Helper: publish an event to all cached relays in parallel.
- * Returns 0 only when at least one relay acknowledged the event with
- * OK=true; -1 when every relay rejected it or never answered. */
+/* Called with work_mu held, on publish entry/exit and during stop. Workers
+ * with a recorded completion no longer need the lock, so joining is safe. */
+static void publish_reap_locked(MdNostr *n) {
+    PublishBatch **link = &n->publishes;
+    while (*link) {
+        PublishBatch *batch = *link;
+        if (batch->waiting || batch->pending) {
+            link = &batch->next;
+            continue;
+        }
+        for (size_t i = 0; i < batch->started; i++)
+            pthread_join(batch->jobs[i].thread, NULL);
+        *link = batch->next;
+        nostr_event_free(batch->event);
+        free(batch);
+    }
+}
+
+/* Fan out to all relays, but wait only until one accepts or all fail.
+ * Other relays continue waiting for their own OK under the bridge context. */
 static int publish_all(MdNostr *n, NostrEvent *ev) {
-    if (!n || !ev || n->relay_count == 0 || is_stopped(n)) return -1;
-
-    GoWaitGroup wg;
-    go_wait_group_init(&wg);
-
-    bool *accepted = calloc(n->relay_count, sizeof(bool));
-    if (!accepted) {
-        go_wait_group_destroy(&wg);
+    if (!n || !ev || !n->relay_count) return -1;
+    if (n->relay_count > (SIZE_MAX - sizeof(PublishBatch)) / sizeof(PublishArg))
+        return -1;
+    PublishBatch *batch = calloc(1, sizeof(*batch) + n->relay_count * sizeof(PublishArg));
+    if (!batch) return -1;
+    batch->event = nostr_event_copy(ev);
+    if (!batch->event) {
+        free(batch);
         return -1;
     }
 
+    pthread_mutex_lock(&n->work_mu);
+    if (n->closing || (n->owner && !md_account_binding_is_current(n->owner))) {
+        pthread_mutex_unlock(&n->work_mu);
+        nostr_event_free(batch->event);
+        free(batch);
+        return -1;
+    }
+    publish_reap_locked(n);
+    batch->bridge = n;
+    batch->waiting = true;
+    batch->next = n->publishes;
+    n->publishes = batch;
     for (size_t i = 0; i < n->relay_count; i++) {
-        go_wait_group_add(&wg, 1);
-        PublishArg *pa = malloc(sizeof(PublishArg));
-        if (pa) {
-            pa->relay    = n->relays[i];
-            pa->event    = ev;
-            pa->wg       = &wg;
-            pa->accepted = &accepted[i];
-            go(publish_one_thread, pa);
-        } else {
-            go_wait_group_done(&wg);
+        PublishArg *job = &batch->jobs[batch->started];
+        job->batch = batch;
+        job->relay = n->relays[i];
+        if (pthread_create(&job->thread, NULL, publish_one_thread, job) == 0) {
+            batch->started++;
+            batch->pending++;
         }
     }
 
-    go_wait_group_wait(&wg);
-    go_wait_group_destroy(&wg);
+    while (!batch->accepted && batch->pending && !n->closing)
+        pthread_cond_wait(&n->work_cv, &n->work_mu);
+    bool accepted = batch->accepted;
+    bool closing = n->closing;
+    batch->waiting = false;
+    publish_reap_locked(n);
+    pthread_cond_broadcast(&n->work_cv);
+    pthread_mutex_unlock(&n->work_mu);
 
-    size_t ok_count = 0;
-    for (size_t i = 0; i < n->relay_count; i++)
-        if (accepted[i]) ok_count++;
-    free(accepted);
-
-    if (ok_count == 0) {
+    if (!accepted && !closing)
         MD_LOG_W("publish rejected (or unacknowledged) by all %zu relays", n->relay_count);
-        return -1;
-    }
-    return 0;
+    return accepted ? 0 : -1;
 }
 
 /* Match nostrc's reason-specific recovery: rate-limited/error back off,
@@ -1077,6 +1122,8 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     n->acl_state = cfg->allowlist_open ? MD_NOSTR_ACL_OPEN : MD_NOSTR_ACL_UNKNOWN;
     n->signer_cancel = md_signer_cancel_new();
     if (!n->signer_cancel) { md_nostr_destroy(n); return NULL; }
+    n->publish_cancel = go_context_with_cancel(NULL);
+    if (!n->publish_cancel.context) { md_nostr_destroy(n); return NULL; }
 
     /* Set up signer: use provided signer, or create direct-key from sk_hex */
     n->owner = md_account_binding_ref(cfg->owner);
@@ -1251,7 +1298,12 @@ void md_nostr_stop(MdNostr *n) {
     pthread_mutex_lock(&n->work_mu);
     n->closing = true;
     md_signer_cancel(n->signer_cancel);
+    if (n->publish_cancel.context) n->publish_cancel.cancel(n->publish_cancel.context);
     pthread_cond_broadcast(&n->work_cv);
+    while (n->publishes) {
+        publish_reap_locked(n);
+        if (n->publishes) pthread_cond_wait(&n->work_cv, &n->work_mu);
+    }
     pthread_mutex_unlock(&n->work_mu);
     for (size_t i = 0; i < n->relay_count; i++)
         nostr_relay_set_auth_signer_full(n->relays[i], NOSTR_RELAY_AUTH_ON_CHALLENGE,
@@ -1297,6 +1349,7 @@ void md_nostr_destroy(MdNostr *n) {
     md_signer_destroy(n->signer);
     md_account_binding_release(n->owner);
     md_signer_cancel_free(n->signer_cancel);
+    go_context_unref(n->publish_cancel.context);
 
     free(n->quality_cipher);
     free(n->pk_hex);
