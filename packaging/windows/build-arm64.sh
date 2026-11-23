@@ -57,8 +57,10 @@ python "$repo/packaging/windows/stage.py" --repo "$(cygpath -m "$repo")" \
   --build "$(cygpath -m "$out/product")" --nostrc "$(cygpath -m "$out/nostrc")" \
   --secp "$(cygpath -m "$out/secp256k1")" --ffmpeg "$(cygpath -m "$out/ffmpeg")" \
   --inputs "$(cygpath -m "$inputs")" --prefix "$(cygpath -m /clangarm64)" --output "$(cygpath -m "$out/stage")"
+# shellcheck disable=SC2046 # pkg-config emits individual compiler/linker arguments.
 cc "$repo/packaging/ffmpeg/verify-codecs.c" $(pkg-config --cflags --libs libavcodec libavutil) -o "$out/stage/verify-codecs.exe"
-"$out/stage/verify-codecs.exe" h264_nvenc h264_amf h264_mf h264_qsv > "$out/codec-inventory.txt"
+IFS=, read -r -a encoders <<< "$(sh "$repo/packaging/ffmpeg/profile-encoders.sh" windows aarch64)"
+"$out/stage/verify-codecs.exe" "${encoders[@]}" > "$out/codec-inventory.txt"
 rm "$out/stage/verify-codecs.exe"
 pacman -Q > "$out/msys2-packages.txt"
 clang --version > "$out/toolchain.txt"

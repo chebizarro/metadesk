@@ -28,11 +28,12 @@ def check_ffmpeg(ff, repo):
     require((ff / 'profile.txt').read_text().strip() == 'windows', 'not Windows profile')
     require('License: LGPL version 2.1 or later' in (ff / 'configure.txt').read_text(), 'not LGPL')
     config = (ff / 'build/config.h').read_text()
+    require('#define ARCH_AARCH64 1' in config.splitlines(), 'not ARM64 FFmpeg')
     for feature in ('GPL', 'NONFREE', 'VERSION3', 'LIBX264', 'LIBX265', 'LIBOPENH264'):
         require(f'#define CONFIG_{feature} 0' in config, f'forbidden {feature}')
     components = (ff / 'build/config_components.h').read_text()
     expected = {'H264_DECODER', 'H264_PARSER', 'H264_NVENC_ENCODER', 'H264_AMF_ENCODER',
-                'H264_MF_ENCODER', 'H264_QSV_ENCODER'}
+                'H264_MF_ENCODER'}  # QSV belongs to the x86 Windows profile.
     actual = set(re.findall(r'^#define CONFIG_(\w+(?:ENCODER|DECODER|PARSER)) 1$', components, re.M))
     require(actual == expected, f'codec inventory mismatch: {actual}')
     patch = '0001-mf-low-latency-vt-bool.patch'

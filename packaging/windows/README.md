@@ -47,7 +47,8 @@ MF `VT_BOOL` patch, then builds nostrc and both products. It never modifies
 closure, with an explicit SDL3 dlopen edge for sdl2-compat, not an indiscriminate
 copy of MSYS2 bin. DLLs resolve only from the private FFmpeg/nostrc/product output and
 CLANGARM64 prefix; API-set/System32 imports are OS-owned and not copied. Driver
-DLLs dynamically loaded by NVENC/AMF/QSV are OS/user-owned, not bundled.
+DLLs dynamically loaded by NVENC/AMF are OS/user-owned, not bundled.
+The ARM64 profile contains NVENC, AMF, and Media Foundation; QSV is x86-only.
 Unknown runtime packages/versions, unresolved imports, non-ARM64 objects, forbidden codec
 DLL names, unexpected FFmpeg codecs/configuration or MF patch drift fail.
 The runtime inventory executable checks **the staged** avcodec/avutil DLLs.
