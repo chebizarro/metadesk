@@ -45,6 +45,7 @@ MdStoreResult md_managed_store_read(MdManagedStore *, const char *coordinate,
 MdStoreResult md_managed_store_stage(MdManagedStore *, const char *coordinate,
     const char *base, const char *plaintext, const char *const *targets, size_t count, int64_t now);
 /* Retry returns the same signed EVENT, for an unacknowledged target only.
+ * Before handing a draft to transport, durably marks it possibly sent.
  * Check the same role generation before sending; use cancellable relay I/O.
  * Transport correlates OK by relay and event ID. Negative/unknown outcomes
  * never commit; transport owns NIP-42 and reconnect handling. */
@@ -61,7 +62,10 @@ MdStoreResult md_managed_store_relay_result(MdManagedStore *, const char *coordi
     const char *target, MdStoreRelayResult *);
 /* Conflict actions. Reapply requires the currently winning base and replaces
  * the previous draft atomically only after validating and signing the edit. */
-MdStoreResult md_managed_store_keep_remote(MdManagedStore *, const char *coordinate);
+/* Republish the exact remote content to the original write targets if the
+ * discarded draft may have escaped. Never-sent drafts can be dropped. */
+MdStoreResult md_managed_store_keep_remote(MdManagedStore *, const char *coordinate,
+    const char *base, int64_t now);
 MdStoreResult md_managed_store_reapply(MdManagedStore *, const char *coordinate,
     const char *base, const char *reviewed_plaintext, const char *const *targets, size_t count, int64_t now);
 

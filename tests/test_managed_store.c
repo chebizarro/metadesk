@@ -102,6 +102,66 @@ static int publish(MdAccountBinding *binding, const char *url, const char *wire)
     md_nostr_destroy(n);
     return rc;
 }
+static void journal_path(char *path, size_t capacity, const char *root, const char *d) {
+    char name[64];
+    CHECK(strlen(d) < sizeof(name));
+    strcpy(name,d);
+    for (char *p = name; *p; ++p) if (*p == ':') *p = '_';
+    int n = snprintf(path,capacity,"%s/%s/%s",root,PK,name);
+    CHECK(n > 0 && (size_t)n < capacity);
+}
+static void check_keep_remote(MdManagedStore *s, MdSigner *client, const char *storage,
+    const char *const *targets, int64_t now) {
+    static const char *const docs[] = {
+        "metadesk-tag:86b09912-5e73-4bb0-a708-30c770882acf",
+        "metadesk-tag:86b09912-5e73-4bb0-a708-30c770882ac0"
+    };
+    for (size_t i = 0; i < sizeof(docs)/sizeof(docs[0]); ++i) {
+        const char *d = docs[i];
+        int kind = NOSTR_KIND_CATEGORIZED_PEOPLE_LIST;
+        const char *remote_plain = "[[\"p\",\"" OTHER "\"]]";
+        char *a = make(client,PK,d,kind,"[]",now-100);
+        char *b = make(client,PK,d,kind,remote_plain,now-50);
+        char *a_id = event_id(a), *b_id = event_id(b);
+        CHECK(md_managed_store_receive(s,d,a,now) == MD_STORE_OK);
+        CHECK(md_managed_store_backfill(s,d,true) == MD_STORE_OK);
+        CHECK(md_managed_store_stage(s,d,a_id,"[[\"p\",\"" HOST "\"]]",targets,2,now) == MD_STORE_PENDING);
+        char *discarded = NULL;
+        if (i == 0) {
+            /* A crash after handoff but before completion must not make the
+             * draft look known-unsent. No explicit completion is recorded. */
+            CHECK(md_managed_store_outgoing(s,d,targets[0],&discarded) == MD_STORE_PENDING);
+        } else {
+            /* Independently prove that a wire echo, with all targets still
+             * WAITING, counts as evidence that the draft escaped. */
+            char path[1024]; journal_path(path,sizeof(path),storage,d);
+            json_t *j = json_load_file(path,0,NULL); CHECK(j);
+            const char *stored = json_string_value(json_object_get(j,"draft")); CHECK(stored);
+            discarded = strdup(stored);
+            json_decref(j);
+        }
+        CHECK(discarded);
+        CHECK(md_managed_store_receive(s,d,b,now) == MD_STORE_CONFLICT);
+        if (i == 1) CHECK(md_managed_store_receive(s,d,discarded,now) == MD_STORE_UNCHANGED);
+        CHECK(md_managed_store_keep_remote(s,d,a_id,now) == MD_STORE_CONFLICT);
+        CHECK(md_managed_store_keep_remote(s,d,b_id,now) == MD_STORE_PENDING);
+        CHECK(md_managed_store_receive(s,d,discarded,now) == MD_STORE_UNCHANGED);
+        char *fixed = NULL, *plain = NULL, *pending = NULL, rev[65];
+        CHECK(md_managed_store_read(s,d,rev,&plain,&pending) == MD_STORE_PENDING);
+        CHECK(!strcmp(rev,b_id) && !strcmp(plain,remote_plain) && !strcmp(pending,remote_plain));
+        CHECK(md_managed_store_outgoing(s,d,targets[0],&fixed) == MD_STORE_PENDING);
+        NostrEvent *e = nostr_event_new(); CHECK(e);
+        CHECK(nostr_event_deserialize_signed(e,fixed,NULL) == NOSTR_EVENT_VALIDATION_OK);
+        CHECK(nostr_event_get_created_at(e) == now+1);
+        char *fixed_id = event_id(fixed);
+        CHECK(md_managed_store_record_result(s,d,targets[0],fixed_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_PARTIAL);
+        CHECK(md_managed_store_record_result(s,d,targets[1],fixed_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_OK);
+        CHECK(md_managed_store_receive(s,d,discarded,now) == MD_STORE_UNCHANGED);
+        CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_OK && !strcmp(rev,fixed_id));
+        nostr_event_free(e); free(fixed_id); free(pending); free(plain); free(fixed);
+        free(discarded); free(a); free(b); free(a_id); free(b_id);
+    }
+}
 static void check_exchange(void) {
     char *text = NULL, *candidates = NULL;
     const char *input = "{\"schema\":\"metadesk-hosts/1\",\"hosts\":[{\"pubkey\":\"" HOST
@@ -218,7 +278,7 @@ int main(int argc, char **argv) {
     CHECK(strstr(plain,"different layout") && strstr(pending,"edited"));
     free(plain); free(pending); free(remote);
     CHECK(md_managed_store_outgoing(s,MD_STORE_MANAGEMENT,targets[0],&wire) == MD_STORE_CONFLICT && !wire);
-    CHECK(md_managed_store_keep_remote(s,MD_STORE_MANAGEMENT) == MD_STORE_OK);
+    CHECK(md_managed_store_keep_remote(s,MD_STORE_MANAGEMENT,revision,now) == MD_STORE_OK);
     CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,NULL,NULL) == MD_STORE_READ_ONLY);
     CHECK(md_managed_store_stage(s,MD_STORE_MANAGEMENT,revision,V1,targets,1,now) == MD_STORE_READ_ONLY);
 
@@ -278,6 +338,7 @@ int main(int argc, char **argv) {
     CHECK(!md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,true) == MD_STORE_OK && md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,false) == MD_STORE_OK && !md_managed_store_unattended(s));
+    check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,MD_SIGNER_NIP5F,HOST_PK,other));
     CHECK(md_managed_store_read(s,MD_STORE_HOSTS,revision,NULL,NULL) == MD_STORE_REVOKED);

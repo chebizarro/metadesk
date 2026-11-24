@@ -23,14 +23,20 @@ store, and open the new owner's store.
 3. Stage a whole-document edit with the read revision and caller-selected
    write targets. Do not send a locally constructed event directly. Retrieve
    the durable signed event from `outgoing`, send it with cancellable transport
-   tied to the same binding, and record the correlated per-relay outcome. Only
+   tied to the same binding, and record the correlated per-relay outcome. The
+   handoff is durably recorded as possibly sent before transport gets the event. Only
    positive OK counts; even a relay echo of the pending event does not commit
    it. Do not mint a new replacement on retry. Raw relay reason strings are
    transport diagnostics, not durable state.
 4. One positive OK commits the winner; remaining targets keep the document
    partial. In a conflict the remote winner and signed local draft are kept
-   separately. Use Keep Remote or present both and call `reapply` to
-   atomically stage the reviewed replacement against the new revision. Nostr has no compare-and-swap:
+   separately. Keep Remote drops a draft only if it was never handed off or
+   echoed and has no outstanding superseded events. Otherwise it stages the
+   exact remote content at a timestamp that beats the discarded draft, using
+   the original targets and normal positive-OK gating. Replayed copies of the
+   discarded draft cannot displace the remote baseline while this correction
+   is pending. To keep reviewed local changes instead, call `reapply` against
+   the current remote revision. Nostr has no compare-and-swap:
    another device may already have published or accepted a competing draft.
 
 Tag deletion is an app-data tombstone plus an empty tag membership document.

@@ -69,21 +69,25 @@ static bool ciphertext(const char *s) {
     return n - prefix <= 2 && strspn(s + prefix, "=") == n - prefix;
 }
 
+static NostrEvent *encrypted_event(const char *owner, int kind, const char *d,
+                                   const char *cipher, int64_t at) {
+    if (!ciphertext(cipher)) return NULL;
+    if (kind == APPDATA) return nostr_nip78_build_event(owner, d, cipher, at);
+    if (kind != PEOPLE) return NULL;
+    NostrListDocument *list = nostr_nip51_document_new(kind, d);
+    if (!list) return NULL;
+    NostrEvent *event = nostr_nip51_document_build_unsigned(list, owner, at, cipher);
+    nostr_nip51_document_free(list);
+    return event;
+}
+
 NostrEvent *md_private_document_build(MdSigner *signer, const MdSignerCancel *cancel,
     const char *owner, int kind, const char *d, const char *plain, int64_t at) {
     if (!plain || strlen(plain) > MD_STORE_MAX_PLAINTEXT || (kind != PEOPLE && kind != APPDATA)) return NULL;
     char *cipher = NULL;
     NostrEvent *event = NULL;
-    if (!md_signer_nip44_encrypt_cancellable(signer, owner, plain, &cipher, cancel) && ciphertext(cipher)) {
-        if (kind == APPDATA) event = nostr_nip78_build_event(owner, d, cipher, at);
-        else {
-            NostrListDocument *list = nostr_nip51_document_new(kind, d);
-            if (list) {
-                event = nostr_nip51_document_build_unsigned(list, owner, at, cipher);
-                nostr_nip51_document_free(list);
-            }
-        }
-    }
+    if (!md_signer_nip44_encrypt_cancellable(signer, owner, plain, &cipher, cancel))
+        event = encrypted_event(owner, kind, d, cipher, at);
     free(cipher);
     return event;
 }
@@ -386,10 +390,11 @@ static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t *
 /* Journal loading also verifies disk envelopes. Never recover an unreadable
  * journal as an empty baseline: that could overwrite newer data on a relay. */
 typedef struct {
-    json_t *j, *relays;
+    json_t *j, *relays, *superseded;
     NostrEvent *winner, *draft;
     const char *base;
     size_t acked;
+    bool exposed;
 } Journal;
 static void dispose(Journal *j) {
     nostr_event_free(j->winner); nostr_event_free(j->draft); json_decref(j->j);
@@ -406,7 +411,17 @@ static bool load(MdManagedStore *s, const char *d, Journal *j) {
     if (json_object_get(j->j,"event") && !(j->winner = parse_event(wire,s->owner,doc_kind(d),d))) return false;
     j->relays = json_object_get(j->j,"relays");
     j->base = field(j->j,"base");
-    if (!json_object_get(j->j,"draft")) return !j->base && !j->relays;
+    j->superseded = json_object_get(j->j,"superseded");
+    json_t *echo = json_object_get(j->j,"echo");
+    if (!json_object_get(j->j,"draft"))
+        return !json_object_get(j->j,"base") && !j->relays && !j->superseded && !echo;
+    if (echo && !json_is_true(echo)) return false;
+    j->exposed = json_is_true(echo);
+    if (j->superseded && (!json_is_array(j->superseded) ||
+                          json_array_size(j->superseded) > MD_STORE_MAX_RELAYS)) return false;
+    size_t index;
+    json_t *item;
+    json_array_foreach(j->superseded,index,item) if (!hex(json_string_value(item),64)) return false;
     j->draft = parse_event(pending,s->owner,doc_kind(d),d);
     if (!j->draft || !j->base || (*j->base && !hex(j->base,64)) ||
         !json_is_object(j->relays) || !json_object_size(j->relays) || json_object_size(j->relays) > MD_STORE_MAX_RELAYS) return false;
@@ -416,8 +431,16 @@ static bool load(MdManagedStore *s, const char *d, Journal *j) {
         if (!hex(key,64) || !json_is_integer(v) || json_integer_value(v) < MD_STORE_RELAY_WAITING ||
             json_integer_value(v) > MD_STORE_RELAY_ACKNOWLEDGED) return false;
         if (json_integer_value(v) == MD_STORE_RELAY_ACKNOWLEDGED) ++j->acked;
+        if (json_integer_value(v) != MD_STORE_RELAY_WAITING) j->exposed = true;
     }
     return j->acked < json_object_size(j->relays);
+}
+static bool superseded(const Journal *j, const char *event_id) {
+    size_t i;
+    json_t *item;
+    json_array_foreach(j->superseded,i,item)
+        if (!strcmp(json_string_value(item),event_id)) return true;
+    return false;
 }
 static MdStoreResult status(const Journal *j) {
     if (!j->draft) return MD_STORE_OK;
@@ -452,8 +475,12 @@ MdStoreResult md_managed_store_receive(MdManagedStore *s, const char *d, const c
     int64_t at = nostr_event_get_created_at(e);
     if (now < 0 || (at > now && at - now > 300)) r = MD_STORE_CLOCK;
     else if (!load(s,d,&j)) r = MD_STORE_IO;
-    /* Echoed pending events are not positive storage acknowledgments. */
-    else if (!strcmp(id(e),id(j.draft)) || (j.winner &&
+    /* Echoes never count as OK, but they prove a draft escaped. */
+    else if (!strcmp(id(e),id(j.draft))) {
+        r = MD_STORE_UNCHANGED;
+        if (!json_is_true(json_object_get(j.j,"echo")) &&
+            (json_object_set(j.j,"echo",json_true()) || !write_json(s,d,j.j))) r = MD_STORE_IO;
+    } else if (superseded(&j,id(e)) || (j.winner &&
         (at < nostr_event_get_created_at(j.winner) ||
          (at == nostr_event_get_created_at(j.winner) && strcmp(id(e),id(j.winner)) >= 0)))) r = MD_STORE_UNCHANGED;
     else {
@@ -546,6 +573,46 @@ static bool relay_key(const char *target, char key[65]) {
     return true;
 }
 
+static bool next_timestamp(const Journal *j, int64_t now, int64_t *at) {
+    int64_t previous = j->winner ? nostr_event_get_created_at(j->winner) : -1;
+    if (j->draft && nostr_event_get_created_at(j->draft) > previous)
+        previous = nostr_event_get_created_at(j->draft);
+    if (now < 0 || previous == INT64_MAX || (previous >= now && previous - now >= 300)) return false;
+    *at = previous >= now ? previous + 1 : now;
+    return true;
+}
+
+/* Keep earlier superseded IDs until a newer draft gets fully acknowledged.
+ * An echo before that ACK cannot undo the explicit conflict decision. */
+static MdStoreResult save_draft(MdManagedStore *s, const char *d, Journal *j,
+                                NostrEvent *event, json_t *relays) {
+    MdStoreResult r = MD_STORE_SIGNER;
+    char *unsigned_wire = event ? nostr_event_serialize_compact(event) : NULL;
+    char *signed_wire = NULL, *canonical = NULL;
+    NostrEvent *signed_event = NULL;
+    if (!unsigned_wire || md_account_binding_sign_event(s->binding,unsigned_wire,&signed_wire)) goto done;
+    signed_event = parse_event(signed_wire,s->owner,doc_kind(d),d);
+    if (!signed_event || nostr_event_get_created_at(signed_event) != nostr_event_get_created_at(event) ||
+        strcmp(nostr_event_get_content(signed_event),nostr_event_get_content(event))) goto done;
+    r = MD_STORE_IO;
+    if (j->draft && j->exposed && !superseded(j,id(j->draft))) {
+        if (!j->superseded) j->superseded = json_object_set_new(j->j,"superseded",json_array()) ?
+            NULL : json_object_get(j->j,"superseded");
+        if (!j->superseded) goto done;
+        if (json_array_size(j->superseded) == MD_STORE_MAX_RELAYS) { r = MD_STORE_LIMIT; goto done; }
+        if (json_array_append_new(j->superseded,json_string(id(j->draft)))) goto done;
+    }
+    json_object_del(j->j,"echo");
+    canonical = nostr_event_serialize_compact(signed_event);
+    if (canonical && !json_object_set_new(j->j,"draft",json_string(canonical)) &&
+        !json_object_set_new(j->j,"base",json_string(id(j->winner))) && !json_object_set(j->j,"relays",relays) &&
+        write_json(s,d,j->j)) r = MD_STORE_PENDING;
+done:
+    free(unsigned_wire); free(signed_wire); free(canonical);
+    nostr_event_free(signed_event);
+    return current(s) ? r : MD_STORE_REVOKED;
+}
+
 static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
     const char *plain, const char *const *targets, size_t count, int64_t now, bool reapply) {
     MdStoreResult r = access_doc(s,d);
@@ -556,19 +623,14 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
     if (!json_is_true(json_object_get(s->ready,d))) return MD_STORE_NOT_READY;
     Journal j = {0};
     json_t *candidate = NULL, *old = NULL, *relays = NULL;
-    NostrEvent *unsigned_event = NULL, *signed_event = NULL;
-    char *encoded = NULL, *unsigned_wire = NULL, *signed_wire = NULL, *canonical = NULL;
+    NostrEvent *unsigned_event = NULL;
+    char *encoded = NULL;
     if (!load(s,d,&j)) { r = MD_STORE_IO; goto done; }
     if (strcmp(base,id(j.winner))) { r = MD_STORE_CONFLICT; goto done; }
     if (reapply && status(&j) != MD_STORE_CONFLICT) { r = MD_STORE_UNCHANGED; goto done; }
     if (!reapply && j.draft) { r = status(&j); goto done; }
-    int64_t previous = j.winner ? nostr_event_get_created_at(j.winner) : -1;
-    /* The previous draft may have reached a relay before its ACK was lost.
-     * A reviewed replacement must also sort after that exact event. */
-    if (j.draft && nostr_event_get_created_at(j.draft) > previous)
-        previous = nostr_event_get_created_at(j.draft);
-    if (now < 0 || previous == INT64_MAX || (previous >= now && previous - now >= 300)) { r = MD_STORE_CLOCK; goto done; }
-    int64_t at = previous >= now ? previous + 1 : now;
+    int64_t at;
+    if (!next_timestamp(&j,now,&at)) { r = MD_STORE_CLOCK; goto done; }
     int kind = doc_kind(d);
     candidate = json_loads(plain,JSON_REJECT_DUPLICATES,NULL);
     r = schema(kind,candidate);
@@ -591,22 +653,13 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
     encoded = json_dumps(candidate,JSON_COMPACT);
     if (!encoded) { r = MD_STORE_IO; goto done; }
     if (strlen(encoded) > MD_STORE_MAX_PLAINTEXT) { r = MD_STORE_LIMIT; goto done; }
-    r = MD_STORE_SIGNER;
     unsigned_event = md_private_document_build(md_account_binding_signer(s->binding),
         md_account_binding_cancel(s->binding),s->owner,kind,d,encoded,at);
-    if (!unsigned_event || !(unsigned_wire = nostr_event_serialize_compact(unsigned_event)) ||
-        md_account_binding_sign_event(s->binding,unsigned_wire,&signed_wire)) goto done;
-    signed_event = parse_event(signed_wire,s->owner,kind,d);
-    if (!signed_event || nostr_event_get_created_at(signed_event) != at ||
-        strcmp(nostr_event_get_content(signed_event),nostr_event_get_content(unsigned_event))) goto done;
-    canonical = nostr_event_serialize_compact(signed_event);
-    r = canonical && !json_object_set_new(j.j,"draft",json_string(canonical)) &&
-        !json_object_set_new(j.j,"base",json_string(base)) && !json_object_set(j.j,"relays",relays) &&
-        write_json(s,d,j.j) ? MD_STORE_PENDING : MD_STORE_IO;
+    r = save_draft(s,d,&j,unsigned_event,relays);
 done:
     json_decref(relays); json_decref(candidate); json_decref(old); dispose(&j);
-    wipe(encoded); free(unsigned_wire); free(signed_wire); free(canonical);
-    nostr_event_free(unsigned_event); nostr_event_free(signed_event);
+    wipe(encoded);
+    nostr_event_free(unsigned_event);
     return current(s) ? r : MD_STORE_REVOKED;
 }
 
@@ -636,6 +689,9 @@ MdStoreResult md_managed_store_outgoing(MdManagedStore *s, const char *d, const 
 #ifndef _WIN32
         else if (fsync(s->dir)) r = MD_STORE_IO;
 #endif
+        else if (json_integer_value(ack) == MD_STORE_RELAY_WAITING &&
+                 (json_object_set_new(j.relays,key,json_integer(MD_STORE_RELAY_UNKNOWN)) ||
+                  !write_json(s,d,j.j))) r = MD_STORE_IO;
         else if (!(*wire = strdup(field(j.j,"draft")))) r = MD_STORE_IO;
     }
     dispose(&j);
@@ -645,6 +701,7 @@ MdStoreResult md_managed_store_outgoing(MdManagedStore *s, const char *d, const 
 }
 static void drop_draft(json_t *j) {
     json_object_del(j,"draft"); json_object_del(j,"base"); json_object_del(j,"relays");
+    json_object_del(j,"echo"); json_object_del(j,"superseded");
 }
 MdStoreResult md_managed_store_record_result(MdManagedStore *s, const char *d,
     const char *target, const char *event_id, MdStoreRelayResult outcome) {
@@ -691,15 +748,40 @@ MdStoreResult md_managed_store_relay_result(MdManagedStore *s, const char *d,
     dispose(&j);
     return current(s) ? r : MD_STORE_REVOKED;
 }
-MdStoreResult md_managed_store_keep_remote(MdManagedStore *s, const char *d) {
+MdStoreResult md_managed_store_keep_remote(MdManagedStore *s, const char *d,
+                                            const char *base, int64_t now) {
     MdStoreResult r = access_doc(s,d);
     if (r != MD_STORE_OK) return r;
+    if (!hex(base,64)) return MD_STORE_INVALID;
     Journal j = {0};
-    if (!load(s,d,&j)) r = MD_STORE_IO;
-    else if (status(&j) != MD_STORE_CONFLICT) r = MD_STORE_UNCHANGED;
-    else { drop_draft(j.j); r = write_json(s,d,j.j) ? MD_STORE_OK : MD_STORE_IO; }
-    dispose(&j);
-    return r;
+    json_t *targets = NULL;
+    NostrEvent *event = NULL;
+    if (!load(s,d,&j)) { r = MD_STORE_IO; goto done; }
+    if (strcmp(base,id(j.winner))) { r = MD_STORE_CONFLICT; goto done; }
+    if (status(&j) != MD_STORE_CONFLICT) { r = MD_STORE_UNCHANGED; goto done; }
+    if (!j.exposed && !json_array_size(j.superseded)) {
+        drop_draft(j.j);
+        r = write_json(s,d,j.j) ? MD_STORE_OK : MD_STORE_IO;
+        goto done;
+    }
+    if (!json_is_true(json_object_get(s->ready,d))) { r = MD_STORE_NOT_READY; goto done; }
+    int64_t at;
+    if (!next_timestamp(&j,now,&at)) { r = MD_STORE_CLOCK; goto done; }
+    targets = json_object();
+    if (!targets) { r = MD_STORE_IO; goto done; }
+    const char *key;
+    json_t *result;
+    json_object_foreach(j.relays,key,result) {
+        if (json_object_set_new(targets,key,json_integer(MD_STORE_RELAY_WAITING))) { r = MD_STORE_IO; goto done; }
+    }
+    /* NIP-44 authenticates content independently of the Nostr timestamp.
+     * Re-signing the winner's ciphertext preserves its exact plaintext,
+     * including a future schema, without materializing it. */
+    event = encrypted_event(s->owner,doc_kind(d),d,nostr_event_get_content(j.winner),at);
+    r = save_draft(s,d,&j,event,targets);
+done:
+    nostr_event_free(event); json_decref(targets); dispose(&j);
+    return current(s) ? r : MD_STORE_REVOKED;
 }
 
 bool md_managed_store_unattended(MdManagedStore *s) {
