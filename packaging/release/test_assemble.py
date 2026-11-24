@@ -98,5 +98,58 @@ class AssemblyTest(unittest.TestCase):
         self.assertFalse((self.output / 'SHA256SUMS').exists())
 
 
+class GitHubReleaseTest(unittest.TestCase):
+    def test_draft_and_publication_guards(self):
+        # Simulate GitHub and ls-remote; no real tags or releases are created.
+        git = shutil.which('git')
+        commit = subprocess.check_output([git, 'rev-parse', 'HEAD'], text=True).strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / 'bin'
+            tools.mkdir()
+            (tools / 'git').write_text('#!/bin/sh\ncase " $* " in *" ls-remote "*) printf "%s" "$REFS"; exit 0;; esac\n'
+                                       f'exec "{git}" "$@"\n')
+            (tools / 'gh').write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                                      'case "$1" in api) printf "%s\\n" "$RELEASES";; '
+                                      'release) echo https://example.invalid/release;; *) exit 99;; esac\n')
+            if not shutil.which('sha256sum'):
+                (tools / 'sha256sum').write_text('#!/bin/sh\nexec shasum -a 256 "$@"\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o755)
+            assets = root / 'assets'
+            assets.mkdir()
+            (assets / 'installer').write_bytes(b'fixture')
+            (assets / 'SHA256SUMS').write_text(f'{assemble.sha(assets / "installer")}  installer\n')
+            (assets / 'release-notes.md').write_text('fixture\n')
+            calls = root / 'calls'
+            tag = 'v0.1.0-alpha.1'
+            ref = f'refs/tags/{tag}'
+            env = dict(os.environ, PATH=f'{tools}:{os.environ["PATH"]}', RUNNER_TEMP=temporary,
+                       TAG=tag, PUBLISH='false', GITHUB_SHA=commit, GITHUB_EVENT_NAME='workflow_dispatch',
+                       GITHUB_REPOSITORY='owner/repo', GITHUB_STEP_SUMMARY=str(root / 'summary'),
+                       CALLS=str(calls), RELEASES='[]', REFS='')
+            scenarios = [
+                ({}, f'--draft --target {commit}'),
+                ({'PUBLISH': 'true', 'GITHUB_REF': 'refs/heads/task/md-6mqr'}, None),
+                ({'PUBLISH': 'true', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': ref}, None),
+                ({'PUBLISH': 'true', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': ref,
+                  'REFS': f'{commit}\t{ref}\n'}, '--verify-tag --prerelease'),
+                ({'RELEASES': json.dumps([{'id': 1, 'draft': True, 'tag_name': tag, 'body': 'owner draft'}])}, None),
+            ]
+            for changes, expected in scenarios:
+                with self.subTest(changes=changes):
+                    calls.unlink(missing_ok=True)
+                    result = subprocess.run(['bash', Path(__file__).with_name('github.sh'), assets],
+                                            env=env | changes, capture_output=True, text=True)
+                    argv = calls.read_text() if calls.exists() else ''
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn('release create', argv)
+                        self.assertNotIn('DELETE', argv)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(expected, argv)
+
+
 if __name__ == '__main__':
     unittest.main()
