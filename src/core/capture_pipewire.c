@@ -18,6 +18,7 @@
  * confirmed on T7610/P40.
  */
 #include "capture.h"
+#include "portal_lock.h"
 #ifdef MD_HAVE_PORTAL_INPUT
 #include "portal_session.h"
 #endif
@@ -85,7 +86,7 @@ typedef struct {
     char            sender[128]; /* munged bus unique name         */
     uint64_t        deadline_ns; /* one budget for the entire negotiation */
     char            owner[128]; /* unique sender of the portal method reply */
-    bool            opened;
+    bool            request_close_unconfirmed;
 } PortalScreencast;
 
 /* Absolute CLOCK_MONOTONIC time for pthread_cond_timedwait on the backend's
@@ -182,6 +183,17 @@ static char *portal_make_token(PortalScreencast *p, char *path_out, size_t path_
     return strdup(token);
 }
 
+/* Cleanup has its own bound, even when Start exhausted the consent budget. */
+static bool portal_close_object(PortalScreencast *p, const char *path, const char *iface) {
+    DBusMessage *msg = dbus_message_new_method_call(p->owner, path, iface, "Close");
+    if (!msg) return false;
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->bus, msg, 1000, NULL);
+    dbus_message_unref(msg);
+    bool ack = reply && dbus_message_has_sender(reply, p->owner) && dbus_message_has_signature(reply, "");
+    if (reply) dbus_message_unref(reply);
+    return ack;
+}
+
 /*
  * Wait for a Response signal on @request_path.
  * Returns the response code (0 = success) and stores the signal
@@ -228,21 +240,15 @@ static uint32_t portal_wait_response(PortalScreencast *p,
     MD_LOG_I("timeout waiting for Response on %s", request_path);
 
 done:
-    if (result == UINT32_MAX) {
-        DBusMessage *close = dbus_message_new_method_call(PORTAL_BUS_NAME,
-            request_path, PORTAL_REQUEST, "Close");
-        if (close) {
-            dbus_message_set_no_reply(close, TRUE);
-            dbus_connection_send(p->bus, close, NULL);
-            dbus_message_unref(close);
-        }
-    }
+    if (result == UINT32_MAX)
+        p->request_close_unconfirmed = !portal_close_object(p, request_path, PORTAL_REQUEST);
     return result;
 }
 
 /* All method waits, including Hello/authentication and AddMatch, consume the
  * same absolute startup budget. No unbounded flush or bus registration. */
-static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
+static DBusMessage *portal_call_status(PortalScreencast *p, DBusMessage *msg, bool *rejected) {
+    if (rejected) *rejected = false;
     int remaining = portal_remaining_ms(p, 180000);
     if (!msg || remaining <= 0) return NULL;
     DBusError err;
@@ -250,14 +256,31 @@ static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->bus, msg, remaining, &err);
     if (dbus_error_is_set(&err)) {
         MD_LOG_I("portal method failed: %s", err.name);
+        /* Only an error reply proves the method was handled and refused;
+         * a local timeout or disconnect leaves its request state unknown. */
+        if (rejected) *rejected = !dbus_error_has_name(&err, DBUS_ERROR_NO_REPLY) &&
+            !dbus_error_has_name(&err, DBUS_ERROR_TIMED_OUT) &&
+            !dbus_error_has_name(&err, DBUS_ERROR_DISCONNECTED);
         dbus_error_free(&err);
     }
     return reply;
 }
 
+static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
+    return portal_call_status(p, msg, NULL);
+}
+
 static bool portal_request(PortalScreencast *p, DBusMessage *msg, const char *path) {
-    DBusMessage *reply = portal_call(p, msg);
-    if (!reply) return false;
+    bool rejected;
+    DBusMessage *reply = portal_call_status(p, msg, &rejected);
+    if (!reply) {
+        /* The portal may already own @path (and a pending backend dialog)
+         * when its method reply is lost or late: cancel it before any
+         * Session.Close, exactly as for a missing Response. */
+        if (!rejected && p->owner[0])
+            p->request_close_unconfirmed = !portal_close_object(p, path, PORTAL_REQUEST);
+        return false;
+    }
     const char *actual = NULL;
     const char *sender = dbus_message_get_sender(reply);
     bool ok = dbus_message_has_signature(reply, "o") && sender && sender[0] == ':' &&
@@ -274,7 +297,7 @@ static void portal_screencast_close(PortalScreencast *portal);
 /*
  * portal_screencast_open:
  * Execute the full ScreenCast portal flow and return a PipeWire fd
- * and stream node_id.  Returns 0 on success, -1 on failure.
+ * and stream node_id. Returns 0 on success or an MD_CAPTURE_* error.
  *
  * On success, portal->pw_fd and portal->node_id are populated.
  * The caller must eventually call portal_screencast_close().
@@ -285,6 +308,7 @@ static void portal_screencast_close(PortalScreencast *portal);
  * XDG_STATE_HOME so capture survives host restarts after one approval. */
 static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfig *cfg) {
     char restore_token[1024] = {0};
+    int status = MD_CAPTURE_ERROR;
     memset(portal, 0, sizeof(*portal));
     portal->pw_fd = -1;
     portal->deadline_ns = md_monotonic_ns() + (uint64_t)md_capture_consent_timeout_ms(cfg) * 1000000;
@@ -321,6 +345,9 @@ static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfi
         dbus_validate_bus_name(name, NULL) && dbus_bus_set_unique_name(portal->bus, name);
     dbus_message_unref(reply);
     if (!registered) goto fail;
+    bool gnome_seen = false;
+    int lock = md_portal_check_lock(portal->bus, portal->deadline_ns, !cfg->unattended, &gnome_seen);
+    if (lock) { status = lock; goto fail; }
 
     /* Subscribe before any portal method; ordered AddMatch has a bounded reply. */
     setup = dbus_message_new_method_call(DBUS_SERVICE_DBUS,
@@ -435,6 +462,9 @@ static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfi
         }
         MD_LOG_I("sources selected (monitor, cursor embedded)");
     }
+
+    lock = md_portal_check_lock(portal->bus, portal->deadline_ns, false, &gnome_seen);
+    if (lock) { status = lock; goto fail; }
 
     /* ── Step 3: Start (shows user consent dialog) ────────── */
     {
@@ -581,7 +611,6 @@ static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfi
         MD_LOG_I("PipeWire fd=%d, node_id=%u", portal->pw_fd, portal->node_id);
     }
 
-    portal->opened = true;
     if (restore_token[0]) {
         if (md_capture_restore_token_save(restore_token) == 0)
             MD_LOG_I("screencast consent persisted");
@@ -591,8 +620,9 @@ static int portal_screencast_open(PortalScreencast *portal, const MdCaptureConfi
     return 0;
 
 fail:
+    if (status == MD_CAPTURE_DESKTOP_LOCKED) MD_LOG_W("desktop locked; ScreenCast Start not sent");
     portal_screencast_close(portal);
-    return -1;
+    return status;
 }
 
 static void portal_screencast_close(PortalScreencast *portal) {
@@ -600,26 +630,13 @@ static void portal_screencast_close(PortalScreencast *portal) {
         close(portal->pw_fd);
         portal->pw_fd = -1;
     }
-    if (portal->bus && portal->session_handle) {
-        DBusMessage *msg = dbus_message_new_method_call(PORTAL_BUS_NAME,
-            portal->session_handle, "org.freedesktop.portal.Session", "Close");
-        if (msg) {
-            /* The portal acknowledges Close only after backend teardown.
-             * Without that boundary a new capture can race old allocations.
-             * Failed startup cleanup may not extend the consent deadline. */
-            int budget = portal->opened ? 1000 : portal_remaining_ms(portal, 1000);
-            if (budget > 0 && dbus_connection_get_is_authenticated(portal->bus)) {
-                DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-                    portal->bus, msg, budget, NULL);
-                if (reply) dbus_message_unref(reply);
-                else MD_LOG_I("portal session Close was not acknowledged");
-            } else {
-                dbus_message_set_no_reply(msg, TRUE);
-                dbus_connection_send(portal->bus, msg, NULL);
-                dbus_connection_read_write(portal->bus, 0);
-            }
-            dbus_message_unref(msg);
-        }
+    if (portal->request_close_unconfirmed) {
+        /* Don't race an in-flight Request.Close with an explicit Session.Close.
+         * Disconnect leaves remaining cleanup to the portal. */
+        MD_LOG_W("portal request Close unconfirmed; disconnecting without Session.Close");
+    } else if (portal->bus && portal->session_handle &&
+               !portal_close_object(portal, portal->session_handle, "org.freedesktop.portal.Session")) {
+        MD_LOG_I("portal session Close was not acknowledged");
     }
     free(portal->session_handle);
     portal->session_handle = NULL;
@@ -1112,12 +1129,13 @@ static int pw_start(MdCaptureCtx *ctx) {
     pw->broken = false;
     pw->stopping = false;
     uint32_t stream_node_id = PW_ID_ANY;
+    int status = MD_CAPTURE_ERROR;
 
     if (ctx->config.portal_input) {
 #ifdef MD_HAVE_PORTAL_INPUT
         if (!pw->paired) {
             pw->paired = md_portal_session_create(&ctx->config,
-                                                  md_capture_consent_timeout_ms(&ctx->config));
+                                                  md_capture_consent_timeout_ms(&ctx->config), &status);
             if (pw->paired) md_portal_session_watch(pw->paired, pw_wake_revoked, pw);
         }
         if (pw->paired) {
@@ -1125,7 +1143,7 @@ static int pw_start(MdCaptureCtx *ctx) {
             if (fd >= 0) pw->core = pw_context_connect_fd(pw->pw_ctx, fd, NULL, 0);
         }
 #endif
-    } else if (portal_screencast_open(&pw->portal, &ctx->config) == 0) {
+    } else if ((status = portal_screencast_open(&pw->portal, &ctx->config)) == 0) {
         /* Portal succeeded — connect using the portal's PipeWire fd */
         pw->portal_active = true;
         pw->core = pw_context_connect_fd(pw->pw_ctx,
@@ -1133,14 +1151,10 @@ static int pw_start(MdCaptureCtx *ctx) {
                                          NULL, 0);
         stream_node_id = pw->portal.node_id;
         MD_LOG_I("connected via portal (node=%u)", stream_node_id);
-    } else {
-        MD_LOG_I("portal authorization failed; refusing capture");
-        pw_cleanup_start_resources(pw);
-        return -1;
     }
     if (!pw->core) {
         pw_cleanup_start_resources(pw);
-        return -1;
+        return status == MD_CAPTURE_DESKTOP_LOCKED ? status : MD_CAPTURE_ERROR;
     }
 
     pw_core_add_listener(pw->core, &pw->core_listener, &core_events, pw);

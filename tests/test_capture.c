@@ -919,13 +919,50 @@ static void mock_portal(int ready, int mode) {
     DBusConnection *bus = dbus_bus_get_private(DBUS_BUS_SESSION, NULL);
     if (!bus || dbus_bus_request_name(bus, "org.freedesktop.portal.Desktop", 0, NULL) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER)
         _exit(20);
+    dbus_connection_set_exit_on_disconnect(bus, FALSE);
+    pid_t noise = -1;
+    bool locked = mode == 6;
+    if ((mode == 6 || mode == 7) && dbus_bus_request_name(bus, "org.gnome.ScreenSaver", 0, NULL) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER)
+        _exit(20);
+    bool request_acked = false;
     if (write(ready, "R", 1) != 1) _exit(21);
     while (dbus_connection_read_write(bus, -1)) {
         DBusMessage *call;
         while ((call = dbus_connection_pop_message(bus))) {
             const char *method = dbus_message_get_member(call);
+            if (dbus_message_is_method_call(call, "org.gnome.ScreenSaver", "GetActive")) {
+                dbus_bool_t active = locked;
+                DBusMessage *reply = dbus_message_new_method_return(call);
+                dbus_message_append_args(reply, DBUS_TYPE_BOOLEAN, &active, DBUS_TYPE_INVALID);
+                dbus_connection_send(bus, reply, NULL);
+                dbus_message_unref(reply);
+                dbus_message_unref(call);
+                dbus_connection_flush(bus);
+                continue;
+            }
+            if (dbus_message_is_method_call(call, "org.freedesktop.portal.Request", "Close")) {
+                if (mode == 2 || mode == 5 || mode == 8 || mode == 9) {
+                    /* Hold the reply briefly and report an already queued Session.Close.
+                     * Also require a reply-bearing request, independently of timing. */
+                    if (write(ready, dbus_message_get_no_reply(call) ? "N" : "Q", 1) != 1) _exit(24);
+                    dbus_connection_read_write(bus, 50);
+                    DBusMessage *early = dbus_connection_borrow_message(bus);
+                    bool premature = early && dbus_message_is_method_call(early, "org.freedesktop.portal.Session", "Close");
+                    if (early) dbus_connection_return_message(bus, early);
+                    if (premature && write(ready, "!", 1) != 1) _exit(24);
+                }
+                DBusMessage *reply = mode == 8 ? dbus_message_new_error(call, DBUS_ERROR_FAILED, "not closed") :
+                    dbus_message_new_method_return(call);
+                dbus_connection_send(bus, reply, NULL);
+                dbus_message_unref(reply);
+                dbus_message_unref(call);
+                dbus_connection_flush(bus);
+                request_acked = mode != 8;
+                continue;
+            }
             if (dbus_message_is_method_call(call, "org.freedesktop.portal.Session", "Close")) {
-                if (write(ready, "X", 1) != 1) _exit(24);
+                bool ordered = (mode != 2 && mode != 5 && mode != 8 && mode != 9) || request_acked;
+                if (write(ready, ordered && !dbus_message_get_no_reply(call) ? "X" : "!", 1) != 1) _exit(24);
                 DBusMessage *closed = dbus_message_new_method_return(call);
                 dbus_connection_send(bus, closed, NULL);
                 dbus_message_unref(closed);
@@ -947,19 +984,27 @@ static void mock_portal(int ready, int mode) {
             char event = (char)('0' + seq);
             if (write(ready, &event, 1) != 1) _exit(23);
             const char *request = path;
-            DBusMessage *reply = dbus_message_new_method_return(call);
-            dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &request, DBUS_TYPE_INVALID);
-            dbus_connection_send(bus, reply, NULL);
-            dbus_message_unref(reply);
-            if ((mode == 2 || mode == 5) && seq == 2) { /* Start never responds. */
+            /* Mode 9: Start's method reply is lost too; the request may still
+             * exist portal-side, so it must be closed before the session. */
+            if (!(mode == 9 && seq == 2)) {
+                DBusMessage *reply = dbus_message_new_method_return(call);
+                dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &request, DBUS_TYPE_INVALID);
+                dbus_connection_send(bus, reply, NULL);
+                dbus_message_unref(reply);
+            }
+            if (mode == 7 && seq == 1) locked = true;
+            if ((mode == 2 || mode == 5 || mode == 8 || mode == 9) && seq == 2) { /* Start never responds. */
                 /* Mode 5: steady unrelated Response chatter, from another
                  * connection, for longer than the consent budget. The portal
                  * itself stays responsive, so elapsed time measures only the
                  * client's wait: a deadline neither expires early per message
                  * (iteration counting) nor stretches past its budget. */
-                if (mode == 5 && fork() == 0) {
+                if (mode == 5) noise = fork();
+                if (noise == 0) {
+                    close(ready);
                     DBusConnection *other_bus = dbus_bus_get_private(DBUS_BUS_SESSION, NULL);
-                    for (int i = 0; other_bus && i < 300; i++) {
+                    if (other_bus) dbus_connection_set_exit_on_disconnect(other_bus, FALSE);
+                    for (int i = 0; other_bus && i < 300 && dbus_connection_get_is_connected(other_bus); i++) {
                         char other[600];
                         snprintf(other, sizeof(other), "%s_other%d", path, i);
                         DBusMessage *noise = dbus_message_new_signal(other,
@@ -1009,10 +1054,14 @@ static void mock_portal(int ready, int mode) {
             dbus_connection_flush(bus);
         }
     }
+    if (noise > 0) waitpid(noise, NULL, 0);
     _exit(0);
 }
 
 static void test_portal_responses(void) {
+    const char *desktop = getenv("XDG_CURRENT_DESKTOP");
+    char *saved_desktop = desktop ? strdup(desktop) : NULL;
+    unsetenv("XDG_CURRENT_DESKTOP");
     const char *old = getenv("DBUS_SESSION_BUS_ADDRESS");
     char *saved = old ? strdup(old) : NULL;
     char state[] = "/tmp/md-capture-response-XXXXXX";
@@ -1020,7 +1069,7 @@ static void test_portal_responses(void) {
     old = getenv("XDG_STATE_HOME");
     char *saved_state = old ? strdup(old) : NULL;
     setenv("XDG_STATE_HOME", state, 1);
-    for (int mode = 0; mode < 6; mode++) {
+    for (int mode = 0; mode < 10; mode++) {
         int output[2], ready[2];
         MD_CHECK(pipe(output) == 0 && pipe(ready) == 0);
         pid_t daemon = fork();
@@ -1045,14 +1094,15 @@ static void test_portal_responses(void) {
         char byte = 0;
         MD_CHECK(read(ready[0], &byte, 1) == 1 && byte == 'R');
         if (mode == 4) MD_CHECK(md_capture_restore_token_save("\xff\xfe") == 0);
+        if (mode == 6 || mode == 7) MD_CHECK(md_capture_restore_token_save("locked-consent") == 0);
         MdCaptureConfig cfg = {.unattended = true, .consent_timeout_ms = 500};
         MdCaptureCtx *ctx = md_capture_create(&cfg);
         MD_CHECK(ctx != NULL);
         double start = test_now();
-        MD_CHECK(md_capture_start(ctx) == -1);
+        MD_CHECK(md_capture_start(ctx) == (mode == 6 || mode == 7 ? MD_CAPTURE_DESKTOP_LOCKED : MD_CAPTURE_ERROR));
         double elapsed = test_now() - start;
         MD_CHECK(elapsed < 1.5);
-        if (mode == 2 || mode == 5) MD_CHECK(elapsed >= .4);
+        if (mode == 2 || mode == 5 || mode == 8 || mode == 9) MD_CHECK(elapsed >= .4);
         MdFrame frame;
         MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_ERROR);
         md_capture_destroy(ctx);
@@ -1061,17 +1111,26 @@ static void test_portal_responses(void) {
             MD_CHECK(md_capture_restore_token_load(token, sizeof(token)) == 2);
             MD_CHECK(md_capture_restore_token_forget() == 0);
         }
-        kill(portal, SIGTERM); kill(daemon, SIGTERM);
-        MD_CHECK(waitpid(portal, NULL, 0) == portal);
+        if (mode == 6 || mode == 7) {
+            char token[32] = {0};
+            MD_CHECK(md_capture_restore_token_load(token, sizeof(token)) == strlen("locked-consent"));
+            MD_CHECK(!strcmp(token, "locked-consent"));
+            MD_CHECK(md_capture_restore_token_forget() == 0);
+        }
+        kill(daemon, SIGTERM);
         MD_CHECK(waitpid(daemon, NULL, 0) == daemon);
+        int status;
+        MD_CHECK(waitpid(portal, &status, 0) == portal && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         char events[16] = {0};
         ssize_t n = read(ready[0], events, sizeof(events)-1);
-        MD_CHECK(n > 0);
+        MD_CHECK(mode == 6 ? n == 0 : n > 0);
         close(ready[0]);
-        bool start_stall = mode == 2 || mode == 5;
-        const char *expected = mode == 0 ? "01X" : mode == 3 ? "012X" : mode == 4 ? "0X" : start_stall ? "012" : "0";
-        MD_CHECK(strcmp(events, expected) == 0 || (start_stall && !strcmp(events, "012X")));
+        bool start_stall = mode == 2 || mode == 5 || mode == 9;
+        const char *expected = mode == 0 || mode == 7 ? "01X" : mode == 3 ? "012X" :
+            mode == 4 ? "0X" : start_stall ? "012QX" : mode == 6 ? "" : mode == 8 ? "012Q" : "0";
+        MD_CHECK(strcmp(events, expected) == 0);
     }
+    if (saved_desktop) { setenv("XDG_CURRENT_DESKTOP", saved_desktop, 1); free(saved_desktop); }
     char leaf[512];
     snprintf(leaf, sizeof(leaf), "%s/metadesk", state);
     MD_CHECK(rmdir(leaf) == 0 && rmdir(state) == 0);

@@ -1958,14 +1958,20 @@ signaling_ready:
         capture = md_capture_create(&cap_cfg);
         int capture_status = host_start_capture(capture, &display_width, &display_height, &ctx);
         if (capture_status != 0) {
-            fprintf(stderr, "ERROR: capture unavailable: authorize screen sharing and retry; "
-                    "refusing video session (use --no-capture only for fixtures)\n");
+            if (capture_status == MD_CAPTURE_DESKTOP_LOCKED) {
+                fprintf(stderr, "ERROR: desktop locked: unlock locally and retry screen sharing\n");
+                md_host_lifecycle_event("desktop_locked", startup_status);
+            } else {
+                fprintf(stderr, "ERROR: capture unavailable: authorize screen sharing and retry; "
+                        "refusing video session (use --no-capture only for fixtures)\n");
+            }
             if (managed && capture_status == MD_CAPTURE_INTERACTION_REQUIRED) {
                 startup_status = MD_HOST_EXIT_CONFIG;
                 md_host_access_lifecycle(&access, managed, "needs_interaction");
                 md_host_lifecycle_event("needs_interaction", startup_status);
             }
-            host_reject_request(&ctx, "capture_unavailable");
+            host_reject_request(&ctx, capture_status == MD_CAPTURE_DESKTOP_LOCKED
+                ? "desktop_locked" : "capture_unavailable");
             if (capture) md_capture_destroy(capture);
             md_stream_server_destroy(srv);
             goto signaling_failed;

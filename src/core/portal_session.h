@@ -8,7 +8,7 @@ typedef struct MdPortalSession MdPortalSession;
 /* Capture retains one reference across stop/start. The input backend takes
  * another when attaching; the final release closes the session and EIS. */
 MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture,
-                                          uint32_t timeout_ms);
+                                          uint32_t timeout_ms, int *status);
 void md_portal_session_unref(MdPortalSession *session);
 int md_portal_session_open_capture(MdPortalSession *session, uint32_t *node);
 bool md_portal_session_revoked(const MdPortalSession *session);

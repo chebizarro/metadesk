@@ -72,8 +72,11 @@ jobs:
         id: nostrc
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
+          # The FFmpeg dylibs copied into prefix retain install names from
+          # their original install tree; a warm restore needs both locations.
           path: |
             ${{ runner.temp }}/md-deps/prefix
+            ${{ runner.temp }}/md-deps/build/ffmpeg/install/lib
             ${{ runner.temp }}/md-deps/sources/nostrc
             ${{ runner.temp }}/md-deps/build/nostrc
           key: nostrc-macos-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ env.NOSTRC_REVISION }}-${{ hashFiles('packaging/macos/build-deps.py', 'packaging/macos/deps.lock.json', 'packaging/git_source.py', 'packaging/ffmpeg/build-minimal-lgpl.sh', '.github/workflows/ci.yml') }}

@@ -148,6 +148,8 @@ static void server(int commands, int notices, int mode) {
     DBusError err = DBUS_ERROR_INIT;
     DBusConnection *bus = dbus_bus_get_private(DBUS_BUS_SESSION, &err);
     if (!bus || dbus_bus_request_name(bus, PORTAL, DBUS_NAME_FLAG_DO_NOT_QUEUE, &err) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) _exit(2);
+    dbus_bool_t locked = mode >= 15 && mode != 17;
+    if (mode >= 15 && dbus_bus_request_name(bus, "org.gnome.ScreenSaver", 0, &err) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) _exit(2);
     DBusConnection *replacement_owner = NULL;
     struct eis *eis = eis_new(NULL);
     eis_setup_backend_fd(eis);
@@ -180,7 +182,22 @@ static void server(int commands, int notices, int mode) {
                 if (!valid) atomic_fetch_add(&stats->bad_calls, 1);
                 step++;
             }
-            if (dbus_message_is_method_call(msg, DBUS_INTERFACE_PROPERTIES, "Get")) {
+            if (dbus_message_is_method_call(msg, "org.gnome.ScreenSaver", "GetActive")) {
+                DBusMessage *reply = dbus_message_new_method_return(msg);
+                dbus_message_append_args(reply, DBUS_TYPE_BOOLEAN, &locked, DBUS_TYPE_INVALID);
+                if (locked && mode == 16) {
+                    if (write(notices, "L", 1) != 1) _exit(2);
+                    struct pollfd command_poll = {commands, POLLIN, 0};
+                    char command;
+                    if (poll(&command_poll, 1, 2000) != 1 || read(commands, &command, 1) != 1 || command != 'U') _exit(2);
+                    locked = FALSE;
+                    /* Order the unlock before the older GetActive snapshot reply. */
+                    DBusMessage *changed = dbus_message_new_signal("/org/gnome/ScreenSaver", "org.gnome.ScreenSaver", "ActiveChanged");
+                    dbus_message_append_args(changed, DBUS_TYPE_BOOLEAN, &locked, DBUS_TYPE_INVALID);
+                    send_message(bus, changed);
+                }
+                send_message(bus, reply);
+            } else if (dbus_message_is_method_call(msg, DBUS_INTERFACE_PROPERTIES, "Get")) {
                 DBusMessage *reply = dbus_message_new_method_return(msg);
                 DBusMessageIter args, variant; uint32_t version = 2;
                 dbus_message_iter_init_append(reply, &args);
@@ -219,15 +236,19 @@ static void server(int commands, int notices, int mode) {
                     if (!strcmp(method, "SelectDevices") && mode >= 8) {
                         const char *restore = get_option(msg, "restore_token");
                         const char *expected = mode == 8 ? "fixture-restore" : mode == 9 ? "paired-first" :
-                            mode == 10 ? "paired-next" : mode == 11 ? "paired-next" : NULL;
+                            mode == 10 || mode == 11 ? "paired-next" : mode >= 15 ? "locked-restore" : NULL;
                         if (expected ? (restore && !strcmp(expected, restore)) : !restore)
                             atomic_fetch_add(&stats->restore_matches, 1);
                     }
                     DBusMessageIter opt;
+                    if (mode == 17 && !strcmp(method, "SelectSources")) locked = TRUE;
                     if (!strcmp(method, "SelectSources") &&
                         (find_option(msg, "restore_token", &opt) || find_option(msg, "persist_mode", &opt)))
                         atomic_fetch_add(&stats->bad_calls, 1);
-                    if (!strcmp(method, "Start")) atomic_fetch_add(&stats->starts, 1);
+                    if (!strcmp(method, "Start")) {
+                        if (locked) atomic_fetch_add(&stats->bad_calls, 1);
+                        atomic_fetch_add(&stats->starts, 1);
+                    }
                     DBusMessage *reply = dbus_message_new_method_return(msg);
                     const char *path_arg = path;
                     dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &path_arg, DBUS_TYPE_INVALID);
@@ -468,6 +489,67 @@ static void check_paired(int mode, int commands, int notices) {
     MD_CHECK(atomic_load(&stats->session_closes) == 1);
 }
 
+static void *start_capture(void *data) {
+    CaptureWait *wait = data;
+    wait->status = md_capture_start(wait->capture);
+    return NULL;
+}
+
+static void check_locked(int mode, int commands, int notices) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/metadesk/remote-desktop.token", getenv("XDG_STATE_HOME"));
+    static const char token[] = "locked-restore";
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    MD_CHECK(fd >= 0);
+    if (fd < 0) return;
+    MD_CHECK(write(fd, token, sizeof(token) - 1) == sizeof(token) - 1);
+    close(fd);
+
+    MdCaptureConfig cfg = {.portal_input = true, .consent_timeout_ms = mode == 15 ? 500 : 3000,
+                           .no_interaction = true, .unattended = mode == 18};
+    MdCaptureCtx *cap = md_capture_create(&cfg);
+    MD_CHECK(cap && md_capture_start(cap) == MD_CAPTURE_INTERACTION_REQUIRED);
+    md_capture_destroy(cap);
+    cfg.no_interaction = false;
+    cap = md_capture_create(&cfg);
+    MD_CHECK(cap != NULL);
+    if (!cap) return;
+    if (mode != 16) {
+        int64_t start = md_now_ms();
+        MD_CHECK(md_capture_start(cap) == MD_CAPTURE_DESKTOP_LOCKED);
+        if (mode == 18) MD_CHECK(md_now_ms() - start < 1500);
+        MD_CHECK(atomic_load(&stats->requests) == (mode == 17 ? 3 : 0));
+        MD_CHECK(atomic_load(&stats->starts) == 0);
+        MD_CHECK(atomic_load(&stats->session_closes) == (mode == 17 ? 1 : 0));
+        char saved[sizeof(token)] = {0};
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        MD_CHECK(fd >= 0);
+        if (fd >= 0) {
+            MD_CHECK(read(fd, saved, sizeof(saved)) == sizeof(token) - 1);
+            MD_CHECK(!memcmp(saved, token, sizeof(token)));
+            close(fd);
+        }
+    } else {
+        CaptureWait wait = {.capture = cap};
+        pthread_t thread;
+        int rc = pthread_create(&thread, NULL, start_capture, &wait);
+        MD_CHECK(rc == 0);
+        if (!rc) {
+            MD_CHECK(notice(notices, 'L'));
+            MD_CHECK(atomic_load(&stats->requests) == 0);
+            MD_CHECK(atomic_load(&stats->starts) == 0);
+            MD_CHECK(write(commands, "U", 1) == 1);
+            MD_CHECK(pthread_join(thread, NULL) == 0);
+            MD_CHECK(wait.status == 0);
+        }
+        MD_CHECK(atomic_load(&stats->starts) == 1);
+        MD_CHECK(atomic_load(&stats->restore_matches) == 1);
+        MD_CHECK(atomic_load(&stats->opens) == 1);
+    }
+    md_capture_destroy(cap);
+    MD_CHECK(atomic_load(&stats->bad_calls) == 0);
+}
+
 int main(void) {
     /* Must be launched on a private bus by the wrapper below. */
     if (!getenv("MD_PORTAL_PRIVATE_TEST")) return 77;
@@ -476,7 +558,7 @@ int main(void) {
     MD_CHECK(stats != MAP_FAILED);
     if (stats == MAP_FAILED) return md_test_report();
     MD_CHECK(md_capture_restore_token_save("independent-screencast") == 0);
-    for (int mode=0; mode<15; mode++) {
+    for (int mode=0; mode<19; mode++) {
         memset(stats,0,sizeof(*stats));
         int commands[2], notices[2];
         if (pipe(commands) || pipe(notices)) return 1;
@@ -485,6 +567,10 @@ int main(void) {
         close(commands[0]); close(notices[1]);
         MD_CHECK(child > 0); MD_CHECK(notice(notices[0],'R'));
         MD_CHECK(md_input_portal_available());
+        if (mode >= 15) {
+            check_locked(mode, commands[1], notices[0]);
+            goto finish;
+        }
         if (mode >= 8) {
             check_paired(mode, commands[1], notices[0]);
             goto finish;
