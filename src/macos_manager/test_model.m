@@ -119,21 +119,28 @@ void md_managed_store_close(MdManagedStore *store) {
 static void check_accounts_and_cache(void) {
     NSFileManager *files = NSFileManager.defaultManager;
     NSString *home = [files.temporaryDirectory.path stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-    NSString *accounts = [home stringByAppendingPathComponent:@"Library/Application Support/metadesk"];
     NSDictionary *directoryMode = @{NSFilePosixPermissions: @0700};
     BOOL created = [files createDirectoryAtPath:home withIntermediateDirectories:NO attributes:directoryMode error:nil];
     MD_CHECK(created);
     if (!created) return;
+    // The account reader rejects symlinks in parent paths (including /var and /tmp).
+    char *canonical = realpath(home.fileSystemRepresentation, NULL);
+    MD_CHECK(canonical != NULL);
+    if (!canonical) { MD_CHECK([files removeItemAtPath:home error:nil]); return; }
+    NSString *accounts = [[files stringWithFileSystemRepresentation:canonical length:strlen(canonical)]
+        stringByAppendingPathComponent:@"Library/Application Support/metadesk"];
     const char *saved = getenv("HOME");
     char *previousHome = saved ? strdup(saved) : NULL;
-    int rc = setenv("HOME", home.fileSystemRepresentation, 1);
+    int rc = setenv("HOME", canonical, 1);
+    free(canonical);
     MD_CHECK(!rc);
     @try {
         if (rc) return; /* never read the operator's account directory on setup failure */
         created = [files createDirectoryAtPath:accounts withIntermediateDirectories:YES attributes:directoryMode error:nil];
         MD_CHECK(created);
         if (!created) return;
-        MD_CHECK([MDAccountsSummary() containsString:@"Client role\nNot assigned\n\nHost role\nNot assigned"]);
+        NSString *emptySummary = MDAccountsSummary();
+        MD_CHECK_MSG([emptySummary containsString:@"Client role\nNot assigned\n\nHost role\nNot assigned"], emptySummary.UTF8String);
         MD_CHECK([MDCachedHosts(home) containsString:@"Assign a client role"] && store_opens == 0);
         NSString *pair = @"{\"backend\":\"nip46\",\"pubkey\":\"" KEY "\"}";
         NSString *metadata = [NSString stringWithFormat:
