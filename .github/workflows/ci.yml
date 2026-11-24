@@ -34,7 +34,7 @@ jobs:
             libxcb-xinput-dev libxcb1-dev libxau-dev libx11-dev libei-dev libeis-dev libxkbcommon-dev \
             uuid-dev libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev \
             libjansson-dev libbz2-dev libcjson-dev libb2-dev libnsync-dev libsodium-dev \
-            libevent-dev dbus-x11 xvfb xauth at-spi2-core pipewire-bin
+            libevent-dev dbus-x11 xvfb xauth at-spi2-core pipewire-bin gnome-keyring
       - name: Cache nostrc SDK
         id: nostrc
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -53,6 +53,7 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/nostrc-sdk/lib/pkgconfig"
           meson setup build -Dnostrc_discovery=installed -Dsigner_nip5f=true -Dmanager=true
           meson test -C build --list | grep -F 'input portal private bus + EIS'
+          meson test -C build --list | grep -F 'account_secret_service'
       - name: Compile
         run: meson compile -C build
       - name: Test
