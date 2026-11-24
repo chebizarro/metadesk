@@ -15,8 +15,12 @@
 #include <string.h>
 
 static pthread_once_t curl_once = PTHREAD_ONCE_INIT;
-static bool curl_ready;
-static void init_curl(void) { curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK; }
+static bool curl_ready, curl_async_dns;
+static void init_curl(void) {
+    curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    const curl_version_info_data *version = curl_ready ? curl_version_info(CURLVERSION_NOW) : NULL;
+    curl_async_dns = version && (version->features & CURL_VERSION_ASYNCHDNS);
+}
 bool md_discovery_http_init(void) {
     pthread_once(&curl_once, init_curl);
     return curl_ready;
@@ -38,9 +42,13 @@ static bool public_address(const struct sockaddr *addr, size_t len) {
     if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
         const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)addr;
         const unsigned char *ip = v6->sin6_addr.s6_addr;
-        if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr)) return public_v4(ip + 12);
+        static const unsigned char nat64[] = {0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0};
+        if (v6->sin6_scope_id) return false;
+        if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr) || !memcmp(ip, nat64, sizeof(nat64)))
+            return public_v4(ip + 12);
         /* Global unicast only; exclude 6to4, Teredo, and documentation. */
-        return !v6->sin6_scope_id && (ip[0] & 0xe0) == 0x20 &&
+        return (ip[0] & 0xe0) == 0x20 &&
+            !(ip[0] == 0x3f && ip[1] == 0xff && (ip[2] & 0xf0) == 0) &&
             !(ip[0] == 0x20 && (ip[1] == 2 || (ip[1] == 1 &&
                 ((ip[2] == 0 && ip[3] == 0) || (ip[2] == 0x0d && ip[3] == 0xb8)))));
     }
@@ -150,7 +158,9 @@ static size_t append_body(char *data, size_t size, size_t count, void *user) {
 
 char *md_discovery_http_get(const char *url, const char *accept, bool public_only,
                             long timeout_ms, bool *unsafe) {
-    CURL *curl = md_discovery_http_init() ? curl_easy_init() : NULL;
+    /* NOSIGNAL cannot bound a synchronous resolver. Do not start a transfer
+     * unless the runtime libcurl can enforce the DNS portion of its timeout. */
+    CURL *curl = md_discovery_http_init() && curl_async_dns ? curl_easy_init() : NULL;
     struct curl_slist *headers = NULL;
     Body body = {0};
     bool blocked = false, ok = false;

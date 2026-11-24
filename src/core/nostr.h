@@ -179,6 +179,8 @@ typedef struct {
     void (*on_dm_error)(MdNostrDmResult result, void *userdata);
     MdNostrOwnerRevokedCallback on_owner_revoked;
     void *owner_userdata;
+    /* Terminal DM inbox refusal; URL and reason are borrowed for this call. */
+    void (*on_dm_relay_unavailable)(const char *url, const char *reason, void *userdata);
 } MdNostrCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────

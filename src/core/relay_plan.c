@@ -126,9 +126,22 @@ void md_relay_metadata_clear(MdRelayMetadata *metadata) {
     memset(metadata, 0, sizeof(*metadata));
 }
 
-static void add_urls(MdRelayPlan *out, char **urls, size_t count, MdRelaySource source) {
-    for (size_t i = 0; i < count && out->count < MD_RELAY_TARGET_MAX; ++i)
-        md_relay_plan_add(out, urls[i], source);
+static void add_urls(MdRelayPlan *out, char **urls, size_t count, MdRelaySource source,
+                     const MdRelayPlan *bootstrap) {
+    for (size_t i = 0; i < count && out->count < MD_RELAY_TARGET_MAX; ++i) {
+        /* Explicit approval is for an exact URL, not its host or any URL the
+         * metadata may name. Metadata can assign a role to that same relay. */
+        char *canonical = relay_url(urls[i], true, 0);
+        MdRelaySource provenance = source;
+        if (canonical) for (size_t b = 0; b < bootstrap->count; ++b)
+            if (bootstrap->target[b].source == MD_RELAY_CONFIGURED &&
+                !strcmp(canonical, bootstrap->target[b].url)) {
+                provenance = MD_RELAY_CONFIGURED;
+                break;
+            }
+        if (canonical) md_relay_plan_add(out, canonical, provenance);
+        free(canonical);
+    }
 }
 
 static void add_bootstrap(MdRelayPlan *out, const MdRelayPlan *bootstrap) {
@@ -143,27 +156,28 @@ static void add_hints(MdRelayPlan *out, const MdIdentity *address) {
                           MD_RELAY_NIP05 : MD_RELAY_NPROFILE);
 }
 
-static void add_nip65(MdRelayPlan *out, const MdRelayMetadata *metadata, bool read, bool write) {
+static void add_nip65(MdRelayPlan *out, const MdRelayMetadata *metadata, bool read, bool write,
+                      const MdRelayPlan *bootstrap) {
     NostrRelayList *list = NULL;
     if (!metadata || !metadata->nip65 || nostr_nip65_parse_relay_list(metadata->nip65, &list)) return;
     size_t count = 0;
     if (read) {
         char **urls = nostr_nip65_get_read_relays(list, &count);
-        if (urls) add_urls(out, urls, count, MD_RELAY_NIP65);
+        if (urls) add_urls(out, urls, count, MD_RELAY_NIP65, bootstrap);
         nostr_nip65_free_string_array(urls);
     }
     if (write) {
         char **urls = nostr_nip65_get_write_relays(list, &count);
-        if (urls) add_urls(out, urls, count, MD_RELAY_NIP65);
+        if (urls) add_urls(out, urls, count, MD_RELAY_NIP65, bootstrap);
         nostr_nip65_free_string_array(urls);
     }
     nostr_nip65_list_free(list);
 }
 
-static void add_dm(MdRelayPlan *out, const MdRelayMetadata *metadata) {
+static void add_dm(MdRelayPlan *out, const MdRelayMetadata *metadata, const MdRelayPlan *bootstrap) {
     if (!metadata || !metadata->dm) return;
     NostrDmRelayList *list = nostr_nip17_parse_dm_relay_list(metadata->dm);
-    if (list) add_urls(out, list->relays, list->count, MD_RELAY_DM_LIST);
+    if (list) add_urls(out, list->relays, list->count, MD_RELAY_DM_LIST, bootstrap);
     nostr_nip17_free_dm_relay_list(list);
 }
 
@@ -174,18 +188,37 @@ MdRelayPlanStatus md_relay_plan_build(MdRelayPlan *out, MdRelayRole role,
     case MD_RELAY_BOOTSTRAP: add_bootstrap(out, bootstrap); break;
     case MD_RELAY_DISCOVERY: add_bootstrap(out, bootstrap); add_hints(out, address); break;
     case MD_RELAY_STORE:
-        add_nip65(out, metadata, false, true);
+        add_nip65(out, metadata, false, true, bootstrap);
         if (!out->count) add_bootstrap(out, bootstrap);
         break;
-    case MD_RELAY_FETCH: add_bootstrap(out, bootstrap); add_nip65(out, metadata, true, true); break;
-    case MD_RELAY_DM_IN: add_dm(out, metadata); break;
+    case MD_RELAY_FETCH: add_bootstrap(out, bootstrap); add_nip65(out, metadata, true, true, bootstrap); break;
+    case MD_RELAY_DM_IN: add_dm(out, metadata, bootstrap); break;
     case MD_RELAY_DM_OUT:
-        add_dm(out, metadata);
-        if (!out->count) add_nip65(out, metadata, true, false);
+        add_dm(out, metadata, bootstrap);
+        if (!out->count) add_nip65(out, metadata, true, false, bootstrap);
         if (!out->count) { add_hints(out, address); add_bootstrap(out, bootstrap); }
         break;
     }
     return out->count ? MD_RELAY_READY : MD_RELAY_NO_TARGETS;
+}
+
+size_t md_relay_plan_union(const MdRelayPlan *plans, const unsigned *roles,
+                           size_t count, MdRelayUse out[MD_RELAY_CONNECTION_MAX]) {
+    size_t selected = 0;
+    /* First give every nonempty role a target, then distribute the remainder. */
+    for (size_t i = 0; i < MD_RELAY_TARGET_MAX; ++i) for (size_t p = 0; p < count; ++p) {
+        if (i >= plans[p].count) continue;
+        const MdRelayTarget *t = &plans[p].target[i];
+        size_t j = 0;
+        while (j < selected && strcmp(out[j].target->url, t->url)) j++;
+        if (j == selected) {
+            if (selected == MD_RELAY_CONNECTION_MAX) continue;
+            out[selected++] = (MdRelayUse){t, 0};
+        }
+        if (t->source == MD_RELAY_CONFIGURED) out[j].target = t;
+        out[j].mask |= roles[p];
+    }
+    return selected;
 }
 
 MdRelayAuth md_relay_auth_from_json(const char *json) {

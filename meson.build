@@ -1068,6 +1068,12 @@ test('nostr ACL and AUTH private relays', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr],
   env : nostr_test_env, timeout : 120,
 )
+test_nostr_routes = executable('test_nostr_routes', 'tests/test_nostr_routes.c',
+  dependencies : dep_metadesk)
+test('nostr routed bridge private relays', find_program('python3'),
+  args : [files('tests/nostr_routes_fixture.py'), test_nostr_routes],
+  env : nostr_test_env, timeout : 65)
+
 test('nostr ACL silent relay deadline', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr, '--silent-relay'],
   env : nostr_test_env, timeout : 20,

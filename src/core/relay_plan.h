@@ -11,6 +11,8 @@ typedef enum { MD_RELAY_CONFIGURED, MD_RELAY_NIP05, MD_RELAY_NPROFILE,
 typedef enum { MD_RELAY_BOOTSTRAP, MD_RELAY_DISCOVERY, MD_RELAY_STORE,
                MD_RELAY_FETCH, MD_RELAY_DM_IN, MD_RELAY_DM_OUT } MdRelayRole;
 typedef enum { MD_RELAY_READY, MD_RELAY_NO_BOOTSTRAP, MD_RELAY_NO_TARGETS } MdRelayPlanStatus;
+#define MD_RELAY_CONNECTION_MAX 32
+
 typedef struct { char *url; MdRelaySource source; } MdRelayTarget;
 typedef struct {
     MdRelayTarget target[MD_RELAY_TARGET_MAX];
@@ -18,6 +20,12 @@ typedef struct {
     uint64_t deadline_ns; /* Optional shared monotonic deadline for DNS validation. */
 } MdRelayPlan;
 typedef struct { NostrEvent *nip65, *dm; } MdRelayMetadata;
+typedef struct { const MdRelayTarget *target; unsigned mask; } MdRelayUse;
+
+/* Round-robin a bounded connection union, merging roles for the same URL.
+ * Returned targets borrow from plans. */
+size_t md_relay_plan_union(const MdRelayPlan *plans, const unsigned *roles,
+                           size_t count, MdRelayUse out[MD_RELAY_CONNECTION_MAX]);
 
 /* Canonicalize, enforce WSS + public addresses for automatic sources, and
  * deduplicate. Explicitly configured URLs may be private or use WS. */

@@ -37,7 +37,31 @@ static void expect(const MdRelayPlan *p, size_t i, const char *url, MdRelaySourc
     CHECK(md_relay_target_check(&p->target[i], 0));
 }
 
+static void test_connection_budget(void) {
+    MdRelayPlan roles[4] = {0};
+    const unsigned masks[] = {1, 2, 4, 8};
+    MdRelayUse union_targets[MD_RELAY_CONNECTION_MAX];
+    for (size_t r = 0; r < 4; ++r) {
+        for (size_t i = 0; i < MD_RELAY_TARGET_MAX; ++i) {
+            char url[100];
+            snprintf(url, sizeof(url), "wss://8.8.8.8/%zu/%zu", r, i);
+            CHECK(md_relay_plan_add(&roles[r], url, MD_RELAY_NIP65));
+        }
+        CHECK(!md_relay_plan_add(&roles[r], "wss://8.8.4.4/extra", MD_RELAY_NIP65));
+    }
+    CHECK(md_relay_plan_union(roles, masks, 4, union_targets) == MD_RELAY_CONNECTION_MAX);
+    for (size_t i = 0; i < MD_RELAY_CONNECTION_MAX; ++i)
+        CHECK(union_targets[i].mask == masks[i % 4]);
+    md_relay_plan_clear(&roles[1]);
+    CHECK(md_relay_plan_add(&roles[1], roles[0].target[0].url, MD_RELAY_CONFIGURED));
+    CHECK(md_relay_plan_union(roles, masks, 4, union_targets) == MD_RELAY_CONNECTION_MAX);
+    CHECK(union_targets[0].mask == (masks[0] | masks[1]));
+    CHECK(union_targets[0].target->source == MD_RELAY_CONFIGURED);
+    for (size_t i = 0; i < 4; ++i) md_relay_plan_clear(&roles[i]);
+}
+
 int main(void) {
+    test_connection_budget();
     MdRelayPlan p = {0}, bootstrap = {0};
     MdRelayMetadata m = {0};
     MdIdentity hints = {.hint_source = MD_HINT_NPROFILE, .hint_count = 1, .hints = {"wss://1.1.1.1/hint/"}};
@@ -45,7 +69,10 @@ int main(void) {
     CHECK(!p.count);
     const char *invalid[] = {"wss://127.0.0.1", "wss://127.1", "wss://2130706433",
         "wss://localhost", "wss://10.2.3.4", "wss://172.16.4.5", "wss://192.168.1.1",
-        "wss://169.254.1.1", "wss://[::1]", "wss://[fd00::1]", "wss://[fe80::1]",
+        "wss://169.254.1.1", "wss://0.0.0.0", "wss://100.64.0.1", "wss://100.127.255.255",
+        "wss://[::1]", "wss://[fd00::1]", "wss://[fe80::1]", "wss://[2002:0808:0808::1]",
+        "wss://[2001:0:1234::1]", "wss://[3fff:fff::1]", "wss://[64:ff9b::a00:1]",
+        "wss://[64:ff9b::7f00:1]", "wss://[64:ff9b::6440:1]",
         "wss://[::ffff:10.0.0.1]", "wss://user@8.8.8.8", "wss://8.8.8.8/#x",
         "wss://8.8.8.8:0", "wss://8.8.8.8:65536", "ws://8.8.8.8", "http://8.8.8.8"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
@@ -55,6 +82,9 @@ int main(void) {
     }
     MdRelayTarget expired = {"wss://8.8.8.8", MD_RELAY_NIP05};
     CHECK(!md_relay_target_check(&expired, 1));
+    CHECK(md_relay_target_check(&expired, 0));
+    MdRelayTarget nat64 = {"wss://[64:ff9b::808:808]", MD_RELAY_NIP05};
+    CHECK(md_relay_target_check(&nat64, 0));
     CHECK(md_relay_plan_add(&bootstrap, "ws://127.0.0.1:80/", MD_RELAY_CONFIGURED));
     CHECK(md_relay_plan_add(&bootstrap, "ws://127.0.0.1", MD_RELAY_CONFIGURED));
     CHECK(bootstrap.count == 1);
@@ -102,6 +132,19 @@ int main(void) {
         md_relay_plan_clear(&p);
     }
     md_relay_metadata_clear(&m);
+    NostrEvent *tie = metadata(NOSTR_KIND_DM_RELAY_LIST, 3, "wss://8.8.4.4/dm");
+    char *a = nostr_event_get_id(inbox), *b = nostr_event_get_id(tie);
+    CHECK(a && b && strcmp(a, b));
+    NostrEvent *lowest = strcmp(a, b) < 0 ? inbox : tie;
+    NostrEvent *highest = lowest == inbox ? tie : inbox;
+    CHECK(md_relay_metadata_offer(&m, PK, highest));
+    CHECK(md_relay_metadata_offer(&m, PK, lowest));
+    CHECK(!md_relay_metadata_offer(&m, PK, highest));
+    char *winner = nostr_event_get_id(m.dm);
+    CHECK(winner && !strcmp(winner, lowest == inbox ? a : b));
+    free(winner); free(a); free(b);
+    md_relay_metadata_clear(&m);
+    nostr_event_free(tie);
     nostr_event_free(inbox);
     nostr_event_free(old);
     nostr_event_free(outbox);

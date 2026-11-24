@@ -26,14 +26,17 @@ check on each saved relay. No authentication requirement advertised by NIP-11
 is not a guarantee that a relay will not send a NIP-42 challenge.
 
 The client looks for signed NIP-65 and kind-10050 lists on bootstrap relays
-and valid address hints. It subscribes for incoming DMs on its own inbox
+and valid address hints. It requests its own lists only on bootstrap relays.
+It does not answer NIP-42 challenges on relays used only as peer hints. It subscribes for incoming DMs on its own inbox
 list and publishes outgoing DMs to the recipient's inbox list. If the
 recipient has no usable inbox targets, it selects the recipient's NIP-65 read
-targets, or address hints and bootstrap relays if no read targets are usable. Without a local DM list it
-receives on the explicit bootstrap relays for compatibility. Client
+targets, or address hints and bootstrap relays if no read targets are usable. Without a usable local inbox list it warns and receives on the explicit
+bootstrap relays for compatibility. Client
 preference reads use bootstrap and own NIP-65 read/write targets; writes
-prefer own NIP-65 write targets. Discovery closes only its scoped REQ at the
-history boundary or its deadline; application subscriptions remain live.
+prefer own NIP-65 write targets. Discovery closes only its scoped REQs at history completion or its deadline;
+connection failures settle their part of discovery. Planning and final DNS
+validation each have a separate budget, so usable metadata survives a silent
+relay. Application subscriptions remain live.
 The host's existing configured-relay workflow is unchanged: for a session
 with a legacy host, its configured relays must reach both the request and
 reply routes.
@@ -44,4 +47,5 @@ dial/reconnect resolve DNS independently: **this is not rebinding-proof**
 (`md-dc2m`). In the time-of-check/time-of-use window a private address can
 receive a connection attempt; verified TLS prevents a WebSocket session if
 that address cannot present a matching certificate. An operator can explicitly
-configure local and `ws://` relays; plaintext use is flagged.
+configure local and `ws://` relays; plaintext use is flagged. Metadata can
+assign a role to an exact operator-approved URL without widening that approval.

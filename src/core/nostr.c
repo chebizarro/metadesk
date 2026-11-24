@@ -88,7 +88,7 @@ typedef struct {
 typedef struct PublishBatch PublishBatch;
 
 enum { ROUTE_IN = 1, ROUTE_OUT = 2, ROUTE_FETCH = 4, ROUTE_STORE = 8,
-       ROUTE_ALL = 15, ROUTE_RELAY_LIMIT = 32 };
+       ROUTE_RELAY_LIMIT = MD_RELAY_CONNECTION_MAX };
 
 struct MdNostr {
     bool routed;
@@ -191,7 +191,7 @@ static bool is_stopped(MdNostr *n) {
 }
 
 static bool owns_host(MdNostr *n) {
-    return n && (!n->owner || md_account_binding_role(n->owner) == MD_ACCOUNT_HOST);
+    return n && !n->routed && (!n->owner || md_account_binding_role(n->owner) == MD_ACCOUNT_HOST);
 }
 static void owner_revoked(void *data) {
     MdNostr *n = data;
@@ -1132,8 +1132,9 @@ typedef struct {
     const char *own, *peer;
     MdRelayMetadata local, remote;
     const char *urls[MD_RELAY_TARGET_MAX];
+    NostrRelay *relays[MD_RELAY_TARGET_MAX];
     bool finished[MD_RELAY_TARGET_MAX];
-    size_t count, pending;
+    size_t count, pending, bootstrap_count, observers;
 } RelayDiscovery;
 
 static void discovery_event(NostrPoolSubscription *sub, NostrIncomingEvent *in, void *data) {
@@ -1142,11 +1143,43 @@ static void discovery_event(NostrPoolSubscription *sub, NostrIncomingEvent *in, 
     const char *author = in->event ? nostr_event_get_pubkey(in->event) : NULL;
     if (author && nostr_event_get_created_at(in->event) <= (int64_t)time(NULL) + 30) {
         pthread_mutex_lock(&d->mu);
-        if (!strcmp(author, d->own)) md_relay_metadata_offer(&d->local, d->own, in->event);
+        for (size_t i = 0; !strcmp(author, d->own) && i < d->bootstrap_count; ++i)
+            if (in->relay == d->relays[i]) {
+                md_relay_metadata_offer(&d->local, d->own, in->event);
+                break;
+            }
         if (!strcmp(author, d->peer)) md_relay_metadata_offer(&d->remote, d->peer, in->event);
         pthread_mutex_unlock(&d->mu);
     }
     nostr_event_free(in->event);
+}
+
+static void discovery_finish(RelayDiscovery *d, NostrRelay *relay) {
+    pthread_mutex_lock(&d->mu);
+    for (size_t i = 0; i < d->count; ++i) {
+        if (!d->finished[i] && d->relays[i] == relay) {
+            d->finished[i] = true;
+            d->pending--;
+            pthread_cond_signal(&d->cv);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->mu);
+}
+
+static void discovery_connection(NostrRelay *relay, NostrRelayConnectionState old,
+    NostrRelayConnectionState state, void *data) {
+    if (state == NOSTR_RELAY_STATE_BACKOFF ||
+        (state == NOSTR_RELAY_STATE_DISCONNECTED && old != NOSTR_RELAY_STATE_DISCONNECTED))
+        discovery_finish(data, relay);
+}
+
+static void discovery_observer_release(void *data) {
+    RelayDiscovery *d = data;
+    pthread_mutex_lock(&d->mu);
+    d->observers--;
+    pthread_cond_signal(&d->cv);
+    pthread_mutex_unlock(&d->mu);
 }
 
 static void discovery_state(NostrPoolSubscription *sub, NostrRelay *relay, const char *state,
@@ -1157,20 +1190,14 @@ static void discovery_state(NostrPoolSubscription *sub, NostrRelay *relay, const
     if (!strcmp(state, "CLOSED")) {
         MD_LOG_W("relay-list discovery CLOSED on %s: %s", url, reason ? reason : "(no reason)");
         /* In particular, allow nostrc to complete AUTH and reissue this REQ. */
-        if (info->recovery != NOSTR_POOL_RECOVERY_NONE &&
-            info->recovery != NOSTR_POOL_RECOVERY_AUTH_REFUSED) return;
-    } else if (strcmp(state, "EOSE")) return;
-    RelayDiscovery *d = data;
-    pthread_mutex_lock(&d->mu);
-    for (size_t i = 0; i < d->count; ++i) {
-        if (!d->finished[i] && !strcmp(d->urls[i], url)) {
-            d->finished[i] = true;
-            d->pending--;
-            pthread_cond_signal(&d->cv);
-            break;
+        if (info->recovery == NOSTR_POOL_RECOVERY_BACKOFF) return;
+        if (info->recovery == NOSTR_POOL_RECOVERY_AWAIT_AUTH) {
+            RelayDiscovery *d = data;
+            for (size_t i = 0; i < d->bootstrap_count; ++i)
+                if (d->relays[i] == relay) return;
         }
-    }
-    pthread_mutex_unlock(&d->mu);
+    } else if (strcmp(state, "EOSE")) return;
+    discovery_finish(data, relay);
 }
 
 static NostrRelay *route_relay(MdNostr *n, const MdRelayTarget *target, unsigned roles,
@@ -1188,36 +1215,35 @@ static NostrRelay *route_relay(MdNostr *n, const MdRelayTarget *target, unsigned
         if (!strcmp(nostr_relay_get_url_const(candidate), target->url)) { relay = candidate; break; }
     }
     pthread_mutex_unlock(&n->pool->pool_mutex);
+    bool existing = relay != NULL;
     if (!relay) {
         if (index >= ROUTE_RELAY_LIMIT) return NULL;
         nostr_simple_pool_ensure_relay_async(n->pool, target->url);
         pthread_mutex_lock(&n->pool->pool_mutex);
         if (n->pool->relay_count > index) relay = n->pool->relays[index];
         pthread_mutex_unlock(&n->pool->pool_mutex);
-        if (!relay || !register_auth(n, relay)) return NULL;
+        if (!relay) return NULL;
     }
+    /* Bootstrap relays are operator-approved. A peer's hint alone may not
+     * solicit a signature; grant AUTH there only for an operational route. */
+    if ((!existing && (roles || target->source == MD_RELAY_CONFIGURED)) ||
+        (existing && roles && !n->routes[index] && target->source != MD_RELAY_CONFIGURED))
+        if (!register_auth(n, relay)) return NULL;
     n->routes[index] |= roles;
     MD_LOG_I("relay %s (%s), roles=0x%x", target->url, md_relay_source_name(target->source), roles);
     return relay;
 }
 
-static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdIdentity *peer) {
-    const uint64_t deadline = md_monotonic_ns() + 10000000000ULL;
-    RelayDiscovery d = {.own = n->pk_hex, .peer = peer->pubkey};
-    MdRelayPlan discovery = {.deadline_ns = deadline};
-    md_relay_plan_build(&discovery, MD_RELAY_DISCOVERY, bootstrap, peer, NULL);
-    pthread_mutex_init(&d.mu, NULL);
-    md_cond_init_monotonic(&d.cv);
-    for (size_t i = 0; i < discovery.count; ++i)
-        if (route_relay(n, &discovery.target[i], 0, deadline)) d.urls[d.count++] = discovery.target[i].url;
-    d.pending = d.count;
+static NostrPoolSubscription *discover_subscribe(MdNostr *n, RelayDiscovery *d,
+    size_t offset, size_t count, bool include_own) {
+    if (!count) return NULL;
     NostrFilters *filters = nostr_filters_new();
     /* Separate limit:1 filters per replaceable coordinate. A limit across
      * both kinds/authors can starve a less recently updated list. */
-    const char *authors[] = {d.own, d.peer};
+    const char *authors[] = {d->peer, d->own};
     const int kinds[] = {NOSTR_KIND_RELAY_LIST_METADATA, NOSTR_KIND_DM_RELAY_LIST};
-    for (size_t a = 0; filters && a < 2; ++a) {
-        if (a && !strcmp(d.own, d.peer)) break;
+    for (size_t a = 0; filters && a < (include_own ? 2u : 1u); ++a) {
+        if (a && !strcmp(d->own, d->peer)) break;
         for (size_t k = 0; k < 2; ++k) {
             NostrFilter *f = nostr_filter_builder_build(nostr_filter_builder_limit(
                 nostr_filter_builder_authors(nostr_filter_builder_kinds(
@@ -1225,62 +1251,85 @@ static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdId
             if (f) { nostr_filters_add(filters, f); nostr_filter_free(f); }
         }
     }
-    NostrPoolSubscription *sub = filters && d.count ? nostr_simple_pool_subscription_open(
-        n->pool, d.urls, d.count, filters, true, discovery_event, discovery_state, &d) : NULL;
+    NostrPoolSubscription *sub = filters ? nostr_simple_pool_subscription_open(
+        n->pool, d->urls + offset, count, filters, true, discovery_event, discovery_state, d) : NULL;
     nostr_filters_free(filters);
-    if (sub) {
-        nostr_simple_pool_start(n->pool);
-        pthread_mutex_lock(&d.mu);
-        while (d.pending && !md_cond_timedwait_until(&d.cv, &d.mu, deadline)) {}
-        if (d.pending) MD_LOG_W("relay-list discovery incomplete: %zu relays did not finish", d.pending);
-        pthread_mutex_unlock(&d.mu);
-        /* On EOSE/terminal CLOSED (or operation failure), close only this
-         * scoped discovery REQ, not the pool or any application subscription. */
-        nostr_pool_subscription_free(sub);
+    if (!sub) for (size_t i = offset; i < offset + count; ++i) discovery_finish(d, d->relays[i]);
+    return sub;
+}
+
+static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdIdentity *peer) {
+    const uint64_t discovery_dns = md_monotonic_ns() + 10000000000ULL;
+    RelayDiscovery d = {.own = n->pk_hex, .peer = peer->pubkey};
+    MdRelayPlan discovery = {.deadline_ns = discovery_dns};
+    md_relay_plan_build(&discovery, MD_RELAY_DISCOVERY, bootstrap, peer, NULL);
+    /* The pool is new and empty. Suspend its background dial until every
+     * scoped filter, AUTH decision and failure observer is installed. */
+    nostr_simple_pool_disconnect_all(n->pool);
+    pthread_mutex_init(&d.mu, NULL);
+    md_cond_init_monotonic(&d.cv);
+    for (size_t i = 0; i < discovery.count; ++i) {
+        MdRelayTarget *target = &discovery.target[i];
+        /* Self-connect must not put our own key on untrusted hint relays. */
+        if (target->source != MD_RELAY_CONFIGURED && !strcmp(d.own, d.peer)) continue;
+        NostrRelay *relay = route_relay(n, target, 0, discovery_dns);
+        if (!relay) continue;
+        d.relays[d.count] = relay;
+        d.urls[d.count++] = target->url;
+        if (target->source == MD_RELAY_CONFIGURED) d.bootstrap_count++;
     }
+    d.pending = d.observers = d.count;
+    for (size_t i = 0; i < d.count; ++i)
+        nostr_relay_set_state_callback_full(d.relays[i], discovery_connection, &d, discovery_observer_release);
+    NostrPoolSubscription *base = discover_subscribe(n, &d, 0, d.bootstrap_count, true);
+    NostrPoolSubscription *hints = discover_subscribe(n, &d, d.bootstrap_count,
+        d.count - d.bootstrap_count, false);
+    nostr_simple_pool_start(n->pool);
+    const uint64_t history_deadline = md_monotonic_ns() + 10000000000ULL;
+    pthread_mutex_lock(&d.mu);
+    while (d.pending && !md_cond_timedwait_until(&d.cv, &d.mu, history_deadline)) {}
+    if (d.pending) MD_LOG_W("relay-list discovery incomplete: %zu relays did not finish", d.pending);
+    pthread_mutex_unlock(&d.mu);
+    /* Close only these scoped discovery REQs, not application subscriptions. */
+    nostr_pool_subscription_free(hints);
+    nostr_pool_subscription_free(base);
+    for (size_t i = 0; i < d.count; ++i)
+        nostr_relay_set_state_callback_full(d.relays[i], NULL, NULL, NULL);
+    pthread_mutex_lock(&d.mu);
+    while (d.observers) pthread_cond_wait(&d.cv, &d.mu);
+    pthread_mutex_unlock(&d.mu);
     pthread_cond_destroy(&d.cv);
     pthread_mutex_destroy(&d.mu);
 
     const MdRelayRole purposes[] = {MD_RELAY_DM_IN, MD_RELAY_DM_OUT, MD_RELAY_FETCH, MD_RELAY_STORE};
     const unsigned roles[] = {ROUTE_IN, ROUTE_OUT, ROUTE_FETCH, ROUTE_STORE};
     MdRelayPlan plans[4] = {0};
+    /* A silent relay may exhaust history time, but may not make already
+     * received metadata unusable or force all subsequent DNS checks to fail. */
+    const uint64_t planning_deadline = md_monotonic_ns() + 10000000000ULL;
     for (size_t p = 0; p < 4; ++p) {
-        plans[p].deadline_ns = deadline;
+        if (roles[p] == ROUTE_FETCH && !n->quality_preferences && !owns_host(n)) continue;
+        plans[p].deadline_ns = planning_deadline;
         bool outgoing = roles[p] == ROUTE_OUT;
-        MdRelayRole purpose = purposes[p];
-        if (purpose == MD_RELAY_DM_IN && !d.local.dm) {
-            MD_LOG_W("no local DM relay list; receiving on configured bootstrap relays");
-            purpose = MD_RELAY_BOOTSTRAP;
-        }
-        md_relay_plan_build(&plans[p], purpose, bootstrap, outgoing ? peer : NULL,
+        md_relay_plan_build(&plans[p], purposes[p], bootstrap, outgoing ? peer : NULL,
                             outgoing ? &d.remote : &d.local);
     }
-    /* Allocate the connection budget across roles before admitting the union.
-     * First give every nonempty role a target, then distribute the remainder. */
-    const MdRelayTarget *targets[ROUTE_RELAY_LIMIT];
-    unsigned masks[ROUTE_RELAY_LIMIT] = {0};
-    size_t selected = 0;
-    for (size_t i = 0; i < MD_RELAY_TARGET_MAX; ++i) for (size_t p = 0; p < 4; ++p) {
-        if (i >= plans[p].count) continue;
-        MdRelayTarget *t = &plans[p].target[i];
-        size_t j = 0;
-        while (j < selected && strcmp(targets[j]->url, t->url)) j++;
-        if (j == selected) {
-            if (selected == ROUTE_RELAY_LIMIT) continue;
-            targets[selected++] = t;
-        }
-        /* Explicit operator approval is also provenance for a shared URL. */
-        if (t->source == MD_RELAY_CONFIGURED) targets[j] = t;
-        masks[j] |= roles[p];
+    if (!plans[0].count) {
+        MD_LOG_W("%s; receiving on configured bootstrap relays",
+            d.local.dm ? "local DM relay list has no usable targets" : "no local DM relay list");
+        md_relay_plan_build(&plans[0], MD_RELAY_BOOTSTRAP, bootstrap, NULL, NULL);
     }
+    MdRelayUse targets[ROUTE_RELAY_LIMIT];
+    size_t selected = md_relay_plan_union(plans, roles, 4, targets);
     for (size_t i = 0; i < d.count; ++i) {
         size_t j = 0;
-        while (j < selected && strcmp(targets[j]->url, d.urls[i])) j++;
+        while (j < selected && strcmp(targets[j].target->url, d.urls[i])) j++;
         if (j == selected) nostr_simple_pool_remove_relay(n->pool, d.urls[i]);
     }
     unsigned admitted = 0;
+    const uint64_t admission_deadline = md_monotonic_ns() + 10000000000ULL;
     for (size_t j = 0; j < selected; ++j)
-        if (route_relay(n, targets[j], masks[j], deadline)) admitted |= masks[j];
+        if (route_relay(n, targets[j].target, targets[j].mask, admission_deadline)) admitted |= targets[j].mask;
     /* A discovery connection can fail final safety validation. Remove it
      * before taking the immutable relay snapshot; compact role bits as well. */
     for (size_t i = n->pool->relay_count; i > 0; --i) {
@@ -1293,6 +1342,11 @@ static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdId
                     (n->pool->relay_count - index) * sizeof(n->routes[0]));
             n->routes[n->pool->relay_count] = 0;
         }
+    }
+    if (!(admitted & ROUTE_IN)) {
+        MD_LOG_W("DM inbox targets failed admission; receiving on configured bootstrap relays");
+        for (size_t i = 0; i < bootstrap->count; ++i)
+            if (route_relay(n, &bootstrap->target[i], ROUTE_IN, admission_deadline)) admitted |= ROUTE_IN;
     }
     for (size_t p = 0; p < 4; ++p) md_relay_plan_clear(&plans[p]);
     md_relay_plan_clear(&discovery);
@@ -1314,9 +1368,15 @@ static void scoped_documents_state(NostrPoolSubscription *sub, NostrRelay *relay
 
 static void scoped_inbox_state(NostrPoolSubscription *sub, NostrRelay *relay,
     const char *state, const char *reason, const NostrPoolCallbackInfo *info, void *data) {
-    (void)sub; (void)info; (void)data;
-    if (!strcmp(state, "CLOSED"))
-        MD_LOG_W("DM inbox CLOSED on %s: %s", nostr_relay_get_url_const(relay), reason ? reason : "(no reason)");
+    (void)sub;
+    MdNostr *n = data;
+    if (is_stopped(n) || strcmp(state, "CLOSED") ||
+        info->frame.connection_generation != nostr_relay_get_connection_generation(relay)) return;
+    const char *url = nostr_relay_get_url_const(relay);
+    MD_LOG_W("DM inbox CLOSED on %s: %s", url, reason ? reason : "(no reason)");
+    if (info->recovery != NOSTR_POOL_RECOVERY_AWAIT_AUTH &&
+        info->recovery != NOSTR_POOL_RECOVERY_BACKOFF && n->cbs.on_dm_relay_unavailable)
+        n->cbs.on_dm_relay_unavailable(url, reason, n->cbs.dm_userdata);
 }
 
 static NostrPoolSubscription *subscribe_route(MdNostr *n, unsigned role, NostrFilters *filters,

@@ -313,6 +313,17 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
 }
 
+static void on_dm_relay_unavailable(const char *url, const char *reason, void *data) {
+    ClientCtx *ctx = data;
+    /* The relay's reason is already logged by core. Keep the UI diagnostic
+     * independent of relay-controlled text and of the host's decision. */
+    (void)reason;
+    fprintf(stderr, "ERROR: relay unavailable: DM inbox refused by %s\n", url);
+    const char *expected = NULL;
+    atomic_compare_exchange_strong(&ctx->connection_status, &expected,
+                                   "Relay unavailable: DM inbox subscription refused");
+}
+
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
@@ -1075,8 +1086,27 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 
 /* ── Main ────────────────────────────────────────────────────── */
 
+static bool address_prefix(const char *s, const char *prefix) {
+    for (; *prefix; ++prefix, ++s) {
+        char c = *s;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != *prefix) return false;
+    }
+    return true;
+}
+
 static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *bootstrap,
                       char **canonical_npub) {
+    /* Do this before argument errors can echo a positional value, including
+     * a route supplied alongside a separate --npub identity. */
+    for (int i = 1; i < argc; ++i) {
+        const char *s = argv[i];
+        if (address_prefix(s, "nostr:")) s += 6;
+        if (address_prefix(s, "nsec1") || address_prefix(s, "ncryptsec1")) {
+            fprintf(stderr, "ERROR: secret keys are not valid host addresses or identities\n");
+            return 1;
+        }
+    }
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
 #ifdef _WIN32
@@ -1349,6 +1379,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
          * and checked through fips_control. */
         MdNostrCallbacks nostr_cbs = { 0 };
         nostr_cbs.on_dm = on_session_dm;
+        nostr_cbs.on_dm_relay_unavailable = on_dm_relay_unavailable;
         nostr_cbs.dm_userdata = &ctx;
 
         MdNostrConfig nostr_cfg = {
