@@ -45,7 +45,7 @@ Hardware encoding and open-source copyright licenses do not by themselves
 establish patent clearance. Cisco's terms have conditions and limits. This
 release note is not legal advice.
 
-## LGPL corresponding source and replacement
+## Copyleft corresponding source and replacement
 
 The **exact corresponding source** for each bundled FFmpeg build is attached
 alongside its binary download. Each archive includes the upstream source
@@ -54,15 +54,17 @@ license notices and codec inventory.
 
 <FFMPEG_SOURCE_TABLE>
 
-FFmpeg is dynamically linked. Users may replace the shared libraries with
+FFmpeg and the AppImage Ubuntu closure libraries are dynamically linked.
+Users may replace the shared libraries with
 compatible modified versions; replacement and local macOS re-signing
-instructions: <REPLACEMENT_INSTRUCTIONS_URL>. No restriction on reverse
+instructions (including AppImage extraction and Flatpak local rebuild):
+<REPLACEMENT_INSTRUCTIONS_URL>. No restriction on reverse
 engineering for debugging these modifications is imposed. If any LGPL
 component is linked statically, provide relinkable application objects and
 instructions at <RELINK_OBJECTS_URL_OR_NOT_APPLICABLE>.
 
-Other redistributed LGPL components (including private GLib/libintl or image
-base libraries): <COMPONENT_SOURCE_LINKS_AND_LICENSE_TEXT_LOCATIONS>.
+Other redistributed copyleft components (including the AppImage runtime’s
+static libfuse and any Ubuntu closure libraries): <COMPONENT_SOURCE_LINKS_AND_LICENSE_TEXT_LOCATIONS>.
 Native distro packages use the distro's corresponding-source mechanisms:
 <DISTRO_COPYRIGHT_AND_SOURCE_INSTRUCTIONS>.
 

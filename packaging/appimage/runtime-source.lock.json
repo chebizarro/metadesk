@@ -1,0 +1,21 @@
+{
+  "release": "20251108",
+  "commit": "dd6cebedcbddde9c82f89b011e8e1d40b6e43868",
+  "sources": {
+    "type2-runtime.tar.gz": {
+      "url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/dd6cebedcbddde9c82f89b011e8e1d40b6e43868",
+      "sha256": "f5fec23be76e50e2445ed2d018bac49b367490fc483c62c4637e99ec705d27ba",
+      "notices": ["LICENSE"]
+    },
+    "fuse-3.15.0.tar.xz": {
+      "url": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+      "sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0",
+      "notices": ["LICENSE", "LGPL2.txt", "GPL2.txt", "AUTHORS"]
+    },
+    "squashfuse-0.5.2.tar.gz": {
+      "url": "https://github.com/vasi/squashfuse/archive/0.5.2.tar.gz",
+      "sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3",
+      "notices": ["LICENSE"]
+    }
+  }
+}

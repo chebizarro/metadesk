@@ -46,19 +46,46 @@ Authenticode path remains available for its separately qualified MSI.
 
 ### LGPL library replacement
 
-Use the matching per-bundle FFmpeg corresponding-source attachment and build
-records, and build ABI-compatible shared libraries. The native Linux packages
-use the distro's FFmpeg rather than redistributing it.
+Use the **matching asset's** source attachments and manifest to build
+ABI-compatible replacements with the same architecture and SONAME. Preserve
+the shared-library links, and test the modified build locally. Native Linux
+packages use distro libraries rather than distributing copies.
 
-- AppImage: extract with `--appimage-extract`, replace the relevant files under
-  `squashfs-root/usr/lib`, then launch `squashfs-root/AppRun` directly.
-- Flatpak: replace the FFmpeg build in a private copy of the matching manifest,
-  build/export with `flatpak/build.sh`, and use that user-installed build.
-  Do not edit the installed immutable OSTree object store.
-- DMG: copy `Metadesk.app` to a writable directory, replace compatible codec
-  dylibs in `Contents/Frameworks` and retain the bundle-relative install names.
-  Re-sign the modified dylibs, then the app, with `codesign --force --sign -`.
-  Modified copies do not retain the original Developer ID or notarization.
+- **AppImage, shared libraries:** extract with `./Metadesk-….AppImage
+  --appimage-extract`. In the closure source tar, find the exact
+  `ubuntu/<source>_<version>/*.dsc` named by the asset's library record.
+  Keep all files beside the descriptor, run `dpkg-source -x FILE.dsc` and
+  build with the matching Noble development dependencies (the included
+  `debian/rules` and `debian/control` describe the build; e.g. use
+  `dpkg-buildpackage -b -us -uc`). Extract the resulting binary package
+  with `dpkg-deb -x` and copy the compatible DSO over the corresponding
+  file under `squashfs-root/usr/lib`. For FFmpeg, instead use the separate
+  FFmpeg source/build-receipt attachment. Run `squashfs-root/AppRun` directly.
+- **AppImage, statically linked libfuse:** the closure tar's `runtime/` holds
+  the pinned type-2 runtime program source (the complete work that links
+  libfuse), libfuse 3.15.0 and squashfuse 0.5.2. Unpack the runtime and use its
+  `BUILD.md` and `scripts/docker/build-with-docker.sh` with the matching
+  `ARCH` on Alpine 3.21. Its `scripts/common/install-dependencies.sh`
+  checks the dependency archives and applies `patches/libfuse/mount.c.diff`.
+  To relink, change libfuse in that build, install the modified static archive,
+  and rebuild the runtime with the same recipe. Use
+  `packaging/appimage/make-image.sh APPDIR NEW.AppImage APPIMAGETOOL NEW_RUNTIME`
+  to combine it with the extracted AppDir; this does not retain original
+  signatures. The extracted `AppRun` also works without any FUSE runtime.
+- **Flatpak:** unpack the release project source and edit a private copy of
+  `packaging/flatpak/modules.json` to build the modified FFmpeg source with
+  the matching configuration and local patch source. Build/export with
+  `packaging/flatpak/build.sh Client|Manager NEW_WORK_DIR` and run that
+  user-installed build. Do not modify the immutable OSTree object store.
+- **DMG:** copy `Metadesk.app` to a writable directory, replace compatible
+  codec dylibs in `Contents/Frameworks`, and retain the bundle-relative
+  install names. Re-sign the modified dylibs, then the app, with
+  `codesign --force --sign -`. Modified copies are not notarized.
+
+The owner must check that the measured manifest maps every redistributed
+library to its license and source where required, and verify all downloaded
+attachments against `SHA256SUMS`. Review the actual tag commit; a draft at a
+different SHA is not evidence for the tag. Do not publish an incomplete set.
 
 ## LGPL codec builds and notices
 
