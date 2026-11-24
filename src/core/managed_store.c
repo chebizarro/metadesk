@@ -149,10 +149,12 @@ MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *pat
     s->lock = INVALID_HANDLE_VALUE;
     MdWinDirectory *parent = md_win_directory(path, false);
     if (parent) {
-        size_t n = strlen(path) + 66;
+        size_t len = strlen(path);
+        size_t n = len + sizeof(s->owner) + 1;
         char *child = malloc(n);
         if (child) {
-            snprintf(child, n, "%s\\%s", path, s->owner);
+            const char *sep = (path[len - 1] == '\\' || path[len - 1] == '/') ? "" : "\\";
+            snprintf(child, n, "%s%s%s", path, sep, s->owner);
             s->dir = md_win_directory(child, true);
             free(child);
         }

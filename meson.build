@@ -1298,10 +1298,8 @@ if host_os == 'darwin'
     dependencies : [dep_metadesk, dependency('appleframeworks', modules : ['AppKit'])])
 endif
 test_quality_preferences = executable('test_quality_preferences', 'tests/test_quality_preferences.c', dependencies : dep_metadesk)
-if host_os != 'windows'
-  test('encrypted quality preferences private relay', find_program('python3'),
-    args : [files('tests/test_quality_preferences.py'), test_quality_preferences], timeout : 60)
-endif
+test('encrypted quality preferences private relay', find_program('python3'),
+  args : [files('tests/test_quality_preferences.py'), test_quality_preferences], timeout : 60)
 
 test_jsonrpc = executable('test_jsonrpc',
   files('tests/test_jsonrpc.c'),
@@ -1439,11 +1437,15 @@ test('OpenH264 offline fetch', test_oh_fetch)
 test('OpenH264 explicit fetch CLI offline', find_program('python3'),
   args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)
 
-if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
+if host_os == 'windows' or (enable_nip5f and (host_os == 'linux' or host_os == 'darwin'))
   test_managed_store = executable('test_managed_store', 'tests/test_managed_store.c',
     dependencies : [dep_metadesk] + core_private_deps)
+  store_fixture_args = [files('tests/test_managed_store.py'), test_managed_store]
+  if host_os != 'windows'
+    store_fixture_args += [access_signer_fixture]
+  endif
   test('encrypted management store private relays', accounts_python,
-    args : [files('tests/test_managed_store.py'), test_managed_store, access_signer_fixture], timeout : 80)
+    args : store_fixture_args, timeout : 80)
 endif
 
 # Same-user host admission and management; no desktop devices.
