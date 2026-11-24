@@ -22,7 +22,9 @@ install_tools() {
         appimage)
             packages+=(libva-dev libdrm-dev nasm squashfs-tools podman)
             if [[ $arch == x86_64 ]]; then packages+=(libvpl-dev); fi ;;
-        flatpak) packages=(flatpak flatpak-builder elfutils appstream) ;;
+        # AppStream compose rasterizes the shipped SVG; the loader is only
+        # a recommendation on Noble and differs across hosted image baselines.
+        flatpak) packages=(flatpak flatpak-builder elfutils appstream librsvg2-common) ;;
         *) return 2 ;;
     esac
     # Match the CI workaround for stalled EC2 mirrors (leave ports mirrors alone).
@@ -52,7 +54,7 @@ build_deb() {
     reject_codecs "$work/deb-payload"
     [[ -z $(find "$work/deb-payload" -iname 'libavcodec*' -o -iname 'libavutil*') ]]
     mkdir "$work/native-smoke"
-    ln "${deb[0]}" "$work/native-smoke/metadesk.deb"
+    cp "${deb[0]}" "$work/native-smoke/metadesk.deb"
     docker run --rm -v "$work/native-smoke:/packages:ro" "$ubuntu" sh -ec '
         apt-get update --error-on=any
         apt-get install -y --no-install-recommends /packages/metadesk.deb
@@ -75,15 +77,16 @@ build_rpm() {
     git archive --format=tar --prefix="metadesk-$version/" --add-file="$work/.metadesk-commit" HEAD | \
         gzip -n > "$work/rpmbuild/SOURCES/metadesk-$version.tar.gz"
     tar -C "$work" --exclude=.git -czf "$work/rpmbuild/SOURCES/nostrc-$NOSTRC_REVISION.tar.gz" nostrc
-    docker run --rm -v "$work:/work" -v "$src/packaging/linux/rpm:/spec:ro" "$FEDORA" bash -euc '
-        dnf -y install rpm-build rpmlint dnf5-plugins
+    docker run --rm -e SOURCE_DATE_EPOCH -v "$work:/work" -v "$src/packaging/linux/rpm:/spec:ro" "$FEDORA" bash -eu -o pipefail -c '
+        dnf -y install rpm-build rpmlint dnf5-plugins cpio
         dnf -y builddep /spec/metadesk.spec
         rpmbuild -ba --define "_topdir /work/rpmbuild" /spec/metadesk.spec
         cd /work/rpmbuild
         rpmlint RPMS/*/*.rpm SRPMS/*.rpm
         rpmfile=$(printf "%s\n" RPMS/*/metadesk-[0-9]*.rpm)
         rpm -qpl "$rpmfile" > /work/rpm-files.txt
-        rpm -qpR "$rpmfile" > /work/requires.txt'
+        rpm -qpR "$rpmfile" > /work/requires.txt
+        rpm2cpio "$rpmfile" | cpio --quiet -i --to-stdout ./usr/share/metadesk/metadesk-bundle.json > /work/rpm-manifest.json'
     if grep -Ei '/[^/]*(openh264|libx264|libx265|libavcodec|libavutil)[^/]*$' "$work/rpm-files.txt"; then
         echo 'Unexpected codec in native RPM payload' >&2
         return 1
@@ -91,7 +94,7 @@ build_rpm() {
     local rpm=("$work/rpmbuild/RPMS/$arch/"metadesk-[0-9]*.rpm) name
     [[ ${#rpm[@]} == 1 && -f ${rpm[0]} ]]
     mkdir "$work/native-smoke"
-    ln "${rpm[0]}" "$work/native-smoke/metadesk.rpm"
+    cp "${rpm[0]}" "$work/native-smoke/metadesk.rpm"
     docker run --rm -v "$work/native-smoke:/packages:ro" "$FEDORA" bash -euc '
         dnf -y --setopt=install_weak_deps=False install /packages/metadesk.rpm
         rpm -V metadesk
@@ -99,7 +102,7 @@ build_rpm() {
         metadesk-client --help'
     name=$(basename "${rpm[0]}")
     jq --rawfile requires "$work/requires.txt" '. + {system_dependencies: $requires}' \
-        "$work/rpmbuild/BUILD/metadesk-$version-build/native-output/tree/usr/share/metadesk/metadesk-bundle.json" \
+        "$work/rpm-manifest.json" \
         > "$work/inventory.json"
     cp "${rpm[0]}" "$upload/"
     record_asset "$name" rpm "$arch" unsigned "$work/inventory.json"
@@ -113,7 +116,14 @@ build_appimage() {
         pin=$(jq -ce --arg dep "$dep" '.modules[] | select(.name==$dep) | .sources[0]' "$modules")
         url=$(jq -er .url <<< "$pin"); rev=$(jq -er .commit <<< "$pin")
         git init -q "$work/$dep"
-        git -C "$work/$dep" fetch --depth=1 "$url" "$rev"
+        git -C "$work/$dep" remote add origin "$url"
+        if [[ $dep == amf-headers ]]; then
+            # The AMF repository also ships large, unrelated SDK binaries.
+            git -C "$work/$dep" sparse-checkout set amf/public/include
+            git -C "$work/$dep" fetch --depth=1 --filter=blob:none origin "$rev"
+        else
+            git -C "$work/$dep" fetch --depth=1 origin "$rev"
+        fi
         git -C "$work/$dep" checkout -q --detach "$rev"
     done
     make -C "$work/nv-codec-headers" PREFIX="$work/headers" install
@@ -147,11 +157,14 @@ build_appimage() {
     cc --version > "$work/ffmpeg-records/toolchain.txt"
     mkdir "$work/legal"
     cp "$work/ffmpeg-source/COPYING.LGPLv2.1" "$work/ffmpeg-source/LICENSE.md" "$work/legal/"
+    cp "$work/amf-headers/LICENSE.txt" "$work/legal/AMF-LICENSE.txt"
+    cp "$work/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h" "$work/legal/NVENC-header-notice.h"
     ffmpeg_receipt "$ffmpeg_archive" "$work/ffmpeg-records" "$work/legal" "$name"
     record_asset "$name" appimage "$arch" unsigned "$work/AppDir/bundle.json"
 }
 
 build_flatpak() {
+    [[ $(jq -er '.modules[] | select(.name=="nostrc").sources[0].commit' "$modules") == "$NOSTRC_REVISION" ]]
     flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
     flatpak install --user --noninteractive --no-related flathub org.gnome.Platform//49 org.gnome.Sdk//49
     locked_download "$ffmpeg_pin" "$ffmpeg_archive"
@@ -172,10 +185,13 @@ build_flatpak() {
         flatpak run --user --command=/app/libexec/metadesk/verify-codecs "$id" $encoders \
             > "$upload/$name.ffmpeg/records/codec-inventory.txt"
         cp "$modules" "$src/packaging/flatpak/build-ffmpeg.sh" "$upload/$name.ffmpeg/records/"
-        flatpak list --user --columns=ref,commit > "$work/runtime-refs.txt"
-        jq --rawfile refs "$work/runtime-refs.txt" \
+        flatpak list --user --columns=ref:f,active:f > "$work/runtime-refs.txt"
+        (cd "$deployed" && find lib -type f -name '*.so*' -exec sha256sum {} +) | \
+            jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  (?<key>.+)$") | {key,value:{sha256}}] | from_entries' \
+            > "$work/libraries.json"
+        jq --rawfile refs "$work/runtime-refs.txt" --slurpfile libs "$work/libraries.json" \
             --arg app_commit "$(flatpak info --user --show-commit "$id")" \
-            '. + {flatpak_refs:$refs, app_commit:$app_commit}' "$modules" > "$work/inventory.json"
+            '. + {flatpak_refs:$refs, app_commit:$app_commit, libraries:$libs[0]}' "$modules" > "$work/inventory.json"
         record_asset "$name" "flatpak-$product" "$arch" unsigned "$work/inventory.json"
         rm -rf "$root" # Only this job's private builder state; keep disk for the next app.
     done

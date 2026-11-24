@@ -30,8 +30,8 @@ sh "$SRC/packaging/appimage/dry-sign.sh" "$IMAGE" "$NEW_PRIVATE_SIGNING_DIR"
 ```
 
 Download tools to a private directory and verify `tools.lock.json` **before
-execution**. These are versioned ARM64 inputs, not overwritten `continuous`
-assets. x86_64 requires its own reviewed tool/runtime hashes. `make-image.sh`
+execution**. This lock uses versioned ARM64 and x86_64 inputs with separate
+tool/runtime hashes, not overwritten `continuous` assets. `make-image.sh`
 uses an explicit type-2 runtime and does not fetch anything itself.
 `appimagetool` supports extract-and-run for FUSE-less builders. The resulting
 image supports `--appimage-extract` and `APPIMAGE_EXTRACT_AND_RUN=1`; native

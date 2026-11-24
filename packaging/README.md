@@ -21,8 +21,44 @@ Status reflects recorded qualification, not published releases.
 | Flatpak | [`build.sh`](flatpak/build.sh) exports client and manager `.flatpak` bundles; no host. [Build guide](flatpak/README.md). | [Local ARM64](flatpak/VALIDATION.md) builds, user installs, help, codec inventory and decode smoke passed. Manifest lint warned about the runtime; build/repo lint failed on missing screenshots. | `md-lxxz`: release source pins, app-ID ownership, screenshots, desktop qualification and Flathub submission. |
 | AppImage | [`assemble.py`](appimage/assemble.py) stages the client AppDir; [`make-image.sh`](appimage/make-image.sh) produces the Type 2 AppImage. [Build guide](appimage/README.md). | [ARM64](appimage/VALIDATION.md): Ubuntu extract-and-run help and clean Fedora 44 help/decode passed. [`dry-sign.sh`](appimage/dry-sign.sh) demonstrated disposable GPG signing and zsync only. | `md-pqc7` is closed; no separate open AppImage release bead was identified. Hosted x86_64, remaining distro/desktop checks, legal/source review and production signing/update setup are outstanding. |
 
-Cross-platform release automation (dry-run matrix, signing and publishing) is
-tracked by `md-6mqr`.
+## GitHub pre-release workflow
+
+`Pre-release packages` (`.github/workflows/release.yml`) runs after a `v*`
+Git tag push, or manually once the workflow is on the default branch. Manual
+runs always create a draft, never a Git tag. The default draft name is
+`v0.1.0-alpha.1`; choose an unused version tag name. The workflow replaces
+only its own previous draft with the same name, never a published release.
+A tag push builds again from the tag commit; it cannot publish the assets
+from a draft built at a different commit. Check the corresponding-source
+attachments and review transitive licenses before pushing a release tag.
+
+Linux installers are unsigned. An unsigned macOS DMG contains an ad-hoc
+signed app. On a tag push only, a complete set of existing Apple credentials
+opts into Developer ID signing using the normal app/DMG producers, followed by
+notarization and stapling. Partial or absent credentials leave the app ad-hoc.
+`APPLE_CERTIFICATE` and `APPLE_NOTARY_KEY` are base64 P12 and P8 respectively;
+other inputs are `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGN_IDENTITY`,
+`APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER`.
+
+Windows (`md-fjgl`, `md-sfxh`, `md-jsrk`) and Intel macOS (`md-c17b`) are
+outside the required matrix. The Windows producer's existing opt-in
+Authenticode path remains available for its separately qualified MSI.
+
+### LGPL library replacement
+
+Use the matching per-bundle FFmpeg corresponding-source attachment and build
+records, and build ABI-compatible shared libraries. The native Linux packages
+use the distro's FFmpeg rather than redistributing it.
+
+- AppImage: extract with `--appimage-extract`, replace the relevant files under
+  `squashfs-root/usr/lib`, then launch `squashfs-root/AppRun` directly.
+- Flatpak: replace the FFmpeg build in a private copy of the matching manifest,
+  build/export with `flatpak/build.sh`, and use that user-installed build.
+  Do not edit the installed immutable OSTree object store.
+- DMG: copy `Metadesk.app` to a writable directory, replace compatible codec
+  dylibs in `Contents/Frameworks` and retain the bundle-relative install names.
+  Re-sign the modified dylibs, then the app, with `codesign --force --sign -`.
+  Modified copies do not retain the original Developer ID or notarization.
 
 ## LGPL codec builds and notices
 

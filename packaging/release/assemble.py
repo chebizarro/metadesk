@@ -42,7 +42,7 @@ def bundle_libraries(inventory):
             yield record
 
 
-def source_receipt(receipt, output):
+def source_receipt(receipt, output, platform, arch):
     archives = list(receipt.glob('ffmpeg-*.tar.*'))
     if len(archives) != 1:
         raise ValueError(f'{receipt}: expected exact FFmpeg archive')
@@ -52,13 +52,30 @@ def source_receipt(receipt, output):
                    'THIRD_PARTY_NOTICES.md', 'build-minimal-lgpl.sh'):
         if not (receipt / needed).is_file():
             raise ValueError(f'{receipt}: missing {needed}')
+    packaging = TEMPLATE.parent
+    if platform == 'dmg':
+        pin = next(p for p in json.loads((packaging / 'macos/deps.lock.json').read_text()) if p['name'] == 'ffmpeg')
+        profile = 'macos'
+    else:
+        modules = json.loads((packaging / 'flatpak/modules.json').read_text())['modules']
+        pin = next(p for m in modules if m['name'] == 'ffmpeg-lgpl' for p in m['sources'] if p['type'] == 'archive')
+        profile = 'container' if platform == 'appimage' else 'flatpak'
+    source_hash = sha(archives[0])
+    if archives[0].name != pin['url'].rsplit('/', 1)[1] or source_hash != pin['sha256']:
+        raise ValueError(f'{receipt}: source archive does not match producer pin')
+    encoders = subprocess.check_output([packaging / 'ffmpeg/profile-encoders.sh', profile, arch], text=True).strip()
+    if ((receipt / 'records/profile.txt').read_text().strip() != profile or
+            (receipt / 'records/encoders.txt').read_text().strip() != encoders or
+            'PASS: exact minimal codec/parser inventory; LGPL-2.1-or-later' not in
+            (receipt / 'records/codec-inventory.txt').read_text()):
+        raise ValueError(f'{receipt}: missing matching profile and runtime verification')
     shutil.make_archive(str(output), 'gztar', receipt.parent, receipt.name)
-    return (archives[0].name.removeprefix('ffmpeg-').split('.tar.', 1)[0],
-            (receipt / 'records/encoders.txt').read_text().strip(), sha(archives[0]))
+    return archives[0].name.removeprefix('ffmpeg-').split('.tar.', 1)[0], encoders, source_hash
 
 
 def assemble(packages, out):
-    tag, commit, nostrc, repo = (os.environ[k] for k in ('TAG', 'GITHUB_SHA', 'NOSTRC_REVISION', 'GITHUB_REPOSITORY'))
+    tag, trigger_sha, nostrc, repo = (os.environ[k] for k in ('TAG', 'GITHUB_SHA', 'NOSTRC_REVISION', 'GITHUB_REPOSITORY'))
+    commit = subprocess.check_output(['git', 'rev-parse', f'{trigger_sha}^{{commit}}'], text=True).strip()
     version = tag.removeprefix('v')
     if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*', tag):
         raise ValueError('invalid tag')
@@ -88,7 +105,8 @@ def assemble(packages, out):
         codec = 'System FFmpeg (not bundled)'
         if platform not in NATIVE:
             source_name = name + '.ffmpeg-source'
-            ffmpeg_version, encoders, source_hash = source_receipt(path.with_name(name + '.ffmpeg'), out / source_name)
+            ffmpeg_version, encoders, source_hash = source_receipt(
+                path.with_name(name + '.ffmpeg'), out / source_name, platform, arch)
             source_name += '.tar.gz'
             codec = f'FFmpeg {ffmpeg_version} LGPL, `h264` decode/parser, `{encoders}`'
             receipt.update(ffmpeg_source=source_name, ffmpeg_source_sha256=source_hash)

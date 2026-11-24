@@ -2,7 +2,9 @@
 # shellcheck source=packaging/release/common.sh
 source "$(dirname "$0")/common.sh"
 [[ $(uname -m) == arm64 ]]
+[[ $(jq -er '.[] | select(.name=="nostrc").commit' packaging/macos/deps.lock.json) == "$NOSTRC_REVISION" ]]
 export MD_CODESIGN_IDENTITY=- MD_DMG=1 MD_DEPS_DOWNLOADS="$RUNNER_TEMP/md-downloads"
+export MD_RELEASE_DEPS_DIR="$RUNNER_TEMP/md-macos-deps"
 signing=ad-hoc
 mountpoint=$work/mounted
 keychain=$work/signing.keychain-db
@@ -55,7 +57,7 @@ hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$upload/$name"
 app=$mountpoint/Metadesk.app
 MD_MACOS_MIN=13.0 packaging/macos/verify-app.sh "$app"
 reject_codecs "$app/Contents/Frameworks"
-deps=$work/build/deps
+deps=$MD_RELEASE_DEPS_DIR
 fw=$app/Contents/Frameworks
 # Enumerate the actual on-disk DMG libraries, not the producer prefix.
 clang -I"$deps/prefix/include" packaging/ffmpeg/verify-codecs.c \
@@ -63,7 +65,10 @@ clang -I"$deps/prefix/include" packaging/ffmpeg/verify-codecs.c \
 copy_ffmpeg_records "$deps/build/ffmpeg" "$work/ffmpeg-records"
 "$work/verify-codecs" h264_videotoolbox | tee "$work/ffmpeg-records/codec-inventory.txt"
 cp "$deps/toolchain.txt" "$deps/deps.lock.json" "$work/ffmpeg-records/"
-archive=$(jq -er '.[] | select(.name=="ffmpeg").archive' "$deps/deps.lock.json")
+pin=$(jq -ce '.[] | select(.name=="ffmpeg")' "$deps/deps.lock.json")
+archive=$(jq -er .archive <<< "$pin")
+mkdir -p "$MD_DEPS_DOWNLOADS"
+locked_download "$pin" "$MD_DEPS_DOWNLOADS/$archive"
 ffmpeg_receipt "$MD_DEPS_DOWNLOADS/$archive" "$work/ffmpeg-records" "$deps/licenses/ffmpeg" "$name"
 jq --slurpfile pins "$deps/deps.lock.json" '. + {pins:$pins[0]}' \
     "$app/Contents/Resources/metadesk-bundle.json" > "$work/inventory.json"
