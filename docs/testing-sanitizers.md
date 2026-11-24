@@ -23,7 +23,7 @@ cmake -S "$nostrc" -B "$private/nostrc-tsan" \
   -DBUILD_NOSTR_GOBJECT=OFF -DBUILD_NOSTR_GTK=OFF \
   -DENABLE_NIP46=ON -DENABLE_NIP55L=ON -DENABLE_NIP5F=ON
 cmake --build "$private/nostrc-tsan" -j2 --target \
-  nostr nostrgo go_fiber nostr_nip51_core nostr_nip98 nostr_nip17_core nip05 nip65 \
+  nostr nostrgo go_fiber nostr_nip51_core nostr_nip78_core nostr_nip98 nostr_nip17_core nip05 nip65 \
   nip11 nostr_json nostr_nip46_core nostr_nip55l_core nostr_nip5f_core
 meson setup build-tsan -Db_sanitize=thread -Db_lundef=false --buildtype=debug \
   -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$private/nostrc-tsan" \

@@ -199,11 +199,11 @@ Cflags: -I${{includedir}}
           '-DBUILD_NOSTR_GOBJECT=OFF', '-DBUILD_NOSTR_GTK=OFF', '-DSIGNET_ENABLE=OFF',
           '-DENABLE_NIP04=ON', '-DENABLE_NIP06=ON', '-DENABLE_NIP11=ON', '-DENABLE_NIP17=ON',
           '-DENABLE_NIP19=ON', '-DENABLE_NIP44=ON', '-DENABLE_NIP46=ON', '-DENABLE_NIP49=OFF',
-          '-DENABLE_NIP51=ON', '-DENABLE_NIP55L=OFF', '-DENABLE_NIP5F=ON', '-DENABLE_NIP98=ON',
+          '-DENABLE_NIP51=ON', '-DENABLE_NIP78=ON', '-DENABLE_NIP55L=OFF', '-DENABLE_NIP5F=ON', '-DENABLE_NIP98=ON',
           '-DOPENSSL_ROOT_DIR=' + str(prefix),
           targets=['nostr', 'nostr_json', 'nostrgo', 'go_fiber', 'nip04', 'nip06', 'nip19',
                    'nip11', 'nostr_nip44_core', 'nostr_nip46_core', 'nostr_nip5f_core',
-                   'nostr_nip51_core', 'nostr_nip98', 'nostr_nip17_core', 'nip05', 'nip65'], install=False)
+                   'nostr_nip51_core', 'nostr_nip78_core', 'nostr_nip98', 'nostr_nip17_core', 'nip05', 'nip65'], install=False)
     run('minimum-os', ['python3', HERE / 'macho.py', '13.0', prefix, out / 'build/nostrc/libjson'])
     print(f'Built {prefix}; nostrc source={sources["nostrc"]}, build={out / "build/nostrc"}')
 

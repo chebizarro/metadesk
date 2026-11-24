@@ -22,6 +22,7 @@
  * provided by nostrc (github.com/chebizarro/nostrc).
  */
 #include "nostr.h"
+#include "managed_store.h"
 #include <nostr-connection.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -2069,33 +2070,11 @@ static NostrEvent *build_allowlist_event(MdNostr *n, const NostrList *list,
         }
     }
     char *plain = ok ? cJSON_PrintUnformatted(items) : NULL;
-    char *cipher = NULL;
-    ok = plain && strlen(plain) <= MD_ALLOWLIST_MAX_CONTENT &&
-        md_signer_nip44_encrypt_cancellable(n->signer, n->pk_hex, plain,
-                                           &cipher, n->signer_cancel) == 0 && cipher &&
-        strlen(cipher) <= MD_ALLOWLIST_MAX_CONTENT;
+    NostrEvent *ev = plain && strlen(plain) <= MD_ALLOWLIST_MAX_CONTENT ?
+        md_private_document_build(n->signer, n->signer_cancel, n->pk_hex,
+            NOSTR_KIND_CATEGORIZED_PEOPLE_LIST, "metadesk-allowlist", plain, created) : NULL;
     if (plain) { md_secure_zero(plain, strlen(plain)); free(plain); }
     cJSON_Delete(items);
-    NostrEvent *ev = ok ? nostr_event_new() : NULL;
-    if (ev) {
-        NostrTags *tags = nostr_tags_new(0);
-        NostrTag *d = nostr_tag_new("d", "metadesk-allowlist", NULL);
-        if (!tags || !d) {
-            nostr_tags_free(tags); nostr_tag_free(d); nostr_event_free(ev); ev = NULL;
-        } else {
-            nostr_tags_append(tags, d);
-            if (nostr_tags_size(tags) != 1) {
-                nostr_tag_free(d); nostr_tags_free(tags); nostr_event_free(ev); ev = NULL;
-            } else {
-                nostr_event_set_tags(ev, tags);
-                nostr_event_set_kind(ev, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST);
-                nostr_event_set_pubkey(ev, n->pk_hex);
-                nostr_event_set_created_at(ev, created);
-                nostr_event_set_content(ev, cipher);
-            }
-        }
-    }
-    free(cipher);
     return ev;
 }
 
@@ -2548,7 +2527,7 @@ int md_nostr_quality_save(MdNostr *n,const char *host,const MdQuality *q) {
     int64_t created=n->quality_created; char base[65]; strcpy(base,n->quality_id);
     pthread_mutex_unlock(&n->allowlist_mu);
     if (busy) { operation_end(n); return -1; }
-    int rc=-1; cJSON *doc=quality_document(n); char *plain=NULL,*cipher=NULL;
+    int rc=-1; cJSON *doc=quality_document(n); char *plain=NULL;
     NostrEvent *ev=NULL,*signed_ev=NULL;
     if (!doc) goto done;
     cJSON *hosts=cJSON_GetObjectItemCaseSensitive(doc,"hosts");
@@ -2558,16 +2537,12 @@ int md_nostr_quality_save(MdNostr *n,const char *host,const MdQuality *q) {
     cJSON_DeleteItemFromObjectCaseSensitive(entry,"quality");
     if (md_quality_write(entry,q)) goto done;
     plain=cJSON_PrintUnformatted(doc);
-    if (!plain || strlen(plain)>32768 || md_signer_nip44_encrypt_cancellable(n->signer,n->pk_hex,
-        plain,&cipher,n->signer_cancel) || !cipher) goto done;
-    ev=nostr_event_new(); if (!ev) goto done;
-    NostrTags *tags=nostr_tags_new(0); NostrTag *d=nostr_tag_new("d","metadesk-session-preferences",NULL);
-    if (!tags || !d) { nostr_tags_free(tags); nostr_tag_free(d); goto done; }
-    nostr_tags_append(tags,d); nostr_event_set_tags(ev,tags);
-    nostr_event_set_kind(ev,30078); nostr_event_set_pubkey(ev,n->pk_hex);
+    if (!plain || strlen(plain)>32768) goto done;
     int64_t now=(int64_t)time(NULL); if (created>=now) now=created+1;
     if (now>(int64_t)time(NULL)+30) goto done;
-    nostr_event_set_created_at(ev,now); nostr_event_set_content(ev,cipher);
+    ev=md_private_document_build(n->signer,n->signer_cancel,n->pk_hex,
+        NOSTR_KIND_APPLICATION_SPECIFIC_DATA,"metadesk-session-preferences",plain,now);
+    if (!ev) goto done;
     signed_ev=sign_event_cancellable(n->signer,ev,n->signer_cancel);
     pthread_mutex_lock(&n->allowlist_mu);
     bool current=!strcmp(base,n->quality_id);
@@ -2575,7 +2550,7 @@ int md_nostr_quality_save(MdNostr *n,const char *host,const MdQuality *q) {
     if (signed_ev && current && !is_stopped(n)) rc=publish_all(n,signed_ev);
  done:
     if (plain) { md_secure_zero(plain,strlen(plain)); free(plain); }
-    free(cipher); cJSON_Delete(doc); nostr_event_free(signed_ev); nostr_event_free(ev);
+    cJSON_Delete(doc); nostr_event_free(signed_ev); nostr_event_free(ev);
     pthread_mutex_lock(&n->allowlist_mu); n->quality_saving=false; pthread_mutex_unlock(&n->allowlist_mu);
     if (is_stopped(n)) rc=-1; operation_end(n); return rc;
 }
