@@ -51,6 +51,8 @@ jobs:
       - name: Configure
         run: |
           export PKG_CONFIG_PATH="$RUNNER_TEMP/nostrc-sdk/lib/pkgconfig"
+          test -f "$RUNNER_TEMP/nostrc-sdk/lib/libnip05.a"
+          test -f "$RUNNER_TEMP/nostrc-sdk/lib/libnip65.a"
           pkg-config --exists nip78
           meson setup build -Dnostrc_discovery=installed -Dsigner_nip5f=true -Dmanager=true
           meson test -C build --list | grep -F 'input portal private bus + EIS'

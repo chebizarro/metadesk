@@ -313,16 +313,30 @@ static void on_session_dm(const char *sender_pubkey_hex, const char *content,
     OPENSSL_cleanse(acc.stream_token, sizeof(acc.stream_token));
 }
 
+static void on_dm_relay_unavailable(const char *url, const char *reason, void *data) {
+    ClientCtx *ctx = data;
+    /* The relay's reason is already logged by core. Keep the UI diagnostic
+     * independent of relay-controlled text and of the host's decision. */
+    (void)reason;
+    fprintf(stderr, "ERROR: relay unavailable: DM inbox refused by %s\n", url);
+    const char *expected = NULL;
+    atomic_compare_exchange_strong(&ctx->connection_status, &expected,
+                                   "Relay unavailable: DM inbox subscription refused");
+}
+
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s [--host ADDRESS] --npub HOST_NPUB [OPTIONS]\n\n", argv0);
+    fprintf(stderr, "Usage: %s [--host ADDRESS] --npub IDENTITY [OPTIONS]\n\n", argv0);
     fprintf(stderr, "Connect to a metadesk host and display remote desktop.\n\n");
     fprintf(stderr, "Arguments:\n");
-    fprintf(stderr, "  ADDRESS            Positional alias for --host (requires --npub)\n\n");
+    fprintf(stderr, "  IDENTITY           npub, nprofile, 64-hex, or name@domain\n");
+    fprintf(stderr, "  ADDRESS            Positional alias for --host when --npub is given\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --host ADDRESS     Direct TCP endpoint (IP or hostname; port via --port)\n");
-    fprintf(stderr, "  --npub HOST_NPUB   Required host identity; FIPS route unless --host is set\n");
+    fprintf(stderr, "  --npub IDENTITY    Host identity; FIPS route unless --host is set\n");
+    fprintf(stderr, "  --pin KEY          Require this npub or 64-hex key to match the resolved identity\n");
+    fprintf(stderr, "  --managed          Require a bound client role and explicit --relay; no direct TCP\n");
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
     fprintf(stderr, "  --timeout MS       Connect/readiness timeout (default: 5000)\n");
@@ -1072,7 +1086,27 @@ static int sleep_with_reconnect_ui(ClientCtx *ctx, uint32_t delay_ms,
 
 /* ── Main ────────────────────────────────────────────────────── */
 
-static int client_run(int argc, char **argv) {
+static bool address_prefix(const char *s, const char *prefix) {
+    for (; *prefix; ++prefix, ++s) {
+        char c = *s;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != *prefix) return false;
+    }
+    return true;
+}
+
+static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *bootstrap,
+                      char **canonical_npub) {
+    /* Do this before argument errors can echo a positional value, including
+     * a route supplied alongside a separate --npub identity. */
+    for (int i = 1; i < argc; ++i) {
+        const char *s = argv[i];
+        if (address_prefix(s, "nostr:")) s += 6;
+        if (address_prefix(s, "nsec1") || address_prefix(s, "ncryptsec1")) {
+            fprintf(stderr, "ERROR: secret keys are not valid host addresses or identities\n");
+            return 1;
+        }
+    }
     /* Progress lines must reach a pipe (container log, supervisor) when
      * printed, not when a block buffer fills or the process exits. */
 #ifdef _WIN32
@@ -1091,7 +1125,8 @@ static int client_run(int argc, char **argv) {
 
     /* Default options */
     const char *host = NULL;
-    const char *npub = NULL;
+    const char *npub = NULL, *pin = NULL;
+    bool explicit_host = false, managed = false;
     const char *bunker_uri = NULL;
     const char *socket_path = NULL;
     const char *fips_control_socket = NULL;
@@ -1161,7 +1196,12 @@ static int client_run(int argc, char **argv) {
                 return 1;
             }
             host = argv[++i];
+            explicit_host = true;
         }
+        else if (!strcmp(argv[i], "--pin") && i + 1 < argc)
+            pin = argv[++i];
+        else if (!strcmp(argv[i], "--managed"))
+            managed = true;
         else if (strcmp(argv[i], "--npub") == 0 && i + 1 < argc)
             npub = argv[++i];
         else if (strcmp(argv[i], "--bunker") == 0 && i + 1 < argc)
@@ -1176,8 +1216,11 @@ static int client_run(int argc, char **argv) {
         else if (strcmp(argv[i], "--auto-signer") == 0)
             auto_signer = true;
         else if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc) {
-            if (relay_count < 16)
-                relay_urls[relay_count++] = argv[++i];
+            if (relay_count >= MD_RELAY_TARGET_MAX) {
+                fprintf(stderr, "ERROR: too many bootstrap relays\n");
+                return 1;
+            }
+            relay_urls[relay_count++] = argv[++i];
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -1191,11 +1234,43 @@ static int client_run(int argc, char **argv) {
         }
     }
 
+    if (!npub && host && !explicit_host &&
+        (strchr(host, '@') || strlen(host) == 64 || !strncmp(host, "nostr:", 6) ||
+         !strncmp(host, "npub1", 5) || !strncmp(host, "nprofile1", 9))) {
+        npub = host;
+        host = NULL;
+    }
     if (!npub) {
         fprintf(stderr, "ERROR: --npub host identity required, including for direct TCP (--host ADDRESS)\n\n");
         usage(argv[0]);
         return 1;
     }
+
+    if (managed && !relay_count) {
+        fprintf(stderr, "ERROR: no relays configured; select bootstrap relays before connecting\n");
+        return 1;
+    }
+    bool explicit_signer = bunker_uri || use_dbus_signer || use_socket_signer || auto_signer;
+    if (managed && (explicit_signer || host)) {
+        fprintf(stderr, "ERROR: managed connections require the bound client role and FIPS routing\n");
+        return 1;
+    }
+    if (!relay_count) relay_urls[relay_count++] = MD_DEFAULT_RELAY; /* CLI only */
+    for (int i = 0; i < relay_count; ++i) {
+        if (!md_relay_plan_add(bootstrap, relay_urls[i], MD_RELAY_CONFIGURED)) {
+            fprintf(stderr, "ERROR: invalid bootstrap relay URL\n");
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < bootstrap->count; ++i)
+        if (!strncmp(bootstrap->target[i].url, "ws://", 5))
+            fprintf(stderr, "WARNING: configured relay uses unencrypted WebSocket: %s\n", bootstrap->target[i].url);
+    MdResolveResult resolution = md_identity_resolve(npub, pin, identity);
+    if (resolution != MD_RESOLVE_OK || !(*canonical_npub = md_identity_npub(identity))) {
+        fprintf(stderr, "ERROR: resolve: %s\n", md_resolve_error(resolution == MD_RESOLVE_OK ? MD_RESOLVE_INVALID : resolution));
+        return 1;
+    }
+    npub = *canonical_npub;
 
     printf("metadesk-client v0.1.0\n");
     if (!host) {
@@ -1218,11 +1293,15 @@ static int client_run(int argc, char **argv) {
     /* ── Signer initialization ─────────────────────────────── */
     MdSigner *signer = NULL;
     MdAccountStartup account = {0};
-    bool explicit_signer = bunker_uri || use_dbus_signer || use_socket_signer || auto_signer;
     if (!explicit_signer) {
         int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &account);
         if (rc) {
             fprintf(stderr, "ERROR: client account restore: %s\n", md_accounts_error_string(rc));
+            return 1;
+        }
+        if (managed && !account.binding) {
+            fprintf(stderr, "ERROR: no bound client role\n");
+            md_account_startup_clear(&account);
             return 1;
         }
         signer = md_signer_ref(md_account_binding_signer(account.binding));
@@ -1296,16 +1375,11 @@ static int client_run(int argc, char **argv) {
             printf("client: using ephemeral signer\n");
         }
 
-        /* Default relay if none specified */
-        if (relay_count == 0) {
-            relay_urls[0] = MD_DEFAULT_RELAY;
-            relay_count = 1;
-        }
-
         /* Session DM callback. FIPS reachability is owned by the FIPS daemon
          * and checked through fips_control. */
         MdNostrCallbacks nostr_cbs = { 0 };
         nostr_cbs.on_dm = on_session_dm;
+        nostr_cbs.on_dm_relay_unavailable = on_dm_relay_unavailable;
         nostr_cbs.dm_userdata = &ctx;
 
         MdNostrConfig nostr_cfg = {
@@ -1314,15 +1388,10 @@ static int client_run(int argc, char **argv) {
             .relay_urls = relay_urls,
             .relay_count = relay_count,
             .quality_preferences = true,
+            .bootstrap_plan = bootstrap,
+            .session_peer = identity,
         };
-
-        if (md_fips_npub_to_pubkey_hex(npub, host_pubkey_hex, sizeof(host_pubkey_hex)) != 0) {
-            fprintf(stderr, "ERROR: --npub must be a valid bech32 FIPS/Nostr npub identity\n");
-            cleanup_session_nostr(&nostr, &ctx);
-            md_signer_destroy(signer);
-            md_account_startup_clear(&account);
-            return 1;
-        }
+        memcpy(host_pubkey_hex, identity->pubkey, sizeof(host_pubkey_hex));
         /* Pin expected peer before callbacks can run. */
         strncpy(ctx.expected_host_pk, host_pubkey_hex, sizeof(ctx.expected_host_pk) - 1);
 
@@ -1717,7 +1786,14 @@ static int client_run(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    int status = client_run(argc, argv);
+    md_identity_scrub_environment();
+    MdIdentity identity = {0};
+    MdRelayPlan bootstrap = {0};
+    char *npub = NULL;
+    int status = client_run(argc, argv, &identity, &bootstrap, &npub);
+    free(npub);
+    md_relay_plan_clear(&bootstrap);
+    md_identity_clear(&identity);
     /* Drain the process-wide network runtime before ExitProcess kills its
      * threads. DLL atexit handlers run too late to join them on Windows. */
     md_nostr_shutdown();

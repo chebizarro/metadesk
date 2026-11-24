@@ -108,6 +108,26 @@ def main():
             except BlockingIOError:
                 pass
         print("PASS: named and positional direct endpoints require host identity before TCP")
+        for args, diagnostic in (
+            (["--managed", "alice@127.0.0.1"], "no relays configured"),
+            (["--pin", "f" * 64, HOST_NPUB], "host key does not match the pin"),
+            (["alice@127.0.0.1"], "NIP-05 refused an unsafe destination"),
+        ):
+            result = subprocess.run([client, "--no-display", *args], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            assert result.returncode == 1 and diagnostic in result.stderr, result
+            assert "signer ready" not in result.stdout, result
+        print("PASS: managed no-relay, pin mismatch and unsafe NIP-05 fail before signaling")
+        for secret, options in (
+            ("NSeC1fixture-secret", ["--npub", "alice@127.0.0.1"]),
+            ("nCRYPTsec1fixture-secret", ["--npub", "alice@127.0.0.1", "--host"]),
+            ("nostr:NSEC1fixture-secret", ["--npub"]),
+        ):
+            result = subprocess.run([client, "--no-display", *options, secret], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            assert result.returncode == 1 and "secret keys are not valid host" in result.stderr, result
+            assert not result.stdout and secret not in result.stderr and "NIP-05" not in result.stderr, result
+        print("PASS: secret-like host arguments refused without echo or lookup")
         pending_shutdown(client, env)
 
 

@@ -44,7 +44,7 @@ cmake -S "$out/nostrc" -B "$out/nostrc/build" -G Ninja \
   -DENABLE_NIP55L=OFF -DENABLE_NIP5F=OFF -DENABLE_NIP57=OFF -DENABLE_NIP78=ON \
   -DWITH_NOSTRDB=OFF -DLIBNOSTR_WITH_NOSTRDB=OFF
 cmake --build "$out/nostrc/build" --target nostr nostr_json go_fiber \
-  nostr_nip44_core nip19 nostr_nip51_core nostr_nip78_core nostr_nip98 nip11 nostr_nip17_core -j2
+  nostr_nip44_core nip19 nostr_nip51_core nostr_nip78_core nostr_nip98 nip11 nostr_nip17_core nip05 nip65 -j2
 meson setup "$out/product" "$repo" --buildtype=release \
   -Dnostrc_discovery=build-tree -Dnostrc_root="$(cygpath -m "$out/nostrc")" \
   -Dnostrc_build_dir="$(cygpath -m "$out/nostrc/build")" -Dtools=true \

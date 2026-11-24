@@ -1,4 +1,5 @@
 #include "window.h"
+#include "identity_resolver.h"
 
 static void activate(GtkApplication *app, gpointer data) {
     (void)data;
@@ -28,6 +29,7 @@ static int command_line(GApplication *app,GApplicationCommandLine *line,gpointer
     return 0;
 }
 int main(int argc, char **argv) {
+    md_identity_scrub_environment();
     g_autoptr(AdwApplication) app = adw_application_new("org.metadesk.Manager", G_APPLICATION_HANDLES_COMMAND_LINE);
     const GActionEntry actions[] = {{.name = "close", .activate = close_window},
         {.name="review-request", .activate=review_request, .parameter_type="(ss)"}};

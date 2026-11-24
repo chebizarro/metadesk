@@ -3,6 +3,7 @@
 #include "signer-status.h"
 #include "access-page.h"
 #include "management_ipc.h"
+#include "relay_plan.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -129,13 +130,14 @@ static void populate_accounts(MdManagerWindow *self) {
     gtk_widget_set_sensitive(GTK_WIDGET(self->save_host), self->accounts != NULL);
 }
 
-typedef enum { LOAD, ADD_ACCOUNT, SAVE_ROLE, SAVE_RELAYS } JobKind;
+typedef enum { LOAD, ADD_ACCOUNT, SAVE_ROLE, SAVE_RELAYS, PROBE_RELAY } JobKind;
 typedef struct {
     JobKind kind;
     MdSignerType backend;
     MdAccountRole role;
     char *key, *label;
     char **relays;
+    guint relay_index;
 } Job;
 typedef struct { GPtrArray *accounts; char **relays; GError *account_error, *relay_error; } Snapshot;
 static void job_free(gpointer data) {
@@ -152,6 +154,11 @@ static void work(GTask *task, gpointer source, gpointer task_data, GCancellable 
     MdManagerWindow *self = source;
     Job *job = task_data;
     g_autoptr(GError) error = NULL;
+    if (job->kind == PROBE_RELAY) {
+        MdRelayTarget target = {job->key, MD_RELAY_CONFIGURED};
+        g_task_return_int(task, md_relay_probe_auth(&target));
+        return;
+    }
     if (job->kind == ADD_ACCOUNT)
         md_manager_account_add(self->directory, job->backend, job->key, job->label, &error);
     else if (job->kind == SAVE_ROLE) {
@@ -176,6 +183,25 @@ static void work_done(GObject *source, GAsyncResult *result, gpointer data) {
     GTask *task = G_TASK(result);
     Job *job = g_task_get_task_data(task);
     g_autoptr(GError) error = NULL;
+    if (job->kind == PROBE_RELAY) {
+        MdRelayAuth auth = g_task_propagate_int(task, &error);
+        if (!self->closed) {
+            const char *status = error ? "Could not check relay authentication" :
+                auth == MD_RELAY_AUTH_REQUIRED ? "This relay requires Nostr authentication" :
+                auth == MD_RELAY_AUTH_NOT_ADVERTISED ? "This relay does not advertise required authentication" :
+                "Could not read the relay information document";
+            GtkListBoxRow *row = gtk_list_box_get_row_at_index(self->relay_list, job->relay_index);
+            if (row) {
+                g_autofree char *text = g_str_has_prefix(job->key, "ws://") ?
+                    g_strdup_printf("Unencrypted connection — %s", status) : g_strdup(status);
+                adw_action_row_set_subtitle(ADW_ACTION_ROW(row), text);
+            }
+            set_busy(self, FALSE);
+        }
+        g_application_release(G_APPLICATION(data));
+        g_object_unref(data);
+        return;
+    }
     Snapshot *snapshot = g_task_propagate_pointer(task, &error);
     if (!self->closed) {
         GtkLabel *error_label = job->kind == SAVE_RELAYS ? self->relay_error : self->account_error;
@@ -254,10 +280,30 @@ static void remove_relay_clicked(GtkButton *button, gpointer data) {
         if (i != index) job->relays[j++] = g_strdup(self->relays[i]);
     start_job(self, job);
 }
+static void probe_relay_clicked(GtkButton *button, gpointer data) {
+    MdManagerWindow *self = data;
+    guint index = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(button), "relay-index"));
+    if (self->busy || !self->relays || index >= g_strv_length(self->relays)) return;
+    Job *job = g_new0(Job, 1);
+    job->kind = PROBE_RELAY;
+    job->relay_index = index;
+    job->key = g_strdup(self->relays[index]);
+    start_job(self, job);
+}
+
 static void populate_relays(MdManagerWindow *self) {
     clear_list(self->relay_list);
     for (guint i = 0; self->relays && self->relays[i]; ++i) {
-        GtkWidget *row = action_row(self->relays[i], "Saved locally — not connected");
+        GtkWidget *row = action_row(self->relays[i], g_str_has_prefix(self->relays[i], "ws://") ?
+                                    "Unencrypted connection — saved locally" : "Saved locally — not connected");
+        GtkWidget *probe = gtk_button_new_from_icon_name("view-refresh-symbolic");
+        gtk_widget_set_tooltip_text(probe, "Check Relay Authentication");
+        gtk_accessible_update_property(GTK_ACCESSIBLE(probe), GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                       "Check Relay Authentication", -1);
+        gtk_widget_set_valign(probe, GTK_ALIGN_CENTER);
+        g_object_set_data(G_OBJECT(probe), "relay-index", GUINT_TO_POINTER(i));
+        g_signal_connect_object(probe, "clicked", G_CALLBACK(probe_relay_clicked), self, 0);
+        adw_action_row_add_suffix(ADW_ACTION_ROW(row), probe);
         GtkWidget *button = gtk_button_new_from_icon_name("user-trash-symbolic");
         gtk_widget_set_tooltip_text(button, "Remove Relay");
         gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
@@ -267,7 +313,7 @@ static void populate_relays(MdManagerWindow *self) {
         gtk_list_box_append(self->relay_list, row);
     }
     if (!self->relays || !self->relays[0])
-        gtk_list_box_append(self->relay_list, action_row("No Relays Selected", "Add an operator-chosen relay below"));
+        gtk_list_box_append(self->relay_list, action_row("No Relays Configured", "Add a bootstrap relay to enable discovery"));
     gtk_widget_set_sensitive(GTK_WIDGET(self->add_relay), self->relays != NULL);
 }
 static void add_relay_clicked(GtkButton *button, gpointer data) {

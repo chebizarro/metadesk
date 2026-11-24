@@ -63,7 +63,7 @@ Both modes connect to the same host daemon and can run simultaneously.
 Choose one nostrc source, then build and test:
 
 ```bash
-# Installed SDK
+# Installed SDK (produced by packaging/linux/build-nostrc.sh)
 PKG_CONFIG_PATH=/path/to/sdk/lib/pkgconfig meson setup build -Dnostrc_discovery=installed
 
 # Or: dedicated CMake build tree
@@ -86,7 +86,7 @@ meson test -C build
 
 ## FIPS Runtime Setup
 
-metadesk does not run or manage FIPS. Start and configure the upstream FIPS daemon before starting `metadesk-host` or connecting with `metadesk-client`.
+metadesk does not run or manage FIPS. Start and configure the upstream FIPS daemon before starting `metadesk-host` or connecting with `metadesk-client`. See [Connecting by host identity](docs/host-resolution.md) for address forms, pins, and relay selection.
 
 Required daemon capabilities for the current metadesk path:
 

@@ -56,9 +56,12 @@ the window. Standard window decorations are retained.
   requested WebSocket endpoint. Only `ws`/`wss` URLs with a host and valid port
   are accepted; credentials,
   query parameters, fragments, whitespace, and malformed URLs are rejected.
-  `ws` is visibly described as unencrypted. No relay is preselected, contacted,
-  or claimed connected. These settings are **not yet consumed** by CLI/core
-  relay planning (`md-2l87`); they do not rewrite its legacy defaults.
+  `ws` is visibly described as unencrypted. No relay is preselected. Use
+  **Check Relay Authentication** on a saved relay to read its NIP-11 information
+  document; “does not advertise” does not rule out a later NIP-42 challenge.
+  Checking does not establish a WebSocket session. The managed client requires
+  explicit `--relay` values and never falls back to the CLI default. The
+  manager’s address-book/launch flow is separate (`md-vb18`).
 - **Access:** connect to an explicit local host socket (or launch with
   `metadesk-manager --management-socket /absolute/private/control.sock`). This
   neither starts a host nor enables attended admission. Kernel peer credentials

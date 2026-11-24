@@ -203,7 +203,7 @@ Cflags: -I${{includedir}}
           '-DOPENSSL_ROOT_DIR=' + str(prefix),
           targets=['nostr', 'nostr_json', 'nostrgo', 'go_fiber', 'nip04', 'nip06', 'nip19',
                    'nip11', 'nostr_nip44_core', 'nostr_nip46_core', 'nostr_nip5f_core',
-                   'nostr_nip51_core', 'nostr_nip78_core', 'nostr_nip98', 'nostr_nip17_core'], install=False)
+                   'nostr_nip51_core', 'nostr_nip78_core', 'nostr_nip98', 'nostr_nip17_core', 'nip05', 'nip65'], install=False)
     run('minimum-os', ['python3', HERE / 'macho.py', '13.0', prefix, out / 'build/nostrc/libjson'])
     print(f'Built {prefix}; nostrc source={sources["nostrc"]}, build={out / "build/nostrc"}')
 

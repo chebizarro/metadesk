@@ -133,6 +133,39 @@ static void save_render(GtkWindow *window, const char *filename) {
     g_autofree char *path = g_build_filename(directory, filename, NULL);
     MD_CHECK(gdk_texture_save_to_png(texture, path));
 }
+static GtkWidget *button_with_tooltip(GtkWidget *widget, const char *tooltip) {
+    if (GTK_IS_BUTTON(widget) && !g_strcmp0(gtk_widget_get_tooltip_text(widget), tooltip)) return widget;
+    for (GtkWidget *c = gtk_widget_get_first_child(widget); c; c = gtk_widget_get_next_sibling(c)) {
+        GtkWidget *match = button_with_tooltip(c, tooltip);
+        if (match) return match;
+    }
+    return NULL;
+}
+
+static gboolean nip11_request(GSocketService *service, GSocketConnection *connection,
+                              GObject *source, gpointer data) {
+    (void)service; (void)source;
+    g_socket_set_timeout(g_socket_connection_get_socket(connection), 2);
+    GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
+    g_autoptr(GDataInputStream) lines = g_data_input_stream_new(in);
+    g_data_input_stream_set_newline_type(lines, G_DATA_STREAM_NEWLINE_TYPE_CR_LF);
+    g_autofree char *request = g_data_input_stream_read_line(lines, NULL, NULL, NULL);
+    gboolean accept = FALSE;
+    for (unsigned i = 0; i < 16; ++i) {
+        g_autofree char *line = g_data_input_stream_read_line(lines, NULL, NULL, NULL);
+        if (!line || !*line) break;
+        accept |= !g_ascii_strcasecmp(line, "Accept: application/nostr+json");
+    }
+    *(gboolean *)data = accept && request && g_str_has_prefix(request, "GET /probe HTTP/");
+    const char *json = "{\"limitation\":{\"auth_required\":true}}";
+    g_autofree char *reply = g_strdup_printf("HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\n"
+        "Connection: close\r\nContent-Length: %zu\r\n\r\n%s", strlen(json), json);
+    g_output_stream_write_all(g_io_stream_get_output_stream(G_IO_STREAM(connection)),
+                              reply, strlen(reply), NULL, NULL, NULL);
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+}
+
 static void activate_button(GtkWindow *window, const char *name) {
     g_signal_emit_by_name(child(window, name), "clicked");
     WAIT_UNTIL(!busy(window));
@@ -282,6 +315,31 @@ int main(void) {
         g_signal_emit_by_name(navigation, "row-activated", gtk_list_box_get_row_at_index(navigation, 3));
         save_render(window, "fixture-identity-wide.png");
         g_signal_emit_by_name(navigation, "row-activated", gtk_list_box_get_row_at_index(navigation, 4));
+    }
+
+    /* The probe uses NIP-11 HTTP on the selected URL, not a WebSocket or a public relay. */
+    gboolean requested_info = FALSE;
+    g_autoptr(GSocketService) service = g_socket_service_new();
+    g_autoptr(GInetAddress) loopback = g_inet_address_new_loopback(G_SOCKET_FAMILY_IPV4);
+    g_autoptr(GSocketAddress) bind_addr = g_inet_socket_address_new(loopback, 0);
+    g_autoptr(GSocketAddress) effective = NULL;
+    MD_CHECK(g_socket_listener_add_address(G_SOCKET_LISTENER(service), bind_addr,
+                 G_SOCKET_TYPE_STREAM, G_SOCKET_PROTOCOL_TCP, NULL, &effective, NULL));
+    if (effective) {
+        g_signal_connect(service, "incoming", G_CALLBACK(nip11_request), &requested_info);
+        g_autofree char *url = g_strdup_printf("ws://127.0.0.1:%u/probe",
+            g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(effective)));
+        gtk_editable_set_text(GTK_EDITABLE(child(window, "relay_url")), url);
+        activate_button(window, "add_relay");
+        GtkListBoxRow *row = gtk_list_box_get_row_at_index(relay_list, 1);
+        GtkWidget *button = row ? button_with_tooltip(GTK_WIDGET(row), "Check Relay Authentication") : NULL;
+        MD_CHECK(button);
+        if (button) {
+            g_signal_emit_by_name(button, "clicked");
+            WAIT_UNTIL(!busy(window));
+            MD_CHECK(requested_info);
+            MD_CHECK(strstr(adw_action_row_get_subtitle(ADW_ACTION_ROW(row)), "requires Nostr authentication"));
+        }
     }
 
     /* Traverse with the same GTK focus-navigation path used by Tab/Shift+Tab. */

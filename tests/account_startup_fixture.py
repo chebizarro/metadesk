@@ -252,11 +252,11 @@ def startup_contracts(host, client, home, env, nip5f):
                         assert "differs from the FIPS node key" in result.stderr, result.stderr
                 # Selected client role is checked against the actual socket owner.
                 if backend == "nip5f" and client:
-                    # A malformed destination fails after role restoration but
-                    # before signing/encryption (this signer is identity-only).
+                    # Identity resolution now precedes account restoration; an
+                    # invalid destination cannot activate the selected signer.
                     result = subprocess.run([client, "--npub", "invalid-fixture-npub", "--no-display"], env=env, capture_output=True, text=True, timeout=15)
-                    assert result.returncode == 1 and "client: signer ready" in result.stdout and "account restore" not in result.stderr, result.stderr
-                    assert "--npub must be a valid" in result.stderr, result.stderr
+                    assert result.returncode == 1 and "client: signer ready" not in result.stdout, result
+                    assert "resolve: invalid host identity" in result.stderr and "account restore" not in result.stderr, result.stderr
                     signer.pubkey = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
                     result = subprocess.run([client, "--host", "127.0.0.1", "--npub", npub, "--no-display"], env=env, capture_output=True, text=True, timeout=15)
                     assert result.returncode == 1 and "client account restore" in result.stderr and "pinned account" in result.stderr, result.stderr

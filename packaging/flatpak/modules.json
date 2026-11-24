@@ -301,9 +301,10 @@
       ],
       "buildsystem": "simple",
       "build-commands": [
-        "cmake -S . -B _build -G Ninja -C tests/packaging/nip-subset.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app/lib/metadesk-nostrc -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_WITH_GLIB=OFF -DENABLE_NIP5F=ON -DENABLE_NIP78=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH=/app",
+        "cmake -S . -B _build -G Ninja -C tests/packaging/nip-subset.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app/lib/metadesk-nostrc -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_WITH_GLIB=OFF -DENABLE_NIP5F=ON -DENABLE_NIP05=ON -DENABLE_NIP65=ON -DENABLE_NIP78=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH=/app",
         "cmake --build _build -j2",
-        "cmake --install _build"
+        "cmake --install _build",
+        "ar rcs /app/lib/metadesk-nostrc/lib/libnip65.a _build/nips/nip65/CMakeFiles/nip65.dir/src/nip65.c.o"
       ],
       "sources": [
         {

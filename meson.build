@@ -109,7 +109,9 @@ if _nostrc_mode == 'installed'
   # NIP-19 and the optional legacy signer adapters have no .pc file.
   # Their install layout nests headers under the nostr include directory.
   nostrc_inc = include_directories([fs.parent(_nostrc_incdir), _nostrc_incdir])
-  _nostrc_deps += {'nip19' : cc.find_library('nip19', dirs : [_nostrc_libdir])}
+  foreach _nip : ['nip05', 'nip19', 'nip65']
+    _nostrc_deps += {_nip : cc.find_library(_nip, dirs : [_nostrc_libdir])}
+  endforeach
   dep_libgo = dependency('libnostrgo', version : '>=0.3.1', method : 'pkg-config')
   _nostrc_pc_deps = [dep_nostr_json, dep_libgo]
   foreach _nip : ['nip11', 'nip17', 'nip44', 'nip51', 'nip78', 'nip98']
@@ -125,7 +127,7 @@ if _nostrc_mode == 'installed'
   endforeach
   message('nostrc installed libdir: ' + _nostrc_libdir)
 else
-  _nostrc_nip_dirs = ['nip11', 'nip17', 'nip19', 'nip44', 'nip51', 'nip78', 'nip98']
+  _nostrc_nip_dirs = ['nip05', 'nip11', 'nip17', 'nip19', 'nip44', 'nip51', 'nip65', 'nip78', 'nip98']
   _nostrc_inc_paths = []
   foreach d : ['libnostr', 'libgo'] + _nostrc_nip_dirs
     _src_inc = _nostrc_root / (d.startswith('nip') ? 'nips' / d : d) / 'include'
@@ -191,6 +193,8 @@ else
     # component : [CMake target / library name, build-tree subdir]
     'nip44' : ['nostr_nip44_core', 'nips/nip44'],
     'nip51' : ['nostr_nip51_core', 'nips/nip51'],
+    'nip05' : ['nip05', 'nips/nip05'],
+    'nip65' : ['nip65', 'nips/nip65'],
     'nip78' : ['nostr_nip78_core', 'nips/nip78'],
     'nip98' : ['nostr_nip98', 'nips/nip98'],     # NIP-98 HTTP auth
     'nip19' : ['nip19', 'nips/nip19'],           # npub allowlist decoding
@@ -413,6 +417,7 @@ elif host_os == 'windows'
   # Windows system libraries
   cc = meson.get_compiler('c')
   platform_hal_deps += [
+    cc.find_library('regex', required : true), # nip05's MinGW POSIX regex dependency
     cc.find_library('ws2_32', required : true),
     cc.find_library('rpcrt4', required : true),
     cc.find_library('d3d11', required : true),
@@ -485,6 +490,8 @@ core_deps += [
   dep_nip19,
   dep_nip17,
   dep_nip11,
+  _nostrc_deps['nip05'],
+  _nostrc_deps['nip65'],
   dep_curl,
   dep_libgo,
   dep_secp256k1,
@@ -768,6 +775,9 @@ core_sources = files(
   'src/core/mcp_bridge.c',
   'src/core/mcp_http.c',
   'src/core/nostr.c',
+  'src/core/discovery_http.c',
+  'src/core/identity_resolver.c',
+  'src/core/relay_plan.c',
   'src/core/session_log.c',
   'src/core/packet.c',
   'src/core/stream.c',
@@ -1054,10 +1064,20 @@ if '@0@'.format(get_option('b_sanitize')).contains('thread')
   endif
 endif
 test('nostr NIP-44', test_nostr, env : nostr_test_env)
+foreach name : ['identity_resolver', 'relay_plan']
+  test(name, executable('test_' + name, 'tests/test_' + name + '.c',
+    dependencies : dep_metadesk))
+endforeach
 test('nostr ACL and AUTH private relays', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr],
   env : nostr_test_env, timeout : 120,
 )
+test_nostr_routes = executable('test_nostr_routes', 'tests/test_nostr_routes.c',
+  dependencies : dep_metadesk)
+test('nostr routed bridge private relays', find_program('python3'),
+  args : [files('tests/nostr_routes_fixture.py'), test_nostr_routes],
+  env : nostr_test_env, timeout : 65)
+
 test('nostr ACL silent relay deadline', find_program('python3'),
   args : [files('tests/nostr_acl_fixture.py'), test_nostr, '--silent-relay'],
   env : nostr_test_env, timeout : 20,
