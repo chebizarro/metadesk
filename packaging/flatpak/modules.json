@@ -6,7 +6,7 @@
     {
       "name": "cjson",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/cjson/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/cjson/LICENSE"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -29,7 +29,7 @@
     {
       "name": "libb2",
       "post-install": [
-        "install -Dm644 COPYING /app/share/licenses/libb2/COPYING"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/COPYING\" /app/share/licenses/libb2/COPYING"
       ],
       "buildsystem": "autotools",
       "sources": [
@@ -48,7 +48,7 @@
     {
       "name": "jansson",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/jansson/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/jansson/LICENSE"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -71,7 +71,7 @@
     {
       "name": "secp256k1",
       "post-install": [
-        "install -Dm644 ../COPYING /app/share/licenses/secp256k1/COPYING"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/COPYING\" /app/share/licenses/secp256k1/COPYING"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -96,7 +96,7 @@
     {
       "name": "nsync",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/nsync/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/nsync/LICENSE"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -118,7 +118,7 @@
     {
       "name": "libwebsockets",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/libwebsockets/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/libwebsockets/LICENSE"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -150,9 +150,9 @@
     {
       "name": "libyuv",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/libyuv/LICENSE",
-        "install -Dm644 ../PATENTS /app/share/licenses/libyuv/PATENTS",
-        "install -Dm644 ../AUTHORS /app/share/licenses/libyuv/AUTHORS"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/libyuv/LICENSE",
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/PATENTS\" /app/share/licenses/libyuv/PATENTS",
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/AUTHORS\" /app/share/licenses/libyuv/AUTHORS"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -173,7 +173,7 @@
     {
       "name": "sdl2",
       "post-install": [
-        "install -Dm644 ../LICENSE.txt /app/share/licenses/sdl2/LICENSE.txt"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE.txt\" /app/share/licenses/sdl2/LICENSE.txt"
       ],
       "buildsystem": "cmake-ninja",
       "sources": [
@@ -229,7 +229,7 @@
     {
       "name": "onevpl",
       "post-install": [
-        "install -Dm644 ../LICENSE /app/share/licenses/onevpl/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/onevpl/LICENSE"
       ],
       "only-arches": [
         "x86_64"
@@ -297,7 +297,7 @@
     {
       "name": "nostrc",
       "post-install": [
-        "install -Dm644 LICENSE /app/share/licenses/nostrc/LICENSE"
+        "install -Dm644 \"$FLATPAK_BUILDER_BUILDDIR/LICENSE\" /app/share/licenses/nostrc/LICENSE"
       ],
       "buildsystem": "simple",
       "build-commands": [

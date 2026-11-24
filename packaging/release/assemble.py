@@ -171,7 +171,7 @@ def assemble(packages, out):
         'COMPONENT_SOURCE_LINKS_AND_LICENSE_TEXT_LOCATIONS': '\n' + '\n'.join(closure_rows) +
             '\n\nFlatpak GNOME Platform is installed separately; only the app payload is redistributed. '
             'See each asset’s manifest entry for the library-to-source and copyright mapping. '
-            'The owner must review these offers and verify the attachments before public distribution.' ,
+            'The owner must review these offers and verify the attachments before public distribution.',
         'DISTRO_COPYRIGHT_AND_SOURCE_INSTRUCTIONS': 'Use Ubuntu or Fedora package metadata and the matching distro source packages.',
     }
     for key, value in replacements.items():

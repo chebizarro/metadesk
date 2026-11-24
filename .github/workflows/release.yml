@@ -137,6 +137,8 @@ jobs:
         with:
           pattern: release-*
           path: ${{ runner.temp }}/packages
+      - name: Test release assembly and source-offer gates
+        run: python3 -B -m unittest discover -s packaging/release -v
       - name: Assemble exact-SHA source, CycloneDX SBOM, notes and checksums
         run: python3 packaging/release/assemble.py "$RUNNER_TEMP/packages" "$RUNNER_TEMP/assets"
       - name: Attach assets to draft (publish only for an existing pushed tag)

@@ -23,10 +23,10 @@ FLATPAK = {
     'libvpl': ('onevpl', 'MIT'),
 }
 DMG = {
-    'libSDL2-2.0': 'Zlib', 'libcjson': 'MIT', 'libcrypto': 'Apache-2.0',
-    'libjansson': 'MIT', 'libnostr-json': 'MIT', 'libnsync': 'Apache-2.0',
-    'libsecp256k1': 'MIT', 'libssl': 'Apache-2.0', 'libwebsockets': 'MIT',
-    'libyuv': 'BSD-3-Clause',
+    'libSDL2-2.0': ('sdl2', 'Zlib'), 'libcjson': ('cjson', 'MIT'), 'libcrypto': ('openssl', 'Apache-2.0'),
+    'libjansson': ('jansson', 'MIT'), 'libnostr-json': ('nostrc', 'MIT'), 'libnsync': ('nsync', 'Apache-2.0'),
+    'libsecp256k1': ('secp256k1', 'MIT'), 'libssl': ('openssl', 'Apache-2.0'), 'libwebsockets': ('libwebsockets', 'MIT'),
+    'libyuv': ('libyuv', 'BSD-3-Clause'),
 }
 
 
@@ -46,7 +46,10 @@ def curl(url, *args):
 
 def dsc_files(directory, source, version):
     """Validate the full SHA256 source package set, including Debian patches."""
-    dsc, = directory.glob('*.dsc')
+    candidates = list(directory.glob('*.dsc'))
+    if len(candidates) != 1:
+        raise ValueError(f'{source}={version}: missing or ambiguous .dsc in {directory}')
+    dsc, = candidates
     data = dsc.read_text()
     for field, value in [('Source', source), ('Version', version)]:
         if not re.search(rf'^{field}: {re.escape(value)}$', data, re.M):
@@ -60,6 +63,8 @@ def dsc_files(directory, source, version):
         path = directory / name
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.+_~:-]*', name) or name in files:
             raise ValueError(f'{dsc}: invalid source member {name}')
+        if not path.is_file():
+            raise ValueError(f'{dsc}: missing source member {name}')
         if path.stat().st_size != int(size) or digest(path) != checksum:
             raise ValueError(f'{path}: source member does not match .dsc')
         files[name] = checksum
@@ -188,7 +193,8 @@ def verify(receipt, offers, ffmpeg_name):
     libraries = inventory['private_libraries' if platform == 'dmg' else 'libraries']
     if not FFMPEG.issubset({stem(name) for name in libraries}):
         raise ValueError(f'{platform}: missing private FFmpeg libraries from inventory')
-    result = {}
+    pins = json.loads((PACKAGING / 'release/reviewed-source-pins.json').read_text())
+    result, checked_sources = {}, {}
     for name, info in libraries.items():
         library = stem(name)
         if library in FFMPEG:
@@ -198,7 +204,10 @@ def verify(receipt, offers, ffmpeg_name):
         elif platform == 'appimage' and 'ubuntu' in info:
             record = info['ubuntu']
             src, version = record['source'], record['version']
-            if dsc_files(offers / 'ubuntu' / f'{src}_{version}', src, version) != record['files']:
+            key = src, version
+            if key not in checked_sources:
+                checked_sources[key] = dsc_files(offers / 'ubuntu' / f'{src}_{version}', src, version)
+            if checked_sources[key] != record['files']:
                 raise ValueError(f'{name}: source receipt mismatch')
             if digest(offers / 'notices' / record['notice']) != record['notice_sha256']:
                 raise ValueError(f'{name}: copyright receipt mismatch')
@@ -209,11 +218,18 @@ def verify(receipt, offers, ffmpeg_name):
             selected, = (m for m in inventory['modules'] if m['name'] == module)
             reviewed, = (m for m in json.loads((PACKAGING / 'flatpak/modules.json').read_text())['modules']
                          if m['name'] == module)
-            if selected != reviewed:
-                raise ValueError(f'{name}: private module pin/recipe mismatch')
-            result[name] = {'license': license_id, 'module': module, 'sources': selected['sources']}
+            pin, = selected['sources']
+            if selected != reviewed or pin.get('commit', pin.get('sha256')) != pins['flatpak'][module]:
+                raise ValueError(f'{name}: unreviewed private Flatpak source pin')
+            result[name] = {'license': license_id, 'module': module, 'sources': selected['sources'],
+                            'notices': f'/app/share/licenses/{module}/'}
         elif platform == 'dmg' and library in DMG:
-            result[name] = {'license': DMG[library]}
+            module, license_id = DMG[library]
+            pin, = (p for p in inventory['pins'] if p['name'] == module)
+            if pin.get('commit', pin.get('sha256')) != pins['dmg'][module]:
+                raise ValueError(f'{name}: unreviewed private DMG source pin')
+            result[name] = {'license': license_id, 'module': module, 'source': pin,
+                            'notices': 'Contents/Resources/licenses/'}
         else:
             raise ValueError(f'{platform}: no reviewed source/license route for {name}')
     if platform == 'appimage':
