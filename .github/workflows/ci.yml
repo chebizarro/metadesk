@@ -19,9 +19,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Install dependencies
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # The regional EC2 mirror repeatedly stalled during package downloads.
+          sudo sed -Ei 's|://[a-z0-9-]+\.ec2\.archive\.ubuntu\.com/|://azure.archive.ubuntu.com/|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          sudo apt-get "${apt_options[@]}" update --error-on=any
+          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends \
             build-essential cmake meson ninja-build pkg-config \
             libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev \
             libgtk-4-dev libadwaita-1-dev libglib2.0-dev libsecret-1-dev \
