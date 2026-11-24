@@ -24,9 +24,9 @@ store, and open the new owner's store.
    write targets. Do not send a locally constructed event directly. Retrieve
    the durable signed event from `outgoing`, send it with cancellable transport
    tied to the same binding, and record the correlated per-relay outcome. The
-   handoff is durably recorded as possibly sent before transport gets the event. Only
-   positive OK counts; even a relay echo of the pending event does not commit
-   it. Do not mint a new replacement on retry. Raw relay reason strings are
+   handoff is durably recorded as possibly sent before transport gets the
+   event. Only positive OK counts; even a relay echo of the pending event does
+   not commit it. Do not mint a new replacement on retry. Raw relay reason strings are
    transport diagnostics, not durable state.
 4. One positive OK commits the winner; remaining targets keep the document
    partial. In a conflict the remote winner and signed local draft are kept
@@ -57,16 +57,20 @@ store returns a size error rather than truncating or sharding a document.
 ## Local data and compatibility
 
 Cache and outbox are one atomic encrypted-event journal per coordinate, with
-relay target fingerprints and finite result codes. Last-connected records are
-local public-key/time/outcome tuples, retaining the newest 100 insertions. The
-local unattended latch defaults to disabled; it is not host authorization.
+relay target fingerprints and finite result codes. Fingerprints use the same
+URL normalization as nostrc (scheme/host case and trailing slashes; path case
+is retained). Decoded JSON trees are scrubbed before release. Last-connected
+records are local public-key/time/outcome tuples, retaining the newest 100
+insertions. Malformed recents are discarded; a corrupt event journal instead
+fails closed and is never treated as empty. The local unattended latch defaults to disabled; it is not host authorization.
 Host policy callers must hold real authorization separately and must not
 report revocation success if the local disable cannot be persisted.
 
 The private host ACL and standalone CLI quality preferences reuse the unsigned
 signer-backed event builder. Host ACL remains host-owned and keeps its positive
 OK and legacy-public review policy. V1 management host metadata also accepts
-the existing quality codec, and retains quality through unrelated edits. The
+the existing quality codec, and retains quality through unrelated edits. Set
+`"quality": null` in an edit to clear that host's quality preference. The
 standalone CLI's existing quality coordinate (`metadesk-session-preferences`)
 remains compatible; it is not silently migrated into the client address book.
 

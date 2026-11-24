@@ -2,6 +2,7 @@
 #include "platform.h"
 #include "quality.h"
 #include <nostr-kinds.h>
+#include <nostr-utils.h>
 #include <nostr/nip51/nip51.h>
 #include <nostr/nip78/nip78.h>
 #include <jansson.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #ifdef _WIN32
 #include "win_private.h"
 #else
@@ -61,6 +63,33 @@ static int doc_kind(const char *d) {
 static void wipe(char *s) {
     if (s) { md_secure_zero(s, strlen(s)); free(s); }
 }
+/* Private, mutable Jansson trees only, after the last semantic use of all
+ * aliases (the merge may share nodes). Jansson owns the backing storage for
+ * parsed/copied strings and keys. Iterate by handle, not key lookup, after
+ * scrubbing key bytes; do not mutate the shared true/false/null singletons. */
+static void wipe_tree(json_t *j) {
+    if (json_is_object(j)) {
+        for (void *it = json_object_iter(j); it; it = json_object_iter_next(j,it)) {
+            wipe_tree(json_object_iter_value(it));
+            md_secure_zero((void *)json_object_iter_key(it),json_object_iter_key_len(it));
+        }
+    } else if (json_is_array(j)) {
+        size_t i;
+        json_t *v;
+        json_array_foreach(j,i,v) wipe_tree(v);
+    } else if (json_is_string(j)) {
+        md_secure_zero((void *)json_string_value(j),json_string_length(j));
+    } else if (json_is_integer(j)) {
+        json_integer_set(j,0);
+    } else if (json_is_real(j)) {
+        json_real_set(j,0.0);
+    }
+}
+static void discard_plaintext(json_t *j) {
+    wipe_tree(j);
+    json_decref(j);
+}
+
 static bool ciphertext(const char *s) {
     if (!s || s[0] != 'A' || s[1] < 'g' || s[1] > 'v') return false;
     size_t n = strlen(s);
@@ -201,23 +230,39 @@ static bool write_json(MdManagedStore *s, const char *coordinate, json_t *j) {
     free(str);
     return ok;
 }
-static json_t *read_json(MdManagedStore *s, const char *coordinate, bool *missing) {
+typedef enum { FILE_OK, FILE_MISSING, FILE_MALFORMED, FILE_IO } FileState;
+static json_t *read_json(MdManagedStore *s, const char *coordinate, FileState *state) {
     char name[64];
     file_name(coordinate, name);
-    *missing = false;
+    *state = FILE_IO;
     unsigned char *buf = NULL;
     size_t used = 0;
 #ifdef _WIN32
     HANDLE f = md_win_file(s->dir, name, GENERIC_READ, OPEN_EXISTING, FILE_SHARE_READ);
-    if (f == INVALID_HANDLE_VALUE) { *missing = GetLastError() == ERROR_FILE_NOT_FOUND; return NULL; }
+    if (f == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) *state = FILE_MISSING;
+        return NULL;
+    }
+    LARGE_INTEGER size;
+    if (GetFileSizeEx(f,&size) && (size.QuadPart <= 0 || size.QuadPart > FILE_LIMIT)) {
+        *state = FILE_MALFORMED;
+        CloseHandle(f);
+        return NULL;
+    }
     bool ok = md_win_read(f, &buf, &used, FILE_LIMIT);
     CloseHandle(f);
     if (!ok) { free(buf); return NULL; }
 #else
     int f = openat(s->dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (f < 0) { *missing = errno == ENOENT; return NULL; }
+    if (f < 0) { if (errno == ENOENT) *state = FILE_MISSING; return NULL; }
     struct stat st;
-    if (owned(f, false) && !fstat(f, &st) && st.st_size > 0 && st.st_size <= FILE_LIMIT) {
+    if (!owned(f,false) || fstat(f,&st)) { close(f); return NULL; }
+    if (st.st_size <= 0 || st.st_size > FILE_LIMIT) {
+        *state = FILE_MALFORMED;
+        close(f);
+        return NULL;
+    }
+    {
         size_t n = (size_t)st.st_size;
         buf = malloc(n);
         while (buf && used < n) {
@@ -230,8 +275,11 @@ static json_t *read_json(MdManagedStore *s, const char *coordinate, bool *missin
     }
     close(f);
 #endif
-    json_t *j = buf ? json_loadb((const char *)buf, used, JSON_REJECT_DUPLICATES | JSON_DECODE_ANY, NULL) : NULL;
+    if (!buf) return NULL;
+    json_error_t error = {0};
+    json_t *j = json_loadb((const char *)buf,used,JSON_REJECT_DUPLICATES | JSON_DECODE_ANY,&error);
     free(buf);
+    *state = j ? FILE_OK : json_error_code(&error) == json_error_out_of_memory ? FILE_IO : FILE_MALFORMED;
     return j;
 }
 
@@ -294,7 +342,7 @@ static bool metadata(json_t *item) {
         if (!strcmp(key,"requested_caps") && !strings(v,5,capability)) return false;
         if (!strcmp(key,"tree_format") && !tree(v)) return false;
         if (!strcmp(key,"port") && (!json_is_integer(v) || json_integer_value(v) < 1 || json_integer_value(v) > 65535)) return false;
-        if (!strcmp(key,"quality")) {
+        if (!strcmp(key,"quality") && !json_is_null(v)) {
             char *wire = json_dumps(v, JSON_COMPACT | JSON_ENCODE_ANY);
             cJSON *host = cJSON_CreateObject(), *q = wire ? cJSON_Parse(wire) : NULL;
             bool attached = host && q && cJSON_AddItemToObject(host,"quality",q);
@@ -303,7 +351,7 @@ static bool metadata(json_t *item) {
             bool valid = attached && !md_quality_read(host,&quality,&has) && has;
             if (!attached) cJSON_Delete(q);
             cJSON_Delete(host);
-            free(wire);
+            wipe(wire);
             if (!valid) return false;
         }
     }
@@ -409,9 +457,9 @@ static void dispose(Journal *j) {
  * the declared ID against the canonical hash and verifies the signature. */
 static const char *id(const NostrEvent *e) { return e ? e->id : ""; }
 static bool load(MdManagedStore *s, const char *d, Journal *j) {
-    bool missing;
-    j->j = read_json(s,d,&missing);
-    if (missing) return (j->j = json_object()) != NULL;
+    FileState state;
+    j->j = read_json(s,d,&state);
+    if (state == FILE_MISSING) return (j->j = json_object()) != NULL;
     if (!json_is_object(j->j) || (!json_object_get(j->j,"event") && !json_object_get(j->j,"draft"))) return false;
     const char *wire = field(j->j,"event"), *pending = field(j->j,"draft");
     if (json_object_get(j->j,"event") && !(j->winner = parse_event(wire,s->owner,doc_kind(d),d,NULL))) return false;
@@ -525,7 +573,7 @@ MdStoreResult md_managed_store_read(MdManagedStore *s, const char *d,
                 (draft_status != MD_STORE_READ_ONLY && draft_status != MD_STORE_INVALID)) {
                 r = draft_status; goto done;
             }
-            json_decref(pending); pending = NULL;
+            discard_plaintext(pending); pending = NULL;
         }
     }
     if (!current(s)) { r = MD_STORE_REVOKED; goto done; }
@@ -537,7 +585,7 @@ MdStoreResult md_managed_store_read(MdManagedStore *s, const char *d,
         r = MD_STORE_IO;
     } else if (revision) strcpy(revision,id(j.winner));
 done:
-    json_decref(winner); json_decref(pending); dispose(&j);
+    discard_plaintext(winner); discard_plaintext(pending); dispose(&j);
     return r;
 }
 
@@ -581,9 +629,13 @@ static bool retain(int kind, json_t *new, json_t *old) {
     return retain_fields(json_object_get(new,"preferences"),prefs,pref_keys);
 }
 static bool relay_key(const char *target, char key[65]) {
-    if (!relay(target)) return false;
+    if (!target || strlen(target) > 2048 ||
+        (strncasecmp(target,"ws://",5) && strncasecmp(target,"wss://",6))) return false;
+    char *url = nostr_normalize_url(target);
     unsigned char digest[SHA256_DIGEST_LENGTH];
-    if (!SHA256((const unsigned char *)target,strlen(target),digest)) return false;
+    bool ok = relay(url) && SHA256((const unsigned char *)url,strlen(url),digest);
+    free(url);
+    if (!ok) return false;
     for (size_t i = 0; i < sizeof(digest); ++i) snprintf(key + 2*i,3,"%02x",(unsigned)digest[i]);
     return true;
 }
@@ -662,9 +714,18 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
             if (!retain(kind,candidate,old)) { r = MD_STORE_IO; goto done; }
             r = schema(kind,candidate);
             if (r != MD_STORE_OK) goto done;
-            if (json_equal(candidate,old)) { r = MD_STORE_UNCHANGED; goto done; }
         }
     }
+    if (kind == APPDATA) {
+        const char *key;
+        json_t *host;
+        json_object_foreach(json_object_get(candidate,"hosts"),key,host) {
+            (void)key;
+            /* Keep the marker through retain(), then materialize the clear. */
+            if (json_is_null(json_object_get(host,"quality"))) json_object_del(host,"quality");
+        }
+    }
+    if (mode != REPLACE_INVALID && old && json_equal(candidate,old)) { r = MD_STORE_UNCHANGED; goto done; }
     relays = json_object();
     if (!relays) { r = MD_STORE_IO; goto done; }
     for (size_t i = 0; i < count; ++i) {
@@ -679,7 +740,7 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
         md_account_binding_cancel(s->binding),s->owner,kind,d,encoded,at);
     r = save_draft(s,d,&j,unsigned_event,relays);
 done:
-    json_decref(relays); json_decref(candidate); json_decref(old); dispose(&j);
+    json_decref(relays); discard_plaintext(candidate); discard_plaintext(old); dispose(&j);
     wipe(encoded);
     nostr_event_free(unsigned_event);
     return current(s) ? r : MD_STORE_REVOKED;
@@ -812,8 +873,8 @@ done:
 
 bool md_managed_store_unattended(MdManagedStore *s) {
     if (!current(s) || s->latch_disabled) return false;
-    bool missing;
-    json_t *j = read_json(s,"local-unattended",&missing);
+    FileState state;
+    json_t *j = read_json(s,"local-unattended",&state);
     bool enabled = json_is_true(j);
     json_decref(j);
     return enabled && current(s);
@@ -827,10 +888,10 @@ MdStoreResult md_managed_store_set_unattended(MdManagedStore *s, bool enabled) {
 }
 
 static json_t *recents(MdManagedStore *s) {
-    bool missing;
-    json_t *j = read_json(s,"local-recents",&missing);
-    if (missing) return json_array();
-    if (!json_is_array(j) || json_array_size(j) > RECENT_LIMIT) { json_decref(j); return NULL; }
+    FileState state;
+    json_t *j = read_json(s,"local-recents",&state);
+    if (state == FILE_IO) return NULL;
+    if (!json_is_array(j) || json_array_size(j) > RECENT_LIMIT) { json_decref(j); return json_array(); }
     size_t i;
     json_t *v;
     json_array_foreach(j,i,v) {
@@ -838,7 +899,7 @@ static json_t *recents(MdManagedStore *s) {
         if (!hex(field(v,"pubkey"),64) || !json_is_integer(at) || json_integer_value(at) < 0 ||
             !json_is_integer(outcome) || json_integer_value(outcome) < 0 ||
             json_integer_value(outcome) > MD_RECENT_MEDIA || json_object_size(v) != 3) {
-            json_decref(j); return NULL;
+            json_decref(j); return json_array();
         }
     }
     return j;
@@ -899,7 +960,7 @@ static MdStoreResult exchange(const char *input, char **result, bool importing) 
     r = *result ? MD_STORE_OK : MD_STORE_IO;
     if (*result && strlen(*result) > MD_STORE_MAX_CONTENT) { wipe(*result); *result = NULL; r = MD_STORE_INVALID; }
 done:
-    json_decref(wrapper); json_decref(doc); json_decref(out); json_decref(seen);
+    json_decref(wrapper); json_decref(out); json_decref(seen); discard_plaintext(doc);
     return r;
 }
 MdStoreResult md_managed_store_import(const char *text, char **candidates) { return exchange(text,candidates,true); }

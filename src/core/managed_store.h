@@ -43,7 +43,7 @@ MdStoreResult md_managed_store_receive(MdManagedStore *, const char *coordinate,
 MdStoreResult md_managed_store_read(MdManagedStore *, const char *coordinate,
     char revision[65], char **plaintext, char **pending_plaintext);
 /* Complete replacement from base after backfill; durable before send.
- * Targets are exact caller-selected relay URLs; only their hashes persist. */
+ * Targets are caller-selected relay URLs; only normalized hashes persist. */
 MdStoreResult md_managed_store_stage(MdManagedStore *, const char *coordinate,
     const char *base, const char *plaintext, const char *const *targets, size_t count, int64_t now);
 /* Retry returns the same signed EVENT, for an unacknowledged target only.

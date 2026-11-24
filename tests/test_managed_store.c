@@ -287,6 +287,24 @@ static void check_relay_outcomes(MdManagedStore *s, MdSigner *client, const char
     free(plain); free(pending); free(remote); free(remote_id); free(draft_id); free(wire);
 }
 
+static void check_normalized_receipts(MdManagedStore *s, int64_t now) {
+    const char *d = "metadesk-tag:86b09912-5e73-4bb0-a708-30c770882ac3";
+    const char *alias = "WS://LOCALHOST:1234/Path/";
+    const char *normalized = "ws://localhost:1234/Path";
+    const char *const targets[] = {alias, normalized};
+    CHECK(md_managed_store_backfill(s,d,true) == MD_STORE_OK);
+    CHECK(md_managed_store_stage(s,d,"","[]",targets,2,now) == MD_STORE_INVALID);
+    CHECK(md_managed_store_stage(s,d,"","[]",targets,1,now) == MD_STORE_PENDING);
+    char *wire = NULL;
+    CHECK(md_managed_store_outgoing(s,d,"ws://localhost:1234/path",&wire) == MD_STORE_INVALID && !wire);
+    CHECK(md_managed_store_outgoing(s,d,normalized,&wire) == MD_STORE_PENDING);
+    char *event = event_id(wire);
+    MdStoreRelayResult observed;
+    CHECK(md_managed_store_relay_result(s,d,alias,&observed) == MD_STORE_OK && observed == MD_STORE_RELAY_UNKNOWN);
+    CHECK(md_managed_store_record_result(s,d,normalized,event,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_OK);
+    free(event); free(wire);
+}
+
 static void check_exchange(void) {
     char *text = NULL, *candidates = NULL;
     const char *input = "{\"schema\":\"metadesk-hosts/1\",\"hosts\":[{\"pubkey\":\"" HOST
@@ -428,11 +446,21 @@ int main(int argc, char **argv) {
     CHECK(md_managed_store_record_result(s,MD_STORE_MANAGEMENT,targets[0],repaired_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_OK);
     CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,NULL) == MD_STORE_OK);
     CHECK(!strcmp(revision,repaired_id) && strstr(plain,SECRET)); free(plain); free(repaired_id); free(wire);
+    const char *clear = "{\"schema_version\":1,\"hosts\":{\"" HOST "\":{\"quality\":null}}}";
+    CHECK(md_managed_store_stage(s,MD_STORE_MANAGEMENT,revision,clear,targets,1,now) == MD_STORE_PENDING);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,&pending) == MD_STORE_PENDING);
+    CHECK(strstr(plain,"quality") && !strstr(pending,"quality") && strstr(pending,"future_host"));
+    free(plain); free(pending);
+    CHECK(md_managed_store_outgoing(s,MD_STORE_MANAGEMENT,targets[0],&wire) == MD_STORE_PENDING);
+    char *clear_id = event_id(wire);
+    CHECK(md_managed_store_record_result(s,MD_STORE_MANAGEMENT,targets[0],clear_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_OK);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,NULL) == MD_STORE_OK);
+    CHECK(!strcmp(revision,clear_id) && !strstr(plain,"quality")); free(plain); free(clear_id); free(wire);
 
     /* A structurally valid encrypted envelope with a bad MAC is a decrypt
      * failure, not a schema error eligible for explicit recovery. */
     NostrEvent *bad_mac = md_private_document_build(client,NULL,PK,NOSTR_KIND_APPLICATION_SPECIFIC_DATA,
-        MD_STORE_MANAGEMENT,V1,now+13); CHECK(bad_mac);
+        MD_STORE_MANAGEMENT,V1,now+14); CHECK(bad_mac);
     char *bad_cipher = strdup(nostr_event_get_content(bad_mac)); CHECK(bad_cipher);
     size_t n_cipher = strlen(bad_cipher); CHECK(n_cipher > 10);
     bad_cipher[n_cipher-8] = bad_cipher[n_cipher-8] == 'A' ? 'B' : 'A';
@@ -498,11 +526,23 @@ int main(int argc, char **argv) {
     json_t *history = json_loads(recent,0,NULL); free(recent);
     CHECK(json_array_size(history) == 100 && json_integer_value(json_object_get(json_array_get(history,99),"at")) == now+1);
     json_decref(history);
+    char recent_path[1024]; journal_path(recent_path,sizeof(recent_path),argv[2],"local-recents");
+    const char *const broken_recent[] = {"", "{", "[{\"at\":23}]"};
+    for (size_t i = 0; i < sizeof(broken_recent)/sizeof(broken_recent[0]); ++i) {
+        overwrite_file(recent_path,broken_recent[i]);
+        CHECK(md_managed_store_record(s,OTHER,now,MD_RECENT_BIND) == MD_STORE_OK);
+        recent = md_managed_store_recents(s); CHECK(recent);
+        history = json_loads(recent,0,NULL); free(recent);
+        CHECK(json_array_size(history) == 1);
+        CHECK(!strcmp(json_string_value(json_object_get(json_array_get(history,0),"pubkey")),OTHER));
+        json_decref(history);
+    }
     CHECK(!md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,true) == MD_STORE_OK && md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,false) == MD_STORE_OK && !md_managed_store_unattended(s));
     check_admission(s,client,argv[2],targets,now);
     check_relay_outcomes(s,client,targets,now);
+    check_normalized_receipts(s,now);
     check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,MD_SIGNER_NIP5F,HOST_PK,other));
