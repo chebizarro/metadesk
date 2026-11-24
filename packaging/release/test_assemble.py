@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import assemble
+import source_offers
 
 
 class AssemblyTest(unittest.TestCase):
@@ -31,6 +32,7 @@ class AssemblyTest(unittest.TestCase):
         (root / 'macos').mkdir()
         (root / 'flatpak').mkdir()
         (root / 'ffmpeg').mkdir()
+        (root / 'appimage').mkdir()
         shutil.copy2(original / 'ffmpeg/profile-encoders.sh', root / 'ffmpeg/')
         self.source = b'exact pinned upstream archive fixture'
         pin = {'type': 'archive', 'name': 'ffmpeg', 'url': 'https://example.invalid/ffmpeg-1.2.3.tar.xz',
@@ -40,6 +42,17 @@ class AssemblyTest(unittest.TestCase):
         template_patch = patch.object(assemble, 'TEMPLATE', template)
         template_patch.start()
         self.addCleanup(template_patch.stop)
+        source_patch = patch.object(source_offers, 'PACKAGING', root)
+        source_patch.start()
+        self.addCleanup(source_patch.stop)
+        (root / 'release').mkdir()
+        (root / 'release/reviewed-source-pins.json').write_text('{}')
+        runtime_tree = {'release': 'fixture', 'additional_notices': {}, 'sources': {
+            'runtime.tar.gz': {'sha256': hashlib.sha256(self.source).hexdigest(), 'notices': ['LICENSE']}}}
+        (root / 'appimage/runtime-source.lock.json').write_text(json.dumps(runtime_tree))
+        (root / 'appimage/tools.lock.json').write_text(json.dumps([
+            {'url': f'https://test.invalid/fixture/runtime-{arch}', 'sha256': 'c' * 64}
+            for arch in ('aarch64', 'x86_64')]))
         self.packages = root / 'packages'
         job = self.packages / 'job'
         job.mkdir(parents=True)
@@ -47,9 +60,36 @@ class AssemblyTest(unittest.TestCase):
         for platform, arch in assemble.MATRIX:
             name = f'{platform}-{arch}.fixture'
             (job / name).write_bytes(b'binary fixture')
+            libraries = {f'{dll}.so.0': {'sha256': 'b' * 64} for dll in source_offers.FFMPEG}
+            inventory = {'libraries': libraries}
+            if platform == 'dmg':
+                inventory = {'private_libraries': {f'{dll}.0.dylib': '/fixture' for dll in source_offers.FFMPEG}}
+            elif platform in assemble.NATIVE:
+                inventory = {'private_origins': {}}
+            elif platform == 'appimage':
+                closure = job / (name + '.closure')
+                package = closure / 'ubuntu/example_1%3A1-1'
+                package.mkdir(parents=True)
+                (package / 'example_1.orig.tar.xz').write_bytes(self.source)
+                (package / 'example_1-1.dsc').write_text(
+                    f'Source: example\nVersion: 1:1-1\nChecksums-Sha256:\n '
+                    f'{hashlib.sha256(self.source).hexdigest()} {len(self.source)} example_1.orig.tar.xz\n')
+                (closure / 'notices/common-licenses').mkdir(parents=True)
+                notice = closure / 'notices/copyright'
+                notice.write_text('fixture copyright')
+                libraries['libexample.so.1'] = {'ubuntu': {
+                    'source': 'example', 'version': '1:1-1', 'notice': 'copyright',
+                    'notice_sha256': assemble.sha(notice),
+                    'files': {f.name: assemble.sha(f) for f in package.iterdir()}}}
+                runtime = closure / 'runtime'
+                runtime.mkdir()
+                (runtime / 'runtime.tar.gz').write_bytes(self.source)
+                (runtime / 'runtime.tar.gz.LICENSE').write_text('fixture license')
+                (closure / 'REBUILD.md').write_text('fixture recipe')
+                inventory['runtime'] = runtime_tree | {'sha256': 'c' * 64, 'license': 'fixture'}
             (job / (name + '.json')).write_text(json.dumps(dict(
                 asset=name, platform=platform, arch=arch, revision=self.commit, nostrc=self.nostrc,
-                signing='unsigned', inventory={'libraries': {'libmetadesk': {'sha256': 'b'*64}}})))
+                signing='unsigned', inventory=inventory)))
             if platform in assemble.NATIVE:
                 continue
             receipt = job / (name + '.ffmpeg')
@@ -78,13 +118,28 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual(bom['bomFormat'], 'CycloneDX')
         self.assertEqual(sum(c['type'] == 'application' for c in bom['components']), 11)
         checks = (self.output / 'SHA256SUMS').read_text().splitlines()
-        self.assertEqual(len(checks), 21)
+        self.assertEqual(len(checks), 23)
         for row in checks:
             digest, name = row.split('  ', 1)
             self.assertEqual(assemble.sha(self.output / name), digest)
         with gzip.open(self.output / 'metadesk-0.1.0-alpha.1-source.tar.gz', 'rb') as stream:
             sha = subprocess.check_output(['git', 'get-tar-commit-id'], input=stream.read()).decode().strip()
         self.assertEqual(sha, self.commit)
+
+    def test_missing_appimage_source_member(self):
+        next(self.packages.glob('*/*.closure/ubuntu/*/*.tar.xz')).unlink()
+        with self.assertRaisesRegex(ValueError, 'missing source member'):
+            assemble.assemble(self.packages, self.output)
+        self.assertFalse((self.output / 'SHA256SUMS').exists())
+
+    def test_unclassified_flatpak_dso(self):
+        path = next(self.packages.glob('*/flatpak-Client*.json'))
+        payload = json.loads(path.read_text())
+        payload['inventory']['libraries']['lib/libunknown.so.0'] = {'sha256': 'b' * 64}
+        path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, 'no reviewed source/license route'):
+            assemble.assemble(self.packages, self.output)
+        self.assertFalse((self.output / 'SHA256SUMS').exists())
 
     def test_missing_cell_fails_closed(self):
         next(self.packages.glob('*/deb-aarch64*.json')).unlink()

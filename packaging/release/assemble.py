@@ -8,6 +8,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+
+import source_offers
 from datetime import datetime, timezone
 
 TEMPLATE = Path(__file__).resolve().parents[1] / 'RELEASE_NOTES_TEMPLATE.md'
@@ -87,7 +90,7 @@ def assemble(packages, out):
         return f'[{name}]({base}/releases/download/{tag}/{name})'
 
     seen = set()
-    components, manifest, rows, source_rows = [], [], [], []
+    components, manifest, rows, source_rows, closure_rows = [], [], [], [], []
     for path in sorted(packages.glob('*/*.json')):
         receipt = json.loads(path.read_text())
         name, platform, arch = (receipt[k] for k in ('asset', 'platform', 'arch'))
@@ -113,6 +116,15 @@ def assemble(packages, out):
             libraries.append(component('library', 'FFmpeg', version=ffmpeg_version,
                                        licenses=[{'license': {'id': 'LGPL-2.1-or-later'}}],
                                        properties=[prop('encoders', encoders), prop('source-sha256', source_hash)]))
+        offers = path.with_name(name + '.closure')
+        receipt['source_offers'] = source_offers.verify(receipt, offers, receipt.get('ffmpeg_source'))
+        if platform == 'appimage':
+            closure_name = offers.name + '-source.tar'
+            with tarfile.open(out / closure_name, 'w') as archive:
+                archive.add(offers, arcname=offers.name)
+            receipt.update(closure_source=closure_name, closure_source_sha256=sha(out / closure_name))
+            closure_rows.append(f'- `{name}`: {link(closure_name)} — exact Ubuntu source packages, '
+                                'distro patches/copyright and AppImage runtime/libfuse source, patch and notices.')
         signing = receipt['signing'] if receipt['signing'] != 'ad-hoc' else 'Unsigned DMG; ad-hoc app'
         rows.append(f'| {link(name)} | {platform} / {arch} | {asset.stat().st_size:,} | {signing} | PASS | '
                     f'{codec} | `{sha(asset)}` |')
@@ -155,9 +167,11 @@ def assemble(packages, out):
         'REPRODUCIBILITY_URL': 'Per-bundle source/records archives below',
         'FFMPEG_SOURCE_TABLE': '\n'.join(source_rows),
         'REPLACEMENT_INSTRUCTIONS_URL': f'[Packaging instructions]({base}/blob/{commit}/packaging/README.md#lgpl-library-replacement)',
-        'RELINK_OBJECTS_URL_OR_NOT_APPLICABLE': 'Not applicable to shared FFmpeg',
-        'COMPONENT_SOURCE_LINKS_AND_LICENSE_TEXT_LOCATIONS': 'See per-package inventories and notices. '
-            'Transitive license/source review is an owner gate before public distribution.',
+        'RELINK_OBJECTS_URL_OR_NOT_APPLICABLE': 'Not applicable to shared libraries. The AppImage runtime attachment contains the runtime program source, patched libfuse source and the recipe to rebuild/relink it separately.',
+        'COMPONENT_SOURCE_LINKS_AND_LICENSE_TEXT_LOCATIONS': '\n' + '\n'.join(closure_rows) +
+            '\n\nFlatpak GNOME Platform is installed separately; only the app payload is redistributed. '
+            'See each asset’s manifest entry for the library-to-source and copyright mapping. '
+            'The owner must review these offers and verify the attachments before public distribution.',
         'DISTRO_COPYRIGHT_AND_SOURCE_INSTRUCTIONS': 'Use Ubuntu or Fedora package metadata and the matching distro source packages.',
     }
     for key, value in replacements.items():

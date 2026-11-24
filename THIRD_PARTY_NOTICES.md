@@ -214,6 +214,27 @@ Release checklist, following [FFmpeg's compliance guidance](https://ffmpeg.org/l
   source mechanisms; their enabled codecs and licensing may differ, including
   libx264 if supplied by the distro. MIT does not relicense those dependencies.
 
+### Portable Linux release offers
+
+The release workflow records the installed Ubuntu binary and exact source
+package version for every copied AppImage distro DSO. It ships the packages'
+original copyright notices and all source members listed by the matching
+Debian source descriptors, including packaging/build rules and patches.
+These descriptors and notices are the license evidence for the shipped
+versions, not the historical prototype tables above. The embedded AppImage
+type-2 runtime additionally links libfuse 3.15.0 statically (LGPL-2.1); its
+complete runtime program source, patched libfuse inputs and build recipe are
+in the same attachment, separately from the shared FFmpeg offer.
+
+Flatpak app bundles redistribute the private modules listed in the asset
+manifest, not the independently installed GNOME Platform. The release checks
+the measured private DSO paths against reviewed licenses and records the
+module source pins. The only private copyleft libraries in the measured
+Flatpak payload are the two shared FFmpeg libraries.
+
+See [release instructions](packaging/README.md#lgpl-library-replacement) for
+replacement, runtime relinking, and the owner publication review.
+
 ## OpenH264 runtime and H.264 patents
 
 OpenH264 source is BSD-2-Clause licensed. The optional software fallback uses

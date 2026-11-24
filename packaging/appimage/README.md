@@ -59,11 +59,10 @@ public endpoint, upload, or production signing claim. Detached signatures must
 be verified by the owner-distributed release key before production use; zsync
 metadata is not itself a signature.
 
-**Not cleared for distribution:** stage a reviewed copyright/license corpus for
-all DSOs, exact corresponding sources and build recipes alongside the artifact,
-and the root third-party notices. Preserve LGPL replacement/reverse-engineering
-rights: extract the image, replace compatible shared LGPL libraries, run
-`AppRun` (or rebuild the image with the provided tool). Include the exact FFmpeg
-source archive/configure receipt, LGPL text, patches and concrete release source
-URLs. The image already carries project notices/FFmpeg LGPL text, but that alone
-is not a complete source offer. No public release/publishing is implemented.
+The release producer records the installed Ubuntu binary/source version for
+every copied distro DSO, places its copyright notice and common license text
+in the AppDir, and supplies the exact source descriptor, upstream archives and
+distro patches beside each architecture's image. The closure attachment also
+includes pinned sources for the embedded runtime and its patched static libfuse.
+Do not publish a standalone image without the matching attachments. See
+[replacement and relinking instructions](../README.md#lgpl-library-replacement).

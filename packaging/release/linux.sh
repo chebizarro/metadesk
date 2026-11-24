@@ -30,6 +30,9 @@ install_tools() {
     # Match the CI workaround for stalled EC2 mirrors (leave ports mirrors alone).
     sudo sed -Ei 's|://[a-z0-9-]+\.ec2\.archive\.ubuntu\.com/|://azure.archive.ubuntu.com/|g' \
         /etc/apt/sources.list.d/ubuntu.sources
+    if [[ $format == appimage ]]; then
+        sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+    fi
     sudo apt-get "${apt_options[@]}" update --error-on=any
     sudo apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"
 }
@@ -148,6 +151,7 @@ build_appimage() {
     locked_download "$pin" "$work/runtime"
     chmod +x "$work/appimagetool"
     name=Metadesk-$TAG-$arch.AppImage
+    python3 packaging/release/source_offers.py "$work/AppDir" "$upload/$name.closure" "$work/runtime"
     packaging/appimage/make-image.sh "$work/AppDir" "$upload/$name" "$work/appimagetool" "$work/runtime"
     podman pull "$FEDORA"
     packaging/appimage/verify-container.sh "$upload/$name" "$FEDORA" "$arch" | tee "$work/codec-inventory.txt"
@@ -186,8 +190,8 @@ build_flatpak() {
             > "$upload/$name.ffmpeg/records/codec-inventory.txt"
         cp "$modules" "$src/packaging/flatpak/build-ffmpeg.sh" "$upload/$name.ffmpeg/records/"
         flatpak list --user --columns=ref:f,active:f > "$work/runtime-refs.txt"
-        (cd "$deployed" && find lib -type f -name '*.so*' -exec sha256sum {} +) | \
-            jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  (?<key>.+)$") | {key,value:{sha256}}] | from_entries' \
+        (cd "$deployed" && find . -type f -name '*.so*' -exec sha256sum {} +) | \
+            jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  \\./(?<key>.+)$") | {key,value:{sha256}}] | from_entries' \
             > "$work/libraries.json"
         jq --rawfile refs "$work/runtime-refs.txt" --slurpfile libs "$work/libraries.json" \
             --arg app_commit "$(flatpak info --user --show-commit "$id")" \

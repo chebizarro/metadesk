@@ -1,0 +1,26 @@
+{
+  "dmg": {
+    "cjson": "c859b25da02955fef659d658b8f324b5cde87be3",
+    "jansson": "dbb5fb3636e155fccfce4cd215de752779bd6971",
+    "libb2": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e",
+    "libwebsockets": "5f39aa483715b813f4d85a692fcb361b5d8d0c1b",
+    "libyuv": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
+    "nostrc": "6f7a8d025768d497bef700fe55eea1c687dac328",
+    "nsync": "5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4",
+    "openssl": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+    "sdl2": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+    "secp256k1": "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d"
+  },
+  "flatpak": {
+    "cjson": "c859b25da02955fef659d658b8f324b5cde87be3",
+    "jansson": "684e18c927e89615c2d501737e90018f4930d6c5",
+    "libb2": "53626fddce753c454a3fea581cbbc7fe9bbcf0bc70416d48fdbbf5d87ef6c72e",
+    "libwebsockets": "4415e84c095857629863804e941b9e1c2e9347ef",
+    "libyuv": "0ec9f68d82634f6f3414aaaf780e03f9edf002b3",
+    "nostrc": "6f7a8d025768d497bef700fe55eea1c687dac328",
+    "nsync": "5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4",
+    "onevpl": "c45b5d786bf7cdabbe49ff1bab78693ad78feb78",
+    "sdl2": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+    "secp256k1": "0cdc758a56360bf58a851fe91085a327ec97685a"
+  }
+}
