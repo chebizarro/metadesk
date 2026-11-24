@@ -47,7 +47,7 @@ class AssemblyTest(unittest.TestCase):
         self.addCleanup(source_patch.stop)
         (root / 'release').mkdir()
         (root / 'release/reviewed-source-pins.json').write_text('{}')
-        runtime_tree = {'release': 'fixture', 'sources': {
+        runtime_tree = {'release': 'fixture', 'additional_notices': {}, 'sources': {
             'runtime.tar.gz': {'sha256': hashlib.sha256(self.source).hexdigest(), 'notices': ['LICENSE']}}}
         (root / 'appimage/runtime-source.lock.json').write_text(json.dumps(runtime_tree))
         (root / 'appimage/tools.lock.json').write_text(json.dumps([
@@ -68,17 +68,17 @@ class AssemblyTest(unittest.TestCase):
                 inventory = {'private_origins': {}}
             elif platform == 'appimage':
                 closure = job / (name + '.closure')
-                package = closure / 'ubuntu/example_1-1'
+                package = closure / 'ubuntu/example_1%3A1-1'
                 package.mkdir(parents=True)
                 (package / 'example_1.orig.tar.xz').write_bytes(self.source)
                 (package / 'example_1-1.dsc').write_text(
-                    f'Source: example\nVersion: 1-1\nChecksums-Sha256:\n '
+                    f'Source: example\nVersion: 1:1-1\nChecksums-Sha256:\n '
                     f'{hashlib.sha256(self.source).hexdigest()} {len(self.source)} example_1.orig.tar.xz\n')
                 (closure / 'notices/common-licenses').mkdir(parents=True)
                 notice = closure / 'notices/copyright'
                 notice.write_text('fixture copyright')
                 libraries['libexample.so.1'] = {'ubuntu': {
-                    'source': 'example', 'version': '1-1', 'notice': 'copyright',
+                    'source': 'example', 'version': '1:1-1', 'notice': 'copyright',
                     'notice_sha256': assemble.sha(notice),
                     'files': {f.name: assemble.sha(f) for f in package.iterdir()}}}
                 runtime = closure / 'runtime'

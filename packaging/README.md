@@ -53,7 +53,7 @@ packages use distro libraries rather than distributing copies.
 
 - **AppImage, shared libraries:** extract with `./Metadesk-….AppImage
   --appimage-extract`. In the closure source tar, find the exact
-  `ubuntu/<source>_<version>/*.dsc` named by the asset's library record.
+  `*.dsc` inside the `source_directory` named by the asset's library record.
   Keep all files beside the descriptor, run `dpkg-source -x FILE.dsc` and
   build with the matching Noble development dependencies (the included
   `debian/rules` and `debian/control` describe the build; e.g. use

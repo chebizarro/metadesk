@@ -111,6 +111,11 @@ def ubuntu_owner(path):
     raise ValueError(f'{path}: no unique installed Ubuntu package owner')
 
 
+def source_directory(source, version):
+    # Actions artifact transport rejects colons (Debian version epochs).
+    return f'{source}_{version}'.replace(':', '%3A')
+
+
 def runtime_lock():
     return json.loads((PACKAGING / 'appimage/runtime-source.lock.json').read_text())
 
@@ -128,15 +133,15 @@ def collect_appimage(appdir, offers, runtime):
             if digest(path) != info['source_sha256']:
                 raise ValueError(f'{name}: original DSO changed since assembly')
             package, binary_version, source, version = ubuntu_owner(path)
-            key = f'{source}_{version}'
-            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.+_~:-]*', key):
+            key = source_directory(source, version)
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.+_~%-]*', key):
                 raise ValueError(f'{name}: invalid source package identity')
             if key not in packages:
                 packages[key] = fetch_ubuntu(offers / 'ubuntu' / key, source, version)
             doc = Path('/usr/share/doc') / package.split(':')[0] / 'copyright'
             if not doc.is_file():
                 doc = Path('/usr/share/doc') / package / 'copyright'
-            notice = legal / package / 'copyright'
+            notice = legal / package.replace(':', '_') / 'copyright'
             notice.parent.mkdir(exist_ok=True)
             shutil.copyfile(doc, notice)
             rel = notice.relative_to(legal)
@@ -169,9 +174,15 @@ def collect_appimage(appdir, offers, runtime):
                     data = archive.extractfile(member).read()
                     (offers / 'runtime' / f'{name}.{rel}').write_bytes(data)
                     (appdir / 'usr/share/licenses' / f'{name}.{rel}').write_bytes(data)
+    for name, pin in lock['additional_notices'].items():
+        destination = offers / 'runtime' / name
+        curl(pin['url'], '--output', str(destination))
+        if digest(destination) != pin['sha256']:
+            raise ValueError(f'{name}: embedded runtime notice checksum mismatch')
+        shutil.copyfile(destination, appdir / 'usr/share/licenses' / name)
     inventory['runtime'] = {'release': lock['release'], 'sha256': runtime_sha,
                             'license': 'MIT with statically linked LGPL-2.1 libfuse',
-                            'sources': lock['sources']}
+                            'sources': lock['sources'], 'additional_notices': lock['additional_notices']}
     shutil.copyfile(PACKAGING / 'README.md', offers / 'REBUILD.md')
     manifest.write_text(json.dumps(inventory, indent=2) + '\n')
 
@@ -206,12 +217,13 @@ def verify(receipt, offers, ffmpeg_name):
             src, version = record['source'], record['version']
             key = src, version
             if key not in checked_sources:
-                checked_sources[key] = dsc_files(offers / 'ubuntu' / f'{src}_{version}', src, version)
+                checked_sources[key] = dsc_files(offers / 'ubuntu' / source_directory(src, version), src, version)
             if checked_sources[key] != record['files']:
                 raise ValueError(f'{name}: source receipt mismatch')
             if digest(offers / 'notices' / record['notice']) != record['notice_sha256']:
                 raise ValueError(f'{name}: copyright receipt mismatch')
             result[name] = {'copyright': f"notices/{record['notice']}", 'source_package': f'{src}={version}',
+                            'source_directory': 'ubuntu/' + source_directory(src, version),
                             'source_asset': offers.name + '-source.tar'}
         elif platform.startswith('flatpak-') and library in FLATPAK:
             module, license_id = FLATPAK[library]
@@ -238,6 +250,7 @@ def verify(receipt, offers, ffmpeg_name):
         pin, = (p for p in json.loads((PACKAGING / 'appimage/tools.lock.json').read_text())
                 if p['url'].endswith('/runtime-' + receipt['arch']))
         if (runtime['release'] != lock['release'] or runtime['sources'] != lock['sources'] or
+                runtime['additional_notices'] != lock['additional_notices'] or
                 runtime['sha256'] != pin['sha256'] or pin['url'].split('/')[-2] != lock['release']):
             raise ValueError('AppImage runtime source lock mismatch')
         for name, pin in lock['sources'].items():
@@ -246,6 +259,9 @@ def verify(receipt, offers, ffmpeg_name):
             for notice in pin['notices']:
                 if not (offers / 'runtime' / f'{name}.{notice}').stat().st_size:
                     raise ValueError(f'{name}: empty AppImage runtime notice {notice}')
+        for name, pin in lock['additional_notices'].items():
+            if digest(offers / 'runtime' / name) != pin['sha256']:
+                raise ValueError(f'{name}: embedded runtime notice checksum mismatch')
         if not (offers / 'REBUILD.md').is_file() or not (offers / 'notices/common-licenses').is_dir():
             raise ValueError('missing runtime build instructions or Ubuntu common licenses')
         result['AppImage runtime'] = {'license': runtime['license'], 'source_asset': offers.name + '-source.tar'}
