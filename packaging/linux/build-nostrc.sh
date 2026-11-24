@@ -11,9 +11,11 @@ if [ "$#" = 3 ]; then
   cmake -S "$src" -B "$out" -G Ninja -C "$src/tests/packaging/nip-subset.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$3" -DCMAKE_INSTALL_LIBDIR=lib \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DNOSTR_WITH_GLIB=OFF \
-    -DBUILD_TESTING=OFF -DENABLE_NIP5F=ON
+    -DBUILD_TESTING=OFF -DENABLE_NIP5F=ON -DENABLE_NIP05=ON -DENABLE_NIP65=ON
   cmake --build "$out" -j2
   cmake --install "$out"
+  # The pinned nip65 target is OBJECT-only and installs headers, not a library.
+  ar rcs "$3/lib/libnip65.a" "$out/nips/nip65/CMakeFiles/nip65.dir/src/nip65.c.o"
   exit
 fi
 cmake -S "$src" -B "$out" -G 'Unix Makefiles' \
@@ -24,4 +26,4 @@ cmake -S "$src" -B "$out" -G 'Unix Makefiles' \
   -DBUILD_LIBMARMOT=OFF -DBUILD_LIBPORTHOME=OFF -DBUILD_LIBVAULT=OFF \
   -DBUILD_LIBVAULT_MARMOT=OFF -DBUILD_MARMOT_GOBJECT=OFF -DSIGNET_ENABLE=OFF
 cmake --build "$out" -j2 --target nostr nostr_json go_fiber nostr_nip44_core \
-  nostr_nip46_core nostr_nip5f_core nip04 nip19 nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
+  nostr_nip46_core nostr_nip5f_core nip04 nip19 nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core nip05 nip65

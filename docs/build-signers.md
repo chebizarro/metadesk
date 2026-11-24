@@ -72,6 +72,8 @@ Build-tree mode links these nostrc components besides the JSON library above:
 | NIP-19 | `nip19` | library |
 | NIP-17 | `nostr_nip17_core` | **OBJECT library**: no archive |
 | NIP-11 | `nip11` | library |
+| NIP-05 | `nip05` | library |
+| NIP-65 | `nip65` | **OBJECT library**; Metadesk's installed SDK producers archive it as `libnip65.a` |
 
 libnostr and libgo come from `nostrc_build_dir` and must match the source
 headers. Each NIP component is discovered in this order:
@@ -213,7 +215,7 @@ cmake -S /Users/bizarro/Documents/Projects/nostrc \
 cmake --build /tmp/md-dpl-nostrc-lws5 --parallel 2 --target \
   nostr nostr_json go_fiber nostr_nip46_core nostr_nip55l_core \
   nostr_nip5f_core nostr_nip49_glib nip04 nip06 nip19 \
-  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
+  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core nip05 nip65
 ```
 
 The actual initial configure additionally passed `-DBUILD_GNOSTR_APP=OFF` and
@@ -231,7 +233,7 @@ cmake -S /Users/bizarro/Documents/Projects/nostrc \
 cmake --build /Users/bizarro/Documents/Projects/nostrc/_build --parallel 2 --target \
   nostr nostr_json go_fiber nostr_nip46_core nostr_nip55l_core \
   nostr_nip5f_core nostr_nip49_glib nip04 nip06 nip19 \
-  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
+  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core nip05 nip65
 ```
 
 **Second blocker found during md-dpl (now fixed by md-66n):** the old common

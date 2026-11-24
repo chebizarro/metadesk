@@ -23,6 +23,7 @@
 #include "signer.h"
 #include "accounts.h"
 #include "session.h"
+#include "relay_plan.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -95,6 +96,9 @@ typedef struct {
      * event-driven wait unbounded. Does not bound signing/publication or
      * change authorization, the subscription, or allowlist_wait_change. */
     uint32_t acl_history_timeout_ms;
+    /* Opt-in role-aware client routing. Borrowed only during create. */
+    const MdRelayPlan *bootstrap_plan;
+    const MdIdentity *session_peer;
 } MdNostrConfig;
 
 /* Snapshot/edit stopped waiting while ACL history was still pending. */

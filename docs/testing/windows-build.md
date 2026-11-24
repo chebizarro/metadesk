@@ -185,7 +185,8 @@ pacman -S --needed --noconfirm \
   mingw-w64-clang-aarch64-libyuv \
   mingw-w64-clang-aarch64-cmake \
   mingw-w64-clang-aarch64-libwebsockets \
-  mingw-w64-clang-aarch64-jansson
+  mingw-w64-clang-aarch64-jansson \
+  mingw-w64-clang-aarch64-libsystre
 pacman -Q > packages-after.txt
 ```
 
@@ -257,7 +258,7 @@ cmake -S nostrc -B nostrc/build -G Ninja \
   -DENABLE_NIP55L=OFF -DENABLE_NIP5F=OFF -DENABLE_NIP57=OFF \
   -DWITH_NOSTRDB=OFF -DLIBNOSTR_WITH_NOSTRDB=OFF
 cmake --build nostrc/build --target \
-  nostr nostr_json go_fiber nostr_nip44_core nip19 nostr_nip51_core \
+  nostr nostr_json go_fiber nostr_nip44_core nip19 nostr_nip51_core nip05 nip65 \
   nostr_nip98 nip11 nostr_nip17_core -j2
 ```
 

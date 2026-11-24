@@ -48,6 +48,14 @@
     "version": "1.11.1-4",
     "license": "BSD-3-Clause"
   },
+  "libsystre": {
+    "version": "1.0.2-3",
+    "license": "BSD-2-Clause"
+  },
+  "libtre": {
+    "version": "0.9.0-2",
+    "license": "BSD"
+  },
   "libunistring": {
     "version": "1.4.2-1",
     "license": "LGPL-3.0-or-later (non-GPL alternative)"
