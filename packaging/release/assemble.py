@@ -43,9 +43,6 @@ def bundle_libraries(inventory):
 
 
 def source_receipt(receipt, output, platform, arch):
-    archives = list(receipt.glob('ffmpeg-*.tar.*'))
-    if len(archives) != 1:
-        raise ValueError(f'{receipt}: expected exact FFmpeg archive')
     for needed in ('notices/COPYING.LGPLv2.1', 'records/configure-args.txt', 'records/configure.txt',
                    'records/config.h', 'records/config_components.h', 'records/config.log',
                    'records/toolchain.txt', 'records/codec-inventory.txt', 'records/encoders.txt',
@@ -60,8 +57,9 @@ def source_receipt(receipt, output, platform, arch):
         modules = json.loads((packaging / 'flatpak/modules.json').read_text())['modules']
         pin = next(p for m in modules if m['name'] == 'ffmpeg-lgpl' for p in m['sources'] if p['type'] == 'archive')
         profile = 'container' if platform == 'appimage' else 'flatpak'
-    source_hash = sha(archives[0])
-    if archives[0].name != pin['url'].rsplit('/', 1)[1] or source_hash != pin['sha256']:
+    upstream_name = pin['url'].rsplit('/', 1)[1]
+    archive = receipt / pin.get('archive', upstream_name)
+    if not archive.is_file() or sha(archive) != pin['sha256']:
         raise ValueError(f'{receipt}: source archive does not match producer pin')
     encoders = subprocess.check_output([packaging / 'ffmpeg/profile-encoders.sh', profile, arch], text=True).strip()
     if ((receipt / 'records/profile.txt').read_text().strip() != profile or
@@ -70,7 +68,7 @@ def source_receipt(receipt, output, platform, arch):
             (receipt / 'records/codec-inventory.txt').read_text()):
         raise ValueError(f'{receipt}: missing matching profile and runtime verification')
     shutil.make_archive(str(output), 'gztar', receipt.parent, receipt.name)
-    return archives[0].name.removeprefix('ffmpeg-').split('.tar.', 1)[0], encoders, source_hash
+    return upstream_name.removeprefix('ffmpeg-').split('.tar.', 1)[0], encoders, pin['sha256']
 
 
 def assemble(packages, out):

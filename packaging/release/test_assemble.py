@@ -35,7 +35,7 @@ class AssemblyTest(unittest.TestCase):
         self.source = b'exact pinned upstream archive fixture'
         pin = {'type': 'archive', 'name': 'ffmpeg', 'url': 'https://example.invalid/ffmpeg-1.2.3.tar.xz',
                'sha256': hashlib.sha256(self.source).hexdigest()}
-        (root / 'macos/deps.lock.json').write_text(json.dumps([pin]))
+        (root / 'macos/deps.lock.json').write_text(json.dumps([dict(pin, archive='ffmpeg.tar.xz')]))
         (root / 'flatpak/modules.json').write_text(json.dumps({'modules': [{'name': 'ffmpeg-lgpl', 'sources': [pin]}]}))
         template_patch = patch.object(assemble, 'TEMPLATE', template)
         template_patch.start()
@@ -55,7 +55,8 @@ class AssemblyTest(unittest.TestCase):
             receipt = job / (name + '.ffmpeg')
             (receipt / 'records').mkdir(parents=True)
             (receipt / 'notices').mkdir()
-            (receipt / 'ffmpeg-1.2.3.tar.xz').write_bytes(self.source)
+            filename = 'ffmpeg.tar.xz' if platform == 'dmg' else 'ffmpeg-1.2.3.tar.xz'
+            (receipt / filename).write_bytes(self.source)
             for item in ('notices/COPYING.LGPLv2.1', 'records/configure-args.txt', 'records/configure.txt',
                          'records/config.h', 'records/config_components.h', 'records/config.log',
                          'records/toolchain.txt', 'THIRD_PARTY_NOTICES.md', 'build-minimal-lgpl.sh'):
