@@ -1,4 +1,7 @@
 #include "managed_store.h"
+#ifdef _WIN32
+#include "md_test_win_private.h"
+#endif
 #include "md_time.h"
 #include "nostr.h"
 #include <nostr-simple-pool.h>
@@ -246,6 +249,13 @@ static void check_admission(MdManagedStore *s, MdSigner *client, const char *sto
 
     char path[1024]; journal_path(path,sizeof(path),storage,d);
     CHECK(md_managed_store_backfill(s,d,true) == MD_STORE_OK);
+#ifdef _WIN32
+    CHECK(md_test_win_acl(path,false));
+    CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_IO && !*rev);
+    CHECK(md_managed_store_receive(s,d,valid,now) == MD_STORE_IO);
+    CHECK(md_test_win_acl(path,true));
+    CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_OK && !strcmp(rev,valid_id));
+#endif
     const char *const damaged[] = {"{", "{}", "{\"event\":17}"};
     for (size_t i = 0; i < sizeof(damaged)/sizeof(damaged[0]); ++i) {
         overwrite_file(path,damaged[i]);
@@ -319,25 +329,38 @@ static void check_exchange(void) {
     CHECK(md_managed_store_export("[{\"pubkey\":\"" HOST "\",\"relay_hints\":[\"wss://user:pass@example.org\"]}]",&text) == MD_STORE_INVALID);
 }
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    CHECK(argc == 6);
+    /* Windows has no NIP-5F backend in the producer. Use real in-process
+     * crypto with the same fixture keys, without persisting credentials. */
+    MdSignerType backend = MD_SIGNER_DIRECT_KEY;
+    MdSigner *client = md_signer_create_direct("0000000000000000000000000000000000000000000000000000000000000002");
+    MdSigner *other = md_signer_create_direct("0000000000000000000000000000000000000000000000000000000000000001");
+    MdWinDirectory *storage = md_win_directory(argv[2], true);
+    CHECK(storage);
+    md_win_directory_close(storage);
+#else
     CHECK(argc == 8);
-    const char *targets[] = {argv[5],argv[6]};
-    int64_t now = (int64_t)time(NULL);
+    MdSignerType backend = MD_SIGNER_NIP5F;
     MdSigner *client = md_signer_create_nip5f(argv[3]);
     MdSigner *other = md_signer_create_nip5f(argv[4]);
+#endif
+    const char *targets[] = {argv[argc - 3],argv[argc - 2]};
+    int64_t now = (int64_t)time(NULL);
     CHECK(client && other);
     MdAccounts *accounts = NULL;
     CHECK(!md_accounts_open(argv[1],NULL,&accounts));
-    CHECK(!md_accounts_add(accounts,MD_SIGNER_NIP5F,PK,"client"));
-    CHECK(!md_accounts_add(accounts,MD_SIGNER_NIP5F,HOST_PK,"other"));
-    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,MD_SIGNER_NIP5F,PK,client));
-    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_HOST,MD_SIGNER_NIP5F,HOST_PK,other));
+    CHECK(!md_accounts_add(accounts,backend,PK,"client"));
+    CHECK(!md_accounts_add(accounts,backend,HOST_PK,"other"));
+    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,backend,PK,client));
+    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_HOST,backend,HOST_PK,other));
     MdAccountBinding *host = md_accounts_acquire_role(accounts,MD_ACCOUNT_HOST);
     CHECK(host && !md_managed_store_open(host,argv[2]));
     md_account_binding_release(host);
     MdAccountBinding *binding = md_accounts_acquire_role(accounts,MD_ACCOUNT_CLIENT);
     MdManagedStore *s = md_managed_store_open(binding,argv[2]);
     CHECK(s && !md_managed_store_open(binding,argv[2]));
-    bool crash = !strcmp(argv[7],"crash");
+    bool crash = !strcmp(argv[argc - 1],"crash");
     char *wire = NULL, *plain = NULL, *pending = NULL, revision[65];
     CHECK(md_managed_store_stage(s,MD_STORE_MANAGEMENT,"",V1,targets,2,now) == MD_STORE_NOT_READY);
     if (crash) {
@@ -545,7 +568,7 @@ int main(int argc, char **argv) {
     check_normalized_receipts(s,now);
     check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
-    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,MD_SIGNER_NIP5F,HOST_PK,other));
+    CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,backend,HOST_PK,other));
     CHECK(md_managed_store_read(s,MD_STORE_HOSTS,revision,NULL,NULL) == MD_STORE_REVOKED);
     md_managed_store_close(s);
     md_account_binding_release(binding);

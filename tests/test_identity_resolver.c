@@ -47,11 +47,14 @@ int main(void) {
     bool unsafe = false;
     char *body = md_discovery_http_get("https://[::ffff:127.0.0.1]/", NULL, true, 1000, &unsafe);
     CHECK(!body && unsafe); /* Checked before connect, no listener or TLS fixture needed. */
-#ifndef _WIN32
+#ifdef _WIN32
+    CHECK(!_putenv_s("NIP05_ALLOW_INSECURE", "1"));
+    CHECK(!_putenv_s("NIP05_TIMEOUT_MS", "1"));
+#else
     CHECK(!setenv("NIP05_ALLOW_INSECURE", "1", 1));
     CHECK(!setenv("NIP05_TIMEOUT_MS", "1", 1));
+#endif
     md_identity_scrub_environment();
     CHECK(!getenv("NIP05_ALLOW_INSECURE") && !getenv("NIP05_TIMEOUT_MS"));
-#endif
     return 0;
 }
