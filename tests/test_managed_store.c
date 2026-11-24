@@ -162,6 +162,131 @@ static void check_keep_remote(MdManagedStore *s, MdSigner *client, const char *s
         free(discarded); free(a); free(b); free(a_id); free(b_id);
     }
 }
+#define ADMISSION_TAG "metadesk-tag:86b09912-5e73-4bb0-a708-30c770882ac1"
+
+static void overwrite_file(const char *path, const char *text) {
+    FILE *f = fopen(path,"w"); CHECK(f);
+    CHECK(fputs(text,f) >= 0 && !fclose(f));
+}
+static void check_admission(MdManagedStore *s, MdSigner *client, const char *storage,
+    const char *const *targets, int64_t now) {
+    const int kind = NOSTR_KIND_CATEGORIZED_PEOPLE_LIST;
+    const char *d = ADMISSION_TAG;
+    char *valid = make(client,PK,d,kind,"[]",now);
+    char *valid_id = event_id(valid);
+    CHECK(md_managed_store_receive(s,d,valid,now) == MD_STORE_OK);
+    char rev[65];
+    static const struct { const char *name, *field; int change; } cases[] = {
+        {"bad signature","sig",0}, {"mismatched id","id",0}, {"wrong kind","kind",1},
+        {"wrong d-tag","tags",2}, {"second d-tag","tags",3}, {"extra public tag","tags",4},
+        {"non-NIP-44 content","content",5}, {"duplicate keys","id",6}
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
+        json_t *j = json_loads(valid,JSON_REJECT_DUPLICATES,NULL); CHECK(j);
+        char *wire = NULL;
+        switch (cases[i].change) {
+        case 0: {
+            char *tampered = strdup(json_string_value(json_object_get(j,cases[i].field))); CHECK(tampered);
+            tampered[0] = tampered[0] == 'a' ? 'b' : 'a';
+            CHECK(!json_object_set_new(j,cases[i].field,json_string(tampered))); free(tampered);
+            break;
+        }
+        case 1: CHECK(!json_object_set_new(j,"kind",json_integer(NOSTR_KIND_APPLICATION_SPECIFIC_DATA))); break;
+        case 2: CHECK(!json_object_set_new(j,"tags",json_pack("[[s,s]]","d",TAG))); break;
+        case 3: CHECK(!json_array_append_new(json_object_get(j,"tags"),json_pack("[s,s]","d",TAG))); break;
+        case 4: CHECK(!json_array_append_new(json_object_get(j,"tags"),json_pack("[s,s]","p",HOST))); break;
+        case 5: CHECK(!json_object_set_new(j,"content",json_string("[]"))); break;
+        case 6: {
+            size_t n = strlen(valid);
+            wire = malloc(n+80); CHECK(wire);
+            snprintf(wire,n+80,"%.*s,\"id\":\"%s\"}",(int)(n-1),valid,valid_id);
+            break;
+        }
+        }
+        if (cases[i].change > 0 && cases[i].change < 6) {
+            CHECK(!json_object_del(j,"id") && !json_object_del(j,"sig"));
+            CHECK(!json_object_set_new(j,"created_at",json_integer(now+1)));
+            char *input = json_dumps(j,JSON_COMPACT); CHECK(input);
+            CHECK(!md_signer_sign_event(client,input,&wire)); free(input);
+        }
+        if (!wire) wire = json_dumps(j,JSON_COMPACT);
+        json_decref(j); CHECK(wire);
+        json_t *parsed = json_loads(wire,0,NULL); CHECK(parsed); json_decref(parsed);
+        if (cases[i].change != 6) {
+            NostrEvent *e = nostr_event_new(); CHECK(e);
+            CHECK(nostr_event_deserialize_signed(e,wire,NULL) == NOSTR_EVENT_VALIDATION_OK);
+            char canonical[65];
+            NostrEventValidationStatus status = nostr_event_validate(e,canonical);
+            CHECK((status == NOSTR_EVENT_VALIDATION_OK) == (cases[i].change != 0));
+            nostr_event_free(e);
+        }
+        if (md_managed_store_receive(s,d,wire,now) != MD_STORE_INVALID) {
+            fprintf(stderr,"unexpected admission: %s\n",cases[i].name); abort();
+        }
+        CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_OK && !strcmp(rev,valid_id));
+        free(wire);
+    }
+    /* Content over the document cap but wire within the envelope allowance.
+     * Sign locally with the throwaway fixture key: the NIP-5F test RPC has a
+     * smaller wire limit and would reject the case before admission. */
+    NostrEvent *huge = nostr_event_new(); CHECK(huge);
+    CHECK(nostr_event_deserialize_signed(huge,valid,NULL) == NOSTR_EVENT_VALIDATION_OK);
+    nostr_event_set_created_at(huge,now+1);
+    char *padding = malloc(MD_STORE_MAX_CONTENT+5); CHECK(padding);
+    memset(padding,'g',MD_STORE_MAX_CONTENT+4); padding[0] = 'A'; padding[MD_STORE_MAX_CONTENT+4] = 0;
+    nostr_event_set_content(huge,padding); free(padding);
+    CHECK(!nostr_event_sign(huge,"0000000000000000000000000000000000000000000000000000000000000002"));
+    char *wire = nostr_event_serialize_compact(huge); CHECK(wire);
+    CHECK(strlen(wire) <= MD_STORE_MAX_CONTENT+1024);
+    json_t *parsed = json_loads(wire,JSON_REJECT_DUPLICATES,NULL); CHECK(parsed); json_decref(parsed);
+    char canonical[65]; CHECK(nostr_event_validate(huge,canonical) == NOSTR_EVENT_VALIDATION_OK);
+    CHECK(md_managed_store_receive(s,d,wire,now) == MD_STORE_LIMIT);
+    CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_OK && !strcmp(rev,valid_id));
+    free(wire); nostr_event_free(huge);
+
+    char path[1024]; journal_path(path,sizeof(path),storage,d);
+    CHECK(md_managed_store_backfill(s,d,true) == MD_STORE_OK);
+    const char *const damaged[] = {"{", "{}", "{\"event\":17}"};
+    for (size_t i = 0; i < sizeof(damaged)/sizeof(damaged[0]); ++i) {
+        overwrite_file(path,damaged[i]);
+        CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_IO && !*rev);
+        CHECK(md_managed_store_receive(s,d,valid,now) == MD_STORE_IO);
+        CHECK(md_managed_store_stage(s,d,"","[]",targets,1,now) == MD_STORE_IO);
+    }
+    free(valid); free(valid_id);
+}
+
+static void check_relay_outcomes(MdManagedStore *s, MdSigner *client, const char *const *targets, int64_t now) {
+    const char *d = "metadesk-tag:86b09912-5e73-4bb0-a708-30c770882ac2";
+    char *wire = NULL, rev[65];
+    CHECK(md_managed_store_backfill(s,d,true) == MD_STORE_OK);
+    CHECK(md_managed_store_stage(s,d,"","[]",targets,2,now) == MD_STORE_PENDING);
+    CHECK(md_managed_store_outgoing(s,d,targets[0],&wire) == MD_STORE_PENDING);
+    char *draft_id = event_id(wire);
+    const MdStoreRelayResult failures[] = {
+        MD_STORE_RELAY_AUTH_REQUIRED, MD_STORE_RELAY_CLOSED, MD_STORE_RELAY_UNKNOWN
+    };
+    for (size_t i = 0; i < sizeof(failures)/sizeof(failures[0]); ++i) {
+        CHECK(md_managed_store_record_result(s,d,targets[0],draft_id,failures[i]) == MD_STORE_PENDING);
+        MdStoreRelayResult outcome;
+        CHECK(md_managed_store_relay_result(s,d,targets[0],&outcome) == MD_STORE_OK && outcome == failures[i]);
+        CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_PENDING && !*rev);
+    }
+    CHECK(md_managed_store_record_result(s,d,targets[0],draft_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_PARTIAL);
+    CHECK(md_managed_store_record_result(s,d,targets[0],draft_id,MD_STORE_RELAY_REJECTED) == MD_STORE_PARTIAL);
+    MdStoreRelayResult outcome;
+    CHECK(md_managed_store_relay_result(s,d,targets[0],&outcome) == MD_STORE_OK && outcome == MD_STORE_RELAY_ACKNOWLEDGED);
+    CHECK(md_managed_store_read(s,d,rev,NULL,NULL) == MD_STORE_PARTIAL && !strcmp(rev,draft_id));
+    char *remote = make(client,PK,d,NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,"[[\"p\",\"" OTHER "\"]]",now+1);
+    CHECK(md_managed_store_receive(s,d,remote,now) == MD_STORE_CONFLICT);
+    CHECK(md_managed_store_receive(s,d,wire,now) == MD_STORE_UNCHANGED);
+    CHECK(md_managed_store_record_result(s,d,targets[1],draft_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_CONFLICT);
+    char *remote_id = event_id(remote), *plain = NULL, *pending = NULL;
+    CHECK(md_managed_store_read(s,d,rev,&plain,&pending) == MD_STORE_CONFLICT);
+    CHECK(!strcmp(rev,remote_id) && strstr(plain,OTHER) && !strcmp(pending,"[]"));
+    free(plain); free(pending); free(remote); free(remote_id); free(draft_id); free(wire);
+}
+
 static void check_exchange(void) {
     char *text = NULL, *candidates = NULL;
     const char *input = "{\"schema\":\"metadesk-hosts/1\",\"hosts\":[{\"pubkey\":\"" HOST
@@ -376,6 +501,8 @@ int main(int argc, char **argv) {
     CHECK(!md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,true) == MD_STORE_OK && md_managed_store_unattended(s));
     CHECK(md_managed_store_set_unattended(s,false) == MD_STORE_OK && !md_managed_store_unattended(s));
+    check_admission(s,client,argv[2],targets,now);
+    check_relay_outcomes(s,client,targets,now);
     check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,MD_SIGNER_NIP5F,HOST_PK,other));

@@ -353,11 +353,15 @@ static MdStoreResult schema(int kind, json_t *doc) {
     return !item || tree(item) ? MD_STORE_OK : MD_STORE_INVALID;
 }
 
-static NostrEvent *parse_event(const char *wire, const char *owner, int kind, const char *d) {
+static NostrEvent *parse_event(const char *wire, const char *owner, int kind,
+                               const char *d, MdStoreResult *why) {
+    if (why) *why = MD_STORE_INVALID;
     if (!wire || strlen(wire) > EVENT_LIMIT) return NULL;
     json_t *strict = json_loads(wire, JSON_REJECT_DUPLICATES, NULL);
     if (!strict) return NULL;
+    bool too_large = json_string_length(json_object_get(strict,"content")) > MD_STORE_MAX_CONTENT;
     json_decref(strict);
+    if (too_large) { if (why) *why = MD_STORE_LIMIT; return NULL; }
     NostrEvent *e = nostr_event_new();
     if (!e) return NULL;
     if (nostr_event_deserialize_signed(e, wire, NULL) == NOSTR_EVENT_VALIDATION_OK) {
@@ -407,10 +411,10 @@ static const char *id(const NostrEvent *e) { return e ? e->id : ""; }
 static bool load(MdManagedStore *s, const char *d, Journal *j) {
     bool missing;
     j->j = read_json(s,d,&missing);
-    if (missing) j->j = json_object();
-    if (!json_is_object(j->j)) return false;
+    if (missing) return (j->j = json_object()) != NULL;
+    if (!json_is_object(j->j) || (!json_object_get(j->j,"event") && !json_object_get(j->j,"draft"))) return false;
     const char *wire = field(j->j,"event"), *pending = field(j->j,"draft");
-    if (json_object_get(j->j,"event") && !(j->winner = parse_event(wire,s->owner,doc_kind(d),d))) return false;
+    if (json_object_get(j->j,"event") && !(j->winner = parse_event(wire,s->owner,doc_kind(d),d,NULL))) return false;
     j->relays = json_object_get(j->j,"relays");
     j->base = field(j->j,"base");
     j->superseded = json_object_get(j->j,"superseded");
@@ -424,7 +428,7 @@ static bool load(MdManagedStore *s, const char *d, Journal *j) {
     size_t index;
     json_t *item;
     json_array_foreach(j->superseded,index,item) if (!hex(json_string_value(item),64)) return false;
-    j->draft = parse_event(pending,s->owner,doc_kind(d),d);
+    j->draft = parse_event(pending,s->owner,doc_kind(d),d,NULL);
     if (!j->draft || !j->base || (*j->base && !hex(j->base,64)) ||
         !json_is_object(j->relays) || !json_object_size(j->relays) || json_object_size(j->relays) > MD_STORE_MAX_RELAYS) return false;
     const char *key;
@@ -471,8 +475,8 @@ MdStoreResult md_managed_store_receive(MdManagedStore *s, const char *d, const c
     MdStoreResult r = access_doc(s,d);
     if (r != MD_STORE_OK) return r;
     int kind = doc_kind(d);
-    NostrEvent *e = parse_event(wire,s->owner,kind,d);
-    if (!e) return MD_STORE_INVALID;
+    NostrEvent *e = parse_event(wire,s->owner,kind,d,&r);
+    if (!e) return r;
     Journal j = {0};
     int64_t at = nostr_event_get_created_at(e);
     if (now < 0 || (at > now && at - now > 300)) r = MD_STORE_CLOCK;
@@ -602,7 +606,7 @@ static MdStoreResult save_draft(MdManagedStore *s, const char *d, Journal *j,
     char *signed_wire = NULL, *canonical = NULL;
     NostrEvent *signed_event = NULL;
     if (!unsigned_wire || md_account_binding_sign_event(s->binding,unsigned_wire,&signed_wire)) goto done;
-    signed_event = parse_event(signed_wire,s->owner,doc_kind(d),d);
+    signed_event = parse_event(signed_wire,s->owner,doc_kind(d),d,NULL);
     if (!signed_event || nostr_event_get_created_at(signed_event) != nostr_event_get_created_at(event) ||
         strcmp(nostr_event_get_content(signed_event),nostr_event_get_content(event))) goto done;
     r = MD_STORE_IO;
