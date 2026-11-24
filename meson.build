@@ -498,6 +498,10 @@ core_deps += [
 if host_os != 'windows'
   core_deps += cc.find_library('dl', required : false)
 endif
+if host_os == 'linux'
+  # Core management IPC calls floor(); don't rely on FFmpeg's link flags.
+  core_deps += cc.find_library('m')
+endif
 
 # ── Signer backend deps + compile flags ─────────────────────────────────────
 # Diagnose stale nostrc objects after a system libwebsockets upgrade, including
