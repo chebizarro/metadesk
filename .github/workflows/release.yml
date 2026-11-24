@@ -3,7 +3,6 @@ name: Pre-release packages
 on:
   push:
     tags: ['v*']
-    branches: ['task/md-k0vi']
   workflow_dispatch:
     inputs:
       tag:
