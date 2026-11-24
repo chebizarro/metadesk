@@ -1,0 +1,144 @@
+name: Pre-release packages
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release name (this does not create a Git tag)
+        type: string
+        default: v0.1.0-alpha.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metadesk-release-${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.1.0-alpha.1' }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.1.0-alpha.1' }}
+  PUBLISH: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+  NOSTRC_REVISION: 6f7a8d025768d497bef700fe55eea1c687dac328
+  FEDORA: registry.fedoraproject.org/fedora@sha256:e47bc35e0f02d8b490f17c9a11dee69c87a393de8d4e5bc81a3fa04b7a7c7ab9
+
+jobs:
+  linux:
+    name: ${{ matrix.format }} (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        format: [deb, rpm, appimage, flatpak]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install producer prerequisites
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: bash packaging/release/linux.sh install "$FORMAT"
+      - name: Identify FFmpeg toolchain and build ABI
+        if: matrix.format == 'appimage'
+        id: ffmpeg-toolchain
+        run: |
+          fingerprint=$({ printf '%s\n' "$RUNNER_TEMP"; cc --version; nasm -v;
+            dpkg-query -W libva-dev libdrm-dev; if [[ $RUNNER_ARCH == X64 ]]; then dpkg-query -W libvpl-dev; fi;
+            } | sha256sum | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Cache source-verified FFmpeg build
+        if: matrix.format == 'appimage'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/md-release/ffmpeg
+          key: appimage-ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ steps.ffmpeg-toolchain.outputs.fingerprint }}-${{ hashFiles('packaging/ffmpeg/**', 'packaging/flatpak/modules.json', 'packaging/release/linux.sh') }}
+      - name: Build and smoke test
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: bash packaging/release/linux.sh build "$FORMAT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.format }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/md-release/upload/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  macos:
+    name: DMG (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: brew install cmake meson ninja pkgconf
+      - name: Identify macOS toolchain
+        id: macos-toolchain
+        run: |
+          fingerprint=$({ printf '%s\n' "$RUNNER_TEMP"; xcodebuild -version; xcrun --show-sdk-path;
+            cmake --version; pkg-config --version; } | shasum -a 256 | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Cache verified macOS build dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/md-macos-deps/prefix
+            ${{ runner.temp }}/md-macos-deps/licenses
+            ${{ runner.temp }}/md-macos-deps/deps.lock.json
+            ${{ runner.temp }}/md-macos-deps/toolchain.txt
+            ${{ runner.temp }}/md-macos-deps/sources/nostrc
+            ${{ runner.temp }}/md-macos-deps/build/nostrc
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/install/lib
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/build/config*.h
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/build/ffbuild/config.log
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/configure*.txt
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/profile.txt
+            ${{ runner.temp }}/md-macos-deps/build/ffmpeg/encoders.txt
+          key: macos-release-deps-${{ runner.arch }}-${{ steps.macos-toolchain.outputs.fingerprint }}-${{ hashFiles('packaging/macos/**', 'packaging/ffmpeg/**', 'packaging/git_source.py') }}
+      - name: Cache pinned macOS source archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/md-downloads
+          key: macos-release-sources-${{ hashFiles('packaging/macos/deps.lock.json') }}
+      - name: Build and verify app and DMG
+        env:
+          APPLE_CERTIFICATE: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGN_IDENTITY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_SIGN_IDENTITY || '' }}
+          APPLE_NOTARY_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY || '' }}
+          APPLE_NOTARY_KEY_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY_ID || '' }}
+          APPLE_NOTARY_ISSUER: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_ISSUER || '' }}
+        run: bash packaging/release/macos.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-dmg-arm64
+          path: ${{ runner.temp }}/md-release/upload/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  release:
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/packages
+      - name: Assemble exact-SHA source, CycloneDX SBOM, notes and checksums
+        run: python3 packaging/release/assemble.py "$RUNNER_TEMP/packages" "$RUNNER_TEMP/assets"
+      - name: Attach assets to draft (publish only for an existing pushed tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash packaging/release/github.sh "$RUNNER_TEMP/assets"
