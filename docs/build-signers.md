@@ -10,7 +10,7 @@ the APIs used by enabled signers. Use a dedicated developer tree or a single
 installed SDK prefix, not a mixture.
 
 With no nostrc paths Meson uses installed pkg-config modules (`nostr`,
-`libnostrgo`, `libnostr-json`, `nip11`, `nip17`, `nip44`, `nip51`, `nip98`,
+`libnostrgo`, `libnostr-json`, `nip11`, `nip17`, `nip44`, `nip51`, `nip78`, `nip98`,
 and `nip04`/`nip46` when enabled). Set `PKG_CONFIG_PATH` to the installed SDK
 prefix's pkg-config directory. Package builds can require this path with
 `-Dnostrc_discovery=installed`. Supplying explicit nostrc paths in `auto`
@@ -68,6 +68,7 @@ Build-tree mode links these nostrc components besides the JSON library above:
 | libgo | `nostrgo` (older trees: `libgo`), `go_fiber` | library, always-static `go_fiber` |
 | NIP-44 | `nostr_nip44_core` | static library |
 | NIP-51 | `nostr_nip51_core` | **OBJECT library**: no archive |
+| NIP-78 | `nostr_nip78_core` | libnostr_nip78_core (installed pkg-config: `nip78`) |
 | NIP-98 | `nostr_nip98` | library |
 | NIP-19 | `nip19` | library |
 | NIP-17 | `nostr_nip17_core` | **OBJECT library**: no archive |
@@ -213,7 +214,7 @@ cmake -S /Users/bizarro/Documents/Projects/nostrc \
 cmake --build /tmp/md-dpl-nostrc-lws5 --parallel 2 --target \
   nostr nostr_json go_fiber nostr_nip46_core nostr_nip55l_core \
   nostr_nip5f_core nostr_nip49_glib nip04 nip06 nip19 \
-  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
+  nostr_nip51_core nostr_nip78_core nostr_nip98 nip11 nostr_nip17_core
 ```
 
 The actual initial configure additionally passed `-DBUILD_GNOSTR_APP=OFF` and
@@ -231,7 +232,7 @@ cmake -S /Users/bizarro/Documents/Projects/nostrc \
 cmake --build /Users/bizarro/Documents/Projects/nostrc/_build --parallel 2 --target \
   nostr nostr_json go_fiber nostr_nip46_core nostr_nip55l_core \
   nostr_nip5f_core nostr_nip49_glib nip04 nip06 nip19 \
-  nostr_nip51_core nostr_nip98 nip11 nostr_nip17_core
+  nostr_nip51_core nostr_nip78_core nostr_nip98 nip11 nostr_nip17_core
 ```
 
 **Second blocker found during md-dpl (now fixed by md-66n):** the old common
