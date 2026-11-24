@@ -3,7 +3,6 @@ name: Pre-release packages
 on:
   push:
     tags: ['v*']
-    branches: ['task/md-6mqr'] # Temporary qualification trigger; remove before merging.
   workflow_dispatch:
     inputs:
       tag:
@@ -108,12 +107,12 @@ jobs:
           key: macos-release-sources-${{ hashFiles('packaging/macos/deps.lock.json') }}
       - name: Build and verify app and DMG
         env:
-          APPLE_CERTIFICATE: ${{ github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_SIGN_IDENTITY: ${{ github.ref_type == 'tag' && secrets.APPLE_SIGN_IDENTITY || '' }}
-          APPLE_NOTARY_KEY: ${{ github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY || '' }}
-          APPLE_NOTARY_KEY_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY_ID || '' }}
-          APPLE_NOTARY_ISSUER: ${{ github.ref_type == 'tag' && secrets.APPLE_NOTARY_ISSUER || '' }}
+          APPLE_CERTIFICATE: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGN_IDENTITY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_SIGN_IDENTITY || '' }}
+          APPLE_NOTARY_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY || '' }}
+          APPLE_NOTARY_KEY_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_KEY_ID || '' }}
+          APPLE_NOTARY_ISSUER: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARY_ISSUER || '' }}
         run: bash packaging/release/macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
