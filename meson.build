@@ -830,6 +830,13 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
+if get_option('macos_manager')
+  if host_os != 'darwin'
+    error('macos_manager requires macOS')
+  endif
+  subdir('src/macos_manager')
+endif
+
 # GTK remains private to the opt-in Linux companion, never libmetadesk.
 if get_option('manager')
   if host_os != 'linux'

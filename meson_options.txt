@@ -8,6 +8,8 @@ option('tools', type : 'boolean', value : false,
        description : 'Build diagnostic utilities (capture_frame, encode_roundtrip, atspi_dump)')
 option('client',   type : 'boolean', value : true,
        description : 'Build the human video client (requires SDL2 + Dear ImGui)')
+option('macos_manager', type : 'boolean', value : false,
+  description : 'Build the native AppKit management prototype (macOS only)')
 option('manager', type : 'boolean', value : false,
        description : 'Build the optional Linux GTK4/libadwaita management companion')
 option('signer_nip46', type : 'boolean', value : false,

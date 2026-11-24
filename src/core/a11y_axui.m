@@ -3,7 +3,7 @@
  * macOS accessibility backend: AXUIElement (spec §2.3.2).
  *
  * Uses the macOS Accessibility API to:
- *   1. Check AXIsProcessTrusted() for permissions
+ *   1. Check md_macos_accessibility_allowed() for permissions
  *   2. Walk the AX hierarchy from the system-wide element
  *   3. Extract: AXRole, AXTitle/AXDescription, AXFrame, AXEnabled etc.
  *   4. Build an MdA11yNode tree
@@ -19,7 +19,7 @@
  */
 #include "a11y.h"
 
-#import <ApplicationServices/ApplicationServices.h>
+#include "macos_permissions.h"
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 
@@ -227,7 +227,7 @@ static char *axui_element_id(AXUIElementRef elem) {
 
 static AXUIElementRef axui_element_at_point(MdA11yCtx *ctx, int x, int y) {
     AXUIState *st = ctx ? ctx->backend_data : NULL;
-    if (!st || !st->connected || !AXIsProcessTrusted()) return NULL;
+    if (!st || !st->connected || !md_macos_accessibility_allowed()) return NULL;
     AXUIElementRef desktop = AXUIElementCreateSystemWide();
     if (!desktop) return NULL;
     AXUIElementRef hit = NULL;
@@ -638,7 +638,7 @@ static int axui_init(MdA11yCtx *ctx) {
     /* Fail fast when accessibility permission is missing: without trust,
      * every AX IPC call blocks for its ~6 s timeout, so a walk of the
      * desktop would grind for minutes instead of failing. */
-    if (!AXIsProcessTrusted()) {
+    if (!md_macos_accessibility_allowed()) {
         MD_LOG_E("accessibility permission not granted — enable this app in System Settings > Privacy & Security > Accessibility");
         return -1;
     }
@@ -740,7 +740,7 @@ static int axui_subscribe_changes(MdA11yCtx *ctx, MdA11yChangeCb cb,
     }
     pthread_mutex_unlock(&st->lock);
 
-    if (!AXIsProcessTrusted()) {
+    if (!md_macos_accessibility_allowed()) {
         MD_LOG_I("accessibility permission required for AXObserver subscriptions");
         return -1;
     }
@@ -880,7 +880,7 @@ static void axui_destroy(MdA11yCtx *ctx) {
 static bool axui_is_connected(const MdA11yCtx *ctx) {
     const AXUIState *st = ctx->backend_data;
     /* Tree walks need trust, not observers: change subscriptions are optional. */
-    return st && st->connected && AXIsProcessTrusted();
+    return st && st->connected && md_macos_accessibility_allowed();
 }
 
 static const MdA11yBackend axui_backend = {

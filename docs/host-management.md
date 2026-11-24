@@ -61,6 +61,14 @@ status fields, supervisor registration and exit/restart policy. Managed Unix
 startup can recover a checked, refused stale endpoint under a lifetime lock;
 interactive startup retains the no-unlink behavior described below.
 
+On macOS, the read-only v1 `host.permissions` request takes no parameters and
+returns the same snapshot as `management.snapshot`, plus `permissions` with
+boolean `screen_recording` and `accessibility` fields. These are prompt-free
+preflights of the responding host process only. No capture, AX tree query or
+input test runs. They do not advance the revision, authorize a session, or
+indicate capture/input readiness. Recheck explicitly; this is not a permission
+subscription. See the [native companion](plans/management-macos.md).
+
 ## Startup and CLI
 
 ```sh

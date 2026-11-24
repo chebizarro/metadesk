@@ -50,6 +50,7 @@
  * Built as Objective-C (.m) — see meson.build darwin block.
  */
 #include "capture.h"
+#include "macos_permissions.h"
 
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
@@ -323,7 +324,7 @@ static void sck_log_system_stop(CGDirectDisplayID display_id, NSError *error) {
              *name ? " " : "", name, meaning ? meaning : "no reason given");
     /* Revocation can also surface as another code; the preflight does not
      * prompt. */
-    if ((sck_domain && code == -3801) || !CGPreflightScreenCaptureAccess())
+    if ((sck_domain && code == -3801) || !md_macos_screen_recording_allowed())
         MD_LOG_E("Screen Recording permission revoked: capture cannot resume until it is "
                  "granted again in System Settings > Privacy & Security > Screen & "
                  "System Audio Recording (macOS may require restarting metadesk-host)");
@@ -553,7 +554,7 @@ void *md_capture_sck_test_bind_delegate(MdCaptureCtx *ctx) {
  * compiler prove that instead of re-checking per call. */
 API_AVAILABLE(macos(12.3))
 static int sck_start(MdCaptureCtx *ctx) {
-    if (ctx->config.no_interaction && !CGPreflightScreenCaptureAccess()) {
+    if (ctx->config.no_interaction && !md_macos_screen_recording_allowed()) {
         MD_LOG_E("managed capture requires prior Screen Recording authorization for this host identity");
         return MD_CAPTURE_INTERACTION_REQUIRED;
     }
