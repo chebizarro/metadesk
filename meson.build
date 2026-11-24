@@ -373,6 +373,7 @@ if host_os == 'linux'
 
   platform_hal_sources += files(
     'src/core/capture_pipewire.c',
+    'src/core/portal_lock.c',
     'src/core/a11y_atspi.c',
     'src/core/input_uinput.c',
     'src/core/ipc_unix.c',

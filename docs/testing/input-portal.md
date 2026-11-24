@@ -130,3 +130,31 @@ flow; its PipeWire socket is a stand-in, not a video producer.
    processes; remove only test-private state and its matching portal permission
    if one was remembered. Do not restart desktop services. Flatpak qualification
    is separate.
+
+## GNOME lock gate qualification (md-xhkx; owner-attended, not run)
+
+Both paired RemoteDesktop and legacy ScreenCast check the local session's
+GNOME ScreenSaver state before portal setup and again before `Start`. An
+interactive host waits for a local unlock notification within the existing
+consent budget. An unattended capture or standalone portal input fails fast.
+A new lock during setup fails fast in either capture mode. Managed capture
+still returns `needs_interaction` without contacting the portal, even with saved
+consent: the portal cannot guarantee prompt-free operation. `desktop_locked`
+is a capture startup rejection, not a request for the application to unlock.
+
+On an owner-approved disposable GNOME desktop (including Ubuntu 24.04 with
+portal-gnome 46.2), seed separate remembered grants for paired capture and
+legacy `--no-input` capture, using private state. Capture method names and
+ordering only, never tokens. Let the operator lock locally. For each path,
+verify interactive startup sends no `Start` while locked, then locally unlock
+and confirm startup reuses the grant and delivers real video. Separately verify
+unattended startup reports `desktop_locked` and sends no `Start`, the grant
+survives, and a fresh attempt after unlock restores it. Check managed startup
+reports `needs_interaction` without a chooser or `Start` while locked and
+unlocked. Clean up only the test grants and state.
+
+On a disposable backend with the upstream fixes, also cancel a pending legacy
+chooser and trace the `Request.Close` reply before `Session.Close`. Do not try
+that cancellation against 46.2 on a shared desktop: close ordering does not
+repair its upstream use-after-free. Lock state and `Start` are on separate
+services; the final check cannot prevent a new lock after the last observation.

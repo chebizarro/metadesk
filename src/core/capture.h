@@ -185,7 +185,8 @@ MdCaptureCtx *md_capture_create(const MdCaptureConfig *cfg);
 /* Start capturing. Returns 0 on success, -1 on error. */
 int md_capture_start(MdCaptureCtx *ctx);
 
-enum { MD_CAPTURE_INTERACTION_REQUIRED = -2, MD_CAPTURE_ERROR = -1, MD_CAPTURE_IDLE = 1 };
+enum { MD_CAPTURE_DESKTOP_LOCKED = -3, MD_CAPTURE_INTERACTION_REQUIRED = -2,
+       MD_CAPTURE_ERROR = -1, MD_CAPTURE_IDLE = 1 };
 
 /* Shared policy used by the portal and host watchdog. */
 uint32_t md_capture_consent_timeout_ms(const MdCaptureConfig *cfg);

@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include "portal_session.h"
+#include "portal_lock.h"
 #include <stdatomic.h>
 
 #define MD_LOG_TAG "input_portal"
@@ -590,7 +591,9 @@ int md_portal_session_open_capture(MdPortalSession *p, uint32_t *node) {
     return fd;
 }
 
-MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32_t timeout_ms) {
+MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32_t timeout_ms,
+                                          int *status) {
+    if (status) *status = MD_CAPTURE_ERROR;
     if (capture && capture->no_interaction) return NULL;
     MdPortalSession *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
@@ -604,7 +607,17 @@ MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32
     char token[1024] = {0}, replacement_token[1024] = {0};
     bool start_accepted = false;
     const char *stage = "session-bus setup";
-    if (!connect_bus(p) || !add_match(p, "type='signal',sender='" PORTAL "',interface='" REQUEST "'") ||
+    if (!connect_bus(p)) goto fail;
+    stage = "desktop lock check";
+    bool gnome_seen = false;
+    int lock = md_portal_check_lock(p->bus, (uint64_t)p->deadline * 1000000,
+                                    capture && !capture->unattended, &gnome_seen);
+    if (lock) {
+        if (status) *status = lock;
+        goto fail;
+    }
+    stage = "portal signal setup";
+    if (!add_match(p, "type='signal',sender='" PORTAL "',interface='" REQUEST "'") ||
         !add_match(p, "type='signal',sender='" PORTAL "',interface='" SESSION "'") ||
         !add_match(p, "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='" PORTAL "'")) goto fail;
     stage = "CreateSession";
@@ -623,6 +636,12 @@ MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32
         resp = request(p, "SelectSources", NULL, capture);
         if (!resp) goto fail;
         dbus_message_unref(resp);
+    }
+    stage = "desktop lock check";
+    lock = md_portal_check_lock(p->bus, (uint64_t)p->deadline * 1000000, false, &gnome_seen);
+    if (lock) {
+        if (status) *status = lock;
+        goto fail;
     }
     MD_LOG_I("Awaiting RemoteDesktop consent (%s)", capture ? "capture and input" : "input only");
     stage = "Start consent";
@@ -665,6 +684,7 @@ MdPortalSession *md_portal_session_create(const MdCaptureConfig *capture, uint32
     if (!ready(p) || pipe2(p->wake, O_CLOEXEC | O_NONBLOCK)) goto fail;
     if (pthread_create(&p->thread, NULL, worker, p)) goto fail;
     p->started = true;
+    if (status) *status = 0;
     pthread_mutex_lock(&token_mutex);
     token_update(token, replacement_token);
     pthread_mutex_unlock(&token_mutex);
@@ -675,7 +695,10 @@ fail:
         token_update(token, NULL);
         pthread_mutex_unlock(&token_mutex);
     }
-    MD_LOG_W("RemoteDesktop %s unavailable or consent not granted (no fallback)", stage);
+    if (status && *status == MD_CAPTURE_DESKTOP_LOCKED)
+        MD_LOG_W("desktop locked; RemoteDesktop Start not sent");
+    else
+        MD_LOG_W("RemoteDesktop %s unavailable or consent not granted (no fallback)", stage);
     md_portal_session_unref(p);
     return NULL;
 }
@@ -695,7 +718,8 @@ static int portal_init(MdInputCtx *ctx) {
         pthread_mutex_unlock(&p->mutex);
         if (!attach) return -1;
     } else {
-        p = md_portal_session_create(NULL, ctx->config.portal_timeout_ms);
+        int status;
+        p = md_portal_session_create(NULL, ctx->config.portal_timeout_ms, &status);
         if (!p) return -1;
     }
     ctx->backend_data = p;
