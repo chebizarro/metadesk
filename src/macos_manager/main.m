@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import "model.h"
+#include <signal.h>
 
 static NSButton *Button(NSString *title, id target, SEL action) {
     return [NSButton buttonWithTitle:title target:target action:action];
@@ -65,6 +66,8 @@ static NSString *PermissionText(MDPermission state) {
     NSTextField *_endpoint, *_stateDirectory, *_address, *_relay;
     NSTextView *_host, *_hosts, *_identity, *_routes, *_access, *_activity;
     dispatch_queue_t _worker;
+    NSUInteger _pendingJobs;
+    BOOL _terminationPending;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -124,13 +127,32 @@ static NSString *PermissionText(MDPermission state) {
     return YES;
 }
 
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    (void)app;
+    if (!_pendingJobs) return NSTerminateNow;
+    _terminationPending = YES;
+    return NSTerminateLater;
+}
+
+/* Queue and completion accounting belongs to AppKit's main thread. Wait for
+ * every queued job to release its IPC/signer/store resources before quitting. */
+- (void)runJob:(id (^)(void))work completion:(void (^)(id))completion {
+    ++_pendingJobs;
+    dispatch_async(_worker, ^{
+        id result = work();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(result);
+            if (--self->_pendingJobs == 0 && self->_terminationPending)
+                [NSApp replyToApplicationShouldTerminate:YES];
+        });
+    });
+}
+
 - (void)read:(NSString *(^)(void))work output:(NSTextView *)output sender:(NSButton *)button {
+    if (_terminationPending) return;
     button.enabled = NO;
     output.string = @"Reading…";
-    dispatch_async(_worker, ^{
-        NSString *result = work();
-        dispatch_async(dispatch_get_main_queue(), ^{ output.string = result; button.enabled = YES; });
-    });
+    [self runJob:work completion:^(id result) { output.string = result; button.enabled = YES; }];
 }
 
 - (void)loadAccounts:(NSButton *)button {
@@ -148,18 +170,16 @@ static NSString *PermissionText(MDPermission state) {
 }
 
 - (void)loadHost:(NSButton *)button {
+    if (_terminationPending) return;
     NSString *path = [_endpoint.stringValue copy];
     button.enabled = NO;
     _endpoint.enabled = NO;
     _host.string = @"Checking the host…";
     _access.string = _activity.string = @"Checking the host…";
-    dispatch_async(_worker, ^{
-        NSDictionary *snapshot = MDHostRead(path);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self showSnapshot:snapshot path:path];
-            self->_endpoint.enabled = button.enabled = YES;
-        });
-    });
+    [self runJob:^{ return MDHostRead(path); } completion:^(id snapshot) {
+        [self showSnapshot:snapshot path:path];
+        self->_endpoint.enabled = button.enabled = YES;
+    }];
 }
 
 - (void)showSnapshot:(NSDictionary *)snapshot path:(NSString *)path {
@@ -203,6 +223,7 @@ static NSString *PermissionText(MDPermission state) {
 @end
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     @autoreleasepool {
         NSApplication *app = NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];

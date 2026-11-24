@@ -119,8 +119,20 @@ NSString *MDCachedHosts(NSString *stateDirectory) {
     MdAccountStartup startup = {0};
     int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &startup);
     NSString *result;
-    if (rc) result = [NSString stringWithFormat:@"Client signer unavailable: %s\nCheck the external signer; Metadesk has no password.",
-                      md_accounts_error_string(rc)];
+    if (rc) {
+        switch (rc) {
+        case MD_CREDENTIAL_NOT_FOUND: case MD_CREDENTIAL_LOCKED: case MD_CREDENTIAL_UNAVAILABLE:
+        case MD_CREDENTIAL_INVALID: case MD_CREDENTIAL_FAILED: case MD_CREDENTIAL_AMBIGUOUS:
+            result = [NSString stringWithFormat:@"Local NIP-46 credential access failed: %s. "
+                "Check this build’s Keychain access and saved pairing; no external signer was reached.",
+                md_credential_error_string(rc)];
+            break;
+        default:
+            result = [NSString stringWithFormat:@"Could not load the client role: %s\n"
+                "If the signer is unavailable, check it separately; Metadesk has no password.", md_accounts_error_string(rc)];
+            break;
+        }
+    }
     else if (!startup.binding) result = @"Assign a client role with the account CLI before reading its cache.";
     else {
         MdManagedStore *store = md_managed_store_open(startup.binding, stateDirectory.fileSystemRepresentation);
@@ -129,8 +141,29 @@ NSString *MDCachedHosts(NSString *stateDirectory) {
             char *winner = NULL;
             MdStoreResult status = md_managed_store_read(store, MD_STORE_HOSTS, NULL, &winner, NULL);
             switch (status) {
-            case MD_STORE_OK: case MD_STORE_PENDING: case MD_STORE_PARTIAL: case MD_STORE_CONFLICT:
+            case MD_STORE_OK:
                 result = MDFormatCachedHosts(winner);
+                break;
+            case MD_STORE_PENDING:
+                result = [@"A local draft is pending publication. Showing only the committed cache.\n\n"
+                    stringByAppendingString:MDFormatCachedHosts(winner)];
+                break;
+            case MD_STORE_PARTIAL:
+                result = [@"Publication is only partially acknowledged. Showing the committed cache.\n\n"
+                    stringByAppendingString:MDFormatCachedHosts(winner)];
+                break;
+            case MD_STORE_CONFLICT:
+                result = [@"A local draft conflicts with the cached winner. Showing only the committed cache.\n\n"
+                    stringByAppendingString:MDFormatCachedHosts(winner)];
+                break;
+            case MD_STORE_READ_ONLY:
+                result = @"The cached Hosts list is unreadable or uses an unsupported schema.";
+                break;
+            case MD_STORE_IO:
+                result = @"Could not read the cached Hosts list from disk.";
+                break;
+            case MD_STORE_REVOKED:
+                result = @"The client role is no longer current. Refresh the saved roles before reading the cache again.";
                 break;
             case MD_STORE_SIGNER:
                 result = @"The external signer could not decrypt the cache. Check the signer and try again.";

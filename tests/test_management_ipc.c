@@ -9,6 +9,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#ifdef __APPLE__
+/* Exercise the production dispatcher with the same compile-time probe
+ * substitution as the AX adapter fixture. Never contact TCC. */
+#include <ApplicationServices/ApplicationServices.h>
+static bool fake_screen_recording(void) { return true; }
+static Boolean fake_accessibility(void) { return false; }
+#define CGPreflightScreenCaptureAccess fake_screen_recording
+#define AXIsProcessTrusted fake_accessibility
+#include "../src/core/management_ipc.c"
+#undef AXIsProcessTrusted
+#undef CGPreflightScreenCaptureAccess
+#endif
 static cJSON *call(const char *path,const char *method) {
     cJSON *j=cJSON_CreateObject();cJSON_AddNumberToObject(j,"v",1);cJSON_AddStringToObject(j,"method",method);
     cJSON *r=md_management_call(path,j);cJSON_Delete(j);return r;
@@ -32,6 +44,37 @@ int main(void) {
     cJSON *host=cJSON_GetObjectItemCaseSensitive(v,"host");
     MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(host,"managed")));
     MD_CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(host,"state")->valuestring,"waiting"));
+    MD_CHECK(!cJSON_GetObjectItemCaseSensitive(v,"permissions"));
+    double revision=cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(v,"revision"));
+    MD_CHECK(revision > 0);
+    cJSON_Delete(v);
+    cJSON *extra=cJSON_Parse("{\"v\":1,\"method\":\"host.permissions\",\"x\":1}");
+    MD_CHECK(extra);
+    v=md_management_call(path,extra); cJSON_Delete(extra);
+    MD_CHECK(v && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok")) &&
+             cJSON_IsString(cJSON_GetObjectItemCaseSensitive(v,"error")) &&
+             !strcmp(cJSON_GetObjectItemCaseSensitive(v,"error")->valuestring,"invalid") &&
+             !cJSON_GetObjectItemCaseSensitive(v,"permissions"));
+    cJSON_Delete(v);
+    v=call(path,"host.permissions");
+    MD_CHECK(v && cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(v,"revision")) == revision);
+#ifdef __APPLE__
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"ok")));
+    cJSON *permissions=cJSON_GetObjectItemCaseSensitive(v,"permissions");
+    MD_CHECK(cJSON_IsObject(permissions) && cJSON_GetArraySize(permissions) == 2);
+    MD_CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(permissions,"screen_recording")));
+    MD_CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(permissions,"accessibility")));
+#else
+    MD_CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok")) &&
+             cJSON_IsString(cJSON_GetObjectItemCaseSensitive(v,"error")) &&
+             !strcmp(cJSON_GetObjectItemCaseSensitive(v,"error")->valuestring,"invalid") &&
+             !cJSON_GetObjectItemCaseSensitive(v,"permissions"));
+#endif
+    cJSON_Delete(v);
+    v=call(path,"management.snapshot");
+    MD_CHECK(v && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"ok")) &&
+             !cJSON_GetObjectItemCaseSensitive(v,"permissions") &&
+             cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(v,"revision")) == revision);
     cJSON_Delete(v);
     v=call(path,"arbitrary.signer");MD_CHECK(v&&cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(v,"ok")));cJSON_Delete(v);
     v=call(path,"access.list");
@@ -51,7 +94,16 @@ int main(void) {
         MD_CHECK(!connect(fd,(struct sockaddr *)&addr,sizeof(addr)));
         const char *line="{\"v\":1,\"method\":\"management.subscribe\"}\n";
         MD_CHECK(send(fd,line,strlen(line),0)==(ssize_t)strlen(line));
-        char ch=0;do { MD_CHECK(recv(fd,&ch,1,0)==1); } while(ch!='\n');
+        char ch=0, response[4096]; size_t used=0;
+        while (used+1<sizeof(response) && recv(fd,&ch,1,0)==1 && ch!='\n')
+            response[used++]=ch;
+        MD_CHECK(ch=='\n');
+        response[used]=0;
+        v=cJSON_Parse(response);
+        MD_CHECK(v && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"ok")) &&
+                 !cJSON_GetObjectItemCaseSensitive(v,"permissions") &&
+                 cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(v,"revision")) == revision);
+        cJSON_Delete(v);
         MD_CHECK(!shutdown(fd,SHUT_WR));MD_CHECK(recv(fd,&ch,1,0)==0);close(fd);
     }
     // Symlink and unsafe parent rejection, also on client.

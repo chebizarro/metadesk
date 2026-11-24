@@ -61,8 +61,12 @@ status fields, supervisor registration and exit/restart policy. Managed Unix
 startup can recover a checked, refused stale endpoint under a lifetime lock;
 interactive startup retains the no-unlink behavior described below.
 
-On macOS, the read-only v1 `host.permissions` request takes no parameters and
-returns the same snapshot as `management.snapshot`, plus `permissions` with
+On macOS, `host.permissions` is a read-only extension to the v1 wire protocol.
+It is available in every macOS host build, including the default build without
+`-Dmacos_manager`, so the companion and host can be built independently. Older
+v1 hosts and non-macOS hosts reject the method as `invalid`; clients can fall
+back to `management.snapshot` with unknown permission state. The new request
+takes no parameters and returns the same snapshot as `management.snapshot`, plus `permissions` with
 boolean `screen_recording` and `accessibility` fields. These are prompt-free
 preflights of the responding host process only. No capture, AX tree query or
 input test runs. They do not advance the revision, authorize a session, or

@@ -19,6 +19,6 @@ custom_target('macos-manager-app',
 
 macos_manager_test = executable('test_macos_manager', 'test_model.m',
   link_with : macos_manager_model,
-  dependencies : dep_cjson,
+  dependencies : [dep_metadesk.partial_dependency(compile_args : true, includes : true), dep_cjson],
   include_directories : [core_inc, include_directories('../../tests')])
 test('macos-manager model', macos_manager_test, suite : 'macos_manager')
