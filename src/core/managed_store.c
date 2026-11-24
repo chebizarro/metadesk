@@ -334,7 +334,7 @@ static MdStoreResult schema(int kind, json_t *doc) {
         return valid ? MD_STORE_OK : MD_STORE_INVALID;
     }
     json_t *version = json_object_get(doc,"schema_version");
-    if (!json_is_integer(version) || json_integer_value(version) < 1) return MD_STORE_INVALID;
+    if (!json_is_integer(version)) return MD_STORE_INVALID;
     if (json_integer_value(version) != 1) return MD_STORE_READ_ONLY;
     json_t *hosts = json_object_get(doc,"hosts"), *tags = json_object_get(doc,"tags");
     json_t *pref = json_object_get(doc,"preferences");
@@ -382,8 +382,10 @@ static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t *
     if (md_account_binding_decrypt(s->binding,s->owner,nostr_event_get_content(e),&plain) || !plain) {
         wipe(plain); return current(s) ? MD_STORE_SIGNER : MD_STORE_REVOKED;
     }
-    if (strlen(plain) <= MD_STORE_MAX_CONTENT) *doc = json_loads(plain,JSON_REJECT_DUPLICATES,NULL);
+    json_error_t error = {0};
+    if (strlen(plain) <= MD_STORE_MAX_CONTENT) *doc = json_loads(plain,JSON_REJECT_DUPLICATES,&error);
     wipe(plain);
+    if (!*doc && json_error_code(&error) == json_error_out_of_memory) return MD_STORE_IO;
     return schema(kind,*doc);
 }
 
@@ -507,16 +509,25 @@ MdStoreResult md_managed_store_read(MdManagedStore *s, const char *d,
     json_t *winner = NULL, *pending = NULL;
     if (!load(s,d,&j)) { r = MD_STORE_IO; goto done; }
     r = j.winner ? decode(s,doc_kind(d),j.winner,&winner) : MD_STORE_OK;
-    if (r != MD_STORE_OK && r != MD_STORE_READ_ONLY) goto done;
-    if (r == MD_STORE_OK || j.draft) r = status(&j);
+    bool invalid_winner = r == MD_STORE_INVALID;
+    if (invalid_winner) r = MD_STORE_READ_ONLY;
+    else if (r == MD_STORE_OK) r = status(&j);
+    else if (r != MD_STORE_READ_ONLY) goto done;
     if (j.draft && draft) {
         MdStoreResult draft_status = decode(s,doc_kind(d),j.draft,&pending);
-        if (draft_status != MD_STORE_OK) { r = draft_status; goto done; }
+        if (draft_status != MD_STORE_OK) {
+            /* A corrective draft may intentionally preserve unreadable content. */
+            if (r != MD_STORE_READ_ONLY ||
+                (draft_status != MD_STORE_READ_ONLY && draft_status != MD_STORE_INVALID)) {
+                r = draft_status; goto done;
+            }
+            json_decref(pending); pending = NULL;
+        }
     }
     if (!current(s)) { r = MD_STORE_REVOKED; goto done; }
-    if (plain && winner) *plain = json_dumps(winner,JSON_COMPACT);
+    if (plain && winner && !invalid_winner) *plain = json_dumps(winner,JSON_COMPACT);
     if (draft && pending) *draft = json_dumps(pending,JSON_COMPACT);
-    if ((plain && winner && !*plain) || (draft && pending && !*draft)) {
+    if ((plain && winner && !invalid_winner && !*plain) || (draft && pending && !*draft)) {
         if (plain) { wipe(*plain); *plain = NULL; }
         if (draft) { wipe(*draft); *draft = NULL; }
         r = MD_STORE_IO;
@@ -613,8 +624,9 @@ done:
     return current(s) ? r : MD_STORE_REVOKED;
 }
 
+typedef enum { EDIT, REAPPLY, REPLACE_INVALID } EditMode;
 static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
-    const char *plain, const char *const *targets, size_t count, int64_t now, bool reapply) {
+    const char *plain, const char *const *targets, size_t count, int64_t now, EditMode mode) {
     MdStoreResult r = access_doc(s,d);
     if (r != MD_STORE_OK) return r;
     if (!base || (*base && !hex(base,64)) || !plain ||
@@ -627,8 +639,9 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
     char *encoded = NULL;
     if (!load(s,d,&j)) { r = MD_STORE_IO; goto done; }
     if (strcmp(base,id(j.winner))) { r = MD_STORE_CONFLICT; goto done; }
-    if (reapply && status(&j) != MD_STORE_CONFLICT) { r = MD_STORE_UNCHANGED; goto done; }
-    if (!reapply && j.draft) { r = status(&j); goto done; }
+    if (mode == REAPPLY && status(&j) != MD_STORE_CONFLICT) { r = MD_STORE_UNCHANGED; goto done; }
+    if (mode == EDIT && j.draft) { r = status(&j); goto done; }
+    if (mode == REPLACE_INVALID && !j.winner) { r = MD_STORE_INVALID; goto done; }
     int64_t at;
     if (!next_timestamp(&j,now,&at)) { r = MD_STORE_CLOCK; goto done; }
     int kind = doc_kind(d);
@@ -637,11 +650,16 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
     if (r != MD_STORE_OK) goto done;
     if (j.winner) {
         r = decode(s,kind,j.winner,&old);
-        if (r != MD_STORE_OK) goto done;
-        if (!retain(kind,candidate,old)) { r = MD_STORE_IO; goto done; }
-        r = schema(kind,candidate);
-        if (r != MD_STORE_OK) goto done;
-        if (json_equal(candidate,old)) { r = MD_STORE_UNCHANGED; goto done; }
+        if (r == MD_STORE_INVALID) {
+            if (mode != REPLACE_INVALID) { r = MD_STORE_READ_ONLY; goto done; }
+        } else {
+            if (r != MD_STORE_OK) goto done; /* Locked signer, future version, or I/O. */
+            if (mode == REPLACE_INVALID) { r = MD_STORE_INVALID; goto done; }
+            if (!retain(kind,candidate,old)) { r = MD_STORE_IO; goto done; }
+            r = schema(kind,candidate);
+            if (r != MD_STORE_OK) goto done;
+            if (json_equal(candidate,old)) { r = MD_STORE_UNCHANGED; goto done; }
+        }
     }
     relays = json_object();
     if (!relays) { r = MD_STORE_IO; goto done; }
@@ -665,11 +683,15 @@ done:
 
 MdStoreResult md_managed_store_stage(MdManagedStore *s, const char *d, const char *base,
     const char *plain, const char *const *targets, size_t count, int64_t now) {
-    return stage(s,d,base,plain,targets,count,now,false);
+    return stage(s,d,base,plain,targets,count,now,EDIT);
 }
 MdStoreResult md_managed_store_reapply(MdManagedStore *s, const char *d, const char *base,
     const char *plain, const char *const *targets, size_t count, int64_t now) {
-    return stage(s,d,base,plain,targets,count,now,true);
+    return stage(s,d,base,plain,targets,count,now,REAPPLY);
+}
+MdStoreResult md_managed_store_replace_invalid(MdManagedStore *s, const char *d, const char *base,
+    const char *plain, const char *const *targets, size_t count, int64_t now) {
+    return stage(s,d,base,plain,targets,count,now,REPLACE_INVALID);
 }
 
 MdStoreResult md_managed_store_outgoing(MdManagedStore *s, const char *d, const char *target, char **wire) {

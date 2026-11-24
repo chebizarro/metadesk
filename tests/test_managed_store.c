@@ -274,13 +274,51 @@ int main(int argc, char **argv) {
     const char *future = "{\"schema_version\":2,\"hosts\":\"different layout\"}";
     char *remote = make(client,PK,MD_STORE_MANAGEMENT,NOSTR_KIND_APPLICATION_SPECIFIC_DATA,future,now+10);
     CHECK(md_managed_store_receive(s,MD_STORE_MANAGEMENT,remote,now) == MD_STORE_CONFLICT);
-    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,&pending) == MD_STORE_CONFLICT);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,&pending) == MD_STORE_READ_ONLY);
     CHECK(strstr(plain,"different layout") && strstr(pending,"edited"));
+    CHECK(md_managed_store_replace_invalid(s,MD_STORE_MANAGEMENT,revision,V1,targets,1,now) == MD_STORE_READ_ONLY);
     free(plain); free(pending); free(remote);
     CHECK(md_managed_store_outgoing(s,MD_STORE_MANAGEMENT,targets[0],&wire) == MD_STORE_CONFLICT && !wire);
     CHECK(md_managed_store_keep_remote(s,MD_STORE_MANAGEMENT,revision,now) == MD_STORE_OK);
     CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,NULL,NULL) == MD_STORE_READ_ONLY);
     CHECK(md_managed_store_stage(s,MD_STORE_MANAGEMENT,revision,V1,targets,1,now) == MD_STORE_READ_ONLY);
+    char long_note[2050]; memset(long_note,'x',sizeof(long_note)-1); long_note[sizeof(long_note)-1] = 0;
+    json_t *bad_doc = json_pack("{s:i,s:{s:{s:s}}}","schema_version",1,"hosts",HOST,"notes",long_note);
+    CHECK(bad_doc);
+    char *invalid_plain = json_dumps(bad_doc,JSON_COMPACT); CHECK(invalid_plain);
+    json_decref(bad_doc);
+    char *invalid = make(client,PK,MD_STORE_MANAGEMENT,NOSTR_KIND_APPLICATION_SPECIFIC_DATA,invalid_plain,now+11);
+    char *invalid_id = event_id(invalid);
+    CHECK(md_managed_store_receive(s,MD_STORE_MANAGEMENT,invalid,now) == MD_STORE_OK);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,NULL) == MD_STORE_READ_ONLY);
+    CHECK(!plain && !strcmp(revision,invalid_id));
+    CHECK(md_managed_store_stage(s,MD_STORE_MANAGEMENT,revision,V1,targets,1,now) == MD_STORE_READ_ONLY);
+    CHECK(md_managed_store_replace_invalid(s,MD_STORE_MANAGEMENT,HOST,V1,targets,1,now) == MD_STORE_CONFLICT);
+    CHECK(md_managed_store_replace_invalid(s,MD_STORE_MANAGEMENT,revision,V1,targets,1,now) == MD_STORE_PENDING);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,&pending) == MD_STORE_READ_ONLY);
+    CHECK(!plain && !strcmp(revision,invalid_id) && strstr(pending,SECRET));
+    free(pending); free(invalid_id); free(invalid); free(invalid_plain);
+    CHECK(md_managed_store_outgoing(s,MD_STORE_MANAGEMENT,targets[0],&wire) == MD_STORE_PENDING);
+    char *repaired_id = event_id(wire);
+    CHECK(md_managed_store_record_result(s,MD_STORE_MANAGEMENT,targets[0],repaired_id,MD_STORE_RELAY_ACKNOWLEDGED) == MD_STORE_OK);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,NULL) == MD_STORE_OK);
+    CHECK(!strcmp(revision,repaired_id) && strstr(plain,SECRET)); free(plain); free(repaired_id); free(wire);
+
+    /* A structurally valid encrypted envelope with a bad MAC is a decrypt
+     * failure, not a schema error eligible for explicit recovery. */
+    NostrEvent *bad_mac = md_private_document_build(client,NULL,PK,NOSTR_KIND_APPLICATION_SPECIFIC_DATA,
+        MD_STORE_MANAGEMENT,V1,now+13); CHECK(bad_mac);
+    char *bad_cipher = strdup(nostr_event_get_content(bad_mac)); CHECK(bad_cipher);
+    size_t n_cipher = strlen(bad_cipher); CHECK(n_cipher > 10);
+    bad_cipher[n_cipher-8] = bad_cipher[n_cipher-8] == 'A' ? 'B' : 'A';
+    nostr_event_set_content(bad_mac,bad_cipher); free(bad_cipher);
+    CHECK(!md_nostr_sign_event_json(client,bad_mac,&wire)); nostr_event_free(bad_mac);
+    char *bad_mac_id = event_id(wire);
+    CHECK(md_managed_store_receive(s,MD_STORE_MANAGEMENT,wire,now) == MD_STORE_OK);
+    CHECK(md_managed_store_read(s,MD_STORE_MANAGEMENT,revision,&plain,NULL) == MD_STORE_SIGNER);
+    CHECK(!*revision && !plain);
+    CHECK(md_managed_store_replace_invalid(s,MD_STORE_MANAGEMENT,bad_mac_id,V1,targets,1,now) == MD_STORE_SIGNER);
+    free(bad_mac_id); free(wire);
 
     const char *p1 = "[[\"p\",\"" HOST "\"],[\"extension\",\"retain\"]]";
     const char *p2 = "[[\"p\",\"" OTHER "\"]]";

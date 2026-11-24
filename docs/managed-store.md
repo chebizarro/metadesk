@@ -42,8 +42,12 @@ store, and open the new owner's store.
 Tag deletion is an app-data tombstone plus an empty tag membership document.
 Host deletion is a hosts-list edit plus independent favorite/tag/metadata
 edits. They are not atomic transactions; filter orphan memberships against
-`metadesk-hosts` while these edits are in progress. A future schema is read-only;
-unknown fields on retained v1 records and unrelated list extensions are kept.
+`metadesk-hosts` while these edits are in progress. An unreadable winner takes
+precedence over draft status. A decrypted but schema-invalid winner returns
+its revision and no plaintext. After explicit user review, `replace_invalid`
+can stage a complete replacement against that exact revision. It cannot
+replace an unknown schema version or bypass a signer/decryption failure.
+Unknown fields on retained v1 records and unrelated list extensions are kept.
 
 Documents are limited to 256 KiB of ciphertext and 1,000 host entries. The
 pinned NIP-44 v2 implementation also limits encrypted plaintext to 65,535 bytes;

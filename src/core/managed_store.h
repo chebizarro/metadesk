@@ -37,7 +37,9 @@ MdStoreResult md_managed_store_receive(MdManagedStore *, const char *coordinate,
                                       const char *signed_event_json, int64_t now);
 
 /* Winning revision (empty means no event) and optional decrypted winner and
- * separate draft. Caller owns plaintext strings and must not persist them. */
+ * separate draft. Caller owns plaintext strings and must not persist them.
+ * READ_ONLY takes precedence over draft status. A schema-invalid winner
+ * returns its revision, without plaintext. Signer failures are separate. */
 MdStoreResult md_managed_store_read(MdManagedStore *, const char *coordinate,
     char revision[65], char **plaintext, char **pending_plaintext);
 /* Complete replacement from base after backfill; durable before send.
@@ -68,6 +70,10 @@ MdStoreResult md_managed_store_keep_remote(MdManagedStore *, const char *coordin
     const char *base, int64_t now);
 MdStoreResult md_managed_store_reapply(MdManagedStore *, const char *coordinate,
     const char *base, const char *reviewed_plaintext, const char *const *targets, size_t count, int64_t now);
+/* Explicit recovery: replace a decrypted but invalid winner at its exact
+ * revision. Does not recover missing/decryption-failed/future-version data. */
+MdStoreResult md_managed_store_replace_invalid(MdManagedStore *, const char *coordinate,
+    const char *base, const char *replacement, const char *const *targets, size_t count, int64_t now);
 
 /* Local safety switch; missing/unreadable is disabled. It is not authority:
  * host policy must also be synchronized and explicitly enabled by the user. */
