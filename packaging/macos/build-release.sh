@@ -6,8 +6,16 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 case "$2" in /*) ;; *) echo 'OUTPUT must be absolute' >&2; exit 2 ;; esac
 [ ! -e "$2" ] || { echo 'OUTPUT must not exist' >&2; exit 2; }
 # The dependency builder enforces platform/source guards before creating output.
-python3 "$here/build-deps.py" "$2/deps" --nostrc-repo "$1"
-out=$(cd "$2" && pwd -P)
+nostrc=$1 output=$2
+set -- "$output/deps" --nostrc-repo "$nostrc"
+if [ -n "${MD_DEPS_DOWNLOADS:-}" ]; then
+    set -- "$@" --downloads "$MD_DEPS_DOWNLOADS"
+fi
+python3 "$here/build-deps.py" "$@" || {
+    tail -n 40 "$output"/deps/logs/*.log >&2
+    exit 1
+}
+out=$(cd "$output" && pwd -P)
 export MD_DEPS_PREFIX="$out/deps/prefix" MD_MACOS_MIN=13.0
 "$here/build-app.sh" "$out/deps/sources/nostrc" "$out/deps/build/nostrc" "$out/app"
 NOSTRC_TEST_ISOLATION=1 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent \

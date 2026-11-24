@@ -8,7 +8,12 @@ cp -a "$out/output/install/"* /app/
 # Metadata relocation only. Keep the exact original configure arguments for source compliance.
 sed -i -e 's|^prefix=.*|prefix=/app|' -e "s|^libdir=.*|libdir=\${prefix}/lib|" -e "s|^includedir=.*|includedir=\${prefix}/include|" /app/lib/pkgconfig/libav*.pc
 install -d /app/share/licenses/ffmpeg
-cp ffmpeg-source/COPYING.LGPLv2.1 "$out/output/configure-args.txt" /app/share/licenses/ffmpeg/
+cp ffmpeg-source/COPYING.LGPLv2.1 ffmpeg-source/LICENSE.md /app/share/licenses/ffmpeg/
+receipt=/app/share/metadesk/ffmpeg-build
+install -d "$receipt"
+cp "$out/output/"configure*.txt "$out/output/profile.txt" "$out/output/encoders.txt" \
+    "$out/output/build/"config*.h "$out/output/build/ffbuild/config.log" "$receipt/"
+cc --version > "$receipt/toolchain.txt"
 python3 - "$out" <<'PYCODE'
 import shlex, subprocess, sys
 probe = sys.argv[1] + '/verify-codecs'
