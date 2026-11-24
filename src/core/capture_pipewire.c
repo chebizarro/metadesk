@@ -247,7 +247,8 @@ done:
 
 /* All method waits, including Hello/authentication and AddMatch, consume the
  * same absolute startup budget. No unbounded flush or bus registration. */
-static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
+static DBusMessage *portal_call_status(PortalScreencast *p, DBusMessage *msg, bool *rejected) {
+    if (rejected) *rejected = false;
     int remaining = portal_remaining_ms(p, 180000);
     if (!msg || remaining <= 0) return NULL;
     DBusError err;
@@ -255,14 +256,31 @@ static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->bus, msg, remaining, &err);
     if (dbus_error_is_set(&err)) {
         MD_LOG_I("portal method failed: %s", err.name);
+        /* Only an error reply proves the method was handled and refused;
+         * a local timeout or disconnect leaves its request state unknown. */
+        if (rejected) *rejected = !dbus_error_has_name(&err, DBUS_ERROR_NO_REPLY) &&
+            !dbus_error_has_name(&err, DBUS_ERROR_TIMED_OUT) &&
+            !dbus_error_has_name(&err, DBUS_ERROR_DISCONNECTED);
         dbus_error_free(&err);
     }
     return reply;
 }
 
+static DBusMessage *portal_call(PortalScreencast *p, DBusMessage *msg) {
+    return portal_call_status(p, msg, NULL);
+}
+
 static bool portal_request(PortalScreencast *p, DBusMessage *msg, const char *path) {
-    DBusMessage *reply = portal_call(p, msg);
-    if (!reply) return false;
+    bool rejected;
+    DBusMessage *reply = portal_call_status(p, msg, &rejected);
+    if (!reply) {
+        /* The portal may already own @path (and a pending backend dialog)
+         * when its method reply is lost or late: cancel it before any
+         * Session.Close, exactly as for a missing Response. */
+        if (!rejected && p->owner[0])
+            p->request_close_unconfirmed = !portal_close_object(p, path, PORTAL_REQUEST);
+        return false;
+    }
     const char *actual = NULL;
     const char *sender = dbus_message_get_sender(reply);
     bool ok = dbus_message_has_signature(reply, "o") && sender && sender[0] == ':' &&

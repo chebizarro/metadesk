@@ -941,7 +941,7 @@ static void mock_portal(int ready, int mode) {
                 continue;
             }
             if (dbus_message_is_method_call(call, "org.freedesktop.portal.Request", "Close")) {
-                if (mode == 2 || mode == 5 || mode == 8) {
+                if (mode == 2 || mode == 5 || mode == 8 || mode == 9) {
                     /* Hold the reply briefly and report an already queued Session.Close.
                      * Also require a reply-bearing request, independently of timing. */
                     if (write(ready, dbus_message_get_no_reply(call) ? "N" : "Q", 1) != 1) _exit(24);
@@ -961,7 +961,7 @@ static void mock_portal(int ready, int mode) {
                 continue;
             }
             if (dbus_message_is_method_call(call, "org.freedesktop.portal.Session", "Close")) {
-                bool ordered = (mode != 2 && mode != 5 && mode != 8) || request_acked;
+                bool ordered = (mode != 2 && mode != 5 && mode != 8 && mode != 9) || request_acked;
                 if (write(ready, ordered && !dbus_message_get_no_reply(call) ? "X" : "!", 1) != 1) _exit(24);
                 DBusMessage *closed = dbus_message_new_method_return(call);
                 dbus_connection_send(bus, closed, NULL);
@@ -984,12 +984,16 @@ static void mock_portal(int ready, int mode) {
             char event = (char)('0' + seq);
             if (write(ready, &event, 1) != 1) _exit(23);
             const char *request = path;
-            DBusMessage *reply = dbus_message_new_method_return(call);
-            dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &request, DBUS_TYPE_INVALID);
-            dbus_connection_send(bus, reply, NULL);
-            dbus_message_unref(reply);
+            /* Mode 9: Start's method reply is lost too; the request may still
+             * exist portal-side, so it must be closed before the session. */
+            if (!(mode == 9 && seq == 2)) {
+                DBusMessage *reply = dbus_message_new_method_return(call);
+                dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &request, DBUS_TYPE_INVALID);
+                dbus_connection_send(bus, reply, NULL);
+                dbus_message_unref(reply);
+            }
             if (mode == 7 && seq == 1) locked = true;
-            if ((mode == 2 || mode == 5 || mode == 8) && seq == 2) { /* Start never responds. */
+            if ((mode == 2 || mode == 5 || mode == 8 || mode == 9) && seq == 2) { /* Start never responds. */
                 /* Mode 5: steady unrelated Response chatter, from another
                  * connection, for longer than the consent budget. The portal
                  * itself stays responsive, so elapsed time measures only the
@@ -1065,7 +1069,7 @@ static void test_portal_responses(void) {
     old = getenv("XDG_STATE_HOME");
     char *saved_state = old ? strdup(old) : NULL;
     setenv("XDG_STATE_HOME", state, 1);
-    for (int mode = 0; mode < 9; mode++) {
+    for (int mode = 0; mode < 10; mode++) {
         int output[2], ready[2];
         MD_CHECK(pipe(output) == 0 && pipe(ready) == 0);
         pid_t daemon = fork();
@@ -1098,7 +1102,7 @@ static void test_portal_responses(void) {
         MD_CHECK(md_capture_start(ctx) == (mode == 6 || mode == 7 ? MD_CAPTURE_DESKTOP_LOCKED : MD_CAPTURE_ERROR));
         double elapsed = test_now() - start;
         MD_CHECK(elapsed < 1.5);
-        if (mode == 2 || mode == 5 || mode == 8) MD_CHECK(elapsed >= .4);
+        if (mode == 2 || mode == 5 || mode == 8 || mode == 9) MD_CHECK(elapsed >= .4);
         MdFrame frame;
         MD_CHECK(md_capture_get_frame(ctx, &frame, 100) == MD_CAPTURE_ERROR);
         md_capture_destroy(ctx);
@@ -1121,7 +1125,7 @@ static void test_portal_responses(void) {
         ssize_t n = read(ready[0], events, sizeof(events)-1);
         MD_CHECK(mode == 6 ? n == 0 : n > 0);
         close(ready[0]);
-        bool start_stall = mode == 2 || mode == 5;
+        bool start_stall = mode == 2 || mode == 5 || mode == 9;
         const char *expected = mode == 0 || mode == 7 ? "01X" : mode == 3 ? "012X" :
             mode == 4 ? "0X" : start_stall ? "012QX" : mode == 6 ? "" : mode == 8 ? "012Q" : "0";
         MD_CHECK(strcmp(events, expected) == 0);
