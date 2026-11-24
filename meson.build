@@ -112,7 +112,7 @@ if _nostrc_mode == 'installed'
   _nostrc_deps += {'nip19' : cc.find_library('nip19', dirs : [_nostrc_libdir])}
   dep_libgo = dependency('libnostrgo', version : '>=0.3.1', method : 'pkg-config')
   _nostrc_pc_deps = [dep_nostr_json, dep_libgo]
-  foreach _nip : ['nip11', 'nip17', 'nip44', 'nip51', 'nip98']
+  foreach _nip : ['nip11', 'nip17', 'nip44', 'nip51', 'nip78', 'nip98']
     _nip_dep = dependency(_nip, method : 'pkg-config', version : '>=0.1.1')
     _nostrc_deps += {_nip : _nip_dep}
     _nostrc_pc_deps += _nip_dep
@@ -125,7 +125,7 @@ if _nostrc_mode == 'installed'
   endforeach
   message('nostrc installed libdir: ' + _nostrc_libdir)
 else
-  _nostrc_nip_dirs = ['nip11', 'nip17', 'nip19', 'nip44', 'nip51', 'nip98']
+  _nostrc_nip_dirs = ['nip11', 'nip17', 'nip19', 'nip44', 'nip51', 'nip78', 'nip98']
   _nostrc_inc_paths = []
   foreach d : ['libnostr', 'libgo'] + _nostrc_nip_dirs
     _src_inc = _nostrc_root / (d.startswith('nip') ? 'nips' / d : d) / 'include'
@@ -191,6 +191,7 @@ else
     # component : [CMake target / library name, build-tree subdir]
     'nip44' : ['nostr_nip44_core', 'nips/nip44'],
     'nip51' : ['nostr_nip51_core', 'nips/nip51'],
+    'nip78' : ['nostr_nip78_core', 'nips/nip78'],
     'nip98' : ['nostr_nip98', 'nips/nip98'],     # NIP-98 HTTP auth
     'nip19' : ['nip19', 'nips/nip19'],           # npub allowlist decoding
     'nip17' : ['nostr_nip17_core', 'nips/nip17'],
@@ -478,6 +479,8 @@ core_deps += [
   dep_nostr,
   dep_nip44,
   dep_nip51,
+  _nostrc_deps['nip78'],
+  dependency('jansson'),
   dep_nip98,
   dep_nip19,
   dep_nip17,
@@ -622,7 +625,7 @@ foreach _sanitizer : ['address', 'thread', 'undefined', 'memory', 'leak']
 endforeach
 # SemVer alone cannot identify a pinned source snapshot. Require the new
 # core and NIP-17 entry points even when all optional adapters are disabled.
-foreach _api : ['nostr_relay_publish_and_wait_with_context', 'nostr_nip17_build_dm_relay_list_unsigned']
+foreach _api : ['nostr_relay_publish_and_wait_with_context', 'nostr_nip17_build_dm_relay_list_unsigned', 'nostr_nip78_build_event']
   if not cc.has_function(_api, args : _signer_check_args, dependencies : core_deps)
     error('nostrc >= 6f7a8d025 required: cannot link ' + _api + ' with the selected SDK.')
   endif
@@ -775,6 +778,7 @@ core_sources = files(
 core_sources += files(
   'src/core/accounts.c',
   'src/core/accounts_signer.c',
+  'src/core/managed_store.c',
   'src/core/credential_store.c',
   'src/core/credential_store_secret_service.c',
   'src/core/credential_store_keychain.c',
@@ -1407,6 +1411,13 @@ test('OpenH264 offline fetch', test_oh_fetch)
 
 test('OpenH264 explicit fetch CLI offline', find_program('python3'),
   args : [files('tests/test_openh264_fetch_cli.py'), metadesk_host], timeout : 35)
+
+if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
+  test_managed_store = executable('test_managed_store', 'tests/test_managed_store.c',
+    dependencies : [dep_metadesk] + core_private_deps)
+  test('encrypted management store private relays', accounts_python,
+    args : [files('tests/test_managed_store.py'), test_managed_store, access_signer_fixture], timeout : 80)
+endif
 
 # Same-user host admission and management; no desktop devices.
 test_host_access = executable('test_host_access', files('tests/test_host_access.c'),

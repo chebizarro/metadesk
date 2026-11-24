@@ -51,6 +51,7 @@ jobs:
       - name: Configure
         run: |
           export PKG_CONFIG_PATH="$RUNNER_TEMP/nostrc-sdk/lib/pkgconfig"
+          pkg-config --exists nip78
           meson setup build -Dnostrc_discovery=installed -Dsigner_nip5f=true -Dmanager=true
           meson test -C build --list | grep -F 'input portal private bus + EIS'
           meson test -C build --list | grep -F 'account_secret_service'
