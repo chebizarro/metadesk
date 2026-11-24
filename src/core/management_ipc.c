@@ -15,6 +15,9 @@
 #include <poll.h>
 #include <limits.h>
 #include "md_time.h"
+#ifdef __APPLE__
+#include "macos_permissions.h"
+#endif
 #define PEERS 8
 #define LINE_MAX_BYTES 8192
 
@@ -222,6 +225,10 @@ static void caps_text(uint32_t caps, char out[64]) {
 static const char *dispatch(MdManagementIpc *s, cJSON *j) {
     if (!schema(j)) return "invalid";
     const char *method = str(j,"method");
+#ifdef __APPLE__
+    if (!strcmp(method,"host.permissions"))
+        return cJSON_GetArraySize(j) == 2 ? NULL : "invalid";
+#endif
     if (!strcmp(method,"management.snapshot") || !strcmp(method,"management.subscribe") ||
         !strcmp(method,"session.list") || !strcmp(method,"requests.list") || !strcmp(method,"access.list"))
         return cJSON_GetArraySize(j) == 2 ? NULL : "invalid";
@@ -301,6 +308,13 @@ static void *serve_peer(void *data) {
     }
     bool policy = j && str(j,"method") && !strncmp(str(j,"method"),"access.",7);
     cJSON *reply = policy ? policy_snapshot(s,error) : snapshot(s->access,error);
+#ifdef __APPLE__
+    if (!error && !strcmp(str(j,"method"),"host.permissions")) {
+        cJSON *permissions = cJSON_AddObjectToObject(reply,"permissions");
+        cJSON_AddBoolToObject(permissions,"screen_recording",md_macos_screen_recording_allowed());
+        cJSON_AddBoolToObject(permissions,"accessibility",md_macos_accessibility_allowed());
+    }
+#endif
     cJSON_AddNumberToObject(reply,"supported",s->supported);
     uint64_t sent_revision = 0;
     while (reply) {
