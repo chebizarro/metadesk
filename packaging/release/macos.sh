@@ -58,6 +58,7 @@ deps=$MD_RELEASE_DEPS_DIR
 copy_ffmpeg_records "$deps/build/ffmpeg" "$work/ffmpeg-records"
 for bundle in Metadesk.app 'Metadesk Manager.app'; do
     app=$mountpoint/$bundle
+    # Also exercises the Manager's real AppKit launch and quit from the mounted image.
     MD_MACOS_MIN=13.0 packaging/macos/verify-app.sh "$app"
     fw=$app/Contents/Frameworks
     reject_codecs "$fw"

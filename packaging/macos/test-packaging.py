@@ -98,6 +98,9 @@ class ManagerBundleTests(unittest.TestCase):
         executable, metadata = bundle_product(plist)
         self.assertEqual(executable, 'metadesk-macos-manager')
         self.assertEqual(metadata['CFBundleName'] + '.app', self.manager.name)
+        self.assertEqual(metadata['CFBundleIdentifier'], 'dev.metadesk.Manager')
+        self.assertEqual(metadata['CFBundleDisplayName'], 'Metadesk Manager')
+        self.assertEqual(metadata['CFBundleInfoDictionaryVersion'], '6.0')
         self.assertEqual(bundle_product(None), ('metadesk-host', None))
         with patch('bundle_app.subprocess.run') as codesign:
             sign(self.manager, '-', False, None)

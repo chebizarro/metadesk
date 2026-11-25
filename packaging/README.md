@@ -37,9 +37,10 @@ from a draft built at a different commit. Check the corresponding-source
 attachments and review transitive licenses before pushing a release tag.
 
 Linux installers are unsigned. The unsigned macOS DMG contains two ad-hoc
-signed apps. The native Manager has only been exercised through fixture tests
-and launch-and-quit smokes; signed on-screen qualification is still open
-(`md-8xlg`, `md-wdi3`). On a tag push only, a complete set of existing Apple credentials
+signed apps. The Manager has fixture coverage and an offline smoke of the
+packaged AppKit window and normal quit, including on the mounted DMG. The smoke
+does not exercise connections, signers, Keychain, host IPC, or user data.
+Signed on-screen qualification is still open (`md-8xlg`, `md-wdi3`). On a tag push only, a complete set of existing Apple credentials
 opts into Developer ID signing using the normal app/DMG producers, followed by
 notarization and stapling. Partial or absent credentials leave both apps ad-hoc.
 `APPLE_CERTIFICATE` and `APPLE_NOTARY_KEY` are base64 P12 and P8 respectively;

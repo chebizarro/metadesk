@@ -12,8 +12,16 @@ client and private libraries; Connect does not need `metadesk-client` on
 `PATH` or `Metadesk.app` alongside it. For manual local hosting, use
 `Metadesk.app/Contents/MacOS/metadesk-host` or your installed CLI on `PATH`.
 The Manager is ad-hoc signed like `Metadesk.app` in the default unsigned DMG.
-It has only been exercised through fixture tests and launch-and-quit smokes;
-signed on-screen qualification is still open (`md-8xlg`, `md-wdi3`).
+Expect each downloaded app to require its own
+[first-launch approval](https://support.apple.com/en-us/102445). With ad-hoc
+signing, expect Keychain items to be tied to the exact Manager build that
+created them. After an update, macOS may prompt or refuse access, and pairings
+may need to be re-imported. These are expected behaviors, not tested results.
+
+Coverage is limited to fixture tests and an offline smoke of the packaged
+`dev.metadesk.Manager` executable. The smoke opens the real AppKit window and
+quits normally without exercising connections, signers, Keychain, host IPC,
+or user data. Signed on-screen qualification is still open (`md-8xlg`, `md-wdi3`).
 
 ## Build and run from source
 
@@ -26,14 +34,15 @@ meson setup build-mac-manager -Dmacos_manager=true -Dclient=true \
 meson compile -C build-mac-manager -j2
 meson test -C build-mac-manager --suite macos_manager --print-errorlogs
 PATH="$PWD/build-mac-manager:$PATH" \
-  'build-mac-manager/src/macos_manager/Metadesk Manager.app/Contents/MacOS/metadesk-macos-manager'
+  build-mac-manager/src/macos_manager/metadesk-macos-manager
 ```
 
 The app targets macOS 13 or later; development dependencies may require a
 newer version. The bundle uses build-tree libraries. It is not a signed release
-and cannot qualify the packaged host's permission identity. `metadesk-client`
-is resolved beside the manager executable, inside its bundle, then on `PATH`
-for development installs. GLib is not linked by the Manager. If `gio-2.0` is
+and cannot qualify the packaged host's permission identity. An app bundle
+requires an executable `metadesk-client` inside `Contents/MacOS` or
+`Contents/Helpers`; if neither works, Connect fails without looking at `PATH`.
+Only unbundled development runs search beside the executable and then `PATH`. GLib is not linked by the Manager. If `gio-2.0` is
 available when configuring, the suite also runs the GTK store against the
 same relay vectors and exchanges real files between both implementations.
 
@@ -43,7 +52,11 @@ same relay vectors and exchanges real files between both implementations.
    cache. Enter explicit bootstrap relay URLs separated by spaces and select
    **Save Relays and Refresh Address Book** to sync. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
-   `~/.config/metadesk`). The app loads the selection on entry but does not sync
+   `~/.config/metadesk`). GTK accepts international relay hostnames and writes
+ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
+international hostname, enter its `xn--` punycode form. macOS does not perform
+IDNA conversion. GTK's saved ASCII URLs can still be read by both. The app
+loads the selection on entry but does not sync
    until you refresh, including after a client-role change. Replacing unreadable
 preferences requires confirmation. Clear the field and refresh to remove all choices; none
    is preselected or used as a fallback. `ws://` is unencrypted.

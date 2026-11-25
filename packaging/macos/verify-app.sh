@@ -83,6 +83,11 @@ case "$main" in
         if [ "$rc" -ne 0 ] || ! grep -Fxq "$app/Contents/MacOS/metadesk-client" "$home/manager-client-path.out"; then
             bad "manager did not resolve its bundled client"
         fi
+        runclean manager-smoke "$app/Contents/MacOS/$main" --smoke-quit
+        if [ "$rc" -ne 0 ] || ! grep -Fxq 'PASS: Manager window opened and normal quit completed' "$home/manager-smoke.out"; then
+            grep -v '^dyld\[' "$home/manager-smoke.err" >&2 || true
+            bad "Manager window or normal quit failed (status $rc)"
+        fi
         runclean client-help "$app/Contents/MacOS/metadesk-client" --help
         [ "$rc" -le 1 ] || bad "manager's metadesk-client --help exited $rc"
         grep -iq 'usage' "$home/client-help.out" "$home/client-help.err" || bad "manager's client printed no usage" ;;

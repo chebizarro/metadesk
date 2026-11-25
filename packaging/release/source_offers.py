@@ -197,7 +197,9 @@ def verify(receipt, offers, ffmpeg_name):
     """Fail before GitHub mutation if a measured library has no reviewed route."""
     inventory = receipt['inventory']
     if receipt['platform'] == 'dmg':
-        bundles = inventory.get('bundles', {})
+        if set(inventory) != {'pins', 'bundles'}:
+            raise ValueError('dmg: inventory must contain exactly pins and bundles')
+        bundles = inventory['bundles']
         if set(bundles) != {'Metadesk.app', 'Metadesk Manager.app'}:
             raise ValueError('dmg: expected measured inventories for both apps')
         return {name: verify_libraries(receipt, bundle | {'pins': inventory['pins']}, offers, ffmpeg_name)

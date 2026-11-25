@@ -170,6 +170,15 @@ class AssemblyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing runtime codec verification for both DMG apps'):
             assemble.assemble(self.packages, self.output)
 
+    def test_unexpected_top_level_dmg_inventory_key(self):
+        path = next(self.packages.glob('*/dmg-*.json'))
+        payload = json.loads(path.read_text())
+        payload['inventory']['private_libraries'] = {'libunknown.dylib': {}}
+        path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, 'inventory must contain exactly pins and bundles'):
+            assemble.assemble(self.packages, self.output)
+        self.assertFalse((self.output / 'SHA256SUMS').exists())
+
     def test_missing_manager_inventory(self):
         path = next(self.packages.glob('*/dmg-*.json'))
         payload = json.loads(path.read_text())

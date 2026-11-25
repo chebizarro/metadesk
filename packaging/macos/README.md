@@ -11,12 +11,15 @@ The release DMG contains two sibling bundles: `Metadesk.app` (the existing
 host/client bundle, with its host agent launcher) and `Metadesk Manager.app`
 (the native AppKit manager, its companion `metadesk-client`, and their private
 library closure). Copy the Manager alone to use it as a client frontend; it
-finds its client in `Contents/MacOS` without `PATH`. Local hosting still uses
+requires its executable client in the bundle and never searches `PATH`. Local hosting still uses
 `metadesk-host` from `Metadesk.app` or an existing CLI installation.
 
-Both apps are ad-hoc signed by default; the DMG is unsigned. The Manager has
-only been exercised through fixture tests and launch-and-quit smokes. Signed
-on-screen qualification remains open (`md-8xlg`, `md-wdi3`).
+Both apps are ad-hoc signed by default; the DMG is unsigned. Expect a separate
+[first-launch approval](https://support.apple.com/en-us/102445) for each downloaded
+app. With ad-hoc signing, expect Keychain access to be tied to the exact Manager
+build that created an item: an update may prompt or refuse access, and you may
+need to re-import pairings. Download approval and Keychain upgrade behavior have
+not been tested. Signed on-screen qualification remains open (`md-8xlg`, `md-wdi3`).
 
 In `deps.lock.json`, `type: git` pins the repository URL and full `commit`
 and `tree` object IDs. The builder shallow-fetches the exact commit and checks
@@ -66,11 +69,13 @@ not a bit-identical-output, legal-compliance or notarization claim.
   commands; missing/too-new minimums and an empty image set fail.
 * `MD_MACOS_MIN=13.0 verify-app.sh APP`: actual image minimums (not just plist),
   dependency/rpath closure, signatures and clean-environment startup for each
-  app. Manager startup checks the exact bundled client path and client help.
-* `build-release.sh`: full configured Meson suite with test isolation. Optional
-  live/permission tests retain their explicit skip status. Set
-  `MD_TEST_NO_KEYCHAIN=1` only on workstations that prohibit even disposable
-  Keychain fixture items; hosted builds run that fixture by default.
+  app. For the Manager this checks the exact bundled client path, client help,
+  and `--smoke-quit`: the packaged executable opens its real AppKit window,
+  runs the event loop, and exits through normal quit. This is an offline
+  check with an isolated home; it requires a window server and does not
+  exercise a connection, signers, Keychain, host IPC, or user data.
+* `build-release.sh`: full configured Meson suite, including the isolated
+  Keychain fixture. Optional live/permission tests retain their explicit skips.
 * The release adapter re-runs the app gates on the read-only mounted DMG,
   probes both FFmpeg copies, and records each bundle's measured libraries and
   hashes. Each inventory must pass the same reviewed source-offer rules.
@@ -84,6 +89,22 @@ not a bit-identical-output, legal-compliance or notarization claim.
   The current CLI-style client prints usage and exits without connection
   arguments. Require actual usage output (or a running client), not just
   `open` success. This is not a GUI connection/codec qualification.
+
+  To exercise the Manager through Launch Services, use the same offline smoke:
+
+  ```sh
+  (
+    home=$(mktemp -d) || exit 1
+    trap 'rm -r "$home"' EXIT
+    /usr/bin/open -n -W -a '/private/tmp/md-app-new/Metadesk Manager.app' \
+      --env "HOME=$home" --env "CFFIXED_USER_HOME=$home" \
+      --env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+      --stdout "$home/smoke.stdout" --stderr "$home/smoke.stderr" --args --smoke-quit &&
+      grep -Fx 'PASS: Manager window opened and normal quit completed' "$home/smoke.stdout"
+  )
+  ```
+
+  Require the app's completion marker, not just `open` success.
 
 arm64 is the first profile. x86_64/universal2 need their own source build and
 qualification, not `lipo` of Homebrew bottles. Developer ID/notarization and the
