@@ -110,8 +110,23 @@ int main(void) {
     g_assert_true(strstr(adw_action_row_get_subtitle(ADW_ACTION_ROW(row)), "Favorite") != NULL);
     g_assert_true(strstr(adw_action_row_get_subtitle(ADW_ACTION_ROW(row)), "Last connected on this device") != NULL);
 
-    /* A real relay EOSE, not a timer or refresh click, enables review. */
-    const char *bootstrap[] = {g_getenv("MD_FIXTURE_RELAY"), NULL};
+    const char *const secrets[] = {"NSEC1fixture", " nostr:Nsec1fixture", "NCRYPTSEC1fixture"};
+    for (size_t i = 0; i < G_N_ELEMENTS(secrets); ++i) {
+        gtk_editable_set_text(GTK_EDITABLE(address), secrets[i]);
+        g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(address)), ==, "");
+        g_assert_nonnull(find(page, NULL, "Private keys are not host addresses. Use a public host identity."));
+    }
+    const char *unreachable[] = {g_getenv("MD_FIXTURE_UNREACHABLE"), NULL};
+    g_assert_nonnull(unreachable[0]);
+    md_manager_hosts_configure(page, directory, g_getenv("MD_FIXTURE_CLIENT"), unreachable);
+    WAIT_UNTIL(find(page, NULL, "Cached Test Host") != NULL && find(page, NULL, "Offline — showing cached hosts") != NULL);
+    g_assert_false(gtk_widget_get_sensitive(connect));
+    row = find(page, NULL, "Cached Test Host");
+    g_assert_true(gtk_widget_get_width(row) <= 360);
+
+    /* One successful EOSE enables review without authorizing writes on an
+     * incomplete fetch set. */
+    const char *bootstrap[] = {g_getenv("MD_FIXTURE_RELAY"), unreachable[0], NULL};
     g_assert_nonnull(bootstrap[0]);
     md_manager_hosts_configure(page, directory, g_getenv("MD_FIXTURE_CLIENT"), bootstrap);
     WAIT_UNTIL(gtk_widget_get_sensitive(connect));
@@ -130,10 +145,13 @@ int main(void) {
     g_assert_nonnull(strstr(body, "NIP-05: Not provided"));
     g_assert_nonnull(strstr(body, "Requested access: View only"));
     g_assert_true(adw_alert_dialog_has_response(review, "cancel"));
+    g_assert_false(adw_alert_dialog_has_response(review, "save"));
     g_assert_cmpstr(adw_alert_dialog_get_default_response(review), ==, "cancel");
     /* The dialog's requested focus can be set before the sheet is open.
      * Wait for the window to actually hand keyboard focus into the dialog. */
     WAIT_UNTIL(focus_inside(window, GTK_WIDGET(review)));
+    g_assert_cmpint(gdk_surface_get_width(gtk_native_get_surface(GTK_NATIVE(window))), ==, 360);
+    g_assert_cmpint(gtk_widget_get_width(GTK_WIDGET(review)), <=, 360);
     keyboard("Escape", FALSE);
     WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) == NULL);
     /* The same QR generator/scanner used by the page must round-trip. */
@@ -146,8 +164,13 @@ int main(void) {
     g_autofree char *decoded = md_manager_qr_scan(png, NULL);
     g_assert_cmpstr(decoded, ==, profile);
     free(profile);
+    g_object_add_weak_pointer(G_OBJECT(page), (gpointer *)&page);
     md_manager_hosts_stop(page);
+    /* The final task owns the page until the worker closes the live bridge,
+     * even when the window is destroyed before that task returns. */
     gtk_window_destroy(window);
+    g_assert_nonnull(page);
+    WAIT_UNTIL(page == NULL);
     md_nostr_shutdown();
     return 0;
 }

@@ -23,6 +23,9 @@ bool md_store_controller_watch(MdStoreController *, const char *coordinate);
 /* Replace the affected persistent REQ to repair a failed local admission. */
 bool md_store_controller_replay(MdStoreController *, const char *coordinate);
 MdStoreSync md_store_controller_sync(MdStoreController *, const char *coordinate);
+/* Review requires EOSE on the connected fetch routes, with at least one
+ * connected route. This is not permission to stage or publish a write. */
+bool md_store_controller_review_ready(MdStoreController *, const char *coordinate);
 /* Wait for an already-issued scoped REQ; deadline is a failure watchdog, not
  * a completion criterion. Does not close or restart any subscription. */
 MdStoreSync md_store_controller_wait(MdStoreController *, const char *coordinate, uint64_t deadline_ns);

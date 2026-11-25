@@ -15,8 +15,9 @@ struct MdManagerLaunch {
 static gboolean read_status(int fd, GIOCondition condition, gpointer data) {
     MdManagerLaunch *launch = data;
     MdLaunchMessage msg;
-    int rc;
-    while ((rc = md_managed_launch_message_read(fd, &msg, true)) == 1) {
+    int rc = 1;
+    /* Yield to GTK even if the child keeps its status socket readable. */
+    for (unsigned i = 0; i < 32 && (rc = md_managed_launch_message_read(fd, &msg, true)) == 1; ++i) {
         if (msg == MD_LAUNCH_ENDED && launch->active) {
             launch->active = FALSE;
             launch->status(msg, launch->data);
@@ -28,7 +29,7 @@ static gboolean read_status(int fd, GIOCondition condition, gpointer data) {
         launch->active = msg == MD_LAUNCH_CONNECTED;
         launch->status(msg, launch->data);
     }
-    if (rc < 0 && errno == EAGAIN && !(condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)))
+    if (rc == 1 || (rc < 0 && errno == EAGAIN && !(condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))))
         return G_SOURCE_CONTINUE;
     launch->source = 0;
     close(launch->fd);

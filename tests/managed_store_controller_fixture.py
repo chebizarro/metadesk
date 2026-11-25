@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Drive scoped REQs and both ACK outcomes against real websocket transport."""
+import json
 import subprocess
 import sys
 import tempfile
@@ -31,11 +32,15 @@ with tempfile.TemporaryDirectory(prefix="md-store-controller-") as directory, Re
     relay.RequestHandlerClass = StorePeer
     relay.frames = []
     relay.rejected = None
+    future = json.loads(subprocess.check_output([sys.argv[1], "future-event"], timeout=10))
+    relay.events[future["id"]] = future
     thread = threading.Thread(target=relay.serve_forever)
     thread.start()
     try:
-        subprocess.run([sys.argv[1], directory, f"ws://127.0.0.1:{relay.server_address[1]}"],
-                       check=True, timeout=25)
+        result = subprocess.run([sys.argv[1], directory, f"ws://127.0.0.1:{relay.server_address[1]}"],
+                                capture_output=True, text=True, timeout=25)
+        assert result.returncode == 0, result.stderr
+        assert "future timestamp" in result.stderr, result.stderr
     finally:
         relay.shutdown()
         thread.join()

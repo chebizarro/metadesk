@@ -15,9 +15,9 @@
 enum { HOSTS, META, FAVORITES, NDOCS };
 static const char *const coordinates[NDOCS] = {MD_STORE_HOSTS, MD_STORE_MANAGEMENT, MD_STORE_FAVORITES};
 
-typedef struct { char revision[65]; json_t *winner, *draft; MdStoreResult status; MdStoreSync sync; } Doc;
+typedef struct { char revision[65]; json_t *winner, *draft; MdStoreResult status; MdStoreSync sync; gboolean review_ready; } Doc;
 typedef struct { Doc doc[NDOCS]; json_t *recents; GHashTable *tags; gboolean store; } View;
-typedef enum { CONFIGURE, START_SYNC, READ, RESOLVE, EDIT, RETRY, RECORD, IMPORT, EXPORT, SCAN } Action;
+typedef enum { CONFIGURE, START_SYNC, READ, RESOLVE, EDIT, RETRY, RECORD, IMPORT, EXPORT, SCAN, CLOSE } Action;
 typedef struct { char *d, *plain, rev[65]; MdStoreEdit mode; json_t *members; gboolean remove; } Edit;
 typedef struct {
     Action action;
@@ -47,7 +47,7 @@ typedef struct {
     GtkApplication *application;
     GWeakRef weak_page;
     gint closed, read_queued;
-    gboolean busy, refresh_pending, configure_pending, start_pending;
+    gboolean busy, refresh_pending, configure_pending, start_pending, close_queued;
     guint generation;
     char *directory, *key, **relays;
     View *view;
@@ -111,7 +111,7 @@ static void free_page(gpointer data) {
     Hosts *p = data;
     g_atomic_int_set(&p->closed, TRUE);
     md_manager_launch_free(p->launch);
-    clear_worker(p);
+    g_assert(p->store == NULL && p->account.accounts == NULL && p->account.store == NULL);
     free_view(p->view);
     g_weak_ref_clear(&p->weak_page);
     g_clear_object(&p->application);
@@ -141,6 +141,7 @@ static void read_doc(Hosts *p, Doc *d, const char *coord) {
     d->winner = parse(winner);
     d->draft = parse(draft);
     d->sync = md_store_controller_sync(p->store, coord);
+    d->review_ready = md_store_controller_review_ready(p->store, coord);
 }
 static View *snapshot(Hosts *p) {
     View *v = g_new0(View, 1);
@@ -278,9 +279,11 @@ static void work(GTask *task, gpointer source, gpointer data, GCancellable *canc
     }
     case READ:
         break;
+    case CLOSE:
+        clear_worker(p);
+        break;
     }
     if (!g_atomic_int_get(&p->closed)) j->view = snapshot(p);
-    else clear_worker(p);
     g_task_return_boolean(task, TRUE);
 }
 
@@ -322,16 +325,16 @@ static void completed(GObject *source, GAsyncResult *result, gpointer unused) {
             if (j->address) { gtk_editable_set_text(GTK_EDITABLE(p->address), j->address); gtk_widget_grab_focus(GTK_WIDGET(p->address)); }
             else gtk_label_set_text(p->error, j->error ? j->error->message : "No nprofile QR code found");
         }
-    } else if (g_atomic_int_get(&p->closed)) clear_worker(p);
+    }
     kick(p);
     if (p->application) g_application_release(G_APPLICATION(p->application));
 }
 
 static void start(Hosts *p, Job *j) {
-    if (p->busy || g_atomic_int_get(&p->closed)) { free_job(j); return; }
+    if (p->busy || (g_atomic_int_get(&p->closed) && j->action != CLOSE)) { free_job(j); return; }
     j->generation = p->generation;
     p->busy = TRUE;
-    gtk_widget_set_sensitive(GTK_WIDGET(p->review), FALSE);
+    if (j->action != CLOSE) gtk_widget_set_sensitive(GTK_WIDGET(p->review), FALSE);
     if (p->application) g_application_hold(G_APPLICATION(p->application));
     g_autoptr(GTask) task = g_task_new(p->page, NULL, completed, NULL);
     g_task_set_task_data(task, j, free_job);
@@ -339,7 +342,16 @@ static void start(Hosts *p, Job *j) {
 }
 
 static void kick(Hosts *p) {
-    if (p->busy || g_atomic_int_get(&p->closed)) return;
+    if (p->busy) return;
+    if (g_atomic_int_get(&p->closed)) {
+        if (!p->close_queued) {
+            p->close_queued = TRUE;
+            Job *j = g_new0(Job, 1);
+            j->action = CLOSE;
+            start(p, j);
+        }
+        return;
+    }
     if (p->configure_pending) {
         p->configure_pending = p->start_pending = p->refresh_pending = FALSE;
         Job *j = g_new0(Job, 1);
@@ -401,7 +413,7 @@ static gboolean readable(const Doc *d) {
 static gboolean can_review(Hosts *p) {
     return p->key && p->relays && *p->relays && p->view && p->view->store &&
         readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]) &&
-        p->view->doc[HOSTS].sync == MD_SYNC_READY && p->view->doc[META].sync == MD_SYNC_READY;
+        p->view->doc[HOSTS].review_ready && p->view->doc[META].review_ready;
 }
 static gboolean writable(Hosts *p, size_t i) {
     return p->view && p->view->store && p->view->doc[i].sync == MD_SYNC_READY && p->view->doc[i].status == MD_STORE_OK;
@@ -546,7 +558,11 @@ static void start_launch(Hosts *p, Review *r) {
     }
     g_autoptr(GError) error = NULL;
     md_manager_launch_free(p->launch);
-    p->launch = md_manager_launch_start("metadesk-client", c, launch_progress, p, &error);
+    g_autofree char *self = g_file_read_link("/proc/self/exe", NULL);
+    g_autofree char *directory = self ? g_path_get_dirname(self) : NULL;
+    g_autofree char *sibling = directory ? g_build_filename(directory, "metadesk-client", NULL) : NULL;
+    const char *client = sibling && g_file_test(sibling, G_FILE_TEST_IS_EXECUTABLE) ? sibling : "metadesk-client";
+    p->launch = md_manager_launch_start(client, c, launch_progress, p, &error);
     g_free(c);
     if (!p->launch) { gtk_label_set_text(p->error, error ? error->message : "Could not start the video client"); return; }
     memcpy(p->launched, r->key, sizeof(p->launched));
@@ -706,9 +722,22 @@ static void resolve(Hosts *p, const char *address, const char *route) {
     j->route = g_steal_pointer(&hint);
     start(p, j);
 }
+static gboolean reject_secret(Hosts *p, GtkEditable *entry) {
+    const char *s = gtk_editable_get_text(entry);
+    while (g_ascii_isspace(*s)) ++s;
+    if (!g_ascii_strncasecmp(s, "nostr:", 6)) s += 6;
+    if (g_ascii_strncasecmp(s, "nsec1", 5) && g_ascii_strncasecmp(s, "ncryptsec1", 10)) return FALSE;
+    gtk_editable_set_text(entry, "");
+    gtk_label_set_text(p->error, "Private keys are not host addresses. Use a public host identity.");
+    return TRUE;
+}
+static void address_changed(GtkEditable *entry, gpointer data) {
+    reject_secret(data, entry);
+}
 static void review_entry(GtkWidget *widget, gpointer data) {
     (void)widget;
     Hosts *p = data;
+    if (reject_secret(p, GTK_EDITABLE(p->address)) || reject_secret(p, GTK_EDITABLE(p->route))) return;
     resolve(p, gtk_editable_get_text(GTK_EDITABLE(p->address)), gtk_editable_get_text(GTK_EDITABLE(p->route)));
 }
 static void review_saved(GtkWidget *button, gpointer data) {
@@ -1282,6 +1311,20 @@ static void present_import(Hosts *p, const char *text) {
         gtk_box_append(GTK_BOX(rows), check);
         if (name && *name) gtk_box_append(GTK_BOX(rows), label(name));
         if (alias && *alias) gtk_box_append(GTK_BOX(rows), label(alias));
+        g_autofree char *npub = md_manager_npub(key);
+        GtkWidget *identity = label(npub ? npub : key);
+        gtk_label_set_selectable(GTK_LABEL(identity), TRUE);
+        gtk_box_append(GTK_BOX(rows), identity);
+        g_autoptr(GString) access = g_string_new("Requested access: ");
+        json_t *caps = json_object_get(candidate, "requested_caps");
+        size_t index;
+        json_t *cap;
+        json_array_foreach(caps, index, cap) {
+            if (index) g_string_append(access, ", ");
+            g_string_append(access, json_string_value(cap));
+        }
+        if (!json_array_size(caps)) g_string_append(access, "video only");
+        gtk_box_append(GTK_BOX(rows), label(access->str));
         g_object_set_data_full(G_OBJECT(check), "candidate", json_incref(candidate), release_json);
         g_ptr_array_add(r->checks, check);
     }
@@ -1364,6 +1407,8 @@ GtkWidget *md_manager_hosts_page_new(void) {
     p->scan_button = GTK_BUTTON(button("Scan QR _Image…", G_CALLBACK(scan_clicked), p));
     gtk_box_append(p->content, GTK_WIDGET(p->scan_button));
     p->error = GTK_LABEL(label(""));
+    g_signal_connect(p->address, "changed", G_CALLBACK(address_changed), p);
+    g_signal_connect(p->route, "changed", G_CALLBACK(address_changed), p);
     gtk_widget_add_css_class(GTK_WIDGET(p->error), "error");
     gtk_box_append(p->content, GTK_WIDGET(p->error));
     p->progress = GTK_LABEL(label(""));
@@ -1422,5 +1467,5 @@ void md_manager_hosts_stop(GtkWidget *page) {
     Hosts *p = g_object_get_data(G_OBJECT(page), HOSTS_DATA);
     g_atomic_int_set(&p->closed, TRUE);
     g_clear_pointer(&p->launch, md_manager_launch_free);
-    if (!p->busy) clear_worker(p);
+    kick(p);
 }

@@ -1,6 +1,8 @@
 #include "managed_store_controller.h"
 #include "nostr.h"
 #include "md_time.h"
+#include "log.h"
+#define MD_LOG_TAG "managed-store"
 #include <jansson.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -49,14 +51,19 @@ static Document *find(MdStoreController *c, const char *coordinate) {
     return NULL;
 }
 
-static MdStoreSync sync_locked(MdStoreController *c, Document *p) {
+static MdStoreSync sync_locked(MdStoreController *c, Document *p, bool connected_only) {
     if (!p || !c->nfetch || !md_account_binding_is_current(c->client)) return MD_SYNC_OFFLINE;
     if (p->dropped) return MD_SYNC_REPLAY_NEEDED;
     if (!p->subscription) return MD_SYNC_OFFLINE;
     MdStoreSync state = MD_SYNC_READY;
+    bool connected = false;
     for (size_t i = 0; i < c->nfetch; ++i) {
         uint64_t generation = md_nostr_document_generation(c->bridge, c->fetch[i]);
-        if (!generation) { state = MD_SYNC_OFFLINE; continue; }
+        if (!generation) {
+            if (!connected_only) state = MD_SYNC_OFFLINE;
+            continue;
+        }
+        connected = true;
         if (generation != p->eose[i]) {
             if (state == MD_SYNC_READY) state = MD_SYNC_CATCHUP;
             continue;
@@ -70,22 +77,26 @@ static MdStoreSync sync_locked(MdStoreController *c, Document *p) {
         case MD_DOCUMENT_RECOVERING: if (state == MD_SYNC_READY) state = MD_SYNC_CATCHUP; break;
         }
     }
-    return state;
+    return connected ? state : MD_SYNC_OFFLINE;
 }
 
 static void receive_event(const char *relay, const char *event, void *data) {
-    (void)relay;
     Document *p = data;
     MdStoreController *c = p->owner;
     pthread_mutex_lock(&c->mu);
     MdStoreResult r = event ? md_managed_store_receive(c->store, p->coordinate, event, time(NULL)) : MD_STORE_IO;
     /* A relay's reconnect cursor advanced before local admission. Do not
      * let a later EOSE unlock edits when the missing event may be skipped. */
-    if (r != MD_STORE_OK && r != MD_STORE_UNCHANGED && r != MD_STORE_CONFLICT && r != MD_STORE_REVOKED) {
+    if (r == MD_STORE_IO || r == MD_STORE_SIGNER) {
         p->dropped = true;
         pthread_cond_broadcast(&c->cv);
     }
     pthread_mutex_unlock(&c->mu);
+    if (r == MD_STORE_INVALID || r == MD_STORE_LIMIT || r == MD_STORE_CLOCK) {
+        MD_LOG_W("ignored management event from %s (%s)", relay,
+            r == MD_STORE_CLOCK ? "future timestamp" : r == MD_STORE_LIMIT ? "size limit" : "invalid event");
+        return;
+    }
     if (r != MD_STORE_UNCHANGED) notify(c);
 }
 
@@ -253,9 +264,17 @@ bool md_store_controller_start(MdStoreController *c, const MdRelayPlan *bootstra
 MdStoreSync md_store_controller_sync(MdStoreController *c, const char *d) {
     if (!c || !d) return MD_SYNC_OFFLINE;
     pthread_mutex_lock(&c->mu);
-    MdStoreSync sync = sync_locked(c, find(c, d));
+    MdStoreSync sync = sync_locked(c, find(c, d), false);
     pthread_mutex_unlock(&c->mu);
     return sync;
+}
+
+bool md_store_controller_review_ready(MdStoreController *c, const char *d) {
+    if (!c || !d) return false;
+    pthread_mutex_lock(&c->mu);
+    bool ready = sync_locked(c, find(c, d), true) == MD_SYNC_READY;
+    pthread_mutex_unlock(&c->mu);
+    return ready;
 }
 
 MdStoreSync md_store_controller_wait(MdStoreController *c, const char *d, uint64_t deadline) {
@@ -263,7 +282,7 @@ MdStoreSync md_store_controller_wait(MdStoreController *c, const char *d, uint64
     pthread_mutex_lock(&c->mu);
     Document *p = find(c, d);
     MdStoreSync state;
-    while ((state = sync_locked(c, p)) == MD_SYNC_CATCHUP || state == MD_SYNC_AUTH_PENDING)
+    while ((state = sync_locked(c, p, false)) == MD_SYNC_CATCHUP || state == MD_SYNC_AUTH_PENDING)
         if (md_cond_timedwait_until(&c->cv, &c->mu, deadline) != 0) break;
     pthread_mutex_unlock(&c->mu);
     return state;
@@ -280,7 +299,7 @@ MdStoreResult md_store_controller_read(MdStoreController *c, const char *d,
 
 static MdStoreResult refresh_barrier(MdStoreController *c, Document *p) {
     if (!p) return MD_STORE_INVALID;
-    bool ready = sync_locked(c, p) == MD_SYNC_READY;
+    bool ready = sync_locked(c, p, false) == MD_SYNC_READY;
     MdStoreResult r = md_managed_store_backfill(c->store, p->coordinate, ready);
     return r != MD_STORE_OK ? r : ready ? MD_STORE_OK : MD_STORE_NOT_READY;
 }

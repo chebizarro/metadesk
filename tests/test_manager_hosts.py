@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,8 @@ with tempfile.TemporaryDirectory(prefix="md-hosts-") as tmp:
                                    "roles": {"client": {"backend": "nip5f", "pubkey": CLIENT_PK}, "host": None}}))
     metadata.chmod(0o600)
     path = root / "signer.sock"
-    with PrivateUnixServer(str(path), Signer) as signer, Relay() as relay:
+    with PrivateUnixServer(str(path), Signer) as signer, Relay() as relay, socket.socket() as unreachable:
+        unreachable.bind(("127.0.0.1", 0))
         signer.crypto, signer.role = crypto, "client"
         servers = (signer, relay)
         threads = [threading.Thread(target=server.serve_forever) for server in servers]
@@ -33,7 +35,8 @@ with tempfile.TemporaryDirectory(prefix="md-hosts-") as tmp:
         try:
             env = dict(os.environ, XDG_CONFIG_HOME=str(config.parent), XDG_STATE_HOME=str(state),
                        NOSTR_SIGNER_SOCK=str(path), MD_FIXTURE_CLIENT=CLIENT_PK,
-                       MD_FIXTURE_RELAY=f"ws://127.0.0.1:{relay.server_address[1]}")
+                       MD_FIXTURE_RELAY=f"ws://127.0.0.1:{relay.server_address[1]}",
+                       MD_FIXTURE_UNREACHABLE=f"ws://127.0.0.1:{unreachable.getsockname()[1]}")
             subprocess.run([binary], env=env, check=True, timeout=30)
         finally:
             for server in servers:
