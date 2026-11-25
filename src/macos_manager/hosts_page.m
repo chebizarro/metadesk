@@ -148,12 +148,16 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
 static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context closing]; }
 
 @implementation MDHostsPage
+- (instancetype)initWithWorker:(MDHostsWorker *)worker {
+    if ((self=[super initWithNibName:nil bundle:nil])) _worker=worker;
+    return self;
+}
 - (BOOL)closing { return atomic_load(&_closing); }
 - (void)loadView {
     atomic_init(&_closing, false); atomic_init(&_dirty, false); atomic_init(&_wakeQueued, false);
     _queue = dispatch_queue_create("metadesk.macos-manager.hosts", DISPATCH_QUEUE_SERIAL);
     __weak MDHostsPage *weakSelf = self;
-    _worker = [[MDHostsWorker alloc] initWithChange:^{ [weakSelf signalChanged]; }];
+    if (!_worker) _worker = [[MDHostsWorker alloc] initWithChange:^{ [weakSelf signalChanged]; }];
     _address = Field(@"Host npub, nprofile, public key or NIP-05 name", nil); _address.delegate = self;
     _route = Field(@"Optional IPv4 or IPv6 route for the host key", nil); _route.delegate = self;
     _relays = Field(@"Bootstrap relays (space-separated; ws:// is unencrypted)", nil);
@@ -455,7 +459,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }];
 }
 - (void)presentReview:(MDHostReview *)review {
-    if (!self.view.window || self.closing) return;
+    if (!self.view.window || self.view.window.attachedSheet || self.closing) return;
     BOOL mismatch = review.oldKey != nil;
     NSUInteger generation = _generation;
     NSString *nip = review.alias ? [NSString stringWithFormat:@"NIP-05: %@ (verified in this review)", MDHostBoundText(review.alias, 320)] : @"NIP-05: Not provided";
@@ -477,15 +481,15 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         if (canSave) [alert addButtonWithTitle:@"Save Host"];
     }
     [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
-        if (response == NSAlertFirstButtonReturn || self.closing || generation != self->_generation) return;
-        if (mismatch || response == NSAlertThirdButtonReturn) {
+        if (self.closing || generation != self->_generation) return;
+        if (mismatch ? response == NSAlertSecondButtonReturn && canSave : response == NSAlertThirdButtonReturn && canSave) {
             NSString *value = confirmation.stringValue;
             if (mismatch && ![self->_book canConfirmReview:review fingerprint:value]) {
                 self->_error.stringValue = @"The saved key was kept. Replacement requires the exact new fingerprint."; return;
             }
             [self run:^id(MDHostsWorker *worker) { return [worker saveReview:review confirmation:value]; }
                 done:^(NSString *message) { self->_error.stringValue = message.length ? message : mismatch ? @"Key replaced. Review it again to connect." : @"Host saved."; }];
-        } else if (response == NSAlertSecondButtonReturn) [self startLaunch:review];
+        } else if (!mismatch && response == NSAlertSecondButtonReturn) [self startLaunch:review];
     }];
 }
 - (void)startLaunch:(MDHostReview *)review {

@@ -28,6 +28,9 @@ static NSTextField *Entry(NSString *label, NSString *value) {
 }
 @interface MDIdentityPage () <NSTextFieldDelegate> {
     MDHostsPage *_hosts;
+    NSString *_directory;
+    MDIdentityConnect _connectSigner;
+    MdCredentialStore *(^_credentials)(void);
     dispatch_queue_t _queue;
     dispatch_group_t _drain;
     atomic_bool _cancelled;
@@ -43,8 +46,15 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
 
 @implementation MDIdentityPage
 - (instancetype)initWithHosts:(MDHostsPage *)hosts {
+    return [self initWithHosts:hosts directory:nil connect:NULL credentials:nil];
+}
+- (instancetype)initWithHosts:(MDHostsPage *)hosts directory:(NSString *)directory
+                      connect:(MDIdentityConnect)connect credentials:(MdCredentialStore *(^)(void))credentials {
     if ((self = [super initWithNibName:nil bundle:nil])) {
         _hosts = hosts; _queue = dispatch_queue_create("metadesk.manager.identity",DISPATCH_QUEUE_SERIAL);
+        _directory=[directory copy]; _connectSigner=connect;
+        if (credentials) _credentials=[credentials copy];
+        else _credentials=^{ return md_credential_store_default(); };
         _drain = dispatch_group_create(); atomic_init(&_cancelled,false);
     }
     return self;
@@ -120,7 +130,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         dispatch_async(self->_queue, ^{ @autoreleasepool {
             NSString *result=work ? work() : @"";
             NSString *readError=nil;
-            NSArray *accounts=MDIdentityAccounts(nil,&readError);
+            NSArray *accounts=MDIdentityAccounts(self->_directory,&readError);
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!self->_closed) {
                     self->_accounts=accounts; self->_busy=NO;
@@ -142,14 +152,14 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     NSString *notice=!a?@"Unassigning role…":[a[@"backend"] intValue]==MD_SIGNER_NIP46 ?
         @"Waiting for remote signer verification or approval. You can cancel the binding." : @"Verifying the selected signer…";
     [self run:notice suspend:role==MD_ACCOUNT_CLIENT cancellable:a!=nil work:^NSString *{
-        MdCredentialStore *store=md_credential_store_default();
-        NSString *error=MDIdentityBind(nil,store,role,a,expected,fips,NULL,NULL,Cancelled,(__bridge void *)self);
+        MdCredentialStore *store=self->_credentials();
+        NSString *error=MDIdentityBind(self->_directory,store,role,a,expected,fips,self->_connectSigner,NULL,Cancelled,(__bridge void *)self);
         md_credential_store_destroy(store);
         return error.length ? error : role==MD_ACCOUNT_HOST ? @"Host role saved. Restart the host to adopt it." : @"Client role saved. Reloading Hosts.";
     }];
 }
-- (void)bindClient:(id)sender { (void)sender; [self bind:MD_ACCOUNT_CLIENT account:self.selected]; }
-- (void)bindHost:(id)sender { (void)sender; [self bind:MD_ACCOUNT_HOST account:self.selected]; }
+- (void)bindClient:(id)sender { (void)sender; if (_client.enabled) [self bind:MD_ACCOUNT_CLIENT account:self.selected]; }
+- (void)bindHost:(id)sender { (void)sender; if (_host.enabled) [self bind:MD_ACCOUNT_HOST account:self.selected]; }
 - (void)unbindClient:(id)sender { (void)sender; [self bind:MD_ACCOUNT_CLIENT account:nil]; }
 - (void)unbindHost:(id)sender { (void)sender; [self bind:MD_ACCOUNT_HOST account:nil]; }
 - (void)cancel:(id)sender { (void)sender; atomic_store(&_cancelled,true); _status.stringValue=@"Cancelling verification. Waiting for the signer operation to drain…"; [self selection:nil]; }
@@ -182,7 +192,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         if (result!=NSAlertFirstButtonReturn || self->_closed) return;
         MdSignerType type = (MdSignerType)backend.selectedTag;
         [self run:@"Adding account…" suspend:NO cancellable:NO work:^NSString *{
-            NSString *error = MDIdentityAdd(nil,type,publicKey,publicLabel);
+            NSString *error = MDIdentityAdd(self->_directory,type,publicKey,publicLabel);
             return error.length ? error : @"Public account added. Select it to assign a role.";
         }];
     }];
@@ -203,7 +213,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         NSString *value=label.stringValue; label.stringValue=@"";
         if (result!=NSAlertFirstButtonReturn || self->_closed) return;
         [self run:@"Saving public label…" suspend:NO cancellable:NO work:^NSString *{
-            NSString *error = MDIdentityLabel(nil,account,value);
+            NSString *error = MDIdentityLabel(self->_directory,account,value);
             return error.length ? error : @"Public label saved.";
         }];
     }];
@@ -239,8 +249,8 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         if (result!=NSAlertFirstButtonReturn || self->_closed || self->_busy) return;
         if (!input) { self->_status.stringValue=@"Enter saved pairing JSON (up to 64 KiB)."; return; }
         [self run:@"Importing pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
-            MdCredentialStore *store=md_credential_store_default();
-            NSString *error=MDIdentityImportPairing(nil,store,account,input.bytes,input.length,Cancelled,(__bridge void *)self);
+            MdCredentialStore *store=self->_credentials();
+            NSString *error=MDIdentityImportPairing(self->_directory,store,account,input.bytes,input.length,Cancelled,(__bridge void *)self);
             md_credential_wipe(input.mutableBytes,input.length);
             md_credential_store_destroy(store);
             return error.length ? error : @"Pairing saved in Keychain. Verify the signer before assigning a role.";
@@ -267,8 +277,8 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     [a beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
         if (response!=NSAlertSecondButtonReturn || self->_closed) return;
         [self run:@"Removing the account…" suspend:YES cancellable:NO work:^NSString *{
-            MdCredentialStore *store=md_credential_store_default();
-            NSString *error=MDIdentityRemove(nil,store,account);
+            MdCredentialStore *store=self->_credentials();
+            NSString *error=MDIdentityRemove(self->_directory,store,account);
             md_credential_store_destroy(store);
             return error.length ? error : @"Account removed. Restart a running host if it used this role.";
         }];

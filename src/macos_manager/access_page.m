@@ -94,12 +94,14 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 @end
 
 @implementation MDLocalHostPages
-- (instancetype)init {
+- (instancetype)init { return [self initWithLinkFactory:nil]; }
+- (instancetype)initWithLinkFactory:(MDHostLink *(^)(MDHostUpdate))factory {
     if (!(self=[super init])) return nil;
     __weak MDLocalHostPages *weakSelf = self;
-    _link = [[MDHostLink alloc] initWithUpdate:^(NSString *status, NSDictionary *s, NSDictionary *p, NSDictionary *perms, BOOL busy) {
+    MDHostUpdate update = ^(NSString *status, NSDictionary *s, NSDictionary *p, NSDictionary *perms, BOOL busy) {
         [weakSelf received:status snapshot:s policy:p permissions:perms busy:busy];
-    }];
+    };
+    _link = factory ? factory(update) : [[MDHostLink alloc] initWithUpdate:update];
     _endpoint = [NSTextField textFieldWithString:@""];
     _endpoint.placeholderString = @"Absolute path to the host management socket";
     _endpoint.accessibilityLabel = @"Host management socket";
@@ -128,7 +130,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         Label(@"Remembered Clients"), _clients, _policyDetail, _refreshPolicy, Stack(@[_edit,_revoke,_kickRevoke], YES)]);
     _posted = [NSMutableSet set]; _noticeCooling=[NSMutableSet set]; _noticeAttempts=[NSMutableDictionary dictionary];
     [self render];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    if (!factory) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (!DistributionSigned()) return;
         UNUserNotificationCenter *center = UNUserNotificationCenter.currentNotificationCenter;
         [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *setting) {
@@ -351,11 +353,14 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     chooser.update();
     [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         self->_chooser = nil; [self tick:nil];
-        if (self->_closed || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1) return;
+        if (self->_closed || self->_busy || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1 ||
+            ![snapshot[@"revision"] isEqual:self->_snapshot[@"revision"]]) return;
         BOOL deny = response == NSAlertThirdButtonReturn+1, remember = response == NSAlertThirdButtonReturn;
-        if (remember && ![policy[@"policy_version"] isEqual:self->_policy[@"policy_version"]]) return;
-        NSDictionary *cmd = MDApprovalCommand(snapshot,r,deny ? @"deny" : @"approve",chooser.selected,remember,Now());
-        [self->_link command:cmd policyVersion:remember ? policy[@"policy_version"] : nil];
+        if (remember && (![self->_policy[@"policy_available"] boolValue] || ![policy[@"policy_version"] isEqual:self->_policy[@"policy_version"]])) return;
+        NSTimeInterval now = Now();
+        NSDictionary *current = MDRequestForToken(self->_snapshot,token,now);
+        NSDictionary *cmd = MDApprovalCommand(self->_snapshot,current,deny ? @"deny" : @"approve",chooser.selected,remember,now);
+        if (cmd) [self->_link command:cmd policyVersion:remember ? policy[@"policy_version"] : nil];
     }];
 }
 - (void)confirm:(NSString *)title text:(NSString *)text window:(NSWindow *)window action:(dispatch_block_t)action {

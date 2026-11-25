@@ -73,3 +73,11 @@ test('macOS management IPC over private Unix socket', macos_hosts_python,
   args : [files('test_local_manager.py'), '--ipc', macos_local_test], suite : 'macos_manager', timeout : 25)
 test('macOS signer roles and fixture credentials', macos_hosts_python,
   args : [files('test_local_manager.py'), '--accounts', macos_local_test], suite : 'macos_manager', timeout : 25)
+
+macos_page_test = executable('test_macos_manager_pages', ['test_pages.m', 'main.m'],
+  objc_args : ['-fobjc-arc', '-DMD_MACOS_MANAGER_APP_TEST'],
+  link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
+  dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_manager_relay_store],
+  include_directories : include_directories('../../tests'))
+test('macOS AppKit controller actions and quit', macos_hosts_python,
+  args : [files('test_local_manager.py'), '--pages', macos_page_test], suite : 'macos_manager', timeout : 25)

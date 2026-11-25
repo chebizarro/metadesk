@@ -16,9 +16,10 @@ NSDictionary *MDPolicyCommand(NSDictionary *snapshot, NSDictionary *policy, NSDi
                               uint32_t caps, BOOL remove, NSString *sessionID);
 NSDictionary *MDKickCommand(NSDictionary *snapshot, NSDictionary *session);
 
+typedef void (^MDHostUpdate)(NSString *status, NSDictionary *snapshot, NSDictionary *policy,
+                             NSDictionary *permissions, BOOL busy);
 @interface MDHostLink : NSObject
-- (instancetype)initWithUpdate:(void (^)(NSString *status, NSDictionary *snapshot, NSDictionary *policy,
-                                          NSDictionary *permissions, BOOL busy))update;
+- (instancetype)initWithUpdate:(MDHostUpdate)update;
 - (void)connect:(NSString *)path;
 - (void)command:(NSDictionary *)command;
 - (void)command:(NSDictionary *)command policyVersion:(NSNumber *)expected;

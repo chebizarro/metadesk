@@ -110,6 +110,9 @@ with tempfile.TemporaryDirectory(prefix='md-local-', dir='/private/tmp') as root
     env = dict(os.environ, HOME=str(directory), CFFIXED_USER_HOME=str(directory))
     if sys.argv[1] == '--accounts':
         subprocess.run([sys.argv[2], '--accounts'], env=env, check=True, timeout=20)
+    elif sys.argv[1] == '--pages':
+        env.update(XDG_CONFIG_HOME=str(directory), XDG_STATE_HOME=str(directory), XDG_CACHE_HOME=str(directory))
+        subprocess.run([sys.argv[2], str(directory / 'accounts')], env=env, check=True, timeout=20)
     else:
         path = directory / 'host.sock'
         with ThreadingHost(str(path), Handler) as host:

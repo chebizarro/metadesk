@@ -161,5 +161,8 @@ verify that scanning a secret-key fixture refuses it without a camera prompt.
 Add and relabel a public account with each supported signer backend. Import a
 matching NIP-46 fixture pairing, refuse a mismatched pairing, and verify that
 assigning a role still requires the signer to prove the account key.
-Startup smoke and headless fixture tests do not qualify these
-signed or interactive workflows.
+The `macos_manager` suite drives the AppKit controllers off-screen with
+fixture models: host trust and pin replacement, access defaults and stale
+requests, wrong-key signer refusal, and quit while a worker is active. It uses
+no synthetic input or permissions. It does not qualify the signed or on-screen
+workflows above.

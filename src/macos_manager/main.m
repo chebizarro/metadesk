@@ -1,4 +1,4 @@
-#import <AppKit/AppKit.h>
+#import "manager_app.h"
 #import "model.h"
 #import "access_page.h"
 #import "hosts_page.h"
@@ -10,9 +10,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     item.label = title; item.view = view; [tabs addTabViewItem:item];
 }
 
-@interface Manager : NSObject <NSApplicationDelegate, NSTabViewDelegate>
-@end
-@implementation Manager {
+@implementation MDManagerApp {
     NSWindow *_window;
     NSTextField *_address, *_relay, *_routes;
     MDHostsPage *_hostsPage;
@@ -23,6 +21,14 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     NSTimer *_terminationDeadline;
     BOOL _terminationPending, _terminationReplied;
 }
+- (instancetype)initWithHosts:(MDHostsPage *)hosts local:(MDLocalHostPages *)local identity:(MDIdentityPage *)identity {
+    if ((self=[super init])) {
+        _hostsPage=hosts; _local=local; _identity=identity;
+        _previewQueue=dispatch_queue_create("metadesk.manager.relay-preview",DISPATCH_QUEUE_SERIAL);
+    }
+    return self;
+}
+- (instancetype)init { return [self initWithHosts:nil local:nil identity:nil]; }
 - (NSView *)relays {
     _address = [NSTextField textFieldWithString:@""]; _address.placeholderString = @"Host npub, nprofile or hex public key";
     _relay = [NSTextField textFieldWithString:@""]; _relay.placeholderString = @"Explicit bootstrap URL (optional)";
@@ -50,9 +56,10 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
-    _previewQueue=dispatch_queue_create("metadesk.manager.relay-preview",DISPATCH_QUEUE_SERIAL);
     NSTabView *tabs=[NSTabView new];
-    _hostsPage=[MDHostsPage new]; _local=[MDLocalHostPages new]; _identity=[[MDIdentityPage alloc] initWithHosts:_hostsPage];
+    if (!_hostsPage) _hostsPage=[MDHostsPage new];
+    if (!_local) _local=[MDLocalHostPages new];
+    if (!_identity) _identity=[[MDIdentityPage alloc] initWithHosts:_hostsPage];
     AddTab(tabs,@"Hosts",_hostsPage.view);
     AddTab(tabs,@"This Computer",_local.computerView);
     AddTab(tabs,@"Access",_local.accessView);
@@ -81,7 +88,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         CFRunLoopPerformBlock(loop,kCFRunLoopCommonModes,^{ [NSApp terminate:nil]; });
         CFRunLoopWakeUp(loop);
     });
-    __weak Manager *weakSelf=self;
+    __weak MDManagerApp *weakSelf=self;
     dispatch_source_set_registration_handler(_terminate, ^{ [weakSelf showWindow]; });
     dispatch_activate(_terminate);
 }
@@ -98,11 +105,12 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     if (_terminationReplied) return;
     _terminationReplied=YES;
     [_terminationDeadline invalidate]; _terminationDeadline=nil;
-    [NSApp replyToApplicationShouldTerminate:YES];
+    [self replyToTermination];
 }
+- (void)replyToTermination { [NSApp replyToApplicationShouldTerminate:YES]; }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     (void)app;
-    if (!_previewQueue || _terminationReplied) return NSTerminateNow;
+    if (!_hostsPage || !_local || !_identity || _terminationReplied) return NSTerminateNow;
     if (!_terminationPending) {
         _terminationPending=YES;
         dispatch_group_t group=dispatch_group_create();
@@ -114,7 +122,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         /* A signer call may be unable to interrupt its transport. Cancellation
          * invalidates the pending role save, but do not hold logout indefinitely
          * for the call to return. This timer also runs in the termination loop. */
-        __weak Manager *weakSelf=self;
+        __weak MDManagerApp *weakSelf=self;
         _terminationDeadline=[NSTimer timerWithTimeInterval:5 repeats:NO block:^(NSTimer *timer) {
             (void)timer; [weakSelf finishTermination];
         }];
@@ -125,6 +133,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
 }
 @end
 
+#ifndef MD_MACOS_MANAGER_APP_TEST
 int main(void) {
     signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
     @autoreleasepool {
@@ -134,8 +143,9 @@ int main(void) {
         appItem.submenu=[[NSMenu alloc] initWithTitle:@"Metadesk Manager"];
         [appItem.submenu addItemWithTitle:@"Quit Metadesk Manager" action:@selector(terminate:) keyEquivalent:@"q"];
         app.mainMenu=menu;
-        __attribute__((objc_precise_lifetime)) Manager *delegate=[Manager new];
+        __attribute__((objc_precise_lifetime)) MDManagerApp *delegate=[MDManagerApp new];
         app.delegate=delegate; [app run];
     }
     return 0;
 }
+#endif

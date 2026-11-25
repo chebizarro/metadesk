@@ -1,7 +1,11 @@
 #import <AppKit/AppKit.h>
+#import "identity_model.h"
 @class MDHostsPage;
 @interface MDIdentityPage : NSViewController
 - (instancetype)initWithHosts:(MDHostsPage *)hosts;
+/* Factory returns an owned credential store for each worker operation. */
+- (instancetype)initWithHosts:(MDHostsPage *)hosts directory:(NSString *)directory
+                      connect:(MDIdentityConnect)connect credentials:(MdCredentialStore *(^)(void))credentials;
 - (void)activate;
 - (void)close:(dispatch_block_t)drained;
 @end
