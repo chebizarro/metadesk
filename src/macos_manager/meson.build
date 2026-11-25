@@ -9,7 +9,7 @@ macos_manager_model = static_library('macos-manager-model', 'model.m',
                   dep_cjson, dep_crypto, foundation])
 macos_hosts_compile = dep_metadesk.partial_dependency(compile_args : true, includes : true)
 macos_hosts_model = static_library('macos-hosts-model', ['hosts_model.m', 'hosts_launch.m', 'access_model.m', 'identity_model.m'],
-  objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, foundation, dep_crypto, dependency('jansson'), dep_manager_relay_store])
+  objc_args : ['-fobjc-arc'] + signer_c_args, dependencies : [macos_hosts_compile, foundation, dep_crypto, dependency('jansson'), dep_manager_relay_store])
 macos_host_qr = static_library('macos-host-qr', 'host_qr.m',
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, foundation, qr_frameworks])
 dep_macos_host_qr = declare_dependency(link_with : macos_host_qr, dependencies : qr_frameworks)

@@ -11,7 +11,22 @@ static NSStackView *Stack(NSArray *views,BOOL row) {
     s.orientation = row ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
     s.alignment = row ? NSLayoutAttributeCenterY : NSLayoutAttributeLeading; s.spacing = 8; return s;
 }
-@interface MDIdentityPage () {
+static const MdSignerType ExternalBackends[] = {MD_SIGNER_NIP5F, MD_SIGNER_NIP46, MD_SIGNER_NIP55L};
+static NSString *BackendTitle(MdSignerType backend) {
+    switch (backend) {
+        case MD_SIGNER_NIP5F: return @"Local socket signer (NIP-5F)";
+        case MD_SIGNER_NIP46: return @"Remote signer (NIP-46)";
+        case MD_SIGNER_NIP55L: return @"D-Bus signer (NIP-55L)";
+        default: return @"Unsupported signer";
+    }
+}
+static NSTextField *Entry(NSString *label, NSString *value) {
+    NSTextField *field = [NSTextField textFieldWithString:value ?: @""];
+    field.placeholderString = label; field.accessibilityLabel = label;
+    [field.widthAnchor constraintEqualToConstant:400].active = YES;
+    return field;
+}
+@interface MDIdentityPage () <NSTextFieldDelegate> {
     MDHostsPage *_hosts;
     dispatch_queue_t _queue;
     dispatch_group_t _drain;
@@ -19,7 +34,7 @@ static NSStackView *Stack(NSArray *views,BOOL row) {
     NSArray<NSDictionary *> *_accounts;
     NSPopUpButton *_list;
     NSTextField *_status, *_details, *_roles;
-    NSButton *_refresh, *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel;
+    NSButton *_refresh, *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel, *_add, *_label, *_pair;
     BOOL _closed, _busy, _cancellable;
 }
 - (BOOL)cancelled;
@@ -42,11 +57,15 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     _refresh=Button(@"Reload Accounts",self,@selector(refresh:));
     _client=Button(@"Use for Client",self,@selector(bindClient:)); _host=Button(@"Use for Host",self,@selector(bindHost:));
     _unbindClient=Button(@"Unassign Client",self,@selector(unbindClient:)); _unbindHost=Button(@"Unassign Host",self,@selector(unbindHost:));
+    _add=Button(@"Add Signer Account…",self,@selector(add:));
+    _label=Button(@"Edit Label…",self,@selector(editLabel:));
+    _pair=Button(@"Import Pairing…",self,@selector(importPairing:));
     _remove=Button(@"Remove Account…",self,@selector(remove:)); _cancel=Button(@"Cancel Verification",self,@selector(cancel:));
     _fips=[NSButton checkboxWithTitle:@"Host will use FIPS (verify the local node key)" target:nil action:NULL]; _fips.state=NSControlStateValueOn;
     NSStackView *content = Stack(@[],NO);
     for (NSView *v in @[_status,_roles,_list,_details,_refresh,_fips,Stack(@[_client,_host],YES),Stack(@[_unbindClient,_unbindHost],YES),
-        Stack(@[_remove,_cancel],YES), Label(@"Add public account metadata or saved NIP-46 pairing with the account CLI. Unlock or authorize the external signer there; Metadesk has no password. Restart an already-running host after changing its role.")]) {
+        Stack(@[_add,_label,_pair],YES), Stack(@[_remove,_cancel],YES),
+        Label(@"Create keys, unlock, and authorize operations in your external signer. Metadesk has no password. Restart an already-running host after changing its role.")]) {
         [content addArrangedSubview:v]; [v.widthAnchor constraintLessThanOrEqualToAnchor:content.widthAnchor].active=YES;
     }
     NSView *view=[NSView new]; [view addSubview:content]; content.translatesAutoresizingMaskIntoConstraints=NO;
@@ -79,7 +98,13 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     NSDictionary *a=self.selected;
     _details.stringValue=a?[NSString stringWithFormat:@"%@\nFingerprint: %@\n%@",MDHostNpub(a[@"key"]),MDHostFingerprint(a[@"key"]),a[@"transport"]]:@"";
     BOOL ready=!_closed && !_busy;
-    BOOL bindable=a && [a[@"backend"] intValue]!=MD_SIGNER_DIRECT_KEY;
+    MdSignerType backend = [a[@"backend"] intValue];
+    BOOL bindable=a && MDIdentitySupportsBackend(backend);
+    BOOL any=NO;
+    for (size_t i=0; i<sizeof(ExternalBackends)/sizeof(*ExternalBackends); ++i)
+        any |= MDIdentitySupportsBackend(ExternalBackends[i]);
+    _add.enabled=ready && any; _label.enabled=ready && a;
+    _pair.enabled=ready && bindable && backend==MD_SIGNER_NIP46;
     _refresh.enabled=ready; _client.enabled=_host.enabled=ready && bindable;
     _unbindClient.enabled=ready && [self accountInRole:MD_ACCOUNT_CLIENT]!=nil;
     _unbindHost.enabled=ready && [self accountInRole:MD_ACCOUNT_HOST]!=nil;
@@ -128,6 +153,111 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
 - (void)unbindClient:(id)sender { (void)sender; [self bind:MD_ACCOUNT_CLIENT account:nil]; }
 - (void)unbindHost:(id)sender { (void)sender; [self bind:MD_ACCOUNT_HOST account:nil]; }
 - (void)cancel:(id)sender { (void)sender; atomic_store(&_cancelled,true); _status.stringValue=@"Cancelling verification. Waiting for the signer operation to drain…"; [self selection:nil]; }
+- (NSWindow *)sheetWindow {
+    NSWindow *window = self.view.window;
+    return !_busy && !_closed && !window.attachedSheet ? window : nil;
+}
+- (void)add:(id)sender {
+    (void)sender;
+    NSWindow *window = [self sheetWindow];
+    if (!window || !_add.enabled) return;
+    NSPopUpButton *backend = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    for (size_t i=0; i<sizeof(ExternalBackends)/sizeof(*ExternalBackends); ++i) {
+        MdSignerType choice = ExternalBackends[i];
+        if (!MDIdentitySupportsBackend(choice)) continue;
+        [backend addItemWithTitle:BackendTitle(choice)]; backend.lastItem.tag = choice;
+    }
+    backend.accessibilityLabel = @"Signer backend";
+    NSTextField *key = Entry(@"Public key (npub or lowercase hex)", nil);
+    NSTextField *label = Entry(@"Public label (optional)", nil);
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"Add Signer Account";
+    alert.informativeText = @"Use the public key of an existing account. This does not contact the signer or create a key.";
+    NSStackView *form = Stack(@[backend,key,label],NO); form.frame = NSMakeRect(0,0,400,90); alert.accessoryView = form;
+    [alert addButtonWithTitle:@"Add Account"]; [alert addButtonWithTitle:@"Cancel"];
+    alert.window.initialFirstResponder = key;
+    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+        NSString *publicKey=key.stringValue, *publicLabel=label.stringValue;
+        key.stringValue=@""; label.stringValue=@"";
+        if (result!=NSAlertFirstButtonReturn || self->_closed) return;
+        MdSignerType type = (MdSignerType)backend.selectedTag;
+        [self run:@"Adding account…" suspend:NO cancellable:NO work:^NSString *{
+            NSString *error = MDIdentityAdd(nil,type,publicKey,publicLabel);
+            return error.length ? error : @"Public account added. Select it to assign a role.";
+        }];
+    }];
+}
+- (void)editLabel:(id)sender {
+    (void)sender;
+    NSDictionary *account=self.selected;
+    NSWindow *window = [self sheetWindow];
+    if (!window || !account) return;
+    NSTextField *label = Entry(@"Public account label", account[@"label"]);
+    label.frame = NSMakeRect(0,0,400,24);
+    NSAlert *alert = [NSAlert new]; alert.messageText = @"Edit Public Label";
+    alert.informativeText = MDHostNpub(account[@"key"]);
+    alert.accessoryView = label;
+    [alert addButtonWithTitle:@"Save Label"]; [alert addButtonWithTitle:@"Cancel"];
+    alert.window.initialFirstResponder = label;
+    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+        NSString *value=label.stringValue; label.stringValue=@"";
+        if (result!=NSAlertFirstButtonReturn || self->_closed) return;
+        [self run:@"Saving public label…" suspend:NO cancellable:NO work:^NSString *{
+            NSString *error = MDIdentityLabel(nil,account,value);
+            return error.length ? error : @"Public label saved.";
+        }];
+    }];
+}
+- (void)importPairing:(id)sender {
+    (void)sender;
+    NSDictionary *account=self.selected;
+    NSWindow *window = [self sheetWindow];
+    if (!window || !_pair.enabled || !account) return;
+    NSSecureTextField *entry = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0,0,400,24)];
+    entry.accessibilityLabel = @"Saved pairing JSON";
+    entry.delegate = self;
+    NSAlert *alert = [NSAlert new]; alert.messageText = @"Import Saved NIP-46 Pairing";
+    alert.informativeText = [NSString stringWithFormat:@"Enter the single-line pairing JSON from your trusted signer for this public key:\n%@\n\nThis replaces any saved pairing for this account in Keychain. It does not bind a role or import a signing key. Do not use the clipboard.", MDHostNpub(account[@"key"])];
+    alert.accessoryView = entry;
+    [alert addButtonWithTitle:@"Import into Keychain"]; [alert addButtonWithTitle:@"Cancel"];
+    alert.window.initialFirstResponder = entry;
+    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+        NSMutableData *input = nil;
+        if (result==NSAlertFirstButtonReturn && !self->_closed && !self->_busy) {
+            NSString *value = entry.stringValue;
+            if (value.length && value.length <= MDIdentityPairingMax) {
+                NSUInteger bytes = [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+                if (bytes && bytes <= MDIdentityPairingMax) {
+                    input = [NSMutableData dataWithLength:bytes + 1];
+                    if (![value getCString:input.mutableBytes maxLength:input.length encoding:NSUTF8StringEncoding]) {
+                        md_credential_wipe(input.mutableBytes,input.length); input = nil;
+                    }
+                }
+            }
+        }
+        entry.stringValue = @"";
+        if (result!=NSAlertFirstButtonReturn || self->_closed || self->_busy) return;
+        if (!input) { self->_status.stringValue=@"Enter saved pairing JSON (up to 64 KiB)."; return; }
+        [self run:@"Importing pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
+            MdCredentialStore *store=md_credential_store_default();
+            NSString *error=MDIdentityImportPairing(nil,store,account,input.bytes,input.length,Cancelled,(__bridge void *)self);
+            md_credential_wipe(input.mutableBytes,input.length);
+            md_credential_store_destroy(store);
+            return error.length ? error : @"Pairing saved in Keychain. Verify the signer before assigning a role.";
+        }];
+    }];
+}
+- (void)controlTextDidBeginEditing:(NSNotification *)note {
+    if (![note.object isKindOfClass:NSSecureTextField.class]) return;
+    NSTextView *editor = (NSTextView *)[note.object currentEditor];
+    editor.allowsUndo = NO;
+}
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)view doCommandBySelector:(SEL)selector {
+    (void)view;
+    return [control isKindOfClass:NSSecureTextField.class] &&
+        (selector==@selector(copy:) || selector==@selector(cut:) || selector==@selector(paste:) ||
+         selector==@selector(pasteAsPlainText:) || selector==@selector(pasteAsRichText:));
+}
 - (void)remove:(id)sender {
     (void)sender; NSDictionary *account=self.selected;
     if (!account || _busy || _closed || !self.view.window || self.view.window.attachedSheet) return;

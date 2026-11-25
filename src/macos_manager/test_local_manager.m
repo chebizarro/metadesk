@@ -1,5 +1,6 @@
 #import "access_model.h"
 #import "identity_model.h"
+#import "hosts_model.h"
 #include "md_test.h"
 #include <time.h>
 
@@ -48,7 +49,53 @@ static int Removed;
 static int ReadPair(void *p,const char *key,char **payload) { (void)p; (void)key; *payload=NULL; return MD_CREDENTIAL_NOT_FOUND; }
 static int NoWrite(void *p,const char *key,const char *payload) { (void)p; (void)key; (void)payload; MD_CHECK(false); return MD_CREDENTIAL_FAILED; }
 static int RemoveOnly(void *unused,const char *key) { (void)unused; MD_CHECK(!strcmp(key,KEY)); ++Removed; return 0; }
+static int Metadata(void) {
+    NSString *directory = [@(getenv("HOME")) stringByAppendingPathComponent:@"meta-edits"];
+    CHECK(MDIdentityAdd(directory,MD_SIGNER_DIRECT_KEY,@KEY,@"Direct").length);
+    for (NSUInteger i=0; i<2; ++i) {
+        MdSignerType type = i ? MD_SIGNER_NIP46 : MD_SIGNER_NIP5F;
+        if (!MDIdentitySupportsBackend(type)) continue;
+        CHECK(MDIdentityAdd(directory,type,@"nsec1fixture-not-a-key",@"Bad key").length);
+        CHECK(MDIdentityAdd(directory,type,MDHostNpub(@KEY),@"ncryptsec1fixture-not-a-key").length);
+        CHECK(!MDIdentityAdd(directory,type,MDHostNpub(@KEY),@"Office").length);
+        CHECK(MDIdentityAdd(directory,type,@KEY,@"Duplicate").length);
+        NSDictionary *account = MDIdentityAccounts(directory,NULL).lastObject;
+        CHECK([account[@"key"] isEqual:@KEY] && [account[@"backend"] intValue] == (int)type);
+        CHECK(!MDIdentityLabel(directory,account,@"Office Mac").length);
+        account = MDIdentityAccounts(directory,NULL).lastObject;
+        CHECK([account[@"label"] isEqual:@"Office Mac"]);
+        CHECK(![account[@"host"] boolValue] && ![account[@"client"] boolValue]);
+        if (type != MD_SIGNER_NIP46) continue;
+
+        MdCredentialStore *store = md_credential_store_memory();
+        CHECK(store);
+        const char *secret = "0000000000000000000000000000000000000000000000000000000000000001";
+        char json[512];
+        size_t len = (size_t)snprintf(json,sizeof(json),"{\"version\":1,\"user_pubkey\":\"%s\",\"remote_pubkey\":\"%s\",\"client_secret\":\"%s\",\"relays\":[\"wss://fixture.invalid/\"]}",KEY,OTHER,secret)+1;
+        CHECK(len < sizeof(json));
+        const char malformed[] = "nsec1fixture-not-a-key";
+        CHECK(MDIdentityImportPairing(directory,store,account,malformed,sizeof(malformed),NULL,NULL).length);
+        CHECK(MDIdentityImportPairing(directory,store,account,json,len-1,NULL,NULL).length);
+        CHECK(MDIdentityImportPairing(directory,store,account,json,len,Cancel,NULL).length);
+        NSDictionary *wrong = @{@"key":@OTHER,@"backend":@(MD_SIGNER_NIP46)};
+        CHECK([MDIdentityImportPairing(directory,store,wrong,json,len,NULL,NULL) containsString:@"different public key"]);
+        MdNip46Credentials *restored = NULL;
+        CHECK(md_credential_store_get(store,KEY,&restored)==MD_CREDENTIAL_NOT_FOUND && !restored);
+        CHECK(MDIdentityImportPairing(directory,NULL,account,json,len,NULL,NULL).length);
+        CHECK(MDIdentityImportPairing(directory,store,account,json,len,NULL,NULL).length == 0);
+        md_credential_wipe(json,sizeof(json));
+        CHECK(!md_credential_store_get(store,KEY,&restored) && restored && !strcmp(restored->client_secret,secret));
+        md_nip46_credentials_free(restored);
+        NSString *metadata = [NSString stringWithContentsOfFile:[directory stringByAppendingPathComponent:@"management.json"] encoding:NSUTF8StringEncoding error:NULL];
+        CHECK(metadata.length && ![metadata containsString:@(secret)] && ![metadata containsString:@"client_secret"]);
+        CHECK(![MDIdentityAccounts(directory,NULL).lastObject[@"host"] boolValue]);
+        CHECK(![MDIdentityAccounts(directory,NULL).lastObject[@"client"] boolValue]);
+        md_credential_store_destroy(store);
+    }
+    return 0;
+}
 static int Accounts(void) {
+    if (Metadata()) return 1;
     MdAccounts *accounts=NULL;
     static const MdCredentialStoreOps storeOps={.get=ReadPair,.put=NoWrite,.remove=RemoveOnly};
     MdCredentialStore *store=md_credential_store_custom(&storeOps,NULL);
