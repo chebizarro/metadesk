@@ -1475,7 +1475,7 @@ if host_os == 'windows' or (enable_nip5f and (host_os == 'linux' or host_os == '
     args : store_fixture_args, timeout : 80)
 endif
 
-if host_os == 'linux'
+if host_os == 'linux' or host_os == 'windows'
   store_controller_test = executable('test_managed_store_controller', 'tests/test_managed_store_controller.c',
     dependencies : [dep_metadesk] + core_private_deps)
   test('address book scoped relay controller', accounts_python,
