@@ -1,6 +1,6 @@
 # macOS management companion prototype (`md-pep3`)
 
-This is the native AppKit counterpart to the [Linux manager](../manager.md), not a port of GTK. The host CLI and SDL overlay remain independent. The companion never starts a host, capture, input, or a client session. Closing it does not stop the host. See the [management UX plan](management-ux-2026-11-14.md) and [host lifecycle](../host-lifecycle.md).
+This is the native AppKit counterpart to the [Linux manager](../manager.md), not a port of GTK. The host CLI and SDL overlay remain independent. The current companion never starts a host, capture, input, or a client session. Closing it does not stop the host. See the [macOS Manager guide](../manager-macos.md) for what the prototype exposes today. See the [management UX plan](management-ux-2026-11-14.md) and [host lifecycle](../host-lifecycle.md).
 
 ## Build and layout
 
@@ -28,6 +28,14 @@ meson test -C build-mac-manager --suite macos_manager --print-errorlogs
 | Activity | Reports whether the host's session slot is occupied; not proof of a bound stream. | Session management, live subscription and local history. |
 
 AppKit owns the main thread. Explicit actions dispatch blocking account, signer, store and IPC work to a serial worker. Quit waits for queued reads to complete. Each cache read closes the owner lock and role binding before returning; no decrypted document is persisted by the frontend. The returned C plaintext buffer is wiped, but Foundation's decoded strings and the displayed keys live in process memory and are not explicitly zeroed. Reading the cache does not synchronize its documents with relays, but the configured signer may need its own network and user approval. There is no Metadesk password: unlock in the external signer, start a missing socket signer, or handle remote signer approval there. Live signer lock/transport state is not inferred from saved metadata. Local NIP-46 credential errors are reported separately from remote signer failures: an unsigned build without access to the saved item's Keychain ACL can fail before reaching the signer. The core lookup does not request Keychain UI. No new Keychain handling is introduced.
+
+## Private client channel (`md-qgxe`, transport only)
+
+The Darwin client now accepts `--managed-session-fd` as its only option in a managed launch. A future AppKit Hosts controller can use `md_managed_launch_spawn` on its worker with an absolute client executable path, then send the reviewed config and consume versioned progress and outcomes. Darwin uses a same-user Unix stream: a bounded big-endian configuration length followed by JSON, then single-byte versioned status/command messages. Linux keeps Unix `SOCK_SEQPACKET` and its existing wire format. Windows still has no managed launch channel.
+
+Darwin's spawn explicitly maps the child endpoint to descriptor 3, attaches standard streams to `/dev/null`, and uses close-on-exec by default for the remaining descriptors. The environment forwards only runtime locations; no signer secret or pairing goes through the channel, arguments or environment. The client validates local peer credentials and independently restores and checks the saved signer. Callers own the parent endpoint and must reap children, including failed launches. The worker must remain responsive to cancellation and distinguish an unfinished launch from an already connected session before tearing down the channel.
+
+There is no AppKit Connect action yet. The next Hosts slice must implement the shared controller, pin review and launch lifecycle together; neither the cache viewer nor the offline preview is sufficient authorization to launch. AppKit approvals/policy edits, session kick, role binding and host-agent controls also remain open. Do not use a standalone `launchctl bootstrap` of the packaged `BundleProgram` plist as a substitute for the signed registration flow in [host lifecycle](../host-lifecycle.md#macos-bundle).
 
 ## Permission onboarding
 

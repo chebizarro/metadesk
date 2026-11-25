@@ -1,5 +1,7 @@
 # Linux Manager
 
+On macOS, see the [native Manager preview](manager-macos.md).
+
 `metadesk-manager` is an optional GTK 4.14 / libadwaita 1.5 companion. For a
 remote connection it launches `metadesk-client` as a separate process; it does
 not embed SDL or start a local host, input device, or accessibility probe.
