@@ -128,7 +128,7 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     MDHostsBook *_book;
     MDHostsLaunch *_launch;
     atomic_bool _closing, _dirty, _wakeQueued;
-    BOOL _busy, _launched, _started;
+    BOOL _busy, _launched, _started, _roleEditing;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
     NSString *_lastOwner;
@@ -208,6 +208,21 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)activate {
     if (!_started) { _started = YES; [self refresh:nil]; }
 }
+- (void)suspendForRoleEdit:(dispatch_block_t)ready {
+    _roleEditing = YES; ++_generation; _book = nil; [self render];
+    if (_launch && _phase < MD_LAUNCH_CONNECTED) {
+        [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO; _control.hidden=YES;
+        _progress.stringValue=@"Unfinished connection cancelled before changing the client role.";
+    }
+    dispatch_async(_queue, ^{ @autoreleasepool {
+        [self->_worker close];
+        dispatch_async(dispatch_get_main_queue(), ready);
+    } });
+}
+- (void)resumeAfterRoleEdit {
+    _roleEditing=NO;
+    if (!self.closing && _started) [self refresh:nil];
+}
 - (void)close:(dispatch_block_t)drained {
     atomic_store(&_closing, true);
     MDHostsLaunch *launch = _launch;
@@ -232,7 +247,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         MDHostsBook *book = self.closing ? nil : [self->_worker snapshot];
         dispatch_async(dispatch_get_main_queue(), ^{
             atomic_store(&self->_wakeQueued, false);
-            if (self.closing) return;
+            if (self.closing || self->_roleEditing) return;
             if (book && !self->_busy) [self showBook:book];
             /* Operations take their own snapshot. If a wakeup raced with one,
              * refresh after it completes rather than dropping the notification. */
@@ -242,7 +257,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     } });
 }
 - (void)run:(id (^)(MDHostsWorker *))work done:(void (^)(id))done {
-    if (_busy || self.closing) return;
+    if (_busy || _roleEditing || self.closing) return;
     _busy = YES; [self render];
     dispatch_async(_queue, ^{ @autoreleasepool {
         id result = self.closing ? nil : work(self->_worker);
@@ -250,6 +265,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.closing) return;
             self->_busy = NO;
+            if (self->_roleEditing) return;
             if (book) [self showBook:book];
             if (done) done(result);
             if (atomic_load(&self->_dirty)) [self scheduleSnapshot];
@@ -273,7 +289,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)render {
     _status.stringValue = _book.status ?: @"Opening the address book…";
-    _refresh.enabled = !_busy && !self.closing;
+    _refresh.enabled = !_roleEditing && !_busy && !self.closing;
+    if (_roleEditing) _status.stringValue=@"Reloading the client role…";
     _review.enabled = !_busy && !_launched && _book.canReview;
     _import.enabled = !_busy && _book.canEdit;
     _export.enabled = !_busy && _book.canExport;

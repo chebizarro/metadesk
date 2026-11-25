@@ -1,15 +1,17 @@
 foundation = dependency('appleframeworks', modules : ['Foundation'])
 appkit = dependency('appleframeworks', modules : ['AppKit'])
+notifications = dependency('appleframeworks', modules : ['Security', 'UserNotifications'])
 macos_manager_model = static_library('macos-manager-model', 'model.m',
   link_with : libmetadesk,
   dependencies : [dep_metadesk.partial_dependency(compile_args : true, includes : true),
                   dep_cjson, dep_crypto, foundation])
 macos_hosts_compile = dep_metadesk.partial_dependency(compile_args : true, includes : true)
-macos_hosts_model = static_library('macos-hosts-model', ['hosts_model.m', 'hosts_launch.m'],
+macos_hosts_model = static_library('macos-hosts-model', ['hosts_model.m', 'hosts_launch.m', 'access_model.m', 'identity_model.m'],
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, foundation, dep_crypto, dependency('jansson')])
-macos_hosts_page = static_library('macos-hosts-page', 'hosts_page.m',
-  objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, appkit])
+macos_hosts_page = static_library('macos-hosts-page', ['hosts_page.m', 'access_page.m', 'identity_page.m'],
+  objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, appkit, notifications, dep_cjson])
 macos_manager_bin = executable('metadesk-macos-manager', 'main.m',
+  objc_args : '-fobjc-arc',
   link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
   dependencies : [dep_metadesk, appkit, dependency('jansson')],
   build_rpath : meson.project_build_root())
@@ -49,3 +51,12 @@ macos_hosts_launch_test = executable('test_macos_hosts_launch', 'test_hosts_laun
   include_directories : include_directories('../../tests'))
 test('macOS Hosts launch worker', macos_hosts_python,
   args : [files('test_hosts_live.py'), '--launch', macos_hosts_launch_test], suite : 'macos_manager', timeout : 20)
+
+macos_local_test = executable('test_macos_local_manager', 'test_local_manager.m',
+  objc_args : '-fobjc-arc', link_with : macos_hosts_model,
+  dependencies : [dep_metadesk, foundation] + core_private_deps, include_directories : include_directories('../../tests'))
+test('macOS local host decision model', macos_local_test, suite : 'macos_manager')
+test('macOS management IPC over private Unix socket', macos_hosts_python,
+  args : [files('test_local_manager.py'), '--ipc', macos_local_test], suite : 'macos_manager', timeout : 25)
+test('macOS signer roles and fixture credentials', macos_hosts_python,
+  args : [files('test_local_manager.py'), '--accounts', macos_local_test], suite : 'macos_manager', timeout : 25)

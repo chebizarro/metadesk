@@ -1,35 +1,6 @@
 #import "model.h"
-
-#include "accounts.h"
 #include "identity_resolver.h"
-#include "management_ipc.h"
 #include "relay_plan.h"
-#include <string.h>
-
-static NSDictionary *Object(id value) {
-    return [value isKindOfClass:NSDictionary.class] ? value : nil;
-}
-
-static BOOL IsBoolean(id value) {
-    return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID();
-}
-
-static BOOL VersionedReply(NSDictionary *snapshot) {
-    id version = snapshot[@"v"];
-    return [version isKindOfClass:NSNumber.class] && !IsBoolean(version) &&
-           [version isEqualToNumber:@1] && IsBoolean(snapshot[@"ok"]);
-}
-
-static BOOL ValidReply(NSDictionary *snapshot) {
-    return VersionedReply(snapshot) && [snapshot[@"ok"] boolValue];
-}
-
-MDPermission MDHostPermission(NSDictionary *snapshot, MDPermissionKind kind) {
-    if (!ValidReply(snapshot)) return MDPermissionUnknown;
-    id value = Object(snapshot[@"permissions"])[kind == MDScreenRecording ? @"screen_recording" : @"accessibility"];
-    if (!IsBoolean(value)) return MDPermissionUnknown;
-    return [value boolValue] ? MDPermissionGranted : MDPermissionMissing;
-}
 
 NSURL *MDPermissionSettingsURL(MDPermissionKind kind) {
     NSString *anchor = kind == MDScreenRecording ? @"Privacy_ScreenCapture" : @"Privacy_Accessibility";
@@ -37,73 +8,17 @@ NSURL *MDPermissionSettingsURL(MDPermissionKind kind) {
                                  stringByAppendingString:anchor]];
 }
 
-static NSDictionary *HostCall(NSString *socketPath, const char *method) {
-    cJSON *request = cJSON_CreateObject();
-    cJSON *reply = NULL;
-    if (cJSON_AddNumberToObject(request, "v", 1) &&
-        cJSON_AddStringToObject(request, "method", method))
-        reply = md_management_call(socketPath.fileSystemRepresentation, request);
-    cJSON_Delete(request);
-    char *wire = reply ? cJSON_PrintUnformatted(reply) : NULL;
-    cJSON_Delete(reply);
-    NSDictionary *snapshot = wire ? Object([NSJSONSerialization JSONObjectWithData:
-        [NSData dataWithBytes:wire length:strlen(wire)] options:0 error:nil]) : nil;
-    cJSON_free(wire);
-    return snapshot;
-}
-
-NSDictionary *MDHostRead(NSString *socketPath) {
-    if (![socketPath hasPrefix:@"/"]) return nil;
-    NSDictionary *snapshot = HostCall(socketPath, "host.permissions");
-    /* A v1 host predating the method returns invalid. Do not retry a failed
-     * or unauthenticated connection, or interpret the legacy reply as TCC state. */
-    if (VersionedReply(snapshot) && ![snapshot[@"ok"] boolValue] && [snapshot[@"error"] isEqual:@"invalid"])
-        snapshot = HostCall(socketPath, "management.snapshot");
-    return ValidReply(snapshot) ? snapshot : nil;
-}
-
-static NSString *Text(const char *text) {
-    return text ? [NSString stringWithUTF8String:text] : nil;
-}
-
-NSString *MDPublicIdentity(const char *hex) {
-    if (!hex || strlen(hex) != 64 || strspn(hex, "0123456789abcdef") != 64) return nil;
-    MdIdentity id = {0};
-    memcpy(id.pubkey, hex, sizeof(id.pubkey));
-    char *npub = md_identity_npub(&id);
-    NSString *value = Text(npub);
-    free(npub);
-    return value ? [NSString stringWithFormat:@"%@\n%.4s %.4s %.4s %.4s", value, hex, hex+4, hex+8, hex+12] : nil;
-}
-
-static NSString *Account(const MdAccount *account) {
-    if (!account) return @"Not assigned";
-    return [NSString stringWithFormat:@"%@ · %@\n%@", Text(account->label).length ? Text(account->label) : @"Unnamed account",
-            Text(md_accounts_backend_name(account->backend)), MDPublicIdentity(account->pubkey) ?: @"Invalid public key"];
-}
-
-NSString *MDAccountsSummary(void) {
-    MdAccounts *accounts = NULL;
-    int rc = md_accounts_open_snapshot(NULL, NULL, &accounts);
-    if (rc) return [NSString stringWithFormat:@"Accounts unavailable: %s", md_accounts_error_string(rc)];
-    NSMutableString *summary = [NSMutableString stringWithFormat:@"Client role\n%@\n\nHost role\n%@\n\nAccounts",
-        Account(md_accounts_role(accounts, MD_ACCOUNT_CLIENT)), Account(md_accounts_role(accounts, MD_ACCOUNT_HOST))];
-    for (size_t i = 0; i < md_accounts_count(accounts); i++)
-        [summary appendFormat:@"\n\n%@", Account(md_accounts_at(accounts, i))];
-    md_accounts_destroy(accounts);
-    return summary;
-}
-
 NSString *MDRoutePreview(NSString *address, NSString *relay) {
-    /* Deliberately offline: no NIP-05 fetch, hint DNS checks or relay dial. */
     if ([address containsString:@"@"]) return @"Live NIP-05 lookup is not part of this offline preview.";
+    if (address.length > 8192 || relay.length > MD_RELAY_URL_MAX) return @"Identity or relay URL is too long.";
     MdIdentity identity = {0};
     MdResolveResult resolved = md_identity_resolve(address.UTF8String, NULL, &identity);
     if (resolved != MD_RESOLVE_OK) return @"Enter a valid npub, nprofile or hex public key. An IP address is not an identity.";
-    NSString *key = MDPublicIdentity(identity.pubkey);
-    md_identity_clear(&identity);
+    char fp[MD_KEY_FINGERPRINT_SIZE];
+    char *npub=md_identity_npub(&identity);
+    NSString *key = npub && md_key_fingerprint(identity.pubkey,fp) ? [NSString stringWithFormat:@"%s\n%s",npub,fp] : nil;
+    free(npub); md_identity_clear(&identity);
     if (!key) return @"Public key unavailable.";
-
     MdRelayPlan bootstrap = {0}, plan = {0};
     NSString *route;
     if (relay.length && !md_relay_plan_add(&bootstrap, relay.UTF8String, MD_RELAY_CONFIGURED))
@@ -112,7 +27,6 @@ NSString *MDRoutePreview(NSString *address, NSString *relay) {
         route = @"No bootstrap relay selected. No default relay will be used.";
     else
         route = [NSString stringWithFormat:@"Bootstrap preview: %s\nNo relay contacted; this is not a delivery plan.", plan.target[0].url];
-    md_relay_plan_clear(&plan);
-    md_relay_plan_clear(&bootstrap);
+    md_relay_plan_clear(&plan); md_relay_plan_clear(&bootstrap);
     return [NSString stringWithFormat:@"%@\n\n%@", key, route];
 }
