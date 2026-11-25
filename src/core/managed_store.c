@@ -85,7 +85,7 @@ static void wipe_tree(json_t *j) {
         json_real_set(j,0.0);
     }
 }
-static void discard_plaintext(json_t *j) {
+void md_managed_store_discard_plaintext(json_t *j) {
     wipe_tree(j);
     json_decref(j);
 }
@@ -575,7 +575,7 @@ MdStoreResult md_managed_store_read(MdManagedStore *s, const char *d,
                 (draft_status != MD_STORE_READ_ONLY && draft_status != MD_STORE_INVALID)) {
                 r = draft_status; goto done;
             }
-            discard_plaintext(pending); pending = NULL;
+            md_managed_store_discard_plaintext(pending); pending = NULL;
         }
     }
     if (!current(s)) { r = MD_STORE_REVOKED; goto done; }
@@ -587,7 +587,7 @@ MdStoreResult md_managed_store_read(MdManagedStore *s, const char *d,
         r = MD_STORE_IO;
     } else if (revision) strcpy(revision,id(j.winner));
 done:
-    discard_plaintext(winner); discard_plaintext(pending); dispose(&j);
+    md_managed_store_discard_plaintext(winner); md_managed_store_discard_plaintext(pending); dispose(&j);
     return r;
 }
 
@@ -742,7 +742,7 @@ static MdStoreResult stage(MdManagedStore *s, const char *d, const char *base,
         md_account_binding_cancel(s->binding),s->owner,kind,d,encoded,at);
     r = save_draft(s,d,&j,unsigned_event,relays);
 done:
-    json_decref(relays); discard_plaintext(candidate); discard_plaintext(old); dispose(&j);
+    json_decref(relays); md_managed_store_discard_plaintext(candidate); md_managed_store_discard_plaintext(old); dispose(&j);
     wipe(encoded);
     nostr_event_free(unsigned_event);
     return current(s) ? r : MD_STORE_REVOKED;
@@ -962,7 +962,7 @@ static MdStoreResult exchange(const char *input, char **result, bool importing) 
     r = *result ? MD_STORE_OK : MD_STORE_IO;
     if (*result && strlen(*result) > MD_STORE_MAX_CONTENT) { wipe(*result); *result = NULL; r = MD_STORE_INVALID; }
 done:
-    json_decref(wrapper); json_decref(out); json_decref(seen); discard_plaintext(doc);
+    json_decref(wrapper); json_decref(out); json_decref(seen); md_managed_store_discard_plaintext(doc);
     return r;
 }
 MdStoreResult md_managed_store_import(const char *text, char **candidates) { return exchange(text,candidates,true); }

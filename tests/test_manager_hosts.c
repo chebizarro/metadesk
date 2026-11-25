@@ -79,6 +79,24 @@ static void keyboard(const char *keys, gboolean focus_window) {
     g_assert_true(g_spawn_check_wait_status(status, &err));
 }
 
+static void type_text(const char *text) {
+    g_autofree char *tool = g_find_program_in_path("xdotool");
+    g_assert_nonnull(tool);
+    char *argv[] = {tool, "type", "--clearmodifiers", "--", (char *)text, NULL};
+    int status;
+    g_assert_true(g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL, NULL, NULL, &status, NULL));
+    g_assert_true(g_spawn_check_wait_status(status, NULL));
+}
+
+static GtkWidget *find_edit(GtkWidget *root) {
+    if (GTK_IS_BUTTON(root) && !g_strcmp0(gtk_widget_get_tooltip_text(root), "Edit Saved Host")) return root;
+    for (GtkWidget *child = gtk_widget_get_first_child(root); child; child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *edit = find_edit(child);
+        if (edit) return edit;
+    }
+    return NULL;
+}
+
 int main(void) {
     g_assert_cmpstr(g_getenv("GTK_A11Y"), ==, "test");
     adw_init();
@@ -130,12 +148,13 @@ int main(void) {
     g_assert_nonnull(bootstrap[0]);
     md_manager_hosts_configure(page, directory, g_getenv("MD_FIXTURE_CLIENT"), bootstrap);
     WAIT_UNTIL(gtk_widget_get_sensitive(connect));
-    gtk_editable_set_text(GTK_EDITABLE(address), "127.0.0.1");
     g_assert_true(gtk_widget_grab_focus(address));
+    type_text("127.0.0.1");
     keyboard("Return", FALSE);
     WAIT_UNTIL(find(page, NULL, md_resolve_error(MD_RESOLVE_INVALID)) != NULL);
     g_assert_null(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)));
-    gtk_editable_set_text(GTK_EDITABLE(address), g_getenv("MD_FIXTURE_CLIENT"));
+    keyboard("ctrl+a", FALSE);
+    type_text(g_getenv("MD_FIXTURE_CLIENT"));
     keyboard("Return", FALSE);
     WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) != NULL);
     AdwAlertDialog *review = ADW_ALERT_DIALOG(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)));
@@ -154,6 +173,35 @@ int main(void) {
     g_assert_cmpint(gtk_widget_get_width(GTK_WIDGET(review)), <=, 360);
     keyboard("Escape", FALSE);
     WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) == NULL);
+    /* Restore the full write barrier and save a first-contact key by keyboard. */
+    const char *online[] = {bootstrap[0], NULL};
+    md_manager_hosts_configure(page, directory, g_getenv("MD_FIXTURE_CLIENT"), online);
+    WAIT_UNTIL(gtk_widget_get_sensitive(connect));
+    g_assert_true(gtk_widget_grab_focus(address));
+    keyboard("Return", FALSE);
+    WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) != NULL);
+    review = ADW_ALERT_DIALOG(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)));
+    g_assert_true(adw_alert_dialog_has_response(review, "save"));
+    WAIT_UNTIL(focus_inside(window, GTK_WIDGET(review)));
+    keyboard("alt+s", FALSE);
+    WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) == NULL &&
+               gtk_widget_get_sensitive(connect) && find(page, NULL, "c604 7f94 41ed 7d6d") != NULL);
+    GtkWidget *saved = find(page, NULL, "c604 7f94 41ed 7d6d");
+    GtkWidget *edit = find_edit(saved);
+    g_assert_nonnull(edit);
+    g_assert_true(gtk_widget_grab_focus(edit));
+    g_assert_true(gtk_widget_has_focus(edit));
+    keyboard("space", FALSE);
+    WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) != NULL);
+    AdwDialog *editor = adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window));
+    g_assert_cmpstr(adw_alert_dialog_get_heading(ADW_ALERT_DIALOG(editor)), ==, "Edit Saved Host");
+    WAIT_UNTIL(focus_inside(window, GTK_WIDGET(editor)));
+    g_assert_cmpint(gtk_widget_get_width(GTK_WIDGET(editor)), <=, 360);
+    type_text("Keyboard-edited host");
+    keyboard("alt+s", FALSE);
+    WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) == NULL &&
+               find(page, NULL, "Keyboard-edited host") != NULL);
+
     /* The same QR generator/scanner used by the page must round-trip. */
     NostrProfilePointer ptr = {.public_key = HOST};
     char *profile = NULL;
@@ -164,6 +212,13 @@ int main(void) {
     g_autofree char *decoded = md_manager_qr_scan(png, NULL);
     g_assert_cmpstr(decoded, ==, profile);
     free(profile);
+    md_manager_hosts_configure(page, directory, HOST, NULL);
+    GtkWidget *rotation = find(page, "client-key-rotation", NULL);
+    g_assert_nonnull(rotation);
+    g_assert_true(gtk_widget_get_visible(rotation));
+    GtkWidget *guidance = gtk_expander_get_child(GTK_EXPANDER(rotation));
+    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(guidance)), "The new client key does not inherit access"));
+    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(guidance)), "Cached Test Host"));
     g_object_add_weak_pointer(G_OBJECT(page), (gpointer *)&page);
     md_manager_hosts_stop(page);
     /* The final task owns the page until the worker closes the live bridge,

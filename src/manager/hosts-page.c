@@ -42,8 +42,11 @@ typedef struct {
     GtkSearchEntry *search;
     GtkListBox *saved, *quick;
     GtkButton *review, *launch_cancel, *export_button, *import_button, *scan_button;
-    GtkLabel *error, *progress;
+    GtkLabel *error, *progress, *relay_diagnostic;
     AdwBanner *banner;
+    GtkWidget *rotation;
+    GtkLabel *rotation_hosts;
+    char *previous_client, *previous_hosts;
     GtkApplication *application;
     GWeakRef weak_page;
     gint closed, read_queued;
@@ -75,13 +78,16 @@ static void wipe(char *s) {
     for (size_t i = strlen(s); i; --i) *p++ = 0;
     free(s);
 }
-static void clear_doc(Doc *d) { json_decref(d->winner); json_decref(d->draft); }
+static void clear_doc(Doc *d) {
+    md_managed_store_discard_plaintext(d->winner);
+    md_managed_store_discard_plaintext(d->draft);
+}
 static void free_doc(gpointer data) { clear_doc(data); g_free(data); }
 static void free_view(View *v) {
     if (!v) return;
     for (size_t i = 0; i < NDOCS; ++i) clear_doc(&v->doc[i]);
     g_clear_pointer(&v->tags, g_hash_table_unref);
-    json_decref(v->recents);
+    md_managed_store_discard_plaintext(v->recents);
     g_free(v);
 }
 static void free_edit(gpointer data) {
@@ -116,6 +122,7 @@ static void free_page(gpointer data) {
     g_weak_ref_clear(&p->weak_page);
     g_clear_object(&p->application);
     g_free(p->directory); g_free(p->key); g_strfreev(p->relays);
+    g_free(p->previous_client); g_free(p->previous_hosts);
     g_free(p);
 }
 static gboolean refresh_on_main(gpointer page) {
@@ -476,6 +483,15 @@ static const char *alias_pin(Hosts *p, const char *alias, gboolean *ambiguous) {
 
 static void launch_progress(MdLaunchMessage msg, gpointer data) {
     Hosts *p = data;
+    if (msg >= MD_LAUNCH_RELAY_AUTH) {
+        const char *detail = msg == MD_LAUNCH_RELAY_AUTH ? "A signaling relay requires authentication" :
+            msg == MD_LAUNCH_RELAY_CLOSED ? "A signaling relay closed the subscription" :
+            "A signaling relay rejected an event";
+        gtk_label_set_text(p->relay_diagnostic, detail);
+        return;
+    }
+    if (msg == MD_LAUNCH_RESOLVE || msg == MD_LAUNCH_CONNECTED || msg == MD_LAUNCH_CANCELLED || msg == MD_LAUNCH_ENDED)
+        gtk_label_set_text(p->relay_diagnostic, "");
     const char *message = msg == MD_LAUNCH_ENDED ? "Video session ended" : "Connection failed";
     static const char *const messages[] = {NULL, "Checking host identity…", "Connecting to signer…",
         "Connecting to relays…", "Checking FIPS route…", "Waiting for approval…", "Connecting…",
@@ -570,6 +586,17 @@ static void start_launch(Hosts *p, Review *r) {
     launch_progress(MD_LAUNCH_RESOLVE, p);
 }
 
+static gboolean prepare_membership_replacement(Job *j, const char *coord, const Doc *d,
+    const char *old_key, const char *new_key) {
+    if (!d || d->status != MD_STORE_OK || d->sync != MD_SYNC_READY) return FALSE;
+    if (member_index(d->winner, old_key) < 0) return TRUE;
+    json_t *list = json_deep_copy(d->winner);
+    gboolean good = list && member_set(list, old_key, FALSE) && member_set(list, new_key, TRUE);
+    if (good) append_document_edit(j, coord, d->revision, MD_EDIT_STAGE, list);
+    md_managed_store_discard_plaintext(list);
+    return good;
+}
+
 static void review_response(AdwAlertDialog *dialog, const char *response, gpointer data) {
     (void)dialog;
     Review *r = data;
@@ -591,13 +618,37 @@ static void review_response(AdwAlertDialog *dialog, const char *response, gpoint
     gboolean ok = record && (!r->alias || json_object_set_new(record, "nip05", json_string(r->alias)) == 0) &&
         (!json_array_size(r->hints) || json_object_set(record, "relay_hints", r->hints) == 0) &&
         member_set(hosts, r->key, TRUE);
-    if (ok && replace) ok = json_object_del(meta, r->old) == 0 && member_set(hosts, r->old, FALSE);
+    if (ok && replace) {
+        json_t *old = json_object_get(meta, r->old);
+        const char *fields[] = {"label", "notes"};
+        for (size_t i = 0; i < G_N_ELEMENTS(fields) && ok; ++i) {
+            const char *text = string_field(old, fields[i]);
+            if (text && !json_object_get(record, fields[i]))
+                ok = json_object_set_new(record, fields[i], json_string(text)) == 0;
+        }
+        ok = ok && json_object_del(meta, r->old) == 0 && member_set(hosts, r->old, FALSE);
+    }
     if (ok) {
         Job *j = g_new0(Job, 1);
         j->action = EDIT;
         append_edit(j, META, r->meta_revision, MD_EDIT_STAGE, doc);
         append_edit(j, HOSTS, r->host_revision, MD_EDIT_STAGE, hosts);
-        start(p, j);
+        if (replace) {
+            ok = prepare_membership_replacement(j, MD_STORE_FAVORITES, &p->view->doc[FAVORITES], r->old, r->key);
+            const char *uuid; json_t *tag;
+            json_object_foreach(tag_labels(p), uuid, tag) {
+                if (!ok) break;
+                if (json_is_true(json_object_get(tag, "deleted"))) continue;
+                Doc *d = p->view->tags ? g_hash_table_lookup(p->view->tags, uuid) : NULL;
+                g_autofree char *coord = g_strconcat(MD_STORE_TAG_PREFIX, uuid, NULL);
+                ok = prepare_membership_replacement(j, coord, d, r->old, r->key);
+            }
+        }
+        if (ok) start(p, j);
+        else {
+            free_job(j);
+            gtk_label_set_text(p->error, "Could not verify all favorites and tags. Sync the address book before replacing this key.");
+        }
     } else gtk_label_set_text(p->error, "Could not prepare the saved host change");
     json_decref(doc); json_decref(hosts);
 }
@@ -1397,6 +1448,13 @@ GtkWidget *md_manager_hosts_page_new(void) {
     adw_clamp_set_child(ADW_CLAMP(clamp), content);
     p->banner = ADW_BANNER(adw_banner_new(""));
     gtk_box_append(p->content, GTK_WIDGET(p->banner));
+    p->rotation = gtk_expander_new_with_mnemonic("Hosts to _Request Access From Again");
+    gtk_widget_set_name(p->rotation, "client-key-rotation");
+    p->rotation_hosts = GTK_LABEL(label(""));
+    gtk_label_set_selectable(p->rotation_hosts, TRUE);
+    gtk_expander_set_child(GTK_EXPANDER(p->rotation), GTK_WIDGET(p->rotation_hosts));
+    gtk_widget_set_visible(p->rotation, FALSE);
+    gtk_box_append(p->content, p->rotation);
     p->address = entry(p, "_Host identity", "npub, nprofile, or name@example.org", MD_MANAGED_ADDRESS_MAX);
     gtk_widget_set_name(GTK_WIDGET(p->address), "host-identity");
     p->route = entry(p, "_IP address (optional route)", "IPv4 or IPv6", 45);
@@ -1413,6 +1471,8 @@ GtkWidget *md_manager_hosts_page_new(void) {
     gtk_box_append(p->content, GTK_WIDGET(p->error));
     p->progress = GTK_LABEL(label(""));
     gtk_box_append(p->content, GTK_WIDGET(p->progress));
+    p->relay_diagnostic = GTK_LABEL(label(""));
+    gtk_box_append(p->content, GTK_WIDGET(p->relay_diagnostic));
     p->launch_cancel = GTK_BUTTON(button("_Cancel Connection", G_CALLBACK(connect_control), p));
     gtk_widget_set_visible(GTK_WIDGET(p->launch_cancel), FALSE);
     gtk_box_append(p->content, GTK_WIDGET(p->launch_cancel));
@@ -1433,6 +1493,30 @@ GtkWidget *md_manager_hosts_page_new(void) {
     return scroll;
 }
 
+static void show_rotation_guidance(Hosts *p, const char *next_key) {
+    if (p->key && p->view && p->view->store && readable(&p->view->doc[HOSTS])) {
+        GString *hosts = g_string_new("");
+        size_t i; json_t *record;
+        json_array_foreach(p->view->doc[HOSTS].winner, i, record) {
+            if (g_strcmp0(json_string_value(json_array_get(record, 0)), "p")) continue;
+            const char *key = json_string_value(json_array_get(record, 1));
+            g_autofree char *npub = md_manager_npub(key);
+            if (!npub) continue;
+            char fp[MD_KEY_FINGERPRINT_SIZE];
+            g_string_append_printf(hosts, "\n\n%s\n%s", title_for(p, key, fp), npub);
+        }
+        g_free(p->previous_client); p->previous_client = g_strdup(p->key);
+        g_free(p->previous_hosts); p->previous_hosts = g_string_free(hosts, FALSE);
+    }
+    gboolean show = next_key && p->previous_client && strcmp(next_key, p->previous_client) &&
+        p->previous_hosts && *p->previous_hosts;
+    g_autofree char *text = show ? g_strconcat(
+        "The new client key does not inherit access from the old key. Request access again from these saved hosts:",
+        p->previous_hosts, NULL) : NULL;
+    gtk_label_set_text(p->rotation_hosts, text ? text : "");
+    gtk_widget_set_visible(p->rotation, show);
+}
+
 void md_manager_hosts_configure(GtkWidget *page, const char *directory, const char *key,
     const char *const *relays) {
     Hosts *p = g_object_get_data(G_OBJECT(page), HOSTS_DATA);
@@ -1447,6 +1531,7 @@ void md_manager_hosts_configure(GtkWidget *page, const char *directory, const ch
         if (app) p->application = g_object_ref(app);
     }
     if (g_strcmp0(p->key, key)) {
+        show_rotation_guidance(p, key);
         md_manager_launch_free(p->launch);
         p->launch = NULL;
         p->record_pending = FALSE;
