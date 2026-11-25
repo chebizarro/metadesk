@@ -1,0 +1,22 @@
+.TH METADESK-MANAGER 1 "November 2026" "Metadesk 0.1.0" "User Commands"
+.SH NAME
+metadesk-manager \- graphical manager for Metadesk accounts, hosts and access
+.SH SYNOPSIS
+.B metadesk-manager
+.RB [ \-\-management-socket
+.IR PATH ]
+.SH DESCRIPTION
+Open the Metadesk Manager to configure local accounts, manage saved hosts and
+launch the video client. To manage access for a running local host, connect to
+its private management socket. The manager does not start a host daemon.
+.SH OPTIONS
+.TP
+.B \-\-help
+Print command-line options and exit.
+.TP
+.BI \-\-management-socket= PATH
+Connect to a running local host's private management socket at
+.IR PATH .
+.SH SEE ALSO
+.BR metadesk-host (1),
+.BR metadesk-client (1)
