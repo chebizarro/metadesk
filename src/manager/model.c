@@ -1,4 +1,5 @@
 #include "model.h"
+#include "identity_resolver.h"
 #include <nostr/nip19/nip19.h>
 #include <glib/gstdio.h>
 #include <stdlib.h>
@@ -46,9 +47,7 @@ char *md_manager_npub(const char *hex) {
 }
 
 gboolean md_manager_fingerprint(const char *hex, char out[20]) {
-    if (!valid_hex(hex)) { out[0] = 0; return FALSE; }
-    g_snprintf(out, 20, "%.8s…%.8s", hex, hex + 56);
-    return TRUE;
+    return md_key_fingerprint(hex, out);
 }
 
 static void account_free(gpointer data) {

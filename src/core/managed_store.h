@@ -91,6 +91,11 @@ char *md_managed_store_recents(MdManagedStore *);
 MdStoreResult md_managed_store_import(const char *text, char **candidates);
 MdStoreResult md_managed_store_export(const char *candidates, char **text);
 
+/* Scrub and release an exclusively owned decrypted JSON tree. Do not call
+ * while any node has aliases still in use. */
+struct json_t;
+void md_managed_store_discard_plaintext(struct json_t *);
+
 /* Shared with existing signer-backed ACL and quality writers. */
 NostrEvent *md_private_document_build(MdSigner *, const MdSignerCancel *,
     const char *author, int kind, const char *coordinate, const char *plaintext, int64_t at);

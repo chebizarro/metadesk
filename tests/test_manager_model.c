@@ -34,9 +34,9 @@ static void test_public_identity(void) {
     MD_CHECK(md_manager_public_key(key_b, hex, NULL));
     MD_CHECK(!strcmp(hex, key_b));
     MD_CHECK(md_manager_fingerprint(key_a, fingerprint));
-    MD_CHECK(!strcmp(fingerprint, "aaaaaaaa…aaaaaaaa"));
+    MD_CHECK(!strcmp(fingerprint, "aaaa aaaa aaaa aaaa"));
     MD_CHECK(md_manager_fingerprint("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", fingerprint));
-    MD_CHECK(!strcmp(fingerprint, "01234567…89abcdef"));
+    MD_CHECK(!strcmp(fingerprint, "0123 4567 89ab cdef"));
     MD_CHECK(!md_manager_fingerprint("short", fingerprint) && !*fingerprint);
     MD_CHECK(!md_manager_npub("invalid"));
     const char *invalid[] = {NULL, "", "nsec1secret", "npub1invalid", "AAAA", "nostr:npub1invalid", NULL};
@@ -75,7 +75,7 @@ static void test_accounts(const char *dir) {
         MdManagerAccount *first = g_ptr_array_index(list, 0);
         MD_CHECK(!strcmp(first->account.label, "Desktop"));
         MD_CHECK(first->roles[MD_ACCOUNT_CLIENT] && first->roles[MD_ACCOUNT_HOST]);
-        MD_CHECK(first->npub && !strcmp(first->fingerprint, "aaaaaaaa…aaaaaaaa"));
+        MD_CHECK(first->npub && !strcmp(first->fingerprint, "aaaa aaaa aaaa aaaa"));
         MdManagerAccount *second = g_ptr_array_index(list, 1);
         MD_CHECK(!second->roles[MD_ACCOUNT_CLIENT] && !second->roles[MD_ACCOUNT_HOST]);
     }

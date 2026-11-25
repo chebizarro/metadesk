@@ -36,6 +36,18 @@ static bool hex_key(const char *s, char out[65]) {
     return true;
 }
 
+bool md_key_fingerprint(const char *pubkey, char out[MD_KEY_FINGERPRINT_SIZE]) {
+    char key[65];
+    if (!out) return false;
+    if (!hex_key(pubkey, key)) {
+        out[0] = '\0';
+        return false;
+    }
+    snprintf(out, MD_KEY_FINGERPRINT_SIZE, "%.4s %.4s %.4s %.4s",
+             key, key + 4, key + 8, key + 12);
+    return true;
+}
+
 static bool direct_key(const char *s, char out[65]) {
     if (hex_key(s, out)) return true;
     uint8_t key[32];
@@ -67,13 +79,32 @@ static bool parse_identifier(const char *input, char **name, char **domain) {
         nostr_nip05_parse_identifier(input, name, domain) == 0;
 }
 
+char *md_identity_normalize_nip05(const char *input) {
+    char *name = NULL, *domain = NULL;
+    if (!parse_identifier(strip_uri(input), &name, &domain)) return NULL;
+    size_t size = strlen(name) + strlen(domain) + 2;
+    char *normalized = malloc(size);
+    if (normalized) snprintf(normalized, size, "%s@%s", name, domain);
+    free(name);
+    free(domain);
+    return normalized;
+}
+
+MdResolveResult md_identity_check_pin(const MdIdentity *id, const char *pin) {
+    char key[65], expected[65];
+    if (!id || !hex_key(id->pubkey, key)) return MD_RESOLVE_INVALID;
+    if (!pin) return MD_RESOLVE_OK;
+    if (!direct_key(strip_uri(pin), expected)) return MD_RESOLVE_INVALID;
+    return strcmp(expected, key) ? MD_RESOLVE_PIN_MISMATCH : MD_RESOLVE_OK;
+}
+
 static MdResolveResult resolved(const char *key, const char *pin, MdIdentityHint source,
                                 char **hints, size_t count, MdIdentity *out) {
-    char pubkey[65], expected[65];
-    if (!hex_key(key, pubkey)) return MD_RESOLVE_INVALID;
-    if (pin && !direct_key(strip_uri(pin), expected)) return MD_RESOLVE_INVALID;
-    if (pin && strcmp(expected, pubkey)) return MD_RESOLVE_PIN_MISMATCH;
-    memcpy(out->pubkey, pubkey, sizeof(pubkey));
+    MdIdentity candidate = {0};
+    if (!hex_key(key, candidate.pubkey)) return MD_RESOLVE_INVALID;
+    MdResolveResult check = md_identity_check_pin(&candidate, pin);
+    if (check != MD_RESOLVE_OK) return check;
+    memcpy(out->pubkey, candidate.pubkey, sizeof(candidate.pubkey));
     out->hint_source = source;
     for (size_t i = 0; i < count && out->hint_count < MD_RELAY_TARGET_MAX; ++i) {
         if (!hints[i] || strlen(hints[i]) > MD_RELAY_URL_MAX) continue;

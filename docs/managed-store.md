@@ -54,6 +54,20 @@ pinned NIP-44 v2 implementation also limits encrypted plaintext to 65,535 bytes;
 a collection can hit that byte limit before it reaches the count ceiling. The
 store returns a size error rather than truncating or sharding a document.
 
+## Live controller
+
+Native frontends can use `src/core/managed_store_controller.h` instead of
+owning relay subscriptions. Serialize calls on a frontend worker; the change
+callback is only a wakeup hint and must not call back into the controller.
+Open the cache first, then start a plan with explicit bootstrap relays. The
+controller watches hosts, favorites and app data; add exact tag coordinates
+as they become known. An offline read can still return cache. Writes require
+an EOSE boundary on every admitted fetch route in its current connection
+generation. A local admission failure needs a fresh scoped replay rather than
+trusting the relay's reconnect cursor. AUTH and retryable CLOSED recovery
+remain owned by the bridge and nostrc. Use `flush` to send an already-staged
+edit; retry sends its original signed event, not a new replacement.
+
 ## Local data and compatibility
 
 Cache and outbox are one atomic encrypted-event journal per coordinate, with

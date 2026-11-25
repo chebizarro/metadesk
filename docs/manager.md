@@ -1,17 +1,20 @@
 # Linux Manager
 
-`metadesk-manager` is an optional GTK 4.14 / libadwaita 1.5 companion. It does
-not embed SDL or start a connection, host, input device, or accessibility probe.
+`metadesk-manager` is an optional GTK 4.14 / libadwaita 1.5 companion. For a
+remote connection it launches `metadesk-client` as a separate process; it does
+not embed SDL or start a local host, input device, or accessibility probe.
 
 ```sh
-meson setup build -Dmanager=true -Dclient=false -Dsigner_nip5f=true \
+meson setup build -Dmanager=true -Dclient=true -Dsigner_nip5f=true \
   -Dnostrc_root=/path/to/nostrc -Dnostrc_build_dir=/path/to/nostrc/build
 meson compile -C build -j2
 meson test -C build --suite manager --print-errorlogs
-build/src/manager/metadesk-manager
+PATH="$PWD/build:$PATH" build/src/manager/metadesk-manager
 ```
 
-The normal core dependencies are still required. Add `-Dsigner_nip55l=true`
+The normal core dependencies are still required. The Manager also uses
+libqrencode, zbar and GdkPixbuf for QR codes. For an installed native build,
+put `metadesk-client` on `PATH`. Add `-Dsigner_nip55l=true`
 and/or `-Dsigner_nip46=true` to enable those existing signer adapters. Merely
 listing an account does not mean its transport was compiled or is reachable.
 With `-Dmanager=false` (the default), GTK and libadwaita are neither discovered
@@ -26,7 +29,7 @@ traverse controls, Return activates navigation rows, and Ctrl+W/Ctrl+Q close
 the window. Standard window decorations are retained.
 
 - **Identity:** lists real `MdAccounts` metadata with backend, a short
-  `first-eight…last-eight` hex fingerprint, and an expandable, selectable full
+  fingerprint (the first 16 hex digits in four groups), and an expandable, selectable full
   NIP-19 npub. The fingerprint is not an authentication check. Add public
   metadata from a local D-Bus signer, local socket signer, or an already-paired
   remote signer; no private-key import or local key vault is provided.
@@ -61,7 +64,8 @@ the window. Standard window decorations are retained.
   document; “does not advertise” does not rule out a later NIP-42 challenge.
   Checking does not establish a WebSocket session. The managed client requires
   explicit `--relay` values and never falls back to the CLI default. The
-  manager’s address-book/launch flow is separate (`md-vb18`).
+  address book uses the client role's discovery, fetch and storage plans; a
+  signaling route is selected separately by the video client.
 - **Access:** connect to an explicit local host socket (or launch with
   `metadesk-manager --management-socket /absolute/private/control.sock`). This
   neither starts a host nor enables attended admission. Kernel peer credentials
@@ -86,8 +90,30 @@ the window. Standard window decorations are retained.
   with confirmed End Session. A reserved ID is not proof of TCP binding;
   “Ending” means revocation requested, not completed OS cleanup. The row must
   disappear to prove host teardown. This is not an invented activity history.
-- **Hosts / This Computer:** lifecycle and managed connection placeholders
-  remain; W16 does not start/stop hosts or launch remote clients.
+- **Hosts:** enter an `npub`, `nprofile`, lowercase hex key or NIP-05 name.
+  A separate optional IP field is only an explicit route for the reviewed key;
+  no connection falls back to TCP. Verify the full npub and short fingerprint
+  before connecting or saving. A changed NIP-05 key blocks connection; replace
+  it separately by typing the new fingerprint. First contact requests video
+  only. Use saved hosts, favorites, tag filtering and recent attempts to find
+  a reviewed identity again. Last-connected timestamps stay on this device.
+- **Offline:** the signer can decrypt the cached address book without a relay.
+  Saving and connecting remain unavailable until the required subscriptions
+  have caught up. Conflicting documents offer Keep Remote and Reapply Draft;
+  unknown or unreadable data is never overwritten. Refresh Address Book
+  starts fresh scoped subscriptions after a delivery failure.
+- **Exchange:** import `metadesk-hosts/1` after reviewing each new key. Existing
+  entries and conflicting pins are not silently overwritten. Export is an
+  explicit plaintext file with keys, labels and notes, never grants or signer
+  secrets. Tag IDs travel with the file; the format does not include tag names.
+  Scan QR Image reads an `nprofile` from an image file (no camera is accessed).
+- **This Computer:** the selected host role can display its public `nprofile`
+  QR. Local host lifecycle controls remain separate.
+- **Video launch:** the only launch arguments are `--managed-session-fd 3`.
+  The private inherited channel carries a versioned launch configuration,
+  progress, cancellation, and outcome. The child independently restores its
+  signer from the OS credential store and verifies the selected key. Closing
+  the Manager cancels an unfinished launch; a connected video window survives.
 
 All account and file operations run on a serialized worker task, with no GTK
 objects accessed from that worker. The account controller is opened per
@@ -113,8 +139,8 @@ metadata/relay edits, failed signer verification, persistence, and closing durin
 a worker task. Native keyboard checks use `xdotool` if available (otherwise an
 explicit skip is printed); GTK focus traversal is always checked. Timeouts
 are failure watchdogs only. `xvfb-run` and `dbus-run-session` must be installed;
-Meson reports explicitly when this test cannot be registered. `GTK_A11Y=none`
-is confined to that isolated test. A private runtime and a bus configuration
+Meson reports explicitly when this test cannot be registered. The private
+runner sets `GTK_A11Y=test`. A private runtime and a bus configuration
 without activation service directories prevent portal, keyring, and AT-SPI
 helpers from touching the live desktop.
 
@@ -133,6 +159,15 @@ private revoke, keyboard focus and 360px layout. A private
 `org.gtk.Notifications` service observes real GNotification calls, verifies exact
 review targets and no approval actions, and checks withdrawal on cancel/expiry.
 These are isolated fixture tests, not GNOME Shell notification-appearance proof.
+
+`manager-hosts-offline` uses an encrypted cache, a throwaway NIP-5F signer,
+and a loopback relay. It checks offline saved data, native keyboard input
+(`xdotool` required), a 360px surface, QR encoding/decoding, and key review
+after EOSE. `manager-launch` exercises the parent on a fixture child;
+`client private managed launch` exercises the real child entry point without
+needing a signer, desktop, or remote session. The scoped controller fixture
+checks EOSE readiness, refusal, an echoed draft with negative OK, a retry of
+the identical signed event, and a positive OK.
 
 For the real-binary test on Linux:
 

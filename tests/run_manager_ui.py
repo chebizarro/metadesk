@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix="md-w11-display-") as temporary:
         directory = root / subdirectory
         directory.mkdir(mode=0o700)
         environment[name] = str(directory)
-    environment.update(GTK_A11Y="none", GDK_BACKEND="x11", GDK_DEBUG="no-portals",
+    environment.update(GTK_A11Y="test", GDK_BACKEND="x11", GDK_DEBUG="no-portals",
                        GSK_RENDERER="cairo", GIO_USE_VFS="local", GSETTINGS_BACKEND="memory",
                        MESA_SHADER_CACHE_DISABLE="true")
     # No service directories: toolkit probes cannot activate portals, AT-SPI,

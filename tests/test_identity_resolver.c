@@ -37,6 +37,14 @@ int main(void) {
     const char *json = "{\"names\":{\"alice\":\"" PK "\"},\"relays\":{\"" PK "\":[\"wss://9.9.9.9\"]}}";
     CHECK(md_identity_from_nip05_json("Alice@EXAMPLE.org", json, PK, &id) == MD_RESOLVE_OK);
     CHECK(!strcmp(id.pubkey, PK) && id.hint_source == MD_HINT_NIP05 && id.hint_count == 1);
+    char *canonical = md_identity_normalize_nip05("nostr:Alice@EXAMPLE.org");
+    CHECK(canonical && !strcmp(canonical, "alice@example.org"));
+    free(canonical);
+    char same_short_pin[65], fp[MD_KEY_FINGERPRINT_SIZE], other_fp[MD_KEY_FINGERPRINT_SIZE];
+    memcpy(same_short_pin, PK, sizeof(same_short_pin));
+    same_short_pin[63] = '8';
+    CHECK(md_key_fingerprint(PK, fp) && md_key_fingerprint(same_short_pin, other_fp));
+    CHECK(!strcmp(fp, other_fp) && md_identity_check_pin(&id, same_short_pin) == MD_RESOLVE_PIN_MISMATCH);
     md_identity_clear(&id);
     CHECK(md_identity_from_nip05_json("Alice@example.org", json, OTHER, &id) == MD_RESOLVE_PIN_MISMATCH);
     CHECK(!id.pubkey[0] && !id.hint_count);

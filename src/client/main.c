@@ -31,6 +31,13 @@
 #include "input_event.h"
 #include "md_socket.h"
 #include "md_time.h"
+#include "managed_launch.h"
+#ifdef __linux__
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <sys/socket.h>
+#endif
 
 #include <SDL2/SDL.h>
 
@@ -121,6 +128,66 @@ fail:
     return -1;
 }
 
+#ifdef __linux__
+static int launch_fd = -1;
+static pthread_t launch_thread;
+static pthread_mutex_t launch_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool launch_active, launch_cancelled, launch_cancel_reported, launch_finished, launch_thread_started;
+
+static void launch_status(MdLaunchMessage msg) {
+    if (launch_fd >= 0) md_managed_launch_message_write(launch_fd, msg);
+}
+
+static void *watch_launch(void *unused) {
+    (void)unused;
+    for (;;) {
+        MdLaunchMessage msg;
+        int rc = md_managed_launch_message_read(launch_fd, &msg, false);
+        if (rc == 1 && msg != MD_LAUNCH_CANCEL && msg != MD_LAUNCH_DISCONNECT) continue;
+        pthread_mutex_lock(&launch_mu);
+        bool stop = !launch_finished && (!launch_active || (rc == 1 && msg == MD_LAUNCH_DISCONNECT));
+        if (stop) {
+            launch_cancelled = true;
+            g_running = 0;
+            go_channel_close(g_shutdown_ch);
+            if (!launch_active)
+                launch_cancel_reported = md_managed_launch_message_write(launch_fd, MD_LAUNCH_CANCELLED);
+        }
+        pthread_mutex_unlock(&launch_mu);
+        if (rc <= 0 || stop) return NULL;
+    }
+}
+static bool launch_handoff(void) {
+    pthread_mutex_lock(&launch_mu);
+    launch_active = !launch_cancelled && g_running &&
+        md_managed_launch_message_write(launch_fd, MD_LAUNCH_CONNECTED);
+    bool active = launch_active;
+    if (!active) launch_cancelled = true;
+    pthread_mutex_unlock(&launch_mu);
+    return active;
+}
+
+static bool launch_open(const char *arg, MdManagedLaunch *launch) {
+    char *end;
+    errno = 0;
+    long fd = strtol(arg, &end, 10);
+    if (errno || end == arg || *end || fd < 3 || fd > INT_MAX) return false;
+    int type;
+    struct sockaddr_storage peer;
+    struct ucred creds;
+    socklen_t n = sizeof(type), pn = sizeof(peer), cn = sizeof(creds);
+    if (fcntl((int)fd, F_SETFD, FD_CLOEXEC) < 0 ||
+        getsockopt((int)fd, SOL_SOCKET, SO_TYPE, &type, &n) || type != SOCK_SEQPACKET ||
+        getpeername((int)fd, (struct sockaddr *)&peer, &pn) || peer.ss_family != AF_UNIX ||
+        getsockopt((int)fd, SOL_SOCKET, SO_PEERCRED, &creds, &cn) || creds.uid != geteuid()) return false;
+    launch_fd = (int)fd;
+    struct pollfd p = {.fd = launch_fd, .events = POLLIN};
+    return poll(&p, 1, 5000) == 1 && (p.revents & POLLIN) && md_managed_launch_read(launch_fd, launch);
+}
+#else
+#define launch_status(msg) ((void)0)
+#endif
+
 /* ── State ───────────────────────────────────────────────────── */
 
 /* A decoded frame as input names it to the host (md-383x): its size and
@@ -177,6 +244,7 @@ typedef struct {
     atomic_int     phase;
     atomic_int     error;
     atomic_bool    cancel_connect;
+    uint8_t managed_caps;
     MdStream      *binding_stream;    /* borrowed under g_connect_mu */
     GoChannel     *cancel_ch;          /* closed by UI, drained before unref */
     bool           paused;            /* explicit disconnect, not process quit */
@@ -324,6 +392,20 @@ static void on_dm_relay_unavailable(const char *url, const char *reason, void *d
                                    "Relay unavailable: DM inbox subscription refused");
 }
 
+#ifdef __linux__
+static bool auth_required(const char *reason) {
+    return reason && !strncmp(reason, "auth-required:", 14);
+}
+static void report_relay_closed(const char *reason, void *data) {
+    (void)data;
+    launch_status(auth_required(reason) ? MD_LAUNCH_RELAY_AUTH : MD_LAUNCH_RELAY_CLOSED);
+}
+static void report_relay_publish(const char *id, bool ok, const char *reason, void *data) {
+    (void)id; (void)data;
+    if (!ok) launch_status(auth_required(reason) ? MD_LAUNCH_RELAY_AUTH : MD_LAUNCH_RELAY_REJECTED);
+}
+#endif
+
 /* ── Usage ───────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
@@ -336,6 +418,9 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --host ADDRESS     Direct TCP endpoint (IP or hostname; port via --port)\n");
     fprintf(stderr, "  --npub IDENTITY    Host identity; FIPS route unless --host is set\n");
     fprintf(stderr, "  --pin KEY          Require this npub or 64-hex key to match the resolved identity\n");
+#ifdef __linux__
+    fprintf(stderr, "  --managed-session-fd N  Inherited private Manager channel (no other options)\n");
+#endif
     fprintf(stderr, "  --managed          Require a bound client role and explicit --relay; no direct TCP\n");
     fprintf(stderr, "  --port PORT        Host port (default: %d)\n", MD_STREAM_PORT);
     fprintf(stderr, "  --no-display       Decode only, no SDL2 window\n");
@@ -444,7 +529,9 @@ static int negotiate_session(MdNostr *nostr, ClientCtx *ctx,
         return -1;
 
     MdSessionRequest req = {
-        .capabilities = MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | (ctx->monitor_control ? MD_CAP_MONITOR : 0) | (ctx->clipboard_requested ? MD_CAP_CLIPBOARD : 0),
+        .capabilities = ctx->managed_caps ? ctx->managed_caps :
+            MD_CAP_VIDEO | MD_CAP_AGENT | MD_CAP_INPUT | (ctx->monitor_control ? MD_CAP_MONITOR : 0) |
+            (ctx->clipboard_requested ? MD_CAP_CLIPBOARD : 0),
         .tree_format = MD_TREE_FORMAT_COMPACT,
         .clipboard_directions=ctx->clipboard_requested,
         .quality = ctx->requested_quality, .quality_present = true,
@@ -695,6 +782,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
     ctx->error = MD_CLIENT_ERROR_NONE;
     if (!host) {
         ctx->phase = MD_CLIENT_FIPS;
+        launch_status(MD_LAUNCH_FIPS);
         printf("client: checking FIPS daemon health...\n");
         if (check_fips_daemon(fips_control_socket,
                               timeout_ms && timeout_ms < 1000 ? timeout_ms : 1000) != 0)
@@ -730,6 +818,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
 
     /* Endpoint selection never bypasses identity-pinned Nostr admission. */
     ctx->phase = MD_CLIENT_NEGOTIATING;
+    launch_status(MD_LAUNCH_APPROVAL);
     MdSessionRequest req;
     if (negotiate_session(nostr, ctx, host_pubkey_hex,
                           timeout_ms, &req) != 0 || !client_owner_current(ctx))
@@ -741,6 +830,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         return NULL;
     }
     ctx->phase = MD_CLIENT_CONNECTING;
+    launch_status(MD_LAUNCH_DIAL);
     if (host) {
         printf("client: connecting to %s:%u...\n", host, port);
         stream = md_stream_connect(host, port,
@@ -761,6 +851,7 @@ static MdStream *connect_client_stream(const char *host, const char *npub,
         return NULL;
     }
     ctx->phase = MD_CLIENT_BINDING;
+    launch_status(MD_LAUNCH_BIND);
     if (!client_owner_current(ctx) || bind_client_stream(stream, ctx) != 0 ||
         !client_owner_current(ctx)) {
         fprintf(stderr, "ERROR: session binding/ACK failed\n");
@@ -1021,8 +1112,24 @@ typedef struct {
 
 static void *connect_worker(void *data) {
     ClientConnect *job = data;
+    if (job->ctx->managed_caps) {
+        pthread_mutex_lock(&g_negotiation_mu);
+        job->ctx->request_pending = 0;
+        memset(&job->ctx->pending_req, 0, sizeof(job->ctx->pending_req));
+        pthread_mutex_unlock(&g_negotiation_mu);
+    }
     job->result = connect_client_stream(job->host, job->npub, job->control,
         job->port, job->timeout, job->nostr, job->pubkey, job->ctx, job->session);
+    if (!job->result && job->ctx->managed_caps && !client_owner_current(job->ctx) &&
+        md_account_binding_is_current(job->ctx->owner) && job->ctx->pending_req.request_id[0]) {
+        /* No session-state mutation on the signaling callback: invalidate
+         * this request locally, then send the existing v1 cancel message. */
+        pthread_mutex_lock(&g_negotiation_mu);
+        job->ctx->request_pending = 0;
+        pthread_mutex_unlock(&g_negotiation_mu);
+        if (md_nostr_send_session_cancel(job->nostr, job->pubkey, job->ctx->pending_req.request_id) != 0)
+            fprintf(stderr, "client: could not confirm delivery of session cancellation\n");
+    }
     if (!job->result && client_owner_current(job->ctx)) {
         switch (job->ctx->phase) {
         case MD_CLIENT_FIPS: job->ctx->error = MD_CLIENT_ERROR_FIPS; break;
@@ -1096,7 +1203,7 @@ static bool address_prefix(const char *s, const char *prefix) {
 }
 
 static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *bootstrap,
-                      char **canonical_npub) {
+                      char **canonical_npub, const MdManagedLaunch *launch) {
     /* Do this before argument errors can echo a positional value, including
      * a route supplied alongside a separate --npub identity. */
     for (int i = 1; i < argc; ++i) {
@@ -1117,6 +1224,13 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
 #endif
     if (start_signal_wake() != 0) return 1;
     atexit(stop_signal_wake);
+#ifdef __linux__
+    if (launch) {
+        if (pthread_create(&launch_thread, NULL, watch_launch, NULL) != 0) return 1;
+        launch_thread_started = true;
+        launch_status(MD_LAUNCH_RESOLVE);
+    }
+#endif
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);  /* host going away mid-send is EPIPE, not fatal */
 #else
@@ -1234,6 +1348,14 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         }
     }
 
+    if (launch) {
+        managed = true;
+        npub = launch->address;
+        pin = launch->pin;
+        host = *launch->route ? launch->route : NULL;
+        port = launch->port;
+        for (size_t i = 0; i < launch->relay_count; ++i) relay_urls[relay_count++] = launch->relays[i];
+    }
     if (!npub && host && !explicit_host &&
         (strchr(host, '@') || strlen(host) == 64 || !strncmp(host, "nostr:", 6) ||
          !strncmp(host, "npub1", 5) || !strncmp(host, "nprofile1", 9))) {
@@ -1251,7 +1373,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         return 1;
     }
     bool explicit_signer = bunker_uri || use_dbus_signer || use_socket_signer || auto_signer;
-    if (managed && (explicit_signer || host)) {
+    if (managed && (explicit_signer || (host && !launch))) {
         fprintf(stderr, "ERROR: managed connections require the bound client role and FIPS routing\n");
         return 1;
     }
@@ -1291,16 +1413,22 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
     }
 
     /* ── Signer initialization ─────────────────────────────── */
+    if (!g_running) return 1;
+    launch_status(MD_LAUNCH_SIGNER);
     MdSigner *signer = NULL;
     MdAccountStartup account = {0};
     if (!explicit_signer) {
-        int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &account);
+        int rc = md_account_startup_open_pinned(MD_ACCOUNT_CLIENT, launch ? launch->signer : NULL, &account);
         if (rc) {
             fprintf(stderr, "ERROR: client account restore: %s\n", md_accounts_error_string(rc));
             return 1;
         }
         if (managed && !account.binding) {
             fprintf(stderr, "ERROR: no bound client role\n");
+            md_account_startup_clear(&account);
+            return 1;
+        }
+        if (launch && !g_running) {
             md_account_startup_clear(&account);
             return 1;
         }
@@ -1334,7 +1462,8 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
     md_session_init(&session);
 
     /* Client context (needed before connect for nostr callbacks) */
-    ClientCtx ctx = { .owner = account.binding, .requested_quality = requested_quality };
+    ClientCtx ctx = { .owner = account.binding, .requested_quality = requested_quality,
+                      .managed_caps = launch ? launch->capabilities : 0 };
     ctx.clipboard_requested=clipboard_requested;
     ctx.monitor_control=monitor_control;
     strcpy(ctx.requested_output,requested_output);
@@ -1381,13 +1510,19 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         nostr_cbs.on_dm = on_session_dm;
         nostr_cbs.on_dm_relay_unavailable = on_dm_relay_unavailable;
         nostr_cbs.dm_userdata = &ctx;
+#ifdef __linux__
+        if (launch) {
+            nostr_cbs.on_dm_relay_closed = report_relay_closed;
+            nostr_cbs.on_publish_result = report_relay_publish;
+        }
+#endif
 
         MdNostrConfig nostr_cfg = {
             .signer = signer,
             .owner = account.binding,
             .relay_urls = relay_urls,
             .relay_count = relay_count,
-            .quality_preferences = true,
+            .quality_preferences = launch == NULL,
             .bootstrap_plan = bootstrap,
             .session_peer = identity,
         };
@@ -1398,6 +1533,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         /* Create channel before nostr_create — callbacks fire on worker threads */
         ctx.session_ch = go_channel_create(1);
 
+        launch_status(MD_LAUNCH_RELAY);
         nostr = md_nostr_create(&nostr_cfg, &nostr_cbs);
         if (!nostr) {
             fprintf(stderr, "ERROR: failed to create Nostr bridge\n");
@@ -1410,7 +1546,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
 
     }
 
-    if (nostr) {
+    if (nostr && !launch) {
         if (!quality_cli && md_nostr_quality_load(nostr, ctx.expected_host_pk, &ctx.requested_quality) < 0)
             fprintf(stderr, "client: saved quality unavailable or invalid; using host defaults\n");
         if (save_quality && md_nostr_quality_save(nostr, ctx.expected_host_pk, &ctx.requested_quality)) {
@@ -1419,6 +1555,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         }
     }
     /* Create decoder */
+    launch_status(MD_LAUNCH_MEDIA);
     MdDecoder *decoder = md_decoder_create();
     if (!decoder) {
         fprintf(stderr, "ERROR: failed to create H.264 decoder\n");
@@ -1472,8 +1609,11 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         }
         return 1;
     }
+#ifdef __linux__
+    if (launch && (!stream || !launch_handoff())) g_running = 0;
+#endif
     ctx.paused = !stream;
-    if (stream) printf("client: connected\n");
+    if (stream && g_running) printf("client: connected\n");
 
     /* ── Main loop ───────────────────────────────────────────── */
     printf("client: receiving stream... (Ctrl+C to stop)\n\n");
@@ -1790,7 +1930,34 @@ int main(int argc, char **argv) {
     MdIdentity identity = {0};
     MdRelayPlan bootstrap = {0};
     char *npub = NULL;
-    int status = client_run(argc, argv, &identity, &bootstrap, &npub);
+    const MdManagedLaunch *launch = NULL;
+#ifdef __linux__
+    MdManagedLaunch config = {0};
+    if (argc > 1 && !strcmp(argv[1], "--managed-session-fd")) {
+        if (argc != 3 || !launch_open(argv[2], &config)) {
+            launch_status(MD_LAUNCH_FAILED);
+            fprintf(stderr, "ERROR: invalid private Manager launch channel or configuration\n");
+            return 1;
+        }
+        launch = &config;
+        argc = 1;
+    }
+#endif
+    int status = client_run(argc, argv, &identity, &bootstrap, &npub, launch);
+#ifdef __linux__
+    if (launch) {
+        pthread_mutex_lock(&launch_mu);
+        launch_finished = true;
+        if (!launch_active) {
+            if (!launch_cancel_reported) launch_status(launch_cancelled ? MD_LAUNCH_CANCELLED : MD_LAUNCH_FAILED);
+            status = 1;
+        } else launch_status(MD_LAUNCH_ENDED);
+        pthread_mutex_unlock(&launch_mu);
+        shutdown(launch_fd, SHUT_RDWR);
+        if (launch_thread_started) pthread_join(launch_thread, NULL);
+        close(launch_fd);
+    }
+#endif
     free(npub);
     md_relay_plan_clear(&bootstrap);
     md_identity_clear(&identity);
