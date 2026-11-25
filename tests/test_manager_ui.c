@@ -249,6 +249,16 @@ int main(void) {
     MD_CHECK(surface_width(window) == 360);
     GtkListBox *navigation = GTK_LIST_BOX(child(window, "navigation"));
     GtkStack *pages = GTK_STACK(child(window, "pages"));
+    GtkWidget *computer = gtk_stack_get_child_by_name(pages, "This Computer");
+    MD_CHECK(ADW_IS_STATUS_PAGE(computer));
+    if (ADW_IS_STATUS_PAGE(computer)) {
+        GtkWidget *qr = adw_status_page_get_child(ADW_STATUS_PAGE(computer));
+#ifdef MD_HAVE_MANAGER_QR
+        MD_CHECK(GTK_IS_BUTTON(qr) && !strcmp(gtk_button_get_label(GTK_BUTTON(qr)), "Show Host _QR Code…"));
+#else
+        MD_CHECK(qr == NULL);
+#endif
+    }
     MD_CHECK(gtk_widget_grab_focus(GTK_WIDGET(gtk_list_box_get_row_at_index(navigation, 0))));
     if (keyboard("Down Down Down Return")) {
         WAIT_UNTIL(!strcmp(gtk_stack_get_visible_child_name(pages), "Identity"));

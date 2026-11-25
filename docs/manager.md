@@ -12,9 +12,13 @@ meson test -C build --suite manager --print-errorlogs
 PATH="$PWD/build:$PATH" build/src/manager/metadesk-manager
 ```
 
-The normal core dependencies are still required. The Manager also uses
-libqrencode, zbar and GdkPixbuf for QR codes. For an installed native build,
-put `metadesk-client` on `PATH`. Add `-Dsigner_nip55l=true`
+The normal core dependencies are still required. `-Dmanager_qr=auto` (default)
+enables QR display and image scanning when libqrencode, ZBar and GdkPixbuf are
+available. Native Manager packages use the distro libraries. Source builds can
+require them with `-Dmanager_qr=enabled` or omit QR with
+`-Dmanager_qr=disabled`. The Manager Flatpak includes its own client but disables
+QR and does not bundle libqrencode or ZBar pending `md-rvu4`. For an installed
+native build, put `metadesk-client` on `PATH`. Add `-Dsigner_nip55l=true`
 and/or `-Dsigner_nip46=true` to enable those existing signer adapters. Merely
 listing an account does not mean its transport was compiled or is reachable.
 With `-Dmanager=false` (the default), GTK and libadwaita are neither discovered
@@ -106,9 +110,10 @@ the window. Standard window decorations are retained.
   entries and conflicting pins are not silently overwritten. Export is an
   explicit plaintext file with keys, labels and notes, never grants or signer
   secrets. Tag IDs travel with the file; the format does not include tag names.
-  Scan QR Image reads an `nprofile` from an image file (no camera is accessed).
-- **This Computer:** the selected host role can display its public `nprofile`
-  QR. Local host lifecycle controls remain separate.
+  When QR is enabled, Scan QR Image reads an `nprofile` from an image file (no
+  camera is accessed).
+- **This Computer:** when QR is enabled, the selected host role can display its
+  public `nprofile` QR. Local host lifecycle controls remain separate.
 - **Video launch:** the only launch arguments are `--managed-session-fd 3`.
   The private inherited channel carries a versioned launch configuration,
   progress, cancellation, and outcome. The child independently restores its
@@ -162,7 +167,8 @@ These are isolated fixture tests, not GNOME Shell notification-appearance proof.
 
 `manager-hosts-offline` uses an encrypted cache, a throwaway NIP-5F signer,
 and a loopback relay. It checks offline saved data, native keyboard input
-(`xdotool` required), a 360px surface, QR encoding/decoding, and key review
+(`xdotool` required), a 360px surface, QR encoding/decoding when enabled (scan
+control absent when disabled), and key review
 after EOSE. `manager-launch` exercises the parent on a fixture child;
 `client private managed launch` exercises the real child entry point without
 needing a signer, desktop, or remote session. The scoped controller fixture

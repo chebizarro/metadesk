@@ -7,7 +7,7 @@ case "$product" in client) client=true; manager=false ;; manager) client=true; m
 [ ! -e "$build" ] || { echo 'build must be new' >&2; exit 2; }
 export PKG_CONFIG_PATH="$nostrc/lib/pkgconfig:$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 meson setup "$build" "$src" --prefix="$prefix" --libdir=lib --buildtype=release \
-  -Dclient="$client" -Dmanager="$manager" -Dsigner_nip5f=true -Dsigner_nip46=true \
+  -Dclient="$client" -Dmanager="$manager" -Dmanager_qr=disabled -Dsigner_nip5f=true -Dsigner_nip46=true \
   -Dportal_input=disabled -Dnostrc_discovery=installed
 if [ "$manager" = true ]; then
   meson compile -C "$build" -j2 metadesk-manager metadesk-client

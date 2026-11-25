@@ -12,6 +12,8 @@ option('macos_manager', type : 'boolean', value : false,
   description : 'Build the native AppKit management prototype (macOS only)')
 option('manager', type : 'boolean', value : false,
        description : 'Build the optional Linux GTK4/libadwaita management companion')
+option('manager_qr', type : 'feature', value : 'auto',
+       description : 'Manager QR display and image scanning (libqrencode and ZBar)')
 option('signer_nip46', type : 'boolean', value : false,
        description : 'Enable NIP-46 Nostr Connect remote signer backend (requires nostr_nip46_core, NIP-04 and Jansson)')
 option('signer_nip55l', type : 'boolean', value : false,

@@ -4,7 +4,12 @@
 set -eu
 [ "$#" = 1 ] || exit 2
 case "$1" in client|manager) ;; *) exit 2 ;; esac
-for file in "/app/bin/metadesk-$1" /app/libexec/metadesk/verify-codecs /app/libexec/metadesk/decode-smoke; do
+product=$1
+set -- "/app/bin/metadesk-$product" /app/libexec/metadesk/verify-codecs /app/libexec/metadesk/decode-smoke
+if [ "$product" = manager ]; then
+  set -- "$@" /app/bin/metadesk-client
+fi
+for file do
   [ ! -e "$file.bin" ] || exit 2
   mv "$file" "$file.bin"
   cat > "$file" <<WRAPPER
