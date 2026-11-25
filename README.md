@@ -138,6 +138,12 @@ metadesk-host
 metadesk-client npub1<host-pubkey>
 ```
 
+With a bound client role and explicit `--relay` configuration, use **Quick
+connect** in the overlay to switch to a saved favorite or recent host without
+restarting. Edit the address book in the manager. The overlay reads existing
+recents but does not record the outcome of a switch; the manager records its
+own launches. See [the managed-store documentation](docs/managed-store.md#sdl-quick-connect).
+
 ## Agent API (MCP)
 
 metadesk exposes a [Model Context Protocol](https://modelcontextprotocol.io) server with 9 tools and 2 resources. Agents read the UI tree, invoke actions on element IDs, and receive deltas showing what changed.

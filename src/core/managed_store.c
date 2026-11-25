@@ -33,6 +33,7 @@ struct MdManagedStore {
     char owner[65];
     json_t *ready;
     bool latch_disabled;
+    bool read_only;
 #ifdef _WIN32
     MdWinDirectory *dir;
     HANDLE lock;
@@ -132,7 +133,7 @@ static bool owned(int fd, bool directory) {
 }
 #endif
 
-MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *path) {
+static MdManagedStore *open_store(MdAccountBinding *binding, const char *path, bool read_only) {
     if (!path || !binding || md_account_binding_role(binding) != MD_ACCOUNT_CLIENT ||
         !md_account_binding_is_current(binding)) return NULL;
     char *owner = NULL;
@@ -145,6 +146,7 @@ MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *pat
     free(owner);
     s->binding = md_account_binding_ref(binding);
     s->ready = json_object();
+    s->read_only = read_only;
 #ifdef _WIN32
     s->lock = INVALID_HANDLE_VALUE;
     MdWinDirectory *parent = md_win_directory(path, false);
@@ -155,26 +157,48 @@ MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *pat
         if (child) {
             const char *sep = (path[len - 1] == '\\' || path[len - 1] == '/') ? "" : "\\";
             snprintf(child, n, "%s%s%s", path, sep, s->owner);
-            s->dir = md_win_directory(child, true);
+            s->dir = md_win_directory(child, !read_only);
             free(child);
         }
         md_win_directory_close(parent);
     }
-    if (s->dir) s->lock = md_win_file(s->dir, "store.lock", GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, 0);
-    bool locked = s->lock != INVALID_HANDLE_VALUE;
+    if (s->dir && !read_only)
+        s->lock = md_win_file(s->dir, "store.lock", GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, 0);
+    bool opened = read_only ? s->dir != NULL : s->lock != INVALID_HANDLE_VALUE;
 #else
     s->dir = s->lock = -1;
     int parent = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (owned(parent, true) && (!mkdirat(parent, s->owner, 0700) || errno == EEXIST)) {
+    if (owned(parent, true) && (read_only || !mkdirat(parent, s->owner, 0700) || errno == EEXIST)) {
         s->dir = openat(parent, s->owner, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (owned(s->dir, true) && !fsync(parent))
+        if (!read_only && owned(s->dir, true) && !fsync(parent))
             s->lock = openat(s->dir, "store.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
     }
     if (parent >= 0) close(parent);
-    bool locked = owned(s->lock, false) && !flock(s->lock, LOCK_EX | LOCK_NB);
+    bool opened = read_only ? owned(s->dir, true) : owned(s->lock, false) && !flock(s->lock, LOCK_EX | LOCK_NB);
 #endif
-    if (!locked || !s->ready || !current(s)) { md_managed_store_close(s); return NULL; }
+    if (!opened || !s->ready || !current(s)) { md_managed_store_close(s); return NULL; }
     return s;
+}
+char *md_managed_store_default_directory(void) {
+#ifdef _WIN32
+    return md_win_default_directory("\\metadesk");
+#else
+    const char *base = getenv("XDG_STATE_HOME");
+    const char *suffix = "/metadesk";
+    if (!base || base[0] != '/') {
+        base = getenv("HOME");
+        suffix = "/.local/state/metadesk";
+    }
+    if (!base || base[0] != '/') return NULL;
+    size_t size = strlen(base) + strlen(suffix) + 1;
+    char *path = malloc(size);
+    if (path) snprintf(path, size, "%s%s", base, suffix);
+    return path;
+#endif
+}
+
+MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *path) {
+    return open_store(binding, path, false);
 }
 void md_managed_store_close(MdManagedStore *s) {
     if (!s) return;
@@ -200,6 +224,7 @@ static void file_name(const char *name, char out[64]) {
     out[i] = 0;
 }
 static bool write_json(MdManagedStore *s, const char *coordinate, json_t *j) {
+    if (s->read_only) return false;
     char name[64];
     file_name(coordinate, name);
     if (!current(s)) return false;
@@ -240,7 +265,8 @@ static json_t *read_json(MdManagedStore *s, const char *coordinate, FileState *s
     unsigned char *buf = NULL;
     size_t used = 0;
 #ifdef _WIN32
-    HANDLE f = md_win_file(s->dir, name, GENERIC_READ, OPEN_EXISTING, FILE_SHARE_READ);
+    DWORD share = FILE_SHARE_READ | (s->read_only ? FILE_SHARE_DELETE : 0);
+    HANDLE f = md_win_file(s->dir, name, GENERIC_READ, OPEN_EXISTING, share);
     if (f == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND) *state = FILE_MISSING;
         return NULL;
@@ -430,10 +456,14 @@ static NostrEvent *parse_event(const char *wire, const char *owner, int kind,
     return NULL;
 }
 
-static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t **doc) {
+static MdStoreResult decode_cancellable(MdManagedStore *s, int kind, NostrEvent *e,
+                                        json_t **doc, const MdSignerCancel *cancel) {
     *doc = NULL;
     char *plain = NULL;
-    if (md_account_binding_decrypt(s->binding,s->owner,nostr_event_get_content(e),&plain) || !plain) {
+    const char *content = nostr_event_get_content(e);
+    int rc = cancel ? md_signer_nip44_decrypt_cancellable(md_account_binding_signer(s->binding),
+        s->owner, content, &plain, cancel) : md_account_binding_decrypt(s->binding, s->owner, content, &plain);
+    if (rc || !plain || !current(s) || md_signer_cancelled(cancel)) {
         wipe(plain); return current(s) ? MD_STORE_SIGNER : MD_STORE_REVOKED;
     }
     json_error_t error = {0};
@@ -441,6 +471,10 @@ static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t *
     wipe(plain);
     if (!*doc && json_error_code(&error) == json_error_out_of_memory) return MD_STORE_IO;
     return schema(kind,*doc);
+}
+
+static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t **doc) {
+    return decode_cancellable(s, kind, e, doc, NULL);
 }
 
 /* Journal loading also verifies disk envelopes. Never recover an unreadable
@@ -924,6 +958,108 @@ MdStoreResult md_managed_store_record(MdManagedStore *s, const char *pk, int64_t
     ok = ok && write_json(s,"local-recents",j);
     json_decref(j);
     return ok ? MD_STORE_OK : MD_STORE_IO;
+}
+
+static const char *host_member(const json_t *tag) {
+    const char *type = json_string_value(json_array_get(tag, 0));
+    return type && !strcmp(type, "p") ? json_string_value(json_array_get(tag, 1)) : NULL;
+}
+
+static bool read_cached_document(MdManagedStore *s, const char *coordinate,
+                                 json_t **winner, json_t **draft, const MdSignerCancel *cancel) {
+    Journal j = {0};
+    int kind = doc_kind(coordinate);
+    bool ok = current(s) && !md_signer_cancelled(cancel) && load(s, coordinate, &j) &&
+        (!j.winner || decode_cancellable(s, kind, j.winner, winner, cancel) == MD_STORE_OK) &&
+        (!j.draft || decode_cancellable(s, kind, j.draft, draft, cancel) == MD_STORE_OK);
+    dispose(&j);
+    return ok;
+}
+
+static bool has_host_member(const json_t *list, const char *key) {
+    size_t i;
+    json_t *tag;
+    json_array_foreach(list, i, tag) {
+        const char *member = host_member(tag);
+        if (member && !strcmp(member, key)) return true;
+    }
+    return false;
+}
+
+static void cancel_cache_read(void *data) { md_signer_cancel(data); }
+
+struct json_t *md_managed_store_quick_hosts_cancellable(MdAccountBinding *binding, const char *path,
+                                                        MdSignerCancel *cancel) {
+    if (md_signer_cancelled(cancel)) return NULL;
+    MdManagedStore *s = open_store(binding, path, true);
+    if (!s) return NULL;
+    /* Preserve the role's cancellation alongside the caller's token. Unwatch
+     * drains the notification before the caller can free the token. */
+    MdAccountWatch *watch = cancel ? md_account_binding_watch(binding, cancel_cache_read, cancel) : NULL;
+    json_t *hosts = NULL, *meta = NULL, *favorites = NULL;
+    json_t *draft_hosts = NULL, *draft_meta = NULL, *draft_favorites = NULL;
+    json_t *recent = NULL, *out = NULL;
+    json_t *saved = json_object(), *seen = json_object();
+    if (!saved || !seen || (cancel && !watch) ||
+        !read_cached_document(s, MD_STORE_HOSTS, &hosts, &draft_hosts, cancel) ||
+        !read_cached_document(s, MD_STORE_MANAGEMENT, &meta, &draft_meta, cancel) ||
+        !read_cached_document(s, MD_STORE_FAVORITES, &favorites, &draft_favorites, cancel) ||
+        !(recent = recents(s))) goto done;
+    out = json_array();
+    if (!out) goto done;
+
+    size_t i;
+    json_t *v;
+    json_array_foreach(hosts, i, v) {
+        const char *key = host_member(v);
+        if (key && (!draft_hosts || has_host_member(draft_hosts, key)) &&
+            json_object_set(saved, key, json_true())) goto failed;
+    }
+    const char *const fields[] = {"label", "nip05", "relay_hints", "port", "requested_caps"};
+    for (unsigned group = 0; group < 2; ++group) {
+        json_array_foreach(group == 0 ? favorites : recent, i, v) {
+            const char *key = group == 0 ? host_member(v) : field(v, "pubkey");
+            if (!key || !json_object_get(saved, key) || json_object_get(seen, key)) continue;
+            json_t *record = json_object_get(json_object_get(meta, "hosts"), key);
+            /* The manager saves a metadata record for every reviewed pin.
+             * A missing record may be a partial delete/replacement; never
+             * reinterpret a formerly aliased host as a raw key. */
+            if (!json_is_object(record) ||
+                (draft_meta && !json_is_object(json_object_get(json_object_get(draft_meta, "hosts"), key))) ||
+                (draft_favorites && (!has_host_member(favorites, key) || !has_host_member(draft_favorites, key))))
+                continue;
+            json_t *row = json_pack("{s:s,s:b}", "pubkey", key, "favorite", group == 0);
+            if (!row) goto failed;
+            if (json_array_append_new(out, row)) goto failed;
+            for (size_t k = 0; k < sizeof(fields)/sizeof(fields[0]); ++k) {
+                json_t *value = json_object_get(record, fields[k]);
+                if (value && json_object_set_new(row, fields[k], json_deep_copy(value))) goto failed;
+            }
+            if (json_object_set(seen, key, json_true())) goto failed;
+        }
+    }
+    if (current(s) && !md_signer_cancelled(cancel)) goto done;
+failed:
+    md_managed_store_discard_plaintext(out);
+    out = NULL;
+done:
+    md_managed_store_discard_plaintext(hosts);
+    md_managed_store_discard_plaintext(meta);
+    md_managed_store_discard_plaintext(favorites);
+    md_managed_store_discard_plaintext(recent);
+    md_managed_store_discard_plaintext(draft_hosts);
+    md_managed_store_discard_plaintext(draft_meta);
+    md_managed_store_discard_plaintext(draft_favorites);
+    md_managed_store_discard_plaintext(saved);
+    md_managed_store_discard_plaintext(seen);
+    md_account_binding_unwatch(watch);
+    md_managed_store_close(s);
+    if (md_signer_cancelled(cancel)) { md_managed_store_discard_plaintext(out); return NULL; }
+    return out;
+}
+
+struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const char *path) {
+    return md_managed_store_quick_hosts_cancellable(binding, path, NULL);
 }
 
 static MdStoreResult exchange(const char *input, char **result, bool importing) {

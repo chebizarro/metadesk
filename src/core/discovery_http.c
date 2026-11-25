@@ -156,8 +156,19 @@ static size_t append_body(char *data, size_t size, size_t count, void *user) {
     return bytes;
 }
 
-char *md_discovery_http_get(const char *url, const char *accept, bool public_only,
-                            long timeout_ms, bool *unsafe) {
+typedef struct { bool (*cancelled)(void *); void *data; } TransferCancel;
+static int transfer_progress(void *ptr, curl_off_t dl, curl_off_t downloaded,
+                             curl_off_t ul, curl_off_t uploaded) {
+    (void)dl; (void)downloaded; (void)ul; (void)uploaded;
+    TransferCancel *cancel = ptr;
+    return cancel->cancelled(cancel->data);
+}
+
+char *md_discovery_http_get_cancellable(const char *url, const char *accept, bool public_only,
+    long timeout_ms, bool *unsafe, bool (*cancelled)(void *), void *data) {
+    if (unsafe) *unsafe = false;
+    if (cancelled && cancelled(data)) return NULL;
+    TransferCancel cancel = {cancelled, data};
     /* NOSIGNAL cannot bound a synchronous resolver. Do not start a transfer
      * unless the runtime libcurl can enforce the DNS portion of its timeout. */
     CURL *curl = md_discovery_http_init() && curl_async_dns ? curl_easy_init() : NULL;
@@ -165,7 +176,6 @@ char *md_discovery_http_get(const char *url, const char *accept, bool public_onl
     Body body = {0};
     bool blocked = false, ok = false;
     long status = 0;
-    if (unsafe) *unsafe = false;
     if (!curl) return NULL;
     if (accept && !(headers = curl_slist_append(NULL, accept))) goto done;
 #define SET(option, value) do { if (curl_easy_setopt(curl, option, value) != CURLE_OK) goto done; } while (0)
@@ -186,6 +196,11 @@ char *md_discovery_http_get(const char *url, const char *accept, bool public_onl
     SET(CURLOPT_CONNECTTIMEOUT_MS, timeout_ms < 3000L ? timeout_ms : 3000L);
     SET(CURLOPT_WRITEFUNCTION, append_body);
     SET(CURLOPT_WRITEDATA, &body);
+    if (cancelled) {
+        SET(CURLOPT_NOPROGRESS, 0L);
+        SET(CURLOPT_XFERINFOFUNCTION, transfer_progress);
+        SET(CURLOPT_XFERINFODATA, &cancel);
+    }
     if (public_only) {
         /* Runs on the address curl will actually connect to, not a preflight DNS answer. */
         SET(CURLOPT_OPENSOCKETFUNCTION, open_public_socket);
@@ -198,7 +213,12 @@ char *md_discovery_http_get(const char *url, const char *accept, bool public_onl
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
     if (unsafe) *unsafe = !ok && blocked;
-    if (ok) return body.json;
+    if (ok && (!cancelled || !cancelled(data))) return body.json;
     free(body.json);
     return NULL;
+}
+
+char *md_discovery_http_get(const char *url, const char *accept, bool public_only,
+                            long timeout_ms, bool *unsafe) {
+    return md_discovery_http_get_cancellable(url, accept, public_only, timeout_ms, unsafe, NULL, NULL);
 }

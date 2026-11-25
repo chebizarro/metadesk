@@ -210,6 +210,7 @@ int md_signer_nip44_decrypt(MdSigner *s, const char *peer_pubkey_hex,
 typedef struct MdSignerCancel MdSignerCancel;
 MdSignerCancel *md_signer_cancel_new(void);
 void md_signer_cancel(MdSignerCancel *cancel);
+bool md_signer_cancelled(const MdSignerCancel *cancel);
 void md_signer_cancel_free(MdSignerCancel *cancel);
 int md_signer_sign_event_cancellable(MdSigner *s, const char *json, char **out,
                                       const MdSignerCancel *cancel);

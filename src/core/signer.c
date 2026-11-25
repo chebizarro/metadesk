@@ -45,7 +45,7 @@ void md_signer_cancel(MdSignerCancel *c) {
     if (c) atomic_store(&c->cancelled, true);
 }
 void md_signer_cancel_free(MdSignerCancel *c) { free(c); }
-static bool call_cancelled(const MdSignerCancel *c) {
+bool md_signer_cancelled(const MdSignerCancel *c) {
     return c && atomic_load(&c->cancelled);
 }
 
@@ -936,8 +936,8 @@ static int signer_call(MdSigner *s, const char *a, const char *b, char **out,
     md_signer_ref(s);
     signer_lock(s);
     bool live = signer_identity_can_switch(s);
-    int ret = call_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED : signer_ensure_key(s, live);
-    if (call_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
+    int ret = md_signer_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED : signer_ensure_key(s, live);
+    if (md_signer_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
     if (ret == MD_SIGNER_OK) {
         if (operation == 0 && s->ops->sign_event)
             ret = s->ops->sign_event(s, a, out);
@@ -946,9 +946,9 @@ static int signer_call(MdSigner *s, const char *a, const char *b, char **out,
         else if (operation == 2 && s->ops->nip44_decrypt)
             ret = s->ops->nip44_decrypt(s, a, b, out);
         else ret = MD_SIGNER_ERR_NOT_INIT;
-        int check = call_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED :
+        int check = md_signer_cancelled(cancel) ? MD_SIGNER_ERR_CANCELLED :
                     signer_ensure_key(s, live && operation != 0);
-        if (call_cancelled(cancel)) check = MD_SIGNER_ERR_CANCELLED;
+        if (md_signer_cancelled(cancel)) check = MD_SIGNER_ERR_CANCELLED;
         if (check != MD_SIGNER_OK) ret = check;
         if (ret == MD_SIGNER_OK && !*out) ret = MD_SIGNER_ERR_INVALID;
         if (ret == MD_SIGNER_OK && operation == 0) {
@@ -976,8 +976,12 @@ static int signer_call(MdSigner *s, const char *a, const char *b, char **out,
             if (requested) nostr_event_free(requested);
         }
     }
-    if (call_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
-    if (ret != MD_SIGNER_OK) { free(*out); *out = NULL; }
+    if (md_signer_cancelled(cancel)) ret = MD_SIGNER_ERR_CANCELLED;
+    if (ret != MD_SIGNER_OK) {
+        if (operation == 2 && *out) md_secure_zero(*out, strlen(*out));
+        free(*out);
+        *out = NULL;
+    }
     pthread_mutex_unlock(&s->sync->op_mu);
     md_signer_destroy(s);
     return ret;

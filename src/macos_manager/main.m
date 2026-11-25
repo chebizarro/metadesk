@@ -75,7 +75,7 @@ static NSString *PermissionText(MDPermission state) {
     _worker = dispatch_queue_create("metadesk.macos-manager", DISPATCH_QUEUE_SERIAL);
     NSTabView *tabs = [[NSTabView alloc] init];
     NSStackView *page = Page(tabs, @"Hosts");
-    _stateDirectory = Field(page, @"Absolute path to the private cache directory");
+    _stateDirectory = Field(page, @"Default cache, or enter an absolute path");
     [page addArrangedSubview:Button(@"Read Cached Hosts", self, @selector(loadHosts:))];
     _hosts = Output(page, @"Reads the client role’s committed host keys using its external signer. "
                          "No relay sync or connect action in this prototype.");

@@ -115,6 +115,11 @@ NSString *MDFormatCachedHosts(const char *winner) {
 }
 
 NSString *MDCachedHosts(NSString *stateDirectory) {
+    if (!stateDirectory.length) {
+        char *path = md_managed_store_default_directory();
+        stateDirectory = path ? [NSString stringWithUTF8String:path] : nil;
+        free(path);
+    }
     if (![stateDirectory hasPrefix:@"/"]) return @"Enter an absolute path to an existing private state directory.";
     MdAccountStartup startup = {0};
     int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &startup);

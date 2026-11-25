@@ -68,6 +68,33 @@ trusting the relay's reconnect cursor. AUTH and retryable CLOSED recovery
 remain owned by the bridge and nostrc. Use `flush` to send an already-staged
 edit; retry sends its original signed event, not a new replacement.
 
+## SDL quick connect
+
+The SDL client reads the committed cache using its own current client-role
+binding, whether started from the Linux manager or from the CLI. Quick connect
+shows saved favorites, then deduplicated local recents. A row needs both saved
+membership and a metadata record. A pending Hosts, metadata or Favorites
+edit can hide an existing pin immediately: while the draft exists a key must
+be present in both the confirmed and draft versions of that document. A draft
+cannot add a selectable pin or change the connection data used for a pin. Opening the list and choosing a host
+read the cache on a worker without opening a management relay subscription or
+acquiring the writer lock. A signer that can decrypt the local cache is still
+required; offline cache access is not offline session establishment.
+
+The list is memory-only, and no new plaintext file or launch-channel payload
+is needed. Linux and macOS use `$XDG_STATE_HOME/metadesk` (or
+`~/.local/state/metadesk`); Windows uses `%LOCALAPPDATA%/metadesk`. The macOS
+manager uses that same default when its cache path field is empty. Saved aliases
+must still resolve to their pinned key. The overlay cannot add, update, or
+replace a pin. Switching discards the old session and starts a new pinned
+session using the original explicitly configured bootstrap relays. Without
+those relays the list remains viewable, but switching is disabled rather than
+using the CLI's implicit default. A one-off direct endpoint supplied for the
+initial connection is not inherited. The Linux
+manager's launch status ends with the session it originally launched. The
+read-only overlay does not record switch outcomes, so switches do not update
+recents; the manager records its own launch outcomes.
+
 ## Local data and compatibility
 
 Cache and outbox are one atomic encrypted-event journal per coordinate, with
