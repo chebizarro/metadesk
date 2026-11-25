@@ -14,12 +14,13 @@ manager_inc = include_directories('.')
 # Consume the shared core API, not its private raw nostrc OBJECT link inputs.
 dep_manager_core = declare_dependency(link_with : libmetadesk,
   include_directories : core_inc)
+manager_model_deps = [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson, cc.find_library('m')] + manager_status_deps
 manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c', 'launch.c'],
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson] + manager_status_deps,
+  dependencies : manager_model_deps,
   c_args : manager_status_args)
 dep_manager_model = declare_dependency(link_with : manager_model,
   include_directories : manager_inc,
-  dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson] + manager_status_deps,
+  dependencies : manager_model_deps,
   compile_args : manager_status_args)
 gnome = import('gnome')
 manager_resources = gnome.compile_resources('manager-resources', 'manager.gresource.xml',
