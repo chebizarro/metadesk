@@ -33,6 +33,7 @@ struct MdManagedStore {
     char owner[65];
     json_t *ready;
     bool latch_disabled;
+    bool read_only;
 #ifdef _WIN32
     MdWinDirectory *dir;
     HANDLE lock;
@@ -132,7 +133,7 @@ static bool owned(int fd, bool directory) {
 }
 #endif
 
-MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *path) {
+static MdManagedStore *open_store(MdAccountBinding *binding, const char *path, bool read_only) {
     if (!path || !binding || md_account_binding_role(binding) != MD_ACCOUNT_CLIENT ||
         !md_account_binding_is_current(binding)) return NULL;
     char *owner = NULL;
@@ -145,6 +146,7 @@ MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *pat
     free(owner);
     s->binding = md_account_binding_ref(binding);
     s->ready = json_object();
+    s->read_only = read_only;
 #ifdef _WIN32
     s->lock = INVALID_HANDLE_VALUE;
     MdWinDirectory *parent = md_win_directory(path, false);
@@ -155,26 +157,30 @@ MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *pat
         if (child) {
             const char *sep = (path[len - 1] == '\\' || path[len - 1] == '/') ? "" : "\\";
             snprintf(child, n, "%s%s%s", path, sep, s->owner);
-            s->dir = md_win_directory(child, true);
+            s->dir = md_win_directory(child, !read_only);
             free(child);
         }
         md_win_directory_close(parent);
     }
-    if (s->dir) s->lock = md_win_file(s->dir, "store.lock", GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, 0);
-    bool locked = s->lock != INVALID_HANDLE_VALUE;
+    if (s->dir && !read_only)
+        s->lock = md_win_file(s->dir, "store.lock", GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, 0);
+    bool opened = read_only ? s->dir != NULL : s->lock != INVALID_HANDLE_VALUE;
 #else
     s->dir = s->lock = -1;
     int parent = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (owned(parent, true) && (!mkdirat(parent, s->owner, 0700) || errno == EEXIST)) {
+    if (owned(parent, true) && (read_only || !mkdirat(parent, s->owner, 0700) || errno == EEXIST)) {
         s->dir = openat(parent, s->owner, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (owned(s->dir, true) && !fsync(parent))
+        if (!read_only && owned(s->dir, true) && !fsync(parent))
             s->lock = openat(s->dir, "store.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
     }
     if (parent >= 0) close(parent);
-    bool locked = owned(s->lock, false) && !flock(s->lock, LOCK_EX | LOCK_NB);
+    bool opened = read_only ? owned(s->dir, true) : owned(s->lock, false) && !flock(s->lock, LOCK_EX | LOCK_NB);
 #endif
-    if (!locked || !s->ready || !current(s)) { md_managed_store_close(s); return NULL; }
+    if (!opened || !s->ready || !current(s)) { md_managed_store_close(s); return NULL; }
     return s;
+}
+MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *path) {
+    return open_store(binding, path, false);
 }
 void md_managed_store_close(MdManagedStore *s) {
     if (!s) return;
@@ -200,6 +206,7 @@ static void file_name(const char *name, char out[64]) {
     out[i] = 0;
 }
 static bool write_json(MdManagedStore *s, const char *coordinate, json_t *j) {
+    if (s->read_only) return false;
     char name[64];
     file_name(coordinate, name);
     if (!current(s)) return false;
@@ -240,7 +247,8 @@ static json_t *read_json(MdManagedStore *s, const char *coordinate, FileState *s
     unsigned char *buf = NULL;
     size_t used = 0;
 #ifdef _WIN32
-    HANDLE f = md_win_file(s->dir, name, GENERIC_READ, OPEN_EXISTING, FILE_SHARE_READ);
+    DWORD share = FILE_SHARE_READ | (s->read_only ? FILE_SHARE_DELETE : 0);
+    HANDLE f = md_win_file(s->dir, name, GENERIC_READ, OPEN_EXISTING, share);
     if (f == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND) *state = FILE_MISSING;
         return NULL;
@@ -924,6 +932,78 @@ MdStoreResult md_managed_store_record(MdManagedStore *s, const char *pk, int64_t
     ok = ok && write_json(s,"local-recents",j);
     json_decref(j);
     return ok ? MD_STORE_OK : MD_STORE_IO;
+}
+
+static const char *host_member(const json_t *tag) {
+    const char *type = json_string_value(json_array_get(tag, 0));
+    return type && !strcmp(type, "p") ? json_string_value(json_array_get(tag, 1)) : NULL;
+}
+
+static json_t *read_cached_winner(MdManagedStore *s, const char *coordinate) {
+    Journal j = {0};
+    json_t *doc = NULL;
+    if (current(s) && load(s, coordinate, &j)) {
+        if (!j.winner) doc = json_array();
+        else if (decode(s, doc_kind(coordinate), j.winner, &doc) != MD_STORE_OK) {
+            md_managed_store_discard_plaintext(doc);
+            doc = NULL;
+        }
+    }
+    dispose(&j);
+    return doc;
+}
+
+struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const char *path) {
+    MdManagedStore *s = open_store(binding, path, true);
+    if (!s) return NULL;
+    json_t *hosts = read_cached_winner(s, MD_STORE_HOSTS);
+    json_t *meta = hosts ? read_cached_winner(s, MD_STORE_MANAGEMENT) : NULL;
+    json_t *favorites = meta ? read_cached_winner(s, MD_STORE_FAVORITES) : NULL;
+    json_t *recent = recents(s), *out = NULL;
+    json_t *saved = json_object(), *seen = json_object();
+    if (!hosts || !meta || !favorites || !recent || !saved || !seen) goto done;
+    out = json_array();
+    if (!out) goto done;
+
+    size_t i;
+    json_t *v;
+    json_array_foreach(hosts, i, v) {
+        const char *key = host_member(v);
+        if (key && json_object_set(saved, key, json_true())) goto failed;
+    }
+    const char *const fields[] = {"label", "nip05", "relay_hints", "port", "requested_caps"};
+    for (unsigned group = 0; group < 2; ++group) {
+        json_array_foreach(group == 0 ? favorites : recent, i, v) {
+            const char *key = group == 0 ? host_member(v) : field(v, "pubkey");
+            if (!key || !json_object_get(saved, key) || json_object_get(seen, key)) continue;
+            json_t *record = json_object_get(json_object_get(meta, "hosts"), key);
+            /* The manager saves a metadata record for every reviewed pin.
+             * A missing record may be a partial delete/replacement; never
+             * reinterpret a formerly aliased host as a raw key. */
+            if (!json_is_object(record)) continue;
+            json_t *row = json_pack("{s:s,s:b}", "pubkey", key, "favorite", group == 0);
+            if (!row) goto failed;
+            if (json_array_append_new(out, row)) goto failed;
+            for (size_t k = 0; k < sizeof(fields)/sizeof(fields[0]); ++k) {
+                json_t *value = json_object_get(record, fields[k]);
+                if (value && json_object_set_new(row, fields[k], json_deep_copy(value))) goto failed;
+            }
+            if (json_object_set(seen, key, json_true())) goto failed;
+        }
+    }
+    if (current(s)) goto done;
+failed:
+    md_managed_store_discard_plaintext(out);
+    out = NULL;
+done:
+    md_managed_store_discard_plaintext(hosts);
+    md_managed_store_discard_plaintext(meta);
+    md_managed_store_discard_plaintext(favorites);
+    md_managed_store_discard_plaintext(recent);
+    json_decref(saved);
+    json_decref(seen);
+    md_managed_store_close(s);
+    return out;
 }
 
 static MdStoreResult exchange(const char *input, char **result, bool importing) {

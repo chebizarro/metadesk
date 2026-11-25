@@ -29,23 +29,32 @@ typedef struct MdOverlay MdOverlay;
 typedef enum {
     MD_CLIENT_IDLE, MD_CLIENT_FIPS, MD_CLIENT_NEGOTIATING,
     MD_CLIENT_CONNECTING, MD_CLIENT_BINDING, MD_CLIENT_STREAMING,
-    MD_CLIENT_BACKOFF,
+    MD_CLIENT_BACKOFF, MD_CLIENT_RESOLVE, MD_CLIENT_RELAY,
 } MdClientPhase;
 typedef enum {
     MD_CLIENT_ERROR_NONE, MD_CLIENT_ERROR_FIPS, MD_CLIENT_ERROR_ADMISSION,
     MD_CLIENT_ERROR_TRANSPORT, MD_CLIENT_ERROR_BINDING,
+    MD_CLIENT_ERROR_RESOLVE, MD_CLIENT_ERROR_RELAY,
 } MdClientError;
 typedef enum {
     MD_OVERLAY_NONE, MD_OVERLAY_DISCONNECT, MD_OVERLAY_RETRY, MD_OVERLAY_QUIT,
+    MD_OVERLAY_LOAD_HOSTS, MD_OVERLAY_SWITCH_HOST,
 } MdOverlayAction;
 
 const char *md_client_phase_label(MdClientPhase phase);
 const char *md_client_error_label(MdClientError error);
 MdOverlayAction md_overlay_take_action(MdOverlay *o);
+void md_overlay_take_host(MdOverlay *o, char pin[65]);
+void md_overlay_reset_session(MdOverlay *o);
+
+struct json_t;
 
 /* Overlay stats shown to user */
 typedef struct {
     const MdCaptureOutputs *outputs;
+    const struct json_t *quick_hosts;
+    const char *current_pin;
+    bool quick_available, quick_loading, quick_configured;
     MdQuality quality;
     bool quality_supported;
     float  latency_ms;       /* total pipeline latency             */

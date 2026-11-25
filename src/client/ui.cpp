@@ -24,6 +24,7 @@
 
 #include <SDL2/SDL.h>
 #include "session.h"
+#include <jansson.h>
 
 #include <cstdlib>
 #include <cstdio>
@@ -34,6 +35,8 @@
 struct MdOverlay {
     bool           visible;
     MdOverlayAction action;
+    bool quick_open;
+    char quick_pin[65];
     char output[32];
     bool output_changed;
     MdQuality quality;
@@ -147,6 +150,8 @@ bool md_overlay_handle_sdl_event(MdOverlay *o, void *event) {
 
 const char *md_client_phase_label(MdClientPhase phase) {
     switch (phase) {
+    case MD_CLIENT_RESOLVE: return "Verifying saved host identity";
+    case MD_CLIENT_RELAY: return "Connecting to signaling relays";
     case MD_CLIENT_FIPS: return "FIPS readiness / route";
     case MD_CLIENT_NEGOTIATING: return "Negotiating (relay / authorization)";
     case MD_CLIENT_CONNECTING: return "Connecting";
@@ -158,6 +163,8 @@ const char *md_client_phase_label(MdClientPhase phase) {
 }
 const char *md_client_error_label(MdClientError error) {
     switch (error) {
+    case MD_CLIENT_ERROR_RESOLVE: return "Saved host identity";
+    case MD_CLIENT_ERROR_RELAY: return "Signaling relays";
     case MD_CLIENT_ERROR_FIPS: return "FIPS route / daemon";
     case MD_CLIENT_ERROR_ADMISSION: return "Session authorization / relay";
     case MD_CLIENT_ERROR_TRANSPORT: return "Transport connection";
@@ -170,6 +177,77 @@ MdOverlayAction md_overlay_take_action(MdOverlay *o) {
     MdOverlayAction action = o->action;
     o->action = MD_OVERLAY_NONE;
     return action;
+}
+
+void md_overlay_take_host(MdOverlay *o, char pin[65]) {
+    std::memcpy(pin, o->quick_pin, sizeof(o->quick_pin));
+    std::memset(o->quick_pin, 0, sizeof(o->quick_pin));
+}
+
+void md_overlay_reset_session(MdOverlay *o) {
+    if (!o) return;
+    o->output_changed = o->quality_changed = false;
+    o->quality_width = o->quality_height = o->quality_bitrate = o->quality_fps = 0;
+    o->smooth_latency = o->smooth_encode = o->smooth_decode = o->smooth_rtt = 0;
+    o->smooth_fps = o->smooth_bitrate = 0;
+}
+
+static void render_quick_connect(MdOverlay *o, const MdOverlayStats *stats) {
+    if (!stats->quick_available) { o->quick_open = false; return; }
+    if (ImGui::Button(o->quick_open ? "Close quick connect" : "Quick connect")) {
+        o->quick_open = !o->quick_open;
+        if (o->quick_open) o->action = MD_OVERLAY_LOAD_HOSTS;
+    }
+    if (!o->quick_open) return;
+    if (stats->quick_loading || o->action == MD_OVERLAY_LOAD_HOSTS) {
+        ImGui::TextUnformatted("Reading saved hosts…");
+        return;
+    }
+    if (!stats->quick_hosts) {
+        ImGui::TextWrapped("Saved hosts unavailable. Check the client signer and address book.");
+        return;
+    }
+    if (!json_array_size(stats->quick_hosts)) {
+        ImGui::TextUnformatted("No saved favorites or recent hosts.");
+        return;
+    }
+    if (stats->quick_configured)
+        ImGui::TextUnformatted("Choose a host to connect to:");
+    else
+        ImGui::TextWrapped("Start with a configured --relay to connect to saved hosts.");
+    ImGui::BeginChild("quick-hosts", ImVec2(0, 180), true);
+    int group = -1;
+    for (size_t i = 0; i < json_array_size(stats->quick_hosts); ++i) {
+        const json_t *row = json_array_get(stats->quick_hosts, i);
+        const char *pin = json_string_value(json_object_get(row, "pubkey"));
+        const char *label = json_string_value(json_object_get(row, "label"));
+        const char *alias = json_string_value(json_object_get(row, "nip05"));
+        int favorite = json_is_true(json_object_get(row, "favorite"));
+        if (favorite != group) {
+            ImGui::Separator();
+            ImGui::TextUnformatted(favorite ? "Favorites" : "Recent hosts");
+            group = favorite;
+        }
+        bool active = stats->connected && stats->current_pin && !std::strcmp(pin, stats->current_pin);
+        ImGui::PushID(pin);
+        // Draw untrusted labels as text, not as ImGui identifiers.
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        bool disabled = active || !stats->quick_configured;
+        if (ImGui::Selectable("##connect", active, disabled ? ImGuiSelectableFlags_Disabled : 0,
+                              ImVec2(0, 2 * ImGui::GetTextLineHeightWithSpacing()))) {
+            std::memcpy(o->quick_pin, pin, sizeof(o->quick_pin));
+            o->action = MD_OVERLAY_SWITCH_HOST;
+            o->quick_open = false;
+        }
+        ImVec2 next = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(pos);
+        const char *title = label && *label ? label : alias && *alias ? alias : "Saved host";
+        ImGui::TextUnformatted(title, title + std::strcspn(title, "\r\n"));
+        ImGui::Text("%.4s %.4s %.4s %.4s%s", pin, pin+4, pin+8, pin+12, active ? " — connected" : "");
+        ImGui::SetCursorScreenPos(next);
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
 }
 
 void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
@@ -264,6 +342,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
             }
         }
     }
+    render_quick_connect(o, stats);
     ImGui::TextWrapped("Phase: %s", md_client_phase_label(stats->phase));
     if (stats->error != MD_CLIENT_ERROR_NONE)
         ImGui::TextWrapped("Error: %s", md_client_error_label(stats->error));

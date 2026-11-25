@@ -96,6 +96,12 @@ MdStoreResult md_managed_store_export(const char *candidates, char **text);
 struct json_t;
 void md_managed_store_discard_plaintext(struct json_t *);
 
+/* Offline, read-only projection of committed cache, even with a writer open.
+ * Returns an owned array of saved hosts with metadata, favorites first then
+ * newest recents, deduplicated. NULL means unavailable, not an empty book.
+ * Release with md_managed_store_discard_plaintext(). */
+struct json_t *md_managed_store_quick_hosts(MdAccountBinding *, const char *state_directory);
+
 /* Shared with existing signer-backed ACL and quality writers. */
 NostrEvent *md_private_document_build(MdSigner *, const MdSignerCancel *,
     const char *author, int kind, const char *coordinate, const char *plaintext, int64_t at);

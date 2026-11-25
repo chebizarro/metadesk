@@ -328,6 +328,48 @@ static void check_exchange(void) {
     CHECK(!candidates);
     CHECK(md_managed_store_export("[{\"pubkey\":\"" HOST "\",\"relay_hints\":[\"wss://user:pass@example.org\"]}]",&text) == MD_STORE_INVALID);
 }
+static void check_offline_quick_hosts(MdManagedStore *s, MdAccountBinding *binding,
+        MdSigner *signer, const char *root, int64_t now) {
+    const char *const keys[] = {HOST, OTHER, HOST_PK, PK};
+    const char *const documents[] = {MD_STORE_HOSTS, MD_STORE_MANAGEMENT, MD_STORE_FAVORITES};
+    const char *const payloads[] = {
+        "[[\"p\",\"" HOST "\"],[\"p\",\"" OTHER "\"],[\"p\",\"" HOST_PK "\"]]",
+        "{\"schema_version\":1,\"hosts\":{\"" HOST "\":{\"label\":\"One\",\"notes\":\"" SECRET "\"},"
+        "\"" OTHER "\":{\"nip05\":\"desk@example.org\"},\"" PK "\":{}}}",
+        "[[\"p\",\"" PK "\"],[\"p\",\"" HOST_PK "\"],[\"p\",\"" HOST "\"]]",
+    };
+    for (size_t i = 0; i < 3; ++i) {
+        char *event = make(signer, PK, documents[i], i == 1 ? NOSTR_KIND_APPLICATION_SPECIFIC_DATA :
+            NOSTR_KIND_CATEGORIZED_PEOPLE_LIST, payloads[i], now);
+        CHECK(md_managed_store_receive(s, documents[i], event, now) == MD_STORE_OK);
+        free(event);
+    }
+    for (size_t i = 0; i < 4; ++i)
+        CHECK(md_managed_store_record(s, keys[i], now, MD_RECENT_CONNECTED) == MD_STORE_OK);
+    CHECK(md_managed_store_record(s, OTHER, now, MD_RECENT_CONNECTED) == MD_STORE_OK);
+    /* No live controller/REQ or unlocked writer is needed to read the cache. */
+    json_t *rows = md_managed_store_quick_hosts(binding, root);
+    CHECK(json_array_size(rows) == 2);
+    for (size_t i = 0; i < 2; ++i) {
+        json_t *row = json_array_get(rows, i);
+        CHECK(!strcmp(json_string_value(json_object_get(row, "pubkey")), keys[i]));
+        CHECK(json_is_true(json_object_get(row, "favorite")) == (i == 0));
+        CHECK(!json_object_get(row, "notes"));
+    }
+    CHECK(!strcmp(json_string_value(json_object_get(json_array_get(rows, 1), "nip05")), "desk@example.org"));
+    md_managed_store_discard_plaintext(rows);
+
+    /* After a manager deletes a pin, orphan favorites/recents cannot restore it. */
+    char *deleted = make(signer, PK, MD_STORE_HOSTS, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,
+        "[[\"p\",\"" OTHER "\"]]", now + 1);
+    CHECK(md_managed_store_receive(s, MD_STORE_HOSTS, deleted, now + 1) == MD_STORE_OK);
+    free(deleted);
+    rows = md_managed_store_quick_hosts(binding, root);
+    CHECK(json_array_size(rows) == 1);
+    CHECK(!strcmp(json_string_value(json_object_get(json_array_get(rows, 0), "pubkey")), OTHER));
+    md_managed_store_discard_plaintext(rows);
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     CHECK(argc == 6);
@@ -356,6 +398,7 @@ int main(int argc, char **argv) {
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_HOST,backend,HOST_PK,other));
     MdAccountBinding *host = md_accounts_acquire_role(accounts,MD_ACCOUNT_HOST);
     CHECK(host && !md_managed_store_open(host,argv[2]));
+    CHECK(!md_managed_store_quick_hosts(host, argv[2]));
     md_account_binding_release(host);
     MdAccountBinding *binding = md_accounts_acquire_role(accounts,MD_ACCOUNT_CLIENT);
     MdManagedStore *s = md_managed_store_open(binding,argv[2]);
@@ -568,8 +611,10 @@ int main(int argc, char **argv) {
     check_normalized_receipts(s,now);
     check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
+    check_offline_quick_hosts(s, binding, client, argv[2], now + 302);
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,backend,HOST_PK,other));
     CHECK(md_managed_store_read(s,MD_STORE_HOSTS,revision,NULL,NULL) == MD_STORE_REVOKED);
+    CHECK(!md_managed_store_quick_hosts(binding, argv[2]));
     md_managed_store_close(s);
     md_account_binding_release(binding);
     binding = md_accounts_acquire_role(accounts,MD_ACCOUNT_CLIENT);
