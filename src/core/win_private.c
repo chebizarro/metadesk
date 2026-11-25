@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#endif
 #include "win_private.h"
 #ifdef _WIN32
 #include <aclapi.h>
@@ -151,7 +156,8 @@ static wchar_t *child(MdWinDirectory *d, const char *name) {
     if (p) { wcscpy(p, d->path); p[len] = L'\\'; MultiByteToWideChar(CP_UTF8, 0, name, -1, p + len + 1, n); }
     return p;
 }
-HANDLE md_win_file(MdWinDirectory *d, const char *name, DWORD access, DWORD creation, DWORD share) {
+static HANDLE open_private_file(MdWinDirectory *d, const char *name, DWORD access,
+                                DWORD creation, DWORD share, DWORD flags) {
     wchar_t *path = child(d, name);
     PSECURITY_DESCRIPTOR sd = private_sd();
     if (!path || !sd) {
@@ -160,12 +166,15 @@ HANDLE md_win_file(MdWinDirectory *d, const char *name, DWORD access, DWORD crea
     }
     SECURITY_ATTRIBUTES sa = {sizeof(sa), sd, FALSE};
     HANDLE h = CreateFileW(path, access | READ_CONTROL, share, &sa, creation,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | flags, NULL);
     DWORD error = GetLastError();
     if (h != INVALID_HANDLE_VALUE && !private_handle(h, false)) {
         CloseHandle(h); h = INVALID_HANDLE_VALUE; error = ERROR_ACCESS_DENIED;
     }
     free(path); LocalFree(sd); SetLastError(error); return h;
+}
+HANDLE md_win_file(MdWinDirectory *d, const char *name, DWORD access, DWORD creation, DWORD share) {
+    return open_private_file(d, name, access, creation, share, 0);
 }
 bool md_win_read(HANDLE h, unsigned char **out, size_t *size, size_t max) {
     *out = NULL; *size = 0;
@@ -177,7 +186,28 @@ bool md_win_read(HANDLE h, unsigned char **out, size_t *size, size_t max) {
     if (!ok) { SecureZeroMemory(data, (size_t)n.QuadPart); free(data); return false; }
     *out = data; *size = used; return true;
 }
-bool md_win_replace(MdWinDirectory *d, const char *name, const void *data, size_t size) {
+/* MoveFileEx cannot replace an open destination, even if it shares delete.
+ * FileRenameInfoEx keeps the old snapshot readable on existing handles. */
+static bool rename_snapshot(MdWinDirectory *d, const char *tmp, const wchar_t *dst) {
+    size_t len = wcslen(dst) * sizeof(*dst);
+    size_t bytes = sizeof(FILE_RENAME_INFO) + len;
+    FILE_RENAME_INFO *info = calloc(1, bytes);
+    if (!info) return false;
+    info->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    info->FileNameLength = (DWORD)len;
+    memcpy(info->FileName, dst, len);
+    /* FlushFileBuffers already handled the contents. Request write-through
+     * for metadata as well; the rename handle must not deny new reads. */
+    HANDLE h = open_private_file(d, tmp, DELETE, OPEN_EXISTING,
+                                 FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_FLAG_WRITE_THROUGH);
+    bool ok = h != INVALID_HANDLE_VALUE &&
+        SetFileInformationByHandle(h, FileRenameInfoEx, info, (DWORD)bytes);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    free(info);
+    return ok;
+}
+static bool replace_file(MdWinDirectory *d, const char *name, const void *data, size_t size,
+                         bool snapshot) {
     static LONG serial;
     char tmp[80];
     snprintf(tmp, sizeof(tmp), ".write.%lu.%ld.tmp", GetCurrentProcessId(), InterlockedIncrement(&serial));
@@ -192,9 +222,16 @@ bool md_win_replace(MdWinDirectory *d, const char *name, const void *data, size_
     bool absent = old == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND;
     if (old != INVALID_HANDLE_VALUE) CloseHandle(old);
     ok = ok && (old != INVALID_HANDLE_VALUE || absent) && src && dst &&
-        MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        (snapshot ? rename_snapshot(d, tmp, dst) :
+         MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH));
     if (!ok && src) DeleteFileW(src);
     free(src); free(dst); return ok;
+}
+bool md_win_replace(MdWinDirectory *d, const char *name, const void *data, size_t size) {
+    return replace_file(d, name, data, size, false);
+}
+bool md_win_replace_snapshot(MdWinDirectory *d, const char *name, const void *data, size_t size) {
+    return replace_file(d, name, data, size, true);
 }
 bool md_win_remove(MdWinDirectory *d, const char *name) {
     HANDLE h = md_win_file(d, name, DELETE, OPEN_EXISTING, 0);
