@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import "model.h"
+#import "hosts_page.h"
 #include <signal.h>
 
 static NSButton *Button(NSString *title, id target, SEL action) {
@@ -58,29 +59,30 @@ static NSString *PermissionText(MDPermission state) {
     }
 }
 
-@interface Manager : NSObject <NSApplicationDelegate>
+@interface Manager : NSObject <NSApplicationDelegate, NSTabViewDelegate>
 @end
 
 @implementation Manager {
     NSWindow *_window;
-    NSTextField *_endpoint, *_stateDirectory, *_address, *_relay;
-    NSTextView *_host, *_hosts, *_identity, *_routes, *_access, *_activity;
+    NSTextField *_endpoint, *_address, *_relay;
+    NSTextView *_host, *_identity, *_routes, *_access, *_activity;
+    MDHostsPage *_hostsPage;
     dispatch_queue_t _worker;
     NSUInteger _pendingJobs;
-    BOOL _terminationPending;
+    BOOL _terminationPending, _hostsDrained;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     _worker = dispatch_queue_create("metadesk.macos-manager", DISPATCH_QUEUE_SERIAL);
     NSTabView *tabs = [[NSTabView alloc] init];
-    NSStackView *page = Page(tabs, @"Hosts");
-    _stateDirectory = Field(page, @"Default cache, or enter an absolute path");
-    [page addArrangedSubview:Button(@"Read Cached Hosts", self, @selector(loadHosts:))];
-    _hosts = Output(page, @"Reads the client role’s committed host keys using its external signer. "
-                         "No relay sync or connect action in this prototype.");
+    _hostsPage = [MDHostsPage new];
+    NSTabViewItem *hosts = [[NSTabViewItem alloc] initWithIdentifier:@"Hosts"];
+    hosts.label = @"Hosts";
+    hosts.view = _hostsPage.view;
+    [tabs addTabViewItem:hosts];
 
-    page = Page(tabs, @"This Computer");
+    NSStackView *page = Page(tabs, @"This Computer");
     _endpoint = Field(page, @"Absolute path to the host’s management socket");
     NSStackView *buttons = [NSStackView stackViewWithViews:@[
         Button(@"Recheck Host", self, @selector(loadHost:)),
@@ -113,13 +115,20 @@ static NSString *PermissionText(MDPermission state) {
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
         backing:NSBackingStoreBuffered defer:NO];
     _window.releasedWhenClosed = NO;
-    _window.title = @"Metadesk Manager — Prototype";
+    _window.title = @"Metadesk Manager";
+    _window.restorable = NO;
     _window.contentMinSize = NSMakeSize(650, 410);
     _window.contentView = tabs;
     [tabs selectTabViewItemAtIndex:1];
+    tabs.delegate = self;
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)item {
+    (void)tabView;
+    if ([item.identifier isEqual:@"Hosts"]) [_hostsPage activate];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
@@ -129,8 +138,13 @@ static NSString *PermissionText(MDPermission state) {
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     (void)app;
-    if (!_pendingJobs) return NSTerminateNow;
-    _terminationPending = YES;
+    if (!_terminationPending) {
+        _terminationPending = YES;
+        [_hostsPage close:^{
+            self->_hostsDrained = YES;
+            if (!self->_pendingJobs) [NSApp replyToApplicationShouldTerminate:YES];
+        }];
+    }
     return NSTerminateLater;
 }
 
@@ -142,7 +156,7 @@ static NSString *PermissionText(MDPermission state) {
         id result = work();
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(result);
-            if (--self->_pendingJobs == 0 && self->_terminationPending)
+            if (--self->_pendingJobs == 0 && self->_terminationPending && self->_hostsDrained)
                 [NSApp replyToApplicationShouldTerminate:YES];
         });
     });
@@ -157,11 +171,6 @@ static NSString *PermissionText(MDPermission state) {
 
 - (void)loadAccounts:(NSButton *)button {
     [self read:^{ return MDAccountsSummary(); } output:_identity sender:button];
-}
-
-- (void)loadHosts:(NSButton *)button {
-    NSString *directory = [_stateDirectory.stringValue copy];
-    [self read:^{ return MDCachedHosts(directory); } output:_hosts sender:button];
 }
 
 - (void)preview:(NSButton *)button {

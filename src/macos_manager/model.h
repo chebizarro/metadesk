@@ -8,7 +8,4 @@ NSURL *MDPermissionSettingsURL(MDPermissionKind kind);
 NSDictionary *MDHostRead(NSString *socketPath);
 NSString *MDPublicIdentity(const char *hex);
 NSString *MDAccountsSummary(void);
-NSString *MDCachedHosts(NSString *stateDirectory);
-/* Testable projections; cache contains only the store's committed winner. */
-NSString *MDFormatCachedHosts(const char *winner);
 NSString *MDRoutePreview(NSString *address, NSString *relay);

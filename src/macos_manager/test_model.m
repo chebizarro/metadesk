@@ -1,7 +1,6 @@
 #import "model.h"
 #include "md_test.h"
 #include <cjson/cJSON.h>
-#include "managed_store.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,12 +59,6 @@ static void check_keys(void) {
     NSString *key = MDPublicIdentity(KEY);
     MD_CHECK([key hasPrefix:@"npub1"] && [key hasSuffix:@"79be 667e f9dc bbac"]);
     MD_CHECK(!MDPublicIdentity("invalid"));
-    MD_CHECK([MDFormatCachedHosts("[[\"extension\",\"value\"],[\"p\",\"" KEY "\"]]") isEqualToString:key]);
-    MD_CHECK([MDFormatCachedHosts("[]") containsString:@"empty"]);
-    MD_CHECK([MDFormatCachedHosts(NULL) containsString:@"No committed"]);
-    MD_CHECK([MDFormatCachedHosts("not JSON") containsString:@"unavailable"]);
-    MD_CHECK([MDFormatCachedHosts("[[\"p\",\"no key\"]]") containsString:@"unavailable"]);
-    MD_CHECK([MDCachedHosts(@"relative/path") containsString:@"absolute"]);
     MD_CHECK([MDRoutePreview(@KEY, @"") containsString:@"No bootstrap relay selected"]);
     MD_CHECK([MDRoutePreview(@KEY, @"wss://EXAMPLE.COM/") containsString:@"wss://example.com"]);
     MD_CHECK([MDRoutePreview(@KEY, @"https://example.com") containsString:@"Invalid relay URL"]);
@@ -73,50 +66,9 @@ static void check_keys(void) {
     MD_CHECK([MDRoutePreview(@"name@example.com", @"") containsString:@"not part of this offline preview"]);
 }
 
-/* Real saved metadata snapshot, fake signer restoration and encrypted store.
- * Opaque tokens must never reach a real signer or store function. */
-static char binding_token, store_token;
-static int startup_error;
-static MdStoreResult store_status;
-static const char *store_winner;
-static unsigned store_opens, store_closes;
-
-int md_account_startup_open(MdAccountRole role, MdAccountStartup *startup) {
-    MD_CHECK(role == MD_ACCOUNT_CLIENT);
-    if (startup_error) return startup_error;
-    int rc = md_accounts_open_snapshot(NULL, NULL, &startup->accounts);
-    if (!rc && md_accounts_role(startup->accounts, role))
-        startup->binding = (MdAccountBinding *)&binding_token;
-    return rc;
-}
-
-void md_account_startup_clear(MdAccountStartup *startup) {
-    MD_CHECK(!startup->binding || startup->binding == (MdAccountBinding *)&binding_token);
-    MD_CHECK(store_opens == store_closes);
-    md_accounts_destroy(startup->accounts);
-}
-
-MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *directory) {
-    MD_CHECK(binding == (MdAccountBinding *)&binding_token);
-    MD_CHECK(directory && directory[0] == '/');
-    ++store_opens;
-    return (MdManagedStore *)&store_token;
-}
-
-MdStoreResult md_managed_store_read(MdManagedStore *store, const char *coordinate,
-                                   char revision[65], char **winner, char **pending) {
-    MD_CHECK(store == (MdManagedStore *)&store_token && !strcmp(coordinate, MD_STORE_HOSTS));
-    MD_CHECK(!revision && winner && !pending);
-    if (winner) *winner = store_winner ? strdup(store_winner) : NULL;
-    return store_status;
-}
-
-void md_managed_store_close(MdManagedStore *store) {
-    MD_CHECK(store == (MdManagedStore *)&store_token);
-    ++store_closes;
-}
-
-static void check_accounts_and_cache(void) {
+/* Read real fixture metadata without restoring a signer. The replacement
+ * Hosts model exercises encrypted cache and sync with a fixture binding. */
+static void check_accounts(void) {
     NSFileManager *files = NSFileManager.defaultManager;
     NSString *home = [files.temporaryDirectory.path stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     NSDictionary *directoryMode = @{NSFilePosixPermissions: @0700};
@@ -141,7 +93,6 @@ static void check_accounts_and_cache(void) {
         if (!created) return;
         NSString *emptySummary = MDAccountsSummary();
         MD_CHECK_MSG([emptySummary containsString:@"Client role\nNot assigned\n\nHost role\nNot assigned"], emptySummary.UTF8String);
-        MD_CHECK([MDCachedHosts(home) containsString:@"Assign a client role"] && store_opens == 0);
         NSString *pair = @"{\"backend\":\"nip46\",\"pubkey\":\"" KEY "\"}";
         NSString *metadata = [NSString stringWithFormat:
             @"{\"version\":1,\"accounts\":[{\"backend\":\"nip46\",\"pubkey\":\"" KEY "\",\"label\":\"Fixture Account\"}],"
@@ -153,32 +104,6 @@ static void check_accounts_and_cache(void) {
         NSString *summary = MDAccountsSummary();
         MD_CHECK([summary containsString:@"Client role\nFixture Account · nip46\nnpub1"]);
         MD_CHECK([summary containsString:@"79be 667e f9dc bbac\n\nHost role\nNot assigned"]);
-        startup_error = MD_CREDENTIAL_LOCKED;
-        NSString *locked = MDCachedHosts(home);
-        MD_CHECK([locked containsString:@"Keychain"] && [locked containsString:@"no external signer was reached"]);
-        MD_CHECK(store_opens == 0);
-        startup_error = 0;
-
-        store_status = MD_STORE_OK;
-        MD_CHECK([MDCachedHosts(home) containsString:@"No committed Hosts list"]);
-        store_winner = "[[\"p\",\"" KEY "\"]]";
-        const MdStoreResult statuses[] = {MD_STORE_PENDING, MD_STORE_PARTIAL, MD_STORE_CONFLICT};
-        NSArray<NSString *> *draftMessages = @[@"pending publication", @"partially acknowledged", @"conflicts"];
-        for (size_t i = 0; i < sizeof(statuses)/sizeof(*statuses); i++) {
-            store_status = statuses[i];
-            NSString *message = MDCachedHosts(home);
-            MD_CHECK([message containsString:draftMessages[i]] && [message containsString:MDPublicIdentity(KEY)]);
-        }
-        store_winner = NULL;
-        const MdStoreResult errors[] = {MD_STORE_READ_ONLY, MD_STORE_IO, MD_STORE_REVOKED};
-        NSArray<NSString *> *errorMessages = @[@"unreadable", @"from disk", @"no longer current"];
-        for (size_t i = 0; i < sizeof(errors)/sizeof(*errors); i++) {
-            store_status = errors[i];
-            NSString *message = MDCachedHosts(home);
-            MD_CHECK([message containsString:errorMessages[i]] && ![message containsString:@"empty"] &&
-                     ![message containsString:@"No committed"]);
-        }
-        MD_CHECK(store_opens == 7 && store_closes == store_opens);
     } @finally {
         MD_CHECK(!(previousHome ? setenv("HOME", previousHome, 1) : unsetenv("HOME")));
         free(previousHome);
@@ -190,7 +115,7 @@ int main(void) {
     @autoreleasepool {
         check_permissions();
         check_keys();
-        check_accounts_and_cache();
+        check_accounts();
     }
     return md_test_report();
 }

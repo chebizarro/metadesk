@@ -2,10 +2,8 @@
 
 #include "accounts.h"
 #include "identity_resolver.h"
-#include "managed_store.h"
 #include "management_ipc.h"
 #include "relay_plan.h"
-#include <openssl/crypto.h>
 #include <string.h>
 
 static NSDictionary *Object(id value) {
@@ -94,95 +92,6 @@ NSString *MDAccountsSummary(void) {
         [summary appendFormat:@"\n\n%@", Account(md_accounts_at(accounts, i))];
     md_accounts_destroy(accounts);
     return summary;
-}
-
-NSString *MDFormatCachedHosts(const char *winner) {
-    if (!winner) return @"No committed Hosts list in this cache. Live history was not checked.";
-    id tags = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytesNoCopy:(void *)winner
-        length:strlen(winner) freeWhenDone:NO] options:0 error:nil];
-    if (![tags isKindOfClass:NSArray.class]) return @"Cached Hosts list unavailable.";
-    NSMutableArray<NSString *> *rows = [NSMutableArray array];
-    for (id tag in tags) {
-        if (![tag isKindOfClass:NSArray.class] || ![tag count] || ![tag[0] isKindOfClass:NSString.class])
-            return @"Cached Hosts list unavailable.";
-        if (![tag[0] isEqual:@"p"]) continue;
-        if ([tag count] != 2 || ![tag[1] isKindOfClass:NSString.class]) return @"Cached Hosts list unavailable.";
-        NSString *key = MDPublicIdentity([tag[1] UTF8String]);
-        if (!key) return @"Cached Hosts list unavailable.";
-        [rows addObject:key];
-    }
-    return rows.count ? [rows componentsJoinedByString:@"\n\n"] : @"The cached Hosts list is empty.";
-}
-
-NSString *MDCachedHosts(NSString *stateDirectory) {
-    if (!stateDirectory.length) {
-        char *path = md_managed_store_default_directory();
-        stateDirectory = path ? [NSString stringWithUTF8String:path] : nil;
-        free(path);
-    }
-    if (![stateDirectory hasPrefix:@"/"]) return @"Enter an absolute path to an existing private state directory.";
-    MdAccountStartup startup = {0};
-    int rc = md_account_startup_open(MD_ACCOUNT_CLIENT, &startup);
-    NSString *result;
-    if (rc) {
-        switch (rc) {
-        case MD_CREDENTIAL_NOT_FOUND: case MD_CREDENTIAL_LOCKED: case MD_CREDENTIAL_UNAVAILABLE:
-        case MD_CREDENTIAL_INVALID: case MD_CREDENTIAL_FAILED: case MD_CREDENTIAL_AMBIGUOUS:
-            result = [NSString stringWithFormat:@"Local NIP-46 credential access failed: %s. "
-                "Check this build’s Keychain access and saved pairing; no external signer was reached.",
-                md_credential_error_string(rc)];
-            break;
-        default:
-            result = [NSString stringWithFormat:@"Could not load the client role: %s\n"
-                "If the signer is unavailable, check it separately; Metadesk has no password.", md_accounts_error_string(rc)];
-            break;
-        }
-    }
-    else if (!startup.binding) result = @"Assign a client role with the account CLI before reading its cache.";
-    else {
-        MdManagedStore *store = md_managed_store_open(startup.binding, stateDirectory.fileSystemRepresentation);
-        if (!store) result = @"Cache unavailable. Check the private directory and close other readers or writers for this account.";
-        else {
-            char *winner = NULL;
-            MdStoreResult status = md_managed_store_read(store, MD_STORE_HOSTS, NULL, &winner, NULL);
-            switch (status) {
-            case MD_STORE_OK:
-                result = MDFormatCachedHosts(winner);
-                break;
-            case MD_STORE_PENDING:
-                result = [@"A local draft is pending publication. Showing only the committed cache.\n\n"
-                    stringByAppendingString:MDFormatCachedHosts(winner)];
-                break;
-            case MD_STORE_PARTIAL:
-                result = [@"Publication is only partially acknowledged. Showing the committed cache.\n\n"
-                    stringByAppendingString:MDFormatCachedHosts(winner)];
-                break;
-            case MD_STORE_CONFLICT:
-                result = [@"A local draft conflicts with the cached winner. Showing only the committed cache.\n\n"
-                    stringByAppendingString:MDFormatCachedHosts(winner)];
-                break;
-            case MD_STORE_READ_ONLY:
-                result = @"The cached Hosts list is unreadable or uses an unsupported schema.";
-                break;
-            case MD_STORE_IO:
-                result = @"Could not read the cached Hosts list from disk.";
-                break;
-            case MD_STORE_REVOKED:
-                result = @"The client role is no longer current. Refresh the saved roles before reading the cache again.";
-                break;
-            case MD_STORE_SIGNER:
-                result = @"The external signer could not decrypt the cache. Check the signer and try again.";
-                break;
-            default:
-                result = @"The cached Hosts list is unreadable; it was not treated as empty.";
-                break;
-            }
-            if (winner) { OPENSSL_cleanse(winner, strlen(winner)); free(winner); }
-            md_managed_store_close(store);
-        }
-    }
-    md_account_startup_clear(&startup);
-    return result;
 }
 
 NSString *MDRoutePreview(NSString *address, NSString *relay) {
