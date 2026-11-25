@@ -7,7 +7,10 @@ release assets, not auto-generated Git snapshots.
 
 Two independent application manifests, GNOME Platform/SDK 49:
 `org.metadesk.Client.json` and `org.metadesk.Manager.json`. The manager consumes
-merged md-fbg4 with `-Dmanager=true`; it does not embed or start a host daemon.
+`-Dmanager=true` and includes its own client; it does not embed or start a host
+daemon. QR display and image scanning are available in native Manager packages
+and QR-enabled source builds. The Manager Flatpak uses `-Dmanager_qr=disabled`
+and does not bundle libqrencode or ZBar pending `md-rvu4`.
 
 Dependencies are pinned in `modules.json`. nostrc
 `6f7a8d025768d497bef700fe55eea1c687dac328` is installed to a private SDK

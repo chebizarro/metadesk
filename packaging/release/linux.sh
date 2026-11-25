@@ -172,13 +172,17 @@ build_flatpak() {
     flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
     flatpak install --user --noninteractive --no-related flathub org.gnome.Platform//49 org.gnome.Sdk//49
     locked_download "$ffmpeg_pin" "$ffmpeg_archive"
-    local product id root name encoders
+    local product id root name encoders manifest
     encoders=$(packaging/ffmpeg/profile-encoders.sh flatpak "$arch" | tr ',' ' ')
-    for product in Client Manager; do
+    for product in Manager Client; do
         id=org.metadesk.$product
+        manifest=$src/packaging/flatpak/$id.json
         appstreamcli validate --no-net "packaging/flatpak/assets/$id.metainfo.xml"
         root=$work/$product
         packaging/flatpak/build.sh "$product" "$root"
+        if [[ $product == Manager ]]; then
+            flatpak run --user --command=/app/bin/metadesk-client "$id" --help
+        fi
         local deployed
         deployed=$(flatpak info --user --show-location "$id")/files
         reject_codecs "$deployed"
@@ -193,9 +197,14 @@ build_flatpak() {
         (cd "$deployed" && find . -type f -name '*.so*' -exec sha256sum {} +) | \
             jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  \\./(?<key>.+)$") | {key,value:{sha256}}] | from_entries' \
             > "$work/libraries.json"
-        jq --rawfile refs "$work/runtime-refs.txt" --slurpfile libs "$work/libraries.json" \
-            --arg app_commit "$(flatpak info --user --show-commit "$id")" \
-            '. + {flatpak_refs:$refs, app_commit:$app_commit, libraries:$libs[0]}' "$modules" > "$work/inventory.json"
+        # Include the frontend module (which also builds the Manager's client).
+        # Keep common module records verbatim for the reviewed-source verifier.
+        jq -e --slurpfile common "$modules" --rawfile refs "$work/runtime-refs.txt" \
+            --slurpfile libs "$work/libraries.json" --arg app_commit "$(flatpak info --user --show-commit "$id")" '
+            {modules: [.modules[] | if . == "modules.json" then $common[0].modules[] else . end],
+             flatpak_refs:$refs, app_commit:$app_commit, libraries:$libs[0]}
+            | if all(.modules[]; type == "object") then . else error("unexpanded Flatpak module include") end
+            ' "$manifest" > "$work/inventory.json"
         record_asset "$name" "flatpak-$product" "$arch" unsigned "$work/inventory.json"
         rm -rf "$root" # Only this job's private builder state; keep disk for the next app.
     done

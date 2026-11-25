@@ -1,5 +1,7 @@
 #include "hosts-page.h"
+#ifdef MD_HAVE_MANAGER_QR
 #include "host-qr.h"
+#endif
 #include "launch.h"
 #include "managed_store_controller.h"
 #include "model.h"
@@ -17,7 +19,12 @@ static const char *const coordinates[NDOCS] = {MD_STORE_HOSTS, MD_STORE_MANAGEME
 
 typedef struct { char revision[65]; json_t *winner, *draft; MdStoreResult status; MdStoreSync sync; gboolean review_ready; } Doc;
 typedef struct { Doc doc[NDOCS]; json_t *recents; GHashTable *tags; gboolean store; } View;
-typedef enum { CONFIGURE, START_SYNC, READ, RESOLVE, EDIT, RETRY, RECORD, IMPORT, EXPORT, SCAN, CLOSE } Action;
+typedef enum {
+    CONFIGURE, START_SYNC, READ, RESOLVE, EDIT, RETRY, RECORD, IMPORT, EXPORT, CLOSE,
+#ifdef MD_HAVE_MANAGER_QR
+    SCAN,
+#endif
+} Action;
 typedef struct { char *d, *plain, rev[65]; MdStoreEdit mode; json_t *members; gboolean remove; } Edit;
 typedef struct {
     Action action;
@@ -41,7 +48,10 @@ typedef struct {
     GtkEntry *address, *route, *tag_filter;
     GtkSearchEntry *search;
     GtkListBox *saved, *quick;
-    GtkButton *review, *launch_cancel, *export_button, *import_button, *scan_button;
+    GtkButton *review, *launch_cancel, *export_button, *import_button;
+#ifdef MD_HAVE_MANAGER_QR
+    GtkButton *scan_button;
+#endif
     GtkLabel *error, *progress, *relay_diagnostic;
     AdwBanner *banner;
     GtkWidget *rotation;
@@ -279,11 +289,13 @@ static void work(GTask *task, gpointer source, gpointer data, GCancellable *canc
             j->action_ok = g_file_replace_contents(j->file, j->exchange, strlen(j->exchange), NULL, FALSE,
                 G_FILE_CREATE_PRIVATE | G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL, &j->error);
         break;
+#ifdef MD_HAVE_MANAGER_QR
     case SCAN: {
         g_autoptr(GBytes) bytes = read_file(j->file, 16 * 1024 * 1024, &j->error);
         if (bytes) j->address = md_manager_qr_scan(bytes, &j->error);
         break;
     }
+#endif
     case READ:
         break;
     case CLOSE:
@@ -328,10 +340,12 @@ static void completed(GObject *source, GAsyncResult *result, gpointer unused) {
             else gtk_label_set_text(p->error, j->error ? j->error->message : "This file is not a supported metadesk-hosts/1 address book");
         }
         if (j->action == EXPORT) gtk_label_set_text(p->error, j->action_ok ? "" : j->error ? j->error->message : "Could not export hosts to this file");
+#ifdef MD_HAVE_MANAGER_QR
         if (j->action == SCAN) {
             if (j->address) { gtk_editable_set_text(GTK_EDITABLE(p->address), j->address); gtk_widget_grab_focus(GTK_WIDGET(p->address)); }
             else gtk_label_set_text(p->error, j->error ? j->error->message : "No nprofile QR code found");
         }
+#endif
     }
     kick(p);
     if (p->application) g_application_release(G_APPLICATION(p->application));
@@ -985,7 +999,9 @@ static void render(Hosts *p) {
     gtk_widget_set_sensitive(GTK_WIDGET(p->review), !p->busy && can_review(p));
     gtk_widget_set_sensitive(GTK_WIDGET(p->export_button), !p->busy && p->view && p->view->store && readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]));
     gtk_widget_set_sensitive(GTK_WIDGET(p->import_button), !p->busy && writable(p, META) && writable(p, HOSTS));
+#ifdef MD_HAVE_MANAGER_QR
     gtk_widget_set_sensitive(GTK_WIDGET(p->scan_button), !p->busy);
+#endif
     const char *status = !p->key ? "Assign a client account in Identity" :
         !p->view || !p->view->store ? "Address book unavailable — check the client signer" :
         !p->relays || !*p->relays ? "Offline — choose bootstrap relays in Relays to connect" : NULL;
@@ -1232,7 +1248,11 @@ static void choose_file(Hosts *p, Action action) {
     GtkRoot *root = gtk_widget_get_root(p->page);
     if (!root || !GTK_IS_WINDOW(root)) return;
     g_autoptr(GtkFileDialog) dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, action == EXPORT ? "Export Saved Hosts" : action == IMPORT ? "Import Hosts" : "Open QR Code Image");
+    const char *title = action == EXPORT ? "Export Saved Hosts" : "Import Hosts";
+#ifdef MD_HAVE_MANAGER_QR
+    if (action == SCAN) title = "Open QR Code Image";
+#endif
+    gtk_file_dialog_set_title(dialog, title);
     FilePick *pick = g_new0(FilePick, 1);
     pick->page = g_object_ref(p->page);
     pick->action = action;
@@ -1243,7 +1263,9 @@ static void choose_file(Hosts *p, Action action) {
     } else gtk_file_dialog_open(dialog, GTK_WINDOW(root), NULL, file_chosen, pick);
 }
 static void import_clicked(GtkButton *button, gpointer data) { (void)button; choose_file(data, IMPORT); }
+#ifdef MD_HAVE_MANAGER_QR
 static void scan_clicked(GtkButton *button, gpointer data) { (void)button; choose_file(data, SCAN); }
+#endif
 static void export_response(AdwAlertDialog *dialog, const char *response, gpointer data) {
     (void)dialog;
     if (!strcmp(response, "export")) choose_file(data, EXPORT);
@@ -1462,8 +1484,10 @@ GtkWidget *md_manager_hosts_page_new(void) {
     gtk_box_append(p->content, GTK_WIDGET(p->review));
     g_signal_connect(p->address, "activate", G_CALLBACK(review_entry), p);
     g_signal_connect(p->route, "activate", G_CALLBACK(review_entry), p);
+#ifdef MD_HAVE_MANAGER_QR
     p->scan_button = GTK_BUTTON(button("Scan QR _Image…", G_CALLBACK(scan_clicked), p));
     gtk_box_append(p->content, GTK_WIDGET(p->scan_button));
+#endif
     p->error = GTK_LABEL(label(""));
     g_signal_connect(p->address, "changed", G_CALLBACK(address_changed), p);
     g_signal_connect(p->route, "changed", G_CALLBACK(address_changed), p);

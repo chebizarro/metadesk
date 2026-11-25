@@ -1,5 +1,7 @@
 #include "hosts-page.h"
+#ifdef MD_HAVE_MANAGER_QR
 #include "host-qr.h"
+#endif
 #include "managed_store.h"
 #include "model.h"
 #include "nostr.h"
@@ -202,6 +204,8 @@ int main(void) {
     WAIT_UNTIL(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)) == NULL &&
                find(page, NULL, "Keyboard-edited host") != NULL);
 
+#ifdef MD_HAVE_MANAGER_QR
+    g_assert_nonnull(find(page, NULL, "Scan QR _Image…"));
     /* The same QR generator/scanner used by the page must round-trip. */
     NostrProfilePointer ptr = {.public_key = HOST};
     char *profile = NULL;
@@ -212,6 +216,9 @@ int main(void) {
     g_autofree char *decoded = md_manager_qr_scan(png, NULL);
     g_assert_cmpstr(decoded, ==, profile);
     free(profile);
+#else
+    g_assert_null(find(page, NULL, "Scan QR _Image…"));
+#endif
     md_manager_hosts_configure(page, directory, HOST, NULL);
     GtkWidget *rotation = find(page, "client-key-rotation", NULL);
     g_assert_nonnull(rotation);

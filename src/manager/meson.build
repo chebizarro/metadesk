@@ -25,14 +25,40 @@ dep_manager_model = declare_dependency(link_with : manager_model,
 gnome = import('gnome')
 manager_resources = gnome.compile_resources('manager-resources', 'manager.gresource.xml',
   source_dir : meson.current_source_dir(), c_name : 'md_manager')
-manager_ui_deps = [dep_manager_model, dep_manager_gtk, dep_manager_adw, dependency('jansson'),
-  dependency('libqrencode'), dependency('zbar'), dependency('gdk-pixbuf-2.0')]
-manager_ui = static_library('metadesk-manager-ui', ['window.c', 'access-page.c', 'hosts-page.c', 'host-qr.c', manager_resources],
-  dependencies : manager_ui_deps)
+manager_ui_deps = [dep_manager_model, dep_manager_gtk, dep_manager_adw, dependency('jansson')]
+manager_ui_sources = ['window.c', 'access-page.c', 'hosts-page.c', manager_resources]
+manager_qr = get_option('manager_qr')
+manager_qr_deps = [dependency('libqrencode', required : manager_qr),
+  dependency('zbar', required : manager_qr), dependency('gdk-pixbuf-2.0', required : manager_qr)]
+manager_qr_enabled = true
+foreach dep : manager_qr_deps
+  manager_qr_enabled = manager_qr_enabled and dep.found()
+endforeach
+manager_ui_args = []
+if manager_qr_enabled
+  manager_ui_deps += manager_qr_deps
+  manager_ui_sources += 'host-qr.c'
+  manager_ui_args += '-DMD_HAVE_MANAGER_QR'
+endif
+message('Manager QR: ' + (manager_qr_enabled ? 'enabled' : 'disabled'))
+manager_ui = static_library('metadesk-manager-ui', manager_ui_sources,
+  dependencies : manager_ui_deps, c_args : manager_ui_args)
 dep_manager_ui = declare_dependency(link_whole : manager_ui,
-  dependencies : manager_ui_deps)
-executable('metadesk-manager', 'main.c', dependencies : dep_manager_ui, install : true,
+  dependencies : manager_ui_deps, compile_args : manager_ui_args)
+manager_exe = executable('metadesk-manager', 'main.c', dependencies : dep_manager_ui, install : true,
   install_rpath : _product_exe_rpath)
+if not manager_qr_enabled
+  manager_readelf = find_program('readelf', 'llvm-readelf')
+  manager_ldd = find_program('ldd')
+  test('manager-no-qr-deps', find_program('sh'), args : ['-ec', '''
+    needed=$("$1" -d "$3")
+    closure=$("$2" "$3")
+    if printf '%s\n%s\n' "$needed" "$closure" | grep -E 'lib(qrencode|zbar)\.so|not found'; then
+      exit 1
+    fi
+  ''', 'manager-no-qr-deps', manager_readelf.full_path(), manager_ldd.full_path(), manager_exe],
+    suite : 'manager')
+endif
 install_data('org.metadesk.Manager.desktop',
   install_dir : get_option('datadir') / 'applications')
 manager_test = executable('test_manager_model', '../../tests/test_manager_model.c',

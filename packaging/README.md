@@ -21,6 +21,10 @@ Status reflects recorded qualification, not published releases.
 | Flatpak | [`build.sh`](flatpak/build.sh) exports client and manager `.flatpak` bundles; no host. [Build guide](flatpak/README.md). | [Local ARM64](flatpak/VALIDATION.md) builds, user installs, help, codec inventory and decode smoke passed. Manifest lint warned about the runtime; build/repo lint failed on missing screenshots. | `md-lxxz`: release source pins, app-ID ownership, screenshots, desktop qualification and Flathub submission. |
 | AppImage | [`assemble.py`](appimage/assemble.py) stages the client AppDir; [`make-image.sh`](appimage/make-image.sh) produces the Type 2 AppImage. [Build guide](appimage/README.md). | [ARM64](appimage/VALIDATION.md): Ubuntu extract-and-run help and clean Fedora 44 help/decode passed. [`dry-sign.sh`](appimage/dry-sign.sh) demonstrated disposable GPG signing and zsync only. | `md-pqc7` is closed; no separate open AppImage release bead was identified. Hosted x86_64, remaining distro/desktop checks, legal/source review and production signing/update setup are outstanding. |
 
+The Manager includes QR display and image scanning in native packages and
+QR-enabled source builds. The Manager Flatpak ships its companion client but
+has no QR support or bundled libqrencode/ZBar pending `md-rvu4`.
+
 ## GitHub pre-release workflow
 
 `Pre-release packages` (`.github/workflows/release.yml`) runs after a `v*`

@@ -3,7 +3,9 @@
 #include "signer-status.h"
 #include "access-page.h"
 #include "hosts-page.h"
+#ifdef MD_HAVE_MANAGER_QR
 #include "host-qr.h"
+#endif
 #include "management_ipc.h"
 #include "relay_plan.h"
 #include <stdlib.h>
@@ -17,7 +19,10 @@ struct _MdManagerWindow {
     AdwBanner *banner;
     GtkStack *pages;
     GtkListBox *navigation, *account_list, *relay_list;
-    GtkWidget *identity_form, *relay_form, *refresh, *hosts, *show_qr;
+    GtkWidget *identity_form, *relay_form, *refresh, *hosts;
+#ifdef MD_HAVE_MANAGER_QR
+    GtkWidget *show_qr;
+#endif
     AdwActionRow *key_status, *session_status, *signing_status, *remote_status;
     AdwComboRow *client_role, *host_role, *backend;
     AdwEntryRow *public_key, *account_label, *relay_url;
@@ -218,14 +223,21 @@ static void work_done(GObject *source, GAsyncResult *result, gpointer data) {
             gtk_label_set_text(self->account_error, snapshot->account_error ? snapshot->account_error->message : "");
             gtk_label_set_text(self->relay_error, snapshot->relay_error ? snapshot->relay_error->message : "");
             populate_accounts(self); populate_relays(self); update_banner(self);
-            const char *client = NULL, *host_key = NULL;
+            const char *client = NULL;
+#ifdef MD_HAVE_MANAGER_QR
+            const char *host_key = NULL;
+#endif
             for (guint i = 0; self->accounts && i < self->accounts->len; ++i) {
                 MdManagerAccount *item = g_ptr_array_index(self->accounts, i);
                 if (item->roles[MD_ACCOUNT_CLIENT]) client = item->account.pubkey;
+#ifdef MD_HAVE_MANAGER_QR
                 if (item->roles[MD_ACCOUNT_HOST]) host_key = item->account.pubkey;
+#endif
             }
+#ifdef MD_HAVE_MANAGER_QR
             gtk_widget_set_sensitive(self->show_qr, host_key != NULL);
             g_object_set_data_full(G_OBJECT(self->show_qr), "host-key", g_strdup(host_key), g_free);
+#endif
             md_manager_hosts_configure(self->hosts, self->directory, client, (const char *const *)self->relays);
             if (job->kind != LOAD) {
                 const char *message = job->kind == ADD_ACCOUNT ? "Public account metadata saved" :
@@ -338,19 +350,23 @@ static void add_relay_clicked(GtkButton *button, gpointer data) {
     job->relays[count] = g_strdup(gtk_editable_get_text(GTK_EDITABLE(self->relay_url)));
     start_job(self, job);
 }
+#ifdef MD_HAVE_MANAGER_QR
 static void show_qr(GtkButton *button, gpointer data) {
     md_manager_qr_present(GTK_WIDGET(data), g_object_get_data(G_OBJECT(button), "host-key"));
 }
+#endif
 static void add_placeholder(MdManagerWindow *self, guint section, const char *title, const char *description) {
     GtkWidget *status = adw_status_page_new();
     adw_status_page_set_icon_name(ADW_STATUS_PAGE(status), icons[section]);
     adw_status_page_set_title(ADW_STATUS_PAGE(status), title);
     adw_status_page_set_description(ADW_STATUS_PAGE(status), description);
+#ifdef MD_HAVE_MANAGER_QR
     self->show_qr = gtk_button_new_with_mnemonic("Show Host _QR Code…");
     gtk_widget_set_halign(self->show_qr, GTK_ALIGN_CENTER);
     gtk_widget_set_sensitive(self->show_qr, FALSE);
     adw_status_page_set_child(ADW_STATUS_PAGE(status), self->show_qr);
     g_signal_connect(self->show_qr, "clicked", G_CALLBACK(show_qr), self);
+#endif
     gtk_stack_add_named(self->pages, status, sections[section]);
 }
 static gboolean close_requested(GtkWindow *window, gpointer data) {

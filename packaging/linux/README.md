@@ -17,8 +17,8 @@ pkg-config dependencies and RPM derives runtime dependencies). For a signed
 Arch-native archive that includes the Manager, set `_with_manager=true` in the
 AUR template; packaging rejects a mismatch between the archive and that list.
 `xdotool` is only for native keyboard smoke tests; it is not a runtime package
-dependency. The separate Flatpak Manager includes its own video client and the
-pinned QR libraries; it does not start a host.
+dependency. The separate Manager Flatpak includes its own video client but
+omits QR support pending `md-rvu4`; it does not start a host.
 
 ## Inputs and ownership
 
