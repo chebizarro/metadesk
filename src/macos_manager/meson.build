@@ -46,7 +46,7 @@ macos_relay_fixture = executable('test_macos_relay_store', 'test_relay_store.m',
   objc_args : '-fobjc-arc', dependencies : [dep_metadesk, dep_macos_relay_store])
 relay_vectors = files('../../tests/manager_relay_vectors.py')
 test('native relay store vectors', macos_hosts_python,
-  args : [relay_vectors, macos_relay_fixture], suite : 'macos_manager')
+  args : [relay_vectors, '--native', macos_relay_fixture], suite : 'macos_manager')
 relay_test_gio = dependency('gio-2.0', version : '>=2.76', required : false)
 if relay_test_gio.found()
   glib_relay_fixture = executable('test_glib_relay_store',
@@ -54,7 +54,7 @@ if relay_test_gio.found()
     include_directories : include_directories('../manager_shared'),
     dependencies : [dep_metadesk, relay_test_gio])
   test('GLib relay vectors and native round trip', macos_hosts_python,
-    args : [relay_vectors, glib_relay_fixture, macos_relay_fixture], suite : 'macos_manager')
+    args : [relay_vectors, glib_relay_fixture, '--native', macos_relay_fixture], suite : 'macos_manager')
 endif
 test('macOS address book scoped relay controller', macos_hosts_python,
   args : [files('../../tests/managed_store_controller_fixture.py'), macos_controller_test],

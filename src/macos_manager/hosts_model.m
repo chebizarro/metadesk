@@ -463,7 +463,7 @@ NSString *MDHostsBootstrap(NSString *input, NSString **error) {
             NSString *url = p && strlen(p) == [piece lengthOfBytesUsingEncoding:NSUTF8StringEncoding] ?
                 MDRelayNormalize(p) : nil;
             if (!url || [url lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > MD_RELAY_URL_MAX) {
-                if (error) *error = @"Use ws:// or wss:// relay URLs without credentials, query parameters or fragments.";
+                if (error) *error = @"Use ws:// or wss:// URLs without credentials, queries or fragments. Enter international hostnames in ASCII punycode (xn--).";
                 return nil;
             }
             [urls addObject:url];
@@ -493,7 +493,7 @@ NSString *MDHostsBootstrap(NSString *input, NSString **error) {
         }
         return [values componentsJoinedByString:@" "];
     }
-    if (error) *error = @"Could not read saved bootstrap relays. No relay connections were started.";
+    if (error) *error = @"Could not read saved bootstrap relays. Use ASCII punycode (xn--) for international hostnames. No relay connections were started.";
     return nil;
 }
 

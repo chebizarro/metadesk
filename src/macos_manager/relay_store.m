@@ -60,33 +60,13 @@ static NSString *Host(char *host, BOOL ipv6) {
     if (!text.length) return nil;
     NSString *decoded = text.stringByRemovingPercentEncoding;
     if (!decoded.length || strlen(decoded.UTF8String) != [decoded lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) return nil;
+    // Do not translate Unicode hostnames: platform IDNA mappings can select
+    // different endpoints. GTK writes ASCII, so its saved URLs still work.
+    for (const unsigned char *p = (const unsigned char *)decoded.UTF8String; *p; ++p)
+        if (*p >= 128) return nil;
     if (!ipv6) {
         struct in_addr address;
         if (strchr(host, '%') && inet_pton(AF_INET, decoded.UTF8String, &address) == 1) return nil;
-        if (![decoded canBeConvertedToEncoding:NSASCIIStringEncoding]) {
-            // Apply Foundation's IDNA conversion label by label so an empty
-            // interior label accepted by the GTK store is preserved.
-            NSArray *labels = [decoded componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@".。．｡"]];
-            NSMutableArray *ascii = [NSMutableArray array];
-            for (NSString *label in labels) {
-                if ([label canBeConvertedToEncoding:NSASCIIStringEncoding]) { [ascii addObject:label]; continue; }
-                NSURLComponents *parts = [NSURLComponents new];
-                parts.scheme = @"ws";
-                parts.host = label;
-                NSString *name = parts.URL.host;
-                if (!name.length) {
-                    // IDNA can map a whole label to nothing (e.g. U+200B).
-                    // Distinguish that from an invalid label using a sentinel.
-                    parts.host = [label stringByAppendingString:@"x"];
-                    if (![parts.URL.host isEqualToString:@"x"]) return nil;
-                    name = @"";
-                }
-                if (![name canBeConvertedToEncoding:NSASCIIStringEncoding]) return nil;
-                [ascii addObject:name];
-            }
-            decoded = [ascii componentsJoinedByString:@"."];
-            if (!decoded.length) return nil;
-        }
     }
     NSMutableString *escaped = [NSMutableString string];
     for (const unsigned char *p = (const unsigned char *)decoded.UTF8String; *p; ++p) {
@@ -143,6 +123,7 @@ NSString *MDRelayNormalize(const char *url) {
             number ? [NSString stringWithFormat:@":%u", number] : @"", resource];
 }
 
+// g_ascii_isspace excludes vertical tab; it is not INI whitespace.
 static BOOL Space(unsigned char c) { return c && strchr(" \t\r\n\f", c); }
 
 static void TrimRight(char *s) {
@@ -277,8 +258,9 @@ BOOL MDRelaySave(NSString *directory, NSArray<NSString *> *relays) {
         if (!ok) unlink(temp);
         else {
             int parent = open(directory.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-            ok = parent >= 0 && fsync(parent) == 0;
-            if (parent >= 0) close(parent);
+            // The rename committed the new contents. A directory sync is
+            // best effort; do not tell the caller the old file is still in use.
+            if (parent >= 0) { (void)fsync(parent); close(parent); }
         }
     }
     free(temp);
