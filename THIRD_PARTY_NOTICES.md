@@ -41,7 +41,8 @@ client/manager (future manager dependencies apply only when it is included).
 | uuid | OS | OS | S | S | R |
 | GLib/GObject/GIO and their closure | B if linked | — unless linked | S | B or base | R |
 | PipeWire/SPA, AT-SPI2, D-Bus, udev/systemd | — | — | S | base/host integration | R/host services |
-| GTK4/libadwaita (future manager) | — | — | S | — | R |
+| GTK4/libadwaita; GdkPixbuf (Linux Manager) | — | — | S | — | R |
+| libqrencode; ZBar (Linux Manager) | — | — | S if built | — | B (Manager modules) |
 | OpenH264 binary | **—** | **—** | **—** | **—** | **—** |
 | FIPS daemon, GPU driver runtimes | **—** | **—** | separate packages | host integration | host integration |
 
@@ -169,7 +170,9 @@ the distro's copyright metadata, not inferred from this macOS snapshot.
 | libssh2; libpsl; libunistring (+libidn2 if selected) | libssh2: BSD-3-Clause; libpsl: MIT; libunistring: LGPL-3.0-or-later or GPL-2.0-or-later (use LGPL); libidn2: LGPL-3.0-or-later or GPL-2.0-or-later (use LGPL). These may enter via curl/libintl; inventory the actual link closure. |
 | glibc/loader, libm, pthreads, libresolv (Linux base) | LGPL-2.1-or-later and per-file exceptions. Do not bundle another libc in the application tree. Containers still redistribute base packages: retain base source/copyright mechanisms. |
 | libgcc, libstdc++ (Linux base) | GPL-3.0-or-later WITH GCC-exception-3.1. “No GPL codecs” is **not** a claim that a whole Linux base image contains no GPL software. |
-| AT-SPI2 libraries, GTK4, libadwaita | LGPL-2.1-or-later; Linux system/Flatpak runtime. GTK/adwaita apply only to future manager artifacts. |
+| AT-SPI2 libraries, GTK4, libadwaita, GdkPixbuf | LGPL-2.1-or-later; Linux system/Flatpak runtime. GTK, adwaita and GdkPixbuf apply to Manager artifacts. |
+| [libqrencode](https://github.com/fukuchi/libqrencode), [ZBar](https://github.com/mchehab/zbar) | LGPL-2.1-or-later; dynamically linked to the Linux Manager. Flatpak builds their shared libraries from the sources pinned in the Manager manifest. |
+| xdotool | BSD-3-Clause; optional X11 test driver, not linked or distributed in Metadesk artifacts. |
 | libudev/libsystemd; libmount/libblkid | LGPL-2.1-or-later (library targets); retain per-file notices and distro metadata. Tools may have different licenses. |
 | D-Bus libdbus | AFL-2.1 OR GPL-2.0-or-later (dual licensed), not LGPL. |
 | PipeWire/libspa | MIT generally; `libspa-alsa.so` includes LGPL code, `libjackserver.so` has GPL-2.0 code. Do not bundle the latter into the minimal codec payload. [Upstream LICENSE](https://github.com/PipeWire/pipewire/blob/master/LICENSE). |

@@ -30,7 +30,8 @@ manager_ui = static_library('metadesk-manager-ui', ['window.c', 'access-page.c',
   dependencies : manager_ui_deps)
 dep_manager_ui = declare_dependency(link_whole : manager_ui,
   dependencies : manager_ui_deps)
-executable('metadesk-manager', 'main.c', dependencies : dep_manager_ui, install : true)
+executable('metadesk-manager', 'main.c', dependencies : dep_manager_ui, install : true,
+  install_rpath : _product_exe_rpath)
 install_data('org.metadesk.Manager.desktop',
   install_dir : get_option('datadir') / 'applications')
 manager_test = executable('test_manager_model', '../../tests/test_manager_model.c',

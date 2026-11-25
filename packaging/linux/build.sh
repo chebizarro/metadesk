@@ -4,8 +4,12 @@ set -eu
 [ "$#" = 5 ] || { echo 'usage: build.sh native|oci SOURCE NOSTRC_SOURCE NOSTRC_BUILD NEW_BUILD' >&2; exit 2; }
 mode=$1 src=$(realpath "$2") nostrc=$(realpath "$3") nb=$(realpath "$4") build=$5
 [ ! -e "$build" ] || { echo 'build must be new' >&2; exit 2; }
+manager=false
 case "$mode" in
-  native) prefix=/usr; libdir=lib/metadesk; client=true; native_rpath=true ;;
+  native) prefix=/usr; libdir=lib/metadesk; client=true; native_rpath=true
+    manager=${MD_NATIVE_MANAGER:-false}
+    case "$manager" in true|false) ;; *) exit 2 ;; esac
+    ;;
   oci) prefix=/opt/metadesk; libdir=lib; client=false; native_rpath=false
     : "${MD_FFMPEG_PREFIX:?OCI requires private minimal LGPL FFmpeg}"
     export PKG_CONFIG_PATH="$MD_FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -32,10 +36,12 @@ PYCODE
   *) exit 2 ;;
 esac
 meson setup "$build" "$src" --prefix="$prefix" --libdir="$libdir" \
-  --buildtype=release -Dclient="$client" -Dsigner_nip5f=true -Dsigner_nip46=true \
+  --buildtype=release -Dclient="$client" -Dmanager="$manager" -Dsigner_nip5f=true -Dsigner_nip46=true \
   -Dlinux_package_rpath="$native_rpath" -Dnostrc_discovery=build-tree -Dnostrc_root="$nostrc" -Dnostrc_build_dir="$nb"
 if [ "$client" = true ]; then
-    meson compile -C "$build" -j2 metadesk-host metadesk-client
+    set -- metadesk-host metadesk-client
+    if [ "$manager" = true ]; then set -- "$@" metadesk-manager; fi
+    meson compile -C "$build" -j2 "$@"
 else
     meson compile -C "$build" -j2 metadesk-host
 fi

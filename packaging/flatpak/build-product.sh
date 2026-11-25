@@ -3,15 +3,23 @@
 set -eu
 [ "$#" = 5 ] || { echo 'usage: build-product.sh SOURCE NOSTRC_PREFIX NEW_BUILD PREFIX client|manager' >&2; exit 2; }
 src=$(realpath "$1") nostrc=$(realpath "$2") build=$3 prefix=$4 product=$5
-case "$product" in client) client=true; manager=false ;; manager) client=false; manager=true ;; *) exit 2 ;; esac
+case "$product" in client) client=true; manager=false ;; manager) client=true; manager=true ;; *) exit 2 ;; esac
 [ ! -e "$build" ] || { echo 'build must be new' >&2; exit 2; }
 export PKG_CONFIG_PATH="$nostrc/lib/pkgconfig:$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 meson setup "$build" "$src" --prefix="$prefix" --libdir=lib --buildtype=release \
   -Dclient="$client" -Dmanager="$manager" -Dsigner_nip5f=true -Dsigner_nip46=true \
   -Dportal_input=disabled -Dnostrc_discovery=installed
-meson compile -C "$build" -j2 "metadesk-$product"
+if [ "$manager" = true ]; then
+  meson compile -C "$build" -j2 metadesk-manager metadesk-client
+else
+  meson compile -C "$build" -j2 metadesk-client
+fi
 install -d "$prefix/bin" "$prefix/lib" "$prefix/libexec/metadesk" "$prefix/share/licenses/metadesk"
-install -m755 "$build/$( [ "$product" = manager ] && printf 'src/manager/' )metadesk-$product" "$prefix/bin/"
+install -m755 "$build/metadesk-client" "$prefix/bin/"
+if [ "$manager" = true ]; then
+  install -m755 "$build/src/manager/metadesk-manager" "$prefix/bin/"
+  patchelf --remove-rpath "$prefix/bin/metadesk-client"
+fi
 # Meson install would also install the host and build unselected targets.
 for file in "$build"/libmetadesk.so*; do
   [ -d "$file" ] || cp -P "$file" "$prefix/lib/"

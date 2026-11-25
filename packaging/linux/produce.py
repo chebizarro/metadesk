@@ -117,6 +117,11 @@ def main():
     (prefix / 'bin').mkdir()
     installed = stage / ('usr' if a.mode == 'native' else 'opt/metadesk')
     names = ['metadesk-host', 'metadesk-client'] if a.mode == 'native' else ['metadesk-host']
+    if a.mode == 'native' and (installed / 'bin/metadesk-manager').is_file():
+        names.append('metadesk-manager')
+        applications = prefix / 'share/applications'
+        applications.mkdir(parents=True)
+        shutil.copy2(installed / 'share/applications/org.metadesk.Manager.desktop', applications)
     for name in names:
         shutil.copy2(installed / 'bin' / name, prefix / 'bin' / name)
     libs = list(installed.rglob('libmetadesk.so*'))

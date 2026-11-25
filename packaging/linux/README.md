@@ -6,6 +6,20 @@ actual results and remaining gates. The application is MIT. Native packages link
 its exact codec inventory. Cisco OpenH264 is never copied/downloaded by any tool
 here. Do not substitute distro FFmpeg into a production OCI tree.
 
+## Optional Manager in native packages
+
+The default native artifact remains host + client. Set `MD_NATIVE_MANAGER=true`
+for `build.sh native` to also stage the GTK Manager and its desktop file.
+Debian dependency generation scans that executable when present; install
+`libgtk-4-dev libadwaita-1-dev libgdk-pixbuf-2.0-dev libqrencode-dev libzbar-dev`
+on the build system. RPM builders use `--with manager` (the spec declares the
+pkg-config dependencies and RPM derives runtime dependencies). For a signed
+Arch-native archive that includes the Manager, set `_with_manager=true` in the
+AUR template; packaging rejects a mismatch between the archive and that list.
+`xdotool` is only for native keyboard smoke tests; it is not a runtime package
+dependency. The separate Flatpak Manager includes its own video client and the
+pinned QR libraries; it does not start a host.
+
 ## Inputs and ownership
 
 Use an isolated matching-architecture Linux build root, not the main checkout.

@@ -30,7 +30,7 @@ jobs:
             build-essential cmake meson ninja-build pkg-config \
             libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev \
             libgtk-4-dev libadwaita-1-dev libglib2.0-dev libsecret-1-dev \
-            libqrencode-dev libzbar-dev \
+            libqrencode-dev libzbar-dev libgdk-pixbuf-2.0-dev \
             libpipewire-0.3-dev libatspi2.0-dev libudev-dev libdbus-1-dev \
             libxcb-xinput-dev libxcb1-dev libxau-dev libx11-dev libei-dev libeis-dev libxkbcommon-dev \
             uuid-dev libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev \

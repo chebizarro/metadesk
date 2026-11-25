@@ -13,9 +13,10 @@ mkdir -p "$root/DEBIAN" "$out/debian"
 printf 'Source: metadesk\n' > "$out/debian/control"
 # Use dpkg's distro shlibs/symbols database; never hard-code SONAME packages.
 cd "$out"
-deps=$(dpkg-shlibdeps -O -l"$root/usr/lib/metadesk" \
-  -e"$root/usr/bin/metadesk-host" -e"$root/usr/bin/metadesk-client" \
-  -e"$root/usr/lib/metadesk/libmetadesk.so.0.1.0" | sed -n 's/^shlibs:Depends=//p')
+set -- -e"$root/usr/bin/metadesk-host" -e"$root/usr/bin/metadesk-client" \
+  -e"$root/usr/lib/metadesk/libmetadesk.so.0.1.0"
+if [ -x "$root/usr/bin/metadesk-manager" ]; then set -- "$@" -e"$root/usr/bin/metadesk-manager"; fi
+deps=$(dpkg-shlibdeps -O -l"$root/usr/lib/metadesk" "$@" | sed -n 's/^shlibs:Depends=//p')
 [ -n "$deps" ] || { echo 'empty shlibs dependencies' >&2; exit 1; }
 arch=$(dpkg --print-architecture)
 cat > "$root/DEBIAN/control" <<EOF

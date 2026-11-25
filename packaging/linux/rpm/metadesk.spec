@@ -5,6 +5,7 @@
 %global _smp_mflags -j2
 %global _lto_cflags -flto=2 -ffat-lto-objects
 %global nostrc_revision 6f7a8d025768d497bef700fe55eea1c687dac328
+%bcond_with manager
 Name:           metadesk
 Version:        0.1.0
 Release:        1%{?dist}
@@ -26,6 +27,11 @@ BuildRequires:  pkgconfig(libcurl) pkgconfig(libwebsockets) pkgconfig(openssl)
 BuildRequires:  pkgconfig(libsecp256k1) pkgconfig(jansson) pkgconfig(libcjson)
 BuildRequires:  pkgconfig(libb2) libyuv-devel libsodium-devel bzip2-devel
 BuildRequires:  systemd-rpm-macros
+%if %{with manager}
+BuildRequires:  pkgconfig(gtk4) >= 4.14
+BuildRequires:  pkgconfig(libadwaita-1) >= 1.5
+BuildRequires:  pkgconfig(gdk-pixbuf-2.0) pkgconfig(libqrencode) pkgconfig(zbar)
+%endif
 Provides:       bundled(nsync) = 1.30.0
 Recommends:     xdg-desktop-portal
 Suggests:       fipsd
@@ -52,6 +58,9 @@ export C_INCLUDE_PATH="$work/nsync-prefix/include"
 export CMAKE_PREFIX_PATH="$work/nsync-prefix"
 ./packaging/linux/build-nostrc.sh "$work/nostrc" "$work/nostrc-build"
 ./packaging/linux/static-json.py "$work/nostrc-build" "$work/nostrc-static"
+%if %{with manager}
+export MD_NATIVE_MANAGER=true
+%endif
 ./packaging/linux/build.sh native "$PWD" "$work/nostrc" "$work/nostrc-static" "$work/native-build"
 ./packaging/linux/produce.py native "$PWD" "$work/native-build" "$work/nostrc" "$work/native-output" --keep-debug
 
@@ -70,6 +79,10 @@ LD_LIBRARY_PATH="../native-output/tree/usr/lib/metadesk" ../native-output/tree/u
 %{_mandir}/man1/metadesk-*.1*
 /usr/bin/metadesk-host
 /usr/bin/metadesk-client
+%if %{with manager}
+/usr/bin/metadesk-manager
+/usr/share/applications/org.metadesk.Manager.desktop
+%endif
 /usr/lib/metadesk/
 /usr/lib/systemd/user/metadesk-host.service
 %{_datadir}/metadesk/
