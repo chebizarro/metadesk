@@ -14,7 +14,7 @@ manager_inc = include_directories('.')
 # Consume the shared core API, not its private raw nostrc OBJECT link inputs.
 dep_manager_core = declare_dependency(link_with : libmetadesk,
   include_directories : core_inc)
-manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c'],
+manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c', 'launch.c'],
   dependencies : [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson] + manager_status_deps,
   c_args : manager_status_args)
 dep_manager_model = declare_dependency(link_with : manager_model,
@@ -24,16 +24,21 @@ dep_manager_model = declare_dependency(link_with : manager_model,
 gnome = import('gnome')
 manager_resources = gnome.compile_resources('manager-resources', 'manager.gresource.xml',
   source_dir : meson.current_source_dir(), c_name : 'md_manager')
-manager_ui = static_library('metadesk-manager-ui', ['window.c', 'access-page.c', manager_resources],
-  dependencies : [dep_manager_model, dep_manager_gtk, dep_manager_adw])
+manager_ui_deps = [dep_manager_model, dep_manager_gtk, dep_manager_adw, dependency('jansson'),
+  dependency('libqrencode'), dependency('zbar'), dependency('gdk-pixbuf-2.0')]
+manager_ui = static_library('metadesk-manager-ui', ['window.c', 'access-page.c', 'hosts-page.c', 'host-qr.c', manager_resources],
+  dependencies : manager_ui_deps)
 dep_manager_ui = declare_dependency(link_whole : manager_ui,
-  dependencies : [dep_manager_model, dep_manager_gtk, dep_manager_adw])
+  dependencies : manager_ui_deps)
 executable('metadesk-manager', 'main.c', dependencies : dep_manager_ui, install : true)
 install_data('org.metadesk.Manager.desktop',
   install_dir : get_option('datadir') / 'applications')
 manager_test = executable('test_manager_model', '../../tests/test_manager_model.c',
   dependencies : dep_manager_model)
 test('manager-model', manager_test, suite : 'manager', timeout : 30)
+manager_launch_test = executable('test_manager_launch', '../../tests/test_manager_launch.c',
+  dependencies : dep_manager_model)
+test('manager-launch', manager_launch_test, suite : 'manager', timeout : 10)
 manager_smoke = executable('test_manager_ui', '../../tests/test_manager_ui.c',
   dependencies : dep_manager_ui)
 manager_dbus = find_program('dbus-run-session', required : false)

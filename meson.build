@@ -789,6 +789,8 @@ core_sources += files(
   'src/core/accounts.c',
   'src/core/accounts_signer.c',
   'src/core/managed_store.c',
+  'src/core/managed_store_controller.c',
+  'src/core/managed_launch.c',
   'src/core/credential_store.c',
   'src/core/credential_store_secret_service.c',
   'src/core/credential_store_keychain.c',
@@ -905,6 +907,13 @@ if host_os == 'linux' or host_os == 'darwin'
     args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture, '--syntax-only'],
     timeout : 30)
   if get_option('signer_nip5f')
+    if get_option('manager') and host_os == 'linux' and manager_dbus.found() and manager_xvfb.found()
+      manager_hosts_test = executable('test_manager_hosts', 'tests/test_manager_hosts.c', dependencies : dep_manager_ui)
+      test('manager-hosts-offline', manager_python,
+        args : [files('tests/run_manager_ui.py'), manager_dbus.full_path(), manager_xvfb.full_path(),
+                manager_python.full_path(), files('tests/test_manager_hosts.py'), manager_hosts_test,
+                access_signer_fixture], suite : 'manager', timeout : 45)
+    endif
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
       timeout : 120)
@@ -987,6 +996,11 @@ endif
 if enable_client and (host_os == 'linux' or host_os == 'darwin')
   test('client startup: piped stdout + GUI display fail-closed', accounts_python,
     args : [files('tests/test_client_startup.py'), metadesk_client], timeout : 60)
+endif
+
+if enable_client and host_os == 'linux'
+  test('client private managed launch', accounts_python,
+    args : [files('tests/test_managed_launch.py'), metadesk_client], timeout : 45)
 endif
 
 # Opt-in private-keyring + disposable-netns end-to-end access/session gate (md-pss).
@@ -1437,6 +1451,13 @@ if enable_nip5f and (host_os == 'linux' or host_os == 'darwin')
     dependencies : [dep_metadesk] + core_private_deps)
   test('encrypted management store private relays', accounts_python,
     args : [files('tests/test_managed_store.py'), test_managed_store, access_signer_fixture], timeout : 80)
+endif
+
+if host_os == 'linux'
+  store_controller_test = executable('test_managed_store_controller', 'tests/test_managed_store_controller.c',
+    dependencies : [dep_metadesk] + core_private_deps)
+  test('address book scoped relay controller', accounts_python,
+    args : [files('tests/managed_store_controller_fixture.py'), store_controller_test], timeout : 40)
 endif
 
 # Same-user host admission and management; no desktop devices.

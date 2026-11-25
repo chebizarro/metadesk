@@ -2,6 +2,8 @@
 #include "model.h"
 #include "signer-status.h"
 #include "access-page.h"
+#include "hosts-page.h"
+#include "host-qr.h"
 #include "management_ipc.h"
 #include "relay_plan.h"
 #include <stdlib.h>
@@ -15,7 +17,7 @@ struct _MdManagerWindow {
     AdwBanner *banner;
     GtkStack *pages;
     GtkListBox *navigation, *account_list, *relay_list;
-    GtkWidget *identity_form, *relay_form, *refresh;
+    GtkWidget *identity_form, *relay_form, *refresh, *hosts, *show_qr;
     AdwActionRow *key_status, *session_status, *signing_status, *remote_status;
     AdwComboRow *client_role, *host_role, *backend;
     AdwEntryRow *public_key, *account_label, *relay_url;
@@ -44,7 +46,7 @@ static void update_banner(MdManagerWindow *self) {
             client |= ((MdManagerAccount *)g_ptr_array_index(self->accounts, i))->roles[MD_ACCOUNT_CLIENT];
         if (!client) message = "Assign a client account in Identity before managed connections become available";
         else if (!self->relays || !self->relays[0]) message = "Choose bootstrap relays in Relays — no default is selected";
-        else message = "Use Access to manage a running local host; host startup and managed connections are not integrated yet";
+        else message = "Use Access to manage a running local host";
     }
     adw_banner_set_title(self->banner, message);
 }
@@ -71,7 +73,7 @@ static void navigate(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
     if (!row) return;
     MdManagerWindow *self = data;
     const char *name = sections[gtk_list_box_row_get_index(row)];
-    gtk_widget_set_visible(GTK_WIDGET(self->banner), strcmp(name,"Access") && strcmp(name,"Activity"));
+    gtk_widget_set_visible(GTK_WIDGET(self->banner), strcmp(name,"Hosts") && strcmp(name,"Access") && strcmp(name,"Activity"));
     gtk_stack_set_visible_child_name(self->pages, name);
     adw_navigation_page_set_title(self->content_page, name);
     adw_navigation_split_view_set_show_content(self->split, TRUE);
@@ -216,6 +218,15 @@ static void work_done(GObject *source, GAsyncResult *result, gpointer data) {
             gtk_label_set_text(self->account_error, snapshot->account_error ? snapshot->account_error->message : "");
             gtk_label_set_text(self->relay_error, snapshot->relay_error ? snapshot->relay_error->message : "");
             populate_accounts(self); populate_relays(self); update_banner(self);
+            const char *client = NULL, *host_key = NULL;
+            for (guint i = 0; self->accounts && i < self->accounts->len; ++i) {
+                MdManagerAccount *item = g_ptr_array_index(self->accounts, i);
+                if (item->roles[MD_ACCOUNT_CLIENT]) client = item->account.pubkey;
+                if (item->roles[MD_ACCOUNT_HOST]) host_key = item->account.pubkey;
+            }
+            gtk_widget_set_sensitive(self->show_qr, host_key != NULL);
+            g_object_set_data_full(G_OBJECT(self->show_qr), "host-key", g_strdup(host_key), g_free);
+            md_manager_hosts_configure(self->hosts, self->directory, client, (const char *const *)self->relays);
             if (job->kind != LOAD) {
                 const char *message = job->kind == ADD_ACCOUNT ? "Public account metadata saved" :
                     job->kind == SAVE_ROLE ? "Role saved — restart the host or client to apply" : "Relay settings saved locally";
@@ -327,17 +338,26 @@ static void add_relay_clicked(GtkButton *button, gpointer data) {
     job->relays[count] = g_strdup(gtk_editable_get_text(GTK_EDITABLE(self->relay_url)));
     start_job(self, job);
 }
+static void show_qr(GtkButton *button, gpointer data) {
+    md_manager_qr_present(GTK_WIDGET(data), g_object_get_data(G_OBJECT(button), "host-key"));
+}
 static void add_placeholder(MdManagerWindow *self, guint section, const char *title, const char *description) {
     GtkWidget *status = adw_status_page_new();
     adw_status_page_set_icon_name(ADW_STATUS_PAGE(status), icons[section]);
     adw_status_page_set_title(ADW_STATUS_PAGE(status), title);
     adw_status_page_set_description(ADW_STATUS_PAGE(status), description);
+    self->show_qr = gtk_button_new_with_mnemonic("Show Host _QR Code…");
+    gtk_widget_set_halign(self->show_qr, GTK_ALIGN_CENTER);
+    gtk_widget_set_sensitive(self->show_qr, FALSE);
+    adw_status_page_set_child(ADW_STATUS_PAGE(status), self->show_qr);
+    g_signal_connect(self->show_qr, "clicked", G_CALLBACK(show_qr), self);
     gtk_stack_add_named(self->pages, status, sections[section]);
 }
 static gboolean close_requested(GtkWindow *window, gpointer data) {
     (void)data;
     MD_MANAGER_WINDOW(window)->closed = TRUE;
     md_manager_access_stop(MD_MANAGER_WINDOW(window)->access);
+    md_manager_hosts_stop(MD_MANAGER_WINDOW(window)->hosts);
     return FALSE;
 }
 static void get_property(GObject *object, guint id, GValue *value, GParamSpec *pspec) {
@@ -349,6 +369,7 @@ static void dispose(GObject *object) {
     self->closed = TRUE;
     g_clear_object(&self->access);
     g_clear_object(&self->status);
+    if (self->hosts) { md_manager_hosts_stop(self->hosts); self->hosts = NULL; }
     gtk_widget_dispose_template(GTK_WIDGET(self), MD_TYPE_MANAGER_WINDOW);
     G_OBJECT_CLASS(md_manager_window_parent_class)->dispose(object);
 }
@@ -382,7 +403,9 @@ static void md_manager_window_init(MdManagerWindow *self) {
         gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), TRUE);
         gtk_list_box_append(self->navigation, row);
     }
-    add_placeholder(self, 0, "Host Connections Are Coming", "Saved hosts, favorites, search, and managed client launch are planned in md-vb18. No connection is started here.");
+    self->hosts = md_manager_hosts_page_new();
+    gtk_stack_add_named(self->pages, self->hosts, sections[0]);
+    gtk_widget_set_visible(GTK_WIDGET(self->banner), FALSE);
     add_placeholder(self, 1, "Host Controls Are Coming", "Host lifecycle controls are planned in md-37rb. Use Access to connect to a running host and Activity to end its current session.");
     self->access = md_manager_access_new(GTK_WINDOW(self), self->pages);
     g_signal_connect(self->navigation, "row-activated", G_CALLBACK(navigate), self);

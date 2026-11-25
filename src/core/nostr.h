@@ -99,7 +99,29 @@ typedef struct {
     /* Opt-in role-aware client routing. Borrowed only during create. */
     const MdRelayPlan *bootstrap_plan;
     const MdIdentity *session_peer;
+    /* Management-only routes: discover our own metadata; no DM or ACL REQ. */
+    bool managed_documents;
 } MdNostrConfig;
+
+/* One persistent scoped REQ for a client-owned addressable document. It uses
+ * every admitted FETCH route; EOSE is scoped by relay and connection. */
+typedef struct MdNostrDocument MdNostrDocument;
+typedef void (*MdDocumentEvent)(const char *relay, const char *event, void *data);
+typedef enum { MD_DOCUMENT_EOSE, MD_DOCUMENT_AUTH_PENDING, MD_DOCUMENT_AUTH_REFUSED,
+    MD_DOCUMENT_RECOVERING, MD_DOCUMENT_REFUSED, MD_DOCUMENT_INCOMPLETE } MdDocumentHistory;
+typedef void (*MdDocumentBoundary)(const char *relay, uint64_t generation,
+    MdDocumentHistory status, void *data);
+MdNostrDocument *md_nostr_document_open(MdNostr *, const char *filter,
+    MdDocumentEvent, MdDocumentBoundary, void *data);
+/* Free subscriptions before bridge destruction, never from a callback. */
+void md_nostr_document_close(MdNostrDocument *);
+size_t md_nostr_document_routes(MdNostr *, bool write, const char *out[MD_RELAY_TARGET_MAX]);
+/* Zero if the route is absent, offline or stopped. */
+uint64_t md_nostr_document_generation(MdNostr *, const char *relay);
+/* Target a single admitted STORE route and wait for correlated OK. */
+typedef enum { MD_DOCUMENT_ACKNOWLEDGED, MD_DOCUMENT_NOT_SENT,
+    MD_DOCUMENT_UNKNOWN } MdDocumentSendResult;
+MdDocumentSendResult md_nostr_document_send(MdNostr *, const char *relay, const char *signed_event);
 
 /* Snapshot/edit stopped waiting while ACL history was still pending. */
 #define MD_NOSTR_ACL_HISTORY_TIMEOUT (-3)
@@ -181,6 +203,10 @@ typedef struct {
     void *owner_userdata;
     /* Terminal DM inbox refusal; URL and reason are borrowed for this call. */
     void (*on_dm_relay_unavailable)(const char *url, const char *reason, void *userdata);
+    /* Management-only connection changes and wire OK diagnostics. */
+    void (*on_document_route)(void *userdata);
+    void (*on_document_ok)(const char *relay, const char *id, bool ok, const char *reason, void *userdata);
+    void *document_userdata;
 } MdNostrCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────
@@ -266,6 +292,9 @@ void md_nostr_set_test_hook(MdNostr *n,
 /* Send a session request to host_pubkey_hex. Returns 0 on publish success. */
 int md_nostr_send_session_request(MdNostr *n, const char *host_pubkey_hex,
                                   const char *json_payload);
+
+/* Best-effort cancellation of an exact pending session-v1 request. */
+int md_nostr_send_session_cancel(MdNostr *, const char *host_pubkey_hex, const char *request_id);
 
 /* Send a session accept to client_pubkey_hex. Returns 0 on publish success. */
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,

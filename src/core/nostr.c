@@ -24,6 +24,7 @@
 #include "nostr.h"
 #include "managed_store.h"
 #include <nostr-connection.h>
+#include <nostr-subscription.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +98,7 @@ struct MdNostr {
     char route_peer[65];
     NostrPoolSubscription *inbox_sub, *documents_sub;
     bool quality_preferences;
+    bool managed_documents;
     bool live_only_dms;
     uint32_t acl_history_timeout_ms;
     char *quality_cipher; /* allowlist_mu; bounded encrypted NIP-78 winner */
@@ -474,6 +476,8 @@ static void md_nostr_relay_state_handler(NostrRelay *relay,
     update_acl_readiness(n);
     pthread_mutex_unlock(&n->allowlist_mu);
     test_point(n, MD_NOSTR_TEST_ALLOWLIST_BOUNDARY);
+    if (n->managed_documents && n->cbs.on_document_route)
+        n->cbs.on_document_route(n->cbs.document_userdata);
 }
 
 /* nostrc runs this on an attempt-owned signer thread, never the reader.
@@ -547,6 +551,8 @@ static void md_nostr_ok_handler(const char *event_id, bool ok,
         MD_LOG_W("relay REJECTED event %.16s%s — %s", event_id ? event_id : "(null)", event_id && strlen(event_id) > 16 ? "..." : "", reason ? reason : "(no reason)");
     }
 
+    if (n->managed_documents && n->cbs.on_document_ok)
+        n->cbs.on_document_ok(n->relay_urls[rs->index], event_id, ok, reason, n->cbs.document_userdata);
     if (n->cbs.on_publish_result) {
         n->cbs.on_publish_result(event_id, ok, reason,
                                  n->cbs.publish_result_userdata);
@@ -1309,13 +1315,14 @@ static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdId
      * received metadata unusable or force all subsequent DNS checks to fail. */
     const uint64_t planning_deadline = md_monotonic_ns() + 10000000000ULL;
     for (size_t p = 0; p < 4; ++p) {
-        if (roles[p] == ROUTE_FETCH && !n->quality_preferences && !owns_host(n)) continue;
+        if (n->managed_documents && (roles[p] == ROUTE_IN || roles[p] == ROUTE_OUT)) continue;
+        if (roles[p] == ROUTE_FETCH && !n->managed_documents && !n->quality_preferences && !owns_host(n)) continue;
         plans[p].deadline_ns = planning_deadline;
         bool outgoing = roles[p] == ROUTE_OUT;
         md_relay_plan_build(&plans[p], purposes[p], bootstrap, outgoing ? peer : NULL,
                             outgoing ? &d.remote : &d.local);
     }
-    if (!plans[0].count) {
+    if (!n->managed_documents && !plans[0].count) {
         MD_LOG_W("%s; receiving on configured bootstrap relays",
             d.local.dm ? "local DM relay list has no usable targets" : "no local DM relay list");
         md_relay_plan_build(&plans[0], MD_RELAY_BOOTSTRAP, bootstrap, NULL, NULL);
@@ -1344,7 +1351,7 @@ static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdId
             n->routes[n->pool->relay_count] = 0;
         }
     }
-    if (!(admitted & ROUTE_IN)) {
+    if (!n->managed_documents && !(admitted & ROUTE_IN)) {
         MD_LOG_W("DM inbox targets failed admission; receiving on configured bootstrap relays");
         for (size_t i = 0; i < bootstrap->count; ++i)
             if (route_relay(n, &bootstrap->target[i], ROUTE_IN, admission_deadline)) admitted |= ROUTE_IN;
@@ -1353,7 +1360,8 @@ static bool discover_routes(MdNostr *n, const MdRelayPlan *bootstrap, const MdId
     md_relay_plan_clear(&discovery);
     md_relay_metadata_clear(&d.local);
     md_relay_metadata_clear(&d.remote);
-    return (admitted & (ROUTE_IN | ROUTE_OUT)) == (ROUTE_IN | ROUTE_OUT);
+    return n->managed_documents ? (admitted & ROUTE_FETCH) != 0 :
+        (admitted & (ROUTE_IN | ROUTE_OUT)) == (ROUTE_IN | ROUTE_OUT);
 }
 
 static void scoped_event(NostrPoolSubscription *sub, NostrIncomingEvent *in, void *data) {
@@ -1388,6 +1396,118 @@ static NostrPoolSubscription *subscribe_route(MdNostr *n, unsigned role, NostrFi
         if (n->routes[i] & role) urls[count++] = n->relay_urls[i];
     return count ? nostr_simple_pool_subscription_open(n->pool, urls, count, filters,
         false, scoped_event, on_state, n) : NULL;
+}
+
+struct MdNostrDocument {
+    MdNostr *bridge;
+    NostrPoolSubscription *sub;
+    MdDocumentEvent event;
+    MdDocumentBoundary boundary;
+    void *data;
+};
+
+size_t md_nostr_document_routes(MdNostr *n, bool write, const char *out[MD_RELAY_TARGET_MAX]) {
+    if (!n || !n->managed_documents || !out || is_stopped(n)) return 0;
+    size_t count = 0;
+    unsigned role = write ? ROUTE_STORE : ROUTE_FETCH;
+    for (size_t i = 0; i < n->relay_count && count < MD_RELAY_TARGET_MAX; ++i)
+        if (n->routes[i] & role) out[count++] = n->relay_urls[i];
+    return count;
+}
+
+uint64_t md_nostr_document_generation(MdNostr *n, const char *url) {
+    if (!n || !n->managed_documents || !url || is_stopped(n)) return 0;
+    for (size_t i = 0; i < n->relay_count; ++i)
+        if ((n->routes[i] & ROUTE_FETCH) && !strcmp(n->relay_urls[i], url) &&
+            nostr_relay_get_connection_state(n->relays[i]) == NOSTR_RELAY_STATE_CONNECTED)
+            return nostr_relay_get_connection_generation(n->relays[i]);
+    return 0;
+}
+
+static void managed_document_event(NostrPoolSubscription *sub, NostrIncomingEvent *in, void *data) {
+    (void)sub;
+    MdNostrDocument *doc = data;
+    if (!is_stopped(doc->bridge)) {
+        const char *url = nostr_relay_get_url_const(in->relay);
+        char *json = nostr_event_serialize_compact(in->event);
+        doc->event(url, json, doc->data); /* NULL is a local admission failure. */
+        free(json);
+    }
+    nostr_event_free(in->event);
+}
+
+static void managed_document_state(NostrPoolSubscription *sub, NostrRelay *relay,
+    const char *state, const char *reason, const NostrPoolCallbackInfo *info, void *data) {
+    (void)sub;
+    MdNostrDocument *doc = data;
+    MdNostr *n = doc->bridge;
+    if (is_stopped(n) || info->frame.connection_generation != nostr_relay_get_connection_generation(relay)) return;
+    const NostrSubscription *active = nostr_simple_pool_get_callback_subscription(n->pool);
+    MdDocumentHistory status;
+    if (!strcmp(state, "EOSE"))
+        status = active && !nostr_subscription_events_dropped(active) ? MD_DOCUMENT_EOSE : MD_DOCUMENT_INCOMPLETE;
+    else if (!strcmp(state, "CLOSED")) {
+        MD_LOG_W("management document REQ closed on %s: %s", nostr_relay_get_url_const(relay), reason ? reason : "no reason");
+        switch (info->recovery) {
+        case NOSTR_POOL_RECOVERY_AWAIT_AUTH: status = MD_DOCUMENT_AUTH_PENDING; break;
+        case NOSTR_POOL_RECOVERY_AUTH_REFUSED: status = MD_DOCUMENT_AUTH_REFUSED; break;
+        case NOSTR_POOL_RECOVERY_BACKOFF: status = MD_DOCUMENT_RECOVERING; break;
+        /* RECONNECT will retry in a future generation. This REQ was refused
+         * for the current connection and must not look like ongoing EOSE. */
+        default: status = MD_DOCUMENT_REFUSED; break;
+        }
+    } else return;
+    doc->boundary(nostr_relay_get_url_const(relay), info->frame.connection_generation, status, doc->data);
+}
+
+MdNostrDocument *md_nostr_document_open(MdNostr *n, const char *filter,
+    MdDocumentEvent event, MdDocumentBoundary boundary, void *data) {
+    if (!n || !n->managed_documents || !filter || !event || !boundary || !operation_begin(n)) return NULL;
+    const char *urls[MD_RELAY_TARGET_MAX];
+    size_t count = md_nostr_document_routes(n, false, urls);
+    MdNostrDocument *doc = count ? calloc(1, sizeof(*doc)) : NULL;
+    NostrFilters *fs = doc ? nostr_filters_new() : NULL;
+    NostrFilter *f = fs ? nostr_filter_new() : NULL;
+    if (f && !nostr_filter_deserialize(f, filter) && nostr_filters_add(fs, f)) {
+        doc->bridge = n;
+        doc->event = event;
+        doc->boundary = boundary;
+        doc->data = data;
+        /* Replays must be delivered if previous local admission failed. The
+         * durable document winner is the idempotency boundary, not the pool. */
+        doc->sub = nostr_simple_pool_subscription_open(n->pool, urls, count, fs, false,
+            managed_document_event, managed_document_state, doc);
+    }
+    nostr_filter_free(f);
+    nostr_filters_free(fs);
+    if (doc && !doc->sub) { free(doc); doc = NULL; }
+    operation_end(n);
+    return doc;
+}
+
+void md_nostr_document_close(MdNostrDocument *doc) {
+    if (!doc) return;
+    nostr_pool_subscription_free(doc->sub);
+    free(doc);
+}
+
+MdDocumentSendResult md_nostr_document_send(MdNostr *n, const char *url, const char *wire) {
+    if (!n || !n->managed_documents || !url || !operation_begin(n)) return MD_DOCUMENT_NOT_SENT;
+    MdDocumentSendResult r = MD_DOCUMENT_NOT_SENT;
+    NostrEvent *event = event_from_json(wire);
+    for (size_t i = 0; event && i < n->relay_count; ++i) {
+        if (!(n->routes[i] & ROUTE_STORE) || strcmp(url, n->relay_urls[i])) continue;
+        Error *err = NULL;
+        bool ok = nostr_relay_publish_and_wait_with_context(n->relays[i], event, 0, n->publish_cancel.context, &err);
+        r = ok ? MD_DOCUMENT_ACKNOWLEDGED : MD_DOCUMENT_UNKNOWN;
+        /* The pinned API reports OK(false) through the ordinary OK callback;
+         * no transport error can be mistaken for positive acknowledgment. */
+        if (err) free_error(err);
+        break;
+    }
+    nostr_event_free(event);
+    operation_end(n);
+    return r;
 }
 
 /* Legacy hosts subscribe once with the full merged filter set: live NIP-17 DM
@@ -1491,6 +1611,10 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
     n->routed = cfg->bootstrap_plan && cfg->session_peer;
     if (n->routed) memcpy(n->route_peer, cfg->session_peer->pubkey, sizeof(n->route_peer));
     n->quality_preferences = cfg->quality_preferences;
+    n->managed_documents = cfg->managed_documents;
+    if (n->managed_documents && (!n->routed || !cfg->owner ||
+        md_account_binding_role(cfg->owner) != MD_ACCOUNT_CLIENT || cfg->quality_preferences ||
+        (cbs && cbs->on_dm))) { md_nostr_destroy(n); return NULL; }
     n->live_only_dms = cfg->live_only_dms;
     n->acl_history_timeout_ms = cfg->acl_history_timeout_ms;
     n->acl_open = cfg->allowlist_open;
@@ -1521,6 +1645,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
         return NULL;
     }
     n->pk_hex = pk;
+    if (n->managed_documents && strcmp(pk, n->route_peer)) { md_nostr_destroy(n); return NULL; }
 
     /* Store callbacks */
     if (cbs)
@@ -1535,7 +1660,7 @@ MdNostr *md_nostr_create(const MdNostrConfig *cfg, const MdNostrCallbacks *cbs) 
 
     /* Reconnect catch-up must include NIP-59's randomized timestamp range,
      * not a cursor derived from untrusted received timestamps. */
-    if (!nostr_simple_pool_set_recovery_window(n->pool, 2 * 86400 + 300)) {
+    if (!n->managed_documents && !nostr_simple_pool_set_recovery_window(n->pool, 2 * 86400 + 300)) {
         MD_LOG_E("pool recovery-window configuration failed");
         md_nostr_destroy(n);
         return NULL;
@@ -1912,6 +2037,14 @@ int md_nostr_send_session_request(MdNostr *n, const char *host_pubkey_hex,
     if (is_stopped(n)) ret = -1;
     operation_end(n);
     return ret;
+}
+
+int md_nostr_send_session_cancel(MdNostr *n, const char *host_pubkey_hex, const char *request_id) {
+    if (!request_id || strlen(request_id) != MD_SESSION_REQUEST_ID_LEN ||
+        strspn(request_id, "0123456789abcdef") != MD_SESSION_REQUEST_ID_LEN) return -1;
+    char json[MD_SESSION_REQUEST_ID_LEN + 64];
+    snprintf(json, sizeof(json), "{\"type\":\"session_cancel\",\"v\":1,\"request_id\":\"%s\"}", request_id);
+    return md_nostr_send_session_request(n, host_pubkey_hex, json);
 }
 
 int md_nostr_send_session_accept(MdNostr *n, const char *client_pubkey_hex,

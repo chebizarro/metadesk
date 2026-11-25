@@ -30,11 +30,12 @@ jobs:
             build-essential cmake meson ninja-build pkg-config \
             libavcodec-dev libavutil-dev libyuv-dev libsdl2-dev \
             libgtk-4-dev libadwaita-1-dev libglib2.0-dev libsecret-1-dev \
+            libqrencode-dev libzbar-dev \
             libpipewire-0.3-dev libatspi2.0-dev libudev-dev libdbus-1-dev \
             libxcb-xinput-dev libxcb1-dev libxau-dev libx11-dev libei-dev libeis-dev libxkbcommon-dev \
             uuid-dev libcurl4-openssl-dev libwebsockets-dev libssl-dev libsecp256k1-dev \
             libjansson-dev libbz2-dev libcjson-dev libb2-dev libnsync-dev libsodium-dev \
-            libevent-dev dbus-x11 xvfb xauth at-spi2-core pipewire-bin gnome-keyring
+            libevent-dev dbus-x11 xvfb xauth xdotool at-spi2-core pipewire-bin gnome-keyring
       - name: Cache nostrc SDK
         id: nostrc
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

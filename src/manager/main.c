@@ -1,5 +1,6 @@
 #include "window.h"
 #include "identity_resolver.h"
+#include "nostr.h"
 
 static void activate(GtkApplication *app, gpointer data) {
     (void)data;
@@ -39,5 +40,8 @@ int main(int argc, char **argv) {
     g_application_add_main_option(G_APPLICATION(app),"management-socket",0,0,G_OPTION_ARG_STRING,"Connect to a running local host’s private management socket","PATH");
     g_signal_connect(app,"command-line",G_CALLBACK(command_line),NULL);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
-    return g_application_run(G_APPLICATION(app), argc, argv);
+    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_clear_object(&app);
+    md_nostr_shutdown();
+    return status;
 }

@@ -12,7 +12,7 @@ void md_account_startup_clear(MdAccountStartup *s) {
     md_credential_store_destroy(s->store);
     memset(s, 0, sizeof(*s));
 }
-int md_account_startup_open(MdAccountRole role, MdAccountStartup *s) {
+int md_account_startup_open_pinned(MdAccountRole role, const char *expected, MdAccountStartup *s) {
     if (!s) return MD_ACCOUNTS_INVALID;
     memset(s, 0, sizeof(*s));
     s->store = md_credential_store_default();
@@ -21,10 +21,18 @@ int md_account_startup_open(MdAccountRole role, MdAccountStartup *s) {
     /* Saved accounts are unsupported here; preserve explicit/direct-IP use. */
     if (rc == MD_ACCOUNTS_UNSUPPORTED) rc = MD_ACCOUNTS_NOT_FOUND;
 #endif
+    if (expected && !rc) {
+        const MdAccount *selected = md_accounts_role(s->accounts, role);
+        if (!selected || strcmp(expected, selected->pubkey)) rc = MD_SIGNER_ERR_KEY_CHANGED;
+    }
     if (!rc) rc = md_accounts_restore_role(s->accounts, role, &s->binding);
     if (rc == MD_ACCOUNTS_NOT_FOUND) { md_account_startup_clear(s); return 0; }
     if (rc) md_account_startup_clear(s);
     return rc;
+}
+
+int md_account_startup_open(MdAccountRole role, MdAccountStartup *s) {
+    return md_account_startup_open_pinned(role, NULL, s);
 }
 
 int md_accounts_connect_signer(MdSignerType type, const char *pubkey,

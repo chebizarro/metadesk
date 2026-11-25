@@ -97,6 +97,8 @@ typedef struct {
 /* Default snapshot + OS store (no prompt or plaintext fallback). No selection
  * succeeds with binding=NULL. Explicit signer flags should bypass this. */
 int md_account_startup_open(MdAccountRole, MdAccountStartup *);
+/* Reject a changed role selection before contacting the signer backend. */
+int md_account_startup_open_pinned(MdAccountRole, const char *expected_pubkey, MdAccountStartup *);
 void md_account_startup_clear(MdAccountStartup *);
 const char *md_accounts_backend_name(MdSignerType);
 int md_accounts_parse_backend(const char *, MdSignerType *out);

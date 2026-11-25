@@ -22,10 +22,18 @@ typedef enum {
 
 /* pin, if provided, is an npub or 64-hex key. Clear out after success. */
 MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdentity *out);
+/* Check an already-resolved candidate against a saved pin without resolving a second time. */
+MdResolveResult md_identity_check_pin(const MdIdentity *, const char *pin);
+/* Normalize with the same NIP-05 parser used for lookup. Malloc-owned. */
+char *md_identity_normalize_nip05(const char *input);
 MdResolveResult md_identity_from_nip05_json(const char *input, const char *json,
                                             const char *pin, MdIdentity *out);
 /* Returned canonical npub is malloc-owned. */
 char *md_identity_npub(const MdIdentity *id);
+/* Display only: the first 16 hex digits in four groups. Validate the full
+ * key first; never use the short fingerprint as the actual pin. */
+#define MD_KEY_FINGERPRINT_SIZE 20
+bool md_key_fingerprint(const char *pubkey, char out[MD_KEY_FINGERPRINT_SIZE]);
 void md_identity_clear(MdIdentity *id);
 void md_identity_scrub_environment(void);
 const char *md_resolve_error(MdResolveResult result);
