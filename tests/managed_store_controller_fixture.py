@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drive scoped REQs and both ACK outcomes against real websocket transport."""
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -37,7 +39,10 @@ with tempfile.TemporaryDirectory(prefix="md-store-controller-") as directory, Re
     thread = threading.Thread(target=relay.serve_forever)
     thread.start()
     try:
-        result = subprocess.run([sys.argv[1], directory, f"ws://127.0.0.1:{relay.server_address[1]}"],
+        # On Windows the account open must create the directory with an
+        # owner-only ACL, not inherit the temporary parent's default ACL.
+        state = Path(directory) / "state" if os.name == "nt" else directory
+        result = subprocess.run([sys.argv[1], state, f"ws://127.0.0.1:{relay.server_address[1]}"],
                                 capture_output=True, text=True, timeout=25)
         assert result.returncode == 0, result.stderr
         assert "future timestamp" in result.stderr, result.stderr
