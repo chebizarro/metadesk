@@ -35,7 +35,7 @@
 #include "managed_store.h"
 #include <jansson.h>
 #include <nostr/nip19/nip19.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -131,7 +131,7 @@ fail:
     return -1;
 }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 static int launch_fd = -1;
 static pthread_t launch_thread;
 static pthread_mutex_t launch_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -186,6 +186,9 @@ static bool launch_open(const char *arg, MdManagedLaunch *launch) {
     errno = 0;
     long fd = strtol(arg, &end, 10);
     if (errno || end == arg || *end || fd < 3 || fd > INT_MAX) return false;
+#ifdef __APPLE__
+    if (!md_managed_launch_prepare_stream((int)fd)) return false;
+#else
     int type;
     struct sockaddr_storage peer;
     struct ucred creds;
@@ -194,6 +197,7 @@ static bool launch_open(const char *arg, MdManagedLaunch *launch) {
         getsockopt((int)fd, SOL_SOCKET, SO_TYPE, &type, &n) || type != SOCK_SEQPACKET ||
         getpeername((int)fd, (struct sockaddr *)&peer, &pn) || peer.ss_family != AF_UNIX ||
         getsockopt((int)fd, SOL_SOCKET, SO_PEERCRED, &creds, &cn) || creds.uid != geteuid()) return false;
+#endif
     launch_fd = (int)fd;
     struct pollfd p = {.fd = launch_fd, .events = POLLIN};
     return poll(&p, 1, 5000) == 1 && (p.revents & POLLIN) && md_managed_launch_read(launch_fd, launch);
@@ -416,7 +420,7 @@ static void on_dm_relay_unavailable(const char *url, const char *reason, void *d
                                    "Relay unavailable: DM inbox subscription refused");
 }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 static bool auth_required(const char *reason) {
     return reason && !strncmp(reason, "auth-required:", 14);
 }
@@ -442,7 +446,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --host ADDRESS     Direct TCP endpoint (IP or hostname; port via --port)\n");
     fprintf(stderr, "  --npub IDENTITY    Host identity; FIPS route unless --host is set\n");
     fprintf(stderr, "  --pin KEY          Require this npub or 64-hex key to match the resolved identity\n");
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     fprintf(stderr, "  --managed-session-fd N  Inherited private Manager channel (no other options)\n");
 #endif
     fprintf(stderr, "  --managed          Require a bound client role and explicit --relay; no direct TCP\n");
@@ -1220,7 +1224,7 @@ static MdNostr *open_client_bridge(ClientCtx *ctx, const MdNostrConfig *cfg, boo
         .on_dm_relay_unavailable = on_dm_relay_unavailable,
         .dm_userdata = ctx,
     };
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (handoff) {
         cbs.on_dm_relay_closed = report_relay_closed;
         cbs.on_publish_result = report_relay_publish;
@@ -1467,7 +1471,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
 #endif
     if (start_signal_wake() != 0) return 1;
     atexit(stop_signal_wake);
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (launch) {
         if (pthread_create(&launch_thread, NULL, watch_launch, NULL) != 0) return 1;
         launch_thread_started = true;
@@ -1845,7 +1849,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         }
         return 1;
     }
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (launch && (!stream || !launch_handoff())) g_running = 0;
 #endif
     ctx.paused = !stream;
@@ -2222,7 +2226,7 @@ int main(int argc, char **argv) {
     MdRelayPlan bootstrap = {0};
     char *npub = NULL;
     const MdManagedLaunch *launch = NULL;
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     MdManagedLaunch config = {0};
     if (argc > 1 && !strcmp(argv[1], "--managed-session-fd")) {
         if (argc != 3 || !launch_open(argv[2], &config)) {
@@ -2235,7 +2239,7 @@ int main(int argc, char **argv) {
     }
 #endif
     int status = client_run(argc, argv, &identity, &bootstrap, &npub, launch);
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (launch) {
         pthread_mutex_lock(&launch_mu);
         if (!launch_active) {

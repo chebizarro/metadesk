@@ -809,7 +809,7 @@ endif
 
 # Append platform HAL backend sources
 if host_os == 'darwin'
-  core_sources += files('src/core/clipboard_macos.m')
+  core_sources += files('src/core/clipboard_macos.m', 'src/core/managed_launch_spawn_macos.c')
 elif host_os == 'windows'
   core_sources += files('src/core/clipboard_windows.c')
 endif
@@ -1013,6 +1013,19 @@ endif
 if enable_client and host_os == 'linux'
   test('client private managed launch', accounts_python,
     args : [files('tests/test_managed_launch.py'), metadesk_client, '--switch-seam', test_client_session], timeout : 45)
+endif
+
+if host_os == 'darwin'
+  test_launch_spawn = executable('test_launch_spawn_macos', files('tests/test_launch_spawn_macos.c'),
+    include_directories : core_inc, dependencies : dep_metadesk)
+  test('macOS managed launch spawn', test_launch_spawn)
+  if enable_client
+    test('macOS client private managed launch', accounts_python,
+      args : [files('tests/test_managed_launch_macos.py'), metadesk_client], timeout : 35)
+  endif
+endif
+
+if enable_client and host_os == 'linux'
   launch_xvfb = find_program('xvfb-run', required : false)
   launch_dbus = find_program('dbus-run-session', required : false)
   if enable_nip5f and launch_xvfb.found() and launch_dbus.found()

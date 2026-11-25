@@ -4,8 +4,8 @@
 #include "identity_resolver.h"
 #include <stdint.h>
 
-/* Linux local SOCK_SEQPACKET channel. Only the client endpoint is inherited.
- * Version 1 carries public configuration, never signer credentials: the child
+/* Private local channel. Only the client endpoint is inherited. Version 1
+ * carries public configuration, never signer credentials: the child
  * restores the OS-backed client binding and verifies its public key. */
 #define MD_MANAGED_LAUNCH_VERSION 1
 #define MD_MANAGED_ADDRESS_MAX 8192
@@ -29,12 +29,22 @@ typedef enum {
     MD_LAUNCH_RELAY_AUTH, MD_LAUNCH_RELAY_CLOSED, MD_LAUNCH_RELAY_REJECTED
 } MdLaunchMessage;
 
-#ifdef __linux__
-/* Strict bounded JSON configuration, followed by typed versioned packets. */
+#if defined(__linux__) || defined(__APPLE__)
+/* Strict bounded JSON configuration, followed by typed versioned messages. */
 bool md_managed_launch_write(int fd, const MdManagedLaunch *);
 bool md_managed_launch_read(int fd, MdManagedLaunch *);
 bool md_managed_launch_message_write(int fd, MdLaunchMessage);
 /* 1 message, 0 EOF, -1 invalid or I/O error (errno=EAGAIN if not ready). */
 int md_managed_launch_message_read(int fd, MdLaunchMessage *, bool nonblocking);
+#endif
+
+#ifdef __APPLE__
+#include <sys/types.h>
+/* Verify a connected same-user Unix stream and suppress SIGPIPE on it. */
+bool md_managed_launch_prepare_stream(int fd);
+/* Absolute executable path. Returns a POSIX error number or zero. On success
+ * the caller owns the nonblocking parent socket and must reap the child,
+ * including on write failure. Send configuration immediately after spawning. */
+int md_managed_launch_spawn(const char *client, int *fd, pid_t *pid);
 #endif
 #endif
