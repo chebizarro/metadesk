@@ -131,7 +131,7 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     BOOL _busy, _launched, _started, _roleEditing;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
-    NSString *_lastOwner;
+    NSString *_lastOwner, *_savedBootstrap;
     NSArray<NSString *> *_lastOwnerHosts;
     NSTextField *_address, *_route, *_relays, *_search, *_directory;
     NSTextField *_status, *_error, *_progress, *_diagnostic, *_rotation, *_detail;
@@ -165,7 +165,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _issues = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _issues.target = self; _issues.action = @selector(issueSelection:);
     [_issues setAccessibilityLabel:@"Address book issues"];
-    _refresh = Button(@"Refresh Address Book", self, @selector(refresh:));
+    _refresh = Button(@"Save Relays and Refresh Address Book", self, @selector(refresh:));
     _review = Button(@"Review and Connect…", self, @selector(reviewEntry:));
     _saved = Button(@"Review Saved Host…", self, @selector(reviewSaved:));
     _edit = Button(@"Edit Saved Host…", self, @selector(edit:));
@@ -206,7 +206,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [self render];
 }
 - (void)activate {
-    if (!_started) { _started = YES; [self refresh:nil]; }
+    if (!_started) { _started = YES; [self reloadBook:NO]; }
 }
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
     _roleEditing = YES; ++_generation; _book = nil; [self render];
@@ -221,7 +221,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)resumeAfterRoleEdit {
     _roleEditing=NO;
-    if (!self.closing && _started) [self refresh:nil];
+    if (!self.closing && _started) [self reloadBook:NO];
 }
 - (void)close:(dispatch_block_t)drained {
     atomic_store(&_closing, true);
@@ -290,6 +290,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)render {
     _status.stringValue = _book.status ?: @"Opening the address book…";
     _refresh.enabled = !_roleEditing && !_busy && !self.closing;
+    _relays.enabled = _refresh.enabled;
     if (_roleEditing) _status.stringValue=@"Reloading the client role…";
     _review.enabled = !_busy && !_launched && _book.canReview;
     _import.enabled = !_busy && _book.canEdit;
@@ -370,17 +371,26 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)refresh:(id)sender {
     (void)sender;
-    if (_busy || self.closing) return;
+    [self reloadBook:YES];
+}
+- (void)reloadBook:(BOOL)refresh {
+    if (_busy || _roleEditing || self.closing) return;
     ++_generation;
-    NSString *relays = _relays.stringValue, *directory = MDHostTrim(_directory.stringValue);
+    NSString *edit = refresh && ![_relays.stringValue isEqual:_savedBootstrap] ? _relays.stringValue : nil;
+    NSString *directory = MDHostTrim(_directory.stringValue);
     _error.stringValue = @"";
     [self run:^id(MDHostsWorker *worker) {
-        NSString *error = nil;
-        if (![worker openDirectory:directory error:&error]) return error;
+        NSString *configError = nil, *cacheError = nil;
+        NSString *relays = MDHostsBootstrap(edit, &configError);
         if (self.closing) return nil;
-        if (![worker startRelays:relays]) return @"Could not configure address book relays. Cached data remains available.";
-        return @"";
-    } done:^(NSString *message) { self->_error.stringValue = message ?: @""; }];
+        BOOL opened = [worker openDirectory:directory error:&cacheError];
+        if (opened && relays && refresh && !self.closing && ![worker startRelays:relays])
+            cacheError = @"Could not configure address book relays. Cached data remains available.";
+        return @[relays ?: NSNull.null, configError ?: cacheError ?: @""];
+    } done:^(NSArray *result) {
+        if (result[0] != NSNull.null) self->_relays.stringValue = self->_savedBootstrap = result[0];
+        self->_error.stringValue = result[1];
+    }];
 }
 - (void)reviewEntry:(id)sender {
     (void)sender;

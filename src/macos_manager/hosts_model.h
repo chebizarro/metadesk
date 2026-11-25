@@ -56,6 +56,9 @@ NSString *MDHostBoundText(NSString *value, NSUInteger limit);
 - (void)recordKey:(NSString *)key owner:(NSString *)owner outcome:(MdRecentOutcome)outcome;
 @end
 
+/* Worker-only. nil input loads; a non-nil field saves explicit choices (including empty). */
+NSString *MDHostsBootstrap(NSString *input, NSString **error);
+
 NSString *MDHostCapsText(uint8_t caps);
 NSString *MDHostLaunchText(MdLaunchMessage message, MdLaunchMessage phase);
 NSString *MDHostLaunchDiagnostic(MdLaunchMessage message);

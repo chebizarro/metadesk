@@ -28,8 +28,11 @@ is resolved beside the manager executable, inside its bundle, then on `PATH`.
 
 1. Assign a client role in **Identity**, then open **Hosts** to load its encrypted
    cache. Enter explicit bootstrap relay URLs separated by spaces and select
-   **Refresh Address Book** to sync. Relay choices are session-local; none is
-   preselected. `ws://` is unencrypted.
+   **Save Relays and Refresh Address Book** to sync. Both managers use the same
+   per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
+   `~/.config/metadesk`). The app loads the selection on entry but does not sync
+   until you refresh. Clear the field and refresh to remove all choices; none
+   is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name. Enter
    an IPv4 or IPv6 address only as a route hint for the reviewed key. Verify the
    full npub, short fingerprint, NIP-05 status and requested access before saving
@@ -116,8 +119,8 @@ import an already-paired signer via the [account CLI](accounts.md#headless-cli).
 
 ## Differences from the Linux Manager and remaining limits
 
-- No persistent bootstrap choices, relay discovery/authentication status panel,
-  or QR display/scanning. The Relays tab is an offline preview.
+- No relay discovery/authentication status panel or QR display/scanning.
+  The Relays tab is an offline preview; edit bootstrap choices in Hosts.
 - No in-app account creation, label editing, pairing import, or Grotto Control1
   status panel. No separate Activity history; live sessions are in This Computer.
 - No LaunchAgent registration or start/stop. No sharing/unattended setters exist
@@ -133,5 +136,7 @@ Hosts review/edit/conflict sheets, HTTPS NIP-05, a real video launch and cancell
 and that quitting leaves a connected client running. Exercise IPC restart/reconnect,
 exact approvals and revocation, signed notification open and withdrawal, signer
 lock and remote approval/cancel, Keychain ACLs and no fallback, FIPS match/mismatch,
-and role switching. Startup smoke and headless fixture tests do not qualify these
+and role switching. Save bootstrap choices, relaunch to check that they are
+restored, and confirm clearing them leaves the address book offline without a
+fallback relay. Startup smoke and headless fixture tests do not qualify these
 signed or interactive workflows.

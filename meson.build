@@ -832,6 +832,10 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
+if (get_option('macos_manager') and host_os == 'darwin') or (get_option('manager') and host_os == 'linux')
+  subdir('src/manager_shared')
+endif
+
 if get_option('macos_manager')
   if host_os != 'darwin'
     error('macos_manager requires macOS')
