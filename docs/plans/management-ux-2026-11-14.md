@@ -1272,3 +1272,23 @@ Columns summarize **publicly documented** behavior (product docs as cited in §3
 | 13 | macOS management frontend timing relative to the notarized DMG | **Open** → `md-pep3` / `md-wdi3` |
 
 With §8, the spike deliverable is complete: a concrete recommendation (§8.5), a phased plan with filed beads (§8.1, §8.6), and the open decisions (§8.7).
+
+### 8.8 Status update (2026-11-24, release epic `md-w9sc`)
+
+The items §8.1 listed as open were implemented under release epic `md-w9sc` (target tag `v0.1.0-alpha.2`). Where this table conflicts with §8.1, this table wins.
+
+| Item | Bead | Status | Where | Carried forward |
+|---|---|---|---|---|
+| P2.4 encrypted management store | `md-v3oh` | Done | `src/core/managed_store.*`, `docs/managed-store.md` | — |
+| P2.5 resolution + relay planning | `md-2l87` | Done, narrowed | `src/core/identity_resolver.*`, `relay_plan.*`, `discovery_http.c` | `md-dc2m`: connect-time destination enforcement needs an upstream nostrc dial policy; discovered relays are validated at selection and pool hand-off only |
+| P4.11a collections + connect | `md-vb18` | Done | `src/manager/hosts-page.c`, `src/core/managed_store_controller.*`, `managed_launch.*`, `docs/manager.md` | `md-7c86`: remaining keyboard matrix, real-client hand-off test, camera QR scan, Connect gated by a stalled storage write |
+| Overlay quick-connect switcher | `md-l35t` | Done | `src/client/ui.cpp`, `src/client/main.c` | `md-zf1y`: overlay switches do not record recents |
+| macOS frontend (deferred item) | `md-pep3` | Prototype done | `docs/plans/management-macos.md`, `src/macos_manager/` (`-Dmacos_manager=true`) | `md-qgxe`: live sync/edit, connect launch, approvals, role binding; never launched on screen |
+| P5.14 release matrix | `md-5zi` | In progress | `docs/testing/results/` | Full host↔client matrix (Omarchy, FIPS, attended visual checks) remains incomplete |
+
+Decisions taken while implementing:
+
+- **§8.7 #8 (pool per concern):** moot; per-subscription handles (`md-b970`) are used.
+- **§3.8 connection-time validation:** not achievable at the pinned nostrc revision without an upstream change; tracked in `md-dc2m`, and the code and docs state the remaining time-of-check/time-of-use window.
+- **New linked nostrc components:** `nip05`, `nip65`, `nip78` at the unchanged pin.
+- **Overlay host list:** the overlay reads the encrypted cache read-only through its own client-role binding on every platform, rather than over the Linux-only launch channel.
