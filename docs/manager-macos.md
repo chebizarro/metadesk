@@ -38,7 +38,10 @@ is resolved beside the manager executable, inside its bundle, then on `PATH`.
    full npub, short fingerprint, NIP-05 status and requested access before saving
    or connecting. A changed NIP-05 pin blocks connection. Keep the old key, or
    verify the new one with the host and type its exact fingerprint to replace
-   it. Review again before connecting. `nsec` and `ncryptsec` are cleared and refused.
+   it. Review again before connecting. **Scan QR Image** reads one QR code from
+   a local image and sends its payload through the same review as typed text.
+   `nsec` and `ncryptsec` are cleared and refused, including when scanned. No
+   camera or camera permission is used.
 3. Filter saved hosts by text or tag. Edit labels, notes, favorites and tag
    membership, or switch to **Quick Connect** for favorites followed by local
    recent attempts. Last-connected times are not synced. A new client key does
@@ -60,6 +63,9 @@ launch; **Disconnect** ends a connected session. Quitting the manager cancels
 an unfinished launch and leaves a connected video window running.
 
 ## This Computer and Access
+
+**Show Host QR Code** displays the saved host role's public `nprofile` and
+fingerprint. It does not contact the signer or check whether the host is running.
 
 Enter the running host's absolute [management socket path](host-management.md#endpoint-and-peer-trust)
 and select **Connect to Local Host**. Status comes from an authenticated live
@@ -119,8 +125,8 @@ import an already-paired signer via the [account CLI](accounts.md#headless-cli).
 
 ## Differences from the Linux Manager and remaining limits
 
-- No relay discovery/authentication status panel or QR display/scanning.
-  The Relays tab is an offline preview; edit bootstrap choices in Hosts.
+- No relay discovery/authentication status panel. The Relays tab is an offline
+  preview; edit bootstrap choices in Hosts.
 - No in-app account creation, label editing, pairing import, or Grotto Control1
   status panel. No separate Activity history; live sessions are in This Computer.
 - No LaunchAgent registration or start/stop. No sharing/unattended setters exist
@@ -138,5 +144,8 @@ exact approvals and revocation, signed notification open and withdrawal, signer
 lock and remote approval/cancel, Keychain ACLs and no fallback, FIPS match/mismatch,
 and role switching. Save bootstrap choices, relaunch to check that they are
 restored, and confirm clearing them leaves the address book offline without a
-fallback relay. Startup smoke and headless fixture tests do not qualify these
+fallback relay. Display and scan the packaged app's host QR on another device,
+compare the fingerprint, confirm the scan opens the normal trust review, and
+verify that scanning a secret-key fixture refuses it without a camera prompt.
+Startup smoke and headless fixture tests do not qualify these
 signed or interactive workflows.

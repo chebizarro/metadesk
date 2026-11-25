@@ -1,5 +1,7 @@
 #import "hosts_page.h"
 #import "hosts_launch.h"
+#import "host_qr.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdatomic.h>
 
 /* These fields may show encrypted-book text. No selection may be copied,
@@ -137,7 +139,7 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     NSTextField *_status, *_error, *_progress, *_diagnostic, *_rotation, *_detail;
     NSPopUpButton *_tags, *_issues;
     NSTableView *_table;
-    NSButton *_refresh, *_review, *_saved, *_edit, *_quick, *_import, *_export, *_issue, *_control, *_copyKey;
+    NSButton *_refresh, *_review, *_scan, *_saved, *_edit, *_quick, *_import, *_export, *_issue, *_control, *_copyKey;
     MdLaunchMessage _phase;
 }
 - (BOOL)closing;
@@ -167,6 +169,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [_issues setAccessibilityLabel:@"Address book issues"];
     _refresh = Button(@"Save Relays and Refresh Address Book", self, @selector(refresh:));
     _review = Button(@"Review and Connect…", self, @selector(reviewEntry:));
+    _scan = Button(@"Scan QR Image…", self, @selector(scanQR:));
     _saved = Button(@"Review Saved Host…", self, @selector(reviewSaved:));
     _edit = Button(@"Edit Saved Host…", self, @selector(edit:));
     _copyKey = Button(@"Copy Public Key", self, @selector(copyPublicKey:));
@@ -188,7 +191,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     for (NSView *v in @[_status, _rotation, _error, _relays, _directory]) Wide(form, v);
     [form addArrangedSubview:_refresh];
     Wide(form, _address); Wide(form, _route);
-    [form addArrangedSubview:Stack(@[_review, _control], NSUserInterfaceLayoutOrientationHorizontal)];
+    [form addArrangedSubview:Stack(@[_review, _scan, _control], NSUserInterfaceLayoutOrientationHorizontal)];
     Wide(form, _progress); Wide(form, _diagnostic);
     Wide(form, _search);
     [form addArrangedSubview:Stack(@[_tags, _quick], NSUserInterfaceLayoutOrientationHorizontal)];
@@ -293,6 +296,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _relays.enabled = _refresh.enabled;
     if (_roleEditing) _status.stringValue=@"Reloading the client role…";
     _review.enabled = !_busy && !_launched && _book.canReview;
+    _scan.enabled = _review.enabled;
     _import.enabled = !_busy && _book.canEdit;
     _export.enabled = !_busy && _book.canExport;
     NSString *tag = _tags.selectedItem.representedObject;
@@ -357,16 +361,20 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSString *npub = MDHostNpub(self.selected[@"key"]);
     if (npub) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:npub forType:NSPasteboardTypeString]; }
 }
-- (BOOL)rejectSecret:(NSTextField *)field {
+- (BOOL)rejectSecret:(NSTextField *)field input:(MDHostInput)input {
+    if (input != MDHostSecret) return NO;
     NSTextView *editor = (NSTextView *)field.currentEditor;
-    if (MDClassifyHostInput(editor ? editor.string : field.stringValue) != MDHostSecret) return NO;
     if (editor) { editor.string = @""; [editor.undoManager removeAllActions]; }
     field.stringValue = @"";
     _error.stringValue = @"Private keys are not host addresses. Use a public host identity.";
     return YES;
 }
 - (void)controlTextDidChange:(NSNotification *)note {
-    if (note.object == _address || note.object == _route) [self rejectSecret:note.object];
+    if (note.object == _address || note.object == _route) {
+        NSTextField *field = note.object;
+        NSTextView *editor = (NSTextView *)field.currentEditor;
+        [self rejectSecret:field input:MDClassifyHostInput(editor ? editor.string : field.stringValue)];
+    }
     if (note.object == _search) [self filter:nil];
 }
 - (void)refresh:(id)sender {
@@ -394,16 +402,40 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)reviewEntry:(id)sender {
     (void)sender;
-    BOOL rejected = [self rejectSecret:_address]; rejected |= [self rejectSecret:_route];
-    if (rejected) return;
-    NSString *address = _address.stringValue;
+    [self reviewInput:_address.stringValue fromImage:NO];
+}
+- (void)reviewInput:(NSString *)address fromImage:(BOOL)fromImage {
     MDHostInput input = MDClassifyHostInput(address);
+    BOOL rejected = [self rejectSecret:_address input:input];
+    rejected |= [self rejectSecret:_route input:MDClassifyHostInput(_route.stringValue)];
+    if (rejected) return;
     if (input != MDHostPublic && input != MDHostName) {
         _error.stringValue = @"Enter an npub, nprofile, lowercase public key or NIP-05 name. An IP address is only a route hint."; return;
     }
     NSString *route = MDHostTrim(_route.stringValue);
     if (!MDHostRouteValid(route)) { _error.stringValue = @"Enter an IPv4 or IPv6 route hint."; return; }
+    if (fromImage) _address.stringValue = MDHostTrim(address);
     [self resolve:address route:route];
+}
+- (void)scanQR:(id)sender {
+    (void)sender;
+    NSWindow *window = self.view.window;
+    if (!_scan.enabled || self.closing || !window || window.attachedSheet) return;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.allowedContentTypes = @[UTTypeImage];
+    NSUInteger generation = _generation;
+    [panel beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK || self.closing || generation != self->_generation) return;
+        NSURL *url = panel.URL;
+        [self run:^id(MDHostsWorker *worker) { (void)worker; return MDReadHostQR(url); }
+             done:^(NSString *value) {
+            if (generation != self->_generation) return;
+            if (!value.length) self->_error.stringValue = @"Choose a supported image containing exactly one QR code.";
+            else [self reviewInput:value fromImage:YES];
+        }];
+    }];
 }
 - (void)reviewSaved:(id)sender {
     (void)sender;
