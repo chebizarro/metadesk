@@ -83,14 +83,17 @@ required; offline cache access is not offline session establishment.
 
 The list is memory-only, and no new plaintext file or launch-channel payload
 is needed. Linux and macOS use `$XDG_STATE_HOME/metadesk` (or
-`~/.local/state/metadesk`); Windows uses `%LOCALAPPDATA%/metadesk`. Saved aliases
+`~/.local/state/metadesk`); Windows uses `%LOCALAPPDATA%/metadesk`. The macOS
+manager uses that same default when its cache path field is empty. Saved aliases
 must still resolve to their pinned key. The overlay cannot add, update, or
 replace a pin. Switching discards the old session and starts a new pinned
 session using the original explicitly configured bootstrap relays. Without
 those relays the list remains viewable, but switching is disabled rather than
 using the CLI's implicit default. A one-off direct endpoint supplied for the
 initial connection is not inherited. The Linux
-manager's launch status ends with the session it originally launched.
+manager's launch status ends with the session it originally launched. The
+read-only overlay does not record switch outcomes, so switches do not update
+recents; the manager records its own launch outcomes.
 
 ## Local data and compatibility
 

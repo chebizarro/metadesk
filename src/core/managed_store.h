@@ -15,6 +15,8 @@
 #define MD_STORE_MAX_RELAYS 32
 
 typedef struct MdManagedStore MdManagedStore;
+/* Malloc-owned platform default. Computes a path, never creates it. */
+char *md_managed_store_default_directory(void);
 typedef enum {
     MD_STORE_OK, MD_STORE_UNCHANGED, MD_STORE_PENDING, MD_STORE_PARTIAL,
     MD_STORE_CONFLICT, MD_STORE_READ_ONLY, MD_STORE_NOT_READY,

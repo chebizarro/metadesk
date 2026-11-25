@@ -56,7 +56,6 @@
 #include <stdatomic.h>
 #ifdef _WIN32
 #include <windows.h>
-#include "win_private.h"
 #endif
 
 static atomic_int g_running = 1;
@@ -1047,20 +1046,7 @@ static void overlay_event_forward(void *event, void *userdata) {
 }
 
 static json_t *read_quick_hosts(MdAccountBinding *owner, MdSignerCancel *cancel) {
-#ifdef _WIN32
-    char *path = md_win_default_directory("\\metadesk");
-#else
-    const char *base = getenv("XDG_STATE_HOME");
-    const char *suffix = "/metadesk";
-    if (!base || base[0] != '/') {
-        base = getenv("HOME");
-        suffix = "/.local/state/metadesk";
-    }
-    if (!base || !*base) return NULL;
-    size_t n = strlen(base) + strlen(suffix) + 1;
-    char *path = malloc(n);
-    if (path) snprintf(path, n, "%s%s", base, suffix);
-#endif
+    char *path = md_managed_store_default_directory();
     if (!path) return NULL;
     json_t *hosts = md_managed_store_quick_hosts_cancellable(owner, path, cancel);
     free(path);

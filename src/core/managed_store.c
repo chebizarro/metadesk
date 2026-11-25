@@ -179,6 +179,24 @@ static MdManagedStore *open_store(MdAccountBinding *binding, const char *path, b
     if (!opened || !s->ready || !current(s)) { md_managed_store_close(s); return NULL; }
     return s;
 }
+char *md_managed_store_default_directory(void) {
+#ifdef _WIN32
+    return md_win_default_directory("\\metadesk");
+#else
+    const char *base = getenv("XDG_STATE_HOME");
+    const char *suffix = "/metadesk";
+    if (!base || base[0] != '/') {
+        base = getenv("HOME");
+        suffix = "/.local/state/metadesk";
+    }
+    if (!base || base[0] != '/') return NULL;
+    size_t size = strlen(base) + strlen(suffix) + 1;
+    char *path = malloc(size);
+    if (path) snprintf(path, size, "%s%s", base, suffix);
+    return path;
+#endif
+}
+
 MdManagedStore *md_managed_store_open(MdAccountBinding *binding, const char *path) {
     return open_store(binding, path, false);
 }
