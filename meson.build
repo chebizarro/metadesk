@@ -1471,6 +1471,9 @@ if host_os == 'darwin'
   if enable_client
     _installed_bins += 'metadesk-client'
   endif
+  if get_option('macos_manager')
+    _installed_bins += 'metadesk-macos-manager'
+  endif
   meson.add_install_script(import('python').find_installation('python3'),
     files('packaging/macos/fix-install-names.py'),
     get_option('libdir'), get_option('bindir'), _installed_bins)

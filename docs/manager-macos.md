@@ -5,7 +5,17 @@ Metadesk Manager is an optional AppKit companion. **Hosts** syncs and connects;
 saved role assignments. The manager does not start a host or enable sharing.
 Quitting it does not stop a host.
 
-## Build and run
+## Install from the macOS DMG
+
+Copy `Metadesk Manager.app` out of the arm64 DMG. It includes its own video
+client and private libraries; Connect does not need `metadesk-client` on
+`PATH` or `Metadesk.app` alongside it. For manual local hosting, use
+`Metadesk.app/Contents/MacOS/metadesk-host` or your installed CLI on `PATH`.
+The Manager is ad-hoc signed like `Metadesk.app` in the default unsigned DMG.
+It has only been exercised through fixture tests and launch-and-quit smokes;
+signed on-screen qualification is still open (`md-8xlg`, `md-wdi3`).
+
+## Build and run from source
 
 With the normal macOS dependencies and a built, pinned nostrc tree:
 
@@ -22,7 +32,10 @@ PATH="$PWD/build-mac-manager:$PATH" \
 The app targets macOS 13 or later; development dependencies may require a
 newer version. The bundle uses build-tree libraries. It is not a signed release
 and cannot qualify the packaged host's permission identity. `metadesk-client`
-is resolved beside the manager executable, inside its bundle, then on `PATH`.
+is resolved beside the manager executable, inside its bundle, then on `PATH`
+for development installs. GLib is not linked by the Manager. If `gio-2.0` is
+available when configuring, the suite also runs the GTK store against the
+same relay vectors and exchanges real files between both implementations.
 
 ## Hosts
 

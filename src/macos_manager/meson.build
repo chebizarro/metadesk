@@ -22,7 +22,8 @@ macos_manager_bin = executable('metadesk-macos-manager', 'main.m',
   objc_args : '-fobjc-arc',
   link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
   dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
-  build_rpath : meson.project_build_root())
+  build_rpath : meson.project_build_root(),
+  install : true, install_rpath : _product_exe_rpath)
 
 macos_manager_plist = configure_file(input : 'Info.plist.in', output : 'Info.plist',
   configuration : {'VERSION': meson.project_version()})

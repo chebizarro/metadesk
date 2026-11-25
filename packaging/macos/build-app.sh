@@ -1,6 +1,6 @@
 #!/bin/sh
 # md-kb7 macOS prototype: build metadesk, stage an install tree, bundle it into
-# a self-contained Metadesk.app, verify it, and (optionally) wrap it in a .dmg.
+# self-contained app bundles, verify them, and (optionally) wrap them in a .dmg.
 #
 #   packaging/macos/build-app.sh NOSTRC_ROOT NOSTRC_BUILD_DIR OUTPUT [MESON_OPTION...]
 #
@@ -75,37 +75,53 @@ if [ -f "$sdl2_lib" ] && strings "$sdl2_lib" | grep -q '^@loader_path/libSDL3.dy
 fi
 
 # Build-tree rpaths are the producer's link view; installed images lost them.
+manager_build="$out/build/src/macos_manager"
+set -- "$out/build/metadesk-client" "$out/build/metadesk-host" "$out/build/libmetadesk.0.dylib"
+if [ -x "$manager_build/metadesk-macos-manager" ]; then
+    set -- "$@" "$manager_build/metadesk-macos-manager"
+fi
 search_args=
-for rp in $(otool -l "$out/build/metadesk-client" "$out/build/metadesk-host" "$out/build/libmetadesk.0.dylib" |
+for rp in $(otool -l "$@" |
             awk '/cmd LC_RPATH/{getline; getline; print $2}' | sort -u); do
     case "$rp" in @*) ;; *) search_args="$search_args --search $rp" ;; esac
 done
 
 hardened=
 [ "$identity" = - ] || hardened=--hardened-runtime
-# shellcheck disable=SC2086 # intentional word splitting of optional args
-python3 "$here/bundle_app.py" --stage "$out/stage/opt/metadesk" --out "$out/Metadesk.app" \
-    --version "$version" --source-rev "$rev" --nostrc-rev "$nostrc_rev" \
-    --sign-identity "$identity" $hardened $dlopen_args $search_args
-if [ -n "${MD_DEPS_PREFIX:-}" ]; then
-    deps=$(dirname "$MD_DEPS_PREFIX")
-    cp "$deps/deps.lock.json" "$out/Metadesk.app/Contents/Resources/"
-    cp -R "$deps/licenses" "$out/Metadesk.app/Contents/Resources/"
-    cp "$src/THIRD_PARTY_NOTICES.md" "$src/LICENSE" "$out/Metadesk.app/Contents/Resources/"
-    mkdir -p "$out/Metadesk.app/Contents/Resources/licenses/imgui"
-    cp "$src/imgui_vendor/LICENSE.txt" "$out/Metadesk.app/Contents/Resources/licenses/imgui/"
-    # Resources were added after bundling: re-seal using the same identity.
-    if [ "$identity" = - ]; then
-        codesign --force --sign "$identity" "$out/Metadesk.app"
-    else
-        codesign --force --sign "$identity" --options runtime --timestamp "$out/Metadesk.app"
+build_bundle() {
+    app=$1; shift
+    # shellcheck disable=SC2086 # intentional word splitting of optional args
+    python3 "$here/bundle_app.py" --stage "$out/stage/opt/metadesk" --out "$app" \
+        --version "$version" --source-rev "$rev" --nostrc-rev "$nostrc_rev" \
+        --sign-identity "$identity" $hardened $dlopen_args $search_args "$@"
+    if [ -n "${MD_DEPS_PREFIX:-}" ]; then
+        deps=$(dirname "$MD_DEPS_PREFIX")
+        resources="$app/Contents/Resources"
+        cp "$deps/deps.lock.json" "$resources/"
+        cp -R "$deps/licenses" "$resources/"
+        cp "$src/THIRD_PARTY_NOTICES.md" "$src/LICENSE" "$resources/"
+        mkdir -p "$resources/licenses/imgui"
+        cp "$src/imgui_vendor/LICENSE.txt" "$resources/licenses/imgui/"
+        # Resources were added after bundling: re-seal using the same identity.
+        if [ "$identity" = - ]; then
+            codesign --force --sign "$identity" "$app"
+        else
+            codesign --force --sign "$identity" --options runtime --timestamp "$app"
+        fi
     fi
-fi
-"$here/verify-app.sh" "$out/Metadesk.app"
+    "$here/verify-app.sh" "$app"
+}
 
-if [ "${MD_DMG:-0}" = 1 ]; then
-    "$here/make-dmg.sh" "$out/Metadesk.app" "$out/Metadesk-$version.dmg"
+set -- Metadesk.app
+build_bundle "$out/$1"
+if [ -x "$manager_build/metadesk-macos-manager" ]; then
+    manager_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$manager_build/Info.plist").app
+    build_bundle "$out/$manager_name" --manager-plist "$manager_build/Info.plist"
+    set -- "$@" "$manager_name"
 fi
-(cd "$out" && find Metadesk.app -type f -print0 | sort -z | xargs -0 shasum -a 256 >SHA256SUMS
+if [ "${MD_DMG:-0}" = 1 ]; then
+    "$here/make-dmg.sh" "$out/$1" "$out/Metadesk-$version.dmg" "${2:+$out/$2}"
+fi
+(cd "$out" && find "$@" -type f -print0 | sort -z | xargs -0 shasum -a 256 >SHA256SUMS
  [ ! -f "Metadesk-$version.dmg" ] || shasum -a 256 "Metadesk-$version.dmg" >>SHA256SUMS)
 echo "Built $out/Metadesk.app ($rev, nostrc $nostrc_rev, signed with '$identity')"

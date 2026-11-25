@@ -36,7 +36,9 @@ codesign --verify --strict --deep "$app" || bad "codesign verification"
 
 # Every image's LC_BUILD_VERSION minos must not exceed the release floor;
 # Homebrew bottles carry the builder's OS version and fail this.
-min=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")
+plist="$app/Contents/Info.plist"
+main=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")
+min=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")
 if [ -n "${MD_MACOS_MIN:-}" ]; then
     newest=$(printf '%s\n%s\n' "$MD_MACOS_MIN" "$min" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
     [ "$newest" = "$MD_MACOS_MIN" ] || bad "bundle needs macOS $min, release floor is $MD_MACOS_MIN"
@@ -52,7 +54,7 @@ trap 'rm -rf "$home"' EXIT INT TERM
 runclean() {
     log=$1; shift
     # shellcheck disable=SC2016 # $ENV is perl, not shell
-    env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="$home" \
+    env -i HOME="$home" CFFIXED_USER_HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="$home" \
         /usr/bin/perl -e '$ENV{DYLD_PRINT_LIBRARIES} = 1; alarm shift; exec @ARGV or die' 20 "$@" \
         >"$home/$log.out" 2>"$home/$log.err" && rc=0 || rc=$?
     sed -n 's/^dyld\[[0-9]*\]: <[^>]*> //p' "$home/$log.err" >"$home/$log.loaded"
@@ -62,19 +64,30 @@ runclean() {
             *) bad "$log loaded $path from outside the bundle" ;;
         esac
     done <"$home/$log.loaded"
-    echo "$log: exit $rc, $(wc -l <"$home/$log.loaded" | tr -d ' ') images, $(grep -c "^$app/" "$home/$log.loaded" || true) bundled"
+    echo "$log: exit $rc, $(wc -l <"$home/$log.loaded" | tr -d ' ') images, $(grep -Fc "$app/" "$home/$log.loaded" || true) bundled"
 }
 
-runclean host-help "$app/Contents/MacOS/metadesk-host" --help
-[ "$rc" -eq 0 ] || bad "metadesk-host --help exited $rc"
-runclean client-help "$app/Contents/MacOS/metadesk-client" --help
-[ "$rc" -le 1 ] || bad "metadesk-client --help exited $rc"
-# Contract gate 4 analogue: with no signer/relay/desktop configuration the
-# host must fail promptly with a diagnostic, not hang or start a substitute.
-runclean host-bare "$app/Contents/MacOS/metadesk-host"
-[ "$rc" -ne 0 ] && [ "$rc" -ne 142 ] || bad "bare metadesk-host exited $rc (142 = hung until alarm)"
-[ -s "$home/host-bare.err" ] || bad "bare metadesk-host printed no diagnostic"
-grep -qv '^dyld\[' "$home/host-bare.err" || bad "bare metadesk-host printed no diagnostic"
+case "$main" in
+    metadesk-client)
+        runclean host-help "$app/Contents/MacOS/metadesk-host" --help
+        [ "$rc" -eq 0 ] || bad "metadesk-host --help exited $rc"
+        runclean client-help "$app/Contents/MacOS/metadesk-client" --help
+        [ "$rc" -le 1 ] || bad "metadesk-client --help exited $rc"
+        # Without configuration the host must fail promptly with a diagnostic.
+        runclean host-bare "$app/Contents/MacOS/metadesk-host"
+        [ "$rc" -ne 0 ] && [ "$rc" -ne 142 ] || bad "bare metadesk-host exited $rc (142 = hung until alarm)"
+        [ -s "$home/host-bare.err" ] || bad "bare metadesk-host printed no diagnostic"
+        grep -qv '^dyld\[' "$home/host-bare.err" || bad "bare metadesk-host printed no diagnostic" ;;
+    metadesk-macos-manager)
+        runclean manager-client-path "$app/Contents/MacOS/$main" --print-client-path
+        if [ "$rc" -ne 0 ] || ! grep -Fxq "$app/Contents/MacOS/metadesk-client" "$home/manager-client-path.out"; then
+            bad "manager did not resolve its bundled client"
+        fi
+        runclean client-help "$app/Contents/MacOS/metadesk-client" --help
+        [ "$rc" -le 1 ] || bad "manager's metadesk-client --help exited $rc"
+        grep -iq 'usage' "$home/client-help.out" "$home/client-help.err" || bad "manager's client printed no usage" ;;
+    *) bad "unexpected main executable: $main" ;;
+esac
 
 if grep -q '"libSDL3.dylib"' "$app/Contents/Resources/metadesk-bundle.json"; then
     # sdl2-compat dlopens SDL3 when SDL initialises; prove the bundled copy is

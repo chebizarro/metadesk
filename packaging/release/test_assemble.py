@@ -63,7 +63,13 @@ class AssemblyTest(unittest.TestCase):
             libraries = {f'{dll}.so.0': {'sha256': 'b' * 64} for dll in source_offers.FFMPEG}
             inventory = {'libraries': libraries}
             if platform == 'dmg':
-                inventory = {'private_libraries': {f'{dll}.0.dylib': '/fixture' for dll in source_offers.FFMPEG}}
+                inventory = {'pins': [], 'bundles': {
+                    app: {'private_libraries': {f'{dll}.0.dylib': {'origin': '/fixture', 'sha256': 'b' * 64}
+                                                for dll in source_offers.FFMPEG},
+                          'bundle_identifier': f'fixture.{exe}', 'main_executable': exe}
+                    for app, exe in [('Metadesk.app', 'metadesk-client'),
+                                     ('Metadesk Manager.app', 'metadesk-macos-manager')]
+                }}
             elif platform in assemble.NATIVE:
                 inventory = {'private_origins': {}}
             elif platform == 'appimage':
@@ -105,7 +111,9 @@ class AssemblyTest(unittest.TestCase):
             encoders = subprocess.check_output([root / 'ffmpeg/profile-encoders.sh', profile, arch], text=True)
             (receipt / 'records/profile.txt').write_text(profile)
             (receipt / 'records/encoders.txt').write_text(encoders)
-            (receipt / 'records/codec-inventory.txt').write_text('PASS: exact minimal codec/parser inventory; LGPL-2.1-or-later\n')
+            codec_pass = 'PASS: exact minimal codec/parser inventory; LGPL-2.1-or-later\n'
+            (receipt / 'records/codec-inventory.txt').write_text(
+                f'Metadesk.app\n{codec_pass}Metadesk Manager.app\n{codec_pass}' if platform == 'dmg' else codec_pass)
 
     def test_complete_matrix(self):
         with patch('builtins.print'):
@@ -117,6 +125,12 @@ class AssemblyTest(unittest.TestCase):
         bom = json.loads((self.output / 'metadesk.cdx.json').read_text())
         self.assertEqual(bom['bomFormat'], 'CycloneDX')
         self.assertEqual(sum(c['type'] == 'application' for c in bom['components']), 11)
+        dmg = next(c for c in bom['components'] if c['name'].startswith('dmg-'))
+        manager = next(c for c in dmg['components'] if c['name'] == 'Metadesk Manager.app')
+        self.assertEqual(manager['components'][0]['hashes'][0]['content'], 'b' * 64)
+        manifest = json.loads((self.output / 'build-manifest.json').read_text())
+        dmg_receipt = next(c for c in manifest if c['platform'] == 'dmg')
+        self.assertIn('libavcodec.0.dylib', dmg_receipt['source_offers']['Metadesk Manager.app'])
         checks = (self.output / 'SHA256SUMS').read_text().splitlines()
         self.assertEqual(len(checks), 23)
         for row in checks:
@@ -140,6 +154,29 @@ class AssemblyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no reviewed source/license route'):
             assemble.assemble(self.packages, self.output)
         self.assertFalse((self.output / 'SHA256SUMS').exists())
+
+    def test_unclassified_manager_dylib(self):
+        path = next(self.packages.glob('*/dmg-*.json'))
+        payload = json.loads(path.read_text())
+        payload['inventory']['bundles']['Metadesk Manager.app']['private_libraries']['libunknown.dylib'] = {}
+        path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, 'no reviewed source/license route for libunknown'):
+            assemble.assemble(self.packages, self.output)
+        self.assertFalse((self.output / 'SHA256SUMS').exists())
+
+    def test_missing_manager_codec_receipt(self):
+        path = next(self.packages.glob('*/dmg-*.ffmpeg/records/codec-inventory.txt'))
+        path.write_text(path.read_text().split('Metadesk Manager.app')[0])
+        with self.assertRaisesRegex(ValueError, 'missing runtime codec verification for both DMG apps'):
+            assemble.assemble(self.packages, self.output)
+
+    def test_missing_manager_inventory(self):
+        path = next(self.packages.glob('*/dmg-*.json'))
+        payload = json.loads(path.read_text())
+        del payload['inventory']['bundles']['Metadesk Manager.app']
+        path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, 'expected measured inventories for both apps'):
+            assemble.assemble(self.packages, self.output)
 
     def test_missing_cell_fails_closed(self):
         next(self.packages.glob('*/deb-aarch64*.json')).unlink()

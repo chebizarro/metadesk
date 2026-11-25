@@ -7,6 +7,17 @@ MD_DMG=1 /path/to/metadesk/packaging/macos/build-release.sh \
   /path/to/nostrc-git-repository /private/tmp/md-release-new
 ```
 
+The release DMG contains two sibling bundles: `Metadesk.app` (the existing
+host/client bundle, with its host agent launcher) and `Metadesk Manager.app`
+(the native AppKit manager, its companion `metadesk-client`, and their private
+library closure). Copy the Manager alone to use it as a client frontend; it
+finds its client in `Contents/MacOS` without `PATH`. Local hosting still uses
+`metadesk-host` from `Metadesk.app` or an existing CLI installation.
+
+Both apps are ad-hoc signed by default; the DMG is unsigned. The Manager has
+only been exercised through fixture tests and launch-and-quit smokes. Signed
+on-screen qualification remains open (`md-8xlg`, `md-wdi3`).
+
 In `deps.lock.json`, `type: git` pins the repository URL and full `commit`
 and `tree` object IDs. The builder shallow-fetches the exact commit and checks
 both IDs before exporting a clean source tree with local `git archive`; the
@@ -29,7 +40,7 @@ For iterative packaging against an already-built private dependency tree:
 export MD_DEPS_PREFIX=/private/tmp/md-release-new/deps/prefix MD_MACOS_MIN=13.0
 /path/to/metadesk/packaging/macos/build-app.sh \
   /private/tmp/md-release-new/deps/sources/nostrc \
-  /private/tmp/md-release-new/deps/build/nostrc /private/tmp/md-app-new
+  /private/tmp/md-release-new/deps/build/nostrc /private/tmp/md-app-new -Dmacos_manager=true
 ```
 
 No target libraries are installed system-wide. Tools may be Homebrew
@@ -49,14 +60,20 @@ not a bit-identical-output, legal-compliance or notarization claim.
 
 ## Gates
 
-* `check-install.sh PREFIX`: staged host/client help with empty environment,
-  before bundle rewriting, without dyld overrides.
+* `check-install.sh PREFIX`: staged host/client help and manager client-path
+  lookup (when built), with an empty environment and no dyld overrides.
 * `macho.py FLOOR TREE...`: every Mach-O slice, including legacy minimum load
   commands; missing/too-new minimums and an empty image set fail.
 * `MD_MACOS_MIN=13.0 verify-app.sh APP`: actual image minimums (not just plist),
-  dependency/rpath closure, signatures and clean-environment startup.
+  dependency/rpath closure, signatures and clean-environment startup for each
+  app. Manager startup checks the exact bundled client path and client help.
 * `build-release.sh`: full configured Meson suite with test isolation. Optional
-  live/permission tests retain their explicit skip status.
+  live/permission tests retain their explicit skip status. Set
+  `MD_TEST_NO_KEYCHAIN=1` only on workstations that prohibit even disposable
+  Keychain fixture items; hosted builds run that fixture by default.
+* The release adapter re-runs the app gates on the read-only mounted DMG,
+  probes both FFmpeg copies, and records each bundle's measured libraries and
+  hashes. Each inventory must pass the same reviewed source-offer rules.
 * Exercise Launch Services/Finder separately on a logged-in Mac:
 
   ```sh

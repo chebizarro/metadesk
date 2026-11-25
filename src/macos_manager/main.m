@@ -2,6 +2,7 @@
 #import "model.h"
 #import "access_page.h"
 #import "hosts_page.h"
+#import "hosts_launch.h"
 #import "identity_page.h"
 #include <signal.h>
 
@@ -134,9 +135,18 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
 @end
 
 #ifndef MD_MACOS_MANAGER_APP_TEST
-int main(void) {
-    signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        // An offline installation diagnostic; use the same resolver as Connect.
+        if (argc == 2 && !strcmp(argv[1], "--print-client-path")) {
+            NSBundle *bundle = NSBundle.mainBundle;
+            NSString *client = MDHostClientPath(bundle.executablePath, bundle.bundlePath,
+                NSProcessInfo.processInfo.environment[@"PATH"]);
+            if (!client) { fputs("metadesk-client not found\n", stderr); return 1; }
+            puts(client.fileSystemRepresentation);
+            return 0;
+        }
+        signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
         NSApplication *app=NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSMenu *menu=[NSMenu new]; NSMenuItem *appItem=[NSMenuItem new]; [menu addItem:appItem];

@@ -31,6 +31,6 @@ fi
 mkdir -p "$output"
 out=$(cd "$output" && pwd -P)
 export MD_DEPS_PREFIX="$deps/prefix" MD_MACOS_MIN=13.0
-"$here/build-app.sh" "$deps/sources/nostrc" "$deps/build/nostrc" "$out/app"
+"$here/build-app.sh" "$deps/sources/nostrc" "$deps/build/nostrc" "$out/app" -Dmacos_manager=true
 NOSTRC_TEST_ISOLATION=1 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent \
     meson test -C "$out/app/build" --print-errorlogs

@@ -171,10 +171,20 @@ def sign(app, identity, hardened, entitlements):
     for lib in sorted((app / 'Contents/Frameworks').iterdir()):
         subprocess.run(base + [str(lib)], check=True, capture_output=True)
     exe_args = base + (['--entitlements', str(entitlements)] if entitlements else [])
+    main = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleExecutable']
     for exe in sorted((app / 'Contents/MacOS').iterdir()):
-        if exe.name != 'metadesk-client':
+        if exe.name != main:
             subprocess.run(exe_args + [str(exe)], check=True, capture_output=True)
     subprocess.run(exe_args + [str(app)], check=True, capture_output=True)
+
+
+def bundle_product(manager_plist):
+    if manager_plist is None:
+        return 'metadesk-host', None
+    plist = plistlib.loads(manager_plist.read_bytes())
+    if plist['CFBundleExecutable'] != 'metadesk-macos-manager' or plist['CFBundlePackageType'] != 'APPL':
+        raise ValueError('invalid manager Info.plist')
+    return plist['CFBundleExecutable'], plist
 
 
 def main():
@@ -189,6 +199,7 @@ def main():
     ap.add_argument('--dlopen', action='append', default=[], metavar='NAME=PATH',
                     help='library loaded with dlopen, bundled as Frameworks/NAME')
     ap.add_argument('--bundle-id', default='dev.metadesk.Metadesk')
+    ap.add_argument('--manager-plist', type=Path, help='build the manager using its configured Info.plist')
     ap.add_argument('--version', required=True)
     ap.add_argument('--source-rev', required=True)
     ap.add_argument('--nostrc-rev', required=True)
@@ -202,21 +213,25 @@ def main():
 
     if a.out.exists():
         raise SystemExit(f'{a.out} must not exist')
-    bins = [a.stage / 'bin' / n for n in ('metadesk-client', 'metadesk-host')]
+    companion, manager_plist = bundle_product(a.manager_plist)
+    if manager_plist and a.out.name != manager_plist['CFBundleName'] + '.app':
+        raise SystemExit('manager output name must match its Info.plist')
+    bins = [a.stage / 'bin' / n for n in ('metadesk-client', companion)]
     for b in bins:
         if not b.exists():
-            raise SystemExit(f'missing {b}; build with -Dclient=true')
+            raise SystemExit(f'missing staged executable: {b}')
 
     contents = a.out / 'Contents'
     macos, frameworks, resources = contents / 'MacOS', contents / 'Frameworks', contents / 'Resources'
     for d in (macos, frameworks, resources):
         d.mkdir(parents=True)
 
-    agents = contents / 'Library/LaunchAgents'
-    agents.mkdir(parents=True)
-    shutil.copyfile(Path(__file__).with_name('dev.metadesk.host.plist'), agents / 'dev.metadesk.host.plist')
-    shutil.copyfile(Path(__file__).with_name('metadesk-host-agent'), resources / 'metadesk-host-agent')
-    (resources / 'metadesk-host-agent').chmod(0o755)
+    if not manager_plist:
+        agents = contents / 'Library/LaunchAgents'
+        agents.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).with_name('dev.metadesk.host.plist'), agents / 'dev.metadesk.host.plist')
+        shutil.copyfile(Path(__file__).with_name('metadesk-host-agent'), resources / 'metadesk-host-agent')
+        (resources / 'metadesk-host-agent').chmod(0o755)
 
     bundler = Bundler(frameworks)
     rewrites, queue, staged = {}, [], []
@@ -271,6 +286,9 @@ def main():
         'LSMinimumSystemVersion': effective,
         'NSHighResolutionCapable': True,
     }
+    if manager_plist:
+        plist = manager_plist
+        plist['LSMinimumSystemVersion'] = max(effective, plist['LSMinimumSystemVersion'], key=version_key)
     with open(contents / 'Info.plist', 'wb') as f:
         plistlib.dump(plist, f)
     manifest = {
