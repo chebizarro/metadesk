@@ -10,6 +10,7 @@
 #include <string.h>
 #include <fcntl.h>
 #ifdef __APPLE__
+#include <errno.h>
 #include <Security/Security.h>
 #endif
 #ifdef MD_HAVE_LIBSECRET
@@ -368,21 +369,37 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--keychain")) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        char *dir = tempdir(), path[PATH_MAX]; snprintf(path, sizeof(path), "%s/test.keychain", dir);
-        CFArrayRef original = NULL; SecKeychainRef kc = NULL;
-        MD_CHECK(SecKeychainCopySearchList(&original) == errSecSuccess);
+        char dir[] = "/private/tmp/md-private-keychain-XXXXXX";
+        char path[sizeof(dir) + sizeof("/fixture.keychain")];
+        if (!mkdtemp(dir)) { MD_CHECK(false); return md_test_report(); }
+        snprintf(path, sizeof(path), "%s/fixture.keychain", dir);
+        /* Apple's file Keychain creation only adds login/System Keychains to
+         * the default list. The exact file here is neither; all item queries
+         * are scoped by the explicit-path backend. Do not read, set or restore
+         * the search list, and unlink the fixture instead of SecKeychainDelete. */
+        SecKeychainRef kc = NULL;
         OSStatus status = SecKeychainCreate(path, 4, "test", false, NULL, &kc);
-        /* SecKeychainCreate can add the new keychain to the search list.
-         * Immediately restore the exact original list, including on failure. */
-        if (original) MD_CHECK(SecKeychainSetSearchList(original) == errSecSuccess);
-        MD_CHECK(status == errSecSuccess);
-        if (!status) {
+        MD_CHECK(status == errSecSuccess && kc);
+        if (!status && kc) {
             MdCredentialStore *s = md_credential_store_keychain(path);
             credential_roundtrip(s); md_credential_store_destroy(s);
-            MD_CHECK(SecKeychainDelete(kc) == errSecSuccess); CFRelease(kc);
         }
-        if (original) CFRelease(original);
-        cleanup(dir); return md_test_report();
+        if (kc) CFRelease(kc);
+        if (unlink(path)) MD_CHECK(status != errSecSuccess && errno == ENOENT);
+        /* Security can leave a file lock next to the database. Clean only the
+         * files inside this freshly-created 0700 fixture directory. */
+        DIR *files = opendir(dir);
+        MD_CHECK(files != NULL);
+        if (files) {
+            struct dirent *entry;
+            while ((entry = readdir(files))) {
+                if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+                MD_CHECK(unlinkat(dirfd(files), entry->d_name, 0) == 0);
+            }
+            closedir(files);
+        }
+        MD_CHECK(rmdir(dir) == 0);
+        return md_test_report();
 #pragma clang diagnostic pop
     }
 #endif

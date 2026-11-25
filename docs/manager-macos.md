@@ -164,5 +164,6 @@ assigning a role still requires the signer to prove the account key.
 The `macos_manager` suite drives the AppKit controllers off-screen with
 fixture models: host trust and pin replacement, access defaults and stale
 requests, wrong-key signer refusal, and quit while a worker is active. It uses
-no synthetic input or permissions. It does not qualify the signed or on-screen
-workflows above.
+no synthetic input or permissions. The separate `account_keychain` test uses
+an explicit private file Keychain, not the login Keychain or its search list.
+Neither fixture qualifies the signed or on-screen workflows above.
