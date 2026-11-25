@@ -86,5 +86,18 @@ if __name__ == '__main__':
     if sys.argv[1] == '--launch':
         with tempfile.TemporaryDirectory(prefix='md-macos-hosts-launch-') as root:
             subprocess.run([sys.argv[2], str(Path(root).resolve())], check=True, timeout=15)
+    elif sys.argv[1] == '--qr':
+        with tempfile.TemporaryDirectory(prefix='md-macos-qr-') as root:
+            home = str(Path(root).resolve())
+            env = dict(os.environ, HOME=home, CFFIXED_USER_HOME=home, XDG_CONFIG_HOME=home)
+            subprocess.run([sys.argv[2], home], env=env, check=True, timeout=25)
+    elif sys.argv[1] == '--bootstrap':
+        with tempfile.TemporaryDirectory(prefix='md-macos-bootstrap-') as root:
+            home = Path(root).resolve()
+            config = home / 'config'
+            config.mkdir(mode=0o700)
+            env = dict(os.environ, HOME=str(home), CFFIXED_USER_HOME=str(home), XDG_CONFIG_HOME=str(config))
+            subprocess.run([sys.argv[2], '--bootstrap', str(config / 'metadesk' / 'manager-relays.ini')],
+                           env=env, check=True, timeout=10)
     else:
         run(sys.argv[1])

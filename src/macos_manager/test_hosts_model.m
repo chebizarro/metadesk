@@ -35,6 +35,27 @@ static int Unit(void) {
     return md_test_report();
 }
 
+static int Bootstrap(NSString *file) {
+    NSString *error = nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    CHECK([MDHostsBootstrap(nil, &error) isEqual:@""] && !error);
+    CHECK(![fm fileExistsAtPath:file]);
+    CHECK([MDHostsBootstrap(@"WSS://Relay.Example:443/a%2Fb wss://relay.example/a%2Fb\nws://localhost", &error)
+          isEqual:@"wss://relay.example/a%2Fb ws://localhost/"]);
+    CHECK([MDHostsBootstrap(nil, &error) isEqual:@"wss://relay.example/a%2Fb ws://localhost/"] && !error);
+    CHECK([@"[relays]\nbootstrap=wss://relay.example/a%2Fb;ws://localhost/;\n" isEqual:
+          [NSString stringWithContentsOfFile:file encoding:NSUTF8StringEncoding error:NULL]]);
+    struct stat st;
+    CHECK(!stat(file.fileSystemRepresentation, &st) && (st.st_mode & 0777) == 0600);
+    CHECK(!MDHostsBootstrap(@"ws://user:secret@localhost", &error) && error.length);
+    CHECK([MDHostsBootstrap(nil, NULL) isEqual:@"wss://relay.example/a%2Fb ws://localhost/"]);
+    CHECK([MDHostsBootstrap(@"", NULL) isEqual:@""] && [MDHostsBootstrap(nil, NULL) isEqual:@""]);
+    CHECK([@"[relays]\nbootstrap=https://invalid/;\n" writeToFile:file atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    error = nil;
+    CHECK(!MDHostsBootstrap(nil, &error) && error.length);
+    return md_test_report();
+}
+
 static MDHostReview *Resolved(MDHostsBook *book, NSString *key, NSString *name) {
     MdIdentity identity = {.hint_source = name ? MD_HINT_NIP05 : MD_HINT_NONE};
     strlcpy(identity.pubkey, key.UTF8String, sizeof(identity.pubkey));
@@ -165,6 +186,7 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc == 1) return Unit();
+        if (argc == 3 && !strcmp(argv[1], "--bootstrap")) return Bootstrap(@(argv[2]));
         CHECK(argc == 4);
         NSString *directory = [NSString stringWithUTF8String:argv[1]];
         MdAccounts *accounts = NULL;

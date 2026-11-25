@@ -136,8 +136,11 @@ With `-Dsigner_nip46=true` it also starts a private loopback WebSocket relay and
 real nostrc bunker/client transports, restores saved pairing material from an
 in-memory credential store, validates a signed event and refuses a wrong-owner
 restore. The fixture uses only deterministic throwaway keys, observes REQ/EOSE
-and OK, and removes all files/connections; it never reads an OS keyring. macOS also runs `account_keychain` against a private throwaway
-Keychain (restoring the original search list). Linux registers
+and OK, and removes all files/connections; it never reads an OS keyring. macOS also runs `account_keychain` against a file
+Keychain created in a unique private temporary directory with an isolated HOME.
+Item queries target only that file. The test reads the search list after
+creation and after cleanup and fails if it contains the fixture; it never
+writes the search list. Linux registers
 `account_secret_service` when `dbus-run-session` and `gnome-keyring-daemon` are
 installed; otherwise Meson explicitly reports the unavailable fixture. It uses
 a private HOME, XDG directories, runtime directory, D-Bus session, and daemon,

@@ -28,14 +28,21 @@ is resolved beside the manager executable, inside its bundle, then on `PATH`.
 
 1. Assign a client role in **Identity**, then open **Hosts** to load its encrypted
    cache. Enter explicit bootstrap relay URLs separated by spaces and select
-   **Refresh Address Book** to sync. Relay choices are session-local; none is
-   preselected. `ws://` is unencrypted.
+   **Save Relays and Refresh Address Book** to sync. Both managers use the same
+   per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
+   `~/.config/metadesk`). The app loads the selection on entry but does not sync
+   until you refresh, including after a client-role change. Replacing unreadable
+preferences requires confirmation. Clear the field and refresh to remove all choices; none
+   is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name. Enter
    an IPv4 or IPv6 address only as a route hint for the reviewed key. Verify the
    full npub, short fingerprint, NIP-05 status and requested access before saving
    or connecting. A changed NIP-05 pin blocks connection. Keep the old key, or
    verify the new one with the host and type its exact fingerprint to replace
-   it. Review again before connecting. `nsec` and `ncryptsec` are cleared and refused.
+   it. Review again before connecting. **Scan QR Image** reads one QR code from
+   a local image, accepts only a valid public `nprofile`, and sends it through the same review as typed text.
+   `nsec` and `ncryptsec` are cleared and refused, including when scanned. No
+   camera or camera permission is used.
 3. Filter saved hosts by text or tag. Edit labels, notes, favorites and tag
    membership, or switch to **Quick Connect** for favorites followed by local
    recent attempts. Last-connected times are not synced. A new client key does
@@ -57,6 +64,9 @@ launch; **Disconnect** ends a connected session. Quitting the manager cancels
 an unfinished launch and leaves a connected video window running.
 
 ## This Computer and Access
+
+**Show Host QR Code** displays the saved host role's public `nprofile` and
+fingerprint. It does not contact the signer or check whether the host is running.
 
 Enter the running host's absolute [management socket path](host-management.md#endpoint-and-peer-trust)
 and select **Connect to Local Host**. Status comes from an authenticated live
@@ -99,6 +109,12 @@ bootstrap the bundled `BundleProgram` plist.
 
 ## Identity and roles
 
+Use **Add Signer Account** to save the public key and optional public label of
+an existing external signer account. Use **Edit Label** to rename it without
+changing either role. The picker offers compiled signer adapters: NIP-5F (local
+socket), NIP-46 (remote), and NIP-55L (D-Bus only in builds that enable it).
+Direct-key accounts are not offered for new managed roles.
+
 Select a saved public account and choose **Use for Client** or **Use for Host**.
 The signer must prove the selected key. FIPS hosting compares that key to the
 local daemon's `show_status` npub; deselect the FIPS check only for direct-IP
@@ -111,15 +127,22 @@ socket signer, or approve verification in the remote signer. Cancelling pending
 verification prevents saving, but the backend call may need to drain. The existing
 Keychain backend restores saved NIP-46 pairing without a prompt; unlock Keychain
 externally if needed. Removing a signer account removes its assignments and any
-Metadesk-held pairing, never the external signer's key. Add public metadata or
-import an already-paired signer via the [account CLI](accounts.md#headless-cli).
+Metadesk-held pairing, never the external signer's key. To restore an already
+paired remote signer, select its saved public NIP-46 account and use **Import
+Pairing**. Choose a trusted [pairing JSON](accounts.md#headless-cli) file (regular
+file, at most 64 KiB; symbolic links are refused). Metadesk reads it on a worker,
+wipes its read buffer after use, and does not modify or delete the source file.
+Protect that file as a credential. The pairing
+must match the selected public key. It replaces the account's Keychain pairing
+without binding a role; role assignment still requires live verification.
+Create and manage signing keys only in the external signer.
 
 ## Differences from the Linux Manager and remaining limits
 
-- No persistent bootstrap choices, relay discovery/authentication status panel,
-  or QR display/scanning. The Relays tab is an offline preview.
-- No in-app account creation, label editing, pairing import, or Grotto Control1
-  status panel. No separate Activity history; live sessions are in This Computer.
+- No relay discovery/authentication status panel. The Relays tab is an offline
+  preview; edit bootstrap choices in Hosts.
+- No Grotto Control1 status panel or separate Activity history; live sessions
+  are in This Computer.
 - No LaunchAgent registration or start/stop. No sharing/unattended setters exist
   in host IPC v1. macOS notification delivery has not been qualified.
 
@@ -133,5 +156,17 @@ Hosts review/edit/conflict sheets, HTTPS NIP-05, a real video launch and cancell
 and that quitting leaves a connected client running. Exercise IPC restart/reconnect,
 exact approvals and revocation, signed notification open and withdrawal, signer
 lock and remote approval/cancel, Keychain ACLs and no fallback, FIPS match/mismatch,
-and role switching. Startup smoke and headless fixture tests do not qualify these
-signed or interactive workflows.
+and role switching. Save bootstrap choices, relaunch to check that they are
+restored, and confirm clearing them leaves the address book offline without a
+fallback relay. Display and scan the packaged app's host QR on another device,
+compare the fingerprint, confirm the scan opens the normal trust review, and
+verify that scanning a secret-key fixture refuses it without a camera prompt.
+Add and relabel a public account with each supported signer backend. Import a
+matching NIP-46 fixture pairing, refuse a mismatched pairing, and verify that
+assigning a role still requires the signer to prove the account key.
+The `macos_manager` suite drives the AppKit controllers off-screen with
+fixture models: host trust and pin replacement, access defaults and stale
+requests, wrong-key signer refusal, and quit while a worker is active. It uses
+no synthetic input or permissions. The separate `account_keychain` test uses
+an explicit private file Keychain and checks it never appears in the search list.
+Neither fixture qualifies the signed or on-screen workflows above.

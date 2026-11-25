@@ -1,4 +1,3 @@
-dep_manager_gio = dependency('gio-2.0', version : '>=2.76')
 dep_manager_gtk = dependency('gtk4', version : '>=4.14')
 dep_manager_adw = dependency('libadwaita-1', version : '>=1.5')
 dep_manager_control = dependency('grotto-control-client-0', method : 'pkg-config',
@@ -14,7 +13,7 @@ manager_inc = include_directories('.')
 # Consume the shared core API, not its private raw nostrc OBJECT link inputs.
 dep_manager_core = declare_dependency(link_with : libmetadesk,
   include_directories : core_inc)
-manager_model_deps = [dep_manager_core, dep_manager_gio, dep_nip19, dep_cjson, cc.find_library('m')] + manager_status_deps
+manager_model_deps = [dep_manager_core, dep_manager_relay_store, dep_nip19, dep_cjson, cc.find_library('m')] + manager_status_deps
 manager_model = static_library('metadesk-manager-model', ['model.c', 'signer-status.c', 'host-client.c', 'launch.c'],
   dependencies : manager_model_deps,
   c_args : manager_status_args)

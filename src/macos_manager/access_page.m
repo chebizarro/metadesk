@@ -1,6 +1,7 @@
 #import "access_page.h"
 #import "access_model.h"
 #import "hosts_model.h"
+#import "host_qr.h"
 #import "model.h"
 #import <Security/Security.h>
 #import <UserNotifications/UserNotifications.h>
@@ -76,6 +77,8 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 
 @interface MDLocalHostPages () <UNUserNotificationCenterDelegate> {
     MDHostLink *_link;
+    dispatch_group_t _qrWork;
+    NSButton *_showQR;
     NSDictionary *_snapshot, *_policy, *_permissions;
     BOOL _busy, _closed;
     NSTextField *_endpoint, *_status, *_agent, *_session, *_permission, *_accessStatus, *_requestDetails, *_policyDetail, *_notificationStatus;
@@ -91,12 +94,14 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 @end
 
 @implementation MDLocalHostPages
-- (instancetype)init {
+- (instancetype)init { return [self initWithLinkFactory:nil]; }
+- (instancetype)initWithLinkFactory:(MDHostLink *(^)(MDHostUpdate))factory {
     if (!(self=[super init])) return nil;
     __weak MDLocalHostPages *weakSelf = self;
-    _link = [[MDHostLink alloc] initWithUpdate:^(NSString *status, NSDictionary *s, NSDictionary *p, NSDictionary *perms, BOOL busy) {
+    MDHostUpdate update = ^(NSString *status, NSDictionary *s, NSDictionary *p, NSDictionary *perms, BOOL busy) {
         [weakSelf received:status snapshot:s policy:p permissions:perms busy:busy];
-    }];
+    };
+    _link = factory ? factory(update) : [[MDHostLink alloc] initWithUpdate:update];
     _endpoint = [NSTextField textFieldWithString:@""];
     _endpoint.placeholderString = @"Absolute path to the host management socket";
     _endpoint.accessibilityLabel = @"Host management socket";
@@ -105,7 +110,9 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     _connect = Button(self, @"Connect to Local Host", @selector(connect:));
     _kick = Button(self, @"Disconnect Session…", @selector(kick:));
     _recheck = Button(self, @"Recheck Permissions", @selector(permissions:));
-    self.computerView = Column(@[_endpoint, _connect, _status, _agent,
+    _qrWork = dispatch_group_create();
+    _showQR = Button(self, @"Show Host QR Code…", @selector(showQR:));
+    self.computerView = Column(@[_showQR, _endpoint, _connect, _status, _agent,
         Label(@"Agent start/stop is not available here. The installed app must register dev.metadesk.host.plist before login can start the opted-in agent. For manual operation, provision a host role and start metadesk-host with --managed and --management-socket PATH; stop that foreground process with Control-C. See Host Lifecycle."),
         Label(@"Sharing and unattended access are not configurable through current host IPC."),
         _session, _kick, _permission,
@@ -123,7 +130,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         Label(@"Remembered Clients"), _clients, _policyDetail, _refreshPolicy, Stack(@[_edit,_revoke,_kickRevoke], YES)]);
     _posted = [NSMutableSet set]; _noticeCooling=[NSMutableSet set]; _noticeAttempts=[NSMutableDictionary dictionary];
     [self render];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    if (!factory) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (!DistributionSigned()) return;
         UNUserNotificationCenter *center = UNUserNotificationCenter.currentNotificationCenter;
         [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *setting) {
@@ -202,12 +209,43 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         completion();
     });
 }
+- (void)showQR:(id)sender {
+    (void)sender;
+    NSWindow *window = self.computerView.window;
+    if (_closed || !_showQR.enabled || !window || window.attachedSheet) return;
+    _showQR.enabled = NO;
+    dispatch_group_async(_qrWork, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
+        NSString *fingerprint = nil;
+        NSString *profile = MDSavedHostProfile(nil, &fingerprint);
+        id pixels = CFBridgingRelease(MDCreateHostQR(profile));
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_closed) return;
+            self->_showQR.enabled = YES;
+            if (window != self.computerView.window || window.attachedSheet) return;
+            NSAlert *alert = [NSAlert new];
+            alert.messageText = @"Host QR Code";
+            [alert addButtonWithTitle:@"Close"];
+            if (pixels) {
+                alert.informativeText = [NSString stringWithFormat:@"Saved public host identity (not a live host check).\nFingerprint: %@", fingerprint];
+                CGImageRef bitmap = (__bridge CGImageRef)pixels;
+                NSSize size = NSMakeSize(CGImageGetWidth(bitmap), CGImageGetHeight(bitmap));
+                NSImageView *view = [NSImageView imageViewWithImage:[[NSImage alloc] initWithCGImage:bitmap size:size]];
+                view.frame = (NSRect){NSZeroPoint, size};
+                view.accessibilityLabel = @"QR code for the saved public host identity";
+                alert.accessoryView = view;
+            } else alert.informativeText = @"Cannot display a QR code. Check the saved host role in Identity.";
+            [alert beginSheetModalForWindow:window completionHandler:nil];
+        });
+    } });
+}
 - (void)close:(dispatch_block_t)drained {
     _closed = YES; [_clock invalidate]; _clock = nil;
     [self clearNotices:_posted.allObjects]; [_posted removeAllObjects];
     _notifications.delegate = nil;
     if (_chooser.alert.window.sheetParent) [_chooser.alert.window.sheetParent endSheet:_chooser.alert.window returnCode:NSAlertFirstButtonReturn];
-    [_link close:drained];
+    dispatch_group_enter(_qrWork);
+    [_link close:^{ dispatch_group_leave(self->_qrWork); }];
+    dispatch_group_notify(_qrWork, dispatch_get_main_queue(), drained);
 }
 - (void)received:(NSString *)status snapshot:(NSDictionary *)s policy:(NSDictionary *)p permissions:(NSDictionary *)perms busy:(BOOL)busy {
     if (_closed) return;
@@ -315,11 +353,14 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     chooser.update();
     [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         self->_chooser = nil; [self tick:nil];
-        if (self->_closed || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1) return;
+        if (self->_closed || self->_busy || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1 ||
+            ![snapshot[@"revision"] isEqual:self->_snapshot[@"revision"]]) return;
         BOOL deny = response == NSAlertThirdButtonReturn+1, remember = response == NSAlertThirdButtonReturn;
-        if (remember && ![policy[@"policy_version"] isEqual:self->_policy[@"policy_version"]]) return;
-        NSDictionary *cmd = MDApprovalCommand(snapshot,r,deny ? @"deny" : @"approve",chooser.selected,remember,Now());
-        [self->_link command:cmd policyVersion:remember ? policy[@"policy_version"] : nil];
+        if (remember && (![self->_policy[@"policy_available"] boolValue] || ![policy[@"policy_version"] isEqual:self->_policy[@"policy_version"]])) return;
+        NSTimeInterval now = Now();
+        NSDictionary *current = MDRequestForToken(self->_snapshot,token,now);
+        NSDictionary *cmd = MDApprovalCommand(self->_snapshot,current,deny ? @"deny" : @"approve",chooser.selected,remember,now);
+        if (cmd) [self->_link command:cmd policyVersion:remember ? policy[@"policy_version"] : nil];
     }];
 }
 - (void)confirm:(NSString *)title text:(NSString *)text window:(NSWindow *)window action:(dispatch_block_t)action {

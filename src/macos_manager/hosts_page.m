@@ -1,5 +1,7 @@
 #import "hosts_page.h"
 #import "hosts_launch.h"
+#import "host_qr.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdatomic.h>
 
 /* These fields may show encrypted-book text. No selection may be copied,
@@ -128,16 +130,16 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     MDHostsBook *_book;
     MDHostsLaunch *_launch;
     atomic_bool _closing, _dirty, _wakeQueued;
-    BOOL _busy, _launched, _started, _roleEditing;
+    BOOL _busy, _launched, _started, _roleEditing, _syncPaused;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
-    NSString *_lastOwner;
+    NSString *_lastOwner, *_savedBootstrap;
     NSArray<NSString *> *_lastOwnerHosts;
     NSTextField *_address, *_route, *_relays, *_search, *_directory;
     NSTextField *_status, *_error, *_progress, *_diagnostic, *_rotation, *_detail;
     NSPopUpButton *_tags, *_issues;
     NSTableView *_table;
-    NSButton *_refresh, *_review, *_saved, *_edit, *_quick, *_import, *_export, *_issue, *_control, *_copyKey;
+    NSButton *_refresh, *_review, *_scan, *_saved, *_edit, *_quick, *_import, *_export, *_issue, *_control, *_copyKey;
     MdLaunchMessage _phase;
 }
 - (BOOL)closing;
@@ -146,12 +148,16 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
 static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context closing]; }
 
 @implementation MDHostsPage
+- (instancetype)initWithWorker:(MDHostsWorker *)worker {
+    if ((self=[super initWithNibName:nil bundle:nil])) _worker=worker;
+    return self;
+}
 - (BOOL)closing { return atomic_load(&_closing); }
 - (void)loadView {
     atomic_init(&_closing, false); atomic_init(&_dirty, false); atomic_init(&_wakeQueued, false);
     _queue = dispatch_queue_create("metadesk.macos-manager.hosts", DISPATCH_QUEUE_SERIAL);
     __weak MDHostsPage *weakSelf = self;
-    _worker = [[MDHostsWorker alloc] initWithChange:^{ [weakSelf signalChanged]; }];
+    if (!_worker) _worker = [[MDHostsWorker alloc] initWithChange:^{ [weakSelf signalChanged]; }];
     _address = Field(@"Host npub, nprofile, public key or NIP-05 name", nil); _address.delegate = self;
     _route = Field(@"Optional IPv4 or IPv6 route for the host key", nil); _route.delegate = self;
     _relays = Field(@"Bootstrap relays (space-separated; ws:// is unencrypted)", nil);
@@ -165,8 +171,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _issues = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _issues.target = self; _issues.action = @selector(issueSelection:);
     [_issues setAccessibilityLabel:@"Address book issues"];
-    _refresh = Button(@"Refresh Address Book", self, @selector(refresh:));
+    _refresh = Button(@"Save Relays and Refresh Address Book", self, @selector(refresh:));
     _review = Button(@"Review and Connect…", self, @selector(reviewEntry:));
+    _scan = Button(@"Scan QR Image…", self, @selector(scanQR:));
     _saved = Button(@"Review Saved Host…", self, @selector(reviewSaved:));
     _edit = Button(@"Edit Saved Host…", self, @selector(edit:));
     _copyKey = Button(@"Copy Public Key", self, @selector(copyPublicKey:));
@@ -188,7 +195,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     for (NSView *v in @[_status, _rotation, _error, _relays, _directory]) Wide(form, v);
     [form addArrangedSubview:_refresh];
     Wide(form, _address); Wide(form, _route);
-    [form addArrangedSubview:Stack(@[_review, _control], NSUserInterfaceLayoutOrientationHorizontal)];
+    [form addArrangedSubview:Stack(@[_review, _scan, _control], NSUserInterfaceLayoutOrientationHorizontal)];
     Wide(form, _progress); Wide(form, _diagnostic);
     Wide(form, _search);
     [form addArrangedSubview:Stack(@[_tags, _quick], NSUserInterfaceLayoutOrientationHorizontal)];
@@ -206,7 +213,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [self render];
 }
 - (void)activate {
-    if (!_started) { _started = YES; [self refresh:nil]; }
+    if (!_started) { _started = YES; [self reloadBook:NO]; }
 }
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
     _roleEditing = YES; ++_generation; _book = nil; [self render];
@@ -221,7 +228,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)resumeAfterRoleEdit {
     _roleEditing=NO;
-    if (!self.closing && _started) [self refresh:nil];
+    if (!self.closing && _started) [self reloadBook:NO];
 }
 - (void)close:(dispatch_block_t)drained {
     atomic_store(&_closing, true);
@@ -290,8 +297,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)render {
     _status.stringValue = _book.status ?: @"Opening the address book…";
     _refresh.enabled = !_roleEditing && !_busy && !self.closing;
+    _relays.enabled = _refresh.enabled;
+    if (_syncPaused && _savedBootstrap.length)
+        _status.stringValue = [_status.stringValue stringByAppendingString:@"\nRelay sync is paused. Select Save Relays and Refresh Address Book to resume."];
     if (_roleEditing) _status.stringValue=@"Reloading the client role…";
     _review.enabled = !_busy && !_launched && _book.canReview;
+    _scan.enabled = _review.enabled;
     _import.enabled = !_busy && _book.canEdit;
     _export.enabled = !_busy && _book.canExport;
     NSString *tag = _tags.selectedItem.representedObject;
@@ -356,44 +367,110 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSString *npub = MDHostNpub(self.selected[@"key"]);
     if (npub) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:npub forType:NSPasteboardTypeString]; }
 }
-- (BOOL)rejectSecret:(NSTextField *)field {
+- (BOOL)rejectSecret:(NSTextField *)field input:(MDHostInput)input {
+    if (input != MDHostSecret) return NO;
     NSTextView *editor = (NSTextView *)field.currentEditor;
-    if (MDClassifyHostInput(editor ? editor.string : field.stringValue) != MDHostSecret) return NO;
     if (editor) { editor.string = @""; [editor.undoManager removeAllActions]; }
     field.stringValue = @"";
     _error.stringValue = @"Private keys are not host addresses. Use a public host identity.";
     return YES;
 }
 - (void)controlTextDidChange:(NSNotification *)note {
-    if (note.object == _address || note.object == _route) [self rejectSecret:note.object];
+    if (note.object == _address || note.object == _route) {
+        NSTextField *field = note.object;
+        NSTextView *editor = (NSTextView *)field.currentEditor;
+        [self rejectSecret:field input:MDClassifyHostInput(editor ? editor.string : field.stringValue)];
+    }
     if (note.object == _search) [self filter:nil];
 }
 - (void)refresh:(id)sender {
     (void)sender;
-    if (_busy || self.closing) return;
-    ++_generation;
-    NSString *relays = _relays.stringValue, *directory = MDHostTrim(_directory.stringValue);
+    [self reloadBook:YES];
+}
+- (void)reloadBook:(BOOL)refresh {
+    [self reloadBook:refresh replaceUnreadable:NO];
+}
+- (void)reloadBook:(BOOL)refresh replaceUnreadable:(BOOL)replace {
+    if (_busy || _roleEditing || self.closing) return;
+    NSUInteger generation = ++_generation;
+    NSString *draft = _relays.stringValue;
+    BOOL edited = ![draft isEqual:_savedBootstrap ?: @""];
+    NSString *directory = MDHostTrim(_directory.stringValue);
     _error.stringValue = @"";
     [self run:^id(MDHostsWorker *worker) {
-        NSString *error = nil;
-        if (![worker openDirectory:directory error:&error]) return error;
+        NSString *configError = nil, *cacheError = nil;
+        NSString *saved = MDHostsBootstrap(nil, &configError);
         if (self.closing) return nil;
-        if (![worker startRelays:relays]) return @"Could not configure address book relays. Cached data remains available.";
-        return @"";
-    } done:^(NSString *message) { self->_error.stringValue = message ?: @""; }];
+        BOOL needsConfirmation = refresh && !saved && !replace;
+        NSString *relays = saved;
+        if (refresh && ((saved && edited) || (!saved && replace))) {
+            configError = nil;
+            relays = MDHostsBootstrap(draft, &configError);
+        }
+        if (self.closing) return nil;
+        BOOL opened = [worker openDirectory:directory error:&cacheError];
+        BOOL syncing = opened && relays && refresh && !self.closing && [worker startRelays:relays];
+        if (opened && relays && refresh && !syncing)
+            cacheError = @"Could not configure address book relays. Cached data remains available.";
+        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing)];
+    } done:^(NSArray *result) {
+        if (result[0] != NSNull.null) self->_relays.stringValue = self->_savedBootstrap = result[0];
+        self->_syncPaused = [result[3] boolValue];
+        self->_error.stringValue = result[1];
+        [self render];
+        NSWindow *window = self.view.window;
+        if (![result[2] boolValue] || !window || window.attachedSheet) return;
+        NSAlert *alert = Alert(@"Replace Unreadable Relay Preferences?",
+            @"The saved preferences could not be read. Replace them with the choices currently shown? An empty field removes all choices.");
+        [alert addButtonWithTitle:@"Keep Existing File"];
+        [alert addButtonWithTitle:@"Replace Preferences"];
+        [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertSecondButtonReturn && generation == self->_generation)
+                [self reloadBook:YES replaceUnreadable:YES];
+        }];
+    }];
 }
 - (void)reviewEntry:(id)sender {
     (void)sender;
-    BOOL rejected = [self rejectSecret:_address]; rejected |= [self rejectSecret:_route];
-    if (rejected) return;
-    NSString *address = _address.stringValue;
+    [self reviewInput:_address.stringValue fromImage:NO];
+}
+- (void)reviewInput:(NSString *)address fromImage:(BOOL)fromImage {
     MDHostInput input = MDClassifyHostInput(address);
+    BOOL rejected = [self rejectSecret:_address input:input];
+    rejected |= [self rejectSecret:_route input:MDClassifyHostInput(_route.stringValue)];
+    if (rejected) return;
+    if (fromImage) {
+        address = MDHostQRProfile(address);
+        if (!address) { _error.stringValue = @"The QR code must contain an nprofile."; return; }
+        input = MDHostPublic;
+    }
     if (input != MDHostPublic && input != MDHostName) {
         _error.stringValue = @"Enter an npub, nprofile, lowercase public key or NIP-05 name. An IP address is only a route hint."; return;
     }
     NSString *route = MDHostTrim(_route.stringValue);
     if (!MDHostRouteValid(route)) { _error.stringValue = @"Enter an IPv4 or IPv6 route hint."; return; }
+    if (fromImage) _address.stringValue = MDHostTrim(address);
     [self resolve:address route:route];
+}
+- (void)scanQR:(id)sender {
+    (void)sender;
+    NSWindow *window = self.view.window;
+    if (!_scan.enabled || self.closing || !window || window.attachedSheet) return;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.allowedContentTypes = @[UTTypeImage];
+    NSUInteger generation = _generation;
+    [panel beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK || self.closing || generation != self->_generation) return;
+        NSURL *url = panel.URL;
+        [self run:^id(MDHostsWorker *worker) { (void)worker; return MDReadHostQR(url); }
+             done:^(NSString *value) {
+            if (generation != self->_generation) return;
+            if (!value.length) self->_error.stringValue = @"Choose a supported image containing exactly one QR code.";
+            else [self reviewInput:value fromImage:YES];
+        }];
+    }];
 }
 - (void)reviewSaved:(id)sender {
     (void)sender;
@@ -413,7 +490,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }];
 }
 - (void)presentReview:(MDHostReview *)review {
-    if (!self.view.window || self.closing) return;
+    if (!self.view.window || self.view.window.attachedSheet || self.closing) return;
     BOOL mismatch = review.oldKey != nil;
     NSUInteger generation = _generation;
     NSString *nip = review.alias ? [NSString stringWithFormat:@"NIP-05: %@ (verified in this review)", MDHostBoundText(review.alias, 320)] : @"NIP-05: Not provided";
@@ -435,15 +512,15 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         if (canSave) [alert addButtonWithTitle:@"Save Host"];
     }
     [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
-        if (response == NSAlertFirstButtonReturn || self.closing || generation != self->_generation) return;
-        if (mismatch || response == NSAlertThirdButtonReturn) {
+        if (self.closing || generation != self->_generation) return;
+        if (mismatch ? response == NSAlertSecondButtonReturn && canSave : response == NSAlertThirdButtonReturn && canSave) {
             NSString *value = confirmation.stringValue;
             if (mismatch && ![self->_book canConfirmReview:review fingerprint:value]) {
                 self->_error.stringValue = @"The saved key was kept. Replacement requires the exact new fingerprint."; return;
             }
             [self run:^id(MDHostsWorker *worker) { return [worker saveReview:review confirmation:value]; }
                 done:^(NSString *message) { self->_error.stringValue = message.length ? message : mismatch ? @"Key replaced. Review it again to connect." : @"Host saved."; }];
-        } else if (response == NSAlertSecondButtonReturn) [self startLaunch:review];
+        } else if (!mismatch && response == NSAlertSecondButtonReturn) [self startLaunch:review];
     }];
 }
 - (void)startLaunch:(MDHostReview *)review {

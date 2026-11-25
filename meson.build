@@ -832,6 +832,10 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
+if (get_option('macos_manager') and host_os == 'darwin') or (get_option('manager') and host_os == 'linux')
+  subdir('src/manager_shared')
+endif
+
 if get_option('macos_manager')
   if host_os != 'darwin'
     error('macos_manager requires macOS')
@@ -854,7 +858,8 @@ if host_os == 'linux' or host_os == 'darwin' or host_os == 'windows'
   test('accounts', test_accounts, timeout : 30)
   accounts_python = import('python').find_installation('python3')
   if host_os == 'darwin'
-    test('account_keychain', test_accounts, args : ['--keychain'], timeout : 30, is_parallel : false)
+    test('account_keychain', accounts_python, args : [files('tests/run_account_keychain.py'), test_accounts],
+      timeout : 30, is_parallel : false)
   elif host_os == 'linux'
     accounts_dbus = find_program('dbus-run-session', required : false)
     accounts_keyring = find_program('gnome-keyring-daemon', required : false)
