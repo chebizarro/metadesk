@@ -158,8 +158,8 @@ def assemble(packages, out):
     notes = notes.replace('<COMMIT>', f'`{commit}`', 1).replace('<COMMIT>', f'`{nostrc}`', 1)
     replacements = {
         'VERSION': version, 'DATE': now.date().isoformat(),
-        'USER_VISIBLE_CHANGES': 'Preview installers for the Linux host/client, Linux portable client/manager and macOS host/client.',
-        'KNOWN_LIMITATIONS': 'No Windows MSI or Intel Mac DMG. Help/codec smokes are not desktop, GPU, or signer qualification.',
+        'USER_VISIBLE_CHANGES': 'Management UX preview: an encrypted address book (saved hosts, favorites, tags, notes) kept in NIP-51/NIP-78 documents; connecting by npub, nprofile or NIP-05 name with key pinning and first-contact review; relay selection from NIP-65 and NIP-17 relay lists; a Hosts page in the Linux manager that launches the client over a private channel; and a quick-connect switcher in the client overlay. Preview installers for the Linux host/client, Linux portable client/manager and macOS host/client.',
+        'KNOWN_LIMITATIONS': 'No Windows MSI or Intel Mac DMG. QR display and scan are available in native Linux packages and source builds, not in the Flatpak manager. Discovered relay addresses are checked before use but not again at connect time. The macOS management app is a source-build prototype and is not in the DMG. Help/codec smokes are not desktop, GPU, or signer qualification, and the cross-platform end-to-end matrix is incomplete.',
         'ARTIFACT_OS_ARCH_URL_AND_SHA256': '\n\n| Download | Target | Bytes | Signing | Smoke | Codec policy | SHA-256 |\n'
             '|---|---|---:|---|---|---|---|\n' + '\n'.join(rows) + '\n\n' +
             f'{link(source)} · {link("SHA256SUMS")}. Draft assets can be downloaded from the attachments below.',
