@@ -77,6 +77,9 @@ test('macOS shared bootstrap relay preferences', macos_hosts_python,
   args : [files('test_hosts_live.py'), '--bootstrap', macos_hosts_test], suite : 'macos_manager')
 test('macOS Hosts workflow over private relay', macos_hosts_python,
   args : [files('test_hosts_live.py'), macos_hosts_test], suite : 'macos_manager', timeout : 65)
+test('macOS Hosts workflow after two discovery deadlines', macos_hosts_python,
+  args : [files('test_hosts_live.py'), '--silent-discovery', macos_hosts_test],
+  suite : 'macos_manager', timeout : 65)
 macos_hosts_launch_test = executable('test_macos_hosts_launch', 'test_hosts_launch.m',
   objc_args : '-fobjc-arc', link_with : macos_hosts_model, dependencies : [dep_metadesk, foundation, dep_macos_relay_store],
   include_directories : include_directories('../../tests'))

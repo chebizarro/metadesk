@@ -93,15 +93,19 @@ static BOOL SendRemote(MdSigner *signer, NSString *owner, int version, time_t ad
 
 static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NSString *relay, NSString *unreachable, dispatch_semaphore_t changed) {
     CHECK(([worker startRelays:[NSString stringWithFormat:@"%@ %@", relay, unreachable]]));
+    CHECK(Signal(@"review-bridge-started"));
     MDHostsBook *book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canReview; });
     CHECK(book && !book.canEdit);
     MDHostReview *review = [worker resolve:A route:@"127.0.0.1" cancelled:NULL data:NULL error:NULL];
     MdManagedLaunch launch;
     CHECK([worker launchConfig:&launch review:review error:NULL]);
     CHECK(launch.relay_count == 2 && !strcmp(launch.pin, A.UTF8String) && !strcmp(launch.route, "127.0.0.1") && launch.capabilities == MD_CAP_VIDEO);
+    CHECK(Signal(@"review-history-ready"));
     CHECK([worker startRelays:relay]);
+    CHECK(Signal(@"edit-bridge-started"));
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canEdit && [b.status isEqual:@"Address book synced."]; });
     CHECK(book && book.rows.count == 0);
+    CHECK(Signal(@"edit-history-ready"));
     review = Resolved(book, A, Name);
     CHECK(review && review.alias && !review.oldKey && review.npub);
     CHECK([worker saveReview:review confirmation:nil].length == 0);
@@ -176,6 +180,7 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     book = [worker snapshot];
     CHECK(Row(book, C) && !book.canReview && !book.canEdit && [book.status containsString:@"Offline"]);
     CHECK([worker startRelays:relay]);
+    CHECK(Signal(@"reload-bridge-started"));
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canEdit; });
     CHECK(book && SendRemote(signer, book.owner, 2, 40, @"Unknown schema"));
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return [b.status containsString:@"read-only"]; });
