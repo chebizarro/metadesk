@@ -38,7 +38,7 @@ typedef enum {
 } MdClientError;
 typedef enum {
     MD_OVERLAY_NONE, MD_OVERLAY_DISCONNECT, MD_OVERLAY_RETRY, MD_OVERLAY_QUIT,
-    MD_OVERLAY_LOAD_HOSTS, MD_OVERLAY_SWITCH_HOST,
+    MD_OVERLAY_LOAD_HOSTS, MD_OVERLAY_CLOSE_HOSTS, MD_OVERLAY_SWITCH_HOST,
 } MdOverlayAction;
 
 const char *md_client_phase_label(MdClientPhase phase);

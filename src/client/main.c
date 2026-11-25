@@ -261,6 +261,7 @@ typedef struct {
     pthread_t quick_thread;
     bool quick_loading, quick_configured, connecting, switch_requested;
     atomic_bool quick_done;
+    MdSignerCancel *quick_cancel, *switch_cancel;
     json_t *quick_hosts, *quick_result;
     char quick_target[65];
 
@@ -704,6 +705,8 @@ static int send_session_info(MdStream *stream, ClientCtx *ctx) {
 }
 
 static void cancel_client_connect(ClientCtx *ctx) {
+    md_signer_cancel(ctx->quick_cancel);
+    md_signer_cancel(ctx->switch_cancel);
     if (!atomic_exchange(&ctx->cancel_connect, true) && ctx->cancel_ch)
         go_channel_close(ctx->cancel_ch);
     /* Borrow only while holding the same lock the worker uses to withdraw
@@ -1043,7 +1046,7 @@ static void overlay_event_forward(void *event, void *userdata) {
     if (!local) forward_input_event(ctx, ev);
 }
 
-static json_t *read_quick_hosts(MdAccountBinding *owner) {
+static json_t *read_quick_hosts(MdAccountBinding *owner, MdSignerCancel *cancel) {
 #ifdef _WIN32
     char *path = md_win_default_directory("\\metadesk");
 #else
@@ -1059,14 +1062,14 @@ static json_t *read_quick_hosts(MdAccountBinding *owner) {
     if (path) snprintf(path, n, "%s%s", base, suffix);
 #endif
     if (!path) return NULL;
-    json_t *hosts = md_managed_store_quick_hosts(owner, path);
+    json_t *hosts = md_managed_store_quick_hosts_cancellable(owner, path, cancel);
     free(path);
     return hosts;
 }
 
 static void *load_quick_hosts(void *data) {
     ClientCtx *ctx = data;
-    ctx->quick_result = read_quick_hosts(ctx->owner);
+    ctx->quick_result = read_quick_hosts(ctx->owner, ctx->quick_cancel);
     ctx->quick_done = true;
     return NULL;
 }
@@ -1156,12 +1159,31 @@ static void reset_client_video(ClientCtx *ctx) {
     md_renderer_reset_frame(ctx->renderer);
 }
 
+static void close_quick_hosts(ClientCtx *ctx) {
+    md_signer_cancel(ctx->quick_cancel);
+    md_managed_store_discard_plaintext(ctx->quick_hosts);
+    ctx->quick_hosts = NULL;
+}
+
+static bool client_select_host(ClientCtx *ctx, const char pin[65]) {
+    if (!g_running || !ctx->quick_configured || ctx->connecting || ctx->quick_loading || !ctx->quick_hosts)
+        return false;
+    memcpy(ctx->quick_target, pin, sizeof(ctx->quick_target));
+    ctx->switch_requested = true;
+    ctx->paused = true; /* stop any old-host reconnect countdown */
+    ctx->stream = NULL;
+    return true;
+}
+
 static void pump_client_ui(ClientCtx *ctx, MdStream *stream) {
     if (ctx->quick_loading && ctx->quick_done) {
         pthread_join(ctx->quick_thread, NULL);
         ctx->quick_loading = false;
-        ctx->quick_hosts = ctx->quick_result;
+        if (!md_signer_cancelled(ctx->quick_cancel)) ctx->quick_hosts = ctx->quick_result;
+        else md_managed_store_discard_plaintext(ctx->quick_result);
         ctx->quick_result = NULL;
+        md_signer_cancel_free(ctx->quick_cancel);
+        ctx->quick_cancel = NULL;
     }
     if (ctx->renderer && md_renderer_poll_events(ctx->renderer) < 0) g_running = 0;
     render_client_overlay(ctx, stream);
@@ -1172,27 +1194,35 @@ static void pump_client_ui(ClientCtx *ctx, MdStream *stream) {
         ctx->error = MD_CLIENT_ERROR_NONE;
         ctx->connection_status = "Disconnected by you";
         cancel_client_connect(ctx);
+        close_quick_hosts(ctx);
         ctx->stream = NULL; /* no input after explicit disconnect */
     } else if (action == MD_OVERLAY_RETRY) {
         ctx->paused = false;
     } else if (action == MD_OVERLAY_LOAD_HOSTS && !ctx->quick_loading) {
-        md_managed_store_discard_plaintext(ctx->quick_hosts);
-        ctx->quick_hosts = NULL;
+        close_quick_hosts(ctx);
+        ctx->quick_cancel = md_signer_cancel_new();
         ctx->quick_done = false;
-        ctx->quick_loading = pthread_create(&ctx->quick_thread, NULL, load_quick_hosts, ctx) == 0;
-    } else if (action == MD_OVERLAY_SWITCH_HOST && ctx->quick_configured) {
-        md_overlay_take_host(ctx->overlay, ctx->quick_target);
-        ctx->switch_requested = true;
-        ctx->paused = true; /* stop any old-host reconnect countdown */
-        ctx->stream = NULL;
-        md_managed_store_discard_plaintext(ctx->quick_hosts);
-        ctx->quick_hosts = NULL;
+        ctx->quick_loading = ctx->quick_cancel && pthread_create(&ctx->quick_thread, NULL, load_quick_hosts, ctx) == 0;
+        if (!ctx->quick_loading) {
+            md_signer_cancel_free(ctx->quick_cancel);
+            ctx->quick_cancel = NULL;
+        }
+    } else if (action == MD_OVERLAY_CLOSE_HOSTS) {
+        close_quick_hosts(ctx);
+    } else if (action == MD_OVERLAY_SWITCH_HOST) {
+        char pin[65];
+        md_overlay_take_host(ctx->overlay, pin);
+        client_select_host(ctx, pin);
+        close_quick_hosts(ctx);
     }
 }
 
+static bool switched_peer_cancelled(void *data) { return !client_owner_current(data); }
+
 static MdResolveResult resolve_client_peer(const char *address, const char *pin,
-                                            MdIdentity *identity, char **npub) {
-    MdResolveResult result = md_identity_resolve(address, pin, identity);
+                                            MdIdentity *identity, char **npub, ClientCtx *switching) {
+    MdResolveResult result = md_identity_resolve_cancellable(address, pin, identity,
+        switching ? switched_peer_cancelled : NULL, switching);
     if (result == MD_RESOLVE_OK && !(*npub = md_identity_npub(identity)))
         result = MD_RESOLVE_INVALID;
     return result;
@@ -1234,7 +1264,7 @@ static MdNostr *prepare_switched_peer(ClientCtx *ctx, ClientPeerSwitch *peer) {
     *peer->npub = NULL;
     ctx->expected_host_pk[0] = 0;
 
-    json_t *hosts = read_quick_hosts(ctx->owner), *row = NULL, *candidate;
+    json_t *hosts = read_quick_hosts(ctx->owner, ctx->switch_cancel), *row = NULL, *candidate;
     size_t i;
     json_array_foreach(hosts, i, candidate) {
         if (!strcmp(ctx->quick_target, json_string_value(json_object_get(candidate, "pubkey")))) {
@@ -1269,7 +1299,8 @@ static MdNostr *prepare_switched_peer(ClientCtx *ctx, ClientPeerSwitch *peer) {
     /* Never fall back from a saved alias to its raw key on a lookup error
      * or pin mismatch. Only the manager can review and change a pin. */
     const char *address = alias && *alias ? alias : profile ? profile : ctx->quick_target;
-    MdResolveResult result = resolve_client_peer(address, ctx->quick_target, peer->identity, peer->npub);
+    MdResolveResult result = resolve_client_peer(address, ctx->quick_target, peer->identity, peer->npub, ctx);
+    if (profile) OPENSSL_cleanse(profile, strlen(profile));
     free(profile);
     /* Like a fresh managed video launch, video is required; input and
      * accessibility are opt-in for this saved host. */
@@ -1362,14 +1393,17 @@ static MdStream *connect_with_ui(const char *host, const char *npub,
     ctx->cancel_connect = false;
     ctx->reconnect_delay_ms = 0;
     ctx->cancel_ch = go_channel_create(1);
+    ctx->switch_cancel = replacement ? md_signer_cancel_new() : NULL;
     ClientConnect job = {host, npub, control, pubkey, port, timeout,
                          nostr, ctx, session, NULL, go_channel_create(1), replacement};
     pthread_t thread;
-    if (!ctx->cancel_ch || !job.done ||
+    if (!ctx->cancel_ch || !job.done || (replacement && !ctx->switch_cancel) ||
         pthread_create(&thread, NULL, connect_worker, &job) != 0) {
         if (job.done) go_channel_unref(job.done);
         if (ctx->cancel_ch) go_channel_unref(ctx->cancel_ch);
         ctx->cancel_ch = NULL;
+        md_signer_cancel_free(ctx->switch_cancel);
+        ctx->switch_cancel = NULL;
         return NULL;
     }
     ctx->connecting = true;
@@ -1379,6 +1413,8 @@ static MdStream *connect_with_ui(const char *host, const char *npub,
      * Cancellation closes a channel; all worker ownership drains via join. */
     while (go_select_timeout(&done, 1, 16).selected_case < 0) pump_client_ui(ctx, NULL);
     pthread_join(thread, NULL);
+    md_signer_cancel_free(ctx->switch_cancel);
+    ctx->switch_cancel = NULL;
     /* Drain queued input and ignore repeats/modifiers held across the
      * connection boundary until a fresh press in the new session. */
     if (ctx->renderer) {
@@ -1609,7 +1645,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
     for (size_t i = 0; i < bootstrap->count; ++i)
         if (!strncmp(bootstrap->target[i].url, "ws://", 5))
             fprintf(stderr, "WARNING: configured relay uses unencrypted WebSocket: %s\n", bootstrap->target[i].url);
-    MdResolveResult resolution = resolve_client_peer(npub, pin, identity, canonical_npub);
+    MdResolveResult resolution = resolve_client_peer(npub, pin, identity, canonical_npub, NULL);
     if (resolution != MD_RESOLVE_OK) {
         fprintf(stderr, "ERROR: resolve: %s\n", md_resolve_error(resolution));
         return 1;
@@ -2171,9 +2207,14 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
     md_decoder_destroy(decoder);
     md_stream_destroy(stream);
 
-    if (ctx.quick_loading) pthread_join(ctx.quick_thread, NULL);
-    md_managed_store_discard_plaintext(ctx.quick_hosts);
-    md_managed_store_discard_plaintext(ctx.quick_result);
+    ctx.stream = NULL;
+    close_quick_hosts(&ctx);
+    /* A backend may not abort its current RPC. Keep the window responsive
+     * while it drains; cancellation prevents any subsequent decrypt. */
+    while (ctx.quick_loading) {
+        pump_client_ui(&ctx, NULL);
+        if (ctx.quick_loading) SDL_Delay(16); /* UI cadence only */
+    }
     cleanup_session_nostr(&nostr, &ctx);
     md_signer_destroy(signer);
     md_account_startup_clear(&account);

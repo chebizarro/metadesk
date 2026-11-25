@@ -438,10 +438,14 @@ static NostrEvent *parse_event(const char *wire, const char *owner, int kind,
     return NULL;
 }
 
-static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t **doc) {
+static MdStoreResult decode_cancellable(MdManagedStore *s, int kind, NostrEvent *e,
+                                        json_t **doc, const MdSignerCancel *cancel) {
     *doc = NULL;
     char *plain = NULL;
-    if (md_account_binding_decrypt(s->binding,s->owner,nostr_event_get_content(e),&plain) || !plain) {
+    const char *content = nostr_event_get_content(e);
+    int rc = cancel ? md_signer_nip44_decrypt_cancellable(md_account_binding_signer(s->binding),
+        s->owner, content, &plain, cancel) : md_account_binding_decrypt(s->binding, s->owner, content, &plain);
+    if (rc || !plain || !current(s) || md_signer_cancelled(cancel)) {
         wipe(plain); return current(s) ? MD_STORE_SIGNER : MD_STORE_REVOKED;
     }
     json_error_t error = {0};
@@ -449,6 +453,10 @@ static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t *
     wipe(plain);
     if (!*doc && json_error_code(&error) == json_error_out_of_memory) return MD_STORE_IO;
     return schema(kind,*doc);
+}
+
+static MdStoreResult decode(MdManagedStore *s, int kind, NostrEvent *e, json_t **doc) {
+    return decode_cancellable(s, kind, e, doc, NULL);
 }
 
 /* Journal loading also verifies disk envelopes. Never recover an unreadable
@@ -940,12 +948,12 @@ static const char *host_member(const json_t *tag) {
 }
 
 static bool read_cached_document(MdManagedStore *s, const char *coordinate,
-                                 json_t **winner, json_t **draft) {
+                                 json_t **winner, json_t **draft, const MdSignerCancel *cancel) {
     Journal j = {0};
     int kind = doc_kind(coordinate);
-    bool ok = current(s) && load(s, coordinate, &j) &&
-        (!j.winner || decode(s, kind, j.winner, winner) == MD_STORE_OK) &&
-        (!j.draft || decode(s, kind, j.draft, draft) == MD_STORE_OK);
+    bool ok = current(s) && !md_signer_cancelled(cancel) && load(s, coordinate, &j) &&
+        (!j.winner || decode_cancellable(s, kind, j.winner, winner, cancel) == MD_STORE_OK) &&
+        (!j.draft || decode_cancellable(s, kind, j.draft, draft, cancel) == MD_STORE_OK);
     dispose(&j);
     return ok;
 }
@@ -960,17 +968,24 @@ static bool has_host_member(const json_t *list, const char *key) {
     return false;
 }
 
-struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const char *path) {
+static void cancel_cache_read(void *data) { md_signer_cancel(data); }
+
+struct json_t *md_managed_store_quick_hosts_cancellable(MdAccountBinding *binding, const char *path,
+                                                        MdSignerCancel *cancel) {
+    if (md_signer_cancelled(cancel)) return NULL;
     MdManagedStore *s = open_store(binding, path, true);
     if (!s) return NULL;
+    /* Preserve the role's cancellation alongside the caller's token. Unwatch
+     * drains the notification before the caller can free the token. */
+    MdAccountWatch *watch = cancel ? md_account_binding_watch(binding, cancel_cache_read, cancel) : NULL;
     json_t *hosts = NULL, *meta = NULL, *favorites = NULL;
     json_t *draft_hosts = NULL, *draft_meta = NULL, *draft_favorites = NULL;
     json_t *recent = NULL, *out = NULL;
     json_t *saved = json_object(), *seen = json_object();
-    if (!saved || !seen ||
-        !read_cached_document(s, MD_STORE_HOSTS, &hosts, &draft_hosts) ||
-        !read_cached_document(s, MD_STORE_MANAGEMENT, &meta, &draft_meta) ||
-        !read_cached_document(s, MD_STORE_FAVORITES, &favorites, &draft_favorites) ||
+    if (!saved || !seen || (cancel && !watch) ||
+        !read_cached_document(s, MD_STORE_HOSTS, &hosts, &draft_hosts, cancel) ||
+        !read_cached_document(s, MD_STORE_MANAGEMENT, &meta, &draft_meta, cancel) ||
+        !read_cached_document(s, MD_STORE_FAVORITES, &favorites, &draft_favorites, cancel) ||
         !(recent = recents(s))) goto done;
     out = json_array();
     if (!out) goto done;
@@ -1005,7 +1020,7 @@ struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const cha
             if (json_object_set(seen, key, json_true())) goto failed;
         }
     }
-    if (current(s)) goto done;
+    if (current(s) && !md_signer_cancelled(cancel)) goto done;
 failed:
     md_managed_store_discard_plaintext(out);
     out = NULL;
@@ -1019,8 +1034,14 @@ done:
     md_managed_store_discard_plaintext(draft_favorites);
     md_managed_store_discard_plaintext(saved);
     md_managed_store_discard_plaintext(seen);
+    md_account_binding_unwatch(watch);
     md_managed_store_close(s);
+    if (md_signer_cancelled(cancel)) { md_managed_store_discard_plaintext(out); return NULL; }
     return out;
+}
+
+struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const char *path) {
+    return md_managed_store_quick_hosts_cancellable(binding, path, NULL);
 }
 
 static MdStoreResult exchange(const char *input, char **result, bool importing) {

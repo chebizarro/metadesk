@@ -101,6 +101,10 @@ void md_managed_store_discard_plaintext(struct json_t *);
  * newest recents, deduplicated. NULL means unavailable, not an empty book.
  * Release with md_managed_store_discard_plaintext(). */
 struct json_t *md_managed_store_quick_hosts(MdAccountBinding *, const char *state_directory);
+/* The optional operation token must outlive the read. Revoking the binding
+ * also cancels it. Already-running non-abortable signer calls may drain. */
+struct json_t *md_managed_store_quick_hosts_cancellable(MdAccountBinding *,
+    const char *state_directory, MdSignerCancel *);
 
 /* Shared with existing signer-backed ACL and quality writers. */
 NostrEvent *md_private_document_build(MdSigner *, const MdSignerCancel *,

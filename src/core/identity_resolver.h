@@ -17,11 +17,13 @@ typedef struct {
 
 typedef enum {
     MD_RESOLVE_OK, MD_RESOLVE_INVALID, MD_RESOLVE_FETCH_FAILED,
-    MD_RESOLVE_UNSAFE, MD_RESOLVE_NOT_FOUND, MD_RESOLVE_PIN_MISMATCH
+    MD_RESOLVE_UNSAFE, MD_RESOLVE_NOT_FOUND, MD_RESOLVE_PIN_MISMATCH, MD_RESOLVE_CANCELLED
 } MdResolveResult;
 
 /* pin, if provided, is an npub or 64-hex key. Clear out after success. */
 MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdentity *out);
+MdResolveResult md_identity_resolve_cancellable(const char *input, const char *pin, MdIdentity *out,
+                                               bool (*cancelled)(void *), void *data);
 /* Check an already-resolved candidate against a saved pin without resolving a second time. */
 MdResolveResult md_identity_check_pin(const MdIdentity *, const char *pin);
 /* Normalize with the same NIP-05 parser used for lookup. Malloc-owned. */

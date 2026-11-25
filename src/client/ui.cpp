@@ -176,6 +176,7 @@ MdOverlayAction md_overlay_take_action(MdOverlay *o) {
     if (!o) return MD_OVERLAY_NONE;
     MdOverlayAction action = o->action;
     o->action = MD_OVERLAY_NONE;
+    if (action == MD_OVERLAY_DISCONNECT || action == MD_OVERLAY_QUIT) o->quick_open = false;
     return action;
 }
 
@@ -192,15 +193,23 @@ void md_overlay_reset_session(MdOverlay *o) {
     o->smooth_fps = o->smooth_bitrate = 0;
 }
 
+static void close_quick_connect(MdOverlay *o) {
+    if (!o->quick_open) return;
+    o->quick_open = false;
+    if (o->action == MD_OVERLAY_NONE) o->action = MD_OVERLAY_CLOSE_HOSTS;
+}
+
 static void render_quick_connect(MdOverlay *o, const MdOverlayStats *stats) {
-    if (!stats->quick_available) { o->quick_open = false; return; }
+    if (!stats->quick_available) { close_quick_connect(o); return; }
+    ImGui::BeginDisabled(!o->quick_open && stats->quick_loading);
     if (ImGui::Button(o->quick_open ? "Close quick connect" : "Quick connect")) {
-        o->quick_open = !o->quick_open;
-        if (o->quick_open) o->action = MD_OVERLAY_LOAD_HOSTS;
+        if (o->quick_open) close_quick_connect(o);
+        else { o->quick_open = true; o->action = MD_OVERLAY_LOAD_HOSTS; }
     }
+    ImGui::EndDisabled();
     if (!o->quick_open) return;
     if (stats->quick_loading || o->action == MD_OVERLAY_LOAD_HOSTS) {
-        ImGui::TextUnformatted("Reading saved hosts…");
+        ImGui::TextUnformatted("Reading saved hosts...");
         return;
     }
     if (!stats->quick_hosts) {
@@ -243,7 +252,7 @@ static void render_quick_connect(MdOverlay *o, const MdOverlayStats *stats) {
         ImGui::SetCursorScreenPos(pos);
         const char *title = label && *label ? label : alias && *alias ? alias : "Saved host";
         ImGui::TextUnformatted(title, title + std::strcspn(title, "\r\n"));
-        ImGui::Text("%.4s %.4s %.4s %.4s%s", pin, pin+4, pin+8, pin+12, active ? " — connected" : "");
+        ImGui::Text("%.4s %.4s %.4s %.4s%s", pin, pin+4, pin+8, pin+12, active ? " - connected" : "");
         ImGui::SetCursorScreenPos(next);
         ImGui::PopID();
     }
@@ -261,6 +270,7 @@ void md_overlay_render(MdOverlay *o, const MdOverlayStats *stats) {
 
     if (!stats->connected) o->visible = true;
     if (!o->visible) {
+        close_quick_connect(o);
         /* Render a minimal "F1 for stats" hint in the corner */
         ImGui::SetNextWindowPos(ImVec2(10, 10));
         ImGui::SetNextWindowBgAlpha(0.3f);

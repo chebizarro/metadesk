@@ -319,7 +319,25 @@ static void test_tls_acceptance_gate(void) {
     }
 }
 
+static void test_quick_connect_cancel(void) {
+    ClientCtx ctx = {.quick_cancel = md_signer_cancel_new(), .switch_cancel = md_signer_cancel_new(),
+                     .quick_hosts = json_array()};
+    MD_CHECK(ctx.quick_cancel && ctx.switch_cancel && ctx.quick_hosts);
+    cancel_client_connect(&ctx);
+    MD_CHECK(md_signer_cancelled(ctx.quick_cancel) && md_signer_cancelled(ctx.switch_cancel));
+    MdIdentity identity;
+    char *npub = NULL;
+    MD_CHECK(resolve_client_peer("desk@example.org", NULL, &identity, &npub, &ctx) == MD_RESOLVE_CANCELLED);
+    MD_CHECK(!npub && !identity.pubkey[0]);
+    close_quick_hosts(&ctx);
+    MD_CHECK(!ctx.quick_hosts);
+    md_signer_cancel_free(ctx.quick_cancel);
+    md_signer_cancel_free(ctx.switch_cancel);
+    PASS("quick-connect cancellation drains cache work and stops alias resolution");
+}
+
 int main(void) {
+    test_quick_connect_cancel();
     test_tls_acceptance_gate();
     test_input_grants();
     const char *reasons[] = {"capture_unavailable", "request_refused", "tls_required"};

@@ -138,8 +138,10 @@ MdResolveResult md_identity_from_nip05_json(const char *input, const char *json,
     return result;
 }
 
-MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdentity *out) {
+MdResolveResult md_identity_resolve_cancellable(const char *input, const char *pin, MdIdentity *out,
+                                               bool (*cancelled)(void *), void *data) {
     memset(out, 0, sizeof(*out));
+    if (cancelled && cancelled(data)) return MD_RESOLVE_CANCELLED;
     input = strip_uri(input);
     char key[65];
     if (!input || !*input || strlen(input) > 8192 ||
@@ -160,8 +162,10 @@ MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdenti
     int len = escaped ? snprintf(url, sizeof(url), "https://%s/.well-known/nostr.json?name=%s", domain, escaped) : -1;
     curl_free(escaped);
     char *json = len > 0 && (size_t)len < sizeof(url) ?
-        md_discovery_http_get(url, "Accept: application/json", true, 10000, &unsafe) : NULL; /* NIP-05 forbids redirects. */
-    MdResolveResult result = json ? resolve_json(name, json, pin, out) :
+        md_discovery_http_get_cancellable(url, "Accept: application/json", true, 10000,
+            &unsafe, cancelled, data) : NULL; /* NIP-05 forbids redirects. */
+    MdResolveResult result = cancelled && cancelled(data) ? MD_RESOLVE_CANCELLED :
+        json ? resolve_json(name, json, pin, out) :
         unsafe ? MD_RESOLVE_UNSAFE : MD_RESOLVE_FETCH_FAILED;
     free(json);
     free(name);
@@ -169,9 +173,14 @@ MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdenti
     return result;
 }
 
+MdResolveResult md_identity_resolve(const char *input, const char *pin, MdIdentity *out) {
+    return md_identity_resolve_cancellable(input, pin, out, NULL, NULL);
+}
+
 const char *md_resolve_error(MdResolveResult result) {
     switch (result) {
     case MD_RESOLVE_OK: return "resolved";
+    case MD_RESOLVE_CANCELLED: return "Identity lookup cancelled";
     case MD_RESOLVE_INVALID: return "invalid host identity or pin (expected npub, nprofile, 64-hex or name@domain; pin must be npub or hex)";
     case MD_RESOLVE_FETCH_FAILED: return "NIP-05 HTTPS lookup failed";
     case MD_RESOLVE_UNSAFE: return "NIP-05 refused an unsafe destination";
