@@ -1,6 +1,7 @@
 #import "hosts_launch.h"
 #include "session.h"
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -68,6 +69,28 @@ NSString *MDHostClientPath(NSString *manager, NSString *bundle, NSString *path) 
 }
 @end
 
+/* Keep the child watch alive independently of the launch channel. Closing
+ * the channel after handoff must not abandon reaping or kill the client. */
+static BOOL WatchClientExit(pid_t pid, dispatch_queue_t queue) {
+    __block dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC,
+        (uintptr_t)pid, DISPATCH_PROC_EXIT, queue);
+    if (!source) return NO;
+    void (^reap)(int) = ^(int options) {
+        if (!source) return;
+        pid_t rc;
+        do rc = waitpid(pid, NULL, options); while (rc < 0 && errno == EINTR);
+        if (!rc) return;
+        dispatch_source_cancel(source);
+        source = nil;
+    };
+    dispatch_source_set_event_handler(source, ^{ reap(0); });
+    /* Also check after registration in case exit preceded the kqueue watch. */
+    dispatch_source_set_registration_handler(source, ^{ reap(WNOHANG); });
+    dispatch_activate(source);
+    reap(WNOHANG);
+    return YES;
+}
+
 @implementation MDHostsLaunch
 - (instancetype)initWithUpdate:(void (^)(MdLaunchMessage))update {
     if ((self = [super init])) {
@@ -124,7 +147,16 @@ NSString *MDHostClientPath(NSString *manager, NSString *bundle, NSString *path) 
         if (!program || md_managed_launch_spawn(program.fileSystemRepresentation, &self->_fd, &pid)) {
             [self emit:MD_LAUNCH_FAILED]; return;
         }
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {} });
+        if (!WatchClientExit(pid, self->_queue)) {
+            /* No configuration was sent. Abort this incomplete launch and
+             * reap the owned child; never leave an untracked video process. */
+            [self disposeChannel];
+            kill(pid, SIGKILL);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+            });
+            [self emit:MD_LAUNCH_FAILED]; return;
+        }
         if (!md_managed_launch_write(self->_fd, wire.bytes)) {
             [self disposeChannel]; [self emit:MD_LAUNCH_FAILED]; return;
         }

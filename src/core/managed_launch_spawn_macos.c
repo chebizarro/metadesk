@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -25,10 +26,20 @@ int md_managed_launch_spawn(const char *client, int *fd, pid_t *pid) {
     *pid = -1;
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) < 0) return errno;
-    int rc = EACCES;
     int child = -1;
+    int rc;
+    /* Darwin lacks SOCK_CLOEXEC for socketpair. An unrelated concurrent
+     * fork/exec could still inherit an end between creation and fcntl.
+     * Our own spawn separately allowlists descriptors with CLOEXEC_DEFAULT. */
+    if (fcntl(sockets[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(sockets[1], F_SETFD, FD_CLOEXEC) < 0) { rc = errno; goto close_sockets; }
+    rc = EACCES;
     if (!md_managed_launch_prepare_stream(sockets[0]) ||
         !md_managed_launch_prepare_stream(sockets[1])) goto close_sockets;
+    /* Darwin's stream send can block on buffer exhaustion despite
+     * MSG_DONTWAIT. The parent's config watchdog needs a nonblocking fd.
+     * The separate child endpoint remains blocking for its command reader. */
+    if (fcntl(sockets[0], F_SETFL, O_NONBLOCK) < 0) { rc = errno; goto close_sockets; }
     /* Keep the source distinct from standard streams and the target fd 3. */
     child = fcntl(sockets[1], F_DUPFD_CLOEXEC, 4);
     if (child < 0) { rc = errno; goto close_sockets; }
@@ -36,7 +47,20 @@ int md_managed_launch_spawn(const char *client, int *fd, pid_t *pid) {
     posix_spawn_file_actions_t actions;
     if ((rc = posix_spawnattr_init(&attr))) goto close_sockets;
     if ((rc = posix_spawn_file_actions_init(&actions))) goto destroy_attr;
-    rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    /* The GUI ignores TERM and libdispatch workers mask async signals.
+     * Present a fresh process signal state before the client sets up sigwait. */
+    sigset_t unblocked, defaults;
+    sigemptyset(&unblocked);
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGINT);
+    sigaddset(&defaults, SIGHUP);
+    sigaddset(&defaults, SIGPIPE);
+    sigaddset(&defaults, SIGCHLD);
+    rc = posix_spawnattr_setsigmask(&attr, &unblocked);
+    if (!rc) rc = posix_spawnattr_setsigdefault(&attr, &defaults);
+    if (!rc) rc = posix_spawnattr_setflags(&attr,
+        POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
     for (int i = 0; i < 3 && !rc; ++i)
         rc = posix_spawn_file_actions_addopen(&actions, i, "/dev/null", i ? O_WRONLY : O_RDONLY, 0);
     if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, child, 3);

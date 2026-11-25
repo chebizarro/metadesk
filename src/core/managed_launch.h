@@ -43,8 +43,8 @@ int md_managed_launch_message_read(int fd, MdLaunchMessage *, bool nonblocking);
 /* Verify a connected same-user Unix stream and suppress SIGPIPE on it. */
 bool md_managed_launch_prepare_stream(int fd);
 /* Absolute executable path. Returns a POSIX error number or zero. On success
- * the caller owns the socket and must reap the child, including on write
- * failure. Send the launch configuration immediately after spawning. */
+ * the caller owns the nonblocking parent socket and must reap the child,
+ * including on write failure. Send configuration immediately after spawning. */
 int md_managed_launch_spawn(const char *client, int *fd, pid_t *pid);
 #endif
 #endif
