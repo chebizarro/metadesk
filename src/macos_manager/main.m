@@ -20,7 +20,8 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     MDIdentityPage *_identity;
     dispatch_queue_t _previewQueue;
     dispatch_source_t _terminate;
-    BOOL _terminationPending, _drained;
+    NSTimer *_terminationDeadline;
+    BOOL _terminationPending, _terminationReplied;
 }
 - (NSView *)relays {
     _address = [NSTextField textFieldWithString:@""]; _address.placeholderString = @"Host npub, nprofile or hex public key";
@@ -73,7 +74,13 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     /* Publish readiness (the visible window) only once a terminal stop can be
      * observed. SIGTERM uses the same asynchronous drain path as Quit. */
     _terminate=dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,SIGTERM,0,dispatch_get_main_queue());
-    dispatch_source_set_event_handler(_terminate, ^{ [NSApp terminate:nil]; });
+    dispatch_source_set_event_handler(_terminate, ^{
+        /* Begin the AppKit termination loop from its run loop, not inside a
+         * GCD main-queue handler: drain completions also target that queue. */
+        CFRunLoopRef loop=CFRunLoopGetMain();
+        CFRunLoopPerformBlock(loop,kCFRunLoopCommonModes,^{ [NSApp terminate:nil]; });
+        CFRunLoopWakeUp(loop);
+    });
     __weak Manager *weakSelf=self;
     dispatch_source_set_registration_handler(_terminate, ^{ [weakSelf showWindow]; });
     dispatch_activate(_terminate);
@@ -87,9 +94,15 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     if ([item.identifier isEqual:@"Identity"]) [_identity activate];
 }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app { (void)app; return YES; }
+- (void)finishTermination {
+    if (_terminationReplied) return;
+    _terminationReplied=YES;
+    [_terminationDeadline invalidate]; _terminationDeadline=nil;
+    [NSApp replyToApplicationShouldTerminate:YES];
+}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     (void)app;
-    if (_drained || !_previewQueue) return NSTerminateNow;
+    if (!_previewQueue || _terminationReplied) return NSTerminateNow;
     if (!_terminationPending) {
         _terminationPending=YES;
         dispatch_group_t group=dispatch_group_create();
@@ -97,11 +110,18 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         dispatch_group_enter(group); [_identity close:^{ dispatch_group_leave(group); }];
         dispatch_group_enter(group); [_local close:^{ dispatch_group_leave(group); }];
         dispatch_group_async(group,_previewQueue,^{});
-        dispatch_group_notify(group,dispatch_get_main_queue(), ^{ self->_drained=YES; [NSApp terminate:nil]; });
+        dispatch_group_notify(group,dispatch_get_main_queue(), ^{ [self finishTermination]; });
+        /* A signer call may be unable to interrupt its transport. Cancellation
+         * invalidates the pending role save, but do not hold logout indefinitely
+         * for the call to return. This timer also runs in the termination loop. */
+        __weak Manager *weakSelf=self;
+        _terminationDeadline=[NSTimer timerWithTimeInterval:5 repeats:NO block:^(NSTimer *timer) {
+            (void)timer; [weakSelf finishTermination];
+        }];
+        [NSRunLoop.mainRunLoop addTimer:_terminationDeadline forMode:NSRunLoopCommonModes];
+        [NSRunLoop.mainRunLoop addTimer:_terminationDeadline forMode:NSModalPanelRunLoopMode];
     }
-    /* Keep AppKit in its regular event loop while main-queue completions
-     * arrive. NSTerminateLater can enter AppKit's termination-only loop. */
-    return NSTerminateCancel;
+    return NSTerminateLater;
 }
 @end
 
