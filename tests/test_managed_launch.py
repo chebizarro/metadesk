@@ -112,5 +112,7 @@ def cancel_after_display(crypto):
                     worker.join()
 
 
-if len(sys.argv) > 2:
+if sys.argv[2:3] == ["--switch-seam"]:
+    subprocess.run([sys.argv[3], "--managed-switch"], check=True, timeout=8)
+elif len(sys.argv) > 2:
     cancel_after_display(sys.argv[2])

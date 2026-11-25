@@ -336,7 +336,63 @@ static void test_quick_connect_cancel(void) {
     PASS("quick-connect cancellation drains cache work and stops alias resolution");
 }
 
-int main(void) {
+#ifdef __linux__
+/* Headless half of the launch fixture. Drive the production selection and
+ * switch worker boundary with the real private-channel watcher. */
+static void test_managed_switch_handoff(void) {
+    int fd[2];
+    MD_CHECK(!socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fd));
+    launch_fd = fd[1];
+    g_shutdown_ch = go_channel_create(1);
+    MD_CHECK(g_shutdown_ch);
+    pthread_t watcher;
+    MD_CHECK(!pthread_create(&watcher, NULL, watch_launch, NULL));
+    MD_CHECK(launch_handoff());
+    MdLaunchMessage message;
+    MD_CHECK(md_managed_launch_message_read(fd[0], &message, false) == 1 && message == MD_LAUNCH_CONNECTED);
+
+    const char key[65] = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+    ClientCtx ctx = {.connecting = true, .quick_configured = true, .quick_hosts = json_array()};
+    MD_CHECK(ctx.quick_hosts);
+    MD_CHECK(!client_select_host(&ctx, key));
+    MD_CHECK(!ctx.switch_requested && !ctx.paused && !ctx.quick_target[0]);
+    ctx.connecting = false;
+    MD_CHECK(client_select_host(&ctx, key));
+    MD_CHECK(ctx.switch_requested && ctx.paused && !strcmp(ctx.quick_target, key));
+    close_quick_hosts(&ctx);
+    MdIdentity identity = {0};
+    char *npub = NULL;
+    MdNostr *bridge = NULL;
+    ClientPeerSwitch peer = {.bridge = &bridge, .identity = &identity, .npub = &npub};
+    /* No bound cache in this seam: retry reaches the same switch boundary
+     * but neither attempt can continue past lookup into signaling. */
+    MD_CHECK(!prepare_switched_peer(&ctx, &peer));
+    MD_CHECK(md_managed_launch_message_read(fd[0], &message, false) == 1 && message == MD_LAUNCH_ENDED);
+    MD_CHECK(!prepare_switched_peer(&ctx, &peer));
+    launch_status(MD_LAUNCH_FIPS);
+    launch_status(MD_LAUNCH_FAILED);
+    MD_CHECK(md_managed_launch_message_read(fd[0], &message, true) == -1 && errno == EAGAIN);
+    MD_CHECK(md_managed_launch_message_write(fd[0], MD_LAUNCH_DISCONNECT));
+    MD_CHECK(!shutdown(fd[0], SHUT_WR));
+    MD_CHECK(!pthread_join(watcher, NULL));
+    MD_CHECK(g_running && !launch_cancelled);
+    close(fd[0]);
+    close(fd[1]);
+    go_channel_unref(g_shutdown_ch);
+    g_shutdown_ch = NULL;
+    PASS("managed switch ends the original handoff exactly once and fences stale manager commands");
+}
+#endif
+
+int main(int argc, char **argv) {
+#ifdef __linux__
+    if (argc == 2 && !strcmp(argv[1], "--managed-switch")) {
+        test_managed_switch_handoff();
+        return md_test_report();
+    }
+#else
+    (void)argc; (void)argv;
+#endif
     test_quick_connect_cancel();
     test_tls_acceptance_gate();
     test_input_grants();
