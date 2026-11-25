@@ -13,6 +13,8 @@ char *md_win_default_directory(const char *suffix);
 HANDLE md_win_file(MdWinDirectory *, const char *name, DWORD access, DWORD creation, DWORD share);
 bool md_win_read(HANDLE, unsigned char **out, size_t *size, size_t max);
 bool md_win_replace(MdWinDirectory *, const char *name, const void *, size_t);
+/* Replace a snapshot while readers with delete-sharing hold its old version. */
+bool md_win_replace_snapshot(MdWinDirectory *, const char *name, const void *, size_t);
 bool md_win_remove(MdWinDirectory *, const char *name);
 bool md_win_read_path(const char *path, unsigned char **out, size_t *size, size_t max);
 #endif

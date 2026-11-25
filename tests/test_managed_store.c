@@ -110,7 +110,9 @@ static void journal_path(char *path, size_t capacity, const char *root, const ch
     CHECK(strlen(d) < sizeof(name));
     strcpy(name,d);
     for (char *p = name; *p; ++p) if (*p == ':') *p = '_';
-    int n = snprintf(path,capacity,"%s/%s/%s",root,PK,name);
+    size_t len = strlen(root);
+    const char *sep = len && (root[len - 1] == '/' || root[len - 1] == '\\') ? "" : "/";
+    int n = snprintf(path,capacity,"%s%s%s/%s",root,sep,PK,name);
     CHECK(n > 0 && (size_t)n < capacity);
 }
 static void check_keep_remote(MdManagedStore *s, MdSigner *client, const char *storage,
@@ -391,12 +393,41 @@ static void check_offline_quick_hosts(MdManagedStore *s, MdAccountBinding *bindi
     /* After a manager deletes a pin, orphan favorites/recents cannot restore it. */
     char *deleted = make(signer, PK, MD_STORE_HOSTS, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,
         "[[\"p\",\"" OTHER "\"]]", now + 3);
+#ifdef _WIN32
+    /* Hold the old journal open across the commit, like an overlapping
+     * quick-hosts reader. No race timing is needed to exercise replacement. */
+    char journal[1024];
+    journal_path(journal, sizeof(journal), root, MD_STORE_HOSTS);
+    char *name = strrchr(journal, '/');
+    CHECK(name);
+    *name++ = 0;
+    MdWinDirectory *dir = md_win_directory(journal, false);
+    CHECK(dir);
+    HANDLE reader = md_win_file(dir, name, GENERIC_READ, OPEN_EXISTING,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE);
+    CHECK(reader != INVALID_HANDLE_VALUE);
+    unsigned char *before = NULL, *after = NULL;
+    size_t before_size = 0, after_size = 0;
+    CHECK(md_win_read(reader, &before, &before_size, 1024 * 1024));
+    CHECK(SetFilePointerEx(reader, (LARGE_INTEGER){0}, NULL, FILE_BEGIN));
+#endif
     CHECK(md_managed_store_receive(s, MD_STORE_HOSTS, deleted, now + 3) == MD_STORE_OK);
     free(deleted);
+#ifdef _WIN32
+    CHECK(md_win_read(reader, &after, &after_size, 1024 * 1024));
+    CHECK(before_size == after_size && !memcmp(before, after, before_size));
+    free(before);
+    free(after);
+#endif
     rows = md_managed_store_quick_hosts(binding, root);
     CHECK(json_array_size(rows) == 1);
     CHECK(!strcmp(json_string_value(json_object_get(json_array_get(rows, 0), "pubkey")), OTHER));
     md_managed_store_discard_plaintext(rows);
+#ifdef _WIN32
+    CloseHandle(reader);
+    md_win_directory_close(dir);
+    puts("PASS: held Windows snapshot survives concurrent journal replacement");
+#endif
 }
 
 int main(int argc, char **argv) {

@@ -233,7 +233,7 @@ static bool write_json(MdManagedStore *s, const char *coordinate, json_t *j) {
     size_t n = strlen(str);
     bool ok = false;
 #ifdef _WIN32
-    ok = n <= FILE_LIMIT && md_win_replace(s->dir, name, str, n);
+    ok = n <= FILE_LIMIT && md_win_replace_snapshot(s->dir, name, str, n);
 #else
     /* Exclusive owner lock also protects the fixed scratch path. */
     const char *tmp = "store.tmp";
