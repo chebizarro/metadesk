@@ -329,7 +329,7 @@ static void check_exchange(void) {
     CHECK(md_managed_store_export("[{\"pubkey\":\"" HOST "\",\"relay_hints\":[\"wss://user:pass@example.org\"]}]",&text) == MD_STORE_INVALID);
 }
 static void check_offline_quick_hosts(MdManagedStore *s, MdAccountBinding *binding,
-        MdSigner *signer, const char *root, int64_t now) {
+        MdSigner *signer, const char *root, const char *const *targets, int64_t now) {
     const char *const keys[] = {HOST, OTHER, HOST_PK, PK};
     const char *const documents[] = {MD_STORE_HOSTS, MD_STORE_MANAGEMENT, MD_STORE_FAVORITES};
     const char *const payloads[] = {
@@ -359,10 +359,39 @@ static void check_offline_quick_hosts(MdManagedStore *s, MdAccountBinding *bindi
     CHECK(!strcmp(json_string_value(json_object_get(json_array_get(rows, 1), "nip05")), "desk@example.org"));
     md_managed_store_discard_plaintext(rows);
 
+    /* No EVENT handoff or positive OK: each draft can only subtract pins.
+     * Keep Remote restores eligibility when an unexposed draft is discarded. */
+    const char *const drafts[] = {
+        "[[\"p\",\"" OTHER "\"]]",
+        "{\"schema_version\":1,\"hosts\":{\"" OTHER "\":{\"nip05\":\"desk@example.org\"},\"" PK "\":{\"label\":\"New pin\"}}}",
+        "[]",
+    };
+    for (size_t i = 0; i < 3; ++i) {
+        char base[65];
+        CHECK(md_managed_store_read(s, documents[i], base, NULL, NULL) == MD_STORE_OK);
+        CHECK(md_managed_store_backfill(s, documents[i], true) == MD_STORE_OK);
+        CHECK(md_managed_store_stage(s, documents[i], base, drafts[i], targets, 1, now + 1) == MD_STORE_PENDING);
+        rows = md_managed_store_quick_hosts(binding, root);
+        CHECK(json_is_array(rows) && json_array_size(rows) == (i == 2 ? 0 : 1));
+        if (i != 2) CHECK(!strcmp(json_string_value(json_object_get(json_array_get(rows, 0), "pubkey")), OTHER));
+        md_managed_store_discard_plaintext(rows);
+        /* Keep Remote applies to conflicts. Simulate a same-content winner
+         * from another device, then discard the local draft. */
+        char *remote = make(signer, PK, documents[i], i == 1 ? NOSTR_KIND_APPLICATION_SPECIFIC_DATA :
+            NOSTR_KIND_CATEGORIZED_PEOPLE_LIST, payloads[i], now + 2);
+        CHECK(md_managed_store_receive(s, documents[i], remote, now + 2) == MD_STORE_CONFLICT);
+        free(remote);
+        CHECK(md_managed_store_read(s, documents[i], base, NULL, NULL) == MD_STORE_CONFLICT);
+        CHECK(md_managed_store_keep_remote(s, documents[i], base, now + 2) == MD_STORE_OK);
+        rows = md_managed_store_quick_hosts(binding, root);
+        CHECK(json_array_size(rows) == 2);
+        md_managed_store_discard_plaintext(rows);
+    }
+
     /* After a manager deletes a pin, orphan favorites/recents cannot restore it. */
     char *deleted = make(signer, PK, MD_STORE_HOSTS, NOSTR_KIND_CATEGORIZED_PEOPLE_LIST,
-        "[[\"p\",\"" OTHER "\"]]", now + 1);
-    CHECK(md_managed_store_receive(s, MD_STORE_HOSTS, deleted, now + 1) == MD_STORE_OK);
+        "[[\"p\",\"" OTHER "\"]]", now + 3);
+    CHECK(md_managed_store_receive(s, MD_STORE_HOSTS, deleted, now + 3) == MD_STORE_OK);
     free(deleted);
     rows = md_managed_store_quick_hosts(binding, root);
     CHECK(json_array_size(rows) == 1);
@@ -611,13 +640,17 @@ int main(int argc, char **argv) {
     check_normalized_receipts(s,now);
     check_keep_remote(s,client,argv[2],targets,now);
     check_exchange();
-    check_offline_quick_hosts(s, binding, client, argv[2], now + 302);
+    check_offline_quick_hosts(s, binding, client, argv[2], targets, now + 302);
     CHECK(!md_accounts_bind_role(accounts,MD_ACCOUNT_CLIENT,backend,HOST_PK,other));
     CHECK(md_managed_store_read(s,MD_STORE_HOSTS,revision,NULL,NULL) == MD_STORE_REVOKED);
     CHECK(!md_managed_store_quick_hosts(binding, argv[2]));
     md_managed_store_close(s);
     md_account_binding_release(binding);
     binding = md_accounts_acquire_role(accounts,MD_ACCOUNT_CLIENT);
+    CHECK(!md_managed_store_quick_hosts(binding, argv[2]));
+    char absent[1024];
+    CHECK(snprintf(absent, sizeof(absent), "%s/%s", argv[2], HOST_PK) > 0);
+    CHECK(access(absent, F_OK) != 0);
     s = md_managed_store_open(binding,argv[2]); CHECK(s);
     CHECK(md_managed_store_read(s,MD_STORE_HOSTS,revision,&plain,NULL) == MD_STORE_OK && !*revision && !plain);
     CHECK(!md_managed_store_unattended(s));

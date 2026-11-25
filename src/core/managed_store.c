@@ -939,29 +939,39 @@ static const char *host_member(const json_t *tag) {
     return type && !strcmp(type, "p") ? json_string_value(json_array_get(tag, 1)) : NULL;
 }
 
-static json_t *read_cached_winner(MdManagedStore *s, const char *coordinate) {
+static bool read_cached_document(MdManagedStore *s, const char *coordinate,
+                                 json_t **winner, json_t **draft) {
     Journal j = {0};
-    json_t *doc = NULL;
-    if (current(s) && load(s, coordinate, &j)) {
-        if (!j.winner) doc = json_array();
-        else if (decode(s, doc_kind(coordinate), j.winner, &doc) != MD_STORE_OK) {
-            md_managed_store_discard_plaintext(doc);
-            doc = NULL;
-        }
-    }
+    int kind = doc_kind(coordinate);
+    bool ok = current(s) && load(s, coordinate, &j) &&
+        (!j.winner || decode(s, kind, j.winner, winner) == MD_STORE_OK) &&
+        (!j.draft || decode(s, kind, j.draft, draft) == MD_STORE_OK);
     dispose(&j);
-    return doc;
+    return ok;
+}
+
+static bool has_host_member(const json_t *list, const char *key) {
+    size_t i;
+    json_t *tag;
+    json_array_foreach(list, i, tag) {
+        const char *member = host_member(tag);
+        if (member && !strcmp(member, key)) return true;
+    }
+    return false;
 }
 
 struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const char *path) {
     MdManagedStore *s = open_store(binding, path, true);
     if (!s) return NULL;
-    json_t *hosts = read_cached_winner(s, MD_STORE_HOSTS);
-    json_t *meta = hosts ? read_cached_winner(s, MD_STORE_MANAGEMENT) : NULL;
-    json_t *favorites = meta ? read_cached_winner(s, MD_STORE_FAVORITES) : NULL;
-    json_t *recent = recents(s), *out = NULL;
+    json_t *hosts = NULL, *meta = NULL, *favorites = NULL;
+    json_t *draft_hosts = NULL, *draft_meta = NULL, *draft_favorites = NULL;
+    json_t *recent = NULL, *out = NULL;
     json_t *saved = json_object(), *seen = json_object();
-    if (!hosts || !meta || !favorites || !recent || !saved || !seen) goto done;
+    if (!saved || !seen ||
+        !read_cached_document(s, MD_STORE_HOSTS, &hosts, &draft_hosts) ||
+        !read_cached_document(s, MD_STORE_MANAGEMENT, &meta, &draft_meta) ||
+        !read_cached_document(s, MD_STORE_FAVORITES, &favorites, &draft_favorites) ||
+        !(recent = recents(s))) goto done;
     out = json_array();
     if (!out) goto done;
 
@@ -969,7 +979,8 @@ struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const cha
     json_t *v;
     json_array_foreach(hosts, i, v) {
         const char *key = host_member(v);
-        if (key && json_object_set(saved, key, json_true())) goto failed;
+        if (key && (!draft_hosts || has_host_member(draft_hosts, key)) &&
+            json_object_set(saved, key, json_true())) goto failed;
     }
     const char *const fields[] = {"label", "nip05", "relay_hints", "port", "requested_caps"};
     for (unsigned group = 0; group < 2; ++group) {
@@ -980,7 +991,10 @@ struct json_t *md_managed_store_quick_hosts(MdAccountBinding *binding, const cha
             /* The manager saves a metadata record for every reviewed pin.
              * A missing record may be a partial delete/replacement; never
              * reinterpret a formerly aliased host as a raw key. */
-            if (!json_is_object(record)) continue;
+            if (!json_is_object(record) ||
+                (draft_meta && !json_is_object(json_object_get(json_object_get(draft_meta, "hosts"), key))) ||
+                (draft_favorites && (!has_host_member(favorites, key) || !has_host_member(draft_favorites, key))))
+                continue;
             json_t *row = json_pack("{s:s,s:b}", "pubkey", key, "favorite", group == 0);
             if (!row) goto failed;
             if (json_array_append_new(out, row)) goto failed;
@@ -1000,8 +1014,11 @@ done:
     md_managed_store_discard_plaintext(meta);
     md_managed_store_discard_plaintext(favorites);
     md_managed_store_discard_plaintext(recent);
-    json_decref(saved);
-    json_decref(seen);
+    md_managed_store_discard_plaintext(draft_hosts);
+    md_managed_store_discard_plaintext(draft_meta);
+    md_managed_store_discard_plaintext(draft_favorites);
+    md_managed_store_discard_plaintext(saved);
+    md_managed_store_discard_plaintext(seen);
     md_managed_store_close(s);
     return out;
 }

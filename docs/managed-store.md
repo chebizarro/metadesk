@@ -73,8 +73,10 @@ edit; retry sends its original signed event, not a new replacement.
 The SDL client reads the committed cache using its own current client-role
 binding, whether started from the Linux manager or from the CLI. Quick connect
 shows saved favorites, then deduplicated local recents. A row needs both saved
-membership and a metadata record; incomplete edits and orphan favorites or
-recents do not make a host selectable. Opening the list and choosing a host
+membership and a metadata record. A pending Hosts, metadata or Favorites
+edit can hide an existing pin immediately: while the draft exists a key must
+be present in both the confirmed and draft versions of that document. A draft
+cannot add a selectable pin or change the connection data used for a pin. Opening the list and choosing a host
 read the cache on a worker without opening a management relay subscription or
 acquiring the writer lock. A signer that can decrypt the local cache is still
 required; offline cache access is not offline session establishment.
