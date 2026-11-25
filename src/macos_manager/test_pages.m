@@ -5,6 +5,7 @@
 #import "identity_page.h"
 #include "md_test.h"
 #include <stdatomic.h>
+#include <unistd.h>
 
 #define CHECK(x) do { MD_CHECK(x); if (md_test_failures) return NO; } while (0)
 #define KEY "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -125,7 +126,28 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     NSTextField *address=Field(view,@"Host npub");
     NSButton *review=Button(view,@"Review and Connect…");
     CHECK(address && review && !review.enabled);
+    NSString *config=[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
+    CHECK([NSFileManager.defaultManager createDirectoryAtPath:config withIntermediateDirectories:YES
+        attributes:@{NSFilePosixPermissions:@0700} error:NULL]);
+    NSString *prefs=[config stringByAppendingPathComponent:@"manager-relays.ini"];
+    NSString *corrupt=@"not a relay preferences file";
+    CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     [page activate]; CHECK(Await(^BOOL{ return review.enabled; }));
+    NSButton *refresh=Button(view,@"Save Relays and Refresh Address Book");
+    CHECK(Send(refresh) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    CHECK([corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
+    CHECK(Send(refresh) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    CHECK(EndSheet(window,NSAlertSecondButtonReturn));
+    CHECK(Await(^BOOL{ return refresh.enabled && !LabelContains(view,@"Could not read saved bootstrap"); }));
+    CHECK(![corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
+    CHECK([@"[relays]\nbootstrap=wss://fixture.invalid/;\n" writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    __block BOOL drained=NO;
+    [page suspendForRoleEdit:^{ drained=YES; }];
+    CHECK(Await(^BOOL{ return drained; }));
+    [page resumeAfterRoleEdit];
+    CHECK(Await(^BOOL{ return LabelContains(view,@"Relay sync is paused"); }));
+
     address.stringValue=@"  nostr:nsec1fixture-not-a-key";
     CHECK(Send(review));
     CHECK(!address.stringValue.length && LabelContains(view,@"Private keys are not host addresses"));
@@ -133,6 +155,9 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     [page reviewInput:@"ncryptsec1fixture-not-a-key" fromImage:YES];
     CHECK(!address.stringValue.length && !worker.resolves && !window.attachedSheet);
 
+    [page reviewInput:@"desk@example.invalid" fromImage:YES];
+    [page reviewInput:@KEY fromImage:YES];
+    CHECK(!worker.resolves && LabelContains(view,@"must contain an nprofile"));
     address.stringValue=@KEY;
     CHECK(Send(review) && !review.enabled && !worker.saves && !worker.launches);
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
@@ -214,10 +239,41 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
         CHECK(!open.enabled && !Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Remember Exact Grant").enabled && !Button(sheet,@"Deny").enabled);
         CHECK(EndSheet(window,NSAlertThirdButtonReturn+1) && link.commands.count==1);
     }
+    for (NSInteger busy=0; busy<2; ++busy) {
+        link.push(@"Fixture",Snapshot(8,all,now+60,NO),policy,nil,NO);
+        CHECK(Send(open) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+        sheet=window.attachedSheet.contentView;
+        CHECK(Button(sheet,@"Approve Once").enabled);
+        link.push(@"Fixture",Snapshot(busy ? 8 : 9,all,now+60,NO),policy,nil,busy!=0);
+        CHECK(!Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Remember Exact Grant").enabled && !Button(sheet,@"Deny").enabled);
+        CHECK(EndSheet(window,NSAlertSecondButtonReturn) && link.commands.count==1);
+    }
     return YES;
 }
 
-static atomic_uint connectCalls;
+static atomic_uint connectCalls, pairWrites;
+static int GetPair(void *unused,const char *key,char **payload) {
+    (void)unused; (void)key; *payload=NULL; return MD_CREDENTIAL_NOT_FOUND;
+}
+static int PutPair(void *unused,const char *key,const char *payload) {
+    (void)unused;
+    MdNip46Credentials *pair = NULL;
+    int rc = md_nip46_credentials_parse(payload,&pair);
+    if (!rc && !strcmp(key,OTHER) && !strcmp(pair->user_pubkey,OTHER) && !strcmp(pair->remote_pubkey,KEY))
+        atomic_fetch_add(&pairWrites,1);
+    else rc = MD_CREDENTIAL_INVALID;
+    md_nip46_credentials_free(pair);
+    return rc;
+}
+static int RemovePair(void *unused,const char *key) { (void)unused; (void)key; return 0; }
+@interface FixtureIdentity : MDIdentityPage
+@property(strong) NSURL *pairingFile;
+@end
+@implementation FixtureIdentity
+- (void)choosePairingFile:(NSWindow *)window completion:(void (^)(NSURL *))completion {
+    (void)window; completion(self.pairingFile);
+}
+@end
 static int FixtureKey(MdSigner *s,char **key) { (void)s; *key=strdup(KEY); return *key?0:MD_SIGNER_ERR_INTERNAL; }
 static int Connect(MdSignerType backend,const char *key,MdCredentialStore *store,MdSigner **out) {
     if (!store || strcmp(key,OTHER)) return MD_SIGNER_ERR_CONNECT;
@@ -225,11 +281,45 @@ static int Connect(MdSignerType backend,const char *key,MdCredentialStore *store
     atomic_fetch_add(&connectCalls,1);
     *out=md_signer_create_custom(backend,&ops,NULL); return *out?0:MD_SIGNER_ERR_INTERNAL;
 }
-static BOOL Identity(MDIdentityPage *page, NSString *directory, MdSignerType backend) {
-    CHECK(!MDIdentityAdd(directory,backend,@OTHER,@"Candidate").length);
-    NSButton *bind=Button(page.view,@"Use for Client");
+static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType backend) {
+    NSView *view=page.view;
+    NSWindow *window=view.window;
+    NSButton *bind=Button(view,@"Use for Client"), *add=Button(view,@"Add Signer Account…");
     CHECK(bind && !bind.enabled);
-    [page activate]; CHECK(Await(^BOOL{ return bind.enabled; }));
+    [page activate]; CHECK(Await(^BOOL{ return add.enabled; }));
+    CHECK(Send(add) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    NSView *form=window.attachedSheet.contentView;
+    NSPopUpButton *picker=(NSPopUpButton *)Find(form,^BOOL(NSView *v){ return [v isKindOfClass:NSPopUpButton.class]; });
+    NSTextField *key=Field(form,@"Public key"), *label=Field(form,@"Public label");
+    CHECK(picker && key && label && [picker selectItemWithTag:backend]);
+    key.stringValue=@OTHER; label.stringValue=@"Candidate";
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    CHECK(Await(^BOOL{ return bind.enabled && LabelContains(view,@"Public account added"); }));
+    CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"key"] isEqual:@OTHER]);
+    CHECK(Send(Button(view,@"Edit Label…")) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    label=Field(window.attachedSheet.contentView,@"Public account label"); CHECK(label);
+    label.stringValue=@"Renamed";
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    CHECK(Await(^BOOL{ return LabelContains(view,@"Public label saved"); }));
+    CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"label"] isEqual:@"Renamed"]);
+    if (backend==MD_SIGNER_NIP46) {
+        NSURL *file=[NSURL fileURLWithPath:[directory stringByAppendingPathComponent:@"fixture-pairing.json"]];
+        NSString *json=[NSString stringWithFormat:@"{\"version\":1,\"user_pubkey\":\"%s\",\"remote_pubkey\":\"%s\",\"client_secret\":\"%064d\",\"relays\":[\"wss://fixture.invalid/\"]}",OTHER,KEY,1];
+        CHECK([json writeToURL:file atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+        NSURL *link=[NSURL fileURLWithPath:[directory stringByAppendingPathComponent:@"fixture-link.json"]];
+        CHECK(!symlink(file.fileSystemRepresentation,link.fileSystemRepresentation));
+        page.pairingFile=link;
+        NSButton *pair=Button(view,@"Import Pairing…");
+        CHECK(Send(pair) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+        CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+        CHECK(Await(^BOOL{ return LabelContains(view,@"not a symbolic link"); }) && !atomic_load(&pairWrites));
+        page.pairingFile=file;
+        CHECK(Send(pair) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+        CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+        CHECK(Await(^BOOL{ return LabelContains(view,@"Pairing saved in Keychain"); }));
+        CHECK(atomic_load(&pairWrites)==1 && ![MDIdentityAccounts(directory,NULL).firstObject[@"client"] boolValue]);
+        CHECK(!unlink(link.fileSystemRepresentation) && !unlink(file.fileSystemRepresentation));
+    }
     CHECK(Send(bind));
     CHECK(!bind.enabled);
     CHECK(Await(^BOOL{ return bind.enabled && LabelContains(page.view,@"different public key"); }));
@@ -267,12 +357,15 @@ static BOOL Run(NSString *directory) {
     MDLocalHostPages *access=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) {
         link.push=update; return link;
     }];
-    MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:directory connect:Connect credentials:^{ return md_credential_store_memory(); }];
+    FixtureIdentity *identity=[[FixtureIdentity alloc] initWithHosts:hosts directory:directory connect:Connect credentials:^{
+        static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
+        return md_credential_store_custom(&ops,NULL);
+    }];
     NSWindow *hostWindow=TestWindow(hosts.view), *accessWindow=TestWindow(access.accessView), *identityWindow=TestWindow(identity.view);
     FixtureApp *app=[[FixtureApp alloc] initWithHosts:hosts local:access identity:identity];
     CHECK(Hosts(hosts,worker,hostWindow) && Access(access,link,accessWindow));
-    MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F :
-        MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 : MD_SIGNER_NIP55L;
+    MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
+        MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F : MD_SIGNER_NIP55L;
     if (MDIdentitySupportsBackend(backend)) CHECK(Identity(identity,directory,backend));
     else puts("SKIP: no compiled external signer adapter for the Identity action fixture");
     CHECK(Quit(app,hosts,worker,link,hostWindow));
@@ -282,6 +375,13 @@ static BOOL Run(NSString *directory) {
 int main(int argc,char **argv) {
     @autoreleasepool {
         MD_CHECK(argc==2);
+        CFDictionaryRef session=CGSessionCopyCurrentDictionary();
+        if (!session || CGMainDisplayID()==kCGNullDirectDisplay) {
+            if (session) CFRelease(session);
+            puts("SKIP: no WindowServer session for the AppKit controller fixture");
+            return 77;
+        }
+        CFRelease(session);
         if (argc==2) Run(@(argv[1]));
         return md_test_report();
     }

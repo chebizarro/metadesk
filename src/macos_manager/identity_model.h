@@ -16,9 +16,11 @@ NSString *MDIdentityBind(NSString *directory, MdCredentialStore *store, MdAccoun
 BOOL MDIdentitySupportsBackend(MdSignerType backend);
 NSString *MDIdentityAdd(NSString *directory, MdSignerType backend, NSString *publicKey, NSString *label);
 NSString *MDIdentityLabel(NSString *directory, NSDictionary *account, NSString *label);
-/* Borrowed single-line JSON, including its NUL terminator. Caller wipes it on
+/* Borrowed JSON bytes, including their NUL terminator. Caller wipes it on
  * every path. This only imports transport credentials; it does not bind a role. */
 enum { MDIdentityPairingMax = 65536 };
 NSString *MDIdentityImportPairing(NSString *directory, MdCredentialStore *store, NSDictionary *account,
     const char *json, size_t length, MDIdentityCancelled cancelled, void *context);
+NSString *MDIdentityImportPairingFile(NSString *directory, MdCredentialStore *store, NSDictionary *account,
+    NSURL *url, MDIdentityCancelled cancelled, void *context);
 NSString *MDIdentityRemove(NSString *directory, MdCredentialStore *store, NSDictionary *account);

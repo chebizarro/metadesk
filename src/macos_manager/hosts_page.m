@@ -130,7 +130,7 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     MDHostsBook *_book;
     MDHostsLaunch *_launch;
     atomic_bool _closing, _dirty, _wakeQueued;
-    BOOL _busy, _launched, _started, _roleEditing;
+    BOOL _busy, _launched, _started, _roleEditing, _syncPaused;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
     NSString *_lastOwner, *_savedBootstrap;
@@ -298,6 +298,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _status.stringValue = _book.status ?: @"Opening the address book…";
     _refresh.enabled = !_roleEditing && !_busy && !self.closing;
     _relays.enabled = _refresh.enabled;
+    if (_syncPaused && _savedBootstrap.length)
+        _status.stringValue = [_status.stringValue stringByAppendingString:@"\nRelay sync is paused. Select Save Relays and Refresh Address Book to resume."];
     if (_roleEditing) _status.stringValue=@"Reloading the client role…";
     _review.enabled = !_busy && !_launched && _book.canReview;
     _scan.enabled = _review.enabled;
@@ -386,22 +388,46 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [self reloadBook:YES];
 }
 - (void)reloadBook:(BOOL)refresh {
+    [self reloadBook:refresh replaceUnreadable:NO];
+}
+- (void)reloadBook:(BOOL)refresh replaceUnreadable:(BOOL)replace {
     if (_busy || _roleEditing || self.closing) return;
-    ++_generation;
-    NSString *edit = refresh && ![_relays.stringValue isEqual:_savedBootstrap] ? _relays.stringValue : nil;
+    NSUInteger generation = ++_generation;
+    NSString *draft = _relays.stringValue;
+    BOOL edited = ![draft isEqual:_savedBootstrap ?: @""];
     NSString *directory = MDHostTrim(_directory.stringValue);
     _error.stringValue = @"";
     [self run:^id(MDHostsWorker *worker) {
         NSString *configError = nil, *cacheError = nil;
-        NSString *relays = MDHostsBootstrap(edit, &configError);
+        NSString *saved = MDHostsBootstrap(nil, &configError);
+        if (self.closing) return nil;
+        BOOL needsConfirmation = refresh && !saved && !replace;
+        NSString *relays = saved;
+        if (refresh && ((saved && edited) || (!saved && replace))) {
+            configError = nil;
+            relays = MDHostsBootstrap(draft, &configError);
+        }
         if (self.closing) return nil;
         BOOL opened = [worker openDirectory:directory error:&cacheError];
-        if (opened && relays && refresh && !self.closing && ![worker startRelays:relays])
+        BOOL syncing = opened && relays && refresh && !self.closing && [worker startRelays:relays];
+        if (opened && relays && refresh && !syncing)
             cacheError = @"Could not configure address book relays. Cached data remains available.";
-        return @[relays ?: NSNull.null, configError ?: cacheError ?: @""];
+        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing)];
     } done:^(NSArray *result) {
         if (result[0] != NSNull.null) self->_relays.stringValue = self->_savedBootstrap = result[0];
+        self->_syncPaused = [result[3] boolValue];
         self->_error.stringValue = result[1];
+        [self render];
+        NSWindow *window = self.view.window;
+        if (![result[2] boolValue] || !window || window.attachedSheet) return;
+        NSAlert *alert = Alert(@"Replace Unreadable Relay Preferences?",
+            @"The saved preferences could not be read. Replace them with the choices currently shown? An empty field removes all choices.");
+        [alert addButtonWithTitle:@"Keep Existing File"];
+        [alert addButtonWithTitle:@"Replace Preferences"];
+        [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertSecondButtonReturn && generation == self->_generation)
+                [self reloadBook:YES replaceUnreadable:YES];
+        }];
     }];
 }
 - (void)reviewEntry:(id)sender {
@@ -413,6 +439,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     BOOL rejected = [self rejectSecret:_address input:input];
     rejected |= [self rejectSecret:_route input:MDClassifyHostInput(_route.stringValue)];
     if (rejected) return;
+    if (fromImage) {
+        address = MDHostQRProfile(address);
+        if (!address) { _error.stringValue = @"The QR code must contain an nprofile."; return; }
+        input = MDHostPublic;
+    }
     if (input != MDHostPublic && input != MDHostName) {
         _error.stringValue = @"Enter an npub, nprofile, lowercase public key or NIP-05 name. An IP address is only a route hint."; return;
     }

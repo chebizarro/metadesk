@@ -26,7 +26,7 @@ static NSTextField *Entry(NSString *label, NSString *value) {
     [field.widthAnchor constraintEqualToConstant:400].active = YES;
     return field;
 }
-@interface MDIdentityPage () <NSTextFieldDelegate> {
+@interface MDIdentityPage () {
     MDHostsPage *_hosts;
     NSString *_directory;
     MDIdentityConnect _connectSigner;
@@ -218,55 +218,35 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         }];
     }];
 }
+- (void)choosePairingFile:(NSWindow *)window completion:(void (^)(NSURL *))completion {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.resolvesAliases = NO;
+    [panel beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        completion(response == NSModalResponseOK ? panel.URL : nil);
+    }];
+}
 - (void)importPairing:(id)sender {
     (void)sender;
     NSDictionary *account=self.selected;
     NSWindow *window = [self sheetWindow];
     if (!window || !_pair.enabled || !account) return;
-    NSSecureTextField *entry = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0,0,400,24)];
-    entry.accessibilityLabel = @"Saved pairing JSON";
-    entry.delegate = self;
     NSAlert *alert = [NSAlert new]; alert.messageText = @"Import Saved NIP-46 Pairing";
-    alert.informativeText = [NSString stringWithFormat:@"Enter the single-line pairing JSON from your trusted signer for this public key:\n%@\n\nThis replaces any saved pairing for this account in Keychain. It does not bind a role or import a signing key. Do not use the clipboard.", MDHostNpub(account[@"key"])];
-    alert.accessoryView = entry;
-    [alert addButtonWithTitle:@"Import into Keychain"]; [alert addButtonWithTitle:@"Cancel"];
-    alert.window.initialFirstResponder = entry;
+    alert.informativeText = [NSString stringWithFormat:@"Choose a saved pairing JSON file from your trusted signer for:\n%@\n\nThis replaces the Keychain pairing, not the signing key or role. The selected file contains credentials and will not be deleted or modified.", MDHostNpub(account[@"key"])];
+    [alert addButtonWithTitle:@"Choose Pairing File…"]; [alert addButtonWithTitle:@"Cancel"];
     [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
-        NSMutableData *input = nil;
-        if (result==NSAlertFirstButtonReturn && !self->_closed && !self->_busy) {
-            NSString *value = entry.stringValue;
-            if (value.length && value.length <= MDIdentityPairingMax) {
-                NSUInteger bytes = [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-                if (bytes && bytes <= MDIdentityPairingMax) {
-                    input = [NSMutableData dataWithLength:bytes + 1];
-                    if (![value getCString:input.mutableBytes maxLength:input.length encoding:NSUTF8StringEncoding]) {
-                        md_credential_wipe(input.mutableBytes,input.length); input = nil;
-                    }
-                }
-            }
-        }
-        entry.stringValue = @"";
         if (result!=NSAlertFirstButtonReturn || self->_closed || self->_busy) return;
-        if (!input) { self->_status.stringValue=@"Enter saved pairing JSON (up to 64 KiB)."; return; }
-        [self run:@"Importing pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
-            MdCredentialStore *store=self->_credentials();
-            NSString *error=MDIdentityImportPairing(self->_directory,store,account,input.bytes,input.length,Cancelled,(__bridge void *)self);
-            md_credential_wipe(input.mutableBytes,input.length);
-            md_credential_store_destroy(store);
-            return error.length ? error : @"Pairing saved in Keychain. Verify the signer before assigning a role.";
+        [self choosePairingFile:window completion:^(NSURL *url) {
+            if (!url || self->_closed || self->_busy) return;
+            [self run:@"Importing pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
+                MdCredentialStore *store=self->_credentials();
+                NSString *error=MDIdentityImportPairingFile(self->_directory,store,account,url,Cancelled,(__bridge void *)self);
+                md_credential_store_destroy(store);
+                return error.length ? error : @"Pairing saved in Keychain. Verify the signer before assigning a role.";
+            }];
         }];
     }];
-}
-- (void)controlTextDidBeginEditing:(NSNotification *)note {
-    if (![note.object isKindOfClass:NSSecureTextField.class]) return;
-    NSTextView *editor = (NSTextView *)[note.object currentEditor];
-    editor.allowsUndo = NO;
-}
-- (BOOL)control:(NSControl *)control textView:(NSTextView *)view doCommandBySelector:(SEL)selector {
-    (void)view;
-    return [control isKindOfClass:NSSecureTextField.class] &&
-        (selector==@selector(copy:) || selector==@selector(cut:) || selector==@selector(paste:) ||
-         selector==@selector(pasteAsPlainText:) || selector==@selector(pasteAsRichText:));
 }
 - (void)remove:(id)sender {
     (void)sender; NSDictionary *account=self.selected;

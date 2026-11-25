@@ -31,7 +31,8 @@ is resolved beside the manager executable, inside its bundle, then on `PATH`.
    **Save Relays and Refresh Address Book** to sync. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
    `~/.config/metadesk`). The app loads the selection on entry but does not sync
-   until you refresh. Clear the field and refresh to remove all choices; none
+   until you refresh, including after a client-role change. Replacing unreadable
+preferences requires confirmation. Clear the field and refresh to remove all choices; none
    is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name. Enter
    an IPv4 or IPv6 address only as a route hint for the reviewed key. Verify the
@@ -39,7 +40,7 @@ is resolved beside the manager executable, inside its bundle, then on `PATH`.
    or connecting. A changed NIP-05 pin blocks connection. Keep the old key, or
    verify the new one with the host and type its exact fingerprint to replace
    it. Review again before connecting. **Scan QR Image** reads one QR code from
-   a local image and sends its payload through the same review as typed text.
+   a local image, accepts only a valid public `nprofile`, and sends it through the same review as typed text.
    `nsec` and `ncryptsec` are cleared and refused, including when scanned. No
    camera or camera permission is used.
 3. Filter saved hosts by text or tag. Edit labels, notes, favorites and tag
@@ -128,8 +129,10 @@ Keychain backend restores saved NIP-46 pairing without a prompt; unlock Keychain
 externally if needed. Removing a signer account removes its assignments and any
 Metadesk-held pairing, never the external signer's key. To restore an already
 paired remote signer, select its saved public NIP-46 account and use **Import
-Pairing**. Enter the single-line [pairing JSON](accounts.md#headless-cli) from a
-trusted source in the masked field, without using the clipboard. The pairing
+Pairing**. Choose a trusted [pairing JSON](accounts.md#headless-cli) file (regular
+file, at most 64 KiB; symbolic links are refused). Metadesk reads it on a worker,
+wipes its read buffer after use, and does not modify or delete the source file.
+Protect that file as a credential. The pairing
 must match the selected public key. It replaces the account's Keychain pairing
 without binding a role; role assignment still requires live verification.
 Create and manage signing keys only in the external signer.
@@ -165,5 +168,5 @@ The `macos_manager` suite drives the AppKit controllers off-screen with
 fixture models: host trust and pin replacement, access defaults and stale
 requests, wrong-key signer refusal, and quit while a worker is active. It uses
 no synthetic input or permissions. The separate `account_keychain` test uses
-an explicit private file Keychain, not the login Keychain or its search list.
+an explicit private file Keychain and checks it never appears in the search list.
 Neither fixture qualifies the signed or on-screen workflows above.

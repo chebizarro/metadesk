@@ -7,8 +7,7 @@
 
 #define CHECK(x) do { MD_CHECK(x); if (md_test_failures) return md_test_report(); } while (0)
 
-static BOOL WriteQR(NSString *value, NSURL *file) {
-    CGImageRef image = MDCreateHostQR(value);
+static BOOL WriteImage(CGImageRef image, NSURL *file) {
     if (!image) return NO;
     CGImageDestinationRef png = CGImageDestinationCreateWithURL((__bridge CFURLRef)file, CFSTR("public.png"), 1, NULL);
     BOOL ok = NO;
@@ -17,7 +16,39 @@ static BOOL WriteQR(NSString *value, NSURL *file) {
         ok = CGImageDestinationFinalize(png);
         CFRelease(png);
     }
-    CGImageRelease(image);
+    return ok;
+}
+static BOOL WriteQR(NSString *value, NSURL *file) {
+    CGImageRef image = MDCreateHostQR(value);
+    BOOL ok = WriteImage(image,file);
+    if (image) CGImageRelease(image);
+    return ok;
+}
+static BOOL WriteCanvas(NSString *value, BOOL two, size_t width, size_t height, NSURL *file) {
+    CGImageRef qr = MDCreateHostQR(value);
+    if (!qr) return NO;
+    CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+    CGContextRef canvas = CGBitmapContextCreate(NULL,width,height,8,0,gray,(CGBitmapInfo)kCGImageAlphaNone);
+    BOOL ok = NO;
+    if (canvas) {
+        CGContextSetGrayFillColor(canvas,1,1);
+        CGContextFillRect(canvas,CGRectMake(0,0,width,height));
+        CGFloat size=CGImageGetWidth(qr);
+        CGContextDrawImage(canvas,CGRectMake(0,0,size,size),qr);
+        if (two) {
+            CGImageRef other=MDCreateHostQR(@"desk@example.invalid");
+            if (other) {
+                CGContextDrawImage(canvas,CGRectMake(width-size,0,size,size),other);
+                CGImageRelease(other);
+            }
+        }
+        CGImageRef image=CGBitmapContextCreateImage(canvas);
+        ok=WriteImage(image,file);
+        if (image) CGImageRelease(image);
+        CGContextRelease(canvas);
+    }
+    CGColorSpaceRelease(gray);
+    CGImageRelease(qr);
     return ok;
 }
 
@@ -49,6 +80,14 @@ int main(int argc, char **argv) {
         CHECK(WriteQR(profile, file));
         NSString *scan = MDReadHostQR(file);
         CHECK([scan isEqual:profile] && MDClassifyHostInput(scan) == MDHostPublic);
+        CHECK([MDHostQRProfile([@"nostr:" stringByAppendingString:scan]) isEqual:profile]);
+        CHECK(!MDHostQRProfile(@"desk@example.invalid") && !MDHostQRProfile(@"nprofile1invalid") &&
+              !MDHostQRProfile(MDHostNpub(@"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")));
+        NSURL *multi=[root URLByAppendingPathComponent:@"multi.png"];
+        CHECK(WriteCanvas(profile,YES,800,300,multi) && !MDReadHostQR(multi));
+        CHECK(WriteCanvas(profile,NO,800,300,multi) && [MDReadHostQR(multi) isEqual:profile]);
+        CHECK(WriteCanvas(profile,NO,8193,300,multi) && !MDReadHostQR(multi));
+        CHECK(WriteCanvas(profile,NO,6000,6000,multi) && !MDReadHostQR(multi));
         NSURL *secret = [root URLByAppendingPathComponent:@"secret-marker.png"];
         CHECK(WriteQR(@"nostr:nsec1fixture-not-a-key", secret));
         CHECK(MDClassifyHostInput(MDReadHostQR(secret)) == MDHostSecret);

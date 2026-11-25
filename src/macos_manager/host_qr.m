@@ -113,3 +113,14 @@ NSString *MDReadHostQR(NSURL *url) {
     if (value.length > MD_MANAGED_ADDRESS_MAX || [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > MD_MANAGED_ADDRESS_MAX) return nil;
     return value;
 }
+
+NSString *MDHostQRProfile(NSString *payload) {
+    if (MDClassifyHostInput(payload) != MDHostPublic) return nil;
+    NSString *value = MDHostTrim(payload);
+    if ([value hasPrefix:@"nostr:"]) value = [value substringFromIndex:6];
+    if (![value hasPrefix:@"nprofile1"]) return nil;
+    NostrProfilePointer *profile = NULL;
+    BOOL valid = !nostr_nip19_decode_nprofile(value.UTF8String, &profile) && profile;
+    if (profile) nostr_profile_pointer_free(profile);
+    return valid ? value : nil;
+}

@@ -2,6 +2,10 @@
 #import "hosts_model.h"
 #include "fips_control.h"
 #include "fips_addr.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <nostr/nip19/nip19.h>
 
 static NSString *AccountID(const MdAccount *a) {
@@ -167,6 +171,35 @@ NSString *MDIdentityImportPairing(NSString *directory, MdCredentialStore *store,
     md_accounts_destroy(a);
     md_nip46_credentials_free(credential);
     return rc ? MDIdentityError(rc,MD_SIGNER_NIP46) : @"";
+}
+NSString *MDIdentityImportPairingFile(NSString *directory, MdCredentialStore *store, NSDictionary *account,
+    NSURL *url, MDIdentityCancelled cancelled, void *context) {
+    NSString *invalid = @"Choose a nonempty regular pairing JSON file (up to 64 KiB), not a symbolic link.";
+    if (!url.isFileURL) return invalid;
+    int fd = open(url.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return invalid;
+    struct stat st;
+    char *buffer = NULL;
+    const size_t capacity = MDIdentityPairingMax + 1;
+    if (!fstat(fd,&st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= MDIdentityPairingMax)
+        buffer = malloc(capacity);
+    size_t used = 0;
+    BOOL complete = NO;
+    if (buffer) while (used < capacity) {
+        ssize_t n = read(fd,buffer+used,capacity-used);
+        if (n < 0 && errno == EINTR) continue;
+        if (!n) complete = YES;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close(fd);
+    NSString *result = invalid;
+    if (complete && used) {
+        buffer[used] = 0;
+        result = MDIdentityImportPairing(directory,store,account,buffer,used+1,cancelled,context);
+    }
+    if (buffer) { md_credential_wipe(buffer,capacity); free(buffer); }
+    return result;
 }
 NSString *MDIdentityRemove(NSString *directory, MdCredentialStore *store, NSDictionary *account) {
     NSString *key = account[@"key"];
