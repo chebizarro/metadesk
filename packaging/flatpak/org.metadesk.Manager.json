@@ -40,6 +40,7 @@
       "post-install": ["install -Dm644 COPYING /app/share/licenses/metadesk/libqrencode-COPYING"],
       "sources": [{
         "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://codeload.github.com/fukuchi/libqrencode/tar.gz/refs/tags/v4.1.1",
         "sha256": "5385bc1b8c2f20f3b91d258bf8ccc8cf62023935df2d2676b5b67049f31a049c"
       }]
@@ -56,6 +57,7 @@
       "post-install": ["install -Dm644 COPYING /app/share/licenses/metadesk/zbar-COPYING"],
       "sources": [{
         "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://codeload.github.com/mchehab/zbar/tar.gz/refs/tags/0.23.93",
         "sha256": "212dfab527894b8bcbcc7cd1d43d63f5604a07473d31a5f02889e372614ebe28"
       }]
