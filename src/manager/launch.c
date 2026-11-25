@@ -23,6 +23,10 @@ static gboolean read_status(int fd, GIOCondition condition, gpointer data) {
             launch->status(msg, launch->data);
             continue;
         }
+        if (msg >= MD_LAUNCH_RELAY_AUTH) {
+            if (!launch->final) launch->status(msg, launch->data);
+            continue;
+        }
         if (msg >= MD_LAUNCH_CANCEL) { errno = EPROTO; rc = -1; break; }
         if (launch->final) continue;
         launch->final = msg >= MD_LAUNCH_CONNECTED;

@@ -106,7 +106,7 @@ bool md_managed_launch_read(int fd, MdManagedLaunch *out) {
 }
 
 bool md_managed_launch_message_write(int fd, MdLaunchMessage msg) {
-    if (msg < MD_LAUNCH_RESOLVE || msg > MD_LAUNCH_ENDED) return false;
+    if (msg < MD_LAUNCH_RESOLVE || msg > MD_LAUNCH_RELAY_REJECTED) return false;
     unsigned char wire[] = {MD_MANAGED_LAUNCH_VERSION, (unsigned char)msg};
     return send_packet(fd, wire, sizeof(wire));
 }
@@ -117,7 +117,7 @@ int md_managed_launch_message_read(int fd, MdLaunchMessage *out, bool nonblockin
     ssize_t n = receive_packet(fd, wire, sizeof(wire), nonblocking ? MSG_DONTWAIT : 0);
     if (n <= 0) return (int)n;
     if (n != sizeof(wire) || wire[0] != MD_MANAGED_LAUNCH_VERSION ||
-        wire[1] < MD_LAUNCH_RESOLVE || wire[1] > MD_LAUNCH_ENDED) {
+        wire[1] < MD_LAUNCH_RESOLVE || wire[1] > MD_LAUNCH_RELAY_REJECTED) {
         errno = EPROTO;
         return -1;
     }

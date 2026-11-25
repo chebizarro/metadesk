@@ -203,6 +203,8 @@ typedef struct {
     void *owner_userdata;
     /* Terminal DM inbox refusal; URL and reason are borrowed for this call. */
     void (*on_dm_relay_unavailable)(const char *url, const char *reason, void *userdata);
+    /* Optional signaling diagnostics for every CLOSED, including AUTH recovery. */
+    void (*on_dm_relay_closed)(const char *reason, void *userdata);
     /* Management-only connection changes and wire OK diagnostics. */
     void (*on_document_route)(void *userdata);
     void (*on_document_ok)(const char *relay, const char *id, bool ok, const char *reason, void *userdata);

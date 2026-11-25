@@ -22,6 +22,8 @@ static int fixture(int argc, char **argv) {
     g_assert_cmpint(config.capabilities, ==, MD_CAP_VIDEO);
     g_assert_cmpuint(config.relay_count, ==, 1);
     g_assert_cmpstr(config.relays[0], ==, "ws://127.0.0.1:9999");
+    for (unsigned i = 0; i < 40; ++i)
+        g_assert_true(md_managed_launch_message_write(3, MD_LAUNCH_RELAY_REJECTED));
     g_assert_true(md_managed_launch_message_write(3, MD_LAUNCH_RESOLVE));
     MdLaunchMessage msg;
     g_assert_cmpint(md_managed_launch_message_read(3, &msg, false), ==, 1);
@@ -33,11 +35,13 @@ static int fixture(int argc, char **argv) {
 typedef struct { GMainLoop *loop; MdManagerLaunch *launch; unsigned count; } Check;
 static void status(MdLaunchMessage msg, gpointer data) {
     Check *check = data;
-    if (++check->count == 1) {
+    if (++check->count <= 40) {
+        g_assert_cmpint(msg, ==, MD_LAUNCH_RELAY_REJECTED);
+    } else if (check->count == 41) {
         g_assert_cmpint(msg, ==, MD_LAUNCH_RESOLVE);
         g_assert_true(md_manager_launch_cancel(check->launch));
     } else {
-        g_assert_cmpuint(check->count, ==, 2);
+        g_assert_cmpuint(check->count, ==, 42);
         g_assert_cmpint(msg, ==, MD_LAUNCH_CANCELLED);
         g_main_loop_quit(check->loop);
     }
@@ -61,7 +65,7 @@ int main(int argc, char **argv) {
     close(17);
     if (dummy != 17) close(dummy);
     g_main_loop_run(check.loop);
-    g_assert_cmpuint(check.count, ==, 2);
+    g_assert_cmpuint(check.count, ==, 42);
     md_manager_launch_free(check.launch);
     g_main_loop_unref(check.loop);
     return 0;

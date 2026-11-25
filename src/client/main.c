@@ -150,7 +150,7 @@ static void *watch_launch(void *unused) {
             launch_cancelled = true;
             g_running = 0;
             go_channel_close(g_shutdown_ch);
-            if (!launch_active && rc == 1)
+            if (!launch_active)
                 launch_cancel_reported = md_managed_launch_message_write(launch_fd, MD_LAUNCH_CANCELLED);
         }
         pthread_mutex_unlock(&launch_mu);
@@ -391,6 +391,20 @@ static void on_dm_relay_unavailable(const char *url, const char *reason, void *d
     atomic_compare_exchange_strong(&ctx->connection_status, &expected,
                                    "Relay unavailable: DM inbox subscription refused");
 }
+
+#ifdef __linux__
+static bool auth_required(const char *reason) {
+    return reason && !strncmp(reason, "auth-required:", 14);
+}
+static void report_relay_closed(const char *reason, void *data) {
+    (void)data;
+    launch_status(auth_required(reason) ? MD_LAUNCH_RELAY_AUTH : MD_LAUNCH_RELAY_CLOSED);
+}
+static void report_relay_publish(const char *id, bool ok, const char *reason, void *data) {
+    (void)id; (void)data;
+    if (!ok) launch_status(auth_required(reason) ? MD_LAUNCH_RELAY_AUTH : MD_LAUNCH_RELAY_REJECTED);
+}
+#endif
 
 /* ── Usage ───────────────────────────────────────────────────── */
 
@@ -1496,6 +1510,12 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         nostr_cbs.on_dm = on_session_dm;
         nostr_cbs.on_dm_relay_unavailable = on_dm_relay_unavailable;
         nostr_cbs.dm_userdata = &ctx;
+#ifdef __linux__
+        if (launch) {
+            nostr_cbs.on_dm_relay_closed = report_relay_closed;
+            nostr_cbs.on_publish_result = report_relay_publish;
+        }
+#endif
 
         MdNostrConfig nostr_cfg = {
             .signer = signer,

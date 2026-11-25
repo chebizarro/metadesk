@@ -1383,6 +1383,7 @@ static void scoped_inbox_state(NostrPoolSubscription *sub, NostrRelay *relay,
         info->frame.connection_generation != nostr_relay_get_connection_generation(relay)) return;
     const char *url = nostr_relay_get_url_const(relay);
     MD_LOG_W("DM inbox CLOSED on %s: %s", url, reason ? reason : "(no reason)");
+    if (n->cbs.on_dm_relay_closed) n->cbs.on_dm_relay_closed(reason, n->cbs.dm_userdata);
     if (info->recovery != NOSTR_POOL_RECOVERY_AWAIT_AUTH &&
         info->recovery != NOSTR_POOL_RECOVERY_BACKOFF && n->cbs.on_dm_relay_unavailable)
         n->cbs.on_dm_relay_unavailable(url, reason, n->cbs.dm_userdata);

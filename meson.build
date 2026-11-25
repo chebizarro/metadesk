@@ -916,10 +916,15 @@ if host_os == 'linux' or host_os == 'darwin'
   if get_option('signer_nip5f')
     if get_option('manager') and host_os == 'linux' and manager_dbus.found() and manager_xvfb.found()
       manager_hosts_test = executable('test_manager_hosts', 'tests/test_manager_hosts.c', dependencies : dep_manager_ui)
-      test('manager-hosts-offline', manager_python,
-        args : [files('tests/run_manager_ui.py'), manager_dbus.full_path(), manager_xvfb.full_path(),
-                manager_python.full_path(), files('tests/test_manager_hosts.py'), manager_hosts_test,
-                access_signer_fixture], suite : 'manager', timeout : 45)
+      manager_xdotool = find_program('xdotool', required : false)
+      if manager_xdotool.found()
+        test('manager-hosts-offline', manager_python,
+          args : [files('tests/run_manager_ui.py'), manager_dbus.full_path(), manager_xvfb.full_path(),
+                  manager_python.full_path(), files('tests/test_manager_hosts.py'), manager_hosts_test,
+                  access_signer_fixture], suite : 'manager', timeout : 60)
+      else
+        message('Skipping manager-hosts-offline: native keyboard test requires xdotool')
+      endif
     endif
     test('access_cli private relay', accounts_python,
       args : [files('tests/test_access_cli.py'), metadesk_host, access_signer_fixture],
@@ -1008,6 +1013,14 @@ endif
 if enable_client and host_os == 'linux'
   test('client private managed launch', accounts_python,
     args : [files('tests/test_managed_launch.py'), metadesk_client], timeout : 45)
+  launch_xvfb = find_program('xvfb-run', required : false)
+  launch_dbus = find_program('dbus-run-session', required : false)
+  if enable_nip5f and launch_xvfb.found() and launch_dbus.found()
+    test('client managed launch cancellation with private display', accounts_python,
+      args : [files('tests/run_manager_ui.py'), launch_dbus.full_path(), launch_xvfb.full_path(),
+              accounts_python.full_path(), files('tests/test_managed_launch.py'), metadesk_client,
+              access_signer_fixture], timeout : 45)
+  endif
 endif
 
 # Opt-in private-keyring + disposable-netns end-to-end access/session gate (md-pss).
