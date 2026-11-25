@@ -124,6 +124,11 @@ load closure when unused; consult the actual bundle manifest, not this input
 list. The builder retains source archives, build/config logs, toolchain and
 root upstream legal texts; the app stages those legal texts, the lock file,
 this notice, metadesk's license and ImGui's license under Resources.
+`Metadesk Manager.app` carries its own copy of the reviewed private closure
+for the manager and its companion client, with the same legal texts. The
+release adapter measures both bundles from the mounted DMG and verifies
+source offers for each (including the shared FFmpeg source attachment).
+The manager does not introduce a GLib runtime dependency.
 Corresponding-source release publication, attribution UI, Developer ID and
 notarization are still publisher gates; shipping this table is not sufficient.
 

@@ -33,7 +33,7 @@ if [[ -n ${APPLE_CERTIFICATE:-} && -n ${APPLE_CERTIFICATE_PASSWORD:-} && -n ${AP
     MD_CODESIGN_IDENTITY=$APPLE_SIGN_IDENTITY
     signing='Developer ID + notarized'
 else
-    echo 'Complete signing/notarization credentials unavailable: unsigned DMG with ad-hoc app signature.'
+    echo 'Complete signing/notarization credentials unavailable: unsigned DMG with ad-hoc app signatures.'
 fi
 unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_NOTARY_KEY
 # Do not export notarization identifiers to the dependency build environment.
@@ -54,22 +54,34 @@ if [[ $signing != ad-hoc ]]; then
 fi
 
 hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$upload/$name"
-app=$mountpoint/Metadesk.app
-MD_MACOS_MIN=13.0 packaging/macos/verify-app.sh "$app"
-reject_codecs "$app/Contents/Frameworks"
 deps=$MD_RELEASE_DEPS_DIR
-fw=$app/Contents/Frameworks
-# Enumerate the actual on-disk DMG libraries, not the producer prefix.
-clang -I"$deps/prefix/include" packaging/ffmpeg/verify-codecs.c \
-    "$fw"/libavcodec.*.dylib "$fw"/libavutil.*.dylib -Wl,-rpath,"$fw" -o "$work/verify-codecs"
 copy_ffmpeg_records "$deps/build/ffmpeg" "$work/ffmpeg-records"
-"$work/verify-codecs" h264_videotoolbox | tee "$work/ffmpeg-records/codec-inventory.txt"
+for bundle in Metadesk.app 'Metadesk Manager.app'; do
+    app=$mountpoint/$bundle
+    # Also exercises the Manager's real AppKit launch and quit from the mounted image.
+    MD_MACOS_MIN=13.0 packaging/macos/verify-app.sh "$app"
+    fw=$app/Contents/Frameworks
+    reject_codecs "$fw"
+    # Enumerate both copies from the mounted DMG, not the producer prefix.
+    clang -I"$deps/prefix/include" packaging/ffmpeg/verify-codecs.c \
+        "$fw"/libavcodec.*.dylib "$fw"/libavutil.*.dylib -Wl,-rpath,"$fw" -o "$work/verify-codecs"
+    { printf '%s\n' "$bundle"; "$work/verify-codecs" h264_videotoolbox; } |
+        tee -a "$work/ffmpeg-records/codec-inventory.txt"
+done
 cp "$deps/toolchain.txt" "$deps/deps.lock.json" "$work/ffmpeg-records/"
 pin=$(jq -ce '.[] | select(.name=="ffmpeg")' "$deps/deps.lock.json")
 archive=$(jq -er .archive <<< "$pin")
 mkdir -p "$MD_DEPS_DOWNLOADS"
 locked_download "$pin" "$MD_DEPS_DOWNLOADS/$archive"
 ffmpeg_receipt "$MD_DEPS_DOWNLOADS/$archive" "$work/ffmpeg-records" "$deps/licenses/ffmpeg" "$name"
-jq --slurpfile pins "$deps/deps.lock.json" '. + {pins:$pins[0]}' \
-    "$app/Contents/Resources/metadesk-bundle.json" > "$work/inventory.json"
+python3 packaging/macos/measure_dmg.py "$mountpoint" "$deps/deps.lock.json" > "$work/inventory.json"
+# Enforce existing reviewed routes on the measured payload before recording it.
+PYTHONPATH=packaging/release python3 - "$work/inventory.json" "$name" <<'PY'
+import json
+from pathlib import Path
+import sys
+from source_offers import verify
+inventory = json.loads(Path(sys.argv[1]).read_text())
+verify({'platform': 'dmg', 'inventory': inventory}, None, sys.argv[2] + '.ffmpeg-source.tar.gz')
+PY
 record_asset "$name" dmg arm64 "$signing" "$work/inventory.json"

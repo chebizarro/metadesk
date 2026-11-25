@@ -196,6 +196,18 @@ def stem(name):
 def verify(receipt, offers, ffmpeg_name):
     """Fail before GitHub mutation if a measured library has no reviewed route."""
     inventory = receipt['inventory']
+    if receipt['platform'] == 'dmg':
+        if set(inventory) != {'pins', 'bundles'}:
+            raise ValueError('dmg: inventory must contain exactly pins and bundles')
+        bundles = inventory['bundles']
+        if set(bundles) != {'Metadesk.app', 'Metadesk Manager.app'}:
+            raise ValueError('dmg: expected measured inventories for both apps')
+        return {name: verify_libraries(receipt, bundle | {'pins': inventory['pins']}, offers, ffmpeg_name)
+                for name, bundle in bundles.items()}
+    return verify_libraries(receipt, inventory, offers, ffmpeg_name)
+
+
+def verify_libraries(receipt, inventory, offers, ffmpeg_name):
     platform = receipt['platform']
     if platform in {'deb', 'rpm'}:
         if inventory['private_origins']:

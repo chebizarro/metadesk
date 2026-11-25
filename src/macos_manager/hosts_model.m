@@ -1,7 +1,7 @@
 #import "hosts_model.h"
 #include "stream.h"
 #include "md_time.h"
-#include "relay_store.h"
+#include "native_relay_store.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <jansson.h>
@@ -450,7 +450,7 @@ static BOOL SetHints(json_t *record, NSArray<NSString *> *hints) {
 }
 
 NSString *MDHostsBootstrap(NSString *input, NSString **error) {
-    g_autofree char *directory = md_manager_config_directory();
+    NSString *directory = MDRelayConfigDirectory();
     if (input) {
         NSMutableOrderedSet<NSString *> *urls = [NSMutableOrderedSet orderedSet];
         if (input.length > (MD_RELAY_URL_MAX + 1) * MD_RELAY_TARGET_MAX) {
@@ -460,40 +460,40 @@ NSString *MDHostsBootstrap(NSString *input, NSString **error) {
         for (NSString *piece in [input componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
             if (!piece.length) continue;
             const char *p = piece.UTF8String;
-            g_autofree char *url = p && strlen(p) == [piece lengthOfBytesUsingEncoding:NSUTF8StringEncoding] ?
-                md_manager_relay_normalize(p, NULL) : NULL;
-            if (!url || strlen(url) > MD_RELAY_URL_MAX) {
-                if (error) *error = @"Use ws:// or wss:// relay URLs without credentials, query parameters or fragments.";
+            NSString *url = p && strlen(p) == [piece lengthOfBytesUsingEncoding:NSUTF8StringEncoding] ?
+                MDRelayNormalize(p) : nil;
+            if (!url || [url lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > MD_RELAY_URL_MAX) {
+                if (error) *error = @"Use ws:// or wss:// URLs without credentials, queries or fragments. Enter international hostnames in ASCII punycode (xn--).";
                 return nil;
             }
-            [urls addObject:Text(url)];
+            [urls addObject:url];
         }
         if (urls.count > MD_RELAY_TARGET_MAX) {
             if (error) *error = @"Too many bootstrap relays.";
             return nil;
         }
-        const char *values[MD_RELAY_TARGET_MAX + 1] = {0};
-        for (NSUInteger i = 0; i < urls.count; ++i) values[i] = [urls[i] UTF8String];
-        if (!md_manager_relays_save(directory, values, NULL)) {
+        if (!MDRelaySave(directory, urls.array)) {
             if (error) *error = @"Could not save bootstrap relays. Check the private configuration directory.";
             return nil;
         }
         return [urls.array componentsJoinedByString:@" "];
     }
 
-    g_auto(GStrv) values = md_manager_relays_load(directory, NULL);
+    NSArray<NSString *> *values = MDRelayLoad(directory);
     if (values) {
-        NSMutableArray<NSString *> *urls = [NSMutableArray array];
-        for (size_t i = 0; values[i]; ++i) {
-            if (i == MD_RELAY_TARGET_MAX || strlen(values[i]) > MD_RELAY_URL_MAX) {
+        if (values.count > MD_RELAY_TARGET_MAX) {
+            if (error) *error = @"The saved bootstrap relay list exceeds the route limits.";
+            return nil;
+        }
+        for (NSString *url in values) {
+            if ([url lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > MD_RELAY_URL_MAX) {
                 if (error) *error = @"The saved bootstrap relay list exceeds the route limits.";
                 return nil;
             }
-            [urls addObject:Text(values[i])];
         }
-        return [urls componentsJoinedByString:@" "];
+        return [values componentsJoinedByString:@" "];
     }
-    if (error) *error = @"Could not read saved bootstrap relays. No relay connections were started.";
+    if (error) *error = @"Could not read saved bootstrap relays. Use ASCII punycode (xn--) for international hostnames. No relay connections were started.";
     return nil;
 }
 

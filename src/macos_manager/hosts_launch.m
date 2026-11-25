@@ -16,7 +16,7 @@ NSString *MDHostCapsText(uint8_t caps) {
 NSString *MDHostLaunchText(MdLaunchMessage m, MdLaunchMessage phase) {
     static NSString *const progress[] = {@"Opening video client…", @"Checking host identity…", @"Connecting to signer…", @"Connecting to relays…",
         @"Checking FIPS route…", @"Waiting for approval…", @"Opening stream…", @"Binding session…", @"Opening video…", @"Connected in video window"};
-    static NSString *const failed[] = {@"Could not start metadesk-client. Check the app bundle or PATH.", @"Host identity could not be verified", @"The client signer is unavailable",
+    static NSString *const failed[] = {@"Could not start metadesk-client. The Manager app must contain an executable client; only unbundled builds search PATH.", @"Host identity could not be verified", @"The client signer is unavailable",
         @"The signaling relays could not be reached", @"The FIPS route is unavailable", @"No approval received or request declined", @"The stream could not be opened",
         @"The host did not confirm the session", @"Video could not be opened"};
     if ((unsigned)m < sizeof(progress)/sizeof(*progress)) return progress[m];
@@ -46,11 +46,15 @@ static NSString *ClientIn(NSString *directory) {
     return !stat(candidate.fileSystemRepresentation, &st) && S_ISREG(st.st_mode) && !access(candidate.fileSystemRepresentation, X_OK) ? candidate : nil;
 }
 NSString *MDHostClientPath(NSString *manager, NSString *bundle, NSString *path) {
+    if (bundle.isAbsolutePath && [bundle.pathExtension.lowercaseString isEqualToString:@"app"]) {
+        for (NSString *relative in @[@"Contents/MacOS", @"Contents/Helpers"]) {
+            NSString *client = ClientIn([bundle stringByAppendingPathComponent:relative]);
+            if (client) return client;
+        }
+        return nil;
+    }
     NSString *program = ClientIn(manager.stringByDeletingLastPathComponent);
     if (program) return program;
-    if (bundle.isAbsolutePath) for (NSString *relative in @[@"Contents/MacOS", @"Contents/Helpers"]) {
-        program = ClientIn([bundle stringByAppendingPathComponent:relative]); if (program) return program;
-    }
     for (NSString *directory in [path componentsSeparatedByString:@":"]) {
         program = ClientIn(directory); if (program) return program;
     }

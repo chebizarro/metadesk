@@ -2,6 +2,7 @@
 #include "md_test.h"
 #include "session.h"
 #include <errno.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define KEY "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -47,11 +48,17 @@ int main(int argc, char **argv) {
         NSString *pathClient = [root stringByAppendingPathComponent:@"metadesk-client"];
         NSString *siblingClient = [directory stringByAppendingPathComponent:@"metadesk-client"];
         CHECK(!symlink(selfPath.fileSystemRepresentation, pathClient.fileSystemRepresentation));
-        CHECK([MDHostClientPath(manager, bundle, root) isEqual:pathClient]);
+        CHECK(!MDHostClientPath(manager, bundle, root));
+        CHECK([MDHostClientPath(manager, nil, root) isEqual:pathClient]);
+        CHECK([@"not executable" writeToFile:helperClient atomically:YES encoding:NSUTF8StringEncoding error:NULL]);
+        CHECK(chmod(helperClient.fileSystemRepresentation, 0600) == 0);
+        CHECK(!MDHostClientPath(manager, bundle, root));
+        CHECK(!unlink(helperClient.fileSystemRepresentation));
         CHECK(!symlink(selfPath.fileSystemRepresentation, helperClient.fileSystemRepresentation));
         CHECK([MDHostClientPath(manager, bundle, root) isEqual:helperClient]);
         CHECK(!symlink(selfPath.fileSystemRepresentation, siblingClient.fileSystemRepresentation));
-        CHECK([MDHostClientPath(manager, bundle, root) isEqual:siblingClient]);
+        CHECK([MDHostClientPath(manager, bundle, root) isEqual:helperClient]);
+        CHECK([MDHostClientPath(manager, nil, root) isEqual:siblingClient]);
         CHECK(!setenv("MD_HOSTS_FIXTURE_SECRET", "dummy", 1));
         __block unsigned events = 0;
         __block MDHostsLaunch *launch;

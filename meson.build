@@ -832,7 +832,7 @@ dep_metadesk = declare_dependency(
   dependencies : core_deps,
 )
 
-if (get_option('macos_manager') and host_os == 'darwin') or (get_option('manager') and host_os == 'linux')
+if get_option('manager') and host_os == 'linux'
   subdir('src/manager_shared')
 endif
 
@@ -849,6 +849,10 @@ if get_option('manager')
     error('metadesk-manager is currently Linux-only')
   endif
   subdir('src/manager')
+  glib_relay_fixture = executable('test_glib_relay_store', 'tests/manager_relay_glib.c',
+    dependencies : [dep_metadesk, dep_manager_relay_store])
+  test('GLib relay store vectors', find_program('python3'),
+    args : [files('tests/manager_relay_vectors.py'), glib_relay_fixture])
 endif
 
 # ── Signer account tests ────────────────────────────────────────────────────
@@ -1466,6 +1470,9 @@ if host_os == 'darwin'
   _installed_bins = ['metadesk-host']
   if enable_client
     _installed_bins += 'metadesk-client'
+  endif
+  if get_option('macos_manager')
+    _installed_bins += 'metadesk-macos-manager'
   endif
   meson.add_install_script(import('python').find_installation('python3'),
     files('packaging/macos/fix-install-names.py'),

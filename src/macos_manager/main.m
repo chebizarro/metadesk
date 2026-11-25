@@ -2,6 +2,7 @@
 #import "model.h"
 #import "access_page.h"
 #import "hosts_page.h"
+#import "hosts_launch.h"
 #import "identity_page.h"
 #include <signal.h>
 
@@ -9,6 +10,10 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:title];
     item.label = title; item.view = view; [tabs addTabViewItem:item];
 }
+
+@interface MDManagerApp ()
+@property(nonatomic) BOOL smokeQuit;
+@end
 
 @implementation MDManagerApp {
     NSWindow *_window;
@@ -19,7 +24,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     dispatch_queue_t _previewQueue;
     dispatch_source_t _terminate;
     NSTimer *_terminationDeadline;
-    BOOL _terminationPending, _terminationReplied;
+    BOOL _terminationPending, _terminationReplied, _smokeReady;
 }
 - (instancetype)initWithHosts:(MDHostsPage *)hosts local:(MDLocalHostPages *)local identity:(MDIdentityPage *)identity {
     if ((self=[super init])) {
@@ -58,7 +63,12 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     (void)notification;
     NSTabView *tabs=[NSTabView new];
     if (!_hostsPage) _hostsPage=[MDHostsPage new];
-    if (!_local) _local=[MDLocalHostPages new];
+    if (!_local) {
+        // Render the real local pages without querying notification settings.
+        _local = self.smokeQuit ? [[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) {
+            return [[MDHostLink alloc] initWithUpdate:update];
+        }] : [MDLocalHostPages new];
+    }
     if (!_identity) _identity=[[MDIdentityPage alloc] initWithHosts:_hostsPage];
     AddTab(tabs,@"Hosts",_hostsPage.view);
     AddTab(tabs,@"This Computer",_local.computerView);
@@ -93,10 +103,23 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     dispatch_activate(_terminate);
 }
 - (void)showWindow {
-    [_window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES];
+    [_window makeKeyAndOrderFront:nil];
+    if (!self.smokeQuit) { [NSApp activateIgnoringOtherApps:YES]; return; }
+    // Wait for an AppKit run-loop turn after showing the window. Then use
+    // the normal termination delegate (including page and worker drain).
+    [NSTimer scheduledTimerWithTimeInterval:0 repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        if (!NSApp.isRunning || !NSScreen.screens.count || !self->_window.isVisible) {
+            fputs("Manager smoke: no visible window in a running AppKit session\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+        self->_smokeReady = YES;
+        [NSApp terminate:nil];
+    }];
 }
 - (void)tabView:(NSTabView *)tabs didSelectTabViewItem:(NSTabViewItem *)item {
     (void)tabs;
+    if (self.smokeQuit) return; // Don’t read or sync host/account state.
     if ([item.identifier isEqual:@"Hosts"]) [_hostsPage activate];
     if ([item.identifier isEqual:@"Identity"]) [_identity activate];
 }
@@ -108,6 +131,11 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     [self replyToTermination];
 }
 - (void)replyToTermination { [NSApp replyToApplicationShouldTerminate:YES]; }
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    (void)notification;
+    if (self.smokeQuit && _smokeReady && _terminationReplied)
+        puts("PASS: Manager window opened and normal quit completed");
+}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     (void)app;
     if (!_hostsPage || !_local || !_identity || _terminationReplied) return NSTerminateNow;
@@ -124,7 +152,13 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
          * for the call to return. This timer also runs in the termination loop. */
         __weak MDManagerApp *weakSelf=self;
         _terminationDeadline=[NSTimer timerWithTimeInterval:5 repeats:NO block:^(NSTimer *timer) {
-            (void)timer; [weakSelf finishTermination];
+            (void)timer;
+            MDManagerApp *app = weakSelf;
+            if (app.smokeQuit) {
+                fputs("Manager smoke: quit did not drain\n", stderr);
+                exit(EXIT_FAILURE);
+            }
+            [app finishTermination];
         }];
         [NSRunLoop.mainRunLoop addTimer:_terminationDeadline forMode:NSRunLoopCommonModes];
         [NSRunLoop.mainRunLoop addTimer:_terminationDeadline forMode:NSModalPanelRunLoopMode];
@@ -134,9 +168,18 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
 @end
 
 #ifndef MD_MACOS_MANAGER_APP_TEST
-int main(void) {
-    signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        // An offline installation diagnostic; use the same resolver as Connect.
+        if (argc == 2 && !strcmp(argv[1], "--print-client-path")) {
+            NSBundle *bundle = NSBundle.mainBundle;
+            NSString *client = MDHostClientPath(bundle.executablePath, bundle.bundlePath,
+                NSProcessInfo.processInfo.environment[@"PATH"]);
+            if (!client) { fputs("No executable metadesk-client found; the Manager app does not search PATH\n", stderr); return 1; }
+            puts(client.fileSystemRepresentation);
+            return 0;
+        }
+        signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
         NSApplication *app=NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSMenu *menu=[NSMenu new]; NSMenuItem *appItem=[NSMenuItem new]; [menu addItem:appItem];
@@ -144,6 +187,7 @@ int main(void) {
         [appItem.submenu addItemWithTitle:@"Quit Metadesk Manager" action:@selector(terminate:) keyEquivalent:@"q"];
         app.mainMenu=menu;
         __attribute__((objc_precise_lifetime)) MDManagerApp *delegate=[MDManagerApp new];
+        delegate.smokeQuit = argc == 2 && !strcmp(argv[1], "--smoke-quit");
         app.delegate=delegate; [app run];
     }
     return 0;

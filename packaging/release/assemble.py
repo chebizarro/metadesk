@@ -37,6 +37,11 @@ def hashes(path):
 
 
 def bundle_libraries(inventory):
+    if 'bundles' in inventory:
+        for name, bundle in inventory['bundles'].items():
+            yield component('application', name, components=list(bundle_libraries(bundle)),
+                            properties=[prop('bundle-identifier', bundle['bundle_identifier']),
+                                        prop('main-executable', bundle['main_executable'])])
     for key in ('libraries', 'private_libraries', 'private_origins'):
         for name, info in inventory.get(key, {}).items():
             record = component('library', name)
@@ -65,10 +70,17 @@ def source_receipt(receipt, output, platform, arch):
     if not archive.is_file() or sha(archive) != pin['sha256']:
         raise ValueError(f'{receipt}: source archive does not match producer pin')
     encoders = subprocess.check_output([packaging / 'ffmpeg/profile-encoders.sh', profile, arch], text=True).strip()
+    codec_inventory = (receipt / 'records/codec-inventory.txt').read_text()
+    passed = 'PASS: exact minimal codec/parser inventory; LGPL-2.1-or-later'
+    if platform == 'dmg':
+        per_app = re.split(r'(?m)^(Metadesk(?: Manager)?\.app)\n', codec_inventory)
+        results = dict(zip(per_app[1::2], per_app[2::2]))
+        if len(per_app) != 5 or set(results) != {'Metadesk.app', 'Metadesk Manager.app'} or not all(
+                passed in result for result in results.values()):
+            raise ValueError(f'{receipt}: missing runtime codec verification for both DMG apps')
     if ((receipt / 'records/profile.txt').read_text().strip() != profile or
             (receipt / 'records/encoders.txt').read_text().strip() != encoders or
-            'PASS: exact minimal codec/parser inventory; LGPL-2.1-or-later' not in
-            (receipt / 'records/codec-inventory.txt').read_text()):
+            passed not in codec_inventory):
         raise ValueError(f'{receipt}: missing matching profile and runtime verification')
     shutil.make_archive(str(output), 'gztar', receipt.parent, receipt.name)
     return upstream_name.removeprefix('ffmpeg-').split('.tar.', 1)[0], encoders, pin['sha256']
@@ -125,7 +137,7 @@ def assemble(packages, out):
             receipt.update(closure_source=closure_name, closure_source_sha256=sha(out / closure_name))
             closure_rows.append(f'- `{name}`: {link(closure_name)} — exact Ubuntu source packages, '
                                 'distro patches/copyright and AppImage runtime/libfuse source, patch and notices.')
-        signing = receipt['signing'] if receipt['signing'] != 'ad-hoc' else 'Unsigned DMG; ad-hoc app'
+        signing = receipt['signing'] if receipt['signing'] != 'ad-hoc' else 'Unsigned DMG; ad-hoc apps'
         rows.append(f'| {link(name)} | {platform} / {arch} | {asset.stat().st_size:,} | {signing} | PASS | '
                     f'{codec} | `{sha(asset)}` |')
         components.append(component('application', name, version=version, hashes=hashes(asset),
@@ -158,8 +170,8 @@ def assemble(packages, out):
     notes = notes.replace('<COMMIT>', f'`{commit}`', 1).replace('<COMMIT>', f'`{nostrc}`', 1)
     replacements = {
         'VERSION': version, 'DATE': now.date().isoformat(),
-        'USER_VISIBLE_CHANGES': 'Management UX preview: an encrypted address book (saved hosts, favorites, tags, notes) kept in NIP-51/NIP-78 documents; connecting by npub, nprofile or NIP-05 name with key pinning and first-contact review; relay selection from NIP-65 and NIP-17 relay lists; a Hosts page in the Linux manager that launches the client over a private channel; and a quick-connect switcher in the client overlay. Preview installers for the Linux host/client, Linux portable client/manager and macOS host/client.',
-        'KNOWN_LIMITATIONS': 'No Windows MSI or Intel Mac DMG. QR display and scan are available in native Linux packages and source builds, not in the Flatpak manager. Discovered relay addresses are checked before use but not again at connect time. The macOS management app is a source-build prototype and is not in the DMG. Help/codec smokes are not desktop, GPU, or signer qualification, and the cross-platform end-to-end matrix is incomplete.',
+        'USER_VISIBLE_CHANGES': 'Management UX preview: an encrypted address book (saved hosts, favorites, tags, notes) kept in NIP-51/NIP-78 documents; connecting by npub, nprofile or NIP-05 name with key pinning and first-contact review; relay selection from NIP-65 and NIP-17 relay lists; a Hosts page in the Linux manager that launches the client over a private channel; and a quick-connect switcher in the client overlay. Preview installers for the Linux host/client, Linux portable client/manager and macOS host/client plus the standalone Metadesk Manager app.',
+        'KNOWN_LIMITATIONS': 'No Windows MSI or Intel Mac DMG. QR display and scan are available in native Linux packages and source builds, not in the Flatpak manager. Discovered relay addresses are checked before use but not again at connect time. The macOS Manager has fixture coverage and an offline smoke of the packaged AppKit window and normal quit on the mounted DMG. The smoke does not exercise connections, signers, Keychain, host IPC, or user data. Signed on-screen qualification remains open (md-8xlg, md-wdi3). Help/codec smokes are not desktop, GPU, or signer qualification, and the cross-platform end-to-end matrix is incomplete.',
         'ARTIFACT_OS_ARCH_URL_AND_SHA256': '\n\n| Download | Target | Bytes | Signing | Smoke | Codec policy | SHA-256 |\n'
             '|---|---|---:|---|---|---|---|\n' + '\n'.join(rows) + '\n\n' +
             f'{link(source)} · {link("SHA256SUMS")}. Draft assets can be downloaded from the attachments below.',

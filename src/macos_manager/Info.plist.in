@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>Metadesk Manager</string>
-    <key>CFBundleIdentifier</key><string>org.metadesk.manager.prototype</string>
+    <key>CFBundleDisplayName</key><string>Metadesk Manager</string>
+    <key>CFBundleIdentifier</key><string>dev.metadesk.Manager</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleExecutable</key><string>metadesk-macos-manager</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>@VERSION@</string>

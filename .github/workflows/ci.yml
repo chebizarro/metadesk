@@ -72,7 +72,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Install build tools
-        run: brew install cmake meson ninja pkgconf
+        run: |
+          brew install cmake meson ninja pkgconf
+          # The Manager fixtures use only Python's standard library and Xcode frameworks.
+          python3 -c 'import sys; assert sys.version_info >= (3, 12)'
+          xcrun --show-sdk-path
       - name: Identify macOS toolchain
         id: toolchain
         run: |
@@ -110,7 +114,7 @@ jobs:
           export LDFLAGS="-L$prefix/lib"
           meson setup build -Dmacos_deps_prefix="$prefix" \
             -Dnostrc_root="$deps/sources/nostrc" -Dnostrc_build_dir="$deps/build/nostrc" \
-            -Dsigner_nip5f=true
+            -Dsigner_nip5f=true -Dmacos_manager=true
       - name: Compile
         run: meson compile -C build
       - name: Test
