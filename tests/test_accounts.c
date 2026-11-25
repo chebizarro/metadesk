@@ -356,6 +356,31 @@ static void test_storage_rejection(void) {
     closedir(d); md_accounts_destroy(a); cleanup(dir);
 }
 #endif
+#ifdef __APPLE__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static bool fixture_not_listed(const char *dir) {
+    CFArrayRef list = NULL;
+    OSStatus rc = SecKeychainCopySearchList(&list);
+    bool ok = rc == errSecSuccess && list;
+    const char *component = strrchr(dir, '/');
+    size_t prefix = strlen(component);
+    if (ok) for (CFIndex i = 0; i < CFArrayGetCount(list); ++i) {
+        char path[PATH_MAX + 1] = {0}; UInt32 n = PATH_MAX;
+        if (SecKeychainGetPath((SecKeychainRef)CFArrayGetValueAtIndex(list, i), &n, path) != errSecSuccess) {
+            ok = false; break;
+        }
+        const char *match = strstr(path, component);
+        if (match && match[prefix] == '/') {
+            fprintf(stderr, "Private fixture appeared in the Keychain search list: %s\n", path);
+            ok = false; break;
+        }
+    }
+    if (list) CFRelease(list);
+    return ok;
+}
+#pragma clang diagnostic pop
+#endif
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--secret-service")) {
         if (!getenv("MD_PRIVATE_KEYRING_FIXTURE")) { fprintf(stderr, "Private fixture required\n"); return 1; }
@@ -373,14 +398,14 @@ int main(int argc, char **argv) {
         char path[sizeof(dir) + sizeof("/fixture.keychain")];
         if (!mkdtemp(dir)) { MD_CHECK(false); return md_test_report(); }
         snprintf(path, sizeof(path), "%s/fixture.keychain", dir);
-        /* Apple's file Keychain creation only adds login/System Keychains to
-         * the default list. The exact file here is neither; all item queries
-         * are scoped by the explicit-path backend. Do not read, set or restore
-         * the search list, and unlink the fixture instead of SecKeychainDelete. */
+        /* Verify isolation without changing the search list. The backend
+         * scopes every item query to the explicit private file. */
         SecKeychainRef kc = NULL;
         OSStatus status = SecKeychainCreate(path, 4, "test", false, NULL, &kc);
         MD_CHECK(status == errSecSuccess && kc);
-        if (!status && kc) {
+        bool isolated = fixture_not_listed(dir);
+        MD_CHECK(isolated);
+        if (!status && kc && isolated) {
             MdCredentialStore *s = md_credential_store_keychain(path);
             credential_roundtrip(s); md_credential_store_destroy(s);
         }
@@ -399,6 +424,7 @@ int main(int argc, char **argv) {
             closedir(files);
         }
         MD_CHECK(rmdir(dir) == 0);
+        MD_CHECK(fixture_not_listed(dir));
         return md_test_report();
 #pragma clang diagnostic pop
     }
