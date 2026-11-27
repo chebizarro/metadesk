@@ -137,6 +137,7 @@ typedef NS_ENUM(NSInteger, MDReload) { MDReloadOpen, MDReloadRefresh, MDReloadSa
     MDStatusView *_relayStatus, *_relayMessage;
     BOOL _relayRequest, _identityDirty; /* a save from the Relays section; accounts or roles changed */
     BOOL _relaysLoaded;                 /* the Relays page shows the persisted list */
+    NSUInteger _suspensions;            /* outstanding suspendForRoleEdit: calls not yet resumed */
     NSUInteger _ownerEpoch;             /* advances when the book's owner is suspended, resumed or known stale */
     NSString *_expectedClient;          /* client-role key from Identity's last reload ("" = none, nil = unknown) */
     NSInteger _accounts; /* signer accounts known on the worker; -1 unknown */
@@ -318,18 +319,24 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (_expectedClient && ![owner isEqual:_expectedClient])
         [self suspendForRoleEdit:^{ [self resumeAfterRoleEdit]; }];
 }
+/* Suspensions are counted: reconciliation and an in-app bind can overlap.
+ * Hosts stays suspended until every one has resumed, then reopens once, for
+ * whichever owner is saved by then. Each caller's ready runs only after the
+ * book is closed (later suspensions queue behind the first one's close). */
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
+    BOOL first = _suspensions++ == 0;
     _roleEditing = YES; ++_ownerEpoch; ++_generation; _book = nil; [self render];
     if (_launch && _phase < MD_LAUNCH_CONNECTED) {
         [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO;
         [self showConnection:@"Unfinished connection cancelled before changing the client role." kind:MDStatusInfo];
     }
     dispatch_async(_queue, ^{ @autoreleasepool {
-        [self->_worker close];
+        if (first) [self->_worker close];
         dispatch_async(dispatch_get_main_queue(), ready);
     } });
 }
 - (void)resumeAfterRoleEdit {
+    if (!_suspensions || --_suspensions) return; /* another suspension is still outstanding */
     _roleEditing=NO; ++_ownerEpoch;
     if (!self.closing && _started) [self reloadBook:NO];
 }
