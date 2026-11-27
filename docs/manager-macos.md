@@ -84,9 +84,13 @@ same relay vectors and exchanges real files between both implementations.
    account, assign the client role, unlock the signer, re-import a remote
    signer pairing, or free the private cache. Relay setup lives in the
    **Relays** section (Hosts links to it): enter explicit bootstrap relay URLs
-   separated by spaces and choose **Save and Sync**. Confirmations and results
-   for that save appear in the Relays section. Afterwards View > Refresh
-   syncs again. Without relays, or while they are unreachable or catching up,
+   separated by spaces and choose **Save and Sync**. The Relays section shows
+   the saved list each time it appears, whether or not Hosts has been opened,
+   and **Save and Sync** stays unavailable until it has loaded. Save writes
+   exactly the validated list shown — an empty list is saved and nothing
+   connects — and its confirmations and results appear in the Relays
+   section. View > Refresh is separate: it syncs the saved list and never
+   writes or offers to replace the file. Without relays, or while they are unreachable or catching up,
    Hosts shows cached hosts and explains why reviewing and connecting wait. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
    `~/.config/metadesk`). GTK accepts international relay hostnames and writes
@@ -94,7 +98,8 @@ ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
 international hostname, enter its `xn--` punycode form. macOS does not perform
 IDNA conversion. GTK's saved ASCII URLs can still be read by both. The app
 loads the selection on entry but does not sync
-   until you refresh, including after a client-role change. Replacing unreadable
+   until you refresh. A client-role change, made in Identity or by another
+   program, closes and reopens Hosts for the new key; a label edit doesn't. Replacing unreadable
 preferences requires confirmation. Clear the field and save to remove all choices; none
    is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name in
@@ -137,9 +142,14 @@ fingerprint. It does not contact the signer or check whether the host is running
 When you open This Computer or Access, the manager connects to the saved host
 role's standard [management socket](host-management.md#endpoint-and-peer-trust)
 automatically, and again whenever the host role is assigned, switched or
-removed in Identity (removing it disconnects). **Use a custom management
-socket** takes an absolute path instead; it is an explicit choice and works
-with or without a host role, over the same authenticated same-user connection.
+removed in Identity (removing it disconnects). On a host-role change the old
+connection, its pending requests, remembered clients and any open approval
+or confirmation sheet are discarded before the new socket is looked up.
+**Use a custom management socket** takes an absolute path instead; it is an
+explicit choice and works with or without a host role, over the same
+authenticated same-user connection, so a role change leaves it connected.
+Clearing the field and choosing **Connect** returns to the standard socket,
+looked up again for the current host role.
 Status comes from an authenticated live subscription. Choose **Try Again** (or
 View > Refresh) after a host restart or loss of the socket. Without a host role,
 the page says so and links to Identity.

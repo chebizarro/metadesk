@@ -14,4 +14,7 @@
 - (void)beginAddAccount;
 /* Called on the main queue after any accounts or roles reload. */
 @property(nonatomic, copy) dispatch_block_t accountsChanged;
+/* Keys (hex) holding each role after the last reload: "" when unassigned,
+ * nil when the saved accounts could not be read. */
+@property(nonatomic, readonly) NSString *clientRoleKey, *hostRoleKey;
 @end

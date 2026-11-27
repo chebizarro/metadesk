@@ -372,8 +372,10 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 @end
 @interface FixtureBook : MDHostsBook
 @property MDHostsState fixtureState;
+@property(strong) NSString *fixtureOwner;
 @end
 @implementation FixtureBook
+- (NSString *)owner { return self.fixtureOwner; }
 /* An explicit state: the page shows its content only when ready. */
 - (MDHostsState)state { return self.fixtureState; }
 - (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
@@ -384,7 +386,8 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 }
 @end
 @interface FixtureHosts : MDHostsWorker
-@property NSUInteger resolves,saves,launches,closes;
+@property NSUInteger resolves,saves,launches,closes,starts;
+@property(strong) NSString *relays,*owner;
 @property BOOL mismatch,observeCancellation;
 @property MDHostsState state;
 @property(strong) NSString *input,*confirmation;
@@ -394,8 +397,8 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 @end
 @implementation FixtureHosts
 - (BOOL)openDirectory:(NSString *)directory error:(NSString **)error { (void)directory; (void)error; return YES; }
-- (MDHostsBook *)snapshot { FixtureBook *b=[FixtureBook new]; b.fixtureState=self.state; return b; }
-- (BOOL)startRelays:(NSString *)urls { (void)urls; return YES; }
+- (MDHostsBook *)snapshot { FixtureBook *b=[FixtureBook new]; b.fixtureState=self.state; b.fixtureOwner=self.owner; return b; }
+- (BOOL)startRelays:(NSString *)urls { ++self.starts; self.relays=urls; return YES; }
 - (MDHostReview *)resolve:(NSString *)value route:(NSString *)route cancelled:(bool (*)(void *))cancelled data:(void *)data error:(NSString **)error {
     (void)route; (void)error;
     ++self.resolves; self.input=value;
@@ -439,16 +442,16 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     NSString *corrupt=@"not a relay preferences file";
     CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     [page activate]; CHECK(Await(^BOOL{ return review.enabled; }));
-    /* View > Refresh and the toolbar's Refresh reach the page as refresh:. */
+    /* View > Refresh and the toolbar's Refresh reach the page as refresh:.
+     * Refresh only syncs the saved list: an unreadable file is reported and
+     * left alone, with no offer to overwrite it (that is Save's job). */
     NSMenuItem *refresh=MenuItem([MDManagerApp makeMainMenu],@selector(refresh:));
     BOOL (^canRefresh)(void)=^BOOL{ return [page validateMenuItem:refresh]; };
-    CHECK(canRefresh() && [NSApp sendAction:@selector(refresh:) to:page from:refresh] && Await(^BOOL{ return window.attachedSheet!=nil; }));
-    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    NSUInteger starts=worker.starts;
+    CHECK(canRefresh() && [NSApp sendAction:@selector(refresh:) to:page from:refresh]);
+    CHECK(Await(^BOOL{ return canRefresh() && LabelContains(view,@"Could not read saved bootstrap"); }));
+    CHECK(!window.attachedSheet && worker.starts==starts);
     CHECK([corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
-    CHECK(canRefresh() && [NSApp sendAction:@selector(refresh:) to:page from:refresh] && Await(^BOOL{ return window.attachedSheet!=nil; }));
-    CHECK(EndSheet(window,NSAlertSecondButtonReturn));
-    CHECK(Await(^BOOL{ return canRefresh() && !LabelContains(view,@"Could not read saved bootstrap"); }));
-    CHECK(![corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
     CHECK([@"[relays]\nbootstrap=wss://fixture.invalid/;\n" writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     __block BOOL drained=NO;
     [page suspendForRoleEdit:^{ drained=YES; }];
@@ -826,18 +829,20 @@ static BOOL BeforeActivation(MDHostsPage *hosts) {
 /* F1: Save and Sync on the Relays page presents its own confirmation and
  * reports into the Relays page, whichever section is not visible. */
 static BOOL RelaysSave(MDManagerApp *app, NSWindow *window) {
+    NSString *prefs=[[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"] stringByAppendingPathComponent:@"manager-relays.ini"];
+    NSString *corrupt=@"not a relay preferences file";
+    CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    [app showSection:@"This Computer"];
     [app showSection:@"Relays"];
     NSView *root=window.contentView;
     NSTextField *relays=Field(root,@"Bootstrap relays");
     NSButton *save=Button(root,@"Save and Sync");
     CHECK(relays && save && Visible(save));
-    NSString *prefs=[[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"] stringByAppendingPathComponent:@"manager-relays.ini"];
-    NSString *corrupt=@"not a relay preferences file";
-    CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     NSString *(^saved)(void)=^NSString *{ return [NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]; };
+    /* The page reloads on appearing and says the saved file is unreadable. */
+    CHECK(Await(^BOOL{ return save.enabled && LabelContains(root,@"can’t be read"); }));
     relays.stringValue=@"wss://relay-one.fixture.invalid/";
     /* Cancel keeps the unreadable file. */
-    CHECK(Await(^BOOL{ return save.enabled; }));
     [save performClick:nil];
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }) && Button(window.attachedSheet.contentView,@"Keep Existing File"));
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
@@ -922,65 +927,112 @@ static BOOL SearchAndSheets(MDManagerApp *app, NSWindow *window) {
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
     return YES;
 }
-/* F3: discovery follows host-role changes; late results from an earlier role
- * are ignored; a custom socket works with no host role. */
+/* A discovery lookup with one fixed answer. If gate is set, the lookup
+ * signals entered and then blocks until gate is released (the barrier),
+ * so the test controls exactly when its answer lands. */
+typedef NSString *(^Discovery)(NSString **);
+static Discovery Answer(NSString *key, NSString *path, dispatch_semaphore_t entered, dispatch_semaphore_t gate, atomic_int *calls) {
+    return ^NSString *(NSString **hostKey) {
+        if (calls) atomic_fetch_add(calls,1);
+        if (entered) dispatch_semaphore_signal(entered);
+        if (gate) MD_CHECK(dispatch_semaphore_wait(gate, dispatch_time(DISPATCH_TIME_NOW, 8*NSEC_PER_SEC))==0);
+        *hostKey=key;
+        return path;
+    };
+}
+static BOOL Entered(dispatch_semaphore_t entered) {
+    return dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, 4*NSEC_PER_SEC))==0;
+}
+static NSTableView *Requests(MDLocalHostPages *page) {
+    return (NSTableView *)Find(page.accessView,^BOOL(NSView *v){ return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Pending requests"]; });
+}
+/* F3 and round 4 #2: discovery follows the host role. A role change fences
+ * the old link, its requests and any open decision before the replacement is
+ * looked up; late answers for an earlier role are dropped; a custom socket
+ * works with no host role, and leaving it always looks up afresh. */
 static BOOL ComputerRole(MDManagerApp *app, MDLocalHostPages *local, FixtureLink *link, NSWindow *window, MDIdentityPage *identity) {
     [app showSection:@"This Computer"];
-    __block NSString *path=nil;
-    __block atomic_int finished=0, calls=0;
-    __block int slowCall=-1; __block NSString *slowAnswer=nil;
-    dispatch_semaphore_t slow=dispatch_semaphore_create(0);
-    /* Discovery requests are answered in order; the call numbered slowCall
-     * blocks until released and then answers slowAnswer. */
-    local.discover=^NSString *(BOOL *role) {
-        int index=atomic_fetch_add(&calls,1);
-        NSString *answer=path;
-        if (index==slowCall) { dispatch_semaphore_wait(slow, dispatch_time(DISPATCH_TIME_NOW, 4*NSEC_PER_SEC)); answer=slowAnswer; }
-        *role=answer!=nil;
-        atomic_fetch_add(&finished,1);
-        return answer;
-    };
-    /* Role changes arrive the way they do in the app: Identity reloads its
-     * accounts and roles, and the app tells This Computer. */
-    BOOL (^roleChanged)(void)=^BOOL{
-        if (!Await(^BOOL{ return [identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; })) return NO;
-        [identity refresh:nil];
-        return YES;
-    };
-    CHECK(roleChanged());
-    CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"doesn’t have a host role"); }));
-    [link.paths removeAllObjects];
-    path=@"/fixture/role-a.sock";
-    CHECK(roleChanged());
+    NSString *keyA=@"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", *keyB=@"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    NSString *keyC=@"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    NSTimeInterval now=NSDate.date.timeIntervalSince1970;
+    NSDictionary *policy=@{@"policy_available":@YES,@"policy_version":@4,@"clients":@[]};
+    const uint32_t all=MD_CAP_VIDEO|MD_CAP_AGENT|MD_CAP_INPUT;
+    /* Role A: found and connected. */
+    local.discover=Answer(keyA,@"/fixture/role-a.sock",nil,nil,NULL);
+    [local hostRoleChanged:keyA];
     CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-a.sock"]; }));
-    /* A slow discovery for role B is overtaken by role C. */
-    /* Role B's discovery is slow; the role changes to C before it answers.
-     * B's late answer must be dropped and C used. */
-    CHECK(Await(^BOOL{ return atomic_load(&finished)==atomic_load(&calls); }));
-    int before=atomic_load(&finished);
-    slowCall=atomic_load(&calls); slowAnswer=@"/fixture/role-b.sock";
-    [local identityChanged];
-    path=@"/fixture/role-c.sock";
-    [local identityChanged];
-    dispatch_semaphore_signal(slow);
-    CHECK(Await(^BOOL{ return atomic_load(&finished)==before+2; }));
-    for (int i=0;i<4;++i) Turn();
-    CHECK([link.paths.lastObject isEqual:@"/fixture/role-c.sock"]);
-    CHECK([link.paths.lastObject isEqual:@"/fixture/role-c.sock"] && ![link.paths containsObject:@"/fixture/role-b.sock"]);
-    /* Unassigning the role drops the link and says so. */
-    path=nil;
-    CHECK(roleChanged());
+    /* Role A is unchanged (a label edit): no lookup, the link stays. */
+    atomic_int idle=0;
+    local.discover=Answer(keyA,@"/fixture/other.sock",nil,nil,&idle);
+    NSUInteger connects=link.paths.count;
+    [local hostRoleChanged:keyA];
+    Turn();
+    CHECK(atomic_load(&idle)==0 && link.paths.count==connects);
+    /* An active snapshot from role A with an approval sheet open. */
+    link.push(@"Fixture",Snapshot(20,all,now+60,NO),policy,nil,NO);
+    NSTableView *requests=Requests(local);
+    CHECK(requests.numberOfRows==2);
+    [app showSection:@"Access"];
+    [local openRequest:@GEN "/" REQUEST];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    NSUInteger commands=link.commands.count;
+    /* Role B: its lookup blocks. Before it answers, role A's link, requests,
+     * remembered clients and decision sheet are already gone. */
+    dispatch_semaphore_t enteredB=dispatch_semaphore_create(0), gateB=dispatch_semaphore_create(0);
+    local.discover=Answer(keyB,@"/fixture/role-b.sock",enteredB,gateB,NULL);
+    [local hostRoleChanged:keyB];
+    CHECK(Entered(enteredB));
+    CHECK(!window.attachedSheet && link.commands.count==commands);
+    CHECK([link.paths.lastObject isEqual:@""] && requests.numberOfRows==0);
+    CHECK(!Button(local.accessView,@"Review Request…").enabled && LabelContains(local.accessView,@"Not Connected"));
+    /* A late update for role A's request can't be approved from a stale sheet. */
+    [local openRequest:@GEN "/" REQUEST];
+    Turn();
+    CHECK(!window.attachedSheet);
+    /* Role C arrives while B is still blocked; B's late answer is dropped.
+     * The discovery queue is serial, so B's answer reaches the main queue
+     * before C's: once C's path is in use, B's has been seen and ignored. */
+    local.discover=Answer(keyC,@"/fixture/role-c.sock",nil,nil,NULL);
+    [local hostRoleChanged:keyC];
+    dispatch_semaphore_signal(gateB);
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-c.sock"]; }));
+    CHECK(![link.paths containsObject:@"/fixture/role-b.sock"]);
+    /* Unassigning the role, as Identity reports it after a reload: the link
+     * is dropped and the page says so. The fixture directory has no host role. */
+    local.discover=Answer(nil,nil,nil,nil,NULL);
+    CHECK(Await(^BOOL{ return [identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; }));
+    [identity refresh:nil];
     CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@""] && LabelContains(local.computerView,@"doesn’t have a host role"); }));
-    /* A custom socket is an explicit choice that works without a host role. */
+    /* Role A again, then a custom socket: an explicit choice that works
+     * without a host role and with an active snapshot of its own. */
+    [app showSection:@"This Computer"];
+    local.discover=Answer(keyA,@"/fixture/role-a.sock",nil,nil,NULL);
+    [local hostRoleChanged:keyA];
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-a.sock"]; }));
     NSTextField *custom=Field(local.computerView,@"Management socket");
     CHECK(custom);
     custom.stringValue=@"/fixture/custom.sock";
     [NSApp sendAction:@selector(connect:) to:local from:nil];
     CHECK([link.paths.lastObject isEqual:@"/fixture/custom.sock"]);
-    [local identityChanged];
+    link.push(@"Fixture",Snapshot(30,all,now+60,NO),policy,nil,NO);
+    /* A role change while custom: no lookup, the custom link stays. */
+    atomic_int customCalls=0;
+    local.discover=Answer(keyB,@"/fixture/role-b.sock",nil,nil,&customCalls);
+    [local hostRoleChanged:keyB];
     Turn();
-    CHECK([link.paths.lastObject isEqual:@"/fixture/custom.sock"]);
-    (void)window;
+    CHECK(atomic_load(&customCalls)==0 && [link.paths.lastObject isEqual:@"/fixture/custom.sock"] && requests.numberOfRows==2);
+    /* Clearing the field and pressing Connect leaves custom mode with a fresh
+     * lookup: never role A's path from before the change. */
+    dispatch_semaphore_t enteredD=dispatch_semaphore_create(0), gateD=dispatch_semaphore_create(0);
+    local.discover=Answer(keyB,@"/fixture/role-b.sock",enteredD,gateD,NULL);
+    custom.stringValue=@"";
+    [NSApp sendAction:@selector(connect:) to:local from:nil];
+    CHECK(Entered(enteredD));
+    CHECK([link.paths.lastObject isEqual:@""] && requests.numberOfRows==0);
+    dispatch_semaphore_signal(gateD);
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-b.sock"]; }));
+    CHECK(![[link.paths subarrayWithRange:NSMakeRange(link.paths.count-2,2)] containsObject:@"/fixture/role-a.sock"]);
+    local.discover=Answer(nil,nil,nil,nil,NULL); /* later role changes answer at once */
     return YES;
 }
 /* B2: the Relays section's host identity field refuses secret keys too. */
@@ -1011,6 +1063,99 @@ static BOOL LateBadge(void) {
     CHECK(Await(^BOOL{ return pending==0; }));
     return YES;
 }
+/* Round 4 #1: a fresh app that goes straight to Relays, never opening Hosts,
+ * shows the saved list; Save stays off until it has loaded, writes exactly
+ * the list shown, and an empty list contacts no relay. */
+static BOOL RelaysFirst(void) {
+    NSString *prefs=[[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"] stringByAppendingPathComponent:@"manager-relays.ini"];
+    NSString *(^saved)(void)=^NSString *{ return [NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]; };
+    FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil]; worker.state=MDHostsSynced;
+    MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
+    MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
+    local.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
+    MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:@"/nonexistent" connect:Connect credentials:nil];
+    MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
+    NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
+    CHECK(![[hosts valueForKey:@"started"] boolValue]); /* opening the window doesn't open Hosts */
+    /* Saved by MDHostsBootstrap itself, so the file is in its own format. */
+    NSString *error=nil;
+    CHECK([MDHostsBootstrap(@"wss://first.fixture.invalid/", &error) containsString:@"first.fixture.invalid"]);
+    NSString *original=saved();
+    CHECK(original.length);
+    [app showSection:@"Relays"];
+    NSView *root=window.contentView;
+    NSTextField *relays=Field(root,@"Bootstrap relays");
+    NSButton *save=Button(root,@"Save and Sync");
+    CHECK(relays && save && Visible(save) && !save.enabled);
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    CHECK([relays.stringValue containsString:@"wss://first.fixture.invalid/"] && worker.starts==0);
+    /* Save with the list unchanged: the same list is kept and synced. */
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return LabelContains(root,@"Relays saved"); }));
+    CHECK([saved() isEqual:original] && worker.starts==1 && [worker.relays containsString:@"first.fixture.invalid"]);
+    /* Clearing it: the empty list is saved and nothing connects. */
+    relays.stringValue=@"";
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return LabelContains(root,@"Relays cleared"); }));
+    CHECK(![saved() containsString:@"first.fixture.invalid"] && worker.starts==1);
+    /* Leaving and returning shows the saved (empty) list again. */
+    relays.stringValue=@"wss://unsaved.fixture.invalid/";
+    [app showSection:@"This Computer"]; [app showSection:@"Relays"];
+    CHECK(Await(^BOOL{ return save.enabled && relays.stringValue.length==0; }));
+    __block int pending=3;
+    [hosts close:^{ --pending; }]; [local close:^{ --pending; }]; [identity close:^{ --pending; }];
+    CHECK(Await(^BOOL{ return pending==0; }));
+    [window close];
+    return YES;
+}
+/* Round 4 #4: an explicit Opening state from the worker is blocked like
+ * the other first-run states, so it agrees with the panel renderState shows. */
+static BOOL OpeningState(MDManagerApp *app, NSWindow *window, MDHostsPage *hosts, FixtureHosts *worker) {
+    worker.state=MDHostsOpening;
+    [app showSection:@"Hosts"];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)]; }));
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(hosts.view);
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && Visible(panel) && [panel.titleLabel.stringValue containsString:@"Opening"]; }));
+    CHECK(!Visible(Field(hosts.view,@"Host npub")));
+    CHECK(![hosts canPerform:@selector(focusHostEntry:)] && !Enabled(window,@selector(connectToHost:)));
+    worker.state=MDHostsSynced;
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && Visible(Field(hosts.view,@"Host npub")); }));
+    CHECK([hosts canPerform:@selector(focusHostEntry:)] && Enabled(window,@selector(connectToHost:)));
+    return YES;
+}
+/* Round 4 #3: a client-role change made outside the manager while Hosts is
+ * ready reopens the book for the new key; a label edit does not. */
+static BOOL ClientRole(MDManagerApp *app, MDHostsPage *hosts, FixtureHosts *worker) {
+    NSString *keyA=@"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", *keyB=@"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    NSString *saved=worker.owner;
+    worker.state=MDHostsSynced; worker.owner=keyA;
+    [app showSection:@"Hosts"];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)]; }));
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    NSButton *review=Button(hosts.view,@"Review and Connect…");
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && review.enabled; }));
+    NSUInteger closes=worker.closes;
+    /* Same key (a label edit, or nothing changed): no reopen. */
+    [hosts identityChanged:keyA];
+    Turn();
+    CHECK(worker.closes==closes && review.enabled);
+    /* The role now names B: Hosts suspends, closes the old book, reopens. */
+    worker.owner=keyB;
+    [hosts identityChanged:keyB];
+    CHECK(Await(^BOOL{ return worker.closes==closes+1 && [hosts canPerform:@selector(refresh:)] && review.enabled; }));
+    [hosts identityChanged:keyB];
+    Turn();
+    CHECK(worker.closes==closes+1);
+    worker.owner=saved;
+    [hosts identityChanged:nil]; /* unknown: nothing to compare */
+    Turn();
+    CHECK(worker.closes==closes+1);
+    return YES;
+}
 static BOOL Run(NSString *directory) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
@@ -1020,7 +1165,7 @@ static BOOL Run(NSString *directory) {
     MDLocalHostPages *access=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) {
         link.push=update; return link;
     }];
-    access.discover=^NSString *(BOOL *role) { *role=NO; return nil; };
+    access.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
     FixtureIdentity *identity=[[FixtureIdentity alloc] initWithHosts:hosts directory:directory connect:Connect credentials:^{
         static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
         return md_credential_store_custom(&ops,NULL);
@@ -1043,6 +1188,8 @@ static BOOL Run(NSString *directory) {
     [app showSection:@"Access"];
     CHECK(Access(access,link,window));
     CHECK(ComputerRole(app,access,link,window,identity));
+    CHECK(ClientRole(app,hosts,worker));
+    CHECK(OpeningState(app,window,hosts,worker));
     CHECK(RelaysField(app,window));
     CHECK(RelaysSave(app,window));
     MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
@@ -1056,6 +1203,7 @@ static BOOL Run(NSString *directory) {
     NSApp.delegate=nil;
     [window close];
     CHECK(LateBadge());
+    CHECK(RelaysFirst());
     return YES;
 }
 int main(int argc,char **argv) {

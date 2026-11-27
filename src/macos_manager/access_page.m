@@ -62,9 +62,11 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     NSTextField *_endpoint, *_agent, *_session, *_sessionKey, *_notificationStatus, *_lifecycle;
     NSButton *_retry, *_openIdentity, *_advanced;
     NSView *_customRow;
-    NSString *_defaultPath;          /* standard socket for the saved host role */
     NSString *_linkPath;             /* what the link was last asked to connect to */
     NSUInteger _discovery;           /* fences discovery completions from an earlier role */
+    NSUInteger _linkEpoch;           /* fences decisions made against an earlier link */
+    NSString *_hostKey;              /* host-role key the standard socket was found for */
+    NSWindow *_decision;             /* open approval, edit or confirmation sheet */
     dispatch_queue_t _discoveryQueue; /* serial: requests are answered in order */
     BOOL _located, _noHostRole, _activated, _custom, _locating;
     id _policyGeneration;            /* remembered clients loaded for this generation */
@@ -189,13 +191,13 @@ static NSTableView *AccessTable(id owner, NSString *label) {
 }
 /* Finds the saved host role's standard socket on a background queue. A newer
  * request (after a role change) supersedes any discovery still running. */
-static NSString *DefaultDiscovery(BOOL *hasRole) {
+static NSString *DefaultDiscovery(NSString **hostKey) {
     MdAccounts *accounts = NULL; NSString *path = nil;
-    *hasRole = NO;
+    *hostKey = nil;
     if (!md_accounts_open_snapshot(NULL, NULL, &accounts)) {
         const MdAccount *host = md_accounts_role(accounts, MD_ACCOUNT_HOST);
         char buffer[1024];
-        if (host) { *hasRole = YES; if (!md_management_path(host->pubkey, buffer, sizeof buffer)) path = @(buffer); }
+        if (host) { *hostKey = @(host->pubkey); if (!md_management_path(host->pubkey, buffer, sizeof buffer)) path = @(buffer); }
         md_accounts_destroy(accounts);
     }
     return path;
@@ -206,30 +208,56 @@ static NSString *DefaultDiscovery(BOOL *hasRole) {
     _locating = YES;
     if (!_snapshot) { [self showStatus:@"Looking for the host on this Mac…"]; [self render]; }
     __weak MDLocalHostPages *weakSelf = self;
-    NSString *(^discover)(BOOL *) = self.discover;
+    NSString *(^discover)(NSString **) = self.discover;
     if (!_discoveryQueue) _discoveryQueue = dispatch_queue_create("metadesk.manager.host-discovery", DISPATCH_QUEUE_SERIAL);
     dispatch_group_async(_qrWork, _discoveryQueue, ^{ @autoreleasepool {
-        BOOL role = NO;
-        NSString *path = discover ? discover(&role) : DefaultDiscovery(&role);
+        NSString *key = nil;
+        NSString *path = discover ? discover(&key) : DefaultDiscovery(&key);
         dispatch_async(dispatch_get_main_queue(), ^{
             MDLocalHostPages *page = weakSelf;
             if (!page || page->_closed || epoch != page->_discovery) return; /* superseded */
-            page->_locating = NO; page->_located = YES; page->_noHostRole = !role; page->_defaultPath = path;
+            page->_locating = NO; page->_located = YES; page->_noHostRole = !key;
+            page->_hostKey = key ?: @"";
             if (page->_custom) { [page showStatus:nil]; [page render]; return; }
             if (path) {
                 page->_endpoint.placeholderString = path;
                 if (![path isEqual:page->_linkPath] || !page->_snapshot) [page connectTo:path];
             } else {
                 /* No host role now: drop a link that followed the previous role. */
-                if (page->_linkPath.length) { page->_snapshot = nil; page->_policy = nil; page->_permissions = nil; page->_linkPath = nil; [page->_link connect:@""]; }
+                if (page->_linkPath.length) [page dropLink];
                 [page showStatus:nil]; [page render];
             }
         });
     } });
 }
-/* A host role may have been assigned, switched or removed. */
-- (void)identityChanged {
-    if (_closed || !_activated || _custom) return;
+/* Invalidates everything learned from the current link before it is
+ * replaced: the snapshot, pending requests, remembered clients and any
+ * decision sheet. A decision made against it can no longer be sent. */
+- (void)fenceLink {
+    ++_linkEpoch;
+    NSWindow *decision = _decision; _decision = nil;
+    if (decision.sheetParent) [decision.sheetParent endSheet:decision returnCode:NSModalResponseAbort];
+    _snapshot = nil; _policy = nil; _permissions = nil; _policyGeneration = nil;
+    _selectedToken = nil; _selectedPeer = nil;
+}
+- (void)dropLink {
+    [self fenceLink];
+    _linkPath = nil; _busy = NO;
+    [_link connect:@""];
+}
+/* Identity reloaded its roles. key is the host role's key ("" when none,
+ * nil when unknown). The standard socket follows the role: on a change the
+ * old link is fenced before the replacement is looked up. A custom socket
+ * is the user's explicit choice and stays, but the standard path learned for
+ * the old role is forgotten, so leaving custom mode looks it up again. */
+- (void)hostRoleChanged:(NSString *)key {
+    if (_closed || !_activated) return;
+    if (!key) { if (!_custom) [self locateAndConnect]; return; } /* unknown: discovery decides */
+    if (_hostKey && [key isEqual:_hostKey]) return; /* e.g. a label edit */
+    _hostKey = nil; _located = NO;
+    if (_custom) { [self showStatus:nil]; [self render]; return; }
+    [self dropLink];
+    [self showStatus:nil]; [self render];
     [self locateAndConnect];
 }
 - (void)reconnect:(id)sender {
@@ -413,16 +441,20 @@ static NSString *DefaultDiscovery(BOOL *hasRole) {
         [self refreshPolicy:nil];
     }
 }
+/* Connect with a custom socket uses it; with the field empty it leaves
+ * custom mode and always looks up the standard socket afresh. */
 - (void)connect:(id)sender {
     (void)sender;
     if (_closed) return;
     NSString *path = MDHostTrim(_endpoint.stringValue);
-    _custom = path.length != 0;
-    [self connectTo:path.length ? path : _defaultPath ?: @""];
+    if (path.length) { _custom = YES; [self connectTo:path]; return; }
+    _custom = NO;
+    [self dropLink];
+    [self locateAndConnect];
 }
 - (void)connectTo:(NSString *)path {
-    _linkPath = path;
-    _snapshot = nil; _policy = nil; _permissions = nil; _busy = YES; _policyGeneration = nil;
+    [self fenceLink];
+    _linkPath = path; _busy = YES;
     [self showStatus:@"Connecting to the host on this Mac…"];
     [self render]; [_link connect:path];
 }
@@ -632,9 +664,12 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
         [form.sheet buttonWithResponse:NSAlertThirdButtonReturn+1].enabled = current;
     };
     chooser.update();
+    NSUInteger epoch = _linkEpoch;
+    _decision = sheet.window;
     [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
-        self->_chooser = nil; [self tick:nil];
-        if (self->_closed || self->_busy || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1 ||
+        self->_chooser = nil; if (self->_decision == sheet.window) self->_decision = nil;
+        [self tick:nil];
+        if (self->_closed || self->_busy || epoch != self->_linkEpoch || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1 ||
             ![snapshot[@"revision"] isEqual:self->_snapshot[@"revision"]]) return;
         BOOL deny = response == NSAlertThirdButtonReturn+1, remember = response == NSAlertThirdButtonReturn;
         if (remember && (![self->_policy[@"policy_available"] boolValue] || ![policy[@"policy_version"] isEqual:self->_policy[@"policy_version"]])) return;
@@ -648,8 +683,11 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     if (_closed || _busy || !window || window.attachedSheet) return;
     NSAlert *a = MDAlert(title, info);
     MDAlertDestructive(a, button);
+    NSUInteger epoch = _linkEpoch;
+    _decision = a.window;
     [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
-        if (!self->_closed && response == NSAlertSecondButtonReturn) action();
+        if (self->_decision == a.window) self->_decision = nil;
+        if (!self->_closed && epoch == self->_linkEpoch && response == NSAlertSecondButtonReturn) action();
     }];
 }
 - (void)kick:(id)sender {
@@ -687,8 +725,11 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     sheet.accessory = form;
     [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
     [sheet addButton:@"Save Access" role:MDSheetDefault response:NSAlertSecondButtonReturn];
+    NSUInteger epoch = _linkEpoch;
+    _decision = sheet.window;
     [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
-        if (!self->_closed && response == NSAlertSecondButtonReturn) [self->_link command:MDPolicyCommand(s,p,c,chooser.selected,NO,nil)];
+        if (self->_decision == sheet.window) self->_decision = nil;
+        if (!self->_closed && epoch == self->_linkEpoch && response == NSAlertSecondButtonReturn) [self->_link command:MDPolicyCommand(s,p,c,chooser.selected,NO,nil)];
     }];
 }
 

@@ -243,7 +243,6 @@ static NSArray *SnapRows(void) {
 @end
 
 static NSString *SignerKey;
-static BOOL FixtureHostRole = YES;
 static int SnapKey(MdSigner *s, char **key) { (void)s; *key = strdup(SignerKey.UTF8String); return *key ? 0 : MD_SIGNER_ERR_INTERNAL; }
 static int SnapConnect(MdSignerType backend, const char *key, MdCredentialStore *store, MdSigner **out) {
     (void)key; (void)store;
@@ -308,7 +307,7 @@ static Scene MakeScene(NSAppearanceName appearance, MDHostsState state, BOOL emp
     s.local = [[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push = update; return link; }];
     /* Never look up the real host role or runtime directory: a fixture path. */
     NSString *socket = [@(getenv("XDG_RUNTIME_DIR")) stringByAppendingPathComponent:@"fixture-host.sock"];
-    s.local.discover = ^NSString *(BOOL *hasRole) { *hasRole = FixtureHostRole; return FixtureHostRole ? socket : nil; };
+    s.local.discover = ^NSString *(NSString **hostKey) { *hostKey = @"fixture-host-role"; return socket; };
     s.identity = [[MDIdentityPage alloc] initWithHosts:s.hosts directory:nil connect:SnapConnect credentials:^{ return SnapStore(); }];
     s.app = [[MDManagerApp alloc] initWithHosts:s.hosts local:s.local identity:s.identity];
     s.window = [s.app makeMainWindow];
@@ -388,7 +387,7 @@ static void Sheets(Scene *s, NSString *suffix) {
         static const char corrupt[] = "not a relay preferences file";
         BOOL wrote = write(fd, corrupt, sizeof corrupt - 1) == (ssize_t)(sizeof corrupt - 1);
         close(fd);
-        if (wrote) Try(s, n(@"sheet-hosts-unreadable-relays-"), hosts, @selector(refresh:));
+        if (wrote) Try(s, n(@"sheet-hosts-unreadable-relays-"), hosts, @selector(saveRelays:));
         unlink(prefs.fileSystemRepresentation);
     }
     Spin();
@@ -456,12 +455,11 @@ static void Pages(NSAppearanceName appearance, NSString *mode) {
     c.link.push(@"Host unreachable or socket not trusted. Agent process state is unknown.", nil, nil, nil, NO);
     Spin();
     Render(Frame(c.window), [@"page-this-computer-unreachable-default-" stringByAppendingString:mode]);
-    FixtureHostRole = NO;
-    [c.local identityChanged];
-    Await(^BOOL{ return [[c.local valueForKey:@"noHostRole"] boolValue]; });
+    c.local.discover = ^NSString *(NSString **hostKey) { *hostKey = nil; return nil; };
+    [c.local hostRoleChanged:@""];
+    Await(^BOOL{ return [[c.local valueForKey:@"located"] boolValue] && [[c.local valueForKey:@"noHostRole"] boolValue]; });
     c.link.push(nil, nil, nil, nil, NO);
     Spin();
-    FixtureHostRole = YES;
     Render(Frame(c.window), [@"page-this-computer-no-host-role-default-" stringByAppendingString:mode]);
     Drain(&c);
 

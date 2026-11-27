@@ -26,8 +26,12 @@
 /* First-run navigation, called explicitly (never through a nil target). */
 @property(nonatomic, copy) void (^showIdentity)(BOOL addAccount);
 @property(nonatomic, copy) dispatch_block_t showRelays;
-/* Accounts or roles changed: re-evaluate first-run guidance. */
-- (void)identityChanged;
+/* Identity reloaded accounts and roles; clientKey is the client role's key
+ * ("" when unassigned, nil when the accounts could not be read). Re-evaluates first-run guidance and reopens the book
+ * if the client role changed under it. */
+- (void)identityChanged:(NSString *)clientKey;
+/* The Relays section appeared: show the persisted relay list. */
+- (void)relaysAppeared;
 /* Test seam: counts saved signer accounts on the worker queue. */
 @property(nonatomic, copy) NSUInteger (^accountCount)(void);
 - (BOOL)validateToolbarItem:(NSToolbarItem *)item;

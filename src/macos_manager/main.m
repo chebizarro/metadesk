@@ -221,8 +221,8 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     _identity.accountsChanged=^{
         MDManagerApp *app=weakSelf;
         if (!app) return;
-        [app->_hostsPage identityChanged];
-        [app->_local identityChanged];
+        [app->_hostsPage identityChanged:app->_identity.clientRoleKey];
+        [app->_local hostRoleChanged:app->_identity.hostRoleKey];
     };
     [_main showSection:@"This Computer"];
     return _main.window;
@@ -230,6 +230,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
 - (void)sectionChanged:(NSString *)section {
     if (self.smokeQuit) return; // Don’t read or sync host/account state.
     if ([section isEqual:@"Hosts"]) [_hostsPage activate];
+    if ([section isEqual:@"Relays"]) [_hostsPage relaysAppeared];
     if ([section isEqual:@"Identity"]) [_identity activate];
     if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local activate];
 }

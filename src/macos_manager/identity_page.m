@@ -159,6 +159,8 @@ static NSString *SignerTitle(NSDictionary *a) {
     (void)note;
     if (!_reloading) [self selection:nil];
 }
+- (NSString *)clientRoleKey { return _accounts ? [self accountInRole:MD_ACCOUNT_CLIENT][@"key"] ?: @"" : nil; }
+- (NSString *)hostRoleKey { return _accounts ? [self accountInRole:MD_ACCOUNT_HOST][@"key"] ?: @"" : nil; }
 - (NSDictionary *)accountInRole:(MdAccountRole)role {
     NSString *field=role==MD_ACCOUNT_CLIENT?@"client":@"host";
     for (NSDictionary *a in _accounts) if ([a[field] boolValue]) return a;

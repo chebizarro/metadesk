@@ -175,8 +175,12 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
 - (void)showSection:(NSString *)identifier {
     for (NSUInteger i = 0; i < _sections.count; ++i) if ([_sections[i].identifier isEqual:identifier]) {
         (void)self.window; (void)_sidebar.view;
+        /* Loading the sidebar selects its first row; only the section asked
+         * for is shown and activated. */
+        _switching = YES;
         [_sidebar.table reloadData];
         [_sidebar.table selectRowIndexes:[NSIndexSet indexSetWithIndex:i] byExtendingSelection:NO];
+        _switching = NO;
         [self select:_sections[i]];
         return;
     }
