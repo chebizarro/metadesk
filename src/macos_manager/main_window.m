@@ -117,7 +117,7 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
     BOOL _switching;
 }
 + (NSSize)defaultContentSize { return NSMakeSize(900, 620); }
-+ (NSSize)minimumContentSize { return NSMakeSize(720, 520); }
++ (NSSize)minimumContentSize { return NSMakeSize(720, 540); }
 - (instancetype)initWithSections:(NSArray<MDSection *> *)sections {
     NSWindow *window = [[NSWindow alloc] initWithContentRect:(NSRect){NSZeroPoint, MDMainWindowController.defaultContentSize}
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |

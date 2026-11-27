@@ -409,14 +409,17 @@ static void Pages(NSString *accounts, NSAppearanceName appearance, NSString *mod
     NSSize sizes[2] = {size, s.window.contentMinSize};
     NSString *names[2] = {@"default", @"minimum"};
     /* Offline/disconnected first, then with fixture state. */
+    Resize(s.window, sizes[0]);
+    for (NSString *section in @[@"This Computer", @"Access"]) {
+        ShowSection(&s, section);
+        Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-disconnected-%@-%@", Slug(section), names[0], mode]);
+    }
     for (int z = 0; z < 2; ++z) {
         Resize(s.window, sizes[z]);
         for (NSString *section in Sections(&s)) {
             ShowSection(&s, section);
             if ([section isEqual:@"Hosts"]) Await(^BOOL{ return HostsTable(s.hosts.view).numberOfRows > 0; });
             if ([section isEqual:@"Identity"]) Await(^BOOL{ return LabelCount(s.identity.view) > 0; });
-            if (z == 0 && ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]))
-                Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-disconnected-%@-%@", Slug(section), names[z], mode]);
             if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) FeedAccess(&s, YES);
             if ([section isEqual:@"Hosts"]) {
                 NSTableView *t = HostsTable(s.hosts.view);

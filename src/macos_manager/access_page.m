@@ -3,36 +3,17 @@
 #import "hosts_model.h"
 #import "host_qr.h"
 #import "model.h"
+#import "ui.h"
 #import <Security/Security.h>
 #import <UserNotifications/UserNotifications.h>
 
 static NSTimeInterval Now(void) { return NSDate.date.timeIntervalSince1970; }
 static NSTextField *Label(NSString *s) { return [NSTextField wrappingLabelWithString:s ?: @""]; }
-static NSButton *Button(id self, NSString *s, SEL sel) { return [NSButton buttonWithTitle:s target:self action:sel]; }
 static NSStackView *Stack(NSArray *views, BOOL horizontal) {
     NSStackView *s = [NSStackView stackViewWithViews:views];
     s.orientation = horizontal ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
     s.alignment = horizontal ? NSLayoutAttributeCenterY : NSLayoutAttributeLeading; s.spacing = 8;
     return s;
-}
-static NSView *Column(NSArray *views) {
-    NSView *root = [NSView new]; NSStackView *s = Stack(@[], NO); s.translatesAutoresizingMaskIntoConstraints = NO;
-    for (NSView *v in views) { [s addArrangedSubview:v]; [v.widthAnchor constraintLessThanOrEqualToAnchor:s.widthAnchor].active = YES; }
-    [root addSubview:s];
-    [NSLayoutConstraint activateConstraints:@[[s.topAnchor constraintEqualToAnchor:root.topAnchor constant:14],
-        [s.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:14], [s.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-14]]];
-    return root;
-}
-static NSPopUpButton *Picker(id self, SEL action) {
-    NSPopUpButton *p = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO]; p.target = self; p.action = action; return p;
-}
-static void Item(NSPopUpButton *p, NSString *label, id key) {
-    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:label action:NULL keyEquivalent:@""];
-    item.representedObject = key; [p.menu addItem:item];
-}
-static void Select(NSPopUpButton *p, id key) {
-    for (NSMenuItem *item in p.itemArray) if ([key isEqual:item.representedObject]) { [p selectItem:item]; return; }
-    [p selectItemAtIndex:p.numberOfItems ? 0 : -1];
 }
 static BOOL DistributionSigned(void) {
     if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"] || !NSBundle.mainBundle.bundleIdentifier) return NO;
@@ -75,14 +56,19 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 }
 @end
 
-@interface MDLocalHostPages () <UNUserNotificationCenterDelegate> {
+@interface MDLocalHostPages () <UNUserNotificationCenterDelegate, NSTableViewDataSource, NSTableViewDelegate> {
     MDHostLink *_link;
     dispatch_group_t _qrWork;
     NSButton *_showQR;
     NSDictionary *_snapshot, *_policy, *_permissions;
     BOOL _busy, _closed;
-    NSTextField *_endpoint, *_status, *_agent, *_session, *_permission, *_accessStatus, *_requestDetails, *_policyDetail, *_notificationStatus;
-    NSPopUpButton *_requests, *_clients;
+    NSTextField *_endpoint, *_agent, *_session, *_sessionKey, *_notificationStatus;
+    MDStatusView *_status, *_accessStatus, *_screen, *_ax;
+    NSTableView *_requests, *_clients;
+    NSArray<NSDictionary *> *_requestRows, *_clientRows;
+    NSString *_selectedToken, *_selectedPeer;
+    NSView *_requestsEmpty, *_clientsEmpty;
+    NSTextField *_requestsEmptyTitle, *_requestsEmptyDetail, *_clientsEmptyTitle, *_clientsEmptyDetail;
     NSButton *_connect, *_recheck, *_kick, *_review, *_refreshPolicy, *_edit, *_revoke, *_kickRevoke;
     NSTimer *_clock;
     MDCapChooser *_chooser;
@@ -103,33 +89,11 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         [weakSelf received:status snapshot:s policy:p permissions:perms busy:busy];
     };
     _link = factory ? factory(update) : [[MDHostLink alloc] initWithUpdate:update];
-    _endpoint = [NSTextField textFieldWithString:@""];
-    _endpoint.placeholderString = @"Absolute path to the host management socket";
-    _endpoint.accessibilityLabel = @"Host management socket";
-    [_endpoint.widthAnchor constraintGreaterThanOrEqualToConstant:430].active = YES;
-    _status = Label(@"No authenticated host connection."); _agent = Label(@""); _session = Label(@""); _permission = Label(@"");
-    _connect = Button(self, @"Connect to Local Host", @selector(connect:));
-    _kick = Button(self, @"Disconnect Session…", @selector(kick:));
-    _recheck = Button(self, @"Recheck Permissions", @selector(permissions:));
     _qrWork = dispatch_group_create();
-    _showQR = Button(self, @"Show Host QR Code…", @selector(showQR:));
-    self.computerView = Column(@[_showQR, _endpoint, _connect, _status, _agent,
-        Label(@"Agent start/stop is not available here. The installed app must register dev.metadesk.host.plist before login can start the opted-in agent. For manual operation, provision a host role and start metadesk-host with --managed and --management-socket PATH; stop that foreground process with Control-C. See Host Lifecycle."),
-        Label(@"Sharing and unattended access are not configurable through current host IPC."),
-        _session, _kick, _permission,
-        Label(@"Grant permissions to the responsible host identity, not this manager. The preflight does not request consent, prove capture or input readiness, or grant remote access."), Stack(@[_recheck, Button(self,@"Screen Recording Settings",@selector(screen:)),
-        Button(self,@"Accessibility Settings",@selector(ax:))], YES)]);
-    _requests = Picker(self,@selector(selection:)); _clients = Picker(self,@selector(selection:));
-    _accessStatus = Label(@""); _requestDetails = Label(@""); _policyDetail = Label(@"");
-    _review = Button(self,@"Review Request…",@selector(review:));
-    _refreshPolicy = Button(self,@"Refresh Private Policy",@selector(refreshPolicy:));
-    _edit = Button(self,@"Edit Capabilities…",@selector(edit:));
-    _revoke = Button(self,@"Revoke…",@selector(revoke:));
-    _kickRevoke = Button(self,@"Kick and Revoke…",@selector(kickRevoke:));
-    _notificationStatus=Label(@"System notifications require an already-authorized signed app. The inbox works without them.");
-    self.accessView = Column(@[_accessStatus, _notificationStatus, Label(@"Pending Requests"), _requests, _requestDetails, _review,
-        Label(@"Remembered Clients"), _clients, _policyDetail, _refreshPolicy, Stack(@[_edit,_revoke,_kickRevoke], YES)]);
+    [self buildComputerView];
+    [self buildAccessView];
     _posted = [NSMutableSet set]; _noticeCooling=[NSMutableSet set]; _noticeAttempts=[NSMutableDictionary dictionary];
+    [self showStatus:nil];
     [self render];
     if (!factory) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (!DistributionSigned()) return;
@@ -141,10 +105,94 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     });
     return self;
 }
+static NSTableView *AccessTable(id owner, NSString *label) {
+    MDTable *t = [MDTable new];
+    t.dataSource = owner; t.delegate = owner; t.accessibilityLabel = label;
+    t.allowsEmptySelection = YES; t.allowsMultipleSelection = NO;
+    return t;
+}
+- (void)buildComputerView {
+    _endpoint = MDKeyField(@"/path/to/management.sock", @"Management socket");
+    _endpoint.target = self; _endpoint.action = @selector(connect:);
+    _connect = MDButton(@"Connect", self, @selector(connect:));
+    _connect.toolTip = @"Connect to the running host’s management socket";
+    _status = [MDStatusView new];
+    _agent = MDWrappingValue(@""); _session = MDWrappingValue(@"");
+    _sessionKey = MDValue(@""); _sessionKey.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    _sessionKey.accessibilityLabel = @"Session client public key";
+    _kick = MDButton(@"Disconnect Session…", self, @selector(kick:));
+    _showQR = MDButton(@"Show Host QR Code…", self, @selector(showQR:));
+    _showQR.toolTip = @"Show the saved host role’s public key as a QR code to scan from another device. This doesn’t check whether the host is running.";
+    NSGridView *host = MDForm(@[@[@"Management socket", MDRow(@[_endpoint, _connect])], @[NSNull.null, _status],
+                                @[@"Host", _agent], @[@"Session", _session], @[NSNull.null, _sessionKey], @[NSNull.null, _kick], @[@"Identity", _showQR]]);
+    _screen = [MDStatusView new]; _ax = [MDStatusView new];
+    NSButton *screen = MDButton(@"Open Settings", self, @selector(screen:));
+    NSButton *ax = MDButton(@"Open Settings", self, @selector(ax:));
+    screen.accessibilityLabel = @"Open Screen Recording settings"; ax.accessibilityLabel = @"Open Accessibility settings";
+    _recheck = MDButton(@"Recheck Permissions", self, @selector(permissions:));
+    NSStackView *screenRow = MDRow(@[_screen, screen]), *axRow = MDRow(@[_ax, ax]);
+    screenRow.alignment = axRow.alignment = NSLayoutAttributeCenterY;
+    [_screen setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [_ax setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSGridView *permissions = MDForm(@[@[@"Screen Recording", screenRow], @[@"Accessibility", axRow], @[NSNull.null, _recheck]]);
+    [permissions columnAtIndex:1].xPlacement = NSGridCellPlacementLeading;
+    NSStackView *stack = nil;
+    NSView *page = MDPage(@[MDHeader(@"Local Host"), host, MDSeparator(),
+        MDHeader(@"Permissions"),
+        MDNote(@"The host needs these permissions to share this Mac. Grant them to the host app in System Settings, not to Metadesk Manager. Checking doesn’t ask for permission or turn on sharing."),
+        permissions, MDSeparator(),
+        MDNote(@"Metadesk Manager doesn’t start or stop the host. A registered host agent starts when you log in; for manual use, run metadesk-host --managed --management-socket PATH in Terminal and stop it with Control-C. Sharing and unattended access can’t be changed here.")], &stack);
+    for (NSView *v in stack.arrangedSubviews) if ([v isKindOfClass:NSBox.class]) {
+        NSUInteger i = [stack.arrangedSubviews indexOfObject:v];
+        [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[i - 1]];
+        [stack setCustomSpacing:MDGroupSpacing afterView:v];
+    }
+    MDAlignForms(@[host, permissions]);
+    self.computerView = MDScrollingPage(page);
+}
+- (void)buildAccessView {
+    _accessStatus = [MDStatusView new];
+    _notificationStatus = MDNote(@"Requests appear here. System notifications need a signed copy of the app that already has notification permission.");
+    _requests = AccessTable(self, @"Pending requests");
+    MDColumnNamed(_requests, @"Client", @"Client", 175, nil);
+    MDColumnNamed(_requests, @"Key", @"Public Key", 160, nil);
+    MDColumnNamed(_requests, @"Requested", @"Requested", 200, nil);
+    MDColumnNamed(_requests, @"Left", @"Time Left", 80, nil);
+    MDFinishColumns(_requests, @"Requested");
+    _requests.target = self; _requests.doubleAction = @selector(review:);
+    _clients = AccessTable(self, @"Remembered clients");
+    MDColumnNamed(_clients, @"Client", @"Client", 175, nil);
+    MDColumnNamed(_clients, @"Key", @"Public Key", 160, nil);
+    MDColumnNamed(_clients, @"Access", @"Access", 260, nil);
+    MDFinishColumns(_clients, @"Access");
+    _clients.target = self; _clients.doubleAction = @selector(edit:);
+    NSView *empty = nil; NSTextField *title = nil, *detail = nil;
+    NSView *requests = MDTableArea(MDTableScroll(_requests), &empty, &title, &detail);
+    _requestsEmpty = empty; _requestsEmptyTitle = title; _requestsEmptyDetail = detail;
+    NSView *clients = MDTableArea(MDTableScroll(_clients), &empty, &title, &detail);
+    _clientsEmpty = empty; _clientsEmptyTitle = title; _clientsEmptyDetail = detail;
+    _review = MDButton(@"Review Request…", self, @selector(review:));
+    NSStackView *requestRow = MDRow(@[_notificationStatus]); requestRow.alignment = NSLayoutAttributeCenterY;
+    [requestRow addView:_review inGravity:NSStackViewGravityTrailing];
+    _refreshPolicy = MDButton(@"Reload", self, @selector(refreshPolicy:));
+    _refreshPolicy.toolTip = @"Read the host’s remembered clients again";
+    _edit = MDButton(@"Edit Access…", self, @selector(edit:));
+    _revoke = MDButton(@"Revoke…", self, @selector(revoke:));
+    _kickRevoke = MDButton(@"Disconnect and Revoke…", self, @selector(kickRevoke:));
+    NSStackView *clientRow = MDRow(@[_refreshPolicy]); clientRow.alignment = NSLayoutAttributeCenterY;
+    for (NSView *v in @[_edit, _revoke, _kickRevoke]) [clientRow addView:v inGravity:NSStackViewGravityTrailing];
+    NSStackView *stack = nil;
+    self.accessView = MDPage(@[_accessStatus, MDHeader(@"Pending Requests"), requests, requestRow, MDSeparator(),
+                               MDHeader(@"Remembered Clients"), clients, clientRow], &stack);
+    [requests.heightAnchor constraintEqualToAnchor:clients.heightAnchor].active = YES;
+    [stack setCustomSpacing:MDGroupSpacing afterView:_accessStatus];
+    [stack setCustomSpacing:MDGroupSpacing afterView:requestRow];
+    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[4]];
+}
 - (void)enableNotifications:(UNUserNotificationCenter *)center {
     if (_closed) return;
     _notifications = center; _notifications.delegate = self;
-    _notificationStatus.stringValue=@""; [self updateNotices];
+    _notificationStatus.stringValue=@"Requests appear here and as notifications."; [self updateNotices];
 }
 - (void)clearNotices:(NSArray *)ids {
     if (!ids.count) return;
@@ -159,7 +207,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     for (NSString *token in _noticeAttempts.allKeys) if (![wanted containsObject:token]) {
         [_noticeAttempts removeObjectForKey:token]; [_noticeCooling removeObject:token];
     }
-    if (!wanted.count) _notificationStatus.stringValue=@"";
+
     __weak MDLocalHostPages *weakSelf = self;
     UNUserNotificationCenter *center = _notifications;
     __weak UNUserNotificationCenter *weakCenter = center;
@@ -183,7 +231,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 - (void)noticeFailed:(NSString *)token {
     [_posted removeObject:token];
     if ([_noticeAttempts[token] unsignedIntegerValue] >= 2) {
-        _notificationStatus.stringValue=@"A notification could not be posted. Review the request in this inbox.";
+        _notificationStatus.stringValue=@"A notification couldn’t be posted. Review the request here.";
         return;
     }
     [_noticeCooling addObject:token];
@@ -203,7 +251,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         if (!self->_closed && opened && MDRequestForToken(self->_snapshot,token,Now())) {
             [NSApp sendAction:@selector(showSection:) to:nil from:@"Access"];
             [self.accessView.window makeKeyAndOrderFront:nil];
-            Select(self->_requests, token);
+            self->_selectedToken = token; [self tick:nil];
             [self review:nil];
         }
         completion();
@@ -247,17 +295,24 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     [_link close:^{ dispatch_group_leave(self->_qrWork); }];
     dispatch_group_notify(_qrWork, dispatch_get_main_queue(), drained);
 }
+- (void)showStatus:(NSString *)status {
+    MDStatusKind kind = _busy ? MDStatusWorking : _snapshot ? MDStatusOK : status.length ? MDStatusWarning : MDStatusInfo;
+    NSString *text = status.length ? status : @"Not connected to a local host.";
+    [_status setText:text kind:kind];
+    NSString *access = _snapshot || _busy ? text : [text stringByAppendingString:@" Connect in This Computer to see requests."];
+    [_accessStatus setText:access kind:kind];
+}
 - (void)received:(NSString *)status snapshot:(NSDictionary *)s policy:(NSDictionary *)p permissions:(NSDictionary *)perms busy:(BOOL)busy {
     if (_closed) return;
     _snapshot = s; _policy = p; _permissions = perms; _busy = busy;
-    _status.stringValue = status ?: @""; _accessStatus.stringValue = status ?: @"";
+    [self showStatus:status];
     [self render];
 }
 - (void)connect:(id)sender {
     (void)sender;
     if (_closed) return;
     _snapshot = nil; _policy = nil; _permissions = nil; _busy = YES;
-    _status.stringValue = _accessStatus.stringValue = @"Connecting to the local host…";
+    [self showStatus:@"Connecting to the local host…"];
     [self render]; [_link connect:MDHostTrim(_endpoint.stringValue)];
 }
 - (BOOL)canRefreshSection:(NSString *)section {
@@ -272,44 +327,90 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 - (void)refreshPolicy:(id)sender { (void)sender; [_link command:@{@"v":@1,@"method":@"access.list"}]; }
 - (void)settings:(MDPermissionKind)kind {
     if (![NSWorkspace.sharedWorkspace openURL:MDPermissionSettingsURL(kind)])
-        _permission.stringValue = @"Open System Settings → Privacy & Security and allow the intended host identity.";
+        [self showStatus:@"System Settings couldn’t be opened. Open Privacy & Security in System Settings and allow the host app there."];
 }
 - (void)screen:(id)sender { (void)sender; [self settings:MDScreenRecording]; }
 - (void)ax:(id)sender { (void)sender; [self settings:MDAccessibility]; }
 - (NSDictionary *)session { id s = _snapshot[@"session"]; return [s isKindOfClass:NSDictionary.class] ? s : nil; }
 - (NSDictionary *)client {
-    NSString *key = _clients.selectedItem.representedObject;
+    NSInteger row = _clients.selectedRow;
+    NSString *key = row >= 0 && (NSUInteger)row < _clientRows.count ? _clientRows[(NSUInteger)row][@"peer"] : nil;
     for (NSDictionary *c in _policy[@"clients"]) if ([key isEqual:c[@"peer"]]) return c;
     return nil;
 }
+- (NSString *)selectedRequestToken {
+    NSInteger row = _requests.selectedRow;
+    return row >= 0 && (NSUInteger)row < _requestRows.count ? _requestRows[(NSUInteger)row][@"token"] : nil;
+}
+static void SelectRow(NSTableView *table, NSArray<NSDictionary *> *rows, NSString *key, id value) {
+    NSUInteger index = NSNotFound;
+    for (NSUInteger i = 0; value && i < rows.count; ++i) if ([rows[i][key] isEqual:value]) { index = i; break; }
+    if (index == NSNotFound && rows.count) index = 0;
+    if (index == NSNotFound) [table deselectAll:nil];
+    else [table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
+}
+static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *key) {
+    if (!permissions) [view setText:@"Unknown" kind:MDStatusInfo];
+    else if ([permissions[key] boolValue]) [view setText:@"Allowed" kind:MDStatusOK];
+    else [view setText:@"Not allowed" kind:MDStatusWarning];
+}
 - (void)render {
     NSDictionary *h = _snapshot[@"host"], *s = self.session;
-    _agent.stringValue = h ? [NSString stringWithFormat:@"%@ host is running and reachable (PID %@, %@).", [h[@"managed"] boolValue] ? @"Managed" : @"Interactive", h[@"pid"], MDHostBoundText(h[@"state"],32)] :
-        _snapshot ? @"Host reachable; supervisor state not exposed." : @"Host reachability and agent state are unknown.";
-    _session.stringValue = !s ? (_snapshot ? @"No session reserved or active." : @"Session state unknown.") :
-        [NSString stringWithFormat:@"%@\n%@ · %@", [s[@"revoked"] boolValue] ? @"Session ending" : @"Session reserved or active", MDHostNpub(s[@"peer"]), MDAccessCaps([s[@"granted"] unsignedIntValue])];
-    _permission.stringValue = [NSString stringWithFormat:@"Host permissions: Screen Recording — %@; Accessibility — %@.",
-        !_permissions ? @"Unknown" : [_permissions[@"screen_recording"] boolValue] ? @"Allowed" : @"Not allowed",
-        !_permissions ? @"Unknown" : [_permissions[@"accessibility"] boolValue] ? @"Allowed" : @"Not allowed"];
-    _connect.enabled = !_busy; _recheck.enabled = _snapshot && !_busy; _kick.enabled = !_busy && MDKickCommand(_snapshot,s) != nil;
+    _agent.stringValue = h ? [NSString stringWithFormat:@"%@ host is running (process %@, %@).", [h[@"managed"] boolValue] ? @"Managed" : @"Interactive", h[@"pid"], MDHostBoundText(h[@"state"],32)] :
+        _snapshot ? @"Reachable. The host doesn’t report its supervisor state." : @"Unknown until you connect.";
+    _agent.textColor = h || _snapshot ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    _session.stringValue = !s ? (_snapshot ? @"No session." : @"Unknown until you connect.") :
+        [NSString stringWithFormat:@"%@ — %@", [s[@"revoked"] boolValue] ? @"Ending" : @"Reserved or active", MDAccessCaps([s[@"granted"] unsignedIntValue])];
+    _sessionKey.stringValue = s ? MDHostNpub(s[@"peer"]) ?: @"Unknown client" : @"";
+    _sessionKey.toolTip = _sessionKey.stringValue;
+    MDSetRowHidden(_sessionKey, !s);
+    _session.textColor = s ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    Permission(_screen, _permissions, @"screen_recording");
+    Permission(_ax, _permissions, @"accessibility");
+    _connect.enabled = !_busy; _endpoint.enabled = !_busy;
+    _recheck.enabled = _snapshot && !_busy; _kick.enabled = !_busy && MDKickCommand(_snapshot,s) != nil;
+    MDSetRowHidden(_kick, !s);
     _refreshPolicy.enabled = _snapshot && !_busy;
-    id selected = _clients.selectedItem.representedObject;
-    [_clients removeAllItems];
-    if ([_policy[@"policy_available"] boolValue]) for (NSDictionary *c in _policy[@"clients"]) Item(_clients, MDHostNpub(c[@"peer"]) ?: @"Invalid key", c[@"peer"]);
-    if (!_clients.numberOfItems) Item(_clients, [_policy[@"policy_available"] boolValue] ? @"No remembered clients" : @"Private policy unavailable", nil);
-    Select(_clients, selected);
+    NSDictionary *selected = self.client;
+    NSString *peer = selected[@"peer"] ?: _selectedPeer;
+    NSMutableArray *clients = [NSMutableArray array];
+    if ([_policy[@"policy_available"] boolValue]) for (NSDictionary *c in _policy[@"clients"]) {
+        uint32_t bits;
+        BOOL known = ![c[@"review_required"] boolValue] && MDPolicyCaps(c[@"caps"], &bits);
+        [clients addObject:@{@"peer":c[@"peer"] ?: @"", @"fingerprint":MDHostFingerprint(c[@"peer"]) ?: @"Invalid key",
+            @"npub":MDHostNpub(c[@"peer"]) ?: @"Invalid key", @"access":known ? MDAccessCaps(bits) : @"Unknown or legacy — review with the CLI"}];
+    }
+    _clientRows = clients;
+    [_clients reloadData];
+    SelectRow(_clients, _clientRows, @"peer", peer);
+    BOOL available = [_policy[@"policy_available"] boolValue];
+    _clientsEmpty.hidden = _clientRows.count != 0;
+    _clientsEmptyTitle.stringValue = !_snapshot ? @"Not Connected" : available ? @"No Remembered Clients" : @"Remembered Clients Not Loaded";
+    _clientsEmptyDetail.stringValue = !_snapshot ? @"Connect to the local host in This Computer." :
+        available ? @"Clients you approve with Remember appear here." : @"Choose Reload to read the host’s remembered clients.";
     [self tick:nil];
 }
 - (void)tick:(NSTimer *)timer {
     (void)timer;
     if (_closed) return;
-    NSArray *requests = MDLiveRequests(_snapshot, Now());
-    NSString *selected = _requests.selectedItem.representedObject;
-    [_requests removeAllItems];
-    for (NSDictionary *r in requests) Item(_requests, MDHostNpub(r[@"peer"]) ?: @"Invalid key", MDRequestToken(_snapshot,r));
-    if (!requests.count) Item(_requests, @"No pending requests", nil);
+    NSTimeInterval now = Now();
+    NSArray *requests = MDLiveRequests(_snapshot, now);
+    NSString *selected = self.selectedRequestToken ?: _selectedToken;
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSDictionary *r in requests) {
+        NSString *token = MDRequestToken(_snapshot,r);
+        long long left = (long long)ceil([r[@"expires_at"] doubleValue] - now);
+        [rows addObject:@{@"token":token ?: @"", @"fingerprint":MDHostFingerprint(r[@"peer"]) ?: @"Invalid key",
+            @"npub":MDHostNpub(r[@"peer"]) ?: @"Invalid key", @"requested":MDAccessCaps([r[@"requested"] unsignedIntValue]),
+            @"left":left >= 60 ? [NSString stringWithFormat:@"%lld min %02lld s", left / 60, left % 60] : [NSString stringWithFormat:@"%lld s", left]}];
+    }
+    _requestRows = rows;
+    [_requests reloadData];
+    SelectRow(_requests, _requestRows, @"token", selected);
+    _requestsEmpty.hidden = rows.count != 0;
+    _requestsEmptyTitle.stringValue = _snapshot ? @"No Pending Requests" : @"Not Connected";
+    _requestsEmptyDetail.stringValue = _snapshot ? @"When a client asks to connect, its request waits here for your review." : @"Connect to the local host in This Computer.";
     if (requests.count != _pendingCount) { _pendingCount = requests.count; if (self.pendingChanged) self.pendingChanged(_pendingCount); }
-    Select(_requests, selected);
     [self selection:nil];
     [self updateNotices];
     if (_chooser.update) _chooser.update();
@@ -320,22 +421,42 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
 }
 - (void)selection:(id)sender {
     (void)sender;
-    NSDictionary *r = MDRequestForToken(_snapshot,_requests.selectedItem.representedObject,Now());
-    _requestDetails.stringValue = r ? [NSString stringWithFormat:@"Requested: %@ · %lld s remaining", MDAccessCaps([r[@"requested"] unsignedIntValue]), (long long)ceil([r[@"expires_at"] doubleValue]-Now())] : @"";
+    NSString *token = self.selectedRequestToken;
+    if (token) _selectedToken = token;
+    NSDictionary *r = MDRequestForToken(_snapshot,token,Now());
     _review.enabled = r && !_busy;
     NSDictionary *c = self.client;
+    if (c) _selectedPeer = c[@"peer"];
     uint32_t bits;
     BOOL editable = c && ![c[@"review_required"] boolValue] && MDPolicyCaps(c[@"caps"], &bits);
-    _policyDetail.stringValue = c ? [NSString stringWithFormat:@"%@\nFingerprint: %@\n%@", MDHostNpub(c[@"peer"]), MDHostFingerprint(c[@"peer"]),
-        editable ? MDAccessCaps(bits) : @"Unknown or legacy policy — review with the CLI; editing is unavailable."] : @"";
     _edit.enabled = editable && !_busy; _revoke.enabled = c && !_busy;
     _kickRevoke.enabled = c && !_busy && [self.session[@"peer"] isEqual:c[@"peer"]];
+}
+- (void)tableViewSelectionDidChange:(NSNotification *)note { (void)note; [self selection:nil]; }
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)table {
+    return (NSInteger)(table == _requests ? _requestRows.count : _clientRows.count);
+}
+- (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    NSDictionary *r = (table == _requests ? _requestRows : _clientRows)[(NSUInteger)row];
+    NSString *identifier = column.identifier;
+    NSString *text = [identifier isEqual:@"Client"] ? r[@"fingerprint"] : [identifier isEqual:@"Key"] ? r[@"npub"] :
+        [identifier isEqual:@"Requested"] ? r[@"requested"] : [identifier isEqual:@"Left"] ? r[@"left"] : r[@"access"];
+    NSTableCellView *cell = MDCell(table, [identifier stringByAppendingString:@"Cell"], text);
+    BOOL key = [identifier isEqual:@"Client"] || [identifier isEqual:@"Key"];
+    cell.textField.font = key ? [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular] : [NSFont systemFontOfSize:NSFont.systemFontSize];
+    cell.textField.lineBreakMode = [identifier isEqual:@"Key"] ? NSLineBreakByTruncatingMiddle : NSLineBreakByTruncatingTail;
+    cell.textField.toolTip = [identifier isEqual:@"Client"] ? r[@"npub"] : text;
+    return cell;
+}
+- (NSString *)tableView:(NSTableView *)table typeSelectStringForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    (void)column;
+    return (table == _requests ? _requestRows : _clientRows)[(NSUInteger)row][@"fingerprint"];
 }
 - (void)review:(id)sender {
     (void)sender;
     NSWindow *window = self.accessView.window;
     NSDictionary *snapshot = _snapshot, *policy = _policy;
-    NSString *token = _requests.selectedItem.representedObject;
+    NSString *token = self.selectedRequestToken;
     NSDictionary *r = MDRequestForToken(snapshot,token,Now());
     if (!r || _busy || _closed || _chooser || !window || window.attachedSheet) return;
     NSAlert *a = [NSAlert new]; a.messageText = @"Review Connection Request";

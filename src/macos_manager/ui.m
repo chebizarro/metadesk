@@ -141,6 +141,22 @@ NSGridView *MDForm(NSArray<NSArray *> *rows) {
     }
     return grid;
 }
+void MDAlignForms(NSArray<NSGridView *> *forms) {
+    CGFloat width = 0;
+    for (NSGridView *g in forms) for (NSInteger r = 0; r < g.numberOfRows; ++r) {
+        NSView *v = [g cellAtColumnIndex:0 rowIndex:r].contentView;
+        if (v && v != NSGridCell.emptyContentView && [g cellAtColumnIndex:0 rowIndex:r].row.numberOfCells && v.intrinsicContentSize.width > width
+            && [g cellAtColumnIndex:1 rowIndex:r].contentView != v) width = v.intrinsicContentSize.width;
+    }
+    for (NSGridView *g in forms) [g columnAtIndex:0].width = ceil(width);
+}
+void MDSetRowHidden(NSView *view, BOOL hidden) {
+    view.hidden = hidden;
+    NSView *v = view;
+    while (v.superview && ![v.superview isKindOfClass:NSGridView.class]) v = v.superview;
+    NSGridView *grid = (NSGridView *)v.superview;
+    if (grid) [grid cellForView:v].row.hidden = hidden;
+}
 NSBox *MDSeparator(void) { NSBox *b = [NSBox new]; b.boxType = NSBoxSeparator; return b; }
 NSView *MDPage(NSArray<NSView *> *views, NSStackView **out) {
     NSView *root = [NSView new];
@@ -163,6 +179,28 @@ NSView *MDPage(NSArray<NSView *> *views, NSStackView **out) {
                  : [stack.bottomAnchor constraintLessThanOrEqualToAnchor:root.bottomAnchor constant:-MDMargin]]];
     if (out) *out = stack;
     return root;
+}
+@interface MDFlippedView : NSView
+@end
+@implementation MDFlippedView
+- (BOOL)isFlipped { return YES; }
+@end
+NSView *MDScrollingPage(NSView *page) {
+    NSScrollView *scroll = [NSScrollView new];
+    scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES; scroll.drawsBackground = NO;
+    scroll.borderType = NSNoBorder;
+    MDFlippedView *document = [MDFlippedView new];
+    document.translatesAutoresizingMaskIntoConstraints = NO;
+    page.translatesAutoresizingMaskIntoConstraints = NO;
+    [document addSubview:page];
+    scroll.documentView = document;
+    NSClipView *clip = scroll.contentView;
+    [NSLayoutConstraint activateConstraints:@[
+        [page.topAnchor constraintEqualToAnchor:document.topAnchor], [page.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
+        [page.leadingAnchor constraintEqualToAnchor:document.leadingAnchor], [page.trailingAnchor constraintEqualToAnchor:document.trailingAnchor],
+        [document.topAnchor constraintEqualToAnchor:clip.topAnchor], [document.leadingAnchor constraintEqualToAnchor:clip.leadingAnchor],
+        [document.widthAnchor constraintEqualToAnchor:clip.widthAnchor]]];
+    return scroll;
 }
 NSScrollView *MDTableScroll(NSTableView *table) {
     NSScrollView *scroll = [NSScrollView new];
@@ -286,7 +324,7 @@ NSTableCellView *MDCell(NSTableView *table, NSString *identifier, NSString *text
     _icon.hidden = symbol == nil;
     if (kind == MDStatusWorking) { _spinner.hidden = NO; [_spinner startAnimation:nil]; }
     else { [_spinner stopAnimation:nil]; _spinner.hidden = YES; }
-    self.hidden = !text.length;
+    MDSetRowHidden(self, !text.length);
     self.accessibilityLabel = description ? [NSString stringWithFormat:@"%@: %@", description, text ?: @""] : text;
 }
 @end

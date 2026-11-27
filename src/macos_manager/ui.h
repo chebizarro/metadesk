@@ -37,9 +37,15 @@ NSStackView *MDColumn(NSArray<NSView *> *views, CGFloat spacing);
  * the first baseline. A row may be a single view that spans both columns; an
  * NSNull label leaves the label cell empty. */
 NSGridView *MDForm(NSArray<NSArray *> *rows);
+/* Gives several forms one label-column width so their controls line up. */
+void MDAlignForms(NSArray<NSGridView *> *forms);
+/* Hides a view and, inside a form, its whole row so no gap is left. */
+void MDSetRowHidden(NSView *view, BOOL hidden);
 NSBox *MDSeparator(void);
 /* Page container: a vertical stack pinned to the standard margins. */
 NSView *MDPage(NSArray<NSView *> *views, NSStackView **stack);
+/* Lets a form page scroll vertically when the window is shorter than it. */
+NSView *MDScrollingPage(NSView *page);
 /* A bordered scroll view around a table, with an overlay for its empty state. */
 NSScrollView *MDTableScroll(NSTableView *table);
 /* Wraps the scroll view in a container with a centered empty-state overlay.
