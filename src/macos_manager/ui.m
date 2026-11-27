@@ -137,6 +137,7 @@ NSGridView *MDForm(NSArray<NSArray *> *rows) {
         NSView *labelView = label == NSNull.null ? NSGridCell.emptyContentView :
             [label isKindOfClass:NSString.class] ? MDFormLabel(label) : label;
         NSGridRow *r = [grid addRowWithViews:@[labelView, row[1]]];
+        if ([row[1] isKindOfClass:NSScrollView.class]) { r.rowAlignment = NSGridRowAlignmentNone; r.yPlacement = NSGridCellPlacementTop; }
         if (!Fills(row[1])) [r cellAtIndex:1].xPlacement = NSGridCellPlacementLeading;
         else [(NSView *)row[1] setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
     }

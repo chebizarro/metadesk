@@ -129,6 +129,8 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
     window.restorable = NO; /* frame only: never restore page content */
     window.title = @"Metadesk Manager";
     window.tabbingMode = NSWindowTabbingModeDisallowed;
+    /* Tab follows the visual order: sidebar, page controls, tables, toolbar. */
+    window.autorecalculatesKeyViewLoop = YES;
     window.delegate = self;
 
     _sidebar = [MDSidebarController new];
