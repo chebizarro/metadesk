@@ -102,3 +102,14 @@ macos_page_test = executable('test_macos_manager_pages', ['test_pages.m', 'main.
   include_directories : include_directories('../../tests'))
 test('macOS AppKit controller actions and quit', macos_hosts_python,
   args : [files('test_local_manager.py'), '--pages', macos_page_test], suite : 'macos_manager', timeout : 25)
+
+# Design review aid: render every page and sheet offscreen to PNG in the build
+# directory (meson test -C BUILD --suite macos_manager_snapshots).
+macos_snapshot_tool = executable('macos_manager_snapshots', ['snapshot_pages.m', 'main.m'],
+  objc_args : ['-fobjc-arc', '-DMD_MACOS_MANAGER_APP_TEST'],
+  link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
+  dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
+  build_by_default : false)
+test('macOS Manager offscreen snapshots', macos_hosts_python,
+  args : [files('snapshot_pages.py'), macos_snapshot_tool, meson.project_build_root() / 'snapshots' / 'current'],
+  suite : 'macos_manager_snapshots', timeout : 300, is_parallel : false)
