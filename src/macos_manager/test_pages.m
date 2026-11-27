@@ -39,15 +39,28 @@ static NSButton *Button(NSView *view, NSString *title) {
             (!((NSButton *)v).title.length && [v.accessibilityLabel isEqual:title]));
     });
 }
+/* Matches an editable field by placeholder or accessibility label prefix. */
 static NSTextField *Field(NSView *view, NSString *prefix) {
     return (NSTextField *)Find(view,^BOOL(NSView *v) {
-        return [v isKindOfClass:NSTextField.class] && [((NSTextField *)v).placeholderString hasPrefix:prefix];
+        return [v isKindOfClass:NSTextField.class] && ((NSTextField *)v).editable &&
+            ([((NSTextField *)v).placeholderString hasPrefix:prefix] || [v.accessibilityLabel hasPrefix:prefix]);
     });
 }
 static BOOL LabelContains(NSView *view, NSString *message) {
     return Find(view,^BOOL(NSView *v) {
         return [v isKindOfClass:NSTextField.class] && [((NSTextField *)v).stringValue containsString:message];
     }) != nil;
+}
+/* Trust decisions must be chosen deliberately: no button answers Return. */
+static BOOL NoDefault(NSView *sheet) {
+    return Find(sheet,^BOOL(NSView *v) {
+        return [v isKindOfClass:NSButton.class] && [((NSButton *)v).keyEquivalent isEqual:@"\r"];
+    }) == nil;
+}
+static BOOL Escapes(NSButton *button) { return [button.keyEquivalent isEqual:@"\e"]; }
+static void Typed(NSTextField *field, NSString *text) {
+    field.stringValue = text;
+    [NSNotificationCenter.defaultCenter postNotificationName:NSControlTextDidChangeNotification object:field];
 }
 static NSWindow *TestWindow(NSView *view) {
     NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,820,540)
@@ -310,6 +323,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
     NSView *sheet=window.attachedSheet.contentView;
     CHECK(Button(sheet,@"Connect").enabled && Button(sheet,@"Save Host").enabled);
+    CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Cancel")));
     CHECK([worker.input isEqual:@KEY] && worker.resolves==1 && !worker.saves && !worker.launches);
     CHECK(EndSheet(window,NSAlertFirstButtonReturn) && !worker.saves && !worker.launches);
     CHECK(Send(review) && Await(^BOOL{ return window.attachedSheet!=nil; }));
@@ -326,12 +340,17 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     sheet=window.attachedSheet.contentView;
     CHECK(Button(sheet,@"Keep Old Key") && Button(sheet,@"Replace Key") && !Button(sheet,@"Connect") && !Button(sheet,@"Save Host"));
     NSTextField *fp=Field(sheet,@"Type the new fingerprint"); CHECK(fp);
-    fp.stringValue=MDHostFingerprint(@KEY);
+    /* Replace stays off until the exact new fingerprint is typed. */
+    CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Keep Old Key")) && !Button(sheet,@"Replace Key").enabled);
+    CHECK(Button(sheet,@"Replace Key").hasDestructiveAction);
+    Typed(fp,@"wrong"); CHECK(!Button(sheet,@"Replace Key").enabled);
+    Typed(fp,MDHostFingerprint(@OTHER)); CHECK(!Button(sheet,@"Replace Key").enabled);
+    Typed(fp,MDHostFingerprint(@KEY)); CHECK(Button(sheet,@"Replace Key").enabled);
     CHECK(EndSheet(window,NSModalResponseCancel) && worker.saves==1);
     CHECK(Send(review) && Await(^BOOL{ return window.attachedSheet!=nil; }));
     fp=Field(window.attachedSheet.contentView,@"Type the new fingerprint"); CHECK(fp); fp.stringValue=@"wrong";
     CHECK(EndSheet(window,NSAlertSecondButtonReturn));
-    CHECK(LabelContains(view,@"Replacement requires") && worker.saves==1 && worker.launches==1);
+    CHECK(LabelContains(view,@"Replacing it needs the exact new fingerprint") && worker.saves==1 && worker.launches==1);
     CHECK(Send(review) && Await(^BOOL{ return window.attachedSheet!=nil; }));
     fp=Field(window.attachedSheet.contentView,@"Type the new fingerprint"); CHECK(fp); fp.stringValue=MDHostFingerprint(@KEY);
     CHECK(EndSheet(window,NSAlertSecondButtonReturn));
@@ -371,7 +390,8 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
     CHECK(video && video.enabled && video.state==NSControlStateValueOn);
     CHECK(agent && agent.enabled && agent.state==NSControlStateValueOff);
     CHECK(input && !input.enabled && input.state==NSControlStateValueOff);
-    CHECK(Button(sheet,@"Approve Once").enabled && Button(sheet,@"Remember Exact Grant").enabled);
+    CHECK(Button(sheet,@"Approve Once").enabled && Button(sheet,@"Approve and Remember").enabled);
+    CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Cancel")));
     CHECK(EndSheet(window,NSAlertSecondButtonReturn));
     CHECK(link.commands.count==1);
     NSDictionary *command=link.commands.firstObject;
@@ -383,7 +403,7 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
         sheet=window.attachedSheet.contentView;
         CHECK(Button(sheet,MDAccessCaps(MD_CAP_VIDEO)).state==NSControlStateValueOff && Button(sheet,@"Deny").enabled);
         link.push(@"Fixture",Snapshot(2+round,MD_CAP_AGENT,round ? now+60 : now-1,round!=0),policy,nil,NO);
-        CHECK(!open.enabled && !Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Remember Exact Grant").enabled && !Button(sheet,@"Deny").enabled);
+        CHECK(!open.enabled && !Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Approve and Remember").enabled && !Button(sheet,@"Deny").enabled);
         CHECK(EndSheet(window,NSAlertThirdButtonReturn+1) && link.commands.count==1);
     }
     for (NSInteger busy=0; busy<2; ++busy) {
@@ -392,7 +412,7 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
         sheet=window.attachedSheet.contentView;
         CHECK(Button(sheet,@"Approve Once").enabled);
         link.push(@"Fixture",Snapshot(busy ? 8 : 9,all,now+60,NO),policy,nil,busy!=0);
-        CHECK(!Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Remember Exact Grant").enabled && !Button(sheet,@"Deny").enabled);
+        CHECK(!Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Approve and Remember").enabled && !Button(sheet,@"Deny").enabled);
         CHECK(EndSheet(window,NSAlertSecondButtonReturn) && link.commands.count==1);
     }
     return YES;
@@ -444,7 +464,7 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
     CHECK(Await(^BOOL{ return bind.enabled && LabelContains(view,@"Account added"); }));
     CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"key"] isEqual:@OTHER]);
     CHECK(Send(Button(view,@"Edit Label…")) && Await(^BOOL{ return window.attachedSheet!=nil; }));
-    label=Field(window.attachedSheet.contentView,@"Public account label"); CHECK(label);
+    label=Field(window.attachedSheet.contentView,@"Public label"); CHECK(label);
     label.stringValue=@"Renamed";
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
     CHECK(Await(^BOOL{ return LabelContains(view,@"Label saved"); }));

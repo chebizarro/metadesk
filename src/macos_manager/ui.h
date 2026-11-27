@@ -78,13 +78,17 @@ void MDAlertConfirm(NSAlert *alert, NSString *action);
 NSButton *MDAlertDestructive(NSAlert *alert, NSString *action);
 /* Labeled, selectable details: @[@[@"Label", value], ...]. Values are plain text. */
 NSGridView *MDDetails(NSArray<NSArray<NSString *> *> *rows);
+/* A selectable key or fingerprint in a monospaced font that wraps by character. */
+NSTextField *MDKeyValue(NSString *text);
 
 /* Review and form sheets with explicit button roles. Buttons are laid out the
  * HIG way: other actions on the left, then Cancel, then the default action on
  * the right. Return activates the default button, if any; Escape and
  * cancelOperation: activate the cancel button, if any. A destructive button
  * gets no key equivalent. Each button ends the sheet with its response code. */
-typedef NS_ENUM(NSInteger, MDSheetRole) { MDSheetDefault, MDSheetCancel, MDSheetOther, MDSheetDestructive };
+/* MDSheetAction sits with Cancel on the right but has no key equivalent: use
+ * it for trust decisions, which must be chosen deliberately, never by Return. */
+typedef NS_ENUM(NSInteger, MDSheetRole) { MDSheetDefault, MDSheetCancel, MDSheetOther, MDSheetDestructive, MDSheetAction };
 @interface MDSheet : NSObject
 - (instancetype)initWithTitle:(NSString *)title message:(NSString *)message width:(CGFloat)width;
 @property(nonatomic, readonly) NSWindow *window;

@@ -114,6 +114,7 @@ NSStackView *MDColumn(NSArray<NSView *> *views, CGFloat spacing) {
         [v.widthAnchor constraintEqualToAnchor:s.widthAnchor].active = YES;
     return s;
 }
+void MDAlignForms(NSArray<NSGridView *> *forms);
 static BOOL Fills(NSView *view) {
     if ([view isKindOfClass:NSTextField.class]) return YES;
     if ([view isKindOfClass:NSStackView.class] || [view isKindOfClass:NSScrollView.class] || [view isKindOfClass:NSBox.class]) return YES;
@@ -139,6 +140,7 @@ NSGridView *MDForm(NSArray<NSArray *> *rows) {
         if (!Fills(row[1])) [r cellAtIndex:1].xPlacement = NSGridCellPlacementLeading;
         else [(NSView *)row[1] setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
     }
+    MDAlignForms(@[grid]);
     return grid;
 }
 void MDAlignForms(NSArray<NSGridView *> *forms) {
@@ -345,6 +347,12 @@ NSButton *MDAlertDestructive(NSAlert *alert, NSString *action) {
     b.hasDestructiveAction = YES; b.keyEquivalent = @"";
     return b;
 }
+NSTextField *MDKeyValue(NSString *text) {
+    NSTextField *f = MDWrappingValue(text);
+    f.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+    f.lineBreakMode = NSLineBreakByCharWrapping;
+    return f;
+}
 NSGridView *MDDetails(NSArray<NSArray<NSString *> *> *rows) {
     NSMutableArray *grid = [NSMutableArray array];
     for (NSArray *row in rows) {
@@ -430,6 +438,7 @@ NSGridView *MDDetails(NSArray<NSArray<NSString *> *> *rows) {
         case MDSheetCancel: b.keyEquivalent = @"\e"; _cancel = b; [_buttons insertView:b atIndex:0 inGravity:NSStackViewGravityTrailing]; break;
         case MDSheetDestructive: b.hasDestructiveAction = YES; [_buttons addView:b inGravity:NSStackViewGravityLeading]; break;
         case MDSheetOther: [_buttons addView:b inGravity:NSStackViewGravityLeading]; break;
+        case MDSheetAction: [_buttons addView:b inGravity:NSStackViewGravityTrailing]; break;
     }
     [_all addObject:b];
     return b;

@@ -8,13 +8,6 @@
 #import <UserNotifications/UserNotifications.h>
 
 static NSTimeInterval Now(void) { return NSDate.date.timeIntervalSince1970; }
-static NSTextField *Label(NSString *s) { return [NSTextField wrappingLabelWithString:s ?: @""]; }
-static NSStackView *Stack(NSArray *views, BOOL horizontal) {
-    NSStackView *s = [NSStackView stackViewWithViews:views];
-    s.orientation = horizontal ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
-    s.alignment = horizontal ? NSLayoutAttributeCenterY : NSLayoutAttributeLeading; s.spacing = 8;
-    return s;
-}
 static BOOL DistributionSigned(void) {
     if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"] || !NSBundle.mainBundle.bundleIdentifier) return NO;
     SecCodeRef code = NULL; SecStaticCodeRef stat = NULL; CFDictionaryRef info = NULL;
@@ -27,17 +20,19 @@ static BOOL DistributionSigned(void) {
     return ok;
 }
 
+/* Permission checkboxes for an approval or an edit. Disabled boxes can't be
+ * granted: the client didn't request them or the host doesn't support them. */
 @interface MDCapChooser : NSObject
 @property(nonatomic) NSArray<NSButton *> *choices;
-@property(nonatomic) NSTextField *lifetime;
-@property(nonatomic) NSAlert *alert;
+@property(nonatomic) MDStatusView *lifetime;
+@property(nonatomic) MDSheet *sheet;
 @property(nonatomic, copy) dispatch_block_t update;
-- (NSView *)viewWithAllowed:(uint32_t)allowed initial:(uint32_t)initial lifetime:(BOOL)lifetime;
+- (NSView *)viewWithAllowed:(uint32_t)allowed initial:(uint32_t)initial;
 - (uint32_t)selected;
 @end
 @implementation MDCapChooser
 static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP_MONITOR, MD_CAP_CLIPBOARD};
-- (NSView *)viewWithAllowed:(uint32_t)allowed initial:(uint32_t)initial lifetime:(BOOL)lifetime {
+- (NSView *)viewWithAllowed:(uint32_t)allowed initial:(uint32_t)initial {
     NSMutableArray *list = [NSMutableArray array];
     for (NSUInteger i=0;i<sizeof(Caps)/sizeof(*Caps);++i) {
         NSButton *b = [NSButton checkboxWithTitle:MDAccessCaps(Caps[i]) target:self action:@selector(changed:)];
@@ -45,8 +40,9 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
         [list addObject:b];
     }
     self.choices = [list copy];
-    if (lifetime) { self.lifetime = Label(@""); [list addObject:self.lifetime]; }
-    NSStackView *s = Stack(list, NO); s.frame = NSMakeRect(0, 0, 380, lifetime ? 166 : 138); return s;
+    NSStackView *boxes = [NSStackView stackViewWithViews:list];
+    boxes.orientation = NSUserInterfaceLayoutOrientationVertical; boxes.alignment = NSLayoutAttributeLeading; boxes.spacing = 6;
+    return boxes;
 }
 - (void)changed:(id)sender { (void)sender; if (self.update) self.update(); }
 - (uint32_t)selected {
@@ -270,19 +266,24 @@ static NSTableView *AccessTable(id owner, NSString *label) {
             if (self->_closed) return;
             self->_showQR.enabled = YES;
             if (window != self.computerView.window || window.attachedSheet) return;
-            NSAlert *alert = [NSAlert new];
-            alert.messageText = @"Host QR Code";
-            [alert addButtonWithTitle:@"Close"];
+            MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Host QR Code"
+                message:pixels ? @"Scan this from the device you’ll connect from, then check that the fingerprint it shows matches this one. This shows the saved host role; it doesn’t check that the host is running."
+                               : @"There’s no saved host role to show. Assign a host role in Identity, then try again."
+                  width:440];
             if (pixels) {
-                alert.informativeText = [NSString stringWithFormat:@"Saved public host identity (not a live host check).\nFingerprint: %@", fingerprint];
                 CGImageRef bitmap = (__bridge CGImageRef)pixels;
                 NSSize size = NSMakeSize(CGImageGetWidth(bitmap), CGImageGetHeight(bitmap));
                 NSImageView *view = [NSImageView imageViewWithImage:[[NSImage alloc] initWithCGImage:bitmap size:size]];
-                view.frame = (NSRect){NSZeroPoint, size};
+                view.imageScaling = NSImageScaleProportionallyUpOrDown;
                 view.accessibilityLabel = @"QR code for the saved public host identity";
-                alert.accessoryView = view;
-            } else alert.informativeText = @"Cannot display a QR code. Check the saved host role in Identity.";
-            [alert beginSheetModalForWindow:window completionHandler:nil];
+                [view.widthAnchor constraintEqualToConstant:MIN(size.width, 280)].active = YES;
+                [view.heightAnchor constraintEqualToAnchor:view.widthAnchor].active = YES;
+                NSStackView *center = [NSStackView stackViewWithViews:@[view]];
+                center.alignment = NSLayoutAttributeCenterX; center.orientation = NSUserInterfaceLayoutOrientationVertical;
+                sheet.accessory = MDColumn(@[center, MDDetails(@[@[@"Fingerprint", MDKeyValue(fingerprint ?: @"")]])], MDGroupSpacing);
+            }
+            [sheet addButton:@"Done" role:MDSheetDefault response:NSAlertFirstButtonReturn];
+            [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) { (void)response; }];
         });
     } });
 }
@@ -290,7 +291,8 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     _closed = YES; [_clock invalidate]; _clock = nil;
     [self clearNotices:_posted.allObjects]; [_posted removeAllObjects];
     _notifications.delegate = nil;
-    if (_chooser.alert.window.sheetParent) [_chooser.alert.window.sheetParent endSheet:_chooser.alert.window returnCode:NSAlertFirstButtonReturn];
+    NSWindow *review = _chooser.sheet.window;
+    if (review.sheetParent) [review.sheetParent endSheet:review returnCode:NSAlertFirstButtonReturn];
     dispatch_group_enter(_qrWork);
     [_link close:^{ dispatch_group_leave(self->_qrWork); }];
     dispatch_group_notify(_qrWork, dispatch_get_main_queue(), drained);
@@ -452,6 +454,9 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     (void)column;
     return (table == _requests ? _requestRows : _clientRows)[(NSUInteger)row][@"fingerprint"];
 }
+/* An approval is a trust decision: no button answers Return, Escape cancels,
+ * and nothing can be approved once the request has expired, been cancelled or
+ * gone stale. Only requested and supported screen viewing starts selected. */
 - (void)review:(id)sender {
     (void)sender;
     NSWindow *window = self.accessView.window;
@@ -459,12 +464,27 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     NSString *token = self.selectedRequestToken;
     NSDictionary *r = MDRequestForToken(snapshot,token,Now());
     if (!r || _busy || _closed || _chooser || !window || window.attachedSheet) return;
-    NSAlert *a = [NSAlert new]; a.messageText = @"Review Connection Request";
-    a.informativeText = [NSString stringWithFormat:@"Client: %@\nFingerprint: %@\nRequest ID: %@\nRequested: %@\nChoose only the permissions you intend to grant.",
-        MDHostNpub(r[@"peer"]), MDHostFingerprint(r[@"peer"]), r[@"request_id"], MDAccessCaps([r[@"requested"] unsignedIntValue])];
-    [a addButtonWithTitle:@"Cancel"]; [a addButtonWithTitle:@"Approve Once"]; [a addButtonWithTitle:@"Remember Exact Grant"]; [a addButtonWithTitle:@"Deny"];
-    MDCapChooser *chooser = [MDCapChooser new]; chooser.alert = a;
-    a.accessoryView = [chooser viewWithAllowed:MDApprovalAllowed(snapshot,r) initial:MDApprovalDefault(snapshot,r) lifetime:YES];
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Allow This Client to Connect?"
+        message:@"Compare the fingerprint with the one the person connecting sees. Only the permissions you check are granted."
+          width:540];
+    MDCapChooser *chooser = [MDCapChooser new]; chooser.sheet = sheet;
+    NSView *boxes = [chooser viewWithAllowed:MDApprovalAllowed(snapshot,r) initial:MDApprovalDefault(snapshot,r)];
+    NSTextField *requestID = MDKeyValue(MDHostBoundText(r[@"request_id"], 64));
+    requestID.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    NSGridView *details = MDDetails(@[@[@"Fingerprint", MDKeyValue(MDHostFingerprint(r[@"peer"]) ?: @"Invalid key")],
+        @[@"Public key", MDKeyValue(MDHostNpub(r[@"peer"]) ?: @"Invalid key")],
+        @[@"Requests", MDAccessCaps([r[@"requested"] unsignedIntValue])], @[@"Request ID", requestID]]);
+    chooser.lifetime = [MDStatusView new];
+    NSGridView *grant = MDForm(@[@[@"Allow", boxes],
+        @[NSNull.null, MDNote(@"Permissions the client didn’t request, or that this host doesn’t support, can’t be checked.")],
+        @[NSNull.null, chooser.lifetime]]);
+    MDAlignForms(@[details, grant]);
+    sheet.accessory = MDColumn(@[details, grant], MDGroupSpacing);
+    [sheet addButton:@"Deny" role:MDSheetOther response:NSAlertThirdButtonReturn+1];
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+    NSButton *remember = [sheet addButton:@"Approve and Remember" role:MDSheetAction response:NSAlertThirdButtonReturn];
+    remember.toolTip = @"Approve now and remember exactly these permissions for this client.";
+    [sheet addButton:@"Approve Once" role:MDSheetAction response:NSAlertSecondButtonReturn];
     _chooser = chooser;
     __weak MDLocalHostPages *weakSelf = self;
     __weak MDCapChooser *weakChooser = chooser;
@@ -473,15 +493,17 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
         if (!page || !form) return;
         BOOL current = !page->_busy && [snapshot[@"revision"] isEqual:page->_snapshot[@"revision"]] &&
             MDRequestForToken(page->_snapshot,token,Now()) != nil;
-        NSTimeInterval remaining = [r[@"expires_at"] doubleValue] - Now();
-        form.lifetime.stringValue = current ? [NSString stringWithFormat:@"%lld s remaining", (long long)ceil(remaining)] : @"Request expired, cancelled, or changed. Close this review.";
-        form.alert.buttons[1].enabled = current && form.selected;
-        form.alert.buttons[2].enabled = current && form.selected && [policy[@"policy_available"] boolValue] &&
+        long long remaining = (long long)ceil([r[@"expires_at"] doubleValue] - Now());
+        if (current) [form.lifetime setText:[NSString stringWithFormat:@"This request expires in %@.",
+            remaining >= 60 ? [NSString stringWithFormat:@"%lld min %02lld s", remaining / 60, remaining % 60] : [NSString stringWithFormat:@"%lld s", remaining]] kind:MDStatusInfo];
+        else [form.lifetime setText:@"This request expired, was cancelled or changed, so it can’t be approved. Choose Cancel." kind:MDStatusError];
+        [form.sheet buttonWithResponse:NSAlertSecondButtonReturn].enabled = current && form.selected;
+        [form.sheet buttonWithResponse:NSAlertThirdButtonReturn].enabled = current && form.selected && [policy[@"policy_available"] boolValue] &&
             [page->_policy[@"policy_version"] isEqual:policy[@"policy_version"]];
-        form.alert.buttons[3].enabled = current;
+        [form.sheet buttonWithResponse:NSAlertThirdButtonReturn+1].enabled = current;
     };
     chooser.update();
-    [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         self->_chooser = nil; [self tick:nil];
         if (self->_closed || self->_busy || response < NSAlertSecondButtonReturn || response > NSAlertThirdButtonReturn+1 ||
             ![snapshot[@"revision"] isEqual:self->_snapshot[@"revision"]]) return;
@@ -493,10 +515,10 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
         if (cmd) [self->_link command:cmd policyVersion:remember ? policy[@"policy_version"] : nil];
     }];
 }
-- (void)confirm:(NSString *)title text:(NSString *)text window:(NSWindow *)window action:(dispatch_block_t)action {
+- (void)confirm:(NSString *)title info:(NSString *)info button:(NSString *)button window:(NSWindow *)window action:(dispatch_block_t)action {
     if (_closed || _busy || !window || window.attachedSheet) return;
-    NSAlert *a=[NSAlert new]; a.messageText=title; a.informativeText=text;
-    [a addButtonWithTitle:@"Cancel"]; [a addButtonWithTitle:title];
+    NSAlert *a = MDAlert(title, info);
+    MDAlertDestructive(a, button);
     [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (!self->_closed && response == NSAlertSecondButtonReturn) action();
     }];
@@ -504,12 +526,19 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
 - (void)kick:(id)sender {
     (void)sender;
     NSDictionary *cmd = MDKickCommand(_snapshot,self.session);
-    if (cmd) [self confirm:@"Disconnect Session" text:@"End this session without changing remembered access?" window:self.computerView.window action:^{ [self->_link command:cmd]; }];
+    if (cmd) [self confirm:@"Disconnect This Session?"
+                      info:@"The client is disconnected now. Its remembered access doesn’t change, so it can ask to connect again."
+                    button:@"Disconnect" window:self.computerView.window action:^{ [self->_link command:cmd]; }];
 }
 - (void)remove:(BOOL)kick {
     NSDictionary *c = self.client;
     NSDictionary *cmd = MDPolicyCommand(_snapshot,_policy,c,0,YES,kick ? self.session[@"session_id"] : nil);
-    if (cmd) [self confirm:kick ? @"Kick and Revoke" : @"Revoke Access" text:@"Remove this private grant and end any admission authority for this client?" window:self.accessView.window action:^{ [self->_link command:cmd]; }];
+    NSString *fingerprint = MDHostFingerprint(c[@"peer"]) ?: @"this client";
+    NSString *info = [NSString stringWithFormat:@"The client with fingerprint %@ loses its remembered access%@ and will need a new approval to connect. "
+        @"If the host doesn’t confirm, reload the list — a failed reply doesn’t prove the access is gone.",
+        fingerprint, kick ? @", its current session ends," : @""];
+    if (cmd) [self confirm:kick ? @"Disconnect and Revoke Access?" : @"Revoke Access?" info:info
+                    button:kick ? @"Disconnect and Revoke" : @"Revoke" window:self.accessView.window action:^{ [self->_link command:cmd]; }];
 }
 - (void)revoke:(id)sender { (void)sender; [self remove:NO]; }
 - (void)kickRevoke:(id)sender { (void)sender; if (self.session) [self remove:YES]; }
@@ -519,13 +548,19 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     uint32_t mask;
     NSWindow *window = self.accessView.window;
     if (_closed || _busy || !window || window.attachedSheet || !MDPolicyCaps(c[@"caps"], &mask) || [c[@"review_required"] boolValue]) return;
-    NSAlert *a = [NSAlert new]; a.messageText = @"Edit Remembered Capabilities";
-    a.informativeText = [NSString stringWithFormat:@"%@\nReplace the grant with exactly the selected capabilities. This ends existing admission for this client.",MDHostNpub(c[@"peer"])];
-    MDCapChooser *chooser=[MDCapChooser new];
-    a.accessoryView = [chooser viewWithAllowed:MD_HOST_ACCESS_CAPS initial:mask lifetime:NO];
-    [a addButtonWithTitle:@"Cancel"]; [a addButtonWithTitle:@"Save Exact Capabilities"];
-    [a beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Edit Remembered Access"
+        message:@"The client’s remembered access is replaced with exactly the permissions you check. It’s disconnected and must connect again."
+          width:520];
+    MDCapChooser *chooser=[MDCapChooser new]; chooser.sheet = sheet;
+    NSView *boxes = [chooser viewWithAllowed:MD_HOST_ACCESS_CAPS initial:mask];
+    NSGridView *form = MDForm(@[@[@"Client", MDKeyValue(MDHostFingerprint(c[@"peer"]) ?: @"Invalid key")],
+                                @[@"Public key", MDKeyValue(MDHostNpub(c[@"peer"]) ?: @"Invalid key")], @[@"Allow", boxes]]);
+    sheet.accessory = form;
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+    [sheet addButton:@"Save Access" role:MDSheetDefault response:NSAlertSecondButtonReturn];
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (!self->_closed && response == NSAlertSecondButtonReturn) [self->_link command:MDPolicyCommand(s,p,c,chooser.selected,NO,nil)];
     }];
 }
+
 @end

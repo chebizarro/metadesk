@@ -10,75 +10,87 @@ static NSTextField *Field(NSString *placeholder, NSString *value) {
     field.stringValue = value ?: @"";
     return field;
 }
-static NSTextField *Label(NSString *value) {
-    NSTextField *f = [NSTextField wrappingLabelWithString:value ?: @""];
-    f.selectable = NO; return f;
-}
-static NSButton *Button(NSString *title, id target, SEL action) {
-    return [NSButton buttonWithTitle:title target:target action:action];
-}
-static NSStackView *Stack(NSArray<NSView *> *views, NSUserInterfaceLayoutOrientation orientation) {
-    NSStackView *s = [NSStackView stackViewWithViews:views];
-    s.orientation = orientation; s.spacing = 8;
-    s.alignment = orientation == NSUserInterfaceLayoutOrientationVertical ? NSLayoutAttributeLeading : NSLayoutAttributeCenterY;
-    return s;
-}
-static void Wide(NSStackView *s, NSView *v) {
-    [s addArrangedSubview:v];
-    [v.widthAnchor constraintEqualToAnchor:s.widthAnchor constant:-s.edgeInsets.left-s.edgeInsets.right].active = YES;
-}
-static NSAlert *Alert(NSString *title, NSString *body) {
-    NSAlert *a = [NSAlert new]; a.messageText = title; a.informativeText = body; return a;
-}
-static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat height) {
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
-    scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES; scroll.borderType = NSBezelBorder;
-    scroll.documentView = table;
-    [scroll.heightAnchor constraintEqualToConstant:height].active = YES;
-    return scroll;
-}
 
-@interface MDHostSelection : NSObject <NSTableViewDataSource, NSTableViewDelegate>
-@property(nonatomic) NSArray<NSDictionary *> *rows;
-@property(nonatomic) NSTableView *table;
-@property(nonatomic) BOOL importing;
-- (NSView *)view;
+/* Checkbox list for choosing tag memberships or hosts to import. Nothing is
+ * chosen for the user except existing tag memberships. */
+@interface MDHostChoices : NSObject
+- (instancetype)initWithRows:(NSArray<NSDictionary *> *)rows importing:(BOOL)importing selected:(NSSet<NSString *> *)selected;
+@property(nonatomic, readonly) NSView *view;
+@property(nonatomic, copy) dispatch_block_t changed;
 - (NSSet<NSString *> *)keys;
 @end
-@implementation MDHostSelection
-- (NSView *)view {
-    self.table = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, 620, 230)];
-    NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"Review"];
-    col.width = 605;
-    [self.table addTableColumn:col];
-    self.table.headerView = nil; self.table.allowsMultipleSelection = YES;
-    self.table.rowHeight = self.importing ? 74 : 24;
-    self.table.dataSource = self; self.table.delegate = self;
-    NSScrollView *scroll = TableScroll(self.table, 620, 230);
-    NSStackView *stack = Stack(@[scroll, Button(@"Select All", self, @selector(selectAll:))], NSUserInterfaceLayoutOrientationVertical);
-    stack.frame = NSMakeRect(0, 0, 620, 266);
-    [scroll.widthAnchor constraintEqualToConstant:620].active = YES;
-    return stack;
+@implementation MDHostChoices {
+    NSArray<NSDictionary *> *_rows;
+    NSMutableArray<NSButton *> *_boxes;
+    BOOL _importing;
 }
-- (void)selectAll:(id)sender { [self.table selectAll:sender]; }
+- (instancetype)initWithRows:(NSArray<NSDictionary *> *)rows importing:(BOOL)importing selected:(NSSet<NSString *> *)selected {
+    if (!(self = [super init])) return nil;
+    _rows = rows; _importing = importing; _boxes = [NSMutableArray array];
+    NSStackView *list = [NSStackView stackViewWithViews:@[]];
+    list.orientation = NSUserInterfaceLayoutOrientationVertical; list.alignment = NSLayoutAttributeLeading;
+    list.spacing = importing ? 12 : 6; list.edgeInsets = NSEdgeInsetsMake(8, 10, 8, 10);
+    list.translatesAutoresizingMaskIntoConstraints = NO;
+    for (NSDictionary *row in rows) {
+        NSString *key = row[importing ? @"key" : @"id"];
+        NSString *title = importing ? ([row[@"label"] length] ? row[@"label"] : @"Unnamed host") : row[@"label"];
+        NSButton *box = [NSButton checkboxWithTitle:MDHostBoundText(title, 128) target:self action:@selector(toggle:)];
+        box.state = [selected containsObject:key] ? NSControlStateValueOn : NSControlStateValueOff;
+        [_boxes addObject:box];
+        if (!importing) { [list addArrangedSubview:box]; continue; }
+        NSTextField *npub = MDValue(row[@"npub"]);
+        npub.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+        NSMutableArray *details = [NSMutableArray arrayWithArray:@[@[@"Fingerprint", MDKeyValue(row[@"fingerprint"])],
+            @[@"Public key", npub], @[@"Requests", row[@"caps"] ?: @""]]];
+        if ([row[@"alias"] length]) [details insertObject:@[@"NIP-05", [row[@"alias"] stringByAppendingString:@" (not verified)"]] atIndex:0];
+        NSGridView *grid = MDDetails(details);
+        for (NSInteger r = 0; r < grid.numberOfRows; ++r) {
+            NSTextField *label = (NSTextField *)[grid cellAtColumnIndex:0 rowIndex:r].contentView;
+            if ([label isKindOfClass:NSTextField.class]) { label.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize]; label.textColor = NSColor.secondaryLabelColor; }
+            NSTextField *value = (NSTextField *)[grid cellAtColumnIndex:1 rowIndex:r].contentView;
+            if ([value isKindOfClass:NSTextField.class]) value.font = [value.font fontWithSize:NSFont.smallSystemFontSize];
+        }
+        NSView *entry = [NSView new];
+        for (NSView *v in @[box, grid]) { v.translatesAutoresizingMaskIntoConstraints = NO; [entry addSubview:v]; }
+        [NSLayoutConstraint activateConstraints:@[
+            [box.topAnchor constraintEqualToAnchor:entry.topAnchor], [box.leadingAnchor constraintEqualToAnchor:entry.leadingAnchor],
+            [grid.topAnchor constraintEqualToAnchor:box.bottomAnchor constant:4], [grid.bottomAnchor constraintEqualToAnchor:entry.bottomAnchor],
+            [grid.leadingAnchor constraintEqualToAnchor:entry.leadingAnchor constant:20], [grid.trailingAnchor constraintEqualToAnchor:entry.trailingAnchor]]];
+        [list addArrangedSubview:entry];
+        [entry.widthAnchor constraintEqualToAnchor:list.widthAnchor constant:-20].active = YES;
+    }
+    NSScrollView *scroll = [NSScrollView new];
+    scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES; scroll.borderType = NSBezelBorder;
+    NSView *document = [NSView new];
+    document.translatesAutoresizingMaskIntoConstraints = NO;
+    [document addSubview:list];
+    scroll.documentView = document;
+    [NSLayoutConstraint activateConstraints:@[
+        [list.topAnchor constraintEqualToAnchor:document.topAnchor], [list.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
+        [list.leadingAnchor constraintEqualToAnchor:document.leadingAnchor], [list.trailingAnchor constraintEqualToAnchor:document.trailingAnchor],
+        [document.topAnchor constraintEqualToAnchor:scroll.contentView.topAnchor],
+        [document.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]]];
+    NSLayoutConstraint *fit = [scroll.heightAnchor constraintEqualToAnchor:document.heightAnchor constant:2];
+    fit.priority = NSLayoutPriorityDefaultLow; fit.active = YES;
+    [scroll.heightAnchor constraintLessThanOrEqualToConstant:importing ? 260 : 150].active = YES;
+    [scroll.heightAnchor constraintGreaterThanOrEqualToConstant:40].active = YES;
+    if (!importing) { _view = scroll; return self; }
+    NSButton *all = MDButton(@"Select All", self, @selector(selectAll:));
+    NSButton *none = MDButton(@"Select None", self, @selector(selectNone:));
+    NSStackView *buttons = MDRow(@[all, none]);
+    _view = MDColumn(@[scroll, buttons], MDItemSpacing);
+    return self;
+}
+- (void)toggle:(id)sender { (void)sender; if (self.changed) self.changed(); }
+- (void)selectAll:(id)sender { for (NSButton *b in _boxes) b.state = NSControlStateValueOn; [self toggle:sender]; }
+- (void)selectNone:(id)sender { for (NSButton *b in _boxes) b.state = NSControlStateValueOff; [self toggle:sender]; }
 - (NSSet<NSString *> *)keys {
     NSMutableSet *keys = [NSMutableSet set];
-    [self.table.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
-        (void)stop;
-        NSString *key = self.rows[i][self.importing ? @"key" : @"id"];
+    for (NSUInteger i = 0; i < _boxes.count; ++i) if (_boxes[i].state == NSControlStateValueOn) {
+        NSString *key = _rows[i][_importing ? @"key" : @"id"];
         if (key) [keys addObject:key];
-    }];
+    }
     return keys;
-}
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)table { (void)table; return self.rows.count; }
-- (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
-    (void)table; (void)column;
-    NSDictionary *value = self.rows[row];
-    if (!self.importing) return Label(value[@"label"]);
-    NSString *text = [NSString stringWithFormat:@"%@%@\n%@\n%@ · Requested: %@", value[@"label"],
-        [value[@"alias"] length] ? [@" — " stringByAppendingString:value[@"alias"]] : @"", value[@"npub"], value[@"fingerprint"], value[@"caps"]];
-    NSTextField *label = Label(text); label.maximumNumberOfLines = 4;
-    return label;
 }
 @end
 
@@ -597,11 +609,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [self render];
         NSWindow *window = self.view.window;
         if (![result[2] boolValue] || !window || window.attachedSheet) return;
-        NSAlert *alert = Alert(@"Replace Unreadable Relay Preferences?",
-            @"The saved preferences could not be read. Replace them with the choices currently shown? An empty field removes all choices.");
-        [alert addButtonWithTitle:@"Keep Existing File"];
-        [alert addButtonWithTitle:@"Replace Preferences"];
-        [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Replace Unreadable Relay Settings?"
+            message:@"Metadesk couldn’t read the saved relay settings file. Replace it with the relays in Address Book Relays? If that list is empty, every saved relay is removed. "
+                    @"The Linux Manager reads the same file."
+              width:500];
+        [sheet addButton:@"Replace Settings" role:MDSheetDestructive response:NSAlertSecondButtonReturn];
+        [sheet addButton:@"Keep Existing File" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+        [sheet makeCancelAlsoDefault];
+        [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
             if (response == NSAlertSecondButtonReturn && generation == self->_generation)
                 [self reloadBook:YES replaceUnreadable:YES];
         }];
@@ -637,6 +652,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
     panel.allowedContentTypes = @[UTTypeImage];
+    panel.message = @"Choose an image of the host’s QR code. Only a public nprofile is accepted.";
+    panel.prompt = @"Scan";
     NSUInteger generation = _generation;
     [panel beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (response != NSModalResponseOK || self.closing || generation != self->_generation) return;
@@ -666,37 +683,76 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         if ([value isKindOfClass:MDHostReview.class]) [self presentReview:value];
     }];
 }
+/* First-contact and key-change reviews. Both are trust decisions, so no
+ * button answers Return; Escape cancels or keeps the saved key. A changed key
+ * offers only Keep Old Key or Replace Key, which needs the exact fingerprint. */
 - (void)presentReview:(MDHostReview *)review {
-    if (!self.view.window || self.view.window.attachedSheet || self.closing) return;
+    NSWindow *window = self.view.window;
+    if (!window || window.attachedSheet || self.closing) return;
     BOOL mismatch = review.oldKey != nil;
     NSUInteger generation = _generation;
-    NSString *nip = review.alias ? [NSString stringWithFormat:@"NIP-05: %@ (verified in this review)", MDHostBoundText(review.alias, 320)] : @"NIP-05: Not provided";
-    NSString *identity = [NSString stringWithFormat:@"%@\n%@\nFingerprint: %@", review.npub, nip, review.fingerprint];
-    NSString *body = mismatch ? [NSString stringWithFormat:@"%@\nSaved fingerprint: %@\n\nConnection is blocked. Verify the new fingerprint with the host before replacing the saved key.", identity, MDHostFingerprint(review.oldKey)] :
-        [NSString stringWithFormat:@"%@\nRequested access: %@\n\nConfirm this fingerprint with the host before trusting the key.", identity, MDHostCapsText(review.caps)];
-    NSAlert *alert = Alert(mismatch ? @"Host Key Changed" : @"Review Host Key", body);
-    [alert addButtonWithTitle:mismatch ? @"Keep Old Key" : @"Cancel"];
     BOOL canSave = _book.canEdit && (!mismatch || [_book canReplaceReview:review]);
+    NSString *alias = review.alias ? [MDHostBoundText(review.alias, 320) stringByAppendingString:@" — verified now"] : @"None";
+    NSMutableArray *rows = [NSMutableArray array];
     NSTextField *confirmation = nil;
+    __block id observer = nil;
+    MDSheet *sheet;
     if (mismatch) {
+        sheet = [[MDSheet alloc] initWithTitle:@"This Host’s Key Has Changed"
+            message:@"The key published for this host no longer matches the one you saved, so connecting is blocked. "
+                    @"Keep the saved key unless the host’s owner confirms they changed it."
+              width:540];
+        [rows addObject:@[@"Saved fingerprint", MDKeyValue(MDHostFingerprint(review.oldKey))]];
+        [rows addObject:@[@"New fingerprint", MDKeyValue(review.fingerprint)]];
+        [rows addObject:@[@"New public key", MDKeyValue(review.npub)]];
+        [rows addObject:@[@"NIP-05", alias]];
+    } else {
+        sheet = [[MDSheet alloc] initWithTitle:@"Verify This Host"
+            message:@"Before you connect or save this host, ask its owner to read you the fingerprint their Metadesk shows, and check that it matches."
+              width:540];
+        [rows addObject:@[@"Fingerprint", MDKeyValue(review.fingerprint)]];
+        [rows addObject:@[@"Public key", MDKeyValue(review.npub)]];
+        [rows addObject:@[@"NIP-05", alias]];
+        [rows addObject:@[@"Requests", MDHostCapsText(review.caps)]];
+        if (review.route.length) [rows addObject:@[@"Route hint", MDHostBoundText(review.route, 64)]];
+    }
+    NSGridView *details = MDDetails(rows);
+    NSMutableArray *content = [NSMutableArray arrayWithObject:details];
+    NSButton *replace = nil;
+    if (mismatch) {
+        [sheet addButton:@"Keep Old Key" role:MDSheetCancel response:NSAlertFirstButtonReturn];
         if (canSave) {
             confirmation = Field(@"Type the new fingerprint exactly", nil);
-            alert.accessoryView = confirmation;
-            [alert addButtonWithTitle:@"Replace Key"];
+            confirmation.accessibilityLabel = @"New fingerprint, typed to confirm";
+            confirmation.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+            NSTextField *hint = MDNote(@"To replace the saved key, type the new fingerprint exactly as the host’s owner reads it to you. You’ll review the host again before connecting.");
+            [content addObject:MDForm(@[@[@"Confirm", confirmation], @[NSNull.null, hint]])];
+            replace = [sheet addButton:@"Replace Key" role:MDSheetDestructive response:NSAlertSecondButtonReturn];
+            replace.enabled = NO;
+            MDHostsBook *book = _book;
+            __weak NSButton *weakReplace = replace;
+            observer = [NSNotificationCenter.defaultCenter addObserverForName:NSControlTextDidChangeNotification object:confirmation queue:nil
+                usingBlock:^(NSNotification *note) { weakReplace.enabled = [book canConfirmReview:review fingerprint:((NSTextField *)note.object).stringValue]; }];
+            sheet.initialFirstResponder = confirmation;
         }
     } else {
-        [alert addButtonWithTitle:@"Connect"];
-        if (canSave) [alert addButtonWithTitle:@"Save Host"];
+        [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+        if (canSave) [sheet addButton:@"Save Host" role:MDSheetOther response:NSAlertThirdButtonReturn];
+        [sheet addButton:@"Connect" role:MDSheetAction response:NSAlertSecondButtonReturn];
     }
-    [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
+    NSStackView *body = MDColumn(content, MDGroupSpacing);
+    if (content.count > 1) MDAlignForms(@[details, content[1]]);
+    sheet.accessory = body;
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        if (observer) [NSNotificationCenter.defaultCenter removeObserver:observer];
         if (self.closing || generation != self->_generation) return;
         if (mismatch ? response == NSAlertSecondButtonReturn && canSave : response == NSAlertThirdButtonReturn && canSave) {
             NSString *value = confirmation.stringValue;
             if (mismatch && ![self->_book canConfirmReview:review fingerprint:value]) {
-                [self note:@"The saved key was kept. Replacement requires the exact new fingerprint." kind:MDStatusError]; return;
+                [self note:@"The saved key was kept. Replacing it needs the exact new fingerprint." kind:MDStatusError]; return;
             }
             [self run:^id(MDHostsWorker *worker) { return [worker saveReview:review confirmation:value]; }
-                done:^(NSString *message) { [self noteResult:message success:mismatch ? @"Key replaced. Review it again to connect." : @"Host saved."]; }];
+                done:^(NSString *message) { [self noteResult:message success:mismatch ? @"Key replaced. Review the host again to connect." : @"Host saved."]; }];
         } else if (!mismatch && response == NSAlertSecondButtonReturn) [self startLaunch:review];
     }];
 }
@@ -755,42 +811,42 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)edit:(id)sender {
     (void)sender;
     NSDictionary *row = self.selected;
-    if (!_book.canEdit || _busy || !row || !self.view.window) return;
+    NSWindow *window = self.view.window;
+    if (!_book.canEdit || _busy || !row || !window || window.attachedSheet) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSString *key = row[@"key"];
-    NSAlert *alert = Alert(@"Edit Saved Host", @"Label and notes are encrypted in the address book. Select existing tag memberships or add a new tag.");
-    NSTextField *label = Field(@"Label", row[@"label"]), *notes = Field(@"Notes", row[@"notes"]), *newTag = Field(@"New tag (optional)", nil);
-    NSButton *favorite = [NSButton checkboxWithTitle:@"Favorite" target:nil action:NULL];
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:[NSString stringWithFormat:@"Edit “%@”", MDHostBoundText(row[@"title"], 64)]
+        message:@"The label, notes and tags are stored encrypted in your address book." width:520];
+    NSTextField *label = Field(@"Name shown in your host list", row[@"label"]), *notes = Field(@"Optional", row[@"notes"]);
+    label.accessibilityLabel = @"Label"; notes.accessibilityLabel = @"Notes";
+    NSTextField *newTag = Field(@"Add a new tag (optional)", nil); newTag.accessibilityLabel = @"New tag";
+    NSButton *favorite = [NSButton checkboxWithTitle:@"Favorite — show first in Quick Connect" target:nil action:NULL];
     favorite.state = [row[@"favorite"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
-    MDHostSelection *selection = [MDHostSelection new]; selection.rows = book.tags;
-    NSView *tags = [selection view];
-    NSMutableIndexSet *selected = [NSMutableIndexSet indexSet];
-    [book.tags enumerateObjectsUsingBlock:^(NSDictionary *value, NSUInteger index, BOOL *stop) {
-        (void)stop; if ([row[@"tagIDs"] containsObject:value[@"id"]]) [selected addIndex:index];
-    }];
-    [selection.table selectRowIndexes:selected byExtendingSelection:NO];
-    NSStackView *form = Stack(@[], NSUserInterfaceLayoutOrientationVertical);
-    for (NSView *v in @[label, notes, newTag]) Wide(form, v);
-    [form addArrangedSubview:favorite];
-    if (book.tags.count) [form addArrangedSubview:tags];
-    form.frame = NSMakeRect(0, 0, 620, book.tags.count ? 390 : 116);
-    alert.accessoryView = form;
-    [alert addButtonWithTitle:@"Cancel"]; [alert addButtonWithTitle:@"Save"]; [alert addButtonWithTitle:@"Remove…"];
-    [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
+    MDHostChoices *choices = [[MDHostChoices alloc] initWithRows:book.tags importing:NO selected:[NSSet setWithArray:row[@"tagIDs"] ?: @[]]];
+    NSMutableArray *form = [NSMutableArray arrayWithArray:@[@[@"Label", label], @[@"Notes", notes], @[NSNull.null, favorite]]];
+    if (book.tags.count) [form addObject:@[@"Tags", choices.view]];
+    [form addObject:@[book.tags.count ? NSNull.null : @"Tags", newTag]];
+    sheet.accessory = MDForm(form);
+    sheet.initialFirstResponder = label;
+    [sheet addButton:@"Remove Host…" role:MDSheetDestructive response:NSAlertThirdButtonReturn];
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+    [sheet addButton:@"Save" role:MDSheetDefault response:NSAlertSecondButtonReturn];
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (self.closing || generation != self->_generation || response == NSAlertFirstButtonReturn) return;
         void (^edit)(BOOL) = ^(BOOL remove) {
             NSString *name = label.stringValue, *memo = notes.stringValue, *tag = MDHostTrim(newTag.stringValue);
             BOOL fav = favorite.state == NSControlStateValueOn;
-            NSSet *membership = [selection keys];
+            NSSet *membership = [choices keys];
             [self run:^id(MDHostsWorker *worker) {
                 return [worker editKey:key book:book label:name notes:memo favorite:fav tagIDs:membership newTag:tag remove:remove];
             } done:^(NSString *message) { [self noteResult:message success:remove ? @"Host removed." : @"Host updated."]; }];
         };
         if (response == NSAlertSecondButtonReturn) edit(NO);
         else if (response == NSAlertThirdButtonReturn && self.view.window) {
-            NSAlert *remove = Alert(@"Remove Saved Host?", @"This removes the saved identity and its local address-book memberships. It does not revoke access at the host.");
-            [remove addButtonWithTitle:@"Cancel"]; [remove addButtonWithTitle:@"Remove Host"];
+            NSAlert *remove = MDAlert([NSString stringWithFormat:@"Remove “%@” from Your Hosts?", MDHostBoundText(row[@"title"], 64)],
+                @"This removes the saved host, its notes and its tags from your address book. It doesn’t revoke any access the host has given you.");
+            MDAlertDestructive(remove, @"Remove Host");
             [remove beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse confirm) {
                 if (confirm == NSAlertSecondButtonReturn && generation == self->_generation && !self.closing) edit(YES);
             }];
@@ -823,19 +879,30 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [self run:^id(MDHostsWorker *worker) { (void)worker; return [book conflictText:coordinate]; }
         done:^(NSString *text) {
         if (!text || !self.view.window) return;
-        NSAlert *alert = Alert(@"Review Address Book Conflict", @"Review both versions. Reapply publishes your reviewed draft against the current remote revision.");
-        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 620, 250)];
-        scroll.hasVerticalScroller = YES; scroll.borderType = NSBezelBorder;
-        NSTextView *display = [[NSTextView alloc] initWithFrame:scroll.contentView.bounds];
+        NSWindow *window = self.view.window;
+        if (window.attachedSheet) return;
+        MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Resolve a Sync Conflict"
+            message:@"Your edit and a newer version from another device changed the same part of your address book. "
+                    @"Compare them, then keep the newer version or reapply your edit on top of it." width:600];
+        NSScrollView *scroll = [NSScrollView new];
+        scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES; scroll.borderType = NSBezelBorder;
+        NSTextView *display = [NSTextView new];
         display.editable = NO; display.selectable = YES; display.richText = NO;
         display.horizontallyResizable = NO; display.verticallyResizable = YES;
         display.autoresizingMask = NSViewWidthSizable;
         display.textContainer.widthTracksTextView = YES;
-        display.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-        display.string = text;
-        scroll.documentView = display; alert.accessoryView = scroll;
-        [alert addButtonWithTitle:@"Cancel"]; [alert addButtonWithTitle:@"Keep Remote"]; [alert addButtonWithTitle:@"Reapply Draft"];
-        [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
+        display.textContainerInset = NSMakeSize(6, 6);
+        display.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+        display.textColor = NSColor.textColor; display.backgroundColor = NSColor.textBackgroundColor;
+        display.string = MDHostBoundText(text, 65536);
+        display.accessibilityLabel = @"Both versions";
+        scroll.documentView = display;
+        [scroll.heightAnchor constraintEqualToConstant:240].active = YES;
+        sheet.accessory = scroll;
+        [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+        [sheet addButton:@"Keep Newer Version" role:MDSheetAction response:NSAlertSecondButtonReturn];
+        [sheet addButton:@"Reapply My Edit" role:MDSheetAction response:NSAlertThirdButtonReturn];
+        [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
             if (self.closing || (response != NSAlertSecondButtonReturn && response != NSAlertThirdButtonReturn)) return;
             [self run:^id(MDHostsWorker *worker) { return [worker resolveIssue:coordinate book:book reapply:response == NSAlertThirdButtonReturn]; }
                 done:^(NSString *message) { [self noteResult:message success:@"Conflict resolved."]; }];
@@ -849,6 +916,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSUInteger generation = _generation;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = NO; panel.allowsMultipleSelection = NO;
+    panel.message = @"Choose a metadesk-hosts/1 file exported from Metadesk.";
+    panel.prompt = @"Review";
     [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
         if (response != NSModalResponseOK || self.closing || generation != self->_generation) return;
         NSURL *url = panel.URL;
@@ -860,28 +929,39 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }];
 }
 - (void)reviewImport:(NSArray *)rows book:(MDHostsBook *)book {
-    if (!self.view.window) return;
-    NSAlert *alert = Alert(@"Review Imported Host Keys", @"Select only keys whose fingerprints you recognize. NIP-05 names in this file are unverified. Existing hosts will not be overwritten.");
-    MDHostSelection *selection = [MDHostSelection new]; selection.importing = YES; selection.rows = rows;
-    alert.accessoryView = [selection view];
-    [alert addButtonWithTitle:@"Cancel"]; [alert addButtonWithTitle:@"Import Selected Hosts"];
-    [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
+    NSWindow *window = self.view.window;
+    if (!window || window.attachedSheet) return;
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Import Hosts"
+        message:@"Choose only hosts whose fingerprints you recognize. NIP-05 names in a file aren’t verified, and hosts you’ve already saved won’t change."
+          width:560];
+    MDHostChoices *choices = [[MDHostChoices alloc] initWithRows:rows importing:YES selected:[NSSet set]];
+    sheet.accessory = choices.view;
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
+    NSButton *importButton = [sheet addButton:@"Import Selected" role:MDSheetAction response:NSAlertSecondButtonReturn];
+    importButton.enabled = NO;
+    __weak MDHostChoices *weakChoices = choices; __weak NSButton *weakImport = importButton;
+    choices.changed = ^{ weakImport.enabled = weakChoices.keys.count != 0; };
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (response != NSAlertSecondButtonReturn || self.closing) return;
-        NSSet *keys = selection.keys;
+        NSSet *keys = choices.keys;
+        if (!keys.count) return;
         [self run:^id(MDHostsWorker *worker) { return [worker applyImport:rows selected:keys book:book]; }
-            done:^(NSString *message) { [self noteResult:message success:@"Selected hosts imported."]; }];
+            done:^(NSString *message) { [self noteResult:message success:keys.count == 1 ? @"1 host imported." : [NSString stringWithFormat:@"%lu hosts imported.", (unsigned long)keys.count]]; }];
     }];
 }
 - (void)exportHosts:(id)sender {
     (void)sender;
-    if (_busy || !_book.canExport || !self.view.window) return;
+    if (_busy || !_book.canExport || !self.view.window || self.view.window.attachedSheet) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
-    NSAlert *alert = Alert(@"Export Saved Hosts?", @"The export is plaintext. Anyone who can read the file can see the host keys, labels and notes. It does not contain credentials or access grants.");
-    [alert addButtonWithTitle:@"Cancel"]; [alert addButtonWithTitle:@"Export…"];
+    NSAlert *alert = MDAlert(@"Export Hosts as Plain Text?",
+        @"Anyone who can read the file will see your hosts’ public keys, labels and notes. It doesn’t contain anything that lets someone connect, and no access grants.");
+    MDAlertConfirm(alert, @"Export…");
     [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
-        if (response != NSAlertSecondButtonReturn || self.closing || generation != self->_generation || !self.view.window) return;
+        if (response != NSAlertFirstButtonReturn || self.closing || generation != self->_generation || !self.view.window) return;
         NSSavePanel *panel = [NSSavePanel savePanel]; panel.nameFieldStringValue = @"metadesk-hosts.json";
+        panel.allowedContentTypes = @[UTTypeJSON];
+        panel.message = @"The export is plain text.";
         [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse selected) {
             if (selected != NSModalResponseOK || self.closing || generation != self->_generation) return;
             NSURL *url = panel.URL;

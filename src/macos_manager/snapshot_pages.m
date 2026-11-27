@@ -239,7 +239,7 @@ static NSDictionary *AccessSnapshot(NSTimeInterval now) {
         @"host":@{@"managed":@YES, @"pid":@4242, @"state":@"running"}};
 }
 static NSDictionary *AccessPolicy(void) {
-    return @{@"policy_available":@YES, @"policy_version":@4, @"clients":@[
+    return @{@"policy_available":@YES, @"policy_version":@4, @"generation":@GEN, @"clients":@[
         @{@"peer":@KEY2, @"caps":@"video,input", @"review_required":@NO},
         @{@"peer":@KEY4, @"caps":@"video", @"review_required":@NO}]};
 }

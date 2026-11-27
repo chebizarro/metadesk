@@ -5,11 +5,6 @@
 #import "ui.h"
 #include <stdatomic.h>
 
-static NSStackView *Stack(NSArray *views,BOOL row) {
-    NSStackView *s = [NSStackView stackViewWithViews:views];
-    s.orientation = row ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
-    s.alignment = row ? NSLayoutAttributeCenterY : NSLayoutAttributeLeading; s.spacing = 8; return s;
-}
 static NSString *const HostSaved = @"Host role saved. Restart the host to use it.";
 static NSString *const ClientSaved = @"Client role saved. Hosts is reloading with the new client key.";
 static NSString *const AccountAdded = @"Account added. Select it to assign a role.";
@@ -28,12 +23,6 @@ static NSString *BackendTitle(MdSignerType backend) {
         case MD_SIGNER_NIP55L: return @"D-Bus signer (NIP-55L)";
         default: return @"Unsupported signer";
     }
-}
-static NSTextField *Entry(NSString *label, NSString *value) {
-    NSTextField *field = [NSTextField textFieldWithString:value ?: @""];
-    field.placeholderString = label; field.accessibilityLabel = label;
-    [field.widthAnchor constraintEqualToConstant:400].active = YES;
-    return field;
 }
 @interface MDIdentityPage () <NSTableViewDataSource, NSTableViewDelegate> {
     MDHostsPage *_hosts;
@@ -277,21 +266,39 @@ static NSString *SignerTitle(NSDictionary *a) {
         if (!MDIdentitySupportsBackend(choice)) continue;
         [backend addItemWithTitle:BackendTitle(choice)]; backend.lastItem.tag = choice;
     }
-    backend.accessibilityLabel = @"Signer backend";
-    NSTextField *key = Entry(@"Public key (npub or lowercase hex)", nil);
-    NSTextField *label = Entry(@"Public label (optional)", nil);
-    NSAlert *alert = [NSAlert new];
-    alert.messageText = @"Add Signer Account";
-    alert.informativeText = @"Use the public key of an existing account. This does not contact the signer or create a key.";
-    NSStackView *form = Stack(@[backend,key,label],NO); form.frame = NSMakeRect(0,0,400,90); alert.accessoryView = form;
-    [alert addButtonWithTitle:@"Add Account"]; [alert addButtonWithTitle:@"Cancel"];
-    alert.window.initialFirstResponder = key;
-    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+    backend.accessibilityLabel = @"Signer";
+    NSTextField *key = MDKeyField(@"npub1… or 64-character hex", @"Public key");
+    NSTextField *label = MDKeyField(@"Optional", @"Public label");
+    MDStatusView *problem = [MDStatusView new];
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Add Signer Account"
+        message:@"Enter the public key of an account that already exists in your external signer. Metadesk saves only the public key; it doesn’t contact the signer or create a key."
+          width:500];
+    sheet.accessory = MDForm(@[@[@"Signer", backend], @[@"Public key", key], @[@"Label", label], @[NSNull.null, problem]]);
+    [problem setText:nil kind:MDStatusNone];
+    sheet.initialFirstResponder = key;
+    NSButton *addButton = [sheet addButton:@"Add Account" role:MDSheetDefault response:NSAlertFirstButtonReturn];
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
+    addButton.enabled = NO;
+    __weak NSButton *weakAdd = addButton; __weak MDStatusView *weakProblem = problem;
+    id observer = [NSNotificationCenter.defaultCenter addObserverForName:NSControlTextDidChangeNotification object:key queue:nil usingBlock:^(NSNotification *note) {
+        NSTextField *field = note.object;
+        NSTextView *editor = (NSTextView *)field.currentEditor;
+        if (MDClassifyHostInput(editor ? editor.string : field.stringValue) == MDHostSecret) {
+            /* Never keep or echo a secret key; drop the undo that held it. */
+            NSUndoManager *undo = editor.undoManager;
+            editor.string = @""; field.stringValue = @"";
+            [undo removeAllActions]; [field.window.undoManager removeAllActions];
+            [weakProblem setText:@"That’s a private key, so it was cleared. Enter the account’s public npub or hex key." kind:MDStatusError];
+        } else [weakProblem setText:nil kind:MDStatusNone];
+        weakAdd.enabled = MDHostTrim(field.stringValue).length != 0;
+    }];
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+        [NSNotificationCenter.defaultCenter removeObserver:observer];
         NSString *publicKey=key.stringValue, *publicLabel=label.stringValue;
         key.stringValue=@""; label.stringValue=@"";
         if (result!=NSAlertFirstButtonReturn || self->_closed) return;
         MdSignerType type = (MdSignerType)backend.selectedTag;
-        [self run:@"Adding account…" suspend:NO cancellable:NO work:^NSString *{
+        [self run:@"Adding the account…" suspend:NO cancellable:NO work:^NSString *{
             NSString *error = MDIdentityAdd(self->_directory,type,publicKey,publicLabel);
             return error.length ? error : AccountAdded;
         }];
@@ -302,17 +309,20 @@ static NSString *SignerTitle(NSDictionary *a) {
     NSDictionary *account=self.selected;
     NSWindow *window = [self sheetWindow];
     if (!window || !account) return;
-    NSTextField *label = Entry(@"Public account label", account[@"label"]);
-    label.frame = NSMakeRect(0,0,400,24);
-    NSAlert *alert = [NSAlert new]; alert.messageText = @"Edit Public Label";
-    alert.informativeText = MDHostNpub(account[@"key"]);
-    alert.accessoryView = label;
-    [alert addButtonWithTitle:@"Save Label"]; [alert addButtonWithTitle:@"Cancel"];
-    alert.window.initialFirstResponder = label;
-    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
+    NSTextField *label = MDKeyField(@"No label", @"Public label");
+    label.stringValue = account[@"label"] ?: @"";
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Edit Label"
+        message:@"The label is saved with the account’s public key on this Mac. Changing it doesn’t affect its roles." width:480];
+    NSTextField *npub = MDKeyValue(MDHostNpub(account[@"key"]) ?: @"");
+    npub.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    sheet.accessory = MDForm(@[@[@"Account", npub], @[@"Label", label]]);
+    sheet.initialFirstResponder = label;
+    [sheet addButton:@"Save" role:MDSheetDefault response:NSAlertFirstButtonReturn];
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
         NSString *value=label.stringValue; label.stringValue=@"";
         if (result!=NSAlertFirstButtonReturn || self->_closed) return;
-        [self run:@"Saving public label…" suspend:NO cancellable:NO work:^NSString *{
+        [self run:@"Saving the label…" suspend:NO cancellable:NO work:^NSString *{
             NSString *error = MDIdentityLabel(self->_directory,account,value);
             return error.length ? error : LabelSaved;
         }];
@@ -323,6 +333,8 @@ static NSString *SignerTitle(NSDictionary *a) {
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
     panel.resolvesAliases = NO;
+    panel.message = @"Choose a pairing JSON file (at most 64 KB). Symbolic links aren’t accepted.";
+    panel.prompt = @"Import";
     [panel beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         completion(response == NSModalResponseOK ? panel.URL : nil);
     }];
@@ -332,14 +344,20 @@ static NSString *SignerTitle(NSDictionary *a) {
     NSDictionary *account=self.selected;
     NSWindow *window = [self sheetWindow];
     if (!window || !_pair.enabled || !account) return;
-    NSAlert *alert = [NSAlert new]; alert.messageText = @"Import Saved NIP-46 Pairing";
-    alert.informativeText = [NSString stringWithFormat:@"Choose a saved pairing JSON file from your trusted signer for:\n%@\n\nThis replaces the Keychain pairing, not the signing key or role. The selected file contains credentials and will not be deleted or modified.", MDHostNpub(account[@"key"])];
-    [alert addButtonWithTitle:@"Choose Pairing File…"]; [alert addButtonWithTitle:@"Cancel"];
+    MDSheet *alert = [[MDSheet alloc] initWithTitle:@"Import Remote Signer Pairing"
+        message:@"Choose the pairing file your remote signer saved for this account. It replaces the pairing stored in Keychain; it doesn’t change the signing key or assign a role. "
+                @"The file contains credentials: keep it safe. Metadesk reads it once and doesn’t change or delete it."
+          width:500];
+    NSTextField *npub = MDKeyValue(MDHostNpub(account[@"key"]) ?: @"");
+    npub.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    alert.accessory = MDDetails(@[@[@"Account", npub]]);
+    [alert addButton:@"Choose File…" role:MDSheetDefault response:NSAlertFirstButtonReturn];
+    [alert addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
     [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
         if (result!=NSAlertFirstButtonReturn || self->_closed || self->_busy) return;
         [self choosePairingFile:window completion:^(NSURL *url) {
             if (!url || self->_closed || self->_busy) return;
-            [self run:@"Importing pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
+            [self run:@"Importing the pairing into Keychain…" suspend:[account[@"client"] boolValue] cancellable:NO work:^NSString *{
                 MdCredentialStore *store=self->_credentials();
                 NSString *error=MDIdentityImportPairingFile(self->_directory,store,account,url,Cancelled,(__bridge void *)self);
                 md_credential_store_destroy(store);
@@ -351,9 +369,10 @@ static NSString *SignerTitle(NSDictionary *a) {
 - (void)remove:(id)sender {
     (void)sender; NSDictionary *account=self.selected;
     if (!account || _busy || _closed || !self.view.window || self.view.window.attachedSheet) return;
-    NSAlert *a=[NSAlert new]; a.messageText=@"Remove Signer Account?";
-    a.informativeText=@"This removes the saved account and role assignments, and any Metadesk-held remote pairing. It does not delete the key in the external signer.";
-    [a addButtonWithTitle:@"Cancel"]; [a addButtonWithTitle:@"Remove Account"];
+    NSString *name = [account[@"label"] length] ? MDHostBoundText(account[@"label"], 64) : MDHostFingerprint(account[@"key"]);
+    NSAlert *a = MDAlert([NSString stringWithFormat:@"Remove “%@”?", name],
+        @"This removes the saved account, any role it holds and any pairing Metadesk stored for it. The key itself stays in your external signer.");
+    MDAlertDestructive(a, @"Remove Account");
     [a beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
         if (response!=NSAlertSecondButtonReturn || self->_closed) return;
         [self run:@"Removing the account…" suspend:YES cancellable:NO work:^NSString *{
