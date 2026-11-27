@@ -431,7 +431,9 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
     _snapshot = s; _policy = p; _permissions = perms; _busy = busy;
     /* A failed or dropped link is explained by the page's own state (no host
      * role, or not reachable); the transport detail stays in the tooltip. */
-    [self showStatus:s || busy || !_located ? status : nil];
+    /* After the link was dropped (no path), its own failure isn't news:
+     * the page's state says what is happening (looking up, or no role). */
+    [self showStatus:(s || busy || !_located) && _linkPath.length ? status : nil];
     _status.toolTip = s || busy ? nil : status;
     [self render];
     /* Read remembered clients once per host generation, so Access is never

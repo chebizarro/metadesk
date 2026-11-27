@@ -985,6 +985,9 @@ static BOOL ComputerRole(MDManagerApp *app, MDLocalHostPages *local, FixtureLink
     CHECK(!window.attachedSheet && link.commands.count==commands);
     CHECK([link.paths.lastObject isEqual:@""] && requests.numberOfRows==0);
     CHECK(!Button(local.accessView,@"Review Request…").enabled && LabelContains(local.accessView,@"Not Connected"));
+    /* The dropped link's own failure doesn't replace "looking for the host". */
+    link.push(@"Host unreachable or socket not trusted. Agent process state is unknown.",nil,nil,nil,NO);
+    CHECK(LabelContains(local.computerView,@"Looking for the host on this Mac") && !LabelContains(local.computerView,@"socket not trusted"));
     /* A late update for role A's request can't be approved from a stale sheet. */
     [local openRequest:@GEN "/" REQUEST];
     Turn();
