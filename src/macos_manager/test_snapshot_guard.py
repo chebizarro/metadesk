@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """The snapshot renderer is confined to a fixture root it creates (md-b9zo B3, R1-R3).
 
-usage: test_snapshot_guard.py RENDERER MESON_BUILD_DIR
+usage: test_snapshot_guard.py RENDERER CHECK_RENDERER MESON_BUILD_DIR
+
+RENDERER is the run target's renderer; CHECK_RENDERER is the test-only build
+of the same source that renders every scene once (light, default size).
 
 1. Refusals: roots it must not use and forged invocations, including a run
    directory with a matching token and a matching environment, an argument
    longer than PATH_MAX, a real root so deep that the run paths would be
    truncated, a root reached through a symlinked ancestor, and roots whose
    Meson marker is a FIFO or a directory (a FIFO must not block the
-   renderer), exit 2 promptly and touch nothing.
-2. A successful isolated render into a throwaway meson-style root under
-   $TMPDIR (which resolves through /private, so the canonical home-path
-   comparison is exercised) must produce exactly the expected artifacts; the
-   renderer itself fails on a missing sheet or a scene that does not drain.
+   renderer), exit 2 promptly and touch nothing. Both binaries are checked.
+2. A successful isolated render with CHECK_RENDERER into a throwaway
+   meson-style root under $TMPDIR (which resolves through /private, so the
+   canonical home-path comparison is exercised) must produce exactly the
+   artifacts this build configuration calls for; the renderer itself fails on
+   a missing sheet or a scene that does not drain. Scenes for a signer type the
+   build doesn't include (read from the build's recorded options) must be
+   reported as skipped and absent, and every other scene present.
    Without a window server the render is skipped and so is this test (77).
 Throughout, HOME and XDG_CONFIG_HOME point at a decoy holding a relay
 preferences file, and the real runtime directory (/private/tmp/metadesk-UID
@@ -25,8 +31,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-EXPECTED = 95   # 2 appearances x 47 images + menu.txt; see snapshot_pages.m
-renderer, build = sys.argv[1], Path(os.path.realpath(sys.argv[2]))
+import json
+
+renderer, check_renderer, build = sys.argv[1], sys.argv[2], Path(os.path.realpath(sys.argv[3]))
+# What this build includes, from Meson's record of its options.
+options = {o['name']: o['value'] for o in json.loads((build / 'meson-info' / 'intro-buildoptions.json').read_text())}
+nip46 = bool(options.get('signer_nip46'))
+any_signer = nip46 or bool(options.get('signer_nip5f')) or bool(options.get('signer_nip55l'))
+# CHECK_RENDERER: light, default size: 2 disconnected + 5 sections + 1
+# connecting + 17 sheets + 2 This Computer states + 13 Hosts states, + menu.txt.
+NOT_BUILT = (['sheet-identity-pairing-light.png'] if not nip46 else []) + \
+            (['sheet-identity-add-light.png'] if not any_signer else [])
+EXPECTED = 2 + 5 + 1 + 17 + 2 + 13 + 1 - len(NOT_BUILT)
 
 
 def state(path):
@@ -112,9 +128,11 @@ try:
         ([renderer, '--fixture-run', str(forged), 'token'], forged_env),
         ([renderer, str(build), 'extra'], env),
     ]
-    for case, case_env in refusals:
-        result = subprocess.run(case, env=case_env, capture_output=True, timeout=20)
-        assert result.returncode == 2, (case, result.returncode, result.stdout, result.stderr)
+    for binary in (renderer, check_renderer):
+        for case, case_env in refusals:
+            case = [binary, *case[1:]]
+            result = subprocess.run(case, env=case_env, capture_output=True, timeout=20)
+            assert result.returncode == 2, (case, result.returncode, result.stdout, result.stderr)
     assert not any((forged / 'out').iterdir()) and not any((forged / 'home').iterdir()), 'forged run directory was used'
     assert set((build / 'snapshots').glob('run-*')) - runs == {forged}, 'a refused call created a run directory'
     assert sorted(os.listdir(deep_fd)) == ['meson-private'], 'the overlong root was written'
@@ -128,7 +146,7 @@ try:
     fake_root = Path(os.path.realpath(tempfile.mkdtemp(prefix='md-snapshot-root-')))
     (fake_root / 'meson-private').mkdir()
     (fake_root / 'meson-private' / 'coredata.dat').write_bytes(b'')
-    result = subprocess.run([renderer, str(fake_root)], env=env, capture_output=True, text=True, timeout=400)
+    result = subprocess.run([check_renderer, str(fake_root)], env=env, capture_output=True, text=True, timeout=400)
     skipped = result.returncode == 77
     if skipped:
         print('SKIP: no WindowServer session for the isolated render')
@@ -141,9 +159,20 @@ try:
         # R1: discovery is injected, so nothing reached even the fixture runtime directory.
         fixture_runtime = produced[0].parent / 'runtime'
         assert fixture_runtime.is_dir() and not any(fixture_runtime.iterdir()), 'host socket discovery ran during the render'
-        for required in ('page-hosts-state-no-signer-account-default-light.png', 'sheet-hosts-key-changed-dark.png',
-                         'sheet-access-review-light.png', 'sheet-computer-qr-dark.png', 'page-relays-minimum-light.png'):
+        for required in ('page-hosts-state-no-signer-account-default-light.png', 'sheet-hosts-key-changed-light.png',
+                         'sheet-access-review-light.png', 'sheet-computer-qr-light.png', 'page-relays-default-light.png',
+                         'page-identity-default-light.png', 'sheet-identity-label-light.png'):
             assert required in files, required
+        # Scenes follow the configuration: present when built, otherwise
+        # reported as skipped and absent.
+        for name in ('sheet-identity-pairing-light.png', 'sheet-identity-add-light.png'):
+            reported = f'SKIP: {name[:-4]} ' in result.stdout
+            if name in NOT_BUILT:
+                assert reported and name not in files, (name, result.stdout[-1000:])
+            else:
+                assert not reported and name in files, (name, result.stdout[-1000:])
+        if NOT_BUILT:
+            print('not built in this configuration: ' + ', '.join(NOT_BUILT))
         print(f'PASS: isolated render wrote {len(files)} files')
 
     assert (prefs.read_bytes(), prefs.stat().st_mtime_ns) == before, 'decoy relay preferences changed'

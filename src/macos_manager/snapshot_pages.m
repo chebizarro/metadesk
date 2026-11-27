@@ -49,6 +49,19 @@ static BOOL WriteNew(NSString *name, NSData *data) {
     return close(fd) == 0;
 }
 static int Failures;
+/* Scenes for a feature this build doesn't include are not rendered and not
+ * expected; each is reported as SKIP. A scene that applies and fails to open
+ * still fails. */
+static NSUInteger Skipped;
+static void Skip(NSString *name, const char *why) { printf("SKIP: %s (%s)\n", name.UTF8String, why); ++Skipped; }
+/* The confinement check build (macos_manager_snapshot_check, a test-only
+ * executable) renders every scene once: light appearance, default size. The
+ * run target renders both appearances and both sizes. */
+#ifdef MD_SNAPSHOT_CHECK
+static const BOOL CheckOnly = YES;
+#else
+static const BOOL CheckOnly = NO;
+#endif
 static NSString *Slug(NSString *section);
 static NSMutableArray<NSString *> *Written;
 
@@ -266,10 +279,29 @@ static MdCredentialStore *SnapStore(void) {
     return md_credential_store_custom(&ops, NULL);
 }
 static BOOL NeverCancelled(void *c) { (void)c; return NO; }
+/* An account saved by a build that includes a signer type this one doesn't:
+ * written through the accounts store directly, as that build would. */
+static void SeedForeign(NSString *directory, MdSignerType type, const char *key, const char *label) {
+    MdCredentialStore *store = md_credential_store_memory();
+    MdAccounts *accounts = NULL;
+    int rc = !store ? -1 : md_accounts_open(directory.fileSystemRepresentation, store, &accounts);
+    if (!rc) rc = md_accounts_add(accounts, type, key, label);
+    if (!rc) rc = md_accounts_save(accounts);
+    md_accounts_destroy(accounts); md_credential_store_destroy(store);
+    if (rc) { fprintf(stderr, "FAIL: fixture account %s: %d\n", label, rc); ++Failures; }
+}
 static void SeedAccounts(NSString *directory) {
-    MDIdentityAdd(directory, MD_SIGNER_NIP46, @KEY1, @"Phone signer");
-    MDIdentityAdd(directory, MD_SIGNER_NIP5F, @KEY2, @"This Mac’s signer");
-    MDIdentityAdd(directory, MD_SIGNER_NIP5F, @KEY4, @"");
+    /* The roles are held by accounts of a signer type this build includes;
+     * the phone signer is a remote (NIP-46) account, saved here even when
+     * this build lacks NIP-46 (Identity then explains it can't be used). */
+    MdSignerType local = MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F :
+        MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 : MD_SIGNER_NIP55L;
+    if (MDIdentitySupportsBackend(MD_SIGNER_NIP46)) MDIdentityAdd(directory, MD_SIGNER_NIP46, @KEY1, @"Phone signer");
+    else SeedForeign(directory, MD_SIGNER_NIP46, KEY1, "Phone signer");
+    for (NSArray *a in @[@[@KEY2, @"This Mac’s signer"], @[@KEY4, @""]]) {
+        NSString *error = MDIdentityAdd(directory, local, a[0], a[1]);
+        if (error.length) { fprintf(stderr, "FAIL: fixture account: %s\n", error.UTF8String); ++Failures; }
+    }
     NSArray *accounts = MDIdentityAccounts(directory, NULL);
     for (NSDictionary *a in accounts) {
         MdAccountRole role;
@@ -415,9 +447,14 @@ static void Sheets(Scene *s, NSString *suffix) {
 
     ShowSection(s, @"Identity");
     Await(^BOOL{ return Table(s->identity.view, @"Signer accounts").numberOfRows > 0; });
-    Try(s, n(@"sheet-identity-add-"), s->identity, @selector(add:));
+    BOOL anySigner = MDIdentitySupportsBackend(MD_SIGNER_NIP5F) || MDIdentitySupportsBackend(MD_SIGNER_NIP46) || MDIdentitySupportsBackend(MD_SIGNER_NIP55L);
+    if (anySigner) Try(s, n(@"sheet-identity-add-"), s->identity, @selector(add:));
+    else Skip(n(@"sheet-identity-add-"), "no external signer type is built");
     Try(s, n(@"sheet-identity-label-"), s->identity, @selector(editLabel:));
-    Try(s, n(@"sheet-identity-pairing-"), s->identity, @selector(importPairing:));
+    /* Import Pairing exists only with remote (NIP-46) signers; the seeded
+     * NIP-46 account is selected for it. */
+    if (MDIdentitySupportsBackend(MD_SIGNER_NIP46)) Try(s, n(@"sheet-identity-pairing-"), s->identity, @selector(importPairing:));
+    else Skip(n(@"sheet-identity-pairing-"), "remote (NIP-46) signers are not built");
     Try(s, n(@"sheet-identity-remove-"), s->identity, @selector(remove:));
 }
 
@@ -430,7 +467,7 @@ static void Pages(NSAppearanceName appearance, NSString *mode) {
         ShowSection(&s, section);
         Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-disconnected-default-%@", Slug(section), mode]);
     }
-    for (int z = 0; z < 2; ++z) {
+    for (int z = 0; z < (CheckOnly ? 1 : 2); ++z) {
         Resize(s.window, sizes[z]);
         for (NSString *section in [s.app sectionIdentifiers]) {
             ShowSection(&s, section);
@@ -490,7 +527,7 @@ static void Pages(NSAppearanceName appearance, NSString *mode) {
         if (states[i].state != MDHostsOpening) Await(^BOOL{ return [e.hosts valueForKey:@"book"] != nil; });
         Spin();
         Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-state-%s-default-%@", states[i].name, mode]);
-        if (i == 6 || i == 9) {
+        if (!CheckOnly && (i == 6 || i == 9)) {
             Resize(e.window, sizes[1]); Spin();
             Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-state-%s-minimum-%@", states[i].name, mode]);
         }
@@ -638,7 +675,7 @@ int main(int argc, char **argv) {
         Written = [NSMutableArray array];
         SeedAccounts(nil);
         Pages(NSAppearanceNameAqua, @"light");
-        Pages(NSAppearanceNameDarkAqua, @"dark");
+        if (!CheckOnly) Pages(NSAppearanceNameDarkAqua, @"dark");
         NSMutableString *dump = [NSMutableString string];
         DumpMenu([MDManagerApp makeMainMenu], dump, 0);
         if (!WriteNew(@"menu.txt", [dump dataUsingEncoding:NSUTF8StringEncoding])) ++Failures;
@@ -649,11 +686,15 @@ int main(int argc, char **argv) {
         for (struct dirent *e; listing && (e = readdir(listing));)
             if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) [files addObject:@(e->d_name)];
         if (listing) closedir(listing); else ++Failures;
-        /* Per appearance: 2 disconnected + 10 sections + 1 connecting + 17 sheets
-         * + 2 This Computer states + 13 Hosts states + 2 minimum Hosts states. */
-        const NSUInteger expected = 2 * (2 + 10 + 1 + 17 + 2 + 13 + 2) + 1;
-        if (files.count != Written.count || files.count != expected) { fprintf(stderr, "FAIL: %lu files, %lu written\n", (unsigned long)files.count, (unsigned long)Written.count); ++Failures; }
-        printf("wrote %lu files to %s\n", (unsigned long)Written.count, Out.UTF8String);
+        /* Per appearance: 2 disconnected + 5 sections per size + 1 connecting
+         * + 17 sheets + 2 This Computer states + 13 Hosts states + 2 minimum
+         * Hosts states (minimum size only); less the scenes not built. */
+        const NSUInteger appearances = CheckOnly ? 1 : 2, sizes = CheckOnly ? 1 : 2;
+        const NSUInteger expected = appearances * (2 + 5 * sizes + 1 + 17 + 2 + 13 + (sizes == 2 ? 2 : 0)) + 1 - Skipped;
+        if (files.count != Written.count || files.count != expected) {
+            fprintf(stderr, "FAIL: %lu files, %lu written, %lu expected\n", (unsigned long)files.count, (unsigned long)Written.count, (unsigned long)expected); ++Failures;
+        }
+        printf("wrote %lu files to %s (%lu scenes not built in this configuration)\n", (unsigned long)Written.count, Out.UTF8String, (unsigned long)Skipped);
         return Failures ? 1 : 0;
     }
 }

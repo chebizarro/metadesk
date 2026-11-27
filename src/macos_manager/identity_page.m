@@ -24,6 +24,15 @@ static NSString *BackendTitle(MdSignerType backend) {
         default: return @"Unsupported signer";
     }
 }
+/* What this build lacks for an account it can't use. */
+static NSString *MissingSupport(MdSignerType backend) {
+    switch (backend) {
+        case MD_SIGNER_NIP5F: return @"local socket (NIP-5F) signers";
+        case MD_SIGNER_NIP46: return @"remote (NIP-46) signers";
+        case MD_SIGNER_NIP55L: return @"D-Bus (NIP-55L) signers";
+        default: return @"this signer type";
+    }
+}
 @interface MDIdentityPage () <NSTableViewDataSource, NSTableViewDelegate> {
     MDHostsPage *_hosts;
     NSString *_directory;
@@ -35,6 +44,7 @@ static NSString *BackendTitle(MdSignerType backend) {
     NSArray<NSDictionary *> *_accounts;
     NSTableView *_list;
     MDStatusView *_status;
+    NSTextField *_unsupported; /* why an account's signer can't be used by this build */
     NSTextField *_details, *_clientRole, *_hostRole, *_emptyTitle, *_emptyDetail, *_roleHint;
     NSView *_empty;
     NSString *_selectedID;
@@ -104,7 +114,8 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     _fips.state = NSControlStateValueOn;
     _fips.toolTip = @"Turn off only if the host will be reached by direct IP rather than FIPS.";
     NSStackView *assign = MDRow(@[_client, _host]); assign.alignment = NSLayoutAttributeCenterY;
-    NSGridView *selected = MDForm(@[@[@"Public key", _details], @[@"Assign", assign], @[NSNull.null, _fips]]);
+    _unsupported = MDNote(@"");
+    NSGridView *selected = MDForm(@[@[@"Public key", _details], @[@"Assign", assign], @[NSNull.null, _unsupported], @[NSNull.null, _fips]]);
     NSStackView *stack = nil;
     NSView *page = MDPage(@[MDHeader(@"Roles"), roles, statusRow, MDSeparator(), MDHeader(@"Signer Accounts"), area, listActions,
                          selected, MDNote(@"Create keys, unlock and approve requests in your external signer; Metadesk has no password. "
@@ -208,8 +219,14 @@ static NSString *SignerTitle(NSDictionary *a) {
     for (size_t i=0; i<sizeof(ExternalBackends)/sizeof(*ExternalBackends); ++i)
         any |= MDIdentitySupportsBackend(ExternalBackends[i]);
     _add.enabled=ready && any; _label.enabled=ready && a;
+    /* A signer type this build doesn't include is never offered: Import
+     * Pairing appears only for NIP-46 accounts in a build with NIP-46, and
+     * the note says why roles can't be assigned to such an account. */
     _pair.enabled=ready && bindable && backend==MD_SIGNER_NIP46;
-    _pair.hidden=!a || backend!=MD_SIGNER_NIP46;
+    _pair.hidden=!a || backend!=MD_SIGNER_NIP46 || !MDIdentitySupportsBackend(MD_SIGNER_NIP46);
+    _unsupported.stringValue = a && !bindable ? [NSString stringWithFormat:
+        @"This copy of Metadesk Manager was built without support for %@, so it can’t assign a role to this account.", MissingSupport(backend)] : @"";
+    MDSetRowHidden(_unsupported, !_unsupported.stringValue.length);
     _client.enabled=_host.enabled=ready && bindable;
     _list.enabled=ready;
     _unbindClient.enabled=ready && [self accountInRole:MD_ACCOUNT_CLIENT]!=nil;
