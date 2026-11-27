@@ -199,7 +199,9 @@ NSView *MDScrollingPage(NSView *page) {
         [page.topAnchor constraintEqualToAnchor:document.topAnchor], [page.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
         [page.leadingAnchor constraintEqualToAnchor:document.leadingAnchor], [page.trailingAnchor constraintEqualToAnchor:document.trailingAnchor],
         [document.topAnchor constraintEqualToAnchor:clip.topAnchor], [document.leadingAnchor constraintEqualToAnchor:clip.leadingAnchor],
-        [document.widthAnchor constraintEqualToAnchor:clip.widthAnchor]]];
+        [document.widthAnchor constraintEqualToAnchor:clip.widthAnchor],
+        /* Fill a tall window so a flexible table in the page can grow. */
+        [document.heightAnchor constraintGreaterThanOrEqualToAnchor:clip.heightAnchor]]];
     return scroll;
 }
 NSScrollView *MDTableScroll(NSTableView *table) {

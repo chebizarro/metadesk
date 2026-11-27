@@ -87,10 +87,10 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     NSStackView *statusRow = MDRow(@[_status, _cancel]); statusRow.alignment = NSLayoutAttributeCenterY;
 
     _list = [MDTable new];
-    MDColumnNamed(_list, @"Label", @"Label", 170, nil);
-    MDColumnNamed(_list, @"Signer", @"Signer", 190, nil);
-    MDColumnNamed(_list, @"Fingerprint", @"Fingerprint", 175, nil);
-    MDColumnNamed(_list, @"Role", @"Role", 90, nil);
+    MDColumnNamed(_list, @"Label", @"Label", 150, nil).minWidth = 80;
+    MDColumnNamed(_list, @"Signer", @"Signer", 165, nil);
+    MDColumnNamed(_list, @"Fingerprint", @"Fingerprint", 165, nil);
+    MDColumnNamed(_list, @"Role", @"Role", 64, nil);
     MDFinishColumns(_list, @"Label");
     _list.dataSource = self; _list.delegate = self; _list.accessibilityLabel = @"Signer accounts";
     _list.allowsEmptySelection = YES;
@@ -103,7 +103,9 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     _pair = MDButton(@"Import Pairing…", self, @selector(importPairing:));
     _pair.toolTip = @"Restore a saved NIP-46 pairing for the selected remote signer account";
     NSStackView *plusMinus = MDRow(@[_add, _remove]); plusMinus.spacing = 0; plusMinus.alignment = NSLayoutAttributeCenterY;
-    NSStackView *listActions = MDRow(@[plusMinus, _label, _pair]); listActions.alignment = NSLayoutAttributeCenterY;
+    [plusMinus setHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *listActions = MDRow(@[]); listActions.alignment = NSLayoutAttributeCenterY;
+    for (NSView *v in @[plusMinus, _label, _pair]) [listActions addView:v inGravity:NSStackViewGravityLeading];
     [listActions setCustomSpacing:12 afterView:plusMinus];
     _details = MDValue(@""); _details.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
     _details.accessibilityLabel = @"Selected account public key";
@@ -115,7 +117,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     NSStackView *assign = MDRow(@[_client, _host]); assign.alignment = NSLayoutAttributeCenterY;
     NSGridView *selected = MDForm(@[@[@"Public key", _details], @[@"Assign", assign], @[NSNull.null, _fips]]);
     NSStackView *stack = nil;
-    self.view = MDPage(@[MDHeader(@"Roles"), roles, statusRow, MDSeparator(), MDHeader(@"Signer Accounts"), area, listActions,
+    NSView *page = MDPage(@[MDHeader(@"Roles"), roles, statusRow, MDSeparator(), MDHeader(@"Signer Accounts"), area, listActions,
                          selected, MDNote(@"Create keys, unlock and approve requests in your external signer; Metadesk has no password. "
                                           @"Restart a running host after changing its role.")], &stack);
     MDAlignForms(@[roles, selected]);
@@ -124,6 +126,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     [stack setCustomSpacing:6 afterView:area];
     [stack setCustomSpacing:MDGroupSpacing afterView:listActions];
     [stack setCustomSpacing:MDGroupSpacing afterView:selected];
+    self.view = MDScrollingPage(page);
     [_status setText:@"Load saved signer accounts." kind:MDStatusInfo];
     [self render];
 }
