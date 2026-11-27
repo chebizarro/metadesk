@@ -114,6 +114,13 @@ macos_snapshot_tool = executable('macos_manager_snapshots', ['snapshot_pages.m',
 # confines HOME, CFFIXED_USER_HOME and XDG_* to; it refuses any other root.
 # A design-review tool, not a gate: meson compile -C BUILD macos-manager-snapshots
 run_target('macos-manager-snapshots', command : [macos_snapshot_tool, meson.project_build_root()])
+# The guard's confinement render uses a test-only build of the same renderer
+# that draws every scene once (light, default size) instead of four times.
+macos_snapshot_check = executable('macos_manager_snapshot_check', ['snapshot_pages.m', 'main.m'],
+  objc_args : ['-fobjc-arc', '-DMD_MACOS_MANAGER_APP_TEST', '-DMD_SNAPSHOT_CHECK'],
+  link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
+  dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
+  build_by_default : false)
 test('macOS snapshot renderer refuses roots it did not create', macos_hosts_python,
-  args : [files('test_snapshot_guard.py'), macos_snapshot_tool, meson.project_build_root()],
+  args : [files('test_snapshot_guard.py'), macos_snapshot_tool, macos_snapshot_check, meson.project_build_root()],
   suite : 'macos_manager', timeout : 480, is_parallel : false)

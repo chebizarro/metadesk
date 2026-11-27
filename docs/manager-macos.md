@@ -202,12 +202,16 @@ bootstrap the bundled `BundleProgram` plist.
 
 ## Identity and roles
 
-Use the **+** button under the accounts list (Add Signer Account) to save the
+Use **Add Account…** under the accounts list (Add Signer Account) to save the
 public key and optional public label of an existing external signer account.
 Use **Edit Label…** to rename it without
 changing either role. The picker offers compiled signer adapters: NIP-5F (local
 socket), NIP-46 (remote), and NIP-55L (D-Bus only in builds that enable it).
-Direct-key accounts are not offered for new managed roles.
+Direct-key accounts are not offered for new managed roles. An account saved by
+a build that includes a signer type this one doesn't (for example a NIP-46
+account in a NIP-5F-only build) is listed, but this build offers nothing it
+can't do: no **Use for Client**, **Use for Host** or **Import Pairing**, and a
+note under the account says the build lacks that signer type.
 
 Select a saved public account and choose **Use for Client** or **Use for Host**.
 The signer must prove the selected key. FIPS hosting compares that key to the
@@ -295,9 +299,13 @@ without following links, validates the Meson marker and creates the run
 directories through those descriptors, and refuses any path that would be
 truncated. Paths it hands to Foundation and AppKit are re-resolved by them;
 the run directory's 0700 mode is what protects those. The suite's renderer
-guard checks refusals (including an overlong root and a symlinked ancestor),
-performs one isolated render and checks every artifact; without a window
-server it reports the test as skipped. It uses
+guard checks refusals (including an overlong root and a symlinked ancestor)
+for the renderer and for a test-only build of it, then uses that build for
+one isolated render that draws every scene once (light appearance, default
+size) and checks every artifact; without a window server it reports the test
+as skipped. Scenes follow the build's configuration: a scene for a signer
+type the build doesn't include (Import Pairing without NIP-46) is reported as
+`SKIP` and not expected, while any scene that applies must open. It uses
 no synthetic input or permissions. The separate `account_keychain` test uses
 an explicit private file Keychain and checks it never appears in the search list.
 Neither fixture qualifies the signed or on-screen workflows above.

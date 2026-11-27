@@ -756,6 +756,37 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
     CHECK(accounts.selectedRow==-1 && !bind.enabled);
     return YES;
 }
+/* An account whose signer type this build doesn't include (saved by another
+ * build) is shown, but nothing the build can't do is offered: no Use for
+ * Client/Host, no Import Pairing, and a note saying why. */
+static BOOL UnbuiltSigner(MDIdentityPage *page, NSString *directory) {
+    MdSignerType types[]={MD_SIGNER_NIP46, MD_SIGNER_NIP5F, MD_SIGNER_NIP55L}, missing=MD_SIGNER_DIRECT_KEY;
+    for (size_t i=0;i<3;++i) if (!MDIdentitySupportsBackend(types[i])) { missing=types[i]; break; }
+    if (missing==MD_SIGNER_DIRECT_KEY) { puts("SKIP: every external signer type is built"); return YES; }
+    const char *key="c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    MdCredentialStore *store=md_credential_store_memory(); MdAccounts *accounts=NULL;
+    CHECK(store && !md_accounts_open(directory.fileSystemRepresentation,store,&accounts));
+    CHECK(!md_accounts_add(accounts,missing,key,"From another build") && !md_accounts_save(accounts));
+    md_accounts_destroy(accounts); md_credential_store_destroy(store);
+    /* Read the expected list once: polling the accounts store while the
+     * page reloads would contend for its lock. */
+    NSArray *rows=MDIdentityAccounts(directory,NULL);
+    NSUInteger row=[rows indexOfObjectPassingTest:^BOOL(NSDictionary *a, NSUInteger i, BOOL *stop) { (void)i; (void)stop; return [a[@"key"] isEqual:@(key)]; }];
+    CHECK(row!=NSNotFound);
+    CHECK(Await(^BOOL{ return [page validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; }));
+    [page refresh:nil];
+    NSTableView *table=(NSTableView *)Find(page.view,^BOOL(NSView *v){ return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Signer accounts"]; });
+    CHECK(Await(^BOOL{ return table.numberOfRows==(NSInteger)rows.count && [page validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; }));
+    [table selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+    NSView *view=page.view;
+    CHECK(![Button(view,@"Use for Client") isEnabled] && ![Button(view,@"Use for Host") isEnabled]);
+    CHECK(!Visible(Button(view,@"Import Pairing…")));
+    CHECK(LabelContains(view,@"built without support for"));
+    /* A supported account selected again: the note goes away. */
+    [table selectRowIndexes:[NSIndexSet indexSetWithIndex:row ? 0 : 1] byExtendingSelection:NO];
+    if (table.numberOfRows>1) CHECK(!LabelContains(view,@"built without support for"));
+    return YES;
+}
 @interface FixtureApp : MDManagerApp
 @property NSUInteger replies;
 @end
@@ -1775,6 +1806,7 @@ static BOOL Run(NSString *directory) {
     [app showSection:@"Identity"];
     if (MDIdentitySupportsBackend(backend)) CHECK(Identity(identity,directory,backend));
     else puts("SKIP: no compiled external signer adapter for the Identity action fixture");
+    CHECK(UnbuiltSigner(identity,directory));
     [app showSection:@"Hosts"];
     CHECK(Quit(app,hosts,worker,link,window));
     KeyWindowOverride=nil;
