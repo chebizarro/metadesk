@@ -115,3 +115,6 @@ macos_snapshot_tool = executable('macos_manager_snapshots', ['snapshot_pages.m',
 test('macOS Manager offscreen snapshots', macos_snapshot_tool,
   args : [meson.project_build_root()],
   suite : 'macos_manager_snapshots', timeout : 600, is_parallel : false)
+test('macOS snapshot renderer refuses roots it did not create', macos_hosts_python,
+  args : [files('test_snapshot_guard.py'), macos_snapshot_tool, meson.project_build_root()],
+  suite : 'macos_manager', timeout : 60, is_parallel : false)
