@@ -27,6 +27,18 @@
 #define REQUEST "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
 
 static NSString *Out;
+/* Creates a new file exclusively (never follows a link, never truncates). */
+static BOOL WriteNew(NSString *path, NSData *data) {
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NO;
+    const uint8_t *bytes = data.bytes; size_t done = 0;
+    while (done < data.length) {
+        ssize_t n = write(fd, bytes + done, data.length - done);
+        if (n <= 0) { close(fd); return NO; }
+        done += (size_t)n;
+    }
+    return close(fd) == 0;
+}
 static int Failures;
 static NSString *Slug(NSString *section);
 static NSMutableArray<NSString *> *Written;
@@ -112,8 +124,7 @@ static void Render(NSView *view, NSString *name) {
     }];
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
     NSString *path = [Out stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]];
-    if ([NSFileManager.defaultManager fileExistsAtPath:path]) { fprintf(stderr, "FAIL: duplicate %s\n", name.UTF8String); ++Failures; return; }
-    if (!png || ![png writeToFile:path atomically:NO]) { fprintf(stderr, "FAIL: could not write %s\n", path.UTF8String); ++Failures; return; }
+    if (!png || !WriteNew(path, png)) { fprintf(stderr, "FAIL: could not write %s\n", path.UTF8String); ++Failures; return; }
     [Written addObject:path.lastPathComponent];
 }
 /* The frame view includes the title bar and toolbar. */
@@ -232,6 +243,7 @@ static NSArray *SnapRows(void) {
 @end
 
 static NSString *SignerKey;
+static BOOL FixtureHostRole = YES;
 static int SnapKey(MdSigner *s, char **key) { (void)s; *key = strdup(SignerKey.UTF8String); return *key ? 0 : MD_SIGNER_ERR_INTERNAL; }
 static int SnapConnect(MdSignerType backend, const char *key, MdCredentialStore *store, MdSigner **out) {
     (void)key; (void)store;
@@ -294,6 +306,9 @@ static Scene MakeScene(NSAppearanceName appearance, MDHostsState state, BOOL emp
     if (accounts >= 0) s.hosts.accountCount = ^NSUInteger { return (NSUInteger)accounts; };
     SnapLink *link = [[SnapLink alloc] initWithUpdate:nil]; s.link = link;
     s.local = [[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push = update; return link; }];
+    /* Never look up the real host role or runtime directory: a fixture path. */
+    NSString *socket = [@(getenv("XDG_RUNTIME_DIR")) stringByAppendingPathComponent:@"fixture-host.sock"];
+    s.local.discover = ^NSString *(BOOL *hasRole) { *hasRole = FixtureHostRole; return FixtureHostRole ? socket : nil; };
     s.identity = [[MDIdentityPage alloc] initWithHosts:s.hosts directory:nil connect:SnapConnect credentials:^{ return SnapStore(); }];
     s.app = [[MDManagerApp alloc] initWithHosts:s.hosts local:s.local identity:s.identity];
     s.window = [s.app makeMainWindow];
@@ -441,9 +456,12 @@ static void Pages(NSAppearanceName appearance, NSString *mode) {
     c.link.push(@"Host unreachable or socket not trusted. Agent process state is unknown.", nil, nil, nil, NO);
     Spin();
     Render(Frame(c.window), [@"page-this-computer-unreachable-default-" stringByAppendingString:mode]);
-    [c.local setValue:@YES forKey:@"noHostRole"];
+    FixtureHostRole = NO;
+    [c.local identityChanged];
+    Await(^BOOL{ return [[c.local valueForKey:@"noHostRole"] boolValue]; });
     c.link.push(nil, nil, nil, nil, NO);
     Spin();
+    FixtureHostRole = YES;
     Render(Frame(c.window), [@"page-this-computer-no-host-role-default-" stringByAppendingString:mode]);
     Drain(&c);
 
@@ -494,77 +512,55 @@ static void DumpMenu(NSMenu *menu, NSMutableString *out, int depth) {
     }
 }
 
-/* ---- Fixture-root safety (md-b9zo B3) ----
- * The renderer only ever reads and writes inside a run directory it creates
- * itself with mkdtemp under BUILD/snapshots, where BUILD is a canonical meson
- * build directory owned by this user. It then re-executes itself with HOME,
- * CFFIXED_USER_HOME and XDG_* pointing into that run directory and refuses to
- * render unless every one of them, and NSHomeDirectory(), is exactly that. */
+/* ---- Fixture-root safety (md-b9zo B3, R2) ----
+ * One entry point, one argument: a canonical meson build directory owned by
+ * this user. Before any Foundation or AppKit call, the renderer creates a new
+ * BUILD/snapshots/run-XXXXXX with mkdtemp and its own home, config, state,
+ * cache, runtime and output directories, points HOME, CFFIXED_USER_HOME and
+ * XDG_* there, and verifies Foundation sees that home. It never re-executes,
+ * accepts no directory, token or environment from a caller, and creates every
+ * file it writes exclusively without following links. */
+static const char *const FixtureDirs[] = {"home", "config", "state", "cache", "runtime", "out"};
+static int Owned(const char *path, mode_t type) {
+    struct stat st;
+    return !lstat(path, &st) && (st.st_mode & S_IFMT) == type && st.st_uid == geteuid();
+}
+static int Prepare(const char *root, char run[PATH_MAX]) {
+    char canonical[PATH_MAX], path[PATH_MAX];
+    if (root[0] != '/' || !realpath(root, canonical) || strcmp(canonical, root) || !Owned(root, S_IFDIR)) return 0;
+    snprintf(path, sizeof path, "%s/meson-private/coredata.dat", root);
+    if (!Owned(path, S_IFREG)) return 0;
+    snprintf(path, sizeof path, "%s/snapshots", root);
+    if (mkdir(path, 0700) && errno != EEXIST) return 0;
+    if (!Owned(path, S_IFDIR)) return 0;
+    snprintf(run, PATH_MAX, "%s/run-XXXXXX", path);
+    if (!mkdtemp(run)) return 0;
+    for (size_t i = 0; i < sizeof FixtureDirs / sizeof *FixtureDirs; ++i) {
+        snprintf(path, sizeof path, "%s/%s", run, FixtureDirs[i]);
+        if (mkdir(path, 0700)) return 0;
+    }
+    static const char *const names[] = {"HOME", "CFFIXED_USER_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"};
+    static const char *const dirs[] = {"home", "home", "config", "state", "cache", "runtime"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; ++i) {
+        snprintf(path, sizeof path, "%s/%s", run, dirs[i]);
+        if (setenv(names[i], path, 1)) return 0;
+    }
+    return 1;
+}
 static NSString *Canonical(NSString *path) {
     char resolved[PATH_MAX];
     return path.isAbsolutePath && realpath(path.fileSystemRepresentation, resolved) ? @(resolved) : nil;
 }
-static BOOL OwnedDirectory(NSString *path) {
-    struct stat st;
-    return !lstat(path.fileSystemRepresentation, &st) && S_ISDIR(st.st_mode) && st.st_uid == geteuid();
-}
-static BOOL BuildRoot(NSString *root) {
-    struct stat st;
-    NSString *marker = [root stringByAppendingPathComponent:@"meson-private/coredata.dat"];
-    return [Canonical(root) isEqual:root] && OwnedDirectory(root) &&
-        !lstat(marker.fileSystemRepresentation, &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid();
-}
-static NSArray<NSString *> *FixtureDirectories(void) { return @[@"home", @"config", @"state", @"cache", @"out"]; }
-static int Launch(const char *self, NSString *root) {
-    if (!BuildRoot(root)) { fprintf(stderr, "refusing: %s is not a canonical meson build directory owned by you\n", root.UTF8String); return 2; }
-    NSString *parent = [root stringByAppendingPathComponent:@"snapshots"];
-    if (mkdir(parent.fileSystemRepresentation, 0700) && errno != EEXIST) return 2;
-    if (!OwnedDirectory(parent) || ![Canonical(parent) isEqual:parent]) { fputs("refusing: snapshots is not a plain directory\n", stderr); return 2; }
-    char run[PATH_MAX];
-    snprintf(run, sizeof run, "%s/run-XXXXXX", parent.fileSystemRepresentation);
-    if (!mkdtemp(run)) return 2;
-    NSString *dir = @(run);
-    for (NSString *sub in FixtureDirectories())
-        if (mkdir([dir stringByAppendingPathComponent:sub].fileSystemRepresentation, 0700)) return 2;
-    NSString *token = NSUUID.UUID.UUIDString;
-    int fd = open([dir stringByAppendingPathComponent:@".fixture-token"].fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-    if (fd < 0 || write(fd, token.UTF8String, token.length) != (ssize_t)token.length) return 2;
-    close(fd);
-    setenv("HOME", [dir stringByAppendingPathComponent:@"home"].fileSystemRepresentation, 1);
-    setenv("CFFIXED_USER_HOME", [dir stringByAppendingPathComponent:@"home"].fileSystemRepresentation, 1);
-    setenv("XDG_CONFIG_HOME", [dir stringByAppendingPathComponent:@"config"].fileSystemRepresentation, 1);
-    setenv("XDG_STATE_HOME", [dir stringByAppendingPathComponent:@"state"].fileSystemRepresentation, 1);
-    setenv("XDG_CACHE_HOME", [dir stringByAppendingPathComponent:@"cache"].fileSystemRepresentation, 1);
-    unsetenv("XDG_RUNTIME_DIR");
-    char *args[] = {(char *)self, "--fixture-run", run, (char *)token.UTF8String, NULL};
-    execv(self, args);
-    perror("execv"); return 2;
-}
-static NSString *CheckFixture(NSString *run, NSString *token) {
-    NSString *canonical = Canonical(run);
-    if (![canonical isEqual:run] || !OwnedDirectory(run)) return nil;
-    NSString *snapshots = run.stringByDeletingLastPathComponent;
-    if (![snapshots.lastPathComponent isEqual:@"snapshots"] || !BuildRoot(snapshots.stringByDeletingLastPathComponent) ||
-        ![run.lastPathComponent hasPrefix:@"run-"]) return nil;
-    NSData *stored = [NSData dataWithContentsOfFile:[run stringByAppendingPathComponent:@".fixture-token"] options:NSDataReadingUncached error:NULL];
-    if (![[[NSString alloc] initWithData:stored encoding:NSUTF8StringEncoding] isEqual:token]) return nil;
-    NSDictionary *want = @{@"HOME":@"home", @"CFFIXED_USER_HOME":@"home", @"XDG_CONFIG_HOME":@"config", @"XDG_STATE_HOME":@"state", @"XDG_CACHE_HOME":@"cache"};
-    for (NSString *name in want) {
-        const char *value = getenv(name.UTF8String);
-        NSString *expected = [run stringByAppendingPathComponent:want[name]];
-        if (!value || ![@(value) isEqual:expected] || ![Canonical(expected) isEqual:expected] || !OwnedDirectory(expected)) return nil;
-    }
-    /* Foundation may report /private/tmp/... as /tmp/...; compare canonically. */
-    if (![Canonical(NSHomeDirectory()) isEqual:[run stringByAppendingPathComponent:@"home"]]) return nil;
-    return [run stringByAppendingPathComponent:@"out"];
-}
 
 int main(int argc, char **argv) {
+    char run[PATH_MAX];
+    if (argc != 2) { fputs("usage: macos_manager_snapshots MESON_BUILD_DIR\n", stderr); return 2; }
+    if (!Prepare(argv[1], run)) { fprintf(stderr, "refusing: %s is not a canonical meson build directory owned by you\n", argv[1]); return 2; }
     @autoreleasepool {
-        if (argc == 2) return Launch(argv[0][0] == '/' ? argv[0] : realpath(argv[0], NULL), @(argv[1]));
-        if (argc != 4 || strcmp(argv[1], "--fixture-run")) { fputs("usage: macos_manager_snapshots MESON_BUILD_DIR\n", stderr); return 2; }
-        Out = CheckFixture(@(argv[2]), @(argv[3]));
-        if (!Out) { fputs("refusing: not a fixture run directory created by this renderer\n", stderr); return 2; }
+        NSString *home = [@(run) stringByAppendingPathComponent:@"home"];
+        /* Foundation may report /private/... as /..., so compare canonically. */
+        if (![Canonical(NSHomeDirectory()) isEqual:home]) { fputs("refusing: Foundation does not see the fixture home\n", stderr); return 2; }
+        Out = [@(run) stringByAppendingPathComponent:@"out"];
         CFDictionaryRef session = CGSessionCopyCurrentDictionary();
         if (!session || CGMainDisplayID() == kCGNullDirectDisplay) {
             if (session) CFRelease(session);
@@ -579,7 +575,7 @@ int main(int argc, char **argv) {
         NSMutableString *dump = [NSMutableString string];
         DumpMenu([MDManagerApp makeMainMenu], dump, 0);
         NSString *menu = [Out stringByAppendingPathComponent:@"menu.txt"];
-        if (![dump writeToFile:menu atomically:NO encoding:NSUTF8StringEncoding error:NULL]) ++Failures;
+        if (!WriteNew(menu, [dump dataUsingEncoding:NSUTF8StringEncoding])) ++Failures;
         else [Written addObject:@"menu.txt"];
         /* Every expected artifact must exist in this fresh directory. */
         NSArray *files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:Out error:NULL];
