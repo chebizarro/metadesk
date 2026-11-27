@@ -15,8 +15,26 @@ NSString *MDHostBoundText(NSString *value, NSUInteger limit);
 @property(nonatomic, readonly) uint8_t caps;
 @end
 
+/* Which condition the address book is in, for the UI to explain it and offer
+ * the next step. Read-only: it does not change what canReview/canEdit allow. */
+typedef NS_ENUM(NSInteger, MDHostsState) {
+    MDHostsOpening,            /* not opened yet */
+    MDHostsNoClientRole,       /* no account holds the client role */
+    MDHostsCredentialFailed,   /* local Keychain pairing for the client signer failed */
+    MDHostsSignerUnavailable,  /* client signer locked, unreachable or refused */
+    MDHostsCacheUnavailable,   /* private encrypted cache could not be opened */
+    MDHostsNoRelays,           /* no bootstrap relays chosen: cached only */
+    MDHostsSyncing,            /* catching up */
+    MDHostsRelaysOffline,      /* relays unreachable: cached only */
+    MDHostsRelayRefused,       /* a relay refused the subscription or authentication */
+    MDHostsAuthPending,        /* waiting for relay authentication */
+    MDHostsReplayNeeded,       /* catch-up incomplete; refresh to replay */
+    MDHostsDocumentError,      /* an encrypted document is invalid or unreadable */
+    MDHostsSynced,
+};
 @interface MDHostsBook : NSObject
 @property(nonatomic, readonly) NSString *owner, *status, *unavailable;
+@property(nonatomic, readonly) MDHostsState state;
 @property(nonatomic, readonly) BOOL canReview, canEdit, canExport;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *rows;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *quick;

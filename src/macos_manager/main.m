@@ -135,16 +135,21 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     _routes.accessibilityLabel = @"Preview result";
     NSGridView *form = MDForm(@[@[@"Host identity", _address], @[@"Bootstrap relay", _relay], @[NSNull.null, _preview]]);
     NSStackView *stack = nil;
-    NSView *page = MDPage(@[MDHeader(@"Route Preview"),
-        MDNote(@"See which key and bootstrap relay a host identity resolves to, without contacting any relay. "
-               @"This preview doesn’t change the relays the Hosts address book uses; set those in Hosts."),
-        form, MDSeparator(), MDHeader(@"Result"), _routes], &stack);
+    NSView *settings = [_hostsPage relaySettingsView];
+    NSStackView *result = MDRow(@[MDFormLabel(@"Result"), _routes]);
+    NSView *page = MDPage(@[settings, MDSeparator(), MDHeader(@"Test a Host Identity"),
+        MDNote(@"See which key and bootstrap relay a host identity resolves to, without contacting any relay or changing your relays."),
+        form, result], &stack);
+    NSMutableArray *forms = [NSMutableArray arrayWithObject:form];
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:settings];
+    while (queue.count) { NSView *v = queue.lastObject; [queue removeLastObject];
+        if ([v isKindOfClass:NSGridView.class]) [forms addObject:v]; else [queue addObjectsFromArray:v.subviews]; }
+    MDAlignForms(forms);
+    [stack setCustomSpacing:MDGroupSpacing afterView:settings];
     [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[1]];
-    [stack setCustomSpacing:MDGroupSpacing afterView:form];
-    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[3]];
+    [stack setCustomSpacing:MDRowSpacing afterView:form];
     _routes.stringValue = @"Enter a host identity and choose Preview.";
-    _address.nextKeyView = _relay; _relay.nextKeyView = _preview;
-    return page;
+    return MDScrollingPage(page);
 }
 - (void)preview:(id)sender {
     (void)sender;
@@ -181,6 +186,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     access.refreshHelp=@"Reload remembered clients";
     MDSection *identity=[MDSection section:@"Identity" symbol:@"person.text.rectangle" controller:_identity view:nil];
     identity.refreshHelp=@"Reload saved accounts";
+    (void)_hostsPage.view;
     NSViewController *relays=[NSViewController new]; relays.view=[self relays];
     MDSection *preview=[MDSection section:@"Relays" symbol:@"antenna.radiowaves.left.and.right" controller:relays view:nil];
     _main=[[MDMainWindowController alloc] initWithSections:@[hosts,computer,access,identity,preview]];
@@ -189,6 +195,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     _main.searchChanged=^(NSString *text) { [weakSelf searchChanged:text]; };
     _local.pendingChanged=^(NSUInteger count) {
         MDManagerApp *app=weakSelf;
+        if (!app) return; /* a late timer tick after the app delegate is gone */
         [app->_main setBadge:count ? [NSString stringWithFormat:@"%lu", (unsigned long)count] : nil forSection:@"Access"];
     };
     [_main showSection:@"This Computer"];
@@ -198,6 +205,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     if (self.smokeQuit) return; // Don’t read or sync host/account state.
     if ([section isEqual:@"Hosts"]) [_hostsPage activate];
     if ([section isEqual:@"Identity"]) [_identity activate];
+    if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local activate];
 }
 - (void)searchChanged:(NSString *)text { [_hostsPage setSearchText:text]; }
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -261,6 +269,13 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     if ([section isEqual:@"Hosts"]) [NSApp sendAction:@selector(refresh:) to:_hostsPage from:sender];
     else if ([section isEqual:@"Identity"]) [NSApp sendAction:@selector(refresh:) to:_identity from:sender];
     else if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local refreshSection:section];
+}
+/* First-run step from Hosts: open Identity and start adding an account. */
+- (void)addSignerAccount:(id)sender {
+    (void)sender;
+    if (_terminationPending || !_main) return;
+    [self showSection:@"Identity"];
+    [_identity beginAddAccount];
 }
 - (void)openHelp:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDHelpURL]]; }
 - (void)reportIssue:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDIssuesURL]]; }

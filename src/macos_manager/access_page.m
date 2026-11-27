@@ -4,6 +4,7 @@
 #import "host_qr.h"
 #import "model.h"
 #import "ui.h"
+#include "accounts.h"
 #import <Security/Security.h>
 #import <UserNotifications/UserNotifications.h>
 
@@ -58,14 +59,19 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     NSButton *_showQR;
     NSDictionary *_snapshot, *_policy, *_permissions;
     BOOL _busy, _closed;
-    NSTextField *_endpoint, *_agent, *_session, *_sessionKey, *_notificationStatus;
+    NSTextField *_endpoint, *_agent, *_session, *_sessionKey, *_notificationStatus, *_lifecycle;
+    NSButton *_retry, *_openIdentity, *_advanced;
+    NSView *_customRow;
+    NSString *_defaultPath;          /* standard socket for the saved host role */
+    BOOL _located, _noHostRole, _activated, _custom;
+    id _policyGeneration;            /* remembered clients loaded for this generation */
     MDStatusView *_status, *_accessStatus, *_screen, *_ax;
     NSTableView *_requests, *_clients;
     NSArray<NSDictionary *> *_requestRows, *_clientRows;
     NSString *_selectedToken, *_selectedPeer;
     NSView *_requestsEmpty, *_clientsEmpty;
     NSTextField *_requestsEmptyTitle, *_requestsEmptyDetail, *_clientsEmptyTitle, *_clientsEmptyDetail;
-    NSButton *_connect, *_recheck, *_kick, *_review, *_refreshPolicy, *_edit, *_revoke, *_kickRevoke;
+    NSButton *_connect, *_recheck, *_kick, *_review, *_edit, *_revoke, *_kickRevoke;
     NSTimer *_clock;
     MDCapChooser *_chooser;
     NSUInteger _pendingCount;
@@ -108,19 +114,34 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     return t;
 }
 - (void)buildComputerView {
-    _endpoint = MDKeyField(@"/path/to/management.sock", @"Management socket");
-    _endpoint.target = self; _endpoint.action = @selector(connect:);
-    _connect = MDButton(@"Connect", self, @selector(connect:));
-    _connect.toolTip = @"Connect to the running host’s management socket";
     _status = [MDStatusView new];
+    _retry = MDButton(@"Try Again", self, @selector(reconnect:));
+    _openIdentity = MDButton(@"Open Identity", self, @selector(openIdentity:));
+    NSStackView *statusRow = MDRow(@[_status, _retry, _openIdentity]); statusRow.alignment = NSLayoutAttributeCenterY;
+    [_status setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
     _agent = MDWrappingValue(@""); _session = MDWrappingValue(@"");
-    _sessionKey = MDValue(@""); _sessionKey.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
-    _sessionKey.accessibilityLabel = @"Session client public key";
+    _sessionKey = MDValue(@""); _sessionKey.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+    _sessionKey.accessibilityLabel = @"Connected client’s fingerprint";
     _kick = MDButton(@"Disconnect Session…", self, @selector(kick:));
     _showQR = MDButton(@"Show Host QR Code…", self, @selector(showQR:));
-    _showQR.toolTip = @"Show the saved host role’s public key as a QR code to scan from another device. This doesn’t check whether the host is running.";
-    NSGridView *host = MDForm(@[@[@"Management socket", MDRow(@[_endpoint, _connect])], @[NSNull.null, _status],
-                                @[@"Host", _agent], @[@"Session", _session], @[NSNull.null, _sessionKey], @[NSNull.null, _kick], @[@"Identity", _showQR]]);
+    _showQR.toolTip = @"Show the saved host role’s public key as a QR code to scan from another device.";
+    NSGridView *host = MDForm(@[@[NSNull.null, statusRow], @[@"Host", _agent], @[@"Session", _session],
+                                @[@"Client", _sessionKey], @[NSNull.null, _kick], @[@"Identity", _showQR]]);
+    /* A custom socket is an advanced case; the standard location is automatic. */
+    _advanced = [NSButton buttonWithTitle:@"Use a custom management socket" target:self action:@selector(toggleAdvanced:)];
+    _advanced.bezelStyle = NSBezelStyleDisclosure; _advanced.buttonType = NSButtonTypeOnOff; _advanced.title = @"";
+    NSTextField *advancedLabel = MDLabel(@"Use a custom management socket");
+    NSClickGestureRecognizer *click = [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(toggleAdvancedLabel:)];
+    [advancedLabel addGestureRecognizer:click];
+    _advanced.accessibilityLabel = @"Use a custom management socket";
+    NSStackView *advancedRow = MDRow(@[_advanced, advancedLabel]); advancedRow.alignment = NSLayoutAttributeCenterY; advancedRow.spacing = 4;
+    _endpoint = MDKeyField(@"/absolute/path/to/control.sock", @"Management socket");
+    _endpoint.target = self; _endpoint.action = @selector(connect:);
+    _connect = MDButton(@"Connect", self, @selector(connect:));
+    _customRow = MDRow(@[_endpoint, _connect]);
+    [host addRowWithViews:@[NSGridCell.emptyContentView, advancedRow]];
+    [host addRowWithViews:@[MDFormLabel(@"Socket"), _customRow]];
+    [host rowAtIndex:host.numberOfRows - 1].hidden = YES;
     _screen = [MDStatusView new]; _ax = [MDStatusView new];
     NSButton *screen = MDButton(@"Open Settings", self, @selector(screen:));
     NSButton *ax = MDButton(@"Open Settings", self, @selector(ax:));
@@ -132,12 +153,15 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     [_ax setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     NSGridView *permissions = MDForm(@[@[@"Screen Recording", screenRow], @[@"Accessibility", axRow], @[NSNull.null, _recheck]]);
     [permissions columnAtIndex:1].xPlacement = NSGridCellPlacementLeading;
+    NSButton *help = [NSButton buttonWithTitle:@"" target:nil action:@selector(openHelp:)];
+    help.bezelStyle = NSBezelStyleHelpButton; help.accessibilityLabel = @"Metadesk Manager Help";
+    _lifecycle = MDNote(@"Metadesk Manager doesn’t start or stop the host; Help explains how to run it yourself.");
+    NSStackView *footer = MDRow(@[_lifecycle, help]); footer.alignment = NSLayoutAttributeCenterY;
     NSStackView *stack = nil;
     NSView *page = MDPage(@[MDHeader(@"Local Host"), host, MDSeparator(),
         MDHeader(@"Permissions"),
-        MDNote(@"The host needs these permissions to share this Mac. Grant them to the host app in System Settings, not to Metadesk Manager. Checking doesn’t ask for permission or turn on sharing."),
-        permissions, MDSeparator(),
-        MDNote(@"Metadesk Manager doesn’t start or stop the host. A registered host agent starts when you log in; for manual use, run metadesk-host --managed --management-socket PATH in Terminal and stop it with Control-C. Sharing and unattended access can’t be changed here.")], &stack);
+        MDNote(@"The host needs these to share this Mac. Grant them to the host app in System Settings, not to Metadesk Manager. Checking doesn’t ask for permission or turn on sharing."),
+        permissions, MDSeparator(), footer], &stack);
     for (NSView *v in stack.arrangedSubviews) if ([v isKindOfClass:NSBox.class]) {
         NSUInteger i = [stack.arrangedSubviews indexOfObject:v];
         [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[i - 1]];
@@ -146,9 +170,49 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     MDAlignForms(@[host, permissions]);
     self.computerView = MDScrollingPage(page);
 }
+- (void)toggleAdvancedLabel:(id)sender { (void)sender; _advanced.state = !_advanced.state; [self toggleAdvanced:_advanced]; }
+- (void)toggleAdvanced:(id)sender {
+    (void)sender;
+    MDSetRowHidden(_customRow, _advanced.state != NSControlStateValueOn);
+    if (_advanced.state == NSControlStateValueOn) [_endpoint.window makeFirstResponder:_endpoint];
+}
+- (void)openIdentity:(id)sender { (void)sender; [NSApp sendAction:@selector(showSection:) to:nil from:@"Identity"]; }
+/* Connect automatically to the saved host role's standard socket. The path
+ * comes from the same rule the host uses; the link authenticates the peer. */
+- (void)activate {
+    if (_closed || _activated) return;
+    _activated = YES;
+    [self locateAndConnect];
+}
+- (void)locateAndConnect {
+    if (_closed || _busy) return;
+    _busy = YES; [self showStatus:@"Looking for the host on this Mac…"]; [self render];
+    __weak MDLocalHostPages *weakSelf = self;
+    dispatch_group_async(_qrWork, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
+        MdAccounts *accounts = NULL; NSString *path = nil; BOOL role = NO;
+        if (!md_accounts_open_snapshot(NULL, NULL, &accounts)) {
+            const MdAccount *host = md_accounts_role(accounts, MD_ACCOUNT_HOST);
+            char buffer[1024];
+            if (host) { role = YES; if (!md_management_path(host->pubkey, buffer, sizeof buffer)) path = @(buffer); }
+            md_accounts_destroy(accounts);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MDLocalHostPages *page = weakSelf;
+            if (!page || page->_closed) return;
+            page->_busy = NO; page->_located = YES; page->_noHostRole = !role; page->_defaultPath = path;
+            if (path && !page->_custom) { page->_endpoint.placeholderString = path; [page connectTo:path]; }
+            else { [page showStatus:nil]; [page render]; }
+        });
+    } });
+}
+- (void)reconnect:(id)sender {
+    (void)sender;
+    if (_custom && MDHostTrim(_endpoint.stringValue).length) [self connect:nil];
+    else [self locateAndConnect];
+}
 - (void)buildAccessView {
     _accessStatus = [MDStatusView new];
-    _notificationStatus = MDNote(@"Requests appear here. System notifications need a signed copy of the app that already has notification permission.");
+    _notificationStatus = MDNote(@"");
     _requests = AccessTable(self, @"Pending requests");
     MDColumnNamed(_requests, @"Client", @"Client", 175, nil);
     MDColumnNamed(_requests, @"Key", @"Public Key", 160, nil);
@@ -170,12 +234,11 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     _review = MDButton(@"Review Request…", self, @selector(review:));
     NSStackView *requestRow = MDRow(@[_notificationStatus]); requestRow.alignment = NSLayoutAttributeCenterY;
     [requestRow addView:_review inGravity:NSStackViewGravityTrailing];
-    _refreshPolicy = MDButton(@"Reload", self, @selector(refreshPolicy:));
-    _refreshPolicy.toolTip = @"Read the host’s remembered clients again";
+
     _edit = MDButton(@"Edit Access…", self, @selector(edit:));
     _revoke = MDButton(@"Revoke…", self, @selector(revoke:));
     _kickRevoke = MDButton(@"Disconnect and Revoke…", self, @selector(kickRevoke:));
-    NSStackView *clientRow = MDRow(@[_refreshPolicy]); clientRow.alignment = NSLayoutAttributeCenterY;
+    NSStackView *clientRow = MDRow(@[]); clientRow.alignment = NSLayoutAttributeCenterY;
     for (NSView *v in @[_edit, _revoke, _kickRevoke]) [clientRow addView:v inGravity:NSStackViewGravityTrailing];
     NSStackView *stack = nil;
     self.accessView = MDPage(@[_accessStatus, MDHeader(@"Pending Requests"), requests, requestRow, MDSeparator(),
@@ -188,7 +251,7 @@ static NSTableView *AccessTable(id owner, NSString *label) {
 - (void)enableNotifications:(UNUserNotificationCenter *)center {
     if (_closed) return;
     _notifications = center; _notifications.delegate = self;
-    _notificationStatus.stringValue=@"Requests appear here and as notifications."; [self updateNotices];
+    _notificationStatus.stringValue=@"New requests also appear as notifications."; [self updateNotices];
 }
 - (void)clearNotices:(NSArray *)ids {
     if (!ids.count) return;
@@ -299,31 +362,50 @@ static NSTableView *AccessTable(id owner, NSString *label) {
 }
 - (void)showStatus:(NSString *)status {
     MDStatusKind kind = _busy ? MDStatusWorking : _snapshot ? MDStatusOK : status.length ? MDStatusWarning : MDStatusInfo;
-    NSString *text = status.length ? status : @"Not connected to a local host.";
+    NSString *text = status;
+    if (!text.length) text = !_located ? @"Not connected." : _noHostRole ? @"This Mac doesn’t have a host role yet. Assign one in Identity to share this Mac."
+        : @"The host isn’t running, or isn’t reachable at its standard location.";
+    if (_located && _noHostRole && !_snapshot && !_busy) kind = MDStatusInfo;
     [_status setText:text kind:kind];
-    NSString *access = _snapshot || _busy ? text : [text stringByAppendingString:@" Connect in This Computer to see requests."];
-    [_accessStatus setText:access kind:kind];
+    _retry.hidden = _busy || _snapshot != nil || !_located || (_noHostRole && !_custom);
+    _openIdentity.hidden = _busy || _snapshot != nil || !_noHostRole;
+    NSString *access = _snapshot || _busy ? text : @"Not connected to the host on this Mac. Requests appear here once This Computer is connected.";
+    [_accessStatus setText:access kind:_snapshot || _busy ? kind : MDStatusInfo];
 }
 - (void)received:(NSString *)status snapshot:(NSDictionary *)s policy:(NSDictionary *)p permissions:(NSDictionary *)perms busy:(BOOL)busy {
     if (_closed) return;
     _snapshot = s; _policy = p; _permissions = perms; _busy = busy;
     [self showStatus:status];
     [self render];
+    /* Read remembered clients once per host generation, so Access is never
+     * waiting on a manual reload. A read, never a change. */
+    if (s && !p && !busy && ![_policyGeneration isEqual:s[@"generation"]]) {
+        _policyGeneration = s[@"generation"];
+        [self refreshPolicy:nil];
+    }
 }
 - (void)connect:(id)sender {
     (void)sender;
     if (_closed) return;
-    _snapshot = nil; _policy = nil; _permissions = nil; _busy = YES;
-    [self showStatus:@"Connecting to the local host…"];
-    [self render]; [_link connect:MDHostTrim(_endpoint.stringValue)];
+    NSString *path = MDHostTrim(_endpoint.stringValue);
+    _custom = path.length != 0;
+    [self connectTo:path.length ? path : _defaultPath ?: @""];
+}
+- (void)connectTo:(NSString *)path {
+    _snapshot = nil; _policy = nil; _permissions = nil; _busy = YES; _policyGeneration = nil;
+    [self showStatus:@"Connecting to the host on this Mac…"];
+    [self render]; [_link connect:path];
 }
 - (BOOL)canRefreshSection:(NSString *)section {
-    if (_closed || _busy || !_snapshot) return NO;
-    return [section isEqual:@"This Computer"] || [section isEqual:@"Access"];
+    if (_closed || _busy) return NO;
+    if ([section isEqual:@"This Computer"]) return YES; /* reconnects when not connected */
+    return [section isEqual:@"Access"] && _snapshot != nil;
 }
 - (void)refreshSection:(NSString *)section {
     if (![self canRefreshSection:section]) return;
-    if ([section isEqual:@"Access"]) [self refreshPolicy:nil]; else [self permissions:nil];
+    if ([section isEqual:@"Access"]) [self refreshPolicy:nil];
+    else if (_snapshot) [self permissions:nil];
+    else [self reconnect:nil];
 }
 - (void)permissions:(id)sender { (void)sender; [_link command:@{@"v":@1,@"method":@"host.permissions"}]; }
 - (void)refreshPolicy:(id)sender { (void)sender; [_link command:@{@"v":@1,@"method":@"access.list"}]; }
@@ -351,28 +433,33 @@ static void SelectRow(NSTableView *table, NSArray<NSDictionary *> *rows, NSStrin
     if (index == NSNotFound) [table deselectAll:nil];
     else [table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
 }
-static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *key) {
-    if (!permissions) [view setText:@"Unknown" kind:MDStatusInfo];
+static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *key, BOOL connected) {
+    if (!permissions) [view setText:connected ? @"Unknown — choose Recheck Permissions" : @"Unknown — connect to check" kind:MDStatusInfo];
     else if ([permissions[key] boolValue]) [view setText:@"Allowed" kind:MDStatusOK];
     else [view setText:@"Not allowed" kind:MDStatusWarning];
 }
 - (void)render {
     NSDictionary *h = _snapshot[@"host"], *s = self.session;
-    _agent.stringValue = h ? [NSString stringWithFormat:@"%@ host is running (process %@, %@).", [h[@"managed"] boolValue] ? @"Managed" : @"Interactive", h[@"pid"], MDHostBoundText(h[@"state"],32)] :
-        _snapshot ? @"Reachable. The host doesn’t report its supervisor state." : @"Unknown until you connect.";
+    NSString *state = MDHostBoundText(h[@"state"], 32);
+    _agent.stringValue = h ? [NSString stringWithFormat:@"Running %@%@.", [h[@"managed"] boolValue] ? @"in the background" : @"in a Terminal session",
+                                 [state isEqual:@"waiting"] ? @", waiting for a client" : @""] :
+        _snapshot ? @"Running." : @"Unknown until connected.";
+    _agent.toolTip = h ? [NSString stringWithFormat:@"Process %@, state “%@”", h[@"pid"], state] : nil;
     _agent.textColor = h || _snapshot ? NSColor.labelColor : NSColor.secondaryLabelColor;
-    _session.stringValue = !s ? (_snapshot ? @"No session." : @"Unknown until you connect.") :
-        [NSString stringWithFormat:@"%@ — %@", [s[@"revoked"] boolValue] ? @"Ending" : @"Reserved or active", MDAccessCaps([s[@"granted"] unsignedIntValue])];
-    _sessionKey.stringValue = s ? MDHostNpub(s[@"peer"]) ?: @"Unknown client" : @"";
-    _sessionKey.toolTip = _sessionKey.stringValue;
+    _session.stringValue = !s ? (_snapshot ? @"No one is connected." : @"Unknown until connected.") :
+        [s[@"revoked"] boolValue] ? @"A client is being disconnected." :
+        [NSString stringWithFormat:@"A client is connected or about to connect, allowed to: %@.", MDAccessCaps([s[@"granted"] unsignedIntValue]).lowercaseString];
+    _sessionKey.stringValue = s ? MDHostFingerprint(s[@"peer"]) ?: @"Unknown client" : @"";
+    _sessionKey.toolTip = s ? MDHostNpub(s[@"peer"]) : nil;
     MDSetRowHidden(_sessionKey, !s);
     _session.textColor = s ? NSColor.labelColor : NSColor.secondaryLabelColor;
-    Permission(_screen, _permissions, @"screen_recording");
-    Permission(_ax, _permissions, @"accessibility");
+    Permission(_screen, _permissions, @"screen_recording", _snapshot != nil);
+    Permission(_ax, _permissions, @"accessibility", _snapshot != nil);
     _connect.enabled = !_busy; _endpoint.enabled = !_busy;
+    _agent.textColor = _session.textColor = _snapshot ? NSColor.labelColor : NSColor.secondaryLabelColor;
     _recheck.enabled = _snapshot && !_busy; _kick.enabled = !_busy && MDKickCommand(_snapshot,s) != nil;
     MDSetRowHidden(_kick, !s);
-    _refreshPolicy.enabled = _snapshot && !_busy;
+
     NSDictionary *selected = self.client;
     NSString *peer = selected[@"peer"] ?: _selectedPeer;
     NSMutableArray *clients = [NSMutableArray array];
@@ -389,7 +476,7 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
     _clientsEmpty.hidden = _clientRows.count != 0;
     _clientsEmptyTitle.stringValue = !_snapshot ? @"Not Connected" : available ? @"No Remembered Clients" : @"Remembered Clients Not Loaded";
     _clientsEmptyDetail.stringValue = !_snapshot ? @"Connect to the local host in This Computer." :
-        available ? @"Clients you approve with Remember appear here." : @"Choose Reload to read the host’s remembered clients.";
+        available ? @"Clients you approve with Approve and Remember appear here." : @"Loading remembered clients…";
     [self tick:nil];
 }
 - (void)tick:(NSTimer *)timer {
@@ -469,11 +556,12 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
           width:540];
     MDCapChooser *chooser = [MDCapChooser new]; chooser.sheet = sheet;
     NSView *boxes = [chooser viewWithAllowed:MDApprovalAllowed(snapshot,r) initial:MDApprovalDefault(snapshot,r)];
-    NSTextField *requestID = MDKeyValue(MDHostBoundText(r[@"request_id"], 64));
-    requestID.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
-    NSGridView *details = MDDetails(@[@[@"Fingerprint", MDKeyValue(MDHostFingerprint(r[@"peer"]) ?: @"Invalid key")],
+    NSTextField *fingerprint = MDKeyValue(MDHostFingerprint(r[@"peer"]) ?: @"Invalid key");
+    fingerprint.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize + 2 weight:NSFontWeightMedium];
+    fingerprint.toolTip = [@"Request " stringByAppendingString:MDHostBoundText(r[@"request_id"], 64)];
+    NSGridView *details = MDDetails(@[@[@"Fingerprint", fingerprint],
         @[@"Public key", MDKeyValue(MDHostNpub(r[@"peer"]) ?: @"Invalid key")],
-        @[@"Requests", MDAccessCaps([r[@"requested"] unsignedIntValue])], @[@"Request ID", requestID]]);
+        @[@"Requests", MDAccessCaps([r[@"requested"] unsignedIntValue])]]);
     chooser.lifetime = [MDStatusView new];
     NSGridView *grant = MDForm(@[@[@"Allow", boxes],
         @[NSNull.null, MDNote(@"Permissions the client didn’t request, or that this host doesn’t support, can’t be checked.")],

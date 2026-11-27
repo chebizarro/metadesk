@@ -183,6 +183,7 @@ static json_t *Ensure(json_t *obj, const char *key) {
 
 @interface MDHostsBook ()
 @property(nonatomic, readwrite) NSString *owner, *unavailable;
+@property(nonatomic) MDHostsState blocker;
 @property(nonatomic) BOOL hasRelays;
 @property(nonatomic) NSDictionary<NSString *, MDDoc *> *documents;
 @property(nonatomic, readwrite) NSArray<NSDictionary *> *rows, *quick, *issues, *tags;
@@ -260,6 +261,25 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
         if (message.length) return message;
     }
     return @"Address book synced.";
+}
+- (MDHostsState)state {
+    if (self.unavailable) return self.blocker ?: MDHostsCacheUnavailable;
+    if (!self.documents) return MDHostsOpening;
+    if (!self.hasRelays) return MDHostsNoRelays;
+    for (NSString *coordinate in Base()) {
+        MDDoc *d = self.documents[coordinate];
+        if (!d) return MDHostsOpening;
+        if (d->result == MD_STORE_INVALID || !Readable(d)) return MDHostsDocumentError;
+        switch (d->sync) {
+            case MD_SYNC_READY: continue;
+            case MD_SYNC_OFFLINE: return MDHostsRelaysOffline;
+            case MD_SYNC_REFUSED: case MD_SYNC_AUTH_REFUSED: return MDHostsRelayRefused;
+            case MD_SYNC_AUTH_PENDING: return MDHostsAuthPending;
+            case MD_SYNC_REPLAY_NEEDED: return MDHostsReplayNeeded;
+            default: return MDHostsSyncing;
+        }
+    }
+    return MDHostsSynced;
 }
 - (void)project:(json_t *)recents {
     NSMutableArray *rows = [NSMutableArray array], *tags = [NSMutableArray array], *issues = [NSMutableArray array];
@@ -502,6 +522,7 @@ NSString *MDHostsBootstrap(NSString *input, NSString **error) {
     MdStoreController *_store;
     MdRelayPlan _relays;
     NSString *_owner, *_unavailable;
+    MDHostsState _blocker;
     dispatch_block_t _changed;
 }
 - (void)notify;
@@ -521,7 +542,7 @@ static void ControllerChanged(void *context) {
     md_store_controller_close(_store); _store = NULL;
     md_account_startup_clear(&_account);
     md_relay_plan_clear(&_relays);
-    _owner = nil; _unavailable = nil;
+    _owner = nil; _unavailable = nil; _blocker = MDHostsOpening;
 }
 - (BOOL)attach:(MdAccountBinding *)binding directory:(NSString *)directory {
     MdSigner *signer = md_account_binding_signer(binding);
@@ -543,18 +564,20 @@ static void ControllerChanged(void *context) {
             case MD_CREDENTIAL_INVALID: case MD_CREDENTIAL_FAILED: case MD_CREDENTIAL_AMBIGUOUS:
                 _unavailable = [NSString stringWithFormat:@"Local NIP-46 credential access failed: %s. Check Keychain and the saved pairing; no external signer was reached.",
                     md_credential_error_string(rc)];
+                _blocker = MDHostsCredentialFailed;
                 break;
             default:
                 _unavailable = [NSString stringWithFormat:@"Client signer unavailable: %s. Check or unlock it outside Metadesk.", md_accounts_error_string(rc)];
+                _blocker = MDHostsSignerUnavailable;
         }
-    } else if (!_account.binding) _unavailable = @"Assign a client role with the account CLI, then refresh.";
+    } else if (!_account.binding) { _unavailable = @"Assign a client role with the account CLI, then refresh."; _blocker = MDHostsNoClientRole; }
     else {
         if (!directory.length) {
             char *path = md_managed_store_default_directory(); directory = Text(path); free(path);
         }
         if (!directory.isAbsolutePath || ![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
             attributes:@{NSFilePosixPermissions:@0700} error:NULL] || ![self attach:_account.binding directory:directory])
-            _unavailable = @"The encrypted cache is unavailable. Check the private state directory and other manager instances.";
+            { _unavailable = @"The encrypted cache is unavailable. Check the private state directory and other manager instances."; _blocker = MDHostsCacheUnavailable; }
     }
     if (error) *error = _unavailable;
     return _store != NULL;
@@ -577,7 +600,7 @@ static void ControllerChanged(void *context) {
 }
 - (MDHostsBook *)snapshot {
     MDHostsBook *book = [MDHostsBook new];
-    book.owner = _owner; book.unavailable = _unavailable; book.hasRelays = _relays.count != 0;
+    book.owner = _owner; book.unavailable = _unavailable; book.blocker = _blocker; book.hasRelays = _relays.count != 0;
     if (!_store) return book;
     NSMutableDictionary *docs = [NSMutableDictionary dictionary];
     for (NSString *coord in Base()) docs[coord] = ReadDoc(_store, coord);

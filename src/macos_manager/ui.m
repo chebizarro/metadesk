@@ -334,6 +334,112 @@ NSTableCellView *MDCell(NSTableView *table, NSString *identifier, NSString *text
 }
 @end
 
+NSButton *MDProminentButton(NSString *title, id target, SEL action) {
+    NSButton *b = MDButton(title, target, action);
+    b.bezelColor = NSColor.controlAccentColor;
+    b.controlSize = NSControlSizeLarge;
+    return b;
+}
+
+@implementation MDCallout {
+    NSImageView *_icon;
+    NSProgressIndicator *_spinner;
+    NSStackView *_buttons;
+}
+- (instancetype)initWithFrame:(NSRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    NSBox *background = [NSBox new];
+    background.boxType = NSBoxCustom; background.cornerRadius = 8; background.borderWidth = 1;
+    background.borderColor = NSColor.separatorColor; background.fillColor = NSColor.quaternarySystemFillColor;
+    background.titlePosition = NSNoTitle;
+    _icon = [NSImageView new];
+    _icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:NSFont.systemFontSize + 3 weight:NSFontWeightRegular];
+    _spinner = [NSProgressIndicator new]; _spinner.style = NSProgressIndicatorStyleSpinning;
+    _spinner.controlSize = NSControlSizeSmall; _spinner.displayedWhenStopped = NO;
+    _titleLabel = MDWrappingLabel(@""); _titleLabel.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+    _textLabel = MDWrappingLabel(@"");
+    _buttons = MDRow(@[]); _buttons.alignment = NSLayoutAttributeCenterY;
+    NSStackView *text = MDColumn(@[_titleLabel, _textLabel, _buttons], 4);
+    [text setCustomSpacing:MDItemSpacing afterView:_textLabel];
+    NSStackView *row = [NSStackView stackViewWithViews:@[_icon, _spinner, text]];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal; row.alignment = NSLayoutAttributeTop; row.spacing = 8;
+    [_icon setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    for (NSView *v in @[background, row]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    [NSLayoutConstraint activateConstraints:@[
+        [background.topAnchor constraintEqualToAnchor:self.topAnchor], [background.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+        [background.leadingAnchor constraintEqualToAnchor:self.leadingAnchor], [background.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [row.topAnchor constraintEqualToAnchor:self.topAnchor constant:12], [row.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
+        [row.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12], [row.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12]]];
+    self.hidden = YES;
+    return self;
+}
+- (void)showTitle:(NSString *)title text:(NSString *)text kind:(MDStatusKind)kind buttons:(NSArray<NSButton *> *)buttons {
+    self.hidden = !title.length;
+    _titleLabel.stringValue = title ?: @""; _textLabel.stringValue = text ?: @"";
+    NSString *symbol = nil; NSColor *tint = NSColor.secondaryLabelColor;
+    switch (kind) {
+        case MDStatusInfo: symbol = @"info.circle.fill"; break;
+        case MDStatusOK: symbol = @"checkmark.circle.fill"; tint = NSColor.systemGreenColor; break;
+        case MDStatusWarning: symbol = @"exclamationmark.triangle.fill"; tint = NSColor.systemOrangeColor; break;
+        case MDStatusError: symbol = @"xmark.octagon.fill"; tint = NSColor.systemRedColor; break;
+        default: break;
+    }
+    _icon.image = symbol ? [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] : nil;
+    _icon.contentTintColor = tint; _icon.hidden = !symbol;
+    if (kind == MDStatusWorking) [_spinner startAnimation:nil]; else [_spinner stopAnimation:nil];
+    _spinner.hidden = kind != MDStatusWorking;
+    for (NSView *v in _buttons.arrangedSubviews.copy) [_buttons removeView:v];
+    for (NSButton *b in buttons) [_buttons addArrangedSubview:b];
+    _buttons.hidden = !buttons.count;
+    self.accessibilityElement = YES; self.accessibilityRole = NSAccessibilityGroupRole;
+    self.accessibilityLabel = title;
+}
+@end
+
+@implementation MDSetupPanel {
+    NSImageView *_image;
+    NSProgressIndicator *_spinner;
+    NSStackView *_buttons;
+}
+- (instancetype)initWithFrame:(NSRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    _image = [NSImageView new];
+    _image.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:44 weight:NSFontWeightLight];
+    _image.contentTintColor = NSColor.secondaryLabelColor;
+    _spinner = [NSProgressIndicator new]; _spinner.style = NSProgressIndicatorStyleSpinning; _spinner.displayedWhenStopped = NO;
+    _titleLabel = MDWrappingLabel(@""); _titleLabel.alignment = NSTextAlignmentCenter;
+    _titleLabel.font = [NSFont systemFontOfSize:NSFont.systemFontSize + 6 weight:NSFontWeightSemibold];
+    _textLabel = MDWrappingLabel(@""); _textLabel.alignment = NSTextAlignmentCenter; _textLabel.textColor = NSColor.secondaryLabelColor;
+    _buttons = [NSStackView stackViewWithViews:@[]];
+    _buttons.orientation = NSUserInterfaceLayoutOrientationVertical; _buttons.spacing = MDItemSpacing; _buttons.alignment = NSLayoutAttributeCenterX;
+    NSStackView *stack = [NSStackView stackViewWithViews:@[_image, _spinner, _titleLabel, _textLabel, _buttons]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical; stack.alignment = NSLayoutAttributeCenterX; stack.spacing = MDRowSpacing;
+    [stack setCustomSpacing:MDGroupSpacing afterView:_textLabel];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        [stack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-20],
+        [stack.widthAnchor constraintLessThanOrEqualToConstant:440],
+        [stack.widthAnchor constraintLessThanOrEqualToAnchor:self.widthAnchor constant:-2 * MDMargin],
+        [_titleLabel.widthAnchor constraintEqualToAnchor:stack.widthAnchor], [_textLabel.widthAnchor constraintEqualToAnchor:stack.widthAnchor]]];
+    return self;
+}
+- (void)showSymbol:(NSString *)symbol title:(NSString *)title text:(NSString *)text
+           primary:(NSButton *)primary secondary:(NSButton *)secondary working:(BOOL)working {
+    _image.image = symbol ? [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] : nil;
+    _image.hidden = working || !symbol;
+    if (working) [_spinner startAnimation:nil]; else [_spinner stopAnimation:nil];
+    _spinner.hidden = !working;
+    _titleLabel.stringValue = title ?: @""; _textLabel.stringValue = text ?: @"";
+    _textLabel.hidden = !text.length;
+    for (NSView *v in _buttons.arrangedSubviews.copy) [_buttons removeView:v];
+    _primary = primary; _secondary = secondary;
+    if (primary) [_buttons addArrangedSubview:primary];
+    if (secondary) [_buttons addArrangedSubview:secondary];
+}
+@end
+
 NSAlert *MDAlert(NSString *title, NSString *info) {
     NSAlert *a = [NSAlert new]; a.messageText = title; a.informativeText = info ?: @""; return a;
 }

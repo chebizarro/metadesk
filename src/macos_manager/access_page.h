@@ -9,5 +9,7 @@
 - (void)close:(dispatch_block_t)drained;
 /* View > Refresh: This Computer rechecks permissions; Access reloads remembered clients. */
 - (BOOL)canRefreshSection:(NSString *)section;
+/* First shown: connect to the saved host role's standard socket. */
+- (void)activate;
 - (void)refreshSection:(NSString *)section;
 @end

@@ -10,4 +10,6 @@
 - (void)close:(dispatch_block_t)drained;
 /* Reloads saved accounts (View > Refresh). */
 - (void)refresh:(id)sender;
+/* Opens Add Signer Account now, or as soon as accounts have loaded. */
+- (void)beginAddAccount;
 @end

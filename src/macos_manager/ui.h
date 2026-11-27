@@ -70,6 +70,24 @@ typedef NS_ENUM(NSInteger, MDStatusKind) { MDStatusNone, MDStatusInfo, MDStatusW
 @property(nonatomic, readonly) MDStatusKind kind;
 @end
 
+/* A rounded callout shown above content: status icon, bold title, a sentence
+ * of explanation and the buttons for the next step. A nil title hides it. */
+@interface MDCallout : NSView
+- (void)showTitle:(NSString *)title text:(NSString *)text kind:(MDStatusKind)kind buttons:(NSArray<NSButton *> *)buttons;
+@property(nonatomic, readonly) NSTextField *titleLabel, *textLabel;
+@end
+/* A centered first-run panel that replaces a page whose prerequisites are
+ * missing: a large symbol, title, explanation, one prominent next step and an
+ * optional secondary button. */
+@interface MDSetupPanel : NSView
+- (void)showSymbol:(NSString *)symbol title:(NSString *)title text:(NSString *)text
+           primary:(NSButton *)primary secondary:(NSButton *)secondary working:(BOOL)working;
+@property(nonatomic, readonly) NSTextField *titleLabel, *textLabel;
+@property(nonatomic, readonly) NSButton *primary, *secondary;
+@end
+/* A prominent (accent-tinted) push button for the one next step. */
+NSButton *MDProminentButton(NSString *title, id target, SEL action);
+
 /* Confirmation alerts. MDAlertConfirm adds the action as the default (Return)
  * and Cancel (Escape). MDAlertDestructive adds Cancel (Escape) and a
  * destructive action that is never the default: Return does nothing. */

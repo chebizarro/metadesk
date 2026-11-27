@@ -35,11 +35,11 @@ static NSString *BackendTitle(MdSignerType backend) {
     NSArray<NSDictionary *> *_accounts;
     NSTableView *_list;
     MDStatusView *_status;
-    NSTextField *_details, *_clientRole, *_hostRole, *_emptyTitle, *_emptyDetail;
+    NSTextField *_details, *_clientRole, *_hostRole, *_emptyTitle, *_emptyDetail, *_roleHint;
     NSView *_empty;
     NSString *_selectedID;
     NSButton *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel, *_add, *_label, *_pair;
-    BOOL _closed, _busy, _cancellable;
+    BOOL _closed, _busy, _cancellable, _pendingAdd;
 }
 - (BOOL)cancelled;
 @end
@@ -70,7 +70,8 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     [clientRow addView:_unbindClient inGravity:NSStackViewGravityTrailing];
     [hostRow addView:_unbindHost inGravity:NSStackViewGravityTrailing];
     clientRow.alignment = hostRow.alignment = NSLayoutAttributeCenterY;
-    NSGridView *roles = MDForm(@[@[@"Client", clientRow], @[@"Host", hostRow]]);
+    _roleHint = MDNote(@"");
+    NSGridView *roles = MDForm(@[@[@"Client", clientRow], @[@"Host", hostRow], @[NSNull.null, _roleHint]]);
     _status = [MDStatusView new];
     _cancel = MDButton(@"Cancel Verification", self, @selector(cancel:));
     NSStackView *statusRow = MDRow(@[_status, _cancel]); statusRow.alignment = NSLayoutAttributeCenterY;
@@ -86,16 +87,15 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
     NSView *empty = nil; NSTextField *title = nil, *detail = nil;
     NSView *area = MDTableArea(MDTableScroll(_list), &empty, &title, &detail);
     _empty = empty; _emptyTitle = title; _emptyDetail = detail;
-    _add = MDSymbolButton(@"plus", @"Add Signer Account…", self, @selector(add:));
-    _remove = MDSymbolButton(@"minus", @"Remove Account…", self, @selector(remove:));
+    _add = MDButton(@"Add Account…", self, @selector(add:));
+    _remove = MDButton(@"Remove…", self, @selector(remove:));
+    _add.toolTip = @"Add the public key of an account in your external signer";
     _label = MDButton(@"Edit Label…", self, @selector(editLabel:));
     _pair = MDButton(@"Import Pairing…", self, @selector(importPairing:));
     _pair.toolTip = @"Restore a saved NIP-46 pairing for the selected remote signer account";
-    NSStackView *plusMinus = MDRow(@[_add, _remove]); plusMinus.spacing = 0; plusMinus.alignment = NSLayoutAttributeCenterY;
-    [plusMinus setHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     NSStackView *listActions = MDRow(@[]); listActions.alignment = NSLayoutAttributeCenterY;
-    for (NSView *v in @[plusMinus, _label, _pair]) [listActions addView:v inGravity:NSStackViewGravityLeading];
-    [listActions setCustomSpacing:12 afterView:plusMinus];
+    for (NSView *v in @[_add, _label, _pair]) [listActions addView:v inGravity:NSStackViewGravityLeading];
+    [listActions addView:_remove inGravity:NSStackViewGravityTrailing];
     _details = MDValue(@""); _details.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
     _details.accessibilityLabel = @"Selected account public key";
     _client = MDButton(@"Use for Client", self, @selector(bindClient:));
@@ -171,13 +171,16 @@ static NSString *SignerTitle(NSDictionary *a) {
     else [_list deselectAll:nil];
     _empty.hidden = _accounts.count != 0;
     _emptyTitle.stringValue = _accounts ? @"No Signer Accounts" : @"Accounts Not Loaded";
-    _emptyDetail.stringValue = _accounts ? @"Choose + to add the public key of an account in your external signer." : @"Choose View > Refresh to load saved accounts.";
+    _emptyDetail.stringValue = _accounts ? @"Choose Add Account to save the public key of an account in your external signer." : @"Saved accounts load when this page opens.";
     NSDictionary *client = [self accountInRole:MD_ACCOUNT_CLIENT], *host = [self accountInRole:MD_ACCOUNT_HOST];
     _clientRole.stringValue = client ? [NSString stringWithFormat:@"%@ — %@", AccountTitle(client), MDHostNpub(client[@"key"])] : @"Not assigned";
     _hostRole.stringValue = host ? [NSString stringWithFormat:@"%@ — %@", AccountTitle(host), MDHostNpub(host[@"key"])] : @"Not assigned";
     _clientRole.toolTip = client ? MDHostNpub(client[@"key"]) : nil; _hostRole.toolTip = host ? MDHostNpub(host[@"key"]) : nil;
     _clientRole.textColor = client ? NSColor.labelColor : NSColor.secondaryLabelColor;
     _hostRole.textColor = host ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    _roleHint.stringValue = client ? @"" : _accounts.count ? @"To read your host list and connect, select an account below and choose Use for Client."
+                                                           : @"Add an account below, then choose Use for Client to read your host list and connect.";
+    MDSetRowHidden(_roleHint, !_roleHint.stringValue.length || !_accounts);
     [self selection:nil];
 }
 - (void)selection:(id)sender {
@@ -220,12 +223,18 @@ static NSString *SignerTitle(NSDictionary *a) {
                     [self->_status setText:result.length ? result : readError ?: @"Saved accounts loaded." kind:failed ? MDStatusError : MDStatusOK];
                     [self render];
                     if (suspend) [self->_hosts resumeAfterRoleEdit];
+                    if (self->_pendingAdd) { self->_pendingAdd = NO; [self add:nil]; }
                 }
                 dispatch_group_leave(self->_drain);
             });
         } });
     };
     if (suspend) [_hosts suspendForRoleEdit:begin]; else begin();
+}
+- (void)beginAddAccount {
+    if (_closed) return;
+    if (!_busy && self.view.window && !self.view.window.attachedSheet && _accounts) [self add:nil];
+    else { _pendingAdd = YES; [self activate]; }
 }
 - (void)refresh:(id)sender { (void)sender; [self run:@"Loading accounts…" suspend:NO cancellable:NO work:nil]; }
 - (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }

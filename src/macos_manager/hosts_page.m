@@ -2,6 +2,7 @@
 #import "hosts_launch.h"
 #import "host_qr.h"
 #import "ui.h"
+#import "identity_model.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdatomic.h>
 
@@ -127,7 +128,13 @@ static NSTextField *Field(NSString *placeholder, NSString *value) {
     NSPopUpButton *_tags, *_issues, *_actions;
     NSStackView *_connectionRow, *_issueRow;
     NSTableView *_table;
-    NSButton *_review, *_scan, *_saved, *_edit, *_copyKey, *_control, *_issue, *_relaysButton;
+    NSButton *_review, *_scan, *_saved, *_edit, *_copyKey, *_control, *_issue, *_saveRelays;
+    MDCallout *_banner;
+    MDSetupPanel *_setup;
+    NSView *_content, *_relayView;
+    NSTextField *_relayField, *_directoryField, *_noSelection;
+    MDStatusView *_relayStatus;
+    NSInteger _accounts; /* signer accounts known on the worker; -1 unknown */
     MdLaunchMessage _phase;
 }
 - (BOOL)closing;
@@ -147,10 +154,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     star.resizingMask = NSTableColumnNoResizing; star.minWidth = star.maxWidth = 22;
     star.headerToolTip = @"Favorite";
     star.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:@"favorite" ascending:NO];
-    MDColumnNamed(table, @"Name", @"Name", 180, @"title").minWidth = 120;
-    MDColumnNamed(table, @"Alias", @"NIP-05", 140, @"alias");
-    MDColumnNamed(table, @"Tags", @"Tags", 100, @"tagText");
-    NSTableColumn *last = MDColumnNamed(table, @"Last", @"Last Connected", 120, nil);
+    MDColumnNamed(table, @"Name", @"Name", 180, @"title").minWidth = 110;
+    MDColumnNamed(table, @"Alias", @"NIP-05", 120, @"alias").minWidth = 80;
+    MDColumnNamed(table, @"Tags", @"Tags", 90, @"tagText").minWidth = 60;
+    NSTableColumn *last = MDColumnNamed(table, @"Last", @"Last Connected", 112, nil);
+    last.minWidth = 100;
     last.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:@"lastConnected" ascending:NO];
     MDFinishColumns(table, @"Name");
     table.dataSource = self; table.delegate = self;
@@ -178,13 +186,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _route = MDKeyField(@"Optional IPv4 or IPv6 address", @"Route hint");
     _route.delegate = self;
     _review = MDButton(@"Review and Connect…", self, @selector(reviewEntry:));
+    /* Scanning fills in Host, so it sits with Host. */
     _scan = MDButton(@"Scan QR Code…", self, @selector(scanQR:));
-    NSGridView *connect = [NSGridView gridViewWithViews:@[@[MDFormLabel(@"Host"), _address, _review],
-                                                          @[MDFormLabel(@"Route hint"), _route, _scan]]];
-    connect.columnSpacing = MDItemSpacing; connect.rowSpacing = MDRowSpacing;
-    connect.rowAlignment = NSGridRowAlignmentFirstBaseline;
-    [connect columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
-    [connect columnAtIndex:2].xPlacement = NSGridCellPlacementFill;
+    _scan.toolTip = @"Read a host’s nprofile from a QR code image";
+    NSStackView *hostRow = MDRow(@[_address, _scan]);
+    NSStackView *reviewRow = MDRow(@[]); [reviewRow addView:_review inGravity:NSStackViewGravityTrailing];
+    NSGridView *connect = MDForm(@[@[@"Host", hostRow], @[@"Route hint", _route], @[NSNull.null, reviewRow]]);
+    _accounts = -1;
+    _banner = [MDCallout new];
     _message = [MDStatusView new];
     _connection = [MDStatusView new];
     _control = MDButton(@"Cancel Connection", self, @selector(control:));
@@ -212,15 +221,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         item.target = self;
     }
     _actions.accessibilityLabel = @"More actions"; _actions.toolTip = @"Import, export and relay settings";
+    _actions.itemArray.lastObject.title = @"Relay Settings…";
     NSStackView *header = MDRow(@[MDHeader(@"Saved Hosts")]);
     header.alignment = NSLayoutAttributeCenterY;
     for (NSView *v in @[_scope, _tags, _actions]) [header addView:v inGravity:NSStackViewGravityTrailing];
     _sync = [MDStatusView new];
-    _relaysButton = MDButton(@"Relays…", self, @selector(editRelays:));
-    _relaysButton.controlSize = NSControlSizeSmall; _relaysButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     NSStackView *syncRow = MDRow(@[_sync]); syncRow.alignment = NSLayoutAttributeCenterY;
-    [syncRow addView:_relaysButton inGravity:NSStackViewGravityTrailing];
-    [_sync setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
     _issueStatus = [MDStatusView new];
     _issues = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _issues.target = self; _issues.action = @selector(issueSelection:);
@@ -241,6 +247,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _detailKey.accessibilityLabel = @"Public key"; _detailFingerprint.accessibilityLabel = @"Fingerprint"; _detailNotes.accessibilityLabel = @"Notes";
     _details = MDForm(@[@[@"Public key", _detailKey], @[@"Fingerprint", _detailFingerprint], @[@"Notes", _detailNotes]]);
     _details.rowSpacing = 4;
+    _noSelection = MDNote(@"Select a host to see its key and notes.");
     _saved = MDButton(@"Connect…", self, @selector(reviewSaved:));
     _edit = MDButton(@"Edit…", self, @selector(edit:));
     _copyKey = MDButton(@"Copy Public Key", self, @selector(copyPublicKey:));
@@ -249,14 +256,23 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [hostActions addView:_saved inGravity:NSStackViewGravityTrailing];
 
     NSStackView *stack = nil;
-    NSView *page = MDPage(@[connect, _message, _connectionRow, _rotation, MDSeparator(), header, syncRow, _issueRow,
-                            list, _details, hostActions], &stack);
+    _content = MDPage(@[_banner, connect, _message, _connectionRow, _rotation, MDSeparator(), header, syncRow, _issueRow,
+                        list, _details, _noSelection, hostActions], &stack);
+    [stack setCustomSpacing:MDGroupSpacing afterView:_banner];
     [stack setCustomSpacing:MDGroupSpacing afterView:_rotation];
-    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[4]];
+    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[5]];
     [stack setCustomSpacing:6 afterView:header];
     [stack setCustomSpacing:12 afterView:list];
     stack.detachesHiddenViews = YES;
-    self.view = page;
+    _setup = [MDSetupPanel new];
+    NSView *root = [NSView new];
+    for (NSView *v in @[_content, _setup]) {
+        v.translatesAutoresizingMaskIntoConstraints = NO; [root addSubview:v];
+        [NSLayoutConstraint activateConstraints:@[[v.topAnchor constraintEqualToAnchor:root.topAnchor], [v.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+            [v.leadingAnchor constraintEqualToAnchor:root.leadingAnchor], [v.trailingAnchor constraintEqualToAnchor:root.trailingAnchor]]];
+    }
+    self.view = root;
+    [self relaySettingsView];
     [self render];
 }
 - (void)activate {
@@ -363,13 +379,84 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if ([status hasSuffix:@"…"]) return MDStatusWorking;
     return MDStatusWarning;
 }
+- (NSButton *)step:(NSString *)title action:(SEL)action {
+    return MDButton(title, self, action);
+}
+/* Each condition a new install can be in, named in plain words with the one
+ * next step. Nothing here changes what the model allows. */
+- (void)renderState {
+    MDHostsState state = _roleEditing || !_book ? MDHostsOpening : _book.state;
+    BOOL paused = state == MDHostsNoRelays && _syncPaused && _savedBootstrap.length;
+    NSString *detail = MDHostBoundText(_book.unavailable ?: @"", 400);
+    BOOL blocked = YES;
+    switch (state) {
+        case MDHostsOpening:
+            [_setup showSymbol:nil title:_roleEditing ? @"Switching Client Account…" : @"Opening Your Host List…" text:nil primary:nil secondary:nil working:YES]; break;
+        case MDHostsNoClientRole:
+            if (_accounts == 0)
+                [_setup showSymbol:@"person.crop.circle.badge.plus" title:@"Add Your Signer Account"
+                    text:@"Metadesk reads your encrypted host list and connects using an account in your external signer, such as a remote (NIP-46) or local (NIP-5F) signer. Add that account’s public key to get started."
+                    primary:MDProminentButton(@"Add Signer Account…", self, @selector(addSignerAccount:)) secondary:nil working:NO];
+            else
+                [_setup showSymbol:@"person.crop.circle.badge.checkmark" title:@"Choose an Account for Connecting"
+                    text:@"None of your signer accounts is set up for connecting yet. In Identity, select one and choose Use for Client; your signer will be asked to prove it holds the key."
+                    primary:MDProminentButton(@"Open Identity", self, @selector(openIdentity:)) secondary:nil working:NO];
+            break;
+        case MDHostsSignerUnavailable:
+            [_setup showSymbol:@"lock" title:@"Your Signer Isn’t Available"
+                text:[detail stringByAppendingString:@" Unlock your signer or start it, then try again."]
+                primary:MDProminentButton(@"Try Again", self, @selector(refresh:)) secondary:[self step:@"Open Identity" action:@selector(openIdentity:)] working:NO]; break;
+        case MDHostsCredentialFailed:
+            [_setup showSymbol:@"key" title:@"Remote Signer Pairing Unavailable"
+                text:[detail stringByAppendingString:@" If the pairing is missing, import it again in Identity."]
+                primary:MDProminentButton(@"Open Identity", self, @selector(openIdentity:)) secondary:[self step:@"Try Again" action:@selector(refresh:)] working:NO]; break;
+        case MDHostsCacheUnavailable:
+            [_setup showSymbol:@"externaldrive.badge.exclamationmark" title:@"Can’t Open Your Host List"
+                text:[detail stringByAppendingString:@" If another copy of Metadesk Manager is open, quit it, then try again."]
+                primary:MDProminentButton(@"Try Again", self, @selector(refresh:)) secondary:[self step:@"Storage Settings…" action:@selector(editRelays:)] working:NO]; break;
+        default: blocked = NO;
+    }
+    _setup.hidden = !blocked; _content.hidden = blocked;
+    if (blocked) { [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]]; return; }
+    BOOL can = _book.canReview;
+    NSString *then = can ? @"" : @" Reviewing and connecting to hosts are available once your host list has caught up.";
+    switch (paused ? MDHostsOpening : state) {
+        case MDHostsOpening:
+            [_banner showTitle:@"Sync Is Paused" text:@"Your relays are saved, but Metadesk doesn’t contact them until you ask. Sync now to review and connect to hosts."
+                kind:MDStatusInfo buttons:@[[self step:@"Sync Now" action:@selector(refresh:)]]]; break;
+        case MDHostsNoRelays:
+            [_banner showTitle:@"Choose Relays to Sync Your Hosts"
+                text:@"Your host list syncs through relays you choose; Metadesk never picks one for you. Until you add one, you can see cached hosts but can’t review or connect to a host."
+                kind:MDStatusWarning buttons:@[[self step:@"Set Up Relays…" action:@selector(editRelays:)]]]; break;
+        case MDHostsSyncing:
+            [_banner showTitle:@"Syncing Your Host List…" text:[@"This usually takes a few seconds." stringByAppendingString:then] kind:MDStatusWorking buttons:@[]]; break;
+        case MDHostsAuthPending:
+            [_banner showTitle:@"Waiting for a Relay to Sign You In" text:[@"A relay asked Metadesk to sign in with your client account. Approve it in your signer if it asks." stringByAppendingString:then]
+                kind:MDStatusWorking buttons:@[]]; break;
+        case MDHostsRelaysOffline:
+            [_banner showTitle:@"Can’t Reach Your Relays" text:[@"Showing your cached hosts." stringByAppendingString:then]
+                kind:MDStatusWarning buttons:@[[self step:@"Try Again" action:@selector(refresh:)], [self step:@"Relay Settings…" action:@selector(editRelays:)]]]; break;
+        case MDHostsRelayRefused:
+            [_banner showTitle:@"A Relay Refused Your Host List" text:[MDHostBoundText(_book.status, 200) stringByAppendingFormat:@" Check the relay or choose another.%@", then]
+                kind:MDStatusError buttons:@[[self step:@"Relay Settings…" action:@selector(editRelays:)], [self step:@"Try Again" action:@selector(refresh:)]]]; break;
+        case MDHostsReplayNeeded:
+            [_banner showTitle:@"Catch-Up Was Incomplete" text:[@"Some updates may be missing." stringByAppendingString:then]
+                kind:MDStatusWarning buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
+        case MDHostsDocumentError:
+            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:[MDHostBoundText(_book.status, 200) stringByAppendingFormat:@" Metadesk won’t overwrite it.%@", then]
+                kind:MDStatusError buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
+        default: [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]];
+    }
+    for (NSButton *b in @[_review, _scan]) b.toolTip = can ? nil : @"Available once your host list has synced — see the message above.";
+}
 - (void)render {
     NSString *status = _book.status ?: @"Opening the address book…";
     if (_syncPaused && _savedBootstrap.length)
         status = [status stringByAppendingString:@" Relay sync is paused. Choose View > Refresh to resume."];
     if (_roleEditing) status = @"Reloading the client role…";
     [_sync setText:status kind:[self syncKind]];
-    _relaysButton.enabled = !_roleEditing && !_busy && !self.closing;
+    [_relayStatus setText:status kind:[self syncKind]];
+    _saveRelays.enabled = !_roleEditing && !_busy && !self.closing;
     _review.enabled = !_busy && !_launched && _book.canReview;
     _scan.enabled = _review.enabled;
     _address.enabled = _route.enabled = !_roleEditing && !self.closing;
@@ -397,6 +484,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [_issueStatus setText:issues == 1 ? @"1 sync issue:" : [NSString stringWithFormat:@"%lu sync issues:", (unsigned long)issues] kind:MDStatusWarning];
     [self issueSelection:nil];
     [self filter:nil];
+    [self renderState];
+    /* The plain sync line only shows the healthy state; anything else is
+     * explained by the callout above the form. */
+    BOOL quiet = !_banner.hidden || _roleEditing || !_book || _book.state != MDHostsSynced;
+    _sync.hidden = quiet; _sync.superview.hidden = quiet;
 }
 - (NSDictionary *)selected { NSInteger index = _table.selectedRow; return index >= 0 && (NSUInteger)index < _rows.count ? _rows[index] : nil; }
 - (NSArray<NSDictionary *> *)sorted:(NSArray<NSDictionary *> *)rows {
@@ -427,10 +519,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _empty.hidden = _rows.count != 0;
     if (_rows.count) return;
     if (!_book) { _emptyTitle.stringValue = @"Opening Address Book…"; _emptyDetail.stringValue = @""; }
-    else if (_book.unavailable) { _emptyTitle.stringValue = @"Address Book Unavailable"; _emptyDetail.stringValue = @"See the message above for what to do next."; }
-    else if (_scope.selectedSegment == 1) { _emptyTitle.stringValue = @"No Favorites or Recent Hosts"; _emptyDetail.stringValue = @"Mark a host as a favorite in Edit, or connect to one, and it appears here."; }
+    else if (_book.unavailable) { _emptyTitle.stringValue = @"Host List Unavailable"; _emptyDetail.stringValue = @""; }
+    else if (_scope.selectedSegment == 1) { _emptyTitle.stringValue = @"No Favorites or Recent Hosts"; _emptyDetail.stringValue = @"Hosts you mark as favorites, or connect to, appear here."; }
     else if (filtered) { _emptyTitle.stringValue = @"No Matching Hosts"; _emptyDetail.stringValue = @"Try a different search or tag."; }
-    else { _emptyTitle.stringValue = @"No Saved Hosts"; _emptyDetail.stringValue = @"Enter a host above and choose Save Host in its review, or import a hosts file."; }
+    else if (!_book.canReview) { _emptyTitle.stringValue = @"No Saved Hosts"; _emptyDetail.stringValue = @"Hosts you save appear here. You can add hosts once your host list has synced."; }
+    else { _emptyTitle.stringValue = @"No Saved Hosts"; _emptyDetail.stringValue = @"Enter a host’s npub or NIP-05 name above, choose Review and Connect, then Save Host — or import a hosts file."; }
 }
 - (void)tableView:(NSTableView *)table sortDescriptorsDidChange:(NSArray<NSSortDescriptor *> *)old {
     (void)table; (void)old;
@@ -462,9 +555,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSString *when = @"Never";
     if ([r[@"lastConnected"] longLongValue] > 0) {
         NSDate *date = [NSDate dateWithTimeIntervalSince1970:[r[@"lastConnected"] doubleValue]];
-        when = [NSDateFormatter localizedStringFromDate:date dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterShortStyle];
+        static NSRelativeDateTimeFormatter *relative;
+        if (!relative) { relative = [NSRelativeDateTimeFormatter new]; relative.unitsStyle = NSRelativeDateTimeFormatterUnitsStyleShort; relative.dateTimeStyle = NSRelativeDateTimeFormatterStyleNamed; }
+        when = [relative localizedStringForDate:date relativeToDate:NSDate.date];
     }
     NSTableCellView *cell = MDCell(table, @"LastCell", when);
+    if ([r[@"lastConnected"] longLongValue] > 0)
+        cell.textField.toolTip = [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:[r[@"lastConnected"] doubleValue]]
+            dateStyle:NSDateFormatterLongStyle timeStyle:NSDateFormatterShortStyle];
     cell.textField.textColor = [r[@"lastConnected"] longLongValue] > 0 ? NSColor.labelColor : NSColor.secondaryLabelColor;
     return cell;
 }
@@ -488,6 +586,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _edit.enabled = !_busy && _book.canEdit && row;
     _copyKey.enabled = row != nil;
     _details.hidden = !row;
+    _noSelection.hidden = row != nil || !_rows.count;
     if (!row) return;
     _detailKey.stringValue = MDHostNpub(row[@"key"]) ?: @"Unknown public key";
     _detailKey.toolTip = _detailKey.stringValue;
@@ -544,7 +643,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
     SEL action = item.action;
     BOOL idle = !_busy && !_roleEditing && !self.closing;
-    if (action == @selector(refresh:) || action == @selector(editRelays:)) return idle;
+    if (action == @selector(refresh:)) return idle;
+    if (action == @selector(editRelays:)) return !self.closing;
     if (action == @selector(focusHostEntry:) || action == @selector(focusSearch:)) return !self.closing;
     if (action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
     if (action == @selector(importHosts:)) return idle && _book.canEdit;
@@ -554,27 +654,36 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (action == @selector(reviewSaved:)) return _saved.enabled;
     return [self respondsToSelector:action];
 }
+/* Relay setup has one home, the Relays section; Hosts links to it. */
 - (void)editRelays:(id)sender {
     (void)sender;
-    NSWindow *window = self.view.window;
-    if (_busy || _roleEditing || self.closing || !window || window.attachedSheet) return;
-    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Address Book Relays"
-        message:@"Metadesk syncs your encrypted address book through these bootstrap relays. Separate several with spaces. "
-                @"Nothing is used unless you list it here; ws:// addresses are unencrypted." width:520];
-    NSTextField *relays = MDKeyField(@"wss://relay.example.com", @"Bootstrap relays");
-    relays.stringValue = _relayDraft ?: @"";
-    NSTextField *directory = MDKeyField(@"Default", @"Private state folder");
-    directory.stringValue = _directoryDraft ?: @"";
-    NSTextField *hint = MDNote(@"Leave the state folder empty unless you keep a separate private cache. International hostnames must be entered in their xn-- form.");
-    sheet.accessory = MDForm(@[@[@"Relays", relays], @[@"State folder", directory], @[NSNull.null, hint]]);
-    sheet.initialFirstResponder = relays;
-    [sheet addButton:@"Save and Sync" role:MDSheetDefault response:NSAlertFirstButtonReturn];
-    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
-    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
-        if (response != NSAlertFirstButtonReturn || self.closing) return;
-        self->_relayDraft = relays.stringValue; self->_directoryDraft = directory.stringValue;
-        [self reloadBook:YES];
-    }];
+    [NSApp sendAction:@selector(showSection:) to:nil from:@"Relays"];
+    if (_relayField.window) [_relayField.window makeFirstResponder:_relayField];
+}
+- (void)openIdentity:(id)sender { (void)sender; [NSApp sendAction:@selector(showSection:) to:nil from:@"Identity"]; }
+- (void)addSignerAccount:(id)sender { (void)sender; [NSApp sendAction:@selector(addSignerAccount:) to:nil from:self]; }
+- (NSView *)relaySettingsView {
+    if (_relayView) return _relayView;
+    _relayField = MDKeyField(@"wss://relay.example.com", @"Bootstrap relays");
+    _relayField.target = self; _relayField.action = @selector(saveRelays:);
+    _directoryField = MDKeyField(@"Default", @"Private state folder");
+    _saveRelays = MDButton(@"Save and Sync", self, @selector(saveRelays:));
+    _relayStatus = [MDStatusView new];
+    NSStackView *save = MDRow(@[_saveRelays]);
+    NSGridView *form = MDForm(@[@[@"Relays", _relayField],
+        @[NSNull.null, MDNote(@"Separate several relays with spaces. Nothing is used unless you list it; ws:// addresses are unencrypted. Enter international hostnames in their xn-- form.")],
+        @[@"State folder", _directoryField],
+        @[NSNull.null, MDNote(@"Leave empty unless you keep a separate private cache.")],
+        @[NSNull.null, save], @[NSNull.null, _relayStatus]]);
+    _relayView = MDColumn(@[MDHeader(@"Address Book Relays"),
+        MDNote(@"Your encrypted host list syncs through these bootstrap relays. The Linux Manager uses the same list."), form], MDRowSpacing);
+    return _relayView;
+}
+- (void)saveRelays:(id)sender {
+    (void)sender;
+    if (_busy || _roleEditing || self.closing) return;
+    _relayDraft = _relayField.stringValue; _directoryDraft = _directoryField.stringValue;
+    [self reloadBook:YES];
 }
 - (void)reloadBook:(BOOL)refresh {
     [self reloadBook:refresh replaceUnreadable:NO];
@@ -601,9 +710,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         BOOL syncing = opened && relays && refresh && !self.closing && [worker startRelays:relays];
         if (opened && relays && refresh && !syncing)
             cacheError = @"Could not configure address book relays. Cached data remains available.";
-        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing)];
+        NSInteger accounts = self.accountCount ? (NSInteger)self.accountCount() : (NSInteger)MDIdentityAccounts(nil, NULL).count;
+        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing), @(accounts)];
     } done:^(NSArray *result) {
-        if (result[0] != NSNull.null) self->_relayDraft = self->_savedBootstrap = result[0];
+        if (result[0] != NSNull.null) {
+            self->_relayDraft = self->_savedBootstrap = result[0];
+            if (!self->_relayField.currentEditor) self->_relayField.stringValue = result[0];
+        }
+        self->_accounts = [result[4] integerValue];
         self->_syncPaused = [result[3] boolValue];
         [self note:result[1] kind:MDStatusError];
         [self render];

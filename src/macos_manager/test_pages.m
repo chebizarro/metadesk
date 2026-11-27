@@ -452,7 +452,7 @@ static int Connect(MdSignerType backend,const char *key,MdCredentialStore *store
 static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType backend) {
     NSView *view=page.view;
     NSWindow *window=view.window;
-    NSButton *bind=Button(view,@"Use for Client"), *add=Button(view,@"Add Signer Account…");
+    NSButton *bind=Button(view,@"Use for Client"), *add=Button(view,@"Add Account…");
     CHECK(bind && !bind.enabled);
     [page activate]; CHECK(Await(^BOOL{ return add.enabled; }));
     CHECK(Send(add) && Await(^BOOL{ return window.attachedSheet!=nil; }));
