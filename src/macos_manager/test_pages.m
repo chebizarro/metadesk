@@ -104,6 +104,7 @@ static BOOL Menus(void) {
         {"Metadesk Manager", "Show All", "", @selector(unhideAllApplications:), 0},
         {"Metadesk Manager", "Quit Metadesk Manager", "q", @selector(terminate:), C},
         {"File", "Connect to Host…", "k", @selector(connectToHost:), C},
+        {"File", "Scan QR Code…", "", @selector(scanQR:), 0},
         {"File", "Import Hosts…", "", @selector(importHosts:), 0},
         {"File", "Export Hosts…", "", @selector(exportHosts:), 0},
         {"File", "Close Window", "w", @selector(performClose:), C},

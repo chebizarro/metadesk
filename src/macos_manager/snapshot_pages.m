@@ -365,7 +365,6 @@ static void Sheets(Scene *s, NSString *suffix) {
     Try(s, [@"sheet-hosts-export-" stringByAppendingString:suffix], hosts, @selector(exportHosts:));
     Try(s, [@"sheet-hosts-conflict-" stringByAppendingString:suffix], hosts, @selector(handleIssue:));
     Try(s, [@"sheet-hosts-relays-" stringByAppendingString:suffix], hosts, @selector(editRelays:));
-    Try(s, [@"sheet-hosts-connect-" stringByAppendingString:suffix], hosts, @selector(showConnectSheet:));
     /* Unreadable relay preferences ask before replacement. */
     NSString *config = [@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
     [NSFileManager.defaultManager createDirectoryAtPath:config withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
@@ -424,15 +423,11 @@ static void Pages(NSString *accounts, NSAppearanceName appearance, NSString *mod
             if ([section isEqual:@"Hosts"]) {
                 NSTableView *t = HostsTable(s.hosts.view);
                 if (t.numberOfRows) [t selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
-                if (getenv("MD_SNAPSHOT_DEBUG")) for (NSTableColumn *c in t.tableColumns) fprintf(stderr, "col %s w=%.0f min=%.0f mask=%lu\n", c.identifier.UTF8String, c.width, c.minWidth, (unsigned long)c.resizingMask);
                 Spin();
             }
             Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-%@-%@", Slug(section), names[z], mode]);
         }
     }
-    NSTableView *side = (NSTableView *)Find(Frame(s.window), ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Sections"]; });
-    if (getenv("MD_SNAPSHOT_DEBUG")) for (NSView *v = side; v; v = v.superview) fprintf(stderr, "  %s %s hidden=%d layer=%d\n", NSStringFromClass(v.class).UTF8String, NSStringFromRect(v.frame).UTF8String, v.isHidden, v.wantsLayer);
-    if (getenv("MD_SNAPSHOT_DEBUG")) fprintf(stderr, "sidebar rows=%ld frame=%s superview=%s\n", (long)side.numberOfRows, NSStringFromRect(side.frame).UTF8String, NSStringFromRect(side.enclosingScrollView.frame).UTF8String);
     Resize(s.window, size);
     Sheets(&s, mode);
     [s.window close];
@@ -501,3 +496,4 @@ int main(int argc, char **argv) {
         return Failures ? 1 : 0;
     }
 }
+

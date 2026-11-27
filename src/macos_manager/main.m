@@ -71,7 +71,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
 
     m = Submenu(bar, @"File");
     Item(m, @"Connect to Host…", @selector(connectToHost:), @"k", cmd);
-    Item(m, @"Scan QR Code Image…", @selector(scanQR:), nil, 0);
+    Item(m, @"Scan QR Code…", @selector(scanQR:), nil, 0);
     [m addItem:NSMenuItem.separatorItem];
     Item(m, @"Import Hosts…", @selector(importHosts:), nil, 0);
     Item(m, @"Export Hosts…", @selector(exportHosts:), nil, 0);
