@@ -11,12 +11,28 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     item.label = title; item.view = view; [tabs addTabViewItem:item];
 }
 
+static NSString *const MDHelpURL = @"https://github.com/chebizarro/metadesk/blob/master/docs/manager-macos.md";
+static NSString *const MDIssuesURL = @"https://github.com/chebizarro/metadesk/issues";
+
+static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, NSString *key, NSEventModifierFlags mask) {
+    NSMenuItem *item = [menu addItemWithTitle:title action:action keyEquivalent:key ?: @""];
+    if (key.length) item.keyEquivalentModifierMask = mask;
+    return item;
+}
+static NSMenu *Submenu(NSMenu *bar, NSString *title) {
+    NSMenuItem *holder = [bar addItemWithTitle:title action:NULL keyEquivalent:@""];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+    holder.submenu = menu;
+    return menu;
+}
+
 @interface MDManagerApp ()
 @property(nonatomic) BOOL smokeQuit;
 @end
 
 @implementation MDManagerApp {
     NSWindow *_window;
+    NSTabView *_tabs;
     NSTextField *_address, *_relay, *_routes;
     MDHostsPage *_hostsPage;
     MDLocalHostPages *_local;
@@ -34,6 +50,82 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     return self;
 }
 - (instancetype)init { return [self initWithHosts:nil local:nil identity:nil]; }
+
+/* Standard macOS menu bar. Every item has a nil target so it travels the
+ * responder chain: the field editor handles editing, the window handles
+ * window commands, and this delegate handles section and page commands. */
++ (NSMenu *)makeMainMenu {
+    const NSEventModifierFlags cmd = NSEventModifierFlagCommand, shift = NSEventModifierFlagShift,
+        opt = NSEventModifierFlagOption, ctrl = NSEventModifierFlagControl;
+    NSString *app = @"Metadesk Manager";
+    NSMenu *bar = [[NSMenu alloc] initWithTitle:@"Main Menu"];
+
+    NSMenu *m = Submenu(bar, app);
+    Item(m, [@"About " stringByAppendingString:app], @selector(orderFrontStandardAboutPanel:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenu *services = [[NSMenu alloc] initWithTitle:@"Services"];
+    Item(m, @"Services", NULL, nil, 0).submenu = services;
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, [@"Hide " stringByAppendingString:app], @selector(hide:), @"h", cmd);
+    Item(m, @"Hide Others", @selector(hideOtherApplications:), @"h", cmd | opt);
+    Item(m, @"Show All", @selector(unhideAllApplications:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, [@"Quit " stringByAppendingString:app], @selector(terminate:), @"q", cmd);
+
+    m = Submenu(bar, @"File");
+    Item(m, @"Connect to Host…", @selector(connectToHost:), @"k", cmd);
+    Item(m, @"Scan QR Code Image…", @selector(scanQR:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Import Hosts…", @selector(importHosts:), nil, 0);
+    Item(m, @"Export Hosts…", @selector(exportHosts:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Close Window", @selector(performClose:), @"w", cmd);
+
+    m = Submenu(bar, @"Edit");
+    Item(m, @"Undo", @selector(undo:), @"z", cmd);
+    Item(m, @"Redo", @selector(redo:), @"z", cmd | shift);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Cut", @selector(cut:), @"x", cmd);
+    Item(m, @"Copy", @selector(copy:), @"c", cmd);
+    Item(m, @"Paste", @selector(paste:), @"v", cmd);
+    Item(m, @"Delete", @selector(delete:), nil, 0);
+    Item(m, @"Select All", @selector(selectAll:), @"a", cmd);
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenu *find = [[NSMenu alloc] initWithTitle:@"Find"];
+    Item(m, @"Find", NULL, nil, 0).submenu = find;
+    Item(find, @"Find Hosts…", @selector(findHosts:), @"f", cmd);
+
+    m = Submenu(bar, @"View");
+    NSArray<NSString *> *sections = MDManagerApp.sectionTitles;
+    for (NSUInteger i = 0; i < sections.count; ++i) {
+        NSMenuItem *item = Item(m, sections[i], @selector(showSection:), [NSString stringWithFormat:@"%lu", (unsigned long)i + 1], cmd);
+        item.representedObject = sections[i];
+    }
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Refresh", @selector(refresh:), @"r", cmd);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Show Sidebar", @selector(toggleSidebar:), @"s", cmd | ctrl);
+    Item(m, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", cmd | ctrl);
+
+    NSMenu *window = Submenu(bar, @"Window");
+    Item(window, @"Minimize", @selector(performMiniaturize:), @"m", cmd);
+    Item(window, @"Zoom", @selector(performZoom:), nil, 0);
+    [window addItem:NSMenuItem.separatorItem];
+    Item(window, @"Bring All to Front", @selector(arrangeInFront:), nil, 0);
+
+    NSMenu *help = Submenu(bar, @"Help");
+    Item(help, [app stringByAppendingString:@" Help"], @selector(openHelp:), @"?", cmd);
+    Item(help, @"Report an Issue…", @selector(reportIssue:), nil, 0);
+    return bar;
+}
++ (NSArray<NSString *> *)sectionTitles { return @[@"Hosts", @"This Computer", @"Access", @"Identity", @"Relays"]; }
++ (void)installMainMenu:(NSApplication *)app {
+    NSMenu *bar = [self makeMainMenu];
+    app.mainMenu = bar;
+    app.servicesMenu = [bar itemAtIndex:0].submenu.itemArray[2].submenu;
+    app.windowsMenu = [bar itemWithTitle:@"Window"].submenu;
+    app.helpMenu = [bar itemWithTitle:@"Help"].submenu;
+}
 - (NSView *)relays {
     _address = [NSTextField textFieldWithString:@""]; _address.placeholderString = @"Host npub, nprofile or hex public key";
     _relay = [NSTextField textFieldWithString:@""]; _relay.placeholderString = @"Explicit bootstrap URL (optional)";
@@ -87,6 +179,7 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     _window.releasedWhenClosed=NO; _window.title=@"Metadesk Manager"; _window.restorable=NO;
     _window.contentMinSize=NSMakeSize(650,410); _window.contentView=tabs;
     [tabs selectTabViewItemAtIndex:1]; tabs.delegate=self;
+    _tabs=tabs;
     [_window center];
     /* Publish readiness (the visible window) only once a terminal stop can be
      * observed. SIGTERM uses the same asynchronous drain path as Quit. */
@@ -116,6 +209,55 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         self->_smokeReady = YES;
         [NSApp terminate:nil];
     }];
+}
+- (NSString *)currentSection { return _tabs.selectedTabViewItem.identifier; }
+- (void)showSection:(id)sender {
+    NSString *section = [sender isKindOfClass:NSString.class] ? sender : [sender representedObject];
+    if ([_tabs indexOfTabViewItemWithIdentifier:section] != NSNotFound) [_tabs selectTabViewItemWithIdentifier:section];
+}
+/* Commands that act on the Hosts page work from any section. */
+- (BOOL)forwardToHosts:(SEL)action from:(id)sender {
+    if (_terminationPending || !_hostsPage) return NO;
+    [self showSection:@"Hosts"];
+    return [NSApp sendAction:action to:_hostsPage from:sender];
+}
+- (void)connectToHost:(id)sender { if ([self forwardToHosts:@selector(focusHostEntry:) from:sender]) return; }
+- (void)scanQR:(id)sender { [self forwardToHosts:@selector(scanQR:) from:sender]; }
+- (void)importHosts:(id)sender { [self forwardToHosts:@selector(importHosts:) from:sender]; }
+- (void)exportHosts:(id)sender { [self forwardToHosts:@selector(exportHosts:) from:sender]; }
+- (void)findHosts:(id)sender { [self forwardToHosts:@selector(focusSearch:) from:sender]; }
+- (void)refresh:(id)sender {
+    NSString *section = self.currentSection;
+    if ([section isEqual:@"Hosts"]) [NSApp sendAction:@selector(refresh:) to:_hostsPage from:sender];
+    else if ([section isEqual:@"Identity"]) [NSApp sendAction:@selector(refresh:) to:_identity from:sender];
+    else if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local refreshSection:section];
+}
+- (void)openHelp:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDHelpURL]]; }
+- (void)reportIssue:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDIssuesURL]]; }
+- (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+    SEL action = item.action;
+    if (_terminationPending) return action == @selector(openHelp:) || action == @selector(reportIssue:);
+    if (action == @selector(showSection:)) {
+        if ([(id)item isKindOfClass:NSMenuItem.class])
+            ((NSMenuItem *)item).state = [[(NSMenuItem *)item representedObject] isEqual:self.currentSection] ? NSControlStateValueOn : NSControlStateValueOff;
+        return _window != nil;
+    }
+    if (action == @selector(refresh:)) {
+        NSString *section = self.currentSection;
+        if ([section isEqual:@"Hosts"]) return [_hostsPage validateUserInterfaceItem:item];
+        if ([section isEqual:@"Identity"]) return [_identity validateUserInterfaceItem:item];
+        if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) return [_local canRefreshSection:section];
+        return NO;
+    }
+    SEL hosts[] = {@selector(connectToHost:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(findHosts:)};
+    SEL forwarded[] = {@selector(focusHostEntry:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(focusSearch:)};
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(*hosts); ++i) if (action == hosts[i]) {
+        if (!_hostsPage || !_window) return NO;
+        NSMenuItem *probe = [[NSMenuItem alloc] initWithTitle:@"" action:forwarded[i] keyEquivalent:@""];
+        return [_hostsPage validateUserInterfaceItem:probe];
+    }
+    return [self respondsToSelector:action];
 }
 - (void)tabView:(NSTabView *)tabs didSelectTabViewItem:(NSTabViewItem *)item {
     (void)tabs;
@@ -182,10 +324,7 @@ int main(int argc, const char *argv[]) {
         signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
         NSApplication *app=NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSMenu *menu=[NSMenu new]; NSMenuItem *appItem=[NSMenuItem new]; [menu addItem:appItem];
-        appItem.submenu=[[NSMenu alloc] initWithTitle:@"Metadesk Manager"];
-        [appItem.submenu addItemWithTitle:@"Quit Metadesk Manager" action:@selector(terminate:) keyEquivalent:@"q"];
-        app.mainMenu=menu;
+        [MDManagerApp installMainMenu:app];
         __attribute__((objc_precise_lifetime)) MDManagerApp *delegate=[MDManagerApp new];
         delegate.smokeQuit = argc == 2 && !strcmp(argv[1], "--smoke-quit");
         app.delegate=delegate; [app run];

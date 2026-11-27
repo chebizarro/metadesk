@@ -4,34 +4,21 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdatomic.h>
 
-/* These fields may show encrypted-book text. No selection may be copied,
- * cut, dragged, or offered to Services by their field editor. */
-@interface MDPrivateEditor : NSTextView
+/* Keys, names and relay URLs must reach the model exactly as typed or pasted,
+ * so this field editor turns off completion, correction and substitutions.
+ * Editing itself is standard: cut, copy, paste, select all, undo, drag and
+ * Services all work through the responder chain. What the user can see is
+ * theirs to copy; secret-key input is refused separately (rejectSecret:). */
+@interface MDKeyFieldCell : NSTextFieldCell
 @end
-@implementation MDPrivateEditor
-- (void)copy:(id)sender { (void)sender; }
-- (void)cut:(id)sender { (void)sender; }
-- (NSArray<NSPasteboardType> *)writablePasteboardTypes { return @[]; }
-- (BOOL)writeSelectionToPasteboard:(NSPasteboard *)pasteboard type:(NSPasteboardType)type { (void)pasteboard; (void)type; return NO; }
-- (BOOL)dragSelectionWithEvent:(NSEvent *)event offset:(NSSize)offset slideBack:(BOOL)slideBack { (void)event; (void)offset; (void)slideBack; return NO; }
-- (BOOL)writeSelectionToPasteboard:(NSPasteboard *)pasteboard types:(NSArray<NSPasteboardType> *)types { (void)pasteboard; (void)types; return NO; }
-- (id)validRequestorForSendType:(NSPasteboardType)sendType returnType:(NSPasteboardType)returnType {
-    return sendType ? nil : [super validRequestorForSendType:sendType returnType:returnType];
-}
-- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
-    return item.action != @selector(copy:) && item.action != @selector(cut:) && [super validateUserInterfaceItem:item];
-}
-@end
-@interface MDPrivateFieldCell : NSTextFieldCell
-@end
-@implementation MDPrivateFieldCell {
-    MDPrivateEditor *_editor;
+@implementation MDKeyFieldCell {
+    NSTextView *_editor;
 }
 - (NSTextView *)fieldEditorForView:(NSView *)control {
     (void)control;
     if (!_editor) {
-        _editor = [[MDPrivateEditor alloc] initWithFrame:NSZeroRect];
-        _editor.fieldEditor = YES; _editor.allowsUndo = NO; _editor.richText = NO;
+        _editor = [[NSTextView alloc] initWithFrame:NSZeroRect];
+        _editor.fieldEditor = YES; _editor.allowsUndo = YES; _editor.richText = NO;
         _editor.automaticTextCompletionEnabled = NO;
         _editor.continuousSpellCheckingEnabled = NO;
         _editor.automaticSpellingCorrectionEnabled = NO;
@@ -45,7 +32,7 @@
 
 static NSTextField *Field(NSString *placeholder, NSString *value) {
     NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 420, 24)];
-    MDPrivateFieldCell *cell = [[MDPrivateFieldCell alloc] initTextCell:value ?: @""];
+    MDKeyFieldCell *cell = [[MDKeyFieldCell alloc] initTextCell:value ?: @""];
     cell.editable = YES; cell.selectable = YES; cell.bezeled = YES; cell.bordered = YES;
     cell.sendsActionOnEndEditing = NO; cell.placeholderString = placeholder;
     field.cell = cell;
@@ -367,10 +354,17 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSString *npub = MDHostNpub(self.selected[@"key"]);
     if (npub) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:npub forType:NSPasteboardTypeString]; }
 }
+/* A secret key is cleared without being echoed, and the undo stack that held
+ * the typed or pasted text is discarded so Undo cannot bring it back. */
 - (BOOL)rejectSecret:(NSTextField *)field input:(MDHostInput)input {
     if (input != MDHostSecret) return NO;
     NSTextView *editor = (NSTextView *)field.currentEditor;
-    if (editor) { editor.string = @""; [editor.undoManager removeAllActions]; }
+    if (editor) {
+        NSUndoManager *undo = editor.undoManager;
+        editor.string = @"";
+        [undo removeAllActions];
+    }
+    [field.window.undoManager removeAllActions];
     field.stringValue = @"";
     _error.stringValue = @"Private keys are not host addresses. Use a public host identity.";
     return YES;
@@ -386,6 +380,25 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)refresh:(id)sender {
     (void)sender;
     [self reloadBook:YES];
+}
+- (void)focusHostEntry:(id)sender {
+    (void)sender;
+    if (_address.enabled) [self.view.window makeFirstResponder:_address];
+}
+- (void)focusSearch:(id)sender {
+    (void)sender;
+    [self.view.window makeFirstResponder:_search];
+}
+- (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+    SEL action = item.action;
+    BOOL idle = !_busy && !_roleEditing && !self.closing;
+    if (action == @selector(refresh:)) return idle;
+    if (action == @selector(focusHostEntry:) || action == @selector(focusSearch:)) return !self.closing;
+    if (action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
+    if (action == @selector(importHosts:)) return idle && _book.canEdit;
+    if (action == @selector(exportHosts:)) return idle && _book.canExport;
+    return [self respondsToSelector:action];
 }
 - (void)reloadBook:(BOOL)refresh {
     [self reloadBook:refresh replaceUnreadable:NO];
@@ -642,8 +655,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         NSAlert *alert = Alert(@"Review Address Book Conflict", @"Review both versions. Reapply publishes your reviewed draft against the current remote revision.");
         NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 620, 250)];
         scroll.hasVerticalScroller = YES; scroll.borderType = NSBezelBorder;
-        MDPrivateEditor *display = [[MDPrivateEditor alloc] initWithFrame:scroll.contentView.bounds];
-        display.editable = NO; display.selectable = NO; display.richText = NO;
+        NSTextView *display = [[NSTextView alloc] initWithFrame:scroll.contentView.bounds];
+        display.editable = NO; display.selectable = YES; display.richText = NO;
         display.horizontallyResizable = NO; display.verticallyResizable = YES;
         display.autoresizingMask = NSViewWidthSizable;
         display.textContainer.widthTracksTextView = YES;

@@ -260,6 +260,14 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     _status.stringValue = _accessStatus.stringValue = @"Connecting to the local host…";
     [self render]; [_link connect:MDHostTrim(_endpoint.stringValue)];
 }
+- (BOOL)canRefreshSection:(NSString *)section {
+    if (_closed || _busy || !_snapshot) return NO;
+    return [section isEqual:@"This Computer"] || [section isEqual:@"Access"];
+}
+- (void)refreshSection:(NSString *)section {
+    if (![self canRefreshSection:section]) return;
+    if ([section isEqual:@"Access"]) [self refreshPolicy:nil]; else [self permissions:nil];
+}
 - (void)permissions:(id)sender { (void)sender; [_link command:@{@"v":@1,@"method":@"host.permissions"}]; }
 - (void)refreshPolicy:(id)sender { (void)sender; [_link command:@{@"v":@1,@"method":@"access.list"}]; }
 - (void)settings:(MDPermissionKind)kind {

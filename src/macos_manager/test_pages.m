@@ -64,6 +64,149 @@ static BOOL EndSheet(NSWindow *window, NSModalResponse response) {
     return Await(^BOOL{ return window.attachedSheet==nil; });
 }
 
+/* The menu bar must carry the standard commands with nil targets, so they
+ * reach the field editor, window or app delegate through the responder chain. */
+static NSMenuItem *MenuItem(NSMenu *menu, SEL action) {
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.action == action) return item;
+        NSMenuItem *hit = item.submenu ? MenuItem(item.submenu, action) : nil;
+        if (hit) return hit;
+    }
+    return nil;
+}
+static NSMenu *TopMenu(NSMenu *bar, NSString *title) {
+    for (NSMenuItem *item in bar.itemArray) if ([item.submenu.title isEqual:title]) return item.submenu;
+    return nil;
+}
+static BOOL Menus(void) {
+    NSMenu *bar = [MDManagerApp makeMainMenu];
+    const NSEventModifierFlags C = NSEventModifierFlagCommand, S = NSEventModifierFlagShift,
+        O = NSEventModifierFlagOption, X = NSEventModifierFlagControl;
+    struct { const char *menu, *title, *key; SEL action; NSEventModifierFlags mask; } want[] = {
+        {"Metadesk Manager", "About Metadesk Manager", "", @selector(orderFrontStandardAboutPanel:), 0},
+        {"Metadesk Manager", "Hide Metadesk Manager", "h", @selector(hide:), C},
+        {"Metadesk Manager", "Hide Others", "h", @selector(hideOtherApplications:), C | O},
+        {"Metadesk Manager", "Show All", "", @selector(unhideAllApplications:), 0},
+        {"Metadesk Manager", "Quit Metadesk Manager", "q", @selector(terminate:), C},
+        {"File", "Connect to Host…", "k", @selector(connectToHost:), C},
+        {"File", "Import Hosts…", "", @selector(importHosts:), 0},
+        {"File", "Export Hosts…", "", @selector(exportHosts:), 0},
+        {"File", "Close Window", "w", @selector(performClose:), C},
+        {"Edit", "Undo", "z", @selector(undo:), C},
+        {"Edit", "Redo", "z", @selector(redo:), C | S},
+        {"Edit", "Cut", "x", @selector(cut:), C},
+        {"Edit", "Copy", "c", @selector(copy:), C},
+        {"Edit", "Paste", "v", @selector(paste:), C},
+        {"Edit", "Delete", "", @selector(delete:), 0},
+        {"Edit", "Select All", "a", @selector(selectAll:), C},
+        {"Edit", "Find Hosts…", "f", @selector(findHosts:), C},
+        {"View", "Refresh", "r", @selector(refresh:), C},
+        {"View", "Show Sidebar", "s", @selector(toggleSidebar:), C | X},
+        {"View", "Enter Full Screen", "f", @selector(toggleFullScreen:), C | X},
+        {"Window", "Minimize", "m", @selector(performMiniaturize:), C},
+        {"Window", "Zoom", "", @selector(performZoom:), 0},
+        {"Window", "Bring All to Front", "", @selector(arrangeInFront:), 0},
+        {"Help", "Metadesk Manager Help", "?", @selector(openHelp:), C},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(*want); ++i) {
+        NSMenu *menu = TopMenu(bar, @(want[i].menu));
+        NSMenuItem *item = MenuItem(menu, want[i].action);
+        if (!item) fprintf(stderr, "missing menu item %s > %s\n", want[i].menu, want[i].title);
+        CHECK(item && [item.title isEqual:@(want[i].title)] && item.target == nil);
+        CHECK([item.keyEquivalent isEqual:@(want[i].key)]);
+        CHECK(!item.keyEquivalent.length || item.keyEquivalentModifierMask == want[i].mask);
+    }
+    NSArray *order = [bar.itemArray valueForKeyPath:@"submenu.title"];
+    CHECK([order isEqual:(@[@"Metadesk Manager", @"File", @"Edit", @"View", @"Window", @"Help"])]);
+    NSMenu *view = TopMenu(bar, @"View");
+    NSArray *sections = MDManagerApp.sectionTitles;
+    for (NSUInteger i = 0; i < sections.count; ++i) {
+        NSMenuItem *item = view.itemArray[i];
+        CHECK(item.action == @selector(showSection:) && [item.representedObject isEqual:sections[i]] && [item.title isEqual:sections[i]]);
+        CHECK([item.keyEquivalent isEqual:([NSString stringWithFormat:@"%lu", (unsigned long)i + 1])]);
+    }
+    /* Key equivalents are unique per modifier set. */
+    NSMutableSet *keys = [NSMutableSet set];
+    NSMutableArray *queue = [bar.itemArray mutableCopy];
+    while (queue.count) {
+        NSMenuItem *item = queue.lastObject; [queue removeLastObject];
+        if (item.submenu) [queue addObjectsFromArray:item.submenu.itemArray];
+        if (!item.keyEquivalent.length) continue;
+        NSString *k = [NSString stringWithFormat:@"%@/%lu", item.keyEquivalent, (unsigned long)item.keyEquivalentModifierMask];
+        CHECK(![keys containsObject:k]); [keys addObject:k];
+    }
+    [MDManagerApp installMainMenu:NSApp];
+    CHECK(NSApp.windowsMenu == TopMenu(bar, @"Window") || [NSApp.windowsMenu.title isEqual:@"Window"]);
+    CHECK([NSApp.helpMenu.title isEqual:@"Help"] && [NSApp.servicesMenu.title isEqual:@"Services"]);
+    return YES;
+}
+
+/* Mirror -[NSApplication targetForAction:to:from:] for a window that is not
+ * key: test windows are never ordered on screen. */
+static id ChainTarget(NSWindow *window, SEL action) {
+    for (NSResponder *r = window.firstResponder; r; r = r.nextResponder) if ([r respondsToSelector:action]) return r;
+    for (id o in @[window.delegate ?: (id)NSNull.null, NSApp, NSApp.delegate ?: (id)NSNull.null])
+        if (o != NSNull.null && [o respondsToSelector:action]) return o;
+    return nil;
+}
+static BOOL Validates(NSWindow *window, NSMenuItem *item) {
+    id target = ChainTarget(window, item.action);
+    if (!target) return NO;
+    if ([target respondsToSelector:@selector(validateMenuItem:)]) return [target validateMenuItem:item];
+    if ([target respondsToSelector:@selector(validateUserInterfaceItem:)]) return [target validateUserInterfaceItem:item];
+    return YES;
+}
+static BOOL Perform(NSWindow *window, NSMenuItem *item) {
+    id target = ChainTarget(window, item.action);
+    return target && Validates(window, item) && [NSApp sendAction:item.action to:target from:item];
+}
+static void Turn(void) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false); }
+/* Editing reaches the connect field through the Edit menu. Pasteboard traffic
+ * uses uniquely named private pasteboards and the field editor's own read and
+ * write methods, never the user's general pasteboard. */
+static BOOL Editing(MDHostsPage *page, NSWindow *window) {
+    NSMenu *bar = [MDManagerApp makeMainMenu];
+    NSMenuItem *selectAll = MenuItem(bar, @selector(selectAll:)), *copy = MenuItem(bar, @selector(copy:)),
+        *cut = MenuItem(bar, @selector(cut:)), *paste = MenuItem(bar, @selector(paste:)),
+        *del = MenuItem(bar, @selector(delete:)), *undo = MenuItem(bar, @selector(undo:)), *redo = MenuItem(bar, @selector(redo:));
+    NSView *view = page.view;
+    NSTextField *address = Field(view, @"Host npub");
+    CHECK(address && [window makeFirstResponder:address]);
+    NSTextView *editor = (NSTextView *)address.currentEditor;
+    CHECK(editor && window.firstResponder == editor && editor.allowsUndo);
+    /* Cut, copy, paste, delete and select all are handled by the field editor. */
+    for (NSMenuItem *item in @[selectAll, copy, cut, paste, del]) CHECK(ChainTarget(window, item.action) == editor);
+    NSPasteboard *in = [NSPasteboard pasteboardWithUniqueName], *out = [NSPasteboard pasteboardWithUniqueName];
+    NSString *npub = MDHostNpub(@KEY);
+    [in clearContents]; CHECK([in setString:npub forType:NSPasteboardTypeString]);
+    CHECK([editor readSelectionFromPasteboard:in] && [address.stringValue isEqual:npub]);
+    Turn();
+    CHECK(Perform(window, selectAll) && editor.selectedRange.length == npub.length);
+    CHECK(Validates(window, copy) && Validates(window, cut) && Validates(window, del));
+    [out clearContents];
+    /* Copy and Cut write the editor's writable types; none were offered when
+     * the old field editor suppressed copying. */
+    CHECK(editor.writablePasteboardTypes.count && [editor writeSelectionToPasteboard:out types:editor.writablePasteboardTypes]);
+    CHECK([[out stringForType:NSPasteboardTypeString] isEqual:npub]);
+    CHECK(Perform(window, del) && !address.stringValue.length);
+    Turn();
+    CHECK(Validates(window, undo) && Perform(window, undo) && [address.stringValue isEqual:npub]);
+    Turn();
+    CHECK(Validates(window, redo) && Perform(window, redo) && !address.stringValue.length);
+    Turn();
+    /* A pasted secret key is refused, cleared, never echoed and not undoable. */
+    [in clearContents]; CHECK([in setString:@"nsec1fixturenotakeyfixturenotakey" forType:NSPasteboardTypeString]);
+    CHECK([editor readSelectionFromPasteboard:in]);
+    CHECK(!address.stringValue.length && !editor.string.length && LabelContains(view, @"Private keys are not host addresses"));
+    CHECK(!LabelContains(view, @"nsec1fixture"));
+    Turn();
+    if (Validates(window, undo)) Perform(window, undo);
+    CHECK(![address.stringValue containsString:@"nsec"] && ![editor.string containsString:@"nsec"]);
+    [in releaseGlobally]; [out releaseGlobally];
+    CHECK([window makeFirstResponder:nil]);
+    return YES;
+}
+
 @interface FixtureReview : MDHostReview
 @property BOOL mismatch;
 @end
@@ -363,6 +506,8 @@ static BOOL Run(NSString *directory) {
     }];
     NSWindow *hostWindow=TestWindow(hosts.view), *accessWindow=TestWindow(access.accessView), *identityWindow=TestWindow(identity.view);
     FixtureApp *app=[[FixtureApp alloc] initWithHosts:hosts local:access identity:identity];
+    CHECK(Menus());
+    CHECK(Editing(hosts,hostWindow));
     CHECK(Hosts(hosts,worker,hostWindow) && Access(access,link,accessWindow));
     MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
         MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F : MD_SIGNER_NIP55L;
