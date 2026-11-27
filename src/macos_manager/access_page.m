@@ -86,6 +86,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     NSButton *_connect, *_recheck, *_kick, *_review, *_refreshPolicy, *_edit, *_revoke, *_kickRevoke;
     NSTimer *_clock;
     MDCapChooser *_chooser;
+    NSUInteger _pendingCount;
     UNUserNotificationCenter *_notifications;
     NSMutableSet<NSString *> *_posted, *_noticeCooling;
     NSMutableDictionary<NSString *, NSNumber *> *_noticeAttempts;
@@ -200,9 +201,8 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     BOOL opened = [response.actionIdentifier isEqual:UNNotificationDefaultActionIdentifier];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self->_closed && opened && MDRequestForToken(self->_snapshot,token,Now())) {
-            NSWindow *window = self.accessView.window ?: self.computerView.window;
-            if ([window.contentView isKindOfClass:NSTabView.class]) [(NSTabView *)window.contentView selectTabViewItemWithIdentifier:@"Access"];
-            [window makeKeyAndOrderFront:nil];
+            [NSApp sendAction:@selector(showSection:) to:nil from:@"Access"];
+            [self.accessView.window makeKeyAndOrderFront:nil];
             Select(self->_requests, token);
             [self review:nil];
         }
@@ -308,6 +308,7 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     [_requests removeAllItems];
     for (NSDictionary *r in requests) Item(_requests, MDHostNpub(r[@"peer"]) ?: @"Invalid key", MDRequestToken(_snapshot,r));
     if (!requests.count) Item(_requests, @"No pending requests", nil);
+    if (requests.count != _pendingCount) { _pendingCount = requests.count; if (self.pendingChanged) self.pendingChanged(_pendingCount); }
     Select(_requests, selected);
     [self selection:nil];
     [self updateNotices];

@@ -14,4 +14,7 @@
 - (void)scanQR:(id)sender;
 - (void)importHosts:(id)sender;
 - (void)exportHosts:(id)sender;
+/* Toolbar search text for the saved-host list. */
+- (void)setSearchText:(NSString *)text;
+- (BOOL)validateToolbarItem:(NSToolbarItem *)item;
 @end

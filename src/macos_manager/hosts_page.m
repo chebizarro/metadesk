@@ -1,42 +1,13 @@
 #import "hosts_page.h"
 #import "hosts_launch.h"
 #import "host_qr.h"
+#import "ui.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdatomic.h>
 
-/* Keys, names and relay URLs must reach the model exactly as typed or pasted,
- * so this field editor turns off completion, correction and substitutions.
- * Editing itself is standard: cut, copy, paste, select all, undo, drag and
- * Services all work through the responder chain. What the user can see is
- * theirs to copy; secret-key input is refused separately (rejectSecret:). */
-@interface MDKeyFieldCell : NSTextFieldCell
-@end
-@implementation MDKeyFieldCell {
-    NSTextView *_editor;
-}
-- (NSTextView *)fieldEditorForView:(NSView *)control {
-    (void)control;
-    if (!_editor) {
-        _editor = [[NSTextView alloc] initWithFrame:NSZeroRect];
-        _editor.fieldEditor = YES; _editor.allowsUndo = YES; _editor.richText = NO;
-        _editor.automaticTextCompletionEnabled = NO;
-        _editor.continuousSpellCheckingEnabled = NO;
-        _editor.automaticSpellingCorrectionEnabled = NO;
-        _editor.automaticQuoteSubstitutionEnabled = NO;
-        _editor.automaticDashSubstitutionEnabled = NO;
-        _editor.automaticDataDetectionEnabled = NO;
-    }
-    return _editor;
-}
-@end
-
 static NSTextField *Field(NSString *placeholder, NSString *value) {
-    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 420, 24)];
-    MDKeyFieldCell *cell = [[MDKeyFieldCell alloc] initTextCell:value ?: @""];
-    cell.editable = YES; cell.selectable = YES; cell.bezeled = YES; cell.bordered = YES;
-    cell.sendsActionOnEndEditing = NO; cell.placeholderString = placeholder;
-    field.cell = cell;
-    [field setAccessibilityLabel:placeholder];
+    NSTextField *field = MDKeyField(placeholder, placeholder);
+    field.stringValue = value ?: @"";
     return field;
 }
 static NSTextField *Label(NSString *value) {
@@ -389,7 +360,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     (void)sender;
     [self.view.window makeFirstResponder:_search];
 }
+- (void)setSearchText:(NSString *)text {
+    _search.stringValue = text ?: @"";
+    [self filter:nil];
+}
 - (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+- (BOOL)validateToolbarItem:(NSToolbarItem *)item { return [self validateUserInterfaceItem:item]; }
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
     SEL action = item.action;
     BOOL idle = !_busy && !_roleEditing && !self.closing;

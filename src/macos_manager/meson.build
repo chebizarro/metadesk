@@ -16,7 +16,7 @@ macos_hosts_model = static_library('macos-hosts-model', ['hosts_model.m', 'hosts
 macos_host_qr = static_library('macos-host-qr', 'host_qr.m',
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, foundation, qr_frameworks])
 dep_macos_host_qr = declare_dependency(link_with : macos_host_qr, dependencies : qr_frameworks)
-macos_hosts_page = static_library('macos-hosts-page', ['hosts_page.m', 'access_page.m', 'identity_page.m'],
+macos_hosts_page = static_library('macos-hosts-page', ['hosts_page.m', 'access_page.m', 'identity_page.m', 'ui.m', 'main_window.m'],
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, appkit, notifications, dep_cjson, dep_macos_host_qr, uttypes])
 macos_manager_bin = executable('metadesk-macos-manager', 'main.m',
   objc_args : '-fobjc-arc',

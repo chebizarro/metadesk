@@ -42,14 +42,69 @@ static NSView *Find(NSView *root, BOOL (^matches)(NSView *)) {
     for (NSView *view in root.subviews) { NSView *hit = Find(view, matches); if (hit) return hit; }
     return nil;
 }
+static NSBitmapImageRep *Cache(NSView *view) {
+    NSBitmapImageRep *rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
+    [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
+    return rep;
+}
+static void Effects(NSView *root, NSMutableArray<NSView *> *out) {
+    for (NSView *v in root.subviews) {
+        if (v.isHidden) continue;
+        if ([NSStringFromClass(v.class) hasSuffix:@"EffectView"] && v.frame.size.width < root.window.contentView.bounds.size.width / 2) [out addObject:v];
+        else Effects(v, out);
+    }
+}
+/* cacheDisplayInRect: does not draw what an NSVisualEffectView or (macOS 26+)
+ * NSGlassEffectView hosts: the sidebar material is composited by the window
+ * server. Approximate the
+ * material with a flat semantic color and draw the hosted views on top. */
+static void Composite(NSView *view, NSBitmapImageRep *rep) {
+    NSMutableArray<NSView *> *effects = [NSMutableArray array];
+    Effects(view, effects);
+    if (!effects.count) return;
+    NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = context;
+    for (NSView *effect in effects) {
+        NSTableView *table = (NSTableView *)Find(effect, ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class]; });
+        if (!table) continue;
+        NSScrollView *scroll = table.enclosingScrollView;
+        NSRect r = [view convertRect:[scroll convertRect:scroll.bounds toView:nil] fromView:nil];
+        if (view.isFlipped) r.origin.y = view.bounds.size.height - NSMaxY(r);
+        if (!view.isFlipped) r = NSIntersectionRect(r, NSMakeRect(0, 0, view.bounds.size.width, NSMaxY(view.window.contentLayoutRect)));
+        BOOL dark = [effect.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] == NSAppearanceNameDarkAqua;
+        [(dark ? [NSColor colorWithWhite:0.17 alpha:1] : [NSColor colorWithWhite:0.93 alpha:1]) setFill];
+        NSRectFill(r);
+        for (NSInteger row = 0; row < table.numberOfRows; ++row) {
+            NSTableRowView *rowView = [table rowViewAtRow:row makeIfNecessary:YES];
+            if (!rowView || NSIsEmptyRect(rowView.bounds)) continue;
+            [rowView layoutSubtreeIfNeeded];
+            NSRect c = [view convertRect:[rowView convertRect:rowView.bounds toView:nil] fromView:nil];
+            if (view.isFlipped) c.origin.y = view.bounds.size.height - NSMaxY(c);
+            if (rowView.isSelected) {
+                [(dark ? [NSColor colorWithWhite:1 alpha:0.12] : [NSColor colorWithWhite:0 alpha:0.08]) setFill];
+                [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(c, 8, 1) xRadius:6 yRadius:6] fill];
+            }
+            for (NSView *cell in rowView.subviews) {
+                if (![cell isKindOfClass:NSTableCellView.class]) continue;
+                NSBitmapImageRep *part = Cache(cell);
+                NSRect cr = [view convertRect:[cell convertRect:cell.bounds toView:nil] fromView:nil];
+                if (view.isFlipped) cr.origin.y = view.bounds.size.height - NSMaxY(cr);
+                [part drawInRect:cr fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+            }
+        }
+    }
+    [context flushGraphics];
+    [NSGraphicsContext restoreGraphicsState];
+}
 static void Render(NSView *view, NSString *name) {
     [view.window layoutIfNeeded];
     [view layoutSubtreeIfNeeded];
     __block NSBitmapImageRep *rep = nil;
     NSAppearance *appearance = view.effectiveAppearance;
     [appearance performAsCurrentDrawingAppearance:^{
-        rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
-        [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
+        rep = Cache(view);
+        Composite(view, rep);
     }];
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
     NSString *path = [Out stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]];
@@ -371,6 +426,9 @@ static void Pages(NSString *accounts, NSAppearanceName appearance, NSString *mod
             Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-%@-%@", Slug(section), names[z], mode]);
         }
     }
+    NSTableView *side = (NSTableView *)Find(Frame(s.window), ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Sections"]; });
+    if (getenv("MD_SNAPSHOT_DEBUG")) for (NSView *v = side; v; v = v.superview) fprintf(stderr, "  %s %s hidden=%d layer=%d\n", NSStringFromClass(v.class).UTF8String, NSStringFromRect(v.frame).UTF8String, v.isHidden, v.wantsLayer);
+    if (getenv("MD_SNAPSHOT_DEBUG")) fprintf(stderr, "sidebar rows=%ld frame=%s superview=%s\n", (long)side.numberOfRows, NSStringFromRect(side.frame).UTF8String, NSStringFromRect(side.enclosingScrollView.frame).UTF8String);
     Resize(s.window, size);
     Sheets(&s, mode);
     [s.window close];

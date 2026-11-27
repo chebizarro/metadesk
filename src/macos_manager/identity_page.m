@@ -146,6 +146,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
 }
 - (void)refresh:(id)sender { (void)sender; [self run:@"Loading accounts…" suspend:NO cancellable:NO work:nil]; }
 - (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+- (BOOL)validateToolbarItem:(NSToolbarItem *)item { return [self validateUserInterfaceItem:item]; }
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
     if (item.action == @selector(refresh:)) return !_closed && !_busy;
     return [self respondsToSelector:item.action];
