@@ -6,8 +6,9 @@ usage: test_snapshot_guard.py RENDERER MESON_BUILD_DIR
 1. Refusals: roots it must not use and forged invocations, including a run
    directory with a matching token and a matching environment, an argument
    longer than PATH_MAX, a real root so deep that the run paths would be
-   truncated, and a root reached through a symlinked ancestor, exit 2 and
-   touch nothing.
+   truncated, a root reached through a symlinked ancestor, and roots whose
+   Meson marker is a FIFO or a directory (a FIFO must not block the
+   renderer), exit 2 promptly and touch nothing.
 2. A successful isolated render into a throwaway meson-style root under
    $TMPDIR (which resolves through /private, so the canonical home-path
    comparison is exercised) must produce exactly the expected artifacts; the
@@ -88,7 +89,16 @@ try:
     (real_parent / 'root' / 'meson-private').mkdir(parents=True)
     (real_parent / 'root' / 'meson-private' / 'coredata.dat').write_bytes(b'')
     (scratch / 'ancestor-link').symlink_to(real_parent)
+    # Malformed Meson markers: a FIFO (opening it must not block) and a directory.
+    malformed = []
+    for kind in ('fifo', 'dir'):
+        root = scratch / f'marker-{kind}'
+        (root / 'meson-private').mkdir(parents=True)
+        marker = root / 'meson-private' / 'coredata.dat'
+        os.mkfifo(marker) if kind == 'fifo' else marker.mkdir()
+        malformed.append(root)
     refusals = [
+        *[([renderer, str(root)], env) for root in malformed],
         ([renderer, str(build) + '/' + 'x' * (path_max + 16)], env),
         ([renderer, deep], env),
         ([renderer, str(scratch / 'ancestor-link' / 'root')], env),
@@ -103,13 +113,15 @@ try:
         ([renderer, str(build), 'extra'], env),
     ]
     for case, case_env in refusals:
-        result = subprocess.run(case, env=case_env, capture_output=True, timeout=60)
+        result = subprocess.run(case, env=case_env, capture_output=True, timeout=20)
         assert result.returncode == 2, (case, result.returncode, result.stdout, result.stderr)
     assert not any((forged / 'out').iterdir()) and not any((forged / 'home').iterdir()), 'forged run directory was used'
     assert set((build / 'snapshots').glob('run-*')) - runs == {forged}, 'a refused call created a run directory'
     assert sorted(os.listdir(deep_fd)) == ['meson-private'], 'the overlong root was written'
     os.close(deep_fd)
     assert sorted(os.listdir(real_parent / 'root')) == ['meson-private'], 'the root behind a symlinked ancestor was written'
+    for root in malformed:
+        assert sorted(os.listdir(root)) == ['meson-private'], f'{root.name} was written'
 
     # A successful isolated render. $TMPDIR resolves through /private, where
     # Foundation reports the home without that prefix.

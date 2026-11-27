@@ -581,7 +581,9 @@ static int Prepare(const char *root, char run[PATH_MAX]) {
     int rootfd = OpenCanonical(root);
     if (!OwnedFD(rootfd, S_IFDIR)) return Close(rootfd, 0);
     int meson = OpenDirAt(rootfd, "meson-private");
-    int marker = OwnedFD(meson, S_IFDIR) ? openat(meson, "coredata.dat", O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+    /* O_NONBLOCK: a FIFO (or device) in the marker's place must not block
+     * the open; its type is checked with fstat before anything else. */
+    int marker = OwnedFD(meson, S_IFDIR) ? openat(meson, "coredata.dat", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) : -1;
     int ok = OwnedFD(marker, S_IFREG);
     Close(marker, 0); Close(meson, 0);
     if (!ok) return Close(rootfd, 0);
