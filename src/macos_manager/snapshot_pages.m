@@ -18,6 +18,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <dirent.h>
+#include <string.h>
+#include <unistd.h>
 
 #define KEY1 "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 #define KEY2 "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
@@ -27,9 +30,15 @@
 #define REQUEST "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
 
 static NSString *Out;
-/* Creates a new file exclusively (never follows a link, never truncates). */
-static BOOL WriteNew(NSString *path, NSData *data) {
-    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+/* Descriptors for the fixture output and config directories, opened by
+ * Prepare; files are created relative to them, never by pathname. */
+static int OutFD = -1, ConfigFD = -1;
+/* Creates a new file named name (a single component) in OutFD exclusively:
+ * never follows a link, never truncates. */
+static BOOL WriteNew(NSString *name, NSData *data) {
+    const char *leaf = name.fileSystemRepresentation;
+    if (!leaf || !*leaf || strchr(leaf, '/') || OutFD < 0) return NO;
+    int fd = openat(OutFD, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return NO;
     const uint8_t *bytes = data.bytes; size_t done = 0;
     while (done < data.length) {
@@ -123,9 +132,9 @@ static void Render(NSView *view, NSString *name) {
         Composite(view, rep);
     }];
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
-    NSString *path = [Out stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]];
-    if (!png || !WriteNew(path, png)) { fprintf(stderr, "FAIL: could not write %s\n", path.UTF8String); ++Failures; return; }
-    [Written addObject:path.lastPathComponent];
+    NSString *file = [name stringByAppendingPathExtension:@"png"];
+    if (!png || !WriteNew(file, png)) { fprintf(stderr, "FAIL: could not write %s\n", file.UTF8String); ++Failures; return; }
+    [Written addObject:file];
 }
 /* The frame view includes the title bar and toolbar. */
 static NSView *Frame(NSWindow *window) { return window.contentView.superview ?: window.contentView; }
@@ -378,18 +387,20 @@ static void Sheets(Scene *s, NSString *suffix) {
     Try(s, n(@"sheet-hosts-conflict-"), hosts, @selector(handleIssue:));
     /* Unreadable relay settings: the fixture file is created here, inside the
      * fixture config directory, exclusively, and removed only by this code. */
-    NSString *config = [@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
-    mkdir(config.fileSystemRepresentation, 0700);
-    NSString *prefs = [config stringByAppendingPathComponent:@"manager-relays.ini"];
-    int fd = open(prefs.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (mkdirat(ConfigFD, "metadesk", 0700) && errno != EEXIST) { fputs("FAIL: fixture config directory\n", stderr); ++Failures; }
+    int dir = openat(ConfigFD, "metadesk", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    int fd = dir >= 0 && !fstat(dir, &st) && st.st_uid == geteuid() ?
+        openat(dir, "manager-relays.ini", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600) : -1;
     if (fd < 0) { fputs("FAIL: fixture relay settings already exist\n", stderr); ++Failures; }
     else {
         static const char corrupt[] = "not a relay preferences file";
         BOOL wrote = write(fd, corrupt, sizeof corrupt - 1) == (ssize_t)(sizeof corrupt - 1);
         close(fd);
         if (wrote) Try(s, n(@"sheet-hosts-unreadable-relays-"), hosts, @selector(saveRelays:));
-        unlink(prefs.fileSystemRepresentation);
+        unlinkat(dir, "manager-relays.ini", 0);
     }
+    if (dir >= 0) close(dir);
     Spin();
 
     ShowSection(s, @"Access");
@@ -510,39 +521,92 @@ static void DumpMenu(NSMenu *menu, NSMutableString *out, int depth) {
     }
 }
 
-/* ---- Fixture-root safety (md-b9zo B3, R2) ----
+/* ---- Fixture-root safety (md-b9zo B3, R2, round 4) ----
  * One entry point, one argument: a canonical meson build directory owned by
- * this user. Before any Foundation or AppKit call, the renderer creates a new
- * BUILD/snapshots/run-XXXXXX with mkdtemp and its own home, config, state,
- * cache, runtime and output directories, points HOME, CFFIXED_USER_HOME and
- * XDG_* there, and verifies Foundation sees that home. It never re-executes,
- * accepts no directory, token or environment from a caller, and creates every
- * file it writes exclusively without following links. */
+ * this user. Before any Foundation or AppKit call, the renderer opens that
+ * directory one component at a time from "/" with O_NOFOLLOW | O_DIRECTORY
+ * (so no component may be a link, ".", ".." or empty), checks ownership with
+ * fstat on each descriptor it relies on, validates the Meson marker through a
+ * descriptor, and creates snapshots/run-XXXXXX with mkdtempat_np and its own
+ * home, config, state, cache, runtime and output directories with mkdirat,
+ * all relative to those descriptors, never by re-resolving a pathname. Every
+ * pathname it composes is checked for truncation. It then points HOME,
+ * CFFIXED_USER_HOME and XDG_* there and verifies Foundation sees that home.
+ * It never re-executes, accepts no directory, token or environment from a
+ * caller, and creates every file it writes exclusively without following
+ * links, relative to the output or config directory descriptor.
+ *
+ * Residual limitation: the paths handed to Foundation and AppKit (HOME,
+ * CFFIXED_USER_HOME, XDG_* and anything the page controllers derive from
+ * them) are re-resolved by those frameworks and cannot be anchored to these
+ * descriptors. They point inside a run directory this process just created
+ * with mode 0700 under a directory owned by the user, which is what limits
+ * the exposure, not descriptor anchoring. */
 static const char *const FixtureDirs[] = {"home", "config", "state", "cache", "runtime", "out"};
-static int Owned(const char *path, mode_t type) {
-    struct stat st;
-    return !lstat(path, &st) && (st.st_mode & S_IFMT) == type && st.st_uid == geteuid();
+static int Join(char *out, size_t size, const char *a, const char *b) {
+    int n = snprintf(out, size, "%s/%s", a, b);
+    return n > 0 && (size_t)n < size;
 }
-static int Prepare(const char *root, char run[PATH_MAX]) {
-    char canonical[PATH_MAX], path[PATH_MAX];
-    if (root[0] != '/' || !realpath(root, canonical) || strcmp(canonical, root) || !Owned(root, S_IFDIR)) return 0;
-    snprintf(path, sizeof path, "%s/meson-private/coredata.dat", root);
-    if (!Owned(path, S_IFREG)) return 0;
-    snprintf(path, sizeof path, "%s/snapshots", root);
-    if (mkdir(path, 0700) && errno != EEXIST) return 0;
-    if (!Owned(path, S_IFDIR)) return 0;
-    snprintf(run, PATH_MAX, "%s/run-XXXXXX", path);
-    if (!mkdtemp(run)) return 0;
-    for (size_t i = 0; i < sizeof FixtureDirs / sizeof *FixtureDirs; ++i) {
-        snprintf(path, sizeof path, "%s/%s", run, FixtureDirs[i]);
-        if (mkdir(path, 0700)) return 0;
+static int OwnedFD(int fd, mode_t type) {
+    struct stat st;
+    return fd >= 0 && !fstat(fd, &st) && (st.st_mode & S_IFMT) == type && st.st_uid == geteuid();
+}
+static int OpenDirAt(int at, const char *name) {
+    return openat(at, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+/* Opens an absolute canonical directory path without following any link. */
+static int OpenCanonical(const char *path) {
+    if (path[0] != '/' || !path[1]) return -1;
+    int fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (const char *p = path + 1; fd >= 0 && *p;) {
+        size_t n = strcspn(p, "/");
+        char name[NAME_MAX + 1];
+        int bad = n == 0 || n > NAME_MAX || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.') ||
+                  (p[n] == '/' && !p[n + 1]);
+        int next = -1;
+        if (!bad) { memcpy(name, p, n); name[n] = 0; next = OpenDirAt(fd, name); }
+        close(fd); fd = next;
+        p += n; if (*p == '/') ++p;
     }
+    return fd;
+}
+static int Close(int fd, int result) { if (fd >= 0) close(fd); return result; }
+static int Prepare(const char *root, char run[PATH_MAX]) {
+    char path[PATH_MAX], name[] = "run-XXXXXX";
+    /* Compose every pathname used below from the template first and refuse,
+     * before creating anything, if any of them would be truncated. */
+    if (strnlen(root, PATH_MAX) >= PATH_MAX || !Join(path, sizeof path, root, "snapshots") || !Join(run, PATH_MAX, path, name)) return 0;
+    for (size_t i = 0; i < sizeof FixtureDirs / sizeof *FixtureDirs; ++i)
+        if (!Join(path, sizeof path, run, FixtureDirs[i])) return 0;
+    int rootfd = OpenCanonical(root);
+    if (!OwnedFD(rootfd, S_IFDIR)) return Close(rootfd, 0);
+    int meson = OpenDirAt(rootfd, "meson-private");
+    int marker = OwnedFD(meson, S_IFDIR) ? openat(meson, "coredata.dat", O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+    int ok = OwnedFD(marker, S_IFREG);
+    Close(marker, 0); Close(meson, 0);
+    if (!ok) return Close(rootfd, 0);
+    if (mkdirat(rootfd, "snapshots", 0700) && errno != EEXIST) return Close(rootfd, 0);
+    int snapshots = OpenDirAt(rootfd, "snapshots");
+    Close(rootfd, 0);
+    if (!OwnedFD(snapshots, S_IFDIR) || !mkdtempat_np(snapshots, name)) return Close(snapshots, 0);
+    int runfd = OpenDirAt(snapshots, name);
+    Close(snapshots, 0);
+    /* Same length as the template checked above, now with the real name. */
+    if (!OwnedFD(runfd, S_IFDIR) || !Join(path, sizeof path, root, "snapshots") || !Join(run, PATH_MAX, path, name))
+        return Close(runfd, 0);
+    for (size_t i = 0; i < sizeof FixtureDirs / sizeof *FixtureDirs; ++i) {
+        if (mkdirat(runfd, FixtureDirs[i], 0700)) return Close(runfd, 0);
+        int fd = OpenDirAt(runfd, FixtureDirs[i]);
+        if (!OwnedFD(fd, S_IFDIR)) { Close(fd, 0); return Close(runfd, 0); }
+        if (!strcmp(FixtureDirs[i], "out")) OutFD = fd;
+        else if (!strcmp(FixtureDirs[i], "config")) ConfigFD = fd;
+        else close(fd);
+    }
+    Close(runfd, 0);
     static const char *const names[] = {"HOME", "CFFIXED_USER_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"};
     static const char *const dirs[] = {"home", "home", "config", "state", "cache", "runtime"};
-    for (size_t i = 0; i < sizeof names / sizeof *names; ++i) {
-        snprintf(path, sizeof path, "%s/%s", run, dirs[i]);
-        if (setenv(names[i], path, 1)) return 0;
-    }
+    for (size_t i = 0; i < sizeof names / sizeof *names; ++i)
+        if (!Join(path, sizeof path, run, dirs[i]) || setenv(names[i], path, 1)) return 0;
     return 1;
 }
 static NSString *Canonical(NSString *path) {
@@ -550,6 +614,9 @@ static NSString *Canonical(NSString *path) {
     return path.isAbsolutePath && realpath(path.fileSystemRepresentation, resolved) ? @(resolved) : nil;
 }
 
+/* Entry point. See "Fixture-root safety" above, including its residual
+ * limitation: paths handed to Foundation and AppKit are re-resolved by them
+ * and cannot be descriptor-anchored. */
 int main(int argc, char **argv) {
     char run[PATH_MAX];
     if (argc != 2) { fputs("usage: macos_manager_snapshots MESON_BUILD_DIR\n", stderr); return 2; }
@@ -572,11 +639,14 @@ int main(int argc, char **argv) {
         Pages(NSAppearanceNameDarkAqua, @"dark");
         NSMutableString *dump = [NSMutableString string];
         DumpMenu([MDManagerApp makeMainMenu], dump, 0);
-        NSString *menu = [Out stringByAppendingPathComponent:@"menu.txt"];
-        if (!WriteNew(menu, [dump dataUsingEncoding:NSUTF8StringEncoding])) ++Failures;
+        if (!WriteNew(@"menu.txt", [dump dataUsingEncoding:NSUTF8StringEncoding])) ++Failures;
         else [Written addObject:@"menu.txt"];
         /* Every expected artifact must exist in this fresh directory. */
-        NSArray *files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:Out error:NULL];
+        NSMutableArray *files = [NSMutableArray array];
+        DIR *listing = fdopendir(dup(OutFD)); /* read through the descriptor */
+        for (struct dirent *e; listing && (e = readdir(listing));)
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) [files addObject:@(e->d_name)];
+        if (listing) closedir(listing); else ++Failures;
         /* Per appearance: 2 disconnected + 10 sections + 1 connecting + 17 sheets
          * + 2 This Computer states + 13 Hosts states + 2 minimum Hosts states. */
         const NSUInteger expected = 2 * (2 + 10 + 1 + 17 + 2 + 13 + 2) + 1;

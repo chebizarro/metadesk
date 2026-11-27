@@ -4,12 +4,15 @@
 usage: test_snapshot_guard.py RENDERER MESON_BUILD_DIR
 
 1. Refusals: roots it must not use and forged invocations, including a run
-   directory with a matching token and a matching environment, exit 2 and
+   directory with a matching token and a matching environment, an argument
+   longer than PATH_MAX, a real root so deep that the run paths would be
+   truncated, and a root reached through a symlinked ancestor, exit 2 and
    touch nothing.
 2. A successful isolated render into a throwaway meson-style root under
    $TMPDIR (which resolves through /private, so the canonical home-path
    comparison is exercised) must produce exactly the expected artifacts; the
    renderer itself fails on a missing sheet or a scene that does not drain.
+   Without a window server the render is skipped and so is this test (77).
 Throughout, HOME and XDG_CONFIG_HOME point at a decoy holding a relay
 preferences file, and the real runtime directory (/private/tmp/metadesk-UID
 and any XDG_RUNTIME_DIR) must be neither created nor modified.
@@ -65,7 +68,30 @@ try:
     forged_env = dict(env, HOME=str(forged / 'home'), CFFIXED_USER_HOME=str(forged / 'home'),
                       XDG_CONFIG_HOME=str(forged / 'config'), XDG_STATE_HOME=str(forged / 'state'),
                       XDG_CACHE_HOME=str(forged / 'cache'), XDG_RUNTIME_DIR=str(forged / 'runtime'))
+    # A root whose run paths would not fit in PATH_MAX. Built with dir_fd so
+    # no pathname used here exceeds PATH_MAX either; it holds a Meson marker.
+    path_max = os.pathconf('/', 'PC_PATH_MAX')
+    deep_fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+    deep = str(scratch)
+    while len(deep) < path_max - 24:
+        part = 'd' * min(200, path_max - 24 - len(deep) - 1)
+        os.mkdir(part, dir_fd=deep_fd)
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY, dir_fd=deep_fd)
+        os.close(deep_fd); deep_fd = next_fd; deep += '/' + part
+    os.mkdir('meson-private', dir_fd=deep_fd)
+    marker_dir = os.open('meson-private', os.O_RDONLY | os.O_DIRECTORY, dir_fd=deep_fd)
+    os.close(os.open('coredata.dat', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=marker_dir))
+    os.close(marker_dir)
+    assert len(deep) < path_max, len(deep)
+    # A valid-looking root reached through a symlinked ancestor.
+    real_parent = scratch / 'real-parent'
+    (real_parent / 'root' / 'meson-private').mkdir(parents=True)
+    (real_parent / 'root' / 'meson-private' / 'coredata.dat').write_bytes(b'')
+    (scratch / 'ancestor-link').symlink_to(real_parent)
     refusals = [
+        ([renderer, str(build) + '/' + 'x' * (path_max + 16)], env),
+        ([renderer, deep], env),
+        ([renderer, str(scratch / 'ancestor-link' / 'root')], env),
         ([renderer], env),
         ([renderer, '/private/tmp'], env),
         ([renderer, str(home)], env),
@@ -81,6 +107,9 @@ try:
         assert result.returncode == 2, (case, result.returncode, result.stdout, result.stderr)
     assert not any((forged / 'out').iterdir()) and not any((forged / 'home').iterdir()), 'forged run directory was used'
     assert set((build / 'snapshots').glob('run-*')) - runs == {forged}, 'a refused call created a run directory'
+    assert sorted(os.listdir(deep_fd)) == ['meson-private'], 'the overlong root was written'
+    os.close(deep_fd)
+    assert sorted(os.listdir(real_parent / 'root')) == ['meson-private'], 'the root behind a symlinked ancestor was written'
 
     # A successful isolated render. $TMPDIR resolves through /private, where
     # Foundation reports the home without that prefix.
@@ -88,7 +117,8 @@ try:
     (fake_root / 'meson-private').mkdir()
     (fake_root / 'meson-private' / 'coredata.dat').write_bytes(b'')
     result = subprocess.run([renderer, str(fake_root)], env=env, capture_output=True, text=True, timeout=400)
-    if result.returncode == 77:
+    skipped = result.returncode == 77
+    if skipped:
         print('SKIP: no WindowServer session for the isolated render')
     else:
         assert result.returncode == 0, (result.returncode, result.stdout[-2000:], result.stderr[-4000:])
@@ -109,6 +139,8 @@ try:
     assert {p: state(p) for p in runtime} == runtime_before, 'the real runtime directory was created or modified'
     assert tmp_existed or not tmp_snapshots.exists(), 'renderer wrote under /private/tmp'
     print('PASS: renderer refused every root it did not create')
+    if skipped:
+        sys.exit(77)  # the render did not run, so the guard as a whole is skipped
 finally:
     shutil.rmtree(scratch, ignore_errors=True)
     shutil.rmtree(forged, ignore_errors=True)

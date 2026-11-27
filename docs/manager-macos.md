@@ -280,10 +280,16 @@ replacement and the trust sheets' button roles; access defaults and stale
 requests; wrong-key signer refusal; and quit while a worker is active.
 `meson compile -C BUILD macos-manager-snapshots` renders every section, sheet
 and first-run state offscreen into a fresh `BUILD/snapshots/run-XXXXXX/out`
-for design review; it refuses any root but a meson build directory and keeps
-its home, configuration, state and runtime directories inside that run. The
-suite's renderer guard performs one such isolated render and checks every
-artifact. It uses
+for design review; it refuses any root but a canonical meson build directory
+owned by you, and keeps its home, configuration, state and runtime
+directories inside that run. It opens the root one component at a time
+without following links, validates the Meson marker and creates the run
+directories through those descriptors, and refuses any path that would be
+truncated. Paths it hands to Foundation and AppKit are re-resolved by them;
+the run directory's 0700 mode is what protects those. The suite's renderer
+guard checks refusals (including an overlong root and a symlinked ancestor),
+performs one isolated render and checks every artifact; without a window
+server it reports the test as skipped. It uses
 no synthetic input or permissions. The separate `account_keychain` test uses
 an explicit private file Keychain and checks it never appears in the search list.
 Neither fixture qualifies the signed or on-screen workflows above.
