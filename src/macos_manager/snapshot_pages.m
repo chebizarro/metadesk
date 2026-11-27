@@ -554,7 +554,8 @@ static NSString *CheckFixture(NSString *run, NSString *token) {
         NSString *expected = [run stringByAppendingPathComponent:want[name]];
         if (!value || ![@(value) isEqual:expected] || ![Canonical(expected) isEqual:expected] || !OwnedDirectory(expected)) return nil;
     }
-    if (![NSHomeDirectory() isEqual:[run stringByAppendingPathComponent:@"home"]]) return nil;
+    /* Foundation may report /private/tmp/... as /tmp/...; compare canonically. */
+    if (![Canonical(NSHomeDirectory()) isEqual:[run stringByAppendingPathComponent:@"home"]]) return nil;
     return [run stringByAppendingPathComponent:@"out"];
 }
 

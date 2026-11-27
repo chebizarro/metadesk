@@ -263,8 +263,9 @@ the connect field through the Edit menu with private pasteboards (never the
 general pasteboard), including refusing a pasted `nsec`; host trust and pin
 replacement and the trust sheets' button roles; access defaults and stale
 requests; wrong-key signer refusal; and quit while a worker is active.
-`meson test --suite macos_manager_snapshots` renders every section and sheet
-offscreen to `BUILD/snapshots/current` for design review. It uses
+`meson compile -C BUILD macos-manager-snapshots` renders every section, sheet
+and first-run state offscreen into a fresh `BUILD/snapshots/run-XXXXXX/out`
+for design review; it refuses any root but a meson build directory. It uses
 no synthetic input or permissions. The separate `account_keychain` test uses
 an explicit private file Keychain and checks it never appears in the search list.
 Neither fixture qualifies the signed or on-screen workflows above.
