@@ -1,4 +1,5 @@
 #import "ui.h"
+#import "hosts_model.h"
 
 static void Shrinkable(NSView *view) {
     [view setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -45,33 +46,166 @@ NSTextField *MDWrappingValue(NSString *text) {
     return f;
 }
 
-/* Keys, names and relay URLs must reach the model exactly as typed or pasted,
- * so this field editor turns off completion, correction and substitutions.
- * Editing itself is standard: cut, copy, paste, select all, undo, drag and
- * Services all work through the responder chain. What the user can see is
- * theirs to copy; secret-key input is refused by the pages that classify it. */
+/* One input policy for every field that takes a key, fingerprint, name, URL
+ * or path (md-b9zo B2, S4, S7):
+ *  - Secret-key text (nsec, ncryptsec, also after nostr:) is refused in
+ *    shouldChangeTextInRanges:, before it reaches the text storage or the undo
+ *    stack, whatever route inserts it: typing, paste, drop, Services, undo or
+ *    redo. Pages are told through MDSecretRefusedNotification to explain.
+ *  - Input is literal: completion, correction, substitutions, smart insert and
+ *    delete and case transformations are off and cannot be turned back on from
+ *    the contextual menu.
+ *  - A typed-only field also refuses paste, drop and Services insertion.
+ * Cut, copy, paste, select all, undo and redo otherwise behave normally. */
+NSNotificationName const MDSecretRefusedNotification = @"MDSecretRefusedNotification";
+static NSPasteboard *EditingPasteboard;
+void MDSetEditingPasteboard(NSPasteboard *pasteboard) { EditingPasteboard = pasteboard; }
+static NSPasteboard *Pasteboard(void) { return EditingPasteboard ?: NSPasteboard.generalPasteboard; }
+BOOL MDContainsSecretKey(NSString *text) {
+    /* Anywhere in the text, not only as a whole token: a key pasted next to
+     * other characters is still a key. Bech32 data never contains "1", so a
+     * public npub or nprofile cannot match. */
+    NSString *lower = text.lowercaseString;
+    if ([lower containsString:@"nsec1"] || [lower containsString:@"ncryptsec1"]) return YES;
+    if (MDClassifyHostInput(text) == MDHostSecret) return YES;
+    for (NSString *token in [text.lowercaseString componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet])
+        if (token.length && MDClassifyHostInput(token) == MDHostSecret) return YES;
+    return NO;
+}
+static BOOL LiteralCommand(SEL action) {
+    SEL commands[] = {
+        @selector(toggleAutomaticQuoteSubstitution:), @selector(toggleAutomaticDashSubstitution:),
+        @selector(toggleAutomaticTextReplacement:), @selector(toggleAutomaticSpellingCorrection:),
+        @selector(toggleContinuousSpellChecking:), @selector(toggleGrammarChecking:), @selector(toggleSmartInsertDelete:),
+        @selector(toggleAutomaticLinkDetection:), @selector(toggleAutomaticDataDetection:), @selector(toggleAutomaticTextCompletion:),
+        @selector(orderFrontSubstitutionsPanel:), @selector(uppercaseWord:), @selector(lowercaseWord:), @selector(capitalizeWord:),
+        @selector(checkSpelling:), @selector(showGuessPanel:), @selector(complete:)};
+    for (size_t i = 0; i < sizeof commands / sizeof *commands; ++i) if (commands[i] == action) return YES;
+    return NO;
+}
+static BOOL PasteCommand(SEL action) {
+    return action == @selector(paste:) || action == @selector(pasteAsPlainText:) || action == @selector(pasteAsRichText:) ||
+           action == @selector(pasteAndMatchStyle:);
+}
+static void Filter(NSMenu *menu, BOOL typedOnly) {
+    for (NSInteger i = menu.numberOfItems - 1; i >= 0; --i) {
+        NSMenuItem *item = [menu itemAtIndex:i];
+        if (item.submenu) {
+            Filter(item.submenu, typedOnly);
+            if (!item.submenu.numberOfItems || ![item.submenu.itemArray indexesOfObjectsPassingTest:^BOOL(NSMenuItem *m, NSUInteger idx, BOOL *stop) {
+                (void)idx; (void)stop; return !m.isSeparatorItem; }].count) [menu removeItemAtIndex:i];
+        } else if ((item.action && LiteralCommand(item.action)) || (typedOnly && item.action && PasteCommand(item.action)))
+            [menu removeItemAtIndex:i];
+    }
+    while (menu.numberOfItems && [menu itemAtIndex:0].isSeparatorItem) [menu removeItemAtIndex:0];
+    while (menu.numberOfItems && menu.itemArray.lastObject.isSeparatorItem) [menu removeItemAtIndex:menu.numberOfItems - 1];
+    for (NSInteger i = menu.numberOfItems - 1; i > 0; --i)
+        if ([menu itemAtIndex:i].isSeparatorItem && [menu itemAtIndex:i - 1].isSeparatorItem) [menu removeItemAtIndex:i];
+}
+NSMenu *MDLiteralMenu(NSMenu *menu, BOOL typedOnly) { if (menu) Filter(menu, typedOnly); return menu; }
+
+@implementation MDKeyEditor
+- (void)configure {
+    self.fieldEditor = YES; self.allowsUndo = YES; self.richText = NO; self.importsGraphics = NO;
+    self.automaticTextCompletionEnabled = NO; self.continuousSpellCheckingEnabled = NO; self.grammarCheckingEnabled = NO;
+    self.automaticSpellingCorrectionEnabled = NO; self.automaticQuoteSubstitutionEnabled = NO;
+    self.automaticDashSubstitutionEnabled = NO; self.automaticTextReplacementEnabled = NO;
+    self.automaticDataDetectionEnabled = NO; self.automaticLinkDetectionEnabled = NO;
+    self.smartInsertDeleteEnabled = NO;
+}
+- (instancetype)initWithFrame:(NSRect)frame { if ((self = [super initWithFrame:frame])) [self configure]; return self; }
+- (BOOL)shouldChangeTextInRanges:(NSArray<NSValue *> *)ranges replacementStrings:(NSArray<NSString *> *)strings {
+    if (strings.count == ranges.count) {
+        NSMutableString *result = [self.string mutableCopy];
+        NSArray *order = [[ranges valueForKey:@"rangeValue"] count] ? ranges : @[];
+        NSMutableArray *pairs = [NSMutableArray array];
+        for (NSUInteger i = 0; i < order.count; ++i) [pairs addObject:@[order[i], strings[i]]];
+        [pairs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+            return [@([b[0] rangeValue].location) compare:@([a[0] rangeValue].location)]; }];
+        for (NSArray *p in pairs) {
+            NSRange r = [p[0] rangeValue];
+            if (NSMaxRange(r) <= result.length) [result replaceCharactersInRange:r withString:p[1]];
+        }
+        if (MDContainsSecretKey(result)) {
+            NSBeep();
+            [NSNotificationCenter.defaultCenter postNotificationName:MDSecretRefusedNotification object:self.delegate ? (id)self.delegate : (id)self];
+            return NO;
+        }
+    }
+    return [super shouldChangeTextInRanges:ranges replacementStrings:strings];
+}
+- (BOOL)shouldChangeTextInRange:(NSRange)range replacementString:(NSString *)string {
+    if (string) return [self shouldChangeTextInRanges:@[[NSValue valueWithRange:range]] replacementStrings:@[string]];
+    return [super shouldChangeTextInRange:range replacementString:string];
+}
+/* Copy, cut and paste use the editing pasteboard (the general pasteboard
+ * unless a test injected a private one). */
+- (void)copy:(id)sender {
+    (void)sender;
+    if (!self.selectedRange.length) return;
+    [Pasteboard() clearContents];
+    [self writeSelectionToPasteboard:Pasteboard() types:self.writablePasteboardTypes];
+}
+- (void)cut:(id)sender { if (!self.selectedRange.length || !self.isEditable) return; [self copy:sender]; [self delete:sender]; }
+- (void)paste:(id)sender { (void)sender; if (!self.typedOnly) [self readSelectionFromPasteboard:Pasteboard()]; else NSBeep(); }
+- (void)pasteAsPlainText:(id)sender { [self paste:sender]; }
+- (BOOL)readSelectionFromPasteboard:(NSPasteboard *)pasteboard {
+    if (self.typedOnly) { NSBeep(); return NO; }
+    return [super readSelectionFromPasteboard:pasteboard];
+}
+- (BOOL)readSelectionFromPasteboard:(NSPasteboard *)pasteboard type:(NSPasteboardType)type {
+    if (self.typedOnly) { NSBeep(); return NO; }
+    return [super readSelectionFromPasteboard:pasteboard type:type];
+}
+- (NSArray<NSPasteboardType> *)acceptableDragTypes { return self.typedOnly ? @[] : super.acceptableDragTypes; }
+- (id)validRequestorForSendType:(NSPasteboardType)sendType returnType:(NSPasteboardType)returnType {
+    if (self.typedOnly && returnType) return nil;
+    return [super validRequestorForSendType:sendType returnType:returnType];
+}
+- (NSMenu *)menuForEvent:(NSEvent *)event { return MDLiteralMenu([super menuForEvent:event], self.typedOnly); }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+    SEL action = item.action;
+    if (LiteralCommand(action)) return NO;
+    if (PasteCommand(action)) return !self.typedOnly && self.isEditable && [Pasteboard() canReadObjectForClasses:@[NSString.class] options:nil];
+    if (action == @selector(copy:)) return self.selectedRange.length != 0;
+    if (action == @selector(cut:)) return self.selectedRange.length != 0 && self.isEditable;
+    return [super validateUserInterfaceItem:item];
+}
+- (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+/* Substitution, correction and case commands do nothing in a literal field. */
+- (void)toggleAutomaticQuoteSubstitution:(id)sender { (void)sender; }
+- (void)toggleAutomaticDashSubstitution:(id)sender { (void)sender; }
+- (void)toggleAutomaticTextReplacement:(id)sender { (void)sender; }
+- (void)toggleAutomaticSpellingCorrection:(id)sender { (void)sender; }
+- (void)toggleContinuousSpellChecking:(id)sender { (void)sender; }
+- (void)toggleGrammarChecking:(id)sender { (void)sender; }
+- (void)toggleSmartInsertDelete:(id)sender { (void)sender; }
+- (void)toggleAutomaticLinkDetection:(id)sender { (void)sender; }
+- (void)toggleAutomaticDataDetection:(id)sender { (void)sender; }
+- (void)toggleAutomaticTextCompletion:(id)sender { (void)sender; }
+- (void)orderFrontSubstitutionsPanel:(id)sender { (void)sender; }
+- (void)uppercaseWord:(id)sender { (void)sender; }
+- (void)lowercaseWord:(id)sender { (void)sender; }
+- (void)capitalizeWord:(id)sender { (void)sender; }
+@end
+
 @interface MDKeyFieldCell : NSTextFieldCell
+@property(nonatomic) BOOL typedOnly;
 @end
 @implementation MDKeyFieldCell {
-    NSTextView *_editor;
+    MDKeyEditor *_editor;
 }
 - (NSTextView *)fieldEditorForView:(NSView *)control {
     (void)control;
-    if (!_editor) {
-        _editor = [[NSTextView alloc] initWithFrame:NSZeroRect];
-        _editor.fieldEditor = YES; _editor.allowsUndo = YES; _editor.richText = NO;
-        _editor.automaticTextCompletionEnabled = NO;
-        _editor.continuousSpellCheckingEnabled = NO;
-        _editor.automaticSpellingCorrectionEnabled = NO;
-        _editor.automaticQuoteSubstitutionEnabled = NO;
-        _editor.automaticDashSubstitutionEnabled = NO;
-        _editor.automaticTextReplacementEnabled = NO;
-        _editor.automaticDataDetectionEnabled = NO;
-        _editor.automaticLinkDetectionEnabled = NO;
-    }
+    if (!_editor) _editor = [[MDKeyEditor alloc] initWithFrame:NSZeroRect];
+    _editor.typedOnly = self.typedOnly;
     return _editor;
 }
 @end
+void MDSetTypedOnly(NSTextField *field) {
+    if ([field.cell isKindOfClass:MDKeyFieldCell.class]) ((MDKeyFieldCell *)field.cell).typedOnly = YES;
+    [field unregisterDraggedTypes];
+}
 NSTextField *MDKeyField(NSString *placeholder, NSString *accessibilityLabel) {
     NSTextField *field = [[NSTextField alloc] initWithFrame:NSZeroRect];
     MDKeyFieldCell *cell = [[MDKeyFieldCell alloc] initTextCell:@""];

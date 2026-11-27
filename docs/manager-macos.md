@@ -18,10 +18,18 @@ Code, Import Hosts and Export Hosts.
 
 Cut, Copy, Paste, Delete, Select All, Undo and Redo work in every field and in
 the contextual menu. With a saved host selected, Edit > Copy copies its public
-npub. The manager writes to the pasteboard only when you choose Copy or Copy
-Public Key. Typing or pasting an `nsec` or `ncryptsec` into the connect field,
-route hint or Add Signer Account's public key clears it without echoing it, and
-Undo cannot restore it.
+npub. The manager writes to the pasteboard only when you choose Copy, Cut or
+Copy Public Key. Fields that take a key, fingerprint, name, address or path
+accept text literally: no smart spaces, substitutions, correction or case
+changes, and the contextual menu doesn't offer them. They refuse any text
+containing a private key (`nsec`, `ncryptsec`, also after `nostr:`) before it
+is entered, however it arrives — typing, Paste, drag and drop or a Service — so
+it is never shown, stored or recoverable with Undo or Redo; the page says why.
+
+One field is deliberately typed only: **Confirm** in the changed-key sheet
+refuses Paste, drag and drop and Services, and the new fingerprint above it
+can't be selected. Typing it yourself, as the host's owner reads it to you, is
+the check; copying it from the same sheet would prove nothing.
 
 Sheets put the safe choice on Return and Cancel on Escape; destructive buttons
 are never the default. Trust decisions have no Return default at all: reviewing
@@ -71,9 +79,13 @@ same relay vectors and exchanges real files between both implementations.
 ## Hosts
 
 1. Assign a client role in **Identity**, then open **Hosts** to load its encrypted
-   cache. Choose **Relays…** (or Address Book Relays in the … menu), enter
-   explicit bootstrap relay URLs separated by spaces and choose **Save and
-   Sync**. Afterwards View > Refresh syncs again. Both managers use the same
+   cache. Until then Hosts shows what's missing and the next step: add a signer
+   account, assign the client role, unlock the signer, re-import a remote
+   signer pairing, or free the private cache. Relay setup lives in the
+   **Relays** section (Hosts links to it): enter explicit bootstrap relay URLs
+   separated by spaces and choose **Save and Sync**. Afterwards View > Refresh
+   syncs again. Without relays, or while they are unreachable or catching up,
+   Hosts shows cached hosts and explains why reviewing and connecting wait. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
    `~/.config/metadesk`). GTK accepts international relay hostnames and writes
 ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
@@ -120,9 +132,12 @@ an unfinished launch and leaves a connected video window running.
 **Show Host QR Code** displays the saved host role's public `nprofile` and
 fingerprint. It does not contact the signer or check whether the host is running.
 
-Enter the running host's absolute [management socket path](host-management.md#endpoint-and-peer-trust)
-in **Management socket** and choose **Connect**. Status comes from an authenticated live
-subscription. Reconnect explicitly after a host restart or loss of the socket.
+When you open This Computer or Access, the manager connects to the saved host
+role's standard [management socket](host-management.md#endpoint-and-peer-trust)
+automatically; **Use a custom management socket** takes an absolute path
+instead. Status comes from an authenticated live subscription. Choose **Try
+Again** (or View > Refresh) after a host restart or loss of the socket. Without
+a host role, the page says so and links to Identity.
 A reachable managed process is not proof of LaunchAgent registration, permission,
 or capture readiness. If unreachable, the agent's process state is unknown.
 **Disconnect Session** ends the slot without changing remembered access; an
@@ -137,8 +152,10 @@ In **Access**, select a pending request and choose **Review Request…**. Check 
 request's public key, fingerprint, requested permissions and remaining time. Only
 requested and supported screen viewing is selected initially. Choose **Approve
 Once**, **Approve and Remember** (exactly the checked permissions) or **Deny**.
-Expired, cancelled, or stale reviews cannot approve. Choose **Reload** to read
-remembered clients before editing them with **Edit Access…**. **Revoke…**
+Expired, cancelled, or stale reviews cannot approve. A notification opens the
+review of exactly the request it announced, or nothing if that request has
+gone. Remembered clients load when the host connects; View > Refresh reloads
+them before editing with **Edit Access…**. **Revoke…**
 removes the grant and ends that client's admission. **Disconnect and Revoke…**
 uses the same host operation for the selected active client. A failed reply does not prove the grant is gone.
 
@@ -193,8 +210,8 @@ Create and manage signing keys only in the external signer.
 
 ## Differences from the Linux Manager and remaining limits
 
-- No relay discovery/authentication status panel. The Relays section is an
-  offline preview; edit bootstrap choices in Hosts > Relays….
+- No relay discovery/authentication status panel. The Relays section holds the
+  bootstrap relay choices and an offline identity preview.
 - No Grotto Control1 status panel or separate activity history; live sessions
   are in This Computer.
 - No LaunchAgent registration or start/stop. No sharing/unattended setters exist
@@ -221,9 +238,13 @@ Menus and editing, by hand with the keyboard and the menu bar: check that the
 menu bar shows the application, File, Edit, View, Window and Help menus. In the
 Host field, paste an npub with Command-V, select it with Command-A, copy and
 cut it with Command-C and Command-X, undo and redo with Command-Z and
-Shift-Command-Z, and use the same commands from the contextual menu. Paste an
-`nsec` fixture into Host, Route hint and Add Signer Account's public key and
-confirm each field clears, shows no part of it, and Undo does not restore it.
+Shift-Command-Z, and use the same commands from the contextual menu. Type,
+paste, drag in and insert with a Service an `nsec` fixture into Host, Route
+hint, Relays > Host identity, Add Signer Account's public key and the
+changed-key Confirm field: each refuses it, shows no part of it, and neither
+Undo nor Redo restores it. Confirm that the changed-key Confirm field refuses
+pasting its fingerprint and accepts it typed. Confirm the contextual menu of a
+key field offers no Substitutions or Transformations.
 Select a saved host and confirm Edit > Copy copies its npub; confirm nothing
 reaches the pasteboard otherwise. Check Command-1 to Command-5, Command-R,
 Command-F, Command-K, Command-W, Command-M and Command-Q, Hide and Show All,

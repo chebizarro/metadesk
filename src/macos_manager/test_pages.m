@@ -3,6 +3,8 @@
 #import "hosts_model.h"
 #import "access_page.h"
 #import "identity_page.h"
+#import "main_window.h"
+#import "ui.h"
 #include "md_test.h"
 #include <stdatomic.h>
 #include <unistd.h>
@@ -12,6 +14,8 @@
 #define OTHER "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
 #define GEN "abababababababababababababababab"
 #define REQUEST "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+#define REQUEST2 "efefefefefefefefefefefefefefefef"
+#define THIRD "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13"
 
 /* Drive the main run loop on dispatched callbacks and sheet operations. The
  * deadline is a watchdog, not a delay used to make an assertion pass. */
@@ -61,13 +65,6 @@ static BOOL Escapes(NSButton *button) { return [button.keyEquivalent isEqual:@"\
 static void Typed(NSTextField *field, NSString *text) {
     field.stringValue = text;
     [NSNotificationCenter.defaultCenter postNotificationName:NSControlTextDidChangeNotification object:field];
-}
-static NSWindow *TestWindow(NSView *view) {
-    NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,820,540)
-        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
-    window.releasedWhenClosed=NO; window.restorable=NO;
-    window.alphaValue=0; window.contentView=view;
-    return window;
 }
 static BOOL Send(NSControl *control) {
     return control.enabled && [NSApp sendAction:control.action to:control.target from:control];
@@ -157,69 +154,136 @@ static BOOL Menus(void) {
     return YES;
 }
 
-/* Mirror -[NSApplication targetForAction:to:from:] for a window that is not
- * key: test windows are never ordered on screen. */
-static id ChainTarget(NSWindow *window, SEL action) {
-    for (NSResponder *r = window.firstResponder; r; r = r.nextResponder) if ([r respondsToSelector:action]) return r;
-    for (id o in @[window.delegate ?: (id)NSNull.null, NSApp, NSApp.delegate ?: (id)NSNull.null])
-        if (o != NSNull.null && [o respondsToSelector:action]) return o;
-    return nil;
+/* Commands are dispatched exactly as AppKit does for the menu bar: validate
+ * with -[NSMenu update] and send with a nil target through NSApp, which
+ * resolves the key window's responder chain. Test windows are never ordered
+ * on screen, so the test application names the key window explicitly. */
+static NSWindow *KeyWindowOverride;
+@interface TestApplication : NSApplication
+@end
+@implementation TestApplication
+- (NSWindow *)keyWindow { return KeyWindowOverride ?: [super keyWindow]; }
+- (NSWindow *)mainWindow { return KeyWindowOverride ?: [super mainWindow]; }
+@end
+static void Turn(void) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false); }
+static BOOL Enabled(NSWindow *key, SEL action) {
+    KeyWindowOverride = key;
+    NSMenuItem *item = MenuItem(NSApp.mainMenu, action);
+    [item.menu update];
+    return item && item.isEnabled;
 }
-static BOOL Validates(NSWindow *window, NSMenuItem *item) {
-    id target = ChainTarget(window, item.action);
-    if (!target) return NO;
-    if ([target respondsToSelector:@selector(validateMenuItem:)]) return [target validateMenuItem:item];
-    if ([target respondsToSelector:@selector(validateUserInterfaceItem:)]) return [target validateUserInterfaceItem:item];
+static BOOL Choose(NSWindow *key, SEL action) {
+    if (!Enabled(key, action)) return NO;
+    NSMenuItem *item = MenuItem(NSApp.mainMenu, action);
+    return [NSApp sendAction:item.action to:item.target from:item];
+}
+/* Independent of the code under test: any trace of a secret-key prefix. */
+static BOOL HasSecret(NSString *text) {
+    NSString *lower = text.lowercaseString;
+    return [lower containsString:@"nsec1"] || [lower containsString:@"ncryptsec1"];
+}
+static BOOL MenuHas(NSMenu *menu, SEL action) {
+    for (NSMenuItem *item in menu.itemArray) if (item.action == action || (item.submenu && MenuHas(item.submenu, action))) return YES;
+    return NO;
+}
+
+/* Edit menu commands reach the connect field's editor through the real
+ * responder chain of the real main window (S10). */
+static BOOL Editing(MDManagerApp *app, NSWindow *window, MDHostsPage *page) {
+    [app showSection:@"Hosts"];
+    NSTextField *address = Field(page.view, @"Host npub");
+    CHECK(address && [window makeFirstResponder:address]);
+    MDKeyEditor *editor = (MDKeyEditor *)address.currentEditor;
+    CHECK([editor isKindOfClass:MDKeyEditor.class] && editor.allowsUndo && window.firstResponder == editor);
+    NSPasteboard *pb = [NSPasteboard pasteboardWithUniqueName];
+    MDSetEditingPasteboard(pb);
+    NSString *npub = MDHostNpub(@KEY);
+    editor.string = @""; [window.undoManager removeAllActions]; Turn();
+    [pb clearContents]; CHECK([pb setString:npub forType:NSPasteboardTypeString]);
+    CHECK(Choose(window, @selector(paste:)) && [address.stringValue isEqual:npub]);
+    Turn();
+    CHECK(Choose(window, @selector(selectAll:)) && editor.selectedRange.length == npub.length);
+    [pb clearContents];
+    CHECK(Choose(window, @selector(copy:)) && [[pb stringForType:NSPasteboardTypeString] isEqual:npub]);
+    [pb clearContents];
+    CHECK(Choose(window, @selector(cut:)) && !address.stringValue.length && [[pb stringForType:NSPasteboardTypeString] isEqual:npub]);
+    Turn();
+    CHECK(Choose(window, @selector(undo:)) && [address.stringValue isEqual:npub]);
+    Turn();
+    CHECK(Choose(window, @selector(redo:)) && !address.stringValue.length);
+    Turn();
+    /* Literal input (S7): no smart spaces, substitutions stay off and are not
+     * offered by the contextual menu. */
+    CHECK(!editor.smartInsertDeleteEnabled);
+    [editor insertText:@"npub" replacementRange:editor.selectedRange];
+    [pb clearContents]; CHECK([pb setString:@"1abc" forType:NSPasteboardTypeString]);
+    CHECK(Choose(window, @selector(paste:)) && [editor.string isEqual:@"npub1abc"]);
+    SEL toggles[] = {@selector(toggleAutomaticQuoteSubstitution:), @selector(toggleSmartInsertDelete:), @selector(toggleAutomaticTextReplacement:),
+                     @selector(toggleAutomaticSpellingCorrection:), @selector(uppercaseWord:)};
+    for (size_t i = 0; i < sizeof toggles / sizeof *toggles; ++i) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"" action:toggles[i] keyEquivalent:@""];
+        CHECK(![editor validateMenuItem:item]);
+        [NSApp sendAction:toggles[i] to:editor from:item];
+    }
+    CHECK(!editor.automaticQuoteSubstitutionEnabled && !editor.smartInsertDeleteEnabled && !editor.automaticTextReplacementEnabled &&
+          [editor.string isEqual:@"npub1abc"]);
+    NSMenu *context = MDLiteralMenu([NSTextView.defaultMenu copy], NO);
+    for (size_t i = 0; i < sizeof toggles / sizeof *toggles; ++i) CHECK(!MenuHas(context, toggles[i]));
+    CHECK(MenuHas(context, @selector(paste:)) && MenuHas(context, @selector(copy:)));
+    /* An event object built only as an argument; it is never posted. */
+    NSEvent *click = [NSEvent mouseEventWithType:NSEventTypeRightMouseDown location:NSZeroPoint modifierFlags:0 timestamp:0
+        windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];
+    NSMenu *ownMenu = click ? [editor menuForEvent:click] : nil;
+    CHECK(ownMenu != nil);
+    for (size_t i = 0; ownMenu && i < sizeof toggles / sizeof *toggles; ++i) CHECK(!MenuHas(ownMenu, toggles[i]));
+    editor.string = @""; [window.undoManager removeAllActions];
+    [pb releaseGlobally]; MDSetEditingPasteboard(nil);
+    CHECK([window makeFirstResponder:nil]);
     return YES;
 }
-static BOOL Perform(NSWindow *window, NSMenuItem *item) {
-    id target = ChainTarget(window, item.action);
-    return target && Validates(window, item) && [NSApp sendAction:item.action to:target from:item];
-}
-static void Turn(void) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false); }
-/* Editing reaches the connect field through the Edit menu. Pasteboard traffic
- * uses uniquely named private pasteboards and the field editor's own read and
- * write methods, never the user's general pasteboard. */
-static BOOL Editing(MDHostsPage *page, NSWindow *window) {
-    NSMenu *bar = [MDManagerApp makeMainMenu];
-    NSMenuItem *selectAll = MenuItem(bar, @selector(selectAll:)), *copy = MenuItem(bar, @selector(copy:)),
-        *cut = MenuItem(bar, @selector(cut:)), *paste = MenuItem(bar, @selector(paste:)),
-        *del = MenuItem(bar, @selector(delete:)), *undo = MenuItem(bar, @selector(undo:)), *redo = MenuItem(bar, @selector(redo:));
-    NSView *view = page.view;
-    NSTextField *address = Field(view, @"Host npub");
-    CHECK(address && [window makeFirstResponder:address]);
-    NSTextView *editor = (NSTextView *)address.currentEditor;
-    CHECK(editor && window.firstResponder == editor && editor.allowsUndo);
-    /* Cut, copy, paste, delete and select all are handled by the field editor. */
-    for (NSMenuItem *item in @[selectAll, copy, cut, paste, del]) CHECK(ChainTarget(window, item.action) == editor);
-    NSPasteboard *in = [NSPasteboard pasteboardWithUniqueName], *out = [NSPasteboard pasteboardWithUniqueName];
-    NSString *npub = MDHostNpub(@KEY);
-    [in clearContents]; CHECK([in setString:npub forType:NSPasteboardTypeString]);
-    CHECK([editor readSelectionFromPasteboard:in] && [address.stringValue isEqual:npub]);
+
+/* Secret-key text is refused before it reaches the field's storage or undo
+ * stack, whichever route inserts it: typing, Paste, drop, Services; and Undo
+ * and Redo afterwards never bring it back (B2). */
+static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSString *message) {
+    KeyWindowOverride = key;
+    CHECK(field && [key makeFirstResponder:field]);
+    MDKeyEditor *editor = (MDKeyEditor *)field.currentEditor;
+    CHECK([editor isKindOfClass:MDKeyEditor.class]);
+    __block BOOL stored = NO;
+    id watch = [NSNotificationCenter.defaultCenter addObserverForName:NSTextStorageDidProcessEditingNotification object:editor.textStorage
+        queue:nil usingBlock:^(NSNotification *note) { if (HasSecret(((NSTextStorage *)note.object).string)) stored = YES; }];
+    NSPasteboard *pb = [NSPasteboard pasteboardWithUniqueName];
+    MDSetEditingPasteboard(pb);
+    /* Setting the string directly bypasses undo; start from a clean stack. */
+    editor.string = @""; [key.undoManager removeAllActions]; Turn();
+    [editor insertText:@"abc" replacementRange:editor.selectedRange]; Turn();
+    for (NSString *secret in @[@"nsec1fixturenotakey", @"  nostr:nsec1fixture", @"NSEC1FIXTURE", @"ncryptsec1fixture", @"npub1x nsec1fixture"]) {
+        [editor insertText:secret replacementRange:editor.selectedRange];                 /* typing */
+        [pb clearContents]; [pb setString:secret forType:NSPasteboardTypeString];
+        Choose(key, @selector(paste:));                                                    /* Edit > Paste */
+        [editor readSelectionFromPasteboard:pb type:NSPasteboardTypeString];               /* drag and drop */
+        [editor readSelectionFromPasteboard:pb];                                           /* Services */
+        Turn();
+        CHECK(!HasSecret(editor.string) && !HasSecret(field.stringValue));
+    }
+    CHECK(!stored);
+    if (message) CHECK(LabelContains(messageView, message));
+    /* Undo and Redo both run, and neither restores the refused text. */
+    CHECK(Choose(key, @selector(undo:)) && !HasSecret(editor.string) && ![editor.string isEqual:@"abc"]);
     Turn();
-    CHECK(Perform(window, selectAll) && editor.selectedRange.length == npub.length);
-    CHECK(Validates(window, copy) && Validates(window, cut) && Validates(window, del));
-    [out clearContents];
-    /* Copy and Cut write the editor's writable types; none were offered when
-     * the old field editor suppressed copying. */
-    CHECK(editor.writablePasteboardTypes.count && [editor writeSelectionToPasteboard:out types:editor.writablePasteboardTypes]);
-    CHECK([[out stringForType:NSPasteboardTypeString] isEqual:npub]);
-    CHECK(Perform(window, del) && !address.stringValue.length);
+    CHECK(Choose(key, @selector(redo:)) && [editor.string isEqual:@"abc"]);
     Turn();
-    CHECK(Validates(window, undo) && Perform(window, undo) && [address.stringValue isEqual:npub]);
+    /* The only undoable change is the legitimate "abc": one more Undo
+     * empties the field and nothing older remains to restore. */
+    CHECK(Choose(key, @selector(undo:)) && !editor.string.length && !HasSecret(editor.string) && !stored);
     Turn();
-    CHECK(Validates(window, redo) && Perform(window, redo) && !address.stringValue.length);
-    Turn();
-    /* A pasted secret key is refused, cleared, never echoed and not undoable. */
-    [in clearContents]; CHECK([in setString:@"nsec1fixturenotakeyfixturenotakey" forType:NSPasteboardTypeString]);
-    CHECK([editor readSelectionFromPasteboard:in]);
-    CHECK(!address.stringValue.length && !editor.string.length && LabelContains(view, @"Private keys are not host addresses"));
-    CHECK(!LabelContains(view, @"nsec1fixture"));
-    Turn();
-    if (Validates(window, undo)) Perform(window, undo);
-    CHECK(![address.stringValue containsString:@"nsec"] && ![editor.string containsString:@"nsec"]);
-    [in releaseGlobally]; [out releaseGlobally];
-    CHECK([window makeFirstResponder:nil]);
+    CHECK(!Enabled(key, @selector(undo:)));
+    CHECK(Choose(key, @selector(redo:)) && [editor.string isEqual:@"abc"] && !stored);
+    [NSNotificationCenter.defaultCenter removeObserver:watch];
+    editor.string = @""; [key.undoManager removeAllActions];
+    [pb releaseGlobally]; MDSetEditingPasteboard(nil);
+    [key makeFirstResponder:nil];
     return YES;
 }
 
@@ -284,7 +348,9 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     NSView *view=page.view;
     NSTextField *address=Field(view,@"Host npub");
     NSButton *review=Button(view,@"Review and Connect…");
-    CHECK(address && review && !review.enabled);
+    CHECK(address && review);
+    CHECK(Refuses(window, Field(view,@"Optional IPv4"), view, @"Private keys are not host addresses"));
+    CHECK(Refuses(window, address, view, @"Private keys are not host addresses"));
     NSString *config=[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
     CHECK([NSFileManager.defaultManager createDirectoryAtPath:config withIntermediateDirectories:YES
         attributes:@{NSFilePosixPermissions:@0700} error:NULL]);
@@ -341,6 +407,28 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     sheet=window.attachedSheet.contentView;
     CHECK(Button(sheet,@"Keep Old Key") && Button(sheet,@"Replace Key") && !Button(sheet,@"Connect") && !Button(sheet,@"Save Host"));
     NSTextField *fp=Field(sheet,@"Type the new fingerprint"); CHECK(fp);
+    /* S4: the confirmation is typed only. Paste, drop and Services insertion
+     * are refused, and the new fingerprint is not offered for copying. */
+    NSWindow *sheetWindow=window.attachedSheet;
+    CHECK(Refuses(sheetWindow, fp, nil, nil));
+    NSTextField *shown=(NSTextField *)Find(sheet,^BOOL(NSView *v){ return [v isKindOfClass:NSTextField.class] &&
+        !((NSTextField *)v).editable && [((NSTextField *)v).stringValue isEqual:MDHostFingerprint(@KEY)]; });
+    CHECK(shown && !shown.selectable);
+    CHECK([sheetWindow makeFirstResponder:fp]);
+    MDKeyEditor *typed=(MDKeyEditor *)fp.currentEditor;
+    CHECK(typed.typedOnly && !typed.acceptableDragTypes.count && ![typed validRequestorForSendType:nil returnType:NSPasteboardTypeString]);
+    NSPasteboard *pb=[NSPasteboard pasteboardWithUniqueName]; MDSetEditingPasteboard(pb);
+    [pb clearContents]; [pb setString:MDHostFingerprint(@KEY) forType:NSPasteboardTypeString];
+    CHECK(!Enabled(sheetWindow,@selector(paste:)));
+    [typed paste:nil];
+    CHECK(![typed readSelectionFromPasteboard:pb] && ![typed readSelectionFromPasteboard:pb type:NSPasteboardTypeString]);
+    CHECK(!fp.stringValue.length && !Button(sheet,@"Replace Key").enabled);
+    [typed insertText:MDHostFingerprint(@KEY) replacementRange:typed.selectedRange];
+    CHECK([fp.stringValue isEqual:MDHostFingerprint(@KEY)] && Button(sheet,@"Replace Key").enabled);
+    typed.string=@""; [sheetWindow.undoManager removeAllActions]; [pb releaseGlobally]; MDSetEditingPasteboard(nil);
+    [sheetWindow makeFirstResponder:nil];
+    Typed(fp,@"");
+    KeyWindowOverride=window;
     /* Replace stays off until the exact new fingerprint is typed. */
     CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Keep Old Key")) && !Button(sheet,@"Replace Key").enabled);
     CHECK(Button(sheet,@"Replace Key").hasDestructiveAction);
@@ -370,12 +458,17 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     MD_CHECK(cmd!=nil && !version); if (cmd) [self.commands addObject:cmd];
 }
 - (void)close:(dispatch_block_t)drained { self.closed=YES; drained(); }
+- (void)connect:(NSString *)path { (void)path; }
 @end
 static NSDictionary *Snapshot(NSInteger revision,uint32_t requested, NSTimeInterval expiry, BOOL removed) {
     NSDictionary *r=@{@"request_id":@REQUEST,@"peer":@KEY,@"requested":@(requested),@"granted":@0,
         @"state":@"pending",@"expires_at":@(expiry)};
+    /* A second client is always waiting too: every action must stay bound
+     * to the request the user chose. */
+    NSDictionary *other=@{@"request_id":@REQUEST2,@"peer":@OTHER,@"requested":@(MD_CAP_VIDEO),@"granted":@0,
+        @"state":@"pending",@"expires_at":@(NSDate.date.timeIntervalSince1970+600)};
     return @{@"v":@1,@"ok":@YES,@"generation":@GEN,@"revision":@(revision),@"session":NSNull.null,
-        @"requests":removed?@[]:@[r],@"supported":@(MD_CAP_VIDEO|MD_CAP_AGENT)};
+        @"requests":removed?@[other]:@[r,other],@"supported":@(MD_CAP_VIDEO|MD_CAP_AGENT)};
 }
 static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) {
     NSButton *open=Button(page.accessView,@"Review Request…");
@@ -407,6 +500,21 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
         CHECK(!open.enabled && !Button(sheet,@"Approve Once").enabled && !Button(sheet,@"Approve and Remember").enabled && !Button(sheet,@"Deny").enabled);
         CHECK(EndSheet(window,NSAlertThirdButtonReturn+1) && link.commands.count==1);
     }
+    /* B1: with A selected, B's notification opens B's review and nothing else;
+     * a notification for a request that has gone opens nothing. */
+    link.push(@"Fixture",Snapshot(10,all,now+60,NO),policy,nil,NO);
+    NSTableView *requests=(NSTableView *)Find(page.accessView,^BOOL(NSView *v){ return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Pending requests"]; });
+    CHECK(requests.numberOfRows==2);
+    [requests selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    [page openRequest:@GEN "/" REQUEST2];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    sheet=window.attachedSheet.contentView;
+    CHECK(LabelContains(sheet,MDHostFingerprint(@OTHER)) && !LabelContains(sheet,MDHostFingerprint(@KEY)) && requests.selectedRow==1);
+    CHECK(EndSheet(window,NSModalResponseCancel) && link.commands.count==1);
+    [requests selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    [page openRequest:@GEN "/" "0123456789abcdef0123456789abcdef"];
+    Turn();
+    CHECK(!window.attachedSheet && requests.selectedRow==0);
     for (NSInteger busy=0; busy<2; ++busy) {
         link.push(@"Fixture",Snapshot(8,all,now+60,NO),policy,nil,NO);
         CHECK(Send(open) && Await(^BOOL{ return window.attachedSheet!=nil; }));
@@ -460,8 +568,18 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
     NSPopUpButton *picker=(NSPopUpButton *)Find(form,^BOOL(NSView *v){ return [v isKindOfClass:NSPopUpButton.class]; });
     NSTextField *key=Field(form,@"Public key"), *label=Field(form,@"Public label");
     CHECK(picker && key && label && [picker selectItemWithTag:backend]);
-    key.stringValue=@OTHER; label.stringValue=@"Candidate";
-    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    NSWindow *sheetWindow=window.attachedSheet;
+    CHECK(Refuses(sheetWindow, key, form, @"That’s a private key"));
+    Typed(key,@"");
+    NSButton *addButton=Button(form,@"Add Account");
+    CHECK(addButton && !addButton.enabled);
+    CHECK([sheetWindow makeFirstResponder:key]);
+    [(NSTextView *)key.currentEditor insertText:@OTHER replacementRange:NSMakeRange(0,0)];
+    CHECK(addButton.enabled);
+    label.stringValue=@"Candidate";
+    [addButton performClick:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet==nil; }));
+    KeyWindowOverride=window;
     CHECK(Await(^BOOL{ return bind.enabled && LabelContains(view,@"Account added"); }));
     CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"key"] isEqual:@OTHER]);
     CHECK(Send(Button(view,@"Edit Label…")) && Await(^BOOL{ return window.attachedSheet!=nil; }));
@@ -488,11 +606,31 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
         CHECK(atomic_load(&pairWrites)==1 && ![MDIdentityAccounts(directory,NULL).firstObject[@"client"] boolValue]);
         CHECK(!unlink(link.fileSystemRepresentation) && !unlink(file.fileSystemRepresentation));
     }
+    /* S5: another writer puts an account ahead of the selected one; after a
+     * reload the selection and Use for Client still mean the same account. */
+    static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
+    MdCredentialStore *store=md_credential_store_custom(&ops,NULL);
+    NSDictionary *selected=MDIdentityAccounts(directory,NULL).firstObject;
+    CHECK(!MDIdentityRemove(directory,store,selected).length);
+    CHECK(!MDIdentityAdd(directory,backend,@THIRD,@"Inserted ahead").length);
+    CHECK(!MDIdentityAdd(directory,backend,@OTHER,@"Renamed").length);
+    NSTableView *accounts=(NSTableView *)Find(view,^BOOL(NSView *v){ return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Signer accounts"]; });
+    CHECK([[MDIdentityAccounts(directory,NULL)[0] objectForKey:@"key"] isEqual:@THIRD]);
+    [page refresh:nil];
+    CHECK(Await(^BOOL{ return bind.enabled && accounts.numberOfRows==2; }));
+    CHECK(accounts.selectedRow==1 && LabelContains(view,MDHostNpub(@OTHER)));
     CHECK(Send(bind));
     CHECK(!bind.enabled);
     CHECK(Await(^BOOL{ return bind.enabled && LabelContains(page.view,@"different public key"); }));
     CHECK(atomic_load(&connectCalls)==1);
-    CHECK(![MDIdentityAccounts(directory,NULL).firstObject[@"client"] boolValue]);
+    CHECK(![MDIdentityAccounts(directory,NULL)[1][@"client"] boolValue]);
+    /* The selected account disappears: nothing else becomes the target. */
+    CHECK(!MDIdentityRemove(directory,store,MDIdentityAccounts(directory,NULL)[1]).length);
+    md_credential_store_destroy(store);
+    [page refresh:nil];
+    CHECK(Await(^BOOL{ return accounts.numberOfRows==1 && !LabelContains(view,@"Loading"); }));
+    CHECK(Await(^BOOL{ return [Button(view,@"Add Account…") isEnabled]; }));
+    CHECK(accounts.selectedRow==-1 && !bind.enabled);
     return YES;
 }
 @interface FixtureApp : MDManagerApp
@@ -504,6 +642,7 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
 static BOOL Quit(FixtureApp *app, MDHostsPage *page, FixtureHosts *worker, FixtureLink *link, NSWindow *window) {
     NSButton *review=Button(page.view,@"Review and Connect…");
     CHECK(Await(^BOOL{ return review.enabled; }));
+    Field(page.view,@"Host npub").stringValue=@KEY;
     __block BOOL entered=NO;
     worker.entered=^{ entered=YES; };
     worker.proceed=dispatch_semaphore_create(0);
@@ -517,8 +656,73 @@ static BOOL Quit(FixtureApp *app, MDHostsPage *page, FixtureHosts *worker, Fixtu
     CHECK([app applicationShouldTerminate:NSApp]==NSTerminateNow);
     return YES;
 }
+/* S6: during a client-role edit or with a sheet open, the Hosts commands are
+ * disabled in the menu and their handlers do nothing, not even switch section. */
+static BOOL Commands(MDManagerApp *app, NSWindow *window, MDHostsPage *hosts) {
+    [app showSection:@"Hosts"];
+    CHECK(Enabled(window,@selector(connectToHost:)));
+    __block BOOL drained=NO;
+    [hosts suspendForRoleEdit:^{ drained=YES; }];
+    CHECK(Await(^BOOL{ return drained; }));
+    [app showSection:@"Identity"];
+    CHECK(!Enabled(window,@selector(connectToHost:)) && !Enabled(window,@selector(importHosts:)) && !Enabled(window,@selector(scanQR:)));
+    [app performSelector:@selector(connectToHost:) withObject:nil];
+    CHECK([window.title isEqual:@"Identity"]);
+    [hosts resumeAfterRoleEdit];
+    [app showSection:@"Hosts"];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(importHosts:)]; }));
+    NSAlert *alert=[NSAlert new]; alert.messageText=@"Fixture"; [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:window completionHandler:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    NSWindow *sheet=window.attachedSheet;
+    CHECK(!Enabled(window,@selector(importHosts:)) && !Enabled(window,@selector(connectToHost:)) && !Enabled(window,@selector(showSection:)));
+    [hosts importHosts:nil];
+    [app performSelector:@selector(connectToHost:) withObject:nil];
+    CHECK(window.attachedSheet==sheet);
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    return YES;
+}
+/* S8: only the window frame is remembered. */
+static BOOL Persistence(MDManagerApp *app, NSWindow *window) {
+    [app showSection:@"Hosts"];
+    CHECK(!window.isRestorable && window.frameAutosaveName.length);
+    NSSplitView *split=(NSSplitView *)Find(window.contentView.superview ?: window.contentView,^BOOL(NSView *v){ return [v isKindOfClass:NSSplitView.class]; });
+    CHECK(split && !split.autosaveName.length);
+    MDMainWindowController *controller=window.windowController;
+    NSSearchField *search=controller.searchField;
+    CHECK(search && !search.recentsAutosaveName.length && search.maximumRecents==0);
+    return YES;
+}
+/* B2: the Relays section's host identity field refuses secret keys too. */
+static BOOL RelaysField(MDManagerApp *app, NSWindow *window) {
+    [app showSection:@"Relays"];
+    NSView *root=window.contentView;
+    CHECK(Refuses(window, Field(root,@"Host identity"), root, @"That’s a private key"));
+    return YES;
+}
+/* S9: a late pending-request update after the app delegate is gone is ignored. */
+static BOOL LateBadge(void) {
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array];
+    MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
+    FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
+    MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
+    MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:@"/nonexistent" connect:Connect credentials:nil];
+    __weak MDManagerApp *gone=nil;
+    @autoreleasepool {
+        MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
+        NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
+        gone=app;
+        [window close];
+    }
+    CHECK(gone==nil && local.pendingChanged);
+    local.pendingChanged(2);
+    __block int pending=3;
+    [hosts close:^{ --pending; }]; [local close:^{ --pending; }]; [identity close:^{ --pending; }];
+    CHECK(Await(^BOOL{ return pending==0; }));
+    return YES;
+}
 static BOOL Run(NSString *directory) {
-    [NSApplication.sharedApplication setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
     MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
     FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array];
@@ -529,17 +733,32 @@ static BOOL Run(NSString *directory) {
         static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
         return md_credential_store_custom(&ops,NULL);
     }];
-    NSWindow *hostWindow=TestWindow(hosts.view), *accessWindow=TestWindow(access.accessView), *identityWindow=TestWindow(identity.view);
+    /* The real main window and controller hierarchy, never ordered on screen. */
     FixtureApp *app=[[FixtureApp alloc] initWithHosts:hosts local:access identity:identity];
+    NSWindow *window=[app makeMainWindow];
+    window.alphaValue=0;
+    KeyWindowOverride=window;
+    NSApp.delegate=app; /* as in production: app-level commands resolve here */
     CHECK(Menus());
-    CHECK(Editing(hosts,hostWindow));
-    CHECK(Hosts(hosts,worker,hostWindow) && Access(access,link,accessWindow));
+    CHECK(Persistence(app,window));
+    [app showSection:@"Hosts"];
+    CHECK(Hosts(hosts,worker,window));
+    CHECK(Editing(app,window,hosts));
+    CHECK(Commands(app,window,hosts));
+    [app showSection:@"Access"];
+    CHECK(Access(access,link,window));
+    CHECK(RelaysField(app,window));
     MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
         MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F : MD_SIGNER_NIP55L;
+    [app showSection:@"Identity"];
     if (MDIdentitySupportsBackend(backend)) CHECK(Identity(identity,directory,backend));
     else puts("SKIP: no compiled external signer adapter for the Identity action fixture");
-    CHECK(Quit(app,hosts,worker,link,hostWindow));
-    [identityWindow close]; [accessWindow close]; [hostWindow close];
+    [app showSection:@"Hosts"];
+    CHECK(Quit(app,hosts,worker,link,window));
+    KeyWindowOverride=nil;
+    NSApp.delegate=nil;
+    [window close];
+    CHECK(LateBadge());
     return YES;
 }
 int main(int argc,char **argv) {
@@ -552,6 +771,7 @@ int main(int argc,char **argv) {
             return 77;
         }
         CFRelease(session);
+        [TestApplication sharedApplication];
         if (argc==2) Run(@(argv[1]));
         return md_test_report();
     }

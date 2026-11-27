@@ -29,6 +29,21 @@ NSTextField *MDWrappingValue(NSString *text);
 /* An editable field for keys, names, URLs and paths: standard editing, undo and
  * contextual menu, with completion, correction and substitutions off. */
 NSTextField *MDKeyField(NSString *placeholder, NSString *accessibilityLabel);
+/* The field editor behind every MDKeyField: literal input that refuses
+ * secret-key text before it reaches storage or undo (see ui.m). */
+@interface MDKeyEditor : NSTextView
+@property(nonatomic) BOOL typedOnly;
+@end
+/* Posted (object: the field, or the editor) when secret-key input is refused. */
+extern NSNotificationName const MDSecretRefusedNotification;
+BOOL MDContainsSecretKey(NSString *text);
+/* Paste, drop and Services insertion are refused: the user must type. */
+void MDSetTypedOnly(NSTextField *field);
+/* Removes substitution, spelling and case commands (and, if typedOnly, paste). */
+NSMenu *MDLiteralMenu(NSMenu *menu, BOOL typedOnly);
+/* Test seam: the pasteboard Cut, Copy and Paste use in key fields. nil means
+ * the general pasteboard. */
+void MDSetEditingPasteboard(NSPasteboard *pasteboard);
 NSButton *MDButton(NSString *title, id target, SEL action);
 NSButton *MDSymbolButton(NSString *symbol, NSString *accessibilityLabel, id target, SEL action);
 NSStackView *MDRow(NSArray<NSView *> *views);

@@ -16,6 +16,8 @@
 - (void)exportHosts:(id)sender;
 /* Toolbar search text for the saved-host list. */
 - (void)setSearchText:(NSString *)text;
+/* The single predicate for each command (menus, buttons and handlers). */
+- (BOOL)canPerform:(SEL)action;
 /* Relay setup, hosted by the Relays section (its one home). */
 - (NSView *)relaySettingsView;
 /* Test seam: counts saved signer accounts on the worker queue. */

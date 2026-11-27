@@ -145,7 +145,6 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
     main.minimumThickness = 520;
     _split = [NSSplitViewController new];
     _split.splitView.vertical = YES; _split.splitView.dividerStyle = NSSplitViewDividerStyleThin;
-    _split.splitView.autosaveName = @"MetadeskManagerSidebar";
     [_split addSplitViewItem:side]; [_split addSplitViewItem:main];
     window.contentViewController = _split;
 
@@ -235,6 +234,7 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
             field.placeholderString = @"Search Hosts";
             field.accessibilityLabel = @"Search saved hosts";
             field.sendsSearchStringImmediately = YES; field.sendsWholeSearchString = NO;
+            field.recentsAutosaveName = nil; field.maximumRecents = 0; /* nothing but the frame is saved */
             field.target = self; field.action = @selector(searchFieldChanged:);
         }
         return _search;

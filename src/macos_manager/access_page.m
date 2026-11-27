@@ -310,8 +310,7 @@ static NSTableView *AccessTable(id owner, NSString *label) {
         if (!self->_closed && opened && MDRequestForToken(self->_snapshot,token,Now())) {
             [NSApp sendAction:@selector(showSection:) to:nil from:@"Access"];
             [self.accessView.window makeKeyAndOrderFront:nil];
-            self->_selectedToken = token; [self tick:nil];
-            [self review:nil];
+            [self openRequest:token];
         }
         completion();
     });
@@ -426,12 +425,16 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     NSInteger row = _requests.selectedRow;
     return row >= 0 && (NSUInteger)row < _requestRows.count ? _requestRows[(NSUInteger)row][@"token"] : nil;
 }
-static void SelectRow(NSTableView *table, NSArray<NSDictionary *> *rows, NSString *key, id value) {
+/* Restores a selection by identity. With nothing selected before, the first
+ * row is selected; a previously selected item that disappeared is never
+ * replaced by a different one. */
+static BOOL SelectRow(NSTableView *table, NSArray<NSDictionary *> *rows, NSString *key, id value) {
     NSUInteger index = NSNotFound;
     for (NSUInteger i = 0; value && i < rows.count; ++i) if ([rows[i][key] isEqual:value]) { index = i; break; }
-    if (index == NSNotFound && rows.count) index = 0;
+    if (!value && rows.count) index = 0;
     if (index == NSNotFound) [table deselectAll:nil];
     else [table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
+    return index != NSNotFound;
 }
 static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *key, BOOL connected) {
     if (!permissions) [view setText:connected ? @"Unknown — choose Recheck Permissions" : @"Unknown — connect to check" kind:MDStatusInfo];
@@ -544,11 +547,18 @@ static void Permission(MDStatusView *view, NSDictionary *permissions, NSString *
 /* An approval is a trust decision: no button answers Return, Escape cancels,
  * and nothing can be approved once the request has expired, been cancelled or
  * gone stale. Only requested and supported screen viewing starts selected. */
-- (void)review:(id)sender {
-    (void)sender;
+/* A notification names one request: review exactly that one, or nothing. */
+- (void)openRequest:(NSString *)token {
+    if (_closed || !token || !MDRequestForToken(_snapshot, token, Now())) return;
+    [self tick:nil];
+    if (!SelectRow(_requests, _requestRows, @"token", token) || ![self.selectedRequestToken isEqual:token]) return;
+    _selectedToken = token;
+    [self reviewToken:token];
+}
+- (void)review:(id)sender { (void)sender; [self reviewToken:self.selectedRequestToken]; }
+- (void)reviewToken:(NSString *)token {
     NSWindow *window = self.accessView.window;
     NSDictionary *snapshot = _snapshot, *policy = _policy;
-    NSString *token = self.selectedRequestToken;
     NSDictionary *r = MDRequestForToken(snapshot,token,Now());
     if (!r || _busy || _closed || _chooser || !window || window.attachedSheet) return;
     MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Allow This Client to Connect?"

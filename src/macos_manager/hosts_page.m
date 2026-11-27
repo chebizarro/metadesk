@@ -273,6 +273,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }
     self.view = root;
     [self relaySettingsView];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(secretRefused:) name:MDSecretRefusedNotification object:nil];
     [self render];
 }
 - (void)activate {
@@ -295,6 +296,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)close:(dispatch_block_t)drained {
     atomic_store(&_closing, true);
+    [NSNotificationCenter.defaultCenter removeObserver:self name:MDSecretRefusedNotification object:nil];
     MDHostsLaunch *launch = _launch;
     _launch = nil; _book = nil; _rows = nil; _lastOwner = nil; _lastOwnerHosts = nil;
     dispatch_group_t group = dispatch_group_create();
@@ -457,8 +459,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [_sync setText:status kind:[self syncKind]];
     [_relayStatus setText:status kind:[self syncKind]];
     _saveRelays.enabled = !_roleEditing && !_busy && !self.closing;
-    _review.enabled = !_busy && !_launched && _book.canReview;
-    _scan.enabled = _review.enabled;
+    _review.enabled = [self can:@selector(reviewEntry:) sheet:NO];
+    _scan.enabled = [self can:@selector(scanQR:) sheet:NO];
     _address.enabled = _route.enabled = !_roleEditing && !self.closing;
     NSString *tag = _tags.selectedItem.representedObject;
     [_tags removeAllItems]; [_tags addItemWithTitle:@"All Tags"];
@@ -582,9 +584,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)updateSelection {
     NSDictionary *row = self.selected;
-    _saved.enabled = _review.enabled && row && [_book addressForKey:row[@"key"]];
-    _edit.enabled = !_busy && _book.canEdit && row;
-    _copyKey.enabled = row != nil;
+    _saved.enabled = [self can:@selector(reviewSaved:) sheet:NO];
+    _edit.enabled = [self can:@selector(edit:) sheet:NO];
+    _copyKey.enabled = [self can:@selector(copyPublicKey:) sheet:NO];
     _details.hidden = !row;
     _noSelection.hidden = row != nil || !_rows.count;
     if (!row) return;
@@ -618,6 +620,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [self note:@"Private keys are not host addresses, so the field was cleared. Enter the host’s public npub, nprofile or NIP-05 name." kind:MDStatusError];
     return YES;
 }
+/* The field editor refused secret-key input before it reached the field. */
+- (void)secretRefused:(NSNotification *)note {
+    if (note.object == _address || note.object == _route)
+        [self note:@"Private keys are not host addresses, so that text wasn’t entered. Enter the host’s public npub, nprofile or NIP-05 name." kind:MDStatusError];
+}
 - (void)controlTextDidChange:(NSNotification *)note {
     if (note.object == _address || note.object == _route) {
         NSTextField *field = note.object;
@@ -627,11 +634,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)refresh:(id)sender {
     (void)sender;
-    [self reloadBook:YES];
+    if ([self canPerform:_cmd]) [self reloadBook:YES];
 }
 - (void)focusHostEntry:(id)sender {
     (void)sender;
-    if (_address.enabled) [self.view.window makeFirstResponder:_address];
+    if ([self canPerform:_cmd]) [self.view.window makeFirstResponder:_address];
 }
 - (void)focusSearch:(id)sender { (void)sender; }
 - (void)setSearchText:(NSString *)text {
@@ -640,20 +647,26 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
 - (BOOL)validateToolbarItem:(NSToolbarItem *)item { return [self validateUserInterfaceItem:item]; }
-- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
-    SEL action = item.action;
-    BOOL idle = !_busy && !_roleEditing && !self.closing;
+/* One predicate per action, shared by menu validation, buttons and the
+ * handlers themselves (which also run when invoked from a menu or the app).
+ * Buttons ignore the sheet check: a sheet already blocks their window. */
+- (BOOL)can:(SEL)action sheet:(BOOL)checkSheet {
+    BOOL open = !self.closing && !_roleEditing && !(checkSheet && self.view.window.attachedSheet);
+    BOOL idle = open && !_busy;
+    NSDictionary *row = self.selected;
+    if (action == @selector(focusHostEntry:)) return open;
+    if (action == @selector(focusSearch:) || action == @selector(editRelays:)) return !self.closing;
     if (action == @selector(refresh:)) return idle;
-    if (action == @selector(editRelays:)) return !self.closing;
-    if (action == @selector(focusHostEntry:) || action == @selector(focusSearch:)) return !self.closing;
-    if (action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
+    if (action == @selector(reviewEntry:) || action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
+    if (action == @selector(reviewSaved:)) return idle && !_launched && _book.canReview && row && [_book addressForKey:row[@"key"]];
     if (action == @selector(importHosts:)) return idle && _book.canEdit;
     if (action == @selector(exportHosts:)) return idle && _book.canExport;
-    if (action == @selector(copy:) || action == @selector(copyPublicKey:)) return self.selected != nil;
-    if (action == @selector(edit:)) return idle && _book.canEdit && self.selected;
-    if (action == @selector(reviewSaved:)) return _saved.enabled;
+    if (action == @selector(edit:)) return idle && _book.canEdit && row;
+    if (action == @selector(copy:) || action == @selector(copyPublicKey:)) return row != nil;
     return [self respondsToSelector:action];
 }
+- (BOOL)canPerform:(SEL)action { return [self can:action sheet:YES]; }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item { return [self canPerform:item.action]; }
 /* Relay setup has one home, the Relays section; Hosts links to it. */
 - (void)editRelays:(id)sender {
     (void)sender;
@@ -738,6 +751,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)reviewEntry:(id)sender {
     (void)sender;
+    if (![self canPerform:_cmd]) return;
     [self reviewInput:_address.stringValue fromImage:NO];
 }
 - (void)reviewInput:(NSString *)address fromImage:(BOOL)fromImage {
@@ -761,7 +775,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)scanQR:(id)sender {
     (void)sender;
     NSWindow *window = self.view.window;
-    if (!_scan.enabled || _busy || self.closing || !window || window.attachedSheet) return;
+    if (![self canPerform:_cmd] || !window) return;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
@@ -782,6 +796,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)reviewSaved:(id)sender {
     (void)sender;
+    if (![self canPerform:_cmd]) return;
     NSString *address = [_book addressForKey:self.selected[@"key"]];
     if (address) [self resolve:address route:@""];
 }
@@ -817,7 +832,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
                     @"Keep the saved key unless the host’s owner confirms they changed it."
               width:540];
         [rows addObject:@[@"Saved fingerprint", MDKeyValue(MDHostFingerprint(review.oldKey))]];
-        [rows addObject:@[@"New fingerprint", MDKeyValue(review.fingerprint)]];
+        NSTextField *newFingerprint = MDKeyValue(review.fingerprint);
+        newFingerprint.selectable = NO; /* typed confirmation: not offered for copying */
+        [rows addObject:@[@"New fingerprint", newFingerprint]];
         [rows addObject:@[@"New public key", MDKeyValue(review.npub)]];
         [rows addObject:@[@"NIP-05", alias]];
     } else {
@@ -839,7 +856,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             confirmation = Field(@"Type the new fingerprint exactly", nil);
             confirmation.accessibilityLabel = @"New fingerprint, typed to confirm";
             confirmation.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
-            NSTextField *hint = MDNote(@"To replace the saved key, type the new fingerprint exactly as the host’s owner reads it to you. You’ll review the host again before connecting.");
+            MDSetTypedOnly(confirmation);
+            NSTextField *hint = MDNote(@"Type the new fingerprint yourself, as the host’s owner reads it to you — pasting isn’t accepted here. You’ll review the host again before connecting.");
             [content addObject:MDForm(@[@[@"Confirm", confirmation], @[NSNull.null, hint]])];
             replace = [sheet addButton:@"Replace Key" role:MDSheetDestructive response:NSAlertSecondButtonReturn];
             replace.enabled = NO;
@@ -926,7 +944,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     (void)sender;
     NSDictionary *row = self.selected;
     NSWindow *window = self.view.window;
-    if (!_book.canEdit || _busy || !row || !window || window.attachedSheet) return;
+    if (![self canPerform:_cmd] || !window) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSString *key = row[@"key"];
@@ -1025,7 +1043,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)importHosts:(id)sender {
     (void)sender;
-    if (_busy || !_book.canEdit || !self.view.window) return;
+    if (![self canPerform:_cmd] || !self.view.window) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
@@ -1065,7 +1083,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)exportHosts:(id)sender {
     (void)sender;
-    if (_busy || !_book.canExport || !self.view.window || self.view.window.attachedSheet) return;
+    if (![self canPerform:_cmd] || !self.view.window) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSAlert *alert = MDAlert(@"Export Hosts as Plain Text?",

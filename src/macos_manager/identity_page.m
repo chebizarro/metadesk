@@ -39,7 +39,7 @@ static NSString *BackendTitle(MdSignerType backend) {
     NSView *_empty;
     NSString *_selectedID;
     NSButton *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel, *_add, *_label, *_pair;
-    BOOL _closed, _busy, _cancellable, _pendingAdd;
+    BOOL _closed, _busy, _cancellable, _pendingAdd, _reloading;
 }
 - (BOOL)cancelled;
 @end
@@ -155,20 +155,29 @@ static NSString *SignerTitle(NSDictionary *a) {
 - (NSString *)tableView:(NSTableView *)table typeSelectStringForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
     (void)table; (void)column; return AccountTitle(_accounts[(NSUInteger)row]);
 }
-- (void)tableViewSelectionDidChange:(NSNotification *)note { (void)note; [self selection:nil]; }
+- (void)tableViewSelectionDidChange:(NSNotification *)note {
+    (void)note;
+    if (!_reloading) [self selection:nil];
+}
 - (NSDictionary *)accountInRole:(MdAccountRole)role {
     NSString *field=role==MD_ACCOUNT_CLIENT?@"client":@"host";
     for (NSDictionary *a in _accounts) if ([a[field] boolValue]) return a;
     return nil;
 }
 - (void)render {
-    NSString *selected=self.selected[@"id"] ?: _selectedID;
+    /* Restore the selection by account ID, never by row index: another writer
+     * may have inserted or reordered accounts. A vanished account is not
+     * replaced by its neighbour. */
+    NSString *selected = _selectedID;
+    _reloading = YES;
     [_list reloadData];
     NSUInteger index = NSNotFound;
-    for (NSUInteger i = 0; i < _accounts.count; ++i) if ([_accounts[i][@"id"] isEqual:selected]) { index = i; break; }
-    if (index == NSNotFound && _accounts.count) index = 0;
+    for (NSUInteger i = 0; selected && i < _accounts.count; ++i) if ([_accounts[i][@"id"] isEqual:selected]) { index = i; break; }
+    if (!selected && _accounts.count) index = 0;
+    if (index == NSNotFound) _selectedID = nil;
     if (index != NSNotFound) [_list selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
     else [_list deselectAll:nil];
+    _reloading = NO;
     _empty.hidden = _accounts.count != 0;
     _emptyTitle.stringValue = _accounts ? @"No Signer Accounts" : @"Accounts Not Loaded";
     _emptyDetail.stringValue = _accounts ? @"Choose Add Account to save the public key of an account in your external signer." : @"Saved accounts load when this page opens.";
@@ -186,7 +195,7 @@ static NSString *SignerTitle(NSDictionary *a) {
 - (void)selection:(id)sender {
     (void)sender;
     NSDictionary *a=self.selected;
-    if (a) _selectedID = a[@"id"];
+    _selectedID = a[@"id"];
     _details.stringValue = a ? MDHostNpub(a[@"key"]) ?: @"" : @"Select an account.";
     _details.toolTip = a ? MDHostNpub(a[@"key"]) : nil;
     _details.textColor = a ? NSColor.labelColor : NSColor.secondaryLabelColor;
@@ -289,6 +298,10 @@ static NSString *SignerTitle(NSDictionary *a) {
     [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
     addButton.enabled = NO;
     __weak NSButton *weakAdd = addButton; __weak MDStatusView *weakProblem = problem;
+    id refused = [NSNotificationCenter.defaultCenter addObserverForName:MDSecretRefusedNotification object:key queue:nil usingBlock:^(NSNotification *note) {
+        (void)note;
+        [weakProblem setText:@"That’s a private key, so it wasn’t entered. Enter the account’s public npub or hex key." kind:MDStatusError];
+    }];
     id observer = [NSNotificationCenter.defaultCenter addObserverForName:NSControlTextDidChangeNotification object:key queue:nil usingBlock:^(NSNotification *note) {
         NSTextField *field = note.object;
         NSTextView *editor = (NSTextView *)field.currentEditor;
@@ -303,9 +316,10 @@ static NSString *SignerTitle(NSDictionary *a) {
     }];
     [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse result) {
         [NSNotificationCenter.defaultCenter removeObserver:observer];
+        [NSNotificationCenter.defaultCenter removeObserver:refused];
         NSString *publicKey=key.stringValue, *publicLabel=label.stringValue;
         key.stringValue=@""; label.stringValue=@"";
-        if (result!=NSAlertFirstButtonReturn || self->_closed) return;
+        if (result!=NSAlertFirstButtonReturn || self->_closed || MDContainsSecretKey(publicKey)) return;
         MdSignerType type = (MdSignerType)backend.selectedTag;
         [self run:@"Adding the account…" suspend:NO cancellable:NO work:^NSString *{
             NSString *error = MDIdentityAdd(self->_directory,type,publicKey,publicLabel);

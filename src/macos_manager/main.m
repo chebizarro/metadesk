@@ -31,6 +31,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     MDMainWindowController *_main;
     NSTextField *_address, *_relay, *_routes;
     NSButton *_preview;
+    id _secretObserver;
     MDHostsPage *_hostsPage;
     MDLocalHostPages *_local;
     MDIdentityPage *_identity;
@@ -149,12 +150,23 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[1]];
     [stack setCustomSpacing:MDRowSpacing afterView:form];
     _routes.stringValue = @"Enter a host identity and choose Preview.";
+    __weak MDManagerApp *weakSelf = self;
+    _secretObserver = [NSNotificationCenter.defaultCenter addObserverForName:MDSecretRefusedNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+        MDManagerApp *app = weakSelf;
+        if (app && (note.object == app->_address || note.object == app->_relay))
+            app->_routes.stringValue = @"That’s a private key, so it wasn’t entered. Enter a public npub, nprofile or hex key.";
+    }];
     return MDScrollingPage(page);
 }
 - (void)preview:(id)sender {
     (void)sender;
     if (_terminationPending || !_preview.enabled) return;
     NSString *address=MDHostTrim(_address.stringValue),*relay=MDHostTrim(_relay.stringValue);
+    if (MDContainsSecretKey(address) || MDContainsSecretKey(relay)) { /* submit-time backstop */
+        _address.stringValue=@""; _relay.stringValue=@"";
+        _routes.stringValue=@"That’s a private key, so it wasn’t used. Enter a public npub, nprofile or hex key.";
+        return;
+    }
     NSButton *button=_preview;
     button.enabled=NO;
     dispatch_async(_previewQueue, ^{ @autoreleasepool {
@@ -244,13 +256,13 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
 - (NSString *)currentSection { return _main.currentSection; }
 - (void)showSection:(id)sender {
     NSString *section = [sender isKindOfClass:NSString.class] ? sender : [sender representedObject];
-    if (!_main || ![MDManagerApp.sectionTitles containsObject:section]) return;
+    if (!_main || _main.window.attachedSheet || ![MDManagerApp.sectionTitles containsObject:section]) return;
     [_main showSection:section];
     [_main.window makeKeyAndOrderFront:nil];
 }
 /* Commands that act on the Hosts page work from any section. */
 - (BOOL)forwardToHosts:(SEL)action from:(id)sender {
-    if (_terminationPending || !_hostsPage) return NO;
+    if (_terminationPending || !_hostsPage || ![_hostsPage canPerform:action]) return NO;
     [self showSection:@"Hosts"];
     return [NSApp sendAction:action to:_hostsPage from:sender];
 }
@@ -260,7 +272,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
 - (void)exportHosts:(id)sender { [self forwardToHosts:@selector(exportHosts:) from:sender]; }
 - (void)findHosts:(id)sender {
     (void)sender;
-    if (_terminationPending || !_main) return;
+    if (_terminationPending || !_main || _main.window.attachedSheet) return;
     [self showSection:@"Hosts"];
     [_main focusSearch];
 }
@@ -286,7 +298,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     if (action == @selector(showSection:)) {
         if ([(id)item isKindOfClass:NSMenuItem.class])
             ((NSMenuItem *)item).state = [[(NSMenuItem *)item representedObject] isEqual:self.currentSection] ? NSControlStateValueOn : NSControlStateValueOff;
-        return _main != nil;
+        return _main != nil && !_main.window.attachedSheet;
     }
     if (action == @selector(refresh:)) {
         NSString *section = self.currentSection;
@@ -299,8 +311,7 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     SEL forwarded[] = {@selector(focusHostEntry:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(focusSearch:)};
     for (size_t i = 0; i < sizeof(hosts) / sizeof(*hosts); ++i) if (action == hosts[i]) {
         if (!_hostsPage || !_main) return NO;
-        NSMenuItem *probe = [[NSMenuItem alloc] initWithTitle:@"" action:forwarded[i] keyEquivalent:@""];
-        return [_hostsPage validateUserInterfaceItem:probe];
+        return [_hostsPage canPerform:forwarded[i]];
     }
     return [self respondsToSelector:action];
 }

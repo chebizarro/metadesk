@@ -11,5 +11,8 @@
 - (BOOL)canRefreshSection:(NSString *)section;
 /* First shown: connect to the saved host role's standard socket. */
 - (void)activate;
+/* Opens the review for exactly this request token (a notification's), or
+ * does nothing if it is no longer pending. */
+- (void)openRequest:(NSString *)token;
 - (void)refreshSection:(NSString *)section;
 @end
