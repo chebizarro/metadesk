@@ -95,7 +95,7 @@ NSButton *MDButton(NSString *title, id target, SEL action) {
 NSButton *MDSymbolButton(NSString *symbol, NSString *accessibilityLabel, id target, SEL action) {
     NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:accessibilityLabel];
     NSButton *b = [NSButton buttonWithImage:image target:target action:action];
-    b.bezelStyle = NSBezelStyleSmallSquare;
+    b.bezelStyle = NSBezelStyleSmallSquare; b.title = @""; b.imagePosition = NSImageOnly;
     b.accessibilityLabel = accessibilityLabel; b.toolTip = accessibilityLabel;
     [b.widthAnchor constraintGreaterThanOrEqualToConstant:24].active = YES;
     return b;

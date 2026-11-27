@@ -32,9 +32,11 @@ static NSView *Find(NSView *root, BOOL (^matches)(NSView *)) {
     }
     return nil;
 }
+/* Matches a button's title, or the accessibility label of an image button. */
 static NSButton *Button(NSView *view, NSString *title) {
     return (NSButton *)Find(view,^BOOL(NSView *v) {
-        return [v isKindOfClass:NSButton.class] && [((NSButton *)v).title isEqual:title];
+        return [v isKindOfClass:NSButton.class] && ([((NSButton *)v).title isEqual:title] ||
+            (!((NSButton *)v).title.length && [v.accessibilityLabel isEqual:title]));
     });
 }
 static NSTextField *Field(NSView *view, NSString *prefix) {
@@ -439,13 +441,13 @@ static BOOL Identity(FixtureIdentity *page, NSString *directory, MdSignerType ba
     CHECK(picker && key && label && [picker selectItemWithTag:backend]);
     key.stringValue=@OTHER; label.stringValue=@"Candidate";
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
-    CHECK(Await(^BOOL{ return bind.enabled && LabelContains(view,@"Public account added"); }));
+    CHECK(Await(^BOOL{ return bind.enabled && LabelContains(view,@"Account added"); }));
     CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"key"] isEqual:@OTHER]);
     CHECK(Send(Button(view,@"Edit Label…")) && Await(^BOOL{ return window.attachedSheet!=nil; }));
     label=Field(window.attachedSheet.contentView,@"Public account label"); CHECK(label);
     label.stringValue=@"Renamed";
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
-    CHECK(Await(^BOOL{ return LabelContains(view,@"Public label saved"); }));
+    CHECK(Await(^BOOL{ return LabelContains(view,@"Label saved"); }));
     CHECK([MDIdentityAccounts(directory,NULL).firstObject[@"label"] isEqual:@"Renamed"]);
     if (backend==MD_SIGNER_NIP46) {
         NSURL *file=[NSURL fileURLWithPath:[directory stringByAppendingPathComponent:@"fixture-pairing.json"]];

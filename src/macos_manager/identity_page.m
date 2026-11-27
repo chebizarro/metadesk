@@ -2,14 +2,23 @@
 #import "identity_model.h"
 #import "hosts_page.h"
 #import "hosts_model.h"
+#import "ui.h"
 #include <stdatomic.h>
 
-static NSTextField *Label(NSString *text) { return [NSTextField wrappingLabelWithString:text ?: @""]; }
-static NSButton *Button(NSString *title,id target,SEL action) { return [NSButton buttonWithTitle:title target:target action:action]; }
 static NSStackView *Stack(NSArray *views,BOOL row) {
     NSStackView *s = [NSStackView stackViewWithViews:views];
     s.orientation = row ? NSUserInterfaceLayoutOrientationHorizontal : NSUserInterfaceLayoutOrientationVertical;
     s.alignment = row ? NSLayoutAttributeCenterY : NSLayoutAttributeLeading; s.spacing = 8; return s;
+}
+static NSString *const HostSaved = @"Host role saved. Restart the host to use it.";
+static NSString *const ClientSaved = @"Client role saved. Hosts is reloading with the new client key.";
+static NSString *const AccountAdded = @"Account added. Select it to assign a role.";
+static NSString *const LabelSaved = @"Label saved.";
+static NSString *const PairingSaved = @"Pairing saved in Keychain. Assigning a role will still ask the signer to prove the key.";
+static NSString *const AccountRemoved = @"Account removed. Restart a running host if it used this account.";
+/* Worker results are either the model's error message or one of these. */
+static BOOL success(NSString *message) {
+    return [@[HostSaved, ClientSaved, AccountAdded, LabelSaved, PairingSaved, AccountRemoved] containsObject:message];
 }
 static const MdSignerType ExternalBackends[] = {MD_SIGNER_NIP5F, MD_SIGNER_NIP46, MD_SIGNER_NIP55L};
 static NSString *BackendTitle(MdSignerType backend) {
@@ -26,7 +35,7 @@ static NSTextField *Entry(NSString *label, NSString *value) {
     [field.widthAnchor constraintEqualToConstant:400].active = YES;
     return field;
 }
-@interface MDIdentityPage () {
+@interface MDIdentityPage () <NSTableViewDataSource, NSTableViewDelegate> {
     MDHostsPage *_hosts;
     NSString *_directory;
     MDIdentityConnect _connectSigner;
@@ -35,9 +44,12 @@ static NSTextField *Entry(NSString *label, NSString *value) {
     dispatch_group_t _drain;
     atomic_bool _cancelled;
     NSArray<NSDictionary *> *_accounts;
-    NSPopUpButton *_list;
-    NSTextField *_status, *_details, *_roles;
-    NSButton *_refresh, *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel, *_add, *_label, *_pair;
+    NSTableView *_list;
+    MDStatusView *_status;
+    NSTextField *_details, *_clientRole, *_hostRole, *_emptyTitle, *_emptyDetail;
+    NSView *_empty;
+    NSString *_selectedID;
+    NSButton *_client, *_host, *_unbindClient, *_unbindHost, *_remove, *_fips, *_cancel, *_add, *_label, *_pair;
     BOOL _closed, _busy, _cancellable;
 }
 - (BOOL)cancelled;
@@ -61,52 +73,128 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
 }
 - (BOOL)cancelled { return atomic_load(&_cancelled); }
 - (void)loadView {
-    _list = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO]; _list.target=self; _list.action=@selector(selection:);
-    [_list setAccessibilityLabel:@"Signer accounts"];
-    _status=Label(@"Load saved signer accounts."); _details=Label(nil); _roles=Label(nil);
-    _refresh=Button(@"Reload Accounts",self,@selector(refresh:));
-    _client=Button(@"Use for Client",self,@selector(bindClient:)); _host=Button(@"Use for Host",self,@selector(bindHost:));
-    _unbindClient=Button(@"Unassign Client",self,@selector(unbindClient:)); _unbindHost=Button(@"Unassign Host",self,@selector(unbindHost:));
-    _add=Button(@"Add Signer Account…",self,@selector(add:));
-    _label=Button(@"Edit Label…",self,@selector(editLabel:));
-    _pair=Button(@"Import Pairing…",self,@selector(importPairing:));
-    _remove=Button(@"Remove Account…",self,@selector(remove:)); _cancel=Button(@"Cancel Verification",self,@selector(cancel:));
-    _fips=[NSButton checkboxWithTitle:@"Host will use FIPS (verify the local node key)" target:nil action:NULL]; _fips.state=NSControlStateValueOn;
-    NSStackView *content = Stack(@[],NO);
-    for (NSView *v in @[_status,_roles,_list,_details,_refresh,_fips,Stack(@[_client,_host],YES),Stack(@[_unbindClient,_unbindHost],YES),
-        Stack(@[_add,_label,_pair],YES), Stack(@[_remove,_cancel],YES),
-        Label(@"Create keys, unlock, and authorize operations in your external signer. Metadesk has no password. Restart an already-running host after changing its role.")]) {
-        [content addArrangedSubview:v]; [v.widthAnchor constraintLessThanOrEqualToAnchor:content.widthAnchor].active=YES;
-    }
-    NSView *view=[NSView new]; [view addSubview:content]; content.translatesAutoresizingMaskIntoConstraints=NO;
-    [NSLayoutConstraint activateConstraints:@[[content.topAnchor constraintEqualToAnchor:view.topAnchor constant:14],
-        [content.leadingAnchor constraintEqualToAnchor:view.leadingAnchor constant:14], [content.trailingAnchor constraintEqualToAnchor:view.trailingAnchor constant:-14]]];
-    self.view=view; [self render];
+    _clientRole = MDValue(@""); _hostRole = MDValue(@"");
+    _unbindClient = MDButton(@"Unassign", self, @selector(unbindClient:));
+    _unbindHost = MDButton(@"Unassign", self, @selector(unbindHost:));
+    _unbindClient.accessibilityLabel = @"Unassign Client"; _unbindHost.accessibilityLabel = @"Unassign Host";
+    NSStackView *clientRow = MDRow(@[_clientRole]), *hostRow = MDRow(@[_hostRole]);
+    [clientRow addView:_unbindClient inGravity:NSStackViewGravityTrailing];
+    [hostRow addView:_unbindHost inGravity:NSStackViewGravityTrailing];
+    clientRow.alignment = hostRow.alignment = NSLayoutAttributeCenterY;
+    NSGridView *roles = MDForm(@[@[@"Client", clientRow], @[@"Host", hostRow]]);
+    _status = [MDStatusView new];
+    _cancel = MDButton(@"Cancel Verification", self, @selector(cancel:));
+    NSStackView *statusRow = MDRow(@[_status, _cancel]); statusRow.alignment = NSLayoutAttributeCenterY;
+
+    _list = [MDTable new];
+    MDColumnNamed(_list, @"Label", @"Label", 170, nil);
+    MDColumnNamed(_list, @"Signer", @"Signer", 190, nil);
+    MDColumnNamed(_list, @"Fingerprint", @"Fingerprint", 175, nil);
+    MDColumnNamed(_list, @"Role", @"Role", 90, nil);
+    MDFinishColumns(_list, @"Label");
+    _list.dataSource = self; _list.delegate = self; _list.accessibilityLabel = @"Signer accounts";
+    _list.allowsEmptySelection = YES;
+    NSView *empty = nil; NSTextField *title = nil, *detail = nil;
+    NSView *area = MDTableArea(MDTableScroll(_list), &empty, &title, &detail);
+    _empty = empty; _emptyTitle = title; _emptyDetail = detail;
+    _add = MDSymbolButton(@"plus", @"Add Signer Account…", self, @selector(add:));
+    _remove = MDSymbolButton(@"minus", @"Remove Account…", self, @selector(remove:));
+    _label = MDButton(@"Edit Label…", self, @selector(editLabel:));
+    _pair = MDButton(@"Import Pairing…", self, @selector(importPairing:));
+    _pair.toolTip = @"Restore a saved NIP-46 pairing for the selected remote signer account";
+    NSStackView *plusMinus = MDRow(@[_add, _remove]); plusMinus.spacing = 0; plusMinus.alignment = NSLayoutAttributeCenterY;
+    NSStackView *listActions = MDRow(@[plusMinus, _label, _pair]); listActions.alignment = NSLayoutAttributeCenterY;
+    [listActions setCustomSpacing:12 afterView:plusMinus];
+    _details = MDValue(@""); _details.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+    _details.accessibilityLabel = @"Selected account public key";
+    _client = MDButton(@"Use for Client", self, @selector(bindClient:));
+    _host = MDButton(@"Use for Host", self, @selector(bindHost:));
+    _fips = [NSButton checkboxWithTitle:@"Check the local FIPS node key when assigning the host" target:nil action:NULL];
+    _fips.state = NSControlStateValueOn;
+    _fips.toolTip = @"Turn off only if the host will be reached by direct IP rather than FIPS.";
+    NSStackView *assign = MDRow(@[_client, _host]); assign.alignment = NSLayoutAttributeCenterY;
+    NSGridView *selected = MDForm(@[@[@"Public key", _details], @[@"Assign", assign], @[NSNull.null, _fips]]);
+    NSStackView *stack = nil;
+    self.view = MDPage(@[MDHeader(@"Roles"), roles, statusRow, MDSeparator(), MDHeader(@"Signer Accounts"), area, listActions,
+                         selected, MDNote(@"Create keys, unlock and approve requests in your external signer; Metadesk has no password. "
+                                          @"Restart a running host after changing its role.")], &stack);
+    MDAlignForms(@[roles, selected]);
+    [stack setCustomSpacing:MDGroupSpacing afterView:statusRow];
+    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[3]];
+    [stack setCustomSpacing:6 afterView:area];
+    [stack setCustomSpacing:MDGroupSpacing afterView:listActions];
+    [stack setCustomSpacing:MDGroupSpacing afterView:selected];
+    [_status setText:@"Load saved signer accounts." kind:MDStatusInfo];
+    [self render];
 }
 - (void)activate { if (!_accounts && !_busy) [self refresh:nil]; }
-- (NSDictionary *)selected { return _list.selectedItem.representedObject; }
+- (NSDictionary *)selected {
+    NSInteger row = _list.selectedRow;
+    return row >= 0 && (NSUInteger)row < _accounts.count ? _accounts[(NSUInteger)row] : nil;
+}
+static NSString *AccountTitle(NSDictionary *a) { return [a[@"label"] length] ? a[@"label"] : MDHostFingerprint(a[@"key"]); }
+static NSString *SignerTitle(NSDictionary *a) {
+    MdSignerType backend = [a[@"backend"] intValue];
+    return backend == MD_SIGNER_NIP5F || backend == MD_SIGNER_NIP46 || backend == MD_SIGNER_NIP55L ? BackendTitle(backend) : a[@"transport"];
+}
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)table { (void)table; return (NSInteger)_accounts.count; }
+- (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    NSDictionary *a = _accounts[(NSUInteger)row];
+    NSString *identifier = column.identifier;
+    if ([identifier isEqual:@"Label"]) {
+        NSTableCellView *cell = MDCell(table, @"LabelCell", [a[@"label"] length] ? a[@"label"] : @"No label");
+        cell.textField.textColor = [a[@"label"] length] ? NSColor.labelColor : NSColor.secondaryLabelColor;
+        return cell;
+    }
+    if ([identifier isEqual:@"Signer"]) return MDCell(table, @"SignerCell", SignerTitle(a));
+    if ([identifier isEqual:@"Fingerprint"]) {
+        NSTableCellView *cell = MDCell(table, @"FingerprintCell", MDHostFingerprint(a[@"key"]));
+        cell.textField.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+        cell.textField.toolTip = MDHostNpub(a[@"key"]);
+        return cell;
+    }
+    NSMutableArray *roles = [NSMutableArray array];
+    if ([a[@"client"] boolValue]) [roles addObject:@"Client"];
+    if ([a[@"host"] boolValue]) [roles addObject:@"Host"];
+    NSTableCellView *cell = MDCell(table, @"RoleCell", roles.count ? [roles componentsJoinedByString:@", "] : @"—");
+    cell.textField.textColor = roles.count ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    return cell;
+}
+- (NSString *)tableView:(NSTableView *)table typeSelectStringForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    (void)table; (void)column; return AccountTitle(_accounts[(NSUInteger)row]);
+}
+- (void)tableViewSelectionDidChange:(NSNotification *)note { (void)note; [self selection:nil]; }
 - (NSDictionary *)accountInRole:(MdAccountRole)role {
     NSString *field=role==MD_ACCOUNT_CLIENT?@"client":@"host";
     for (NSDictionary *a in _accounts) if ([a[field] boolValue]) return a;
     return nil;
 }
 - (void)render {
-    NSString *selected=self.selected[@"id"];
-    [_list removeAllItems];
-    for (NSDictionary *a in _accounts) {
-        NSString *title =[NSString stringWithFormat:@"%@ · %@", [a[@"label"] length]?a[@"label"]:MDHostFingerprint(a[@"key"]),a[@"transport"]];
-        NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:NULL keyEquivalent:@""]; item.representedObject=a;
-        [_list.menu addItem:item]; if ([selected isEqual:a[@"id"]]) [_list selectItem:item];
-    }
-    if (!_list.numberOfItems) [_list addItemWithTitle:@"No saved accounts"];
-    _roles.stringValue=[NSString stringWithFormat:@"Client: %@\nHost: %@",MDHostNpub([self accountInRole:MD_ACCOUNT_CLIENT][@"key"])?:@"Not assigned",
-        MDHostNpub([self accountInRole:MD_ACCOUNT_HOST][@"key"])?:@"Not assigned"];
+    NSString *selected=self.selected[@"id"] ?: _selectedID;
+    [_list reloadData];
+    NSUInteger index = NSNotFound;
+    for (NSUInteger i = 0; i < _accounts.count; ++i) if ([_accounts[i][@"id"] isEqual:selected]) { index = i; break; }
+    if (index == NSNotFound && _accounts.count) index = 0;
+    if (index != NSNotFound) [_list selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
+    else [_list deselectAll:nil];
+    _empty.hidden = _accounts.count != 0;
+    _emptyTitle.stringValue = _accounts ? @"No Signer Accounts" : @"Accounts Not Loaded";
+    _emptyDetail.stringValue = _accounts ? @"Choose + to add the public key of an account in your external signer." : @"Choose View > Refresh to load saved accounts.";
+    NSDictionary *client = [self accountInRole:MD_ACCOUNT_CLIENT], *host = [self accountInRole:MD_ACCOUNT_HOST];
+    _clientRole.stringValue = client ? [NSString stringWithFormat:@"%@ — %@", AccountTitle(client), MDHostNpub(client[@"key"])] : @"Not assigned";
+    _hostRole.stringValue = host ? [NSString stringWithFormat:@"%@ — %@", AccountTitle(host), MDHostNpub(host[@"key"])] : @"Not assigned";
+    _clientRole.toolTip = client ? MDHostNpub(client[@"key"]) : nil; _hostRole.toolTip = host ? MDHostNpub(host[@"key"]) : nil;
+    _clientRole.textColor = client ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    _hostRole.textColor = host ? NSColor.labelColor : NSColor.secondaryLabelColor;
     [self selection:nil];
 }
 - (void)selection:(id)sender {
     (void)sender;
     NSDictionary *a=self.selected;
-    _details.stringValue=a?[NSString stringWithFormat:@"%@\nFingerprint: %@\n%@",MDHostNpub(a[@"key"]),MDHostFingerprint(a[@"key"]),a[@"transport"]]:@"";
+    if (a) _selectedID = a[@"id"];
+    _details.stringValue = a ? MDHostNpub(a[@"key"]) ?: @"" : @"Select an account.";
+    _details.toolTip = a ? MDHostNpub(a[@"key"]) : nil;
+    _details.textColor = a ? NSColor.labelColor : NSColor.secondaryLabelColor;
     BOOL ready=!_closed && !_busy;
     MdSignerType backend = [a[@"backend"] intValue];
     BOOL bindable=a && MDIdentitySupportsBackend(backend);
@@ -115,7 +203,9 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         any |= MDIdentitySupportsBackend(ExternalBackends[i]);
     _add.enabled=ready && any; _label.enabled=ready && a;
     _pair.enabled=ready && bindable && backend==MD_SIGNER_NIP46;
-    _refresh.enabled=ready; _client.enabled=_host.enabled=ready && bindable;
+    _pair.hidden=!a || backend!=MD_SIGNER_NIP46;
+    _client.enabled=_host.enabled=ready && bindable;
+    _list.enabled=ready;
     _unbindClient.enabled=ready && [self accountInRole:MD_ACCOUNT_CLIENT]!=nil;
     _unbindHost.enabled=ready && [self accountInRole:MD_ACCOUNT_HOST]!=nil;
     _fips.enabled=ready; _remove.enabled=ready && a;
@@ -124,7 +214,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
 - (void)run:(NSString *)notice suspend:(BOOL)suspend cancellable:(BOOL)cancellable work:(NSString *(^)(void))work {
     if (_closed || _busy) return;
     atomic_store(&_cancelled,false); _busy=YES; _cancellable=cancellable;
-    _status.stringValue=notice; [self selection:nil];
+    [_status setText:notice kind:MDStatusWorking]; [self selection:nil];
     dispatch_group_enter(_drain);
     dispatch_block_t begin=^{
         dispatch_async(self->_queue, ^{ @autoreleasepool {
@@ -134,7 +224,8 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!self->_closed) {
                     self->_accounts=accounts; self->_busy=NO;
-                    self->_status.stringValue=result.length ? result : readError ?: @"Saved accounts loaded.";
+                    BOOL failed = readError.length || (result.length && !success(result));
+                    [self->_status setText:result.length ? result : readError ?: @"Saved accounts loaded." kind:failed ? MDStatusError : MDStatusOK];
                     [self render];
                     if (suspend) [self->_hosts resumeAfterRoleEdit];
                 }
@@ -161,14 +252,14 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         MdCredentialStore *store=self->_credentials();
         NSString *error=MDIdentityBind(self->_directory,store,role,a,expected,fips,self->_connectSigner,NULL,Cancelled,(__bridge void *)self);
         md_credential_store_destroy(store);
-        return error.length ? error : role==MD_ACCOUNT_HOST ? @"Host role saved. Restart the host to adopt it." : @"Client role saved. Reloading Hosts.";
+        return error.length ? error : role==MD_ACCOUNT_HOST ? HostSaved : ClientSaved;
     }];
 }
 - (void)bindClient:(id)sender { (void)sender; if (_client.enabled) [self bind:MD_ACCOUNT_CLIENT account:self.selected]; }
 - (void)bindHost:(id)sender { (void)sender; if (_host.enabled) [self bind:MD_ACCOUNT_HOST account:self.selected]; }
 - (void)unbindClient:(id)sender { (void)sender; [self bind:MD_ACCOUNT_CLIENT account:nil]; }
 - (void)unbindHost:(id)sender { (void)sender; [self bind:MD_ACCOUNT_HOST account:nil]; }
-- (void)cancel:(id)sender { (void)sender; atomic_store(&_cancelled,true); _status.stringValue=@"Cancelling verification. Waiting for the signer operation to drain…"; [self selection:nil]; }
+- (void)cancel:(id)sender { (void)sender; atomic_store(&_cancelled,true); [_status setText:@"Cancelling verification. Waiting for the signer to finish…" kind:MDStatusWorking]; [self selection:nil]; }
 - (NSWindow *)sheetWindow {
     NSWindow *window = self.view.window;
     return !_busy && !_closed && !window.attachedSheet ? window : nil;
@@ -199,7 +290,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         MdSignerType type = (MdSignerType)backend.selectedTag;
         [self run:@"Adding account…" suspend:NO cancellable:NO work:^NSString *{
             NSString *error = MDIdentityAdd(self->_directory,type,publicKey,publicLabel);
-            return error.length ? error : @"Public account added. Select it to assign a role.";
+            return error.length ? error : AccountAdded;
         }];
     }];
 }
@@ -220,7 +311,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
         if (result!=NSAlertFirstButtonReturn || self->_closed) return;
         [self run:@"Saving public label…" suspend:NO cancellable:NO work:^NSString *{
             NSString *error = MDIdentityLabel(self->_directory,account,value);
-            return error.length ? error : @"Public label saved.";
+            return error.length ? error : LabelSaved;
         }];
     }];
 }
@@ -249,7 +340,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
                 MdCredentialStore *store=self->_credentials();
                 NSString *error=MDIdentityImportPairingFile(self->_directory,store,account,url,Cancelled,(__bridge void *)self);
                 md_credential_store_destroy(store);
-                return error.length ? error : @"Pairing saved in Keychain. Verify the signer before assigning a role.";
+                return error.length ? error : PairingSaved;
             }];
         }];
     }];
@@ -266,7 +357,7 @@ static BOOL Cancelled(void *context) { return [(__bridge MDIdentityPage *)contex
             MdCredentialStore *store=self->_credentials();
             NSString *error=MDIdentityRemove(self->_directory,store,account);
             md_credential_store_destroy(store);
-            return error.length ? error : @"Account removed. Restart a running host if it used this role.";
+            return error.length ? error : AccountRemoved;
         }];
     }];
 }
