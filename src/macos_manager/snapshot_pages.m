@@ -421,6 +421,7 @@ static void Pages(NSString *accounts, NSAppearanceName appearance, NSString *mod
             if ([section isEqual:@"Hosts"]) {
                 NSTableView *t = HostsTable(s.hosts.view);
                 if (t.numberOfRows) [t selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+                if (getenv("MD_SNAPSHOT_DEBUG")) for (NSTableColumn *c in t.tableColumns) fprintf(stderr, "col %s w=%.0f min=%.0f mask=%lu\n", c.identifier.UTF8String, c.width, c.minWidth, (unsigned long)c.resizingMask);
                 Spin();
             }
             Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-%@-%@", Slug(section), names[z], mode]);

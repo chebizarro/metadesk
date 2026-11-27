@@ -82,7 +82,20 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
 }
 @end
 
-@interface MDHostsPage () <NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate> {
+@interface MDHostTable : MDTable
+@end
+@implementation MDHostTable
+/* Return opens the selected host's review, like a double-click. */
+- (void)keyDown:(NSEvent *)event {
+    if ([event.charactersIgnoringModifiers isEqual:@"\r"] && self.selectedRow >= 0 && self.doubleAction) {
+        [NSApp sendAction:self.doubleAction to:self.target from:self];
+        return;
+    }
+    [super keyDown:event];
+}
+@end
+
+@interface MDHostsPage () <NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate> {
     dispatch_queue_t _queue;
     MDHostsWorker *_worker;
     MDHostsBook *_book;
@@ -91,13 +104,18 @@ static NSScrollView *TableScroll(NSTableView *table, CGFloat width, CGFloat heig
     BOOL _busy, _launched, _started, _roleEditing, _syncPaused;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
-    NSString *_lastOwner, *_savedBootstrap;
+    NSString *_lastOwner, *_savedBootstrap, *_relayDraft, *_directoryDraft, *_query, *_diagnosticText;
     NSArray<NSString *> *_lastOwnerHosts;
-    NSTextField *_address, *_route, *_relays, *_search, *_directory;
-    NSTextField *_status, *_error, *_progress, *_diagnostic, *_rotation, *_detail;
-    NSPopUpButton *_tags, *_issues;
+    NSTextField *_address, *_route;
+    MDStatusView *_message, *_connection, *_rotation, *_sync, *_issueStatus;
+    NSTextField *_detailKey, *_detailFingerprint, *_detailNotes, *_emptyTitle, *_emptyDetail;
+    NSGridView *_details;
+    NSView *_empty;
+    NSSegmentedControl *_scope;
+    NSPopUpButton *_tags, *_issues, *_actions;
+    NSStackView *_connectionRow, *_issueRow;
     NSTableView *_table;
-    NSButton *_refresh, *_review, *_scan, *_saved, *_edit, *_quick, *_import, *_export, *_issue, *_control, *_copyKey;
+    NSButton *_review, *_scan, *_saved, *_edit, *_copyKey, *_control, *_issue, *_relaysButton;
     MdLaunchMessage _phase;
 }
 - (BOOL)closing;
@@ -111,63 +129,122 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     return self;
 }
 - (BOOL)closing { return atomic_load(&_closing); }
+- (NSTableView *)hostTable {
+    MDHostTable *table = [MDHostTable new];
+    NSTableColumn *star = MDColumnNamed(table, @"Favorite", @"", 22, nil);
+    star.resizingMask = NSTableColumnNoResizing; star.minWidth = star.maxWidth = 22;
+    star.headerToolTip = @"Favorite";
+    star.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:@"favorite" ascending:NO];
+    MDColumnNamed(table, @"Name", @"Name", 180, @"title").minWidth = 120;
+    MDColumnNamed(table, @"Alias", @"NIP-05", 140, @"alias");
+    MDColumnNamed(table, @"Tags", @"Tags", 100, @"tagText");
+    NSTableColumn *last = MDColumnNamed(table, @"Last", @"Last Connected", 120, nil);
+    last.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:@"lastConnected" ascending:NO];
+    MDFinishColumns(table, @"Name");
+    table.dataSource = self; table.delegate = self;
+    table.target = self; table.doubleAction = @selector(reviewSaved:);
+    table.accessibilityLabel = @"Saved hosts";
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Host"];
+    [menu addItemWithTitle:@"Connect…" action:@selector(reviewSaved:) keyEquivalent:@""].target = self;
+    [menu addItemWithTitle:@"Edit…" action:@selector(edit:) keyEquivalent:@""].target = self;
+    [menu addItem:NSMenuItem.separatorItem];
+    [menu addItemWithTitle:@"Copy Public Key" action:@selector(copyPublicKey:) keyEquivalent:@""].target = self;
+    menu.delegate = self;
+    table.menu = menu;
+    return table;
+}
 - (void)loadView {
     atomic_init(&_closing, false); atomic_init(&_dirty, false); atomic_init(&_wakeQueued, false);
     _queue = dispatch_queue_create("metadesk.macos-manager.hosts", DISPATCH_QUEUE_SERIAL);
     __weak MDHostsPage *weakSelf = self;
     if (!_worker) _worker = [[MDHostsWorker alloc] initWithChange:^{ [weakSelf signalChanged]; }];
-    _address = Field(@"Host npub, nprofile, public key or NIP-05 name", nil); _address.delegate = self;
-    _route = Field(@"Optional IPv4 or IPv6 route for the host key", nil); _route.delegate = self;
-    _relays = Field(@"Bootstrap relays (space-separated; ws:// is unencrypted)", nil);
-    _directory = Field(@"Private state directory (empty uses default)", nil);
-    _search = Field(@"Filter saved hosts", nil); _search.delegate = self;
-    _status = Label(@"Opening the address book…"); _error = Label(nil); _progress = Label(nil);
-    _diagnostic = Label(nil); _rotation = Label(nil); _detail = Label(nil);
+    _relayDraft = @""; _directoryDraft = @""; _query = @"";
+
+    /* Connect: an aligned form with its actions in a trailing column. */
+    _address = MDKeyField(@"Host npub, nprofile, public key or NIP-05 name", @"Host");
+    _address.delegate = self; _address.target = self; _address.action = @selector(reviewEntry:);
+    _route = MDKeyField(@"Optional IPv4 or IPv6 address", @"Route hint");
+    _route.delegate = self;
+    _review = MDButton(@"Review and Connect…", self, @selector(reviewEntry:));
+    _scan = MDButton(@"Scan QR Code…", self, @selector(scanQR:));
+    NSGridView *connect = [NSGridView gridViewWithViews:@[@[MDFormLabel(@"Host"), _address, _review],
+                                                          @[MDFormLabel(@"Route hint"), _route, _scan]]];
+    connect.columnSpacing = MDItemSpacing; connect.rowSpacing = MDRowSpacing;
+    connect.rowAlignment = NSGridRowAlignmentFirstBaseline;
+    [connect columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+    [connect columnAtIndex:2].xPlacement = NSGridCellPlacementFill;
+    _message = [MDStatusView new];
+    _connection = [MDStatusView new];
+    _control = MDButton(@"Cancel Connection", self, @selector(control:));
+    _connectionRow = MDRow(@[_connection, _control]); _connectionRow.alignment = NSLayoutAttributeCenterY;
+    _connectionRow.hidden = YES;
+    _rotation = [MDStatusView new];
+
+    /* Saved hosts: header with scope, tag filter and an action menu. */
+    _scope = [NSSegmentedControl segmentedControlWithLabels:@[@"All Hosts", @"Quick Connect"]
+        trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(filter:)];
+    _scope.selectedSegment = 0; _scope.accessibilityLabel = @"Show";
+    [_scope setToolTip:@"Favorites first, then hosts you tried recently on this Mac" forSegment:1];
     _tags = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [_tags addItemWithTitle:@"All Tags"]; _tags.target = self; _tags.action = @selector(filter:);
-    [_tags setAccessibilityLabel:@"Filter by tag"];
+    _tags.accessibilityLabel = @"Filter by tag";
+    _actions = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
+    _actions.bezelStyle = NSBezelStyleRegularSquare; _actions.bordered = YES;
+    [_actions addItemWithTitle:@""];
+    _actions.itemArray[0].image = [NSImage imageWithSystemSymbolName:@"ellipsis.circle" accessibilityDescription:@"More Actions"];
+    for (NSArray *a in @[@[@"Import Hosts…", NSStringFromSelector(@selector(importHosts:))],
+                         @[@"Export Hosts…", NSStringFromSelector(@selector(exportHosts:))], @[@"-", @""],
+                         @[@"Address Book Relays…", NSStringFromSelector(@selector(editRelays:))]]) {
+        if ([a[0] isEqual:@"-"]) { [_actions.menu addItem:NSMenuItem.separatorItem]; continue; }
+        NSMenuItem *item = [_actions.menu addItemWithTitle:a[0] action:NSSelectorFromString(a[1]) keyEquivalent:@""];
+        item.target = self;
+    }
+    _actions.accessibilityLabel = @"More actions"; _actions.toolTip = @"Import, export and relay settings";
+    NSStackView *header = MDRow(@[MDHeader(@"Saved Hosts")]);
+    header.alignment = NSLayoutAttributeCenterY;
+    for (NSView *v in @[_scope, _tags, _actions]) [header addView:v inGravity:NSStackViewGravityTrailing];
+    _sync = [MDStatusView new];
+    _relaysButton = MDButton(@"Relays…", self, @selector(editRelays:));
+    _relaysButton.controlSize = NSControlSizeSmall; _relaysButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    NSStackView *syncRow = MDRow(@[_sync]); syncRow.alignment = NSLayoutAttributeCenterY;
+    [syncRow addView:_relaysButton inGravity:NSStackViewGravityTrailing];
+    [_sync setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _issueStatus = [MDStatusView new];
     _issues = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _issues.target = self; _issues.action = @selector(issueSelection:);
-    [_issues setAccessibilityLabel:@"Address book issues"];
-    _refresh = Button(@"Save Relays and Refresh Address Book", self, @selector(refresh:));
-    _review = Button(@"Review and Connect…", self, @selector(reviewEntry:));
-    _scan = Button(@"Scan QR Image…", self, @selector(scanQR:));
-    _saved = Button(@"Review Saved Host…", self, @selector(reviewSaved:));
-    _edit = Button(@"Edit Saved Host…", self, @selector(edit:));
-    _copyKey = Button(@"Copy Public Key", self, @selector(copyPublicKey:));
-    _quick = [NSButton checkboxWithTitle:@"Quick Connect (favorites, then recent attempts)" target:self action:@selector(filter:)];
-    _import = Button(@"Import…", self, @selector(importHosts:));
-    _export = Button(@"Export…", self, @selector(exportHosts:));
-    _issue = Button(@"Review Issue…", self, @selector(handleIssue:));
-    _control = Button(@"Cancel Connection", self, @selector(control:)); _control.hidden = YES;
-    _address.target = self; _address.action = @selector(reviewEntry:);
-    _table = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, 600, 170)];
-    NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"Host"];
-    col.width = 600; [_table addTableColumn:col];
-    _table.headerView = nil; _table.rowHeight = 26; _table.dataSource = self; _table.delegate = self;
-    _table.target = self; _table.doubleAction = @selector(reviewSaved:);
-    [_table setAccessibilityLabel:@"Saved hosts"];
-    NSScrollView *list = TableScroll(_table, 600, 170);
-    NSStackView *form = Stack(@[], NSUserInterfaceLayoutOrientationVertical);
-    form.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
-    for (NSView *v in @[_status, _rotation, _error, _relays, _directory]) Wide(form, v);
-    [form addArrangedSubview:_refresh];
-    Wide(form, _address); Wide(form, _route);
-    [form addArrangedSubview:Stack(@[_review, _scan, _control], NSUserInterfaceLayoutOrientationHorizontal)];
-    Wide(form, _progress); Wide(form, _diagnostic);
-    Wide(form, _search);
-    [form addArrangedSubview:Stack(@[_tags, _quick], NSUserInterfaceLayoutOrientationHorizontal)];
-    Wide(form, list); Wide(form, _detail);
-    [form addArrangedSubview:Stack(@[_saved, _edit, _copyKey], NSUserInterfaceLayoutOrientationHorizontal)];
-    [form addArrangedSubview:Stack(@[_import, _export], NSUserInterfaceLayoutOrientationHorizontal)];
-    [form addArrangedSubview:_issues]; [form addArrangedSubview:_issue];
+    _issues.accessibilityLabel = @"Address book issues";
+    [_issues setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _issue = MDButton(@"Review Conflict…", self, @selector(handleIssue:));
+    _issueRow = MDRow(@[_issueStatus, _issues, _issue]); _issueRow.alignment = NSLayoutAttributeCenterY;
+    _issueRow.hidden = YES;
 
-    NSScrollView *scroll = [NSScrollView new];
-    scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES;
-    scroll.documentView = form;
-    form.translatesAutoresizingMaskIntoConstraints = NO;
-    [form.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor].active = YES;
-    self.view = scroll;
+    _table = [self hostTable];
+    NSTextField *emptyTitle = nil, *emptyDetail = nil; NSView *empty = nil;
+    NSView *list = MDTableArea(MDTableScroll(_table), &empty, &emptyTitle, &emptyDetail);
+    _empty = empty; _emptyTitle = emptyTitle; _emptyDetail = emptyDetail;
+
+    _detailKey = MDValue(@""); _detailKey.font = [NSFont monospacedSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+    _detailFingerprint = MDValue(@""); _detailFingerprint.font = _detailKey.font;
+    _detailNotes = MDValue(@""); _detailNotes.lineBreakMode = NSLineBreakByTruncatingTail;
+    _detailKey.accessibilityLabel = @"Public key"; _detailFingerprint.accessibilityLabel = @"Fingerprint"; _detailNotes.accessibilityLabel = @"Notes";
+    _details = MDForm(@[@[@"Public key", _detailKey], @[@"Fingerprint", _detailFingerprint], @[@"Notes", _detailNotes]]);
+    _details.rowSpacing = 4;
+    _saved = MDButton(@"Connect…", self, @selector(reviewSaved:));
+    _edit = MDButton(@"Edit…", self, @selector(edit:));
+    _copyKey = MDButton(@"Copy Public Key", self, @selector(copyPublicKey:));
+    _saved.toolTip = @"Review the selected host, then connect";
+    NSStackView *hostActions = MDRow(@[_copyKey, _edit]); hostActions.alignment = NSLayoutAttributeCenterY;
+    [hostActions addView:_saved inGravity:NSStackViewGravityTrailing];
+
+    NSStackView *stack = nil;
+    NSView *page = MDPage(@[connect, _message, _connectionRow, _rotation, MDSeparator(), header, syncRow, _issueRow,
+                            list, _details, hostActions], &stack);
+    [stack setCustomSpacing:MDGroupSpacing afterView:_rotation];
+    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[4]];
+    [stack setCustomSpacing:6 afterView:header];
+    [stack setCustomSpacing:12 afterView:list];
+    stack.detachesHiddenViews = YES;
+    self.view = page;
     [self render];
 }
 - (void)activate {
@@ -176,8 +253,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
     _roleEditing = YES; ++_generation; _book = nil; [self render];
     if (_launch && _phase < MD_LAUNCH_CONNECTED) {
-        [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO; _control.hidden=YES;
-        _progress.stringValue=@"Unfinished connection cancelled before changing the client role.";
+        [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO;
+        [self showConnection:@"Unfinished connection cancelled before changing the client role." kind:MDStatusInfo];
     }
     dispatch_async(_queue, ^{ @autoreleasepool {
         [self->_worker close];
@@ -240,8 +317,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)showBook:(MDHostsBook *)book {
     if (_lastOwner && book.owner && ![_lastOwner isEqual:book.owner]) {
         NSString *hosts = _lastOwnerHosts.count ? [@" Previous hosts: " stringByAppendingString:[_lastOwnerHosts componentsJoinedByString:@", "]] : @"";
-        _rotation.stringValue = [@"Client key changed. Previous grants still name the old key. Re-request access and ask host admins to remove the old grant." stringByAppendingString:hosts];
-        if (_launch && _phase < MD_LAUNCH_CONNECTED) { [_launch close:nil]; _launch = nil; ++_launchGeneration; _launched = NO; _control.hidden = YES; _progress.stringValue = @"Connection cancelled because the client role changed."; }
+        [_rotation setText:[@"Your client key changed. Hosts that granted access to the old key don’t know the new one: request access again, and ask each host’s admin to remove the old grant." stringByAppendingString:hosts] kind:MDStatusWarning];
+        if (_launch && _phase < MD_LAUNCH_CONNECTED) {
+            [_launch close:nil]; _launch = nil; ++_launchGeneration; _launched = NO;
+            [self showConnection:@"Connection cancelled because the client role changed." kind:MDStatusInfo];
+        }
     }
     if (book.owner && !book.unavailable) {
         _lastOwner = book.owner;
@@ -252,79 +332,166 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _book = book;
     [self render];
 }
+/* Feedback for the last action: what happened, or what to do next. */
+- (void)note:(NSString *)text kind:(MDStatusKind)kind { [_message setText:text kind:text.length ? kind : MDStatusNone]; }
+- (void)noteResult:(NSString *)error success:(NSString *)success {
+    if (error.length) [self note:error kind:MDStatusError]; else [self note:success kind:MDStatusOK];
+}
+- (void)showConnection:(NSString *)text kind:(MDStatusKind)kind {
+    NSString *line = _diagnosticText.length && kind != MDStatusOK ? [NSString stringWithFormat:@"%@ %@", text ?: @"", _diagnosticText] : text;
+    [_connection setText:line kind:kind];
+    _connectionRow.hidden = !text.length;
+    _control.hidden = !_launched;
+}
+- (MDStatusKind)syncKind {
+    if (_roleEditing) return MDStatusWorking;
+    if (!_book || _book.unavailable) return _book ? MDStatusError : MDStatusWorking;
+    NSString *status = _book.status;
+    if ([status isEqual:@"Address book synced."]) return _syncPaused && _savedBootstrap.length ? MDStatusWarning : MDStatusOK;
+    if ([status hasSuffix:@"…"]) return MDStatusWorking;
+    return MDStatusWarning;
+}
 - (void)render {
-    _status.stringValue = _book.status ?: @"Opening the address book…";
-    _refresh.enabled = !_roleEditing && !_busy && !self.closing;
-    _relays.enabled = _refresh.enabled;
+    NSString *status = _book.status ?: @"Opening the address book…";
     if (_syncPaused && _savedBootstrap.length)
-        _status.stringValue = [_status.stringValue stringByAppendingString:@"\nRelay sync is paused. Select Save Relays and Refresh Address Book to resume."];
-    if (_roleEditing) _status.stringValue=@"Reloading the client role…";
+        status = [status stringByAppendingString:@" Relay sync is paused. Choose View > Refresh to resume."];
+    if (_roleEditing) status = @"Reloading the client role…";
+    [_sync setText:status kind:[self syncKind]];
+    _relaysButton.enabled = !_roleEditing && !_busy && !self.closing;
     _review.enabled = !_busy && !_launched && _book.canReview;
     _scan.enabled = _review.enabled;
-    _import.enabled = !_busy && _book.canEdit;
-    _export.enabled = !_busy && _book.canExport;
+    _address.enabled = _route.enabled = !_roleEditing && !self.closing;
     NSString *tag = _tags.selectedItem.representedObject;
     [_tags removeAllItems]; [_tags addItemWithTitle:@"All Tags"];
+    if (_book.tags.count) [_tags.menu addItem:NSMenuItem.separatorItem];
     for (NSDictionary *entry in _book.tags) {
         NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:entry[@"label"] action:NULL keyEquivalent:@""];
         item.representedObject = entry[@"id"]; [_tags.menu addItem:item];
         if ([tag isEqual:entry[@"id"]]) [_tags selectItem:item];
     }
+    _tags.enabled = _book.tags.count != 0 && _scope.selectedSegment == 0;
     NSString *issue = _issues.selectedItem.representedObject;
     [_issues removeAllItems];
     for (NSDictionary *entry in _book.issues) {
         NSString *coord = entry[@"coordinate"];
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@ — %@", coord, entry[@"message"]] action:NULL keyEquivalent:@""];
+        NSString *collection = [coord componentsSeparatedByString:@":"].lastObject ?: @"";
+        NSString *title = [NSString stringWithFormat:@"%@ (%@)", MDHostBoundText(entry[@"message"], 160), MDHostBoundText(collection, 64)];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:NULL keyEquivalent:@""];
         item.representedObject = coord; [_issues.menu addItem:item];
         if ([issue isEqual:coord]) [_issues selectItem:item];
     }
-    _issues.hidden = _issue.hidden = !_book.issues.count;
+    NSUInteger issues = _book.issues.count;
+    _issueRow.hidden = !issues;
+    [_issueStatus setText:issues == 1 ? @"1 sync issue:" : [NSString stringWithFormat:@"%lu sync issues:", (unsigned long)issues] kind:MDStatusWarning];
     [self issueSelection:nil];
     [self filter:nil];
 }
 - (NSDictionary *)selected { NSInteger index = _table.selectedRow; return index >= 0 && (NSUInteger)index < _rows.count ? _rows[index] : nil; }
+- (NSArray<NSDictionary *> *)sorted:(NSArray<NSDictionary *> *)rows {
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:rows.count];
+    for (NSDictionary *row in rows) {
+        NSMutableDictionary *r = [row mutableCopy];
+        r[@"tagText"] = [row[@"tags"] componentsJoinedByString:@", "] ?: @"";
+        [out addObject:r];
+    }
+    /* Quick Connect keeps the model's order: favorites, then recent attempts. */
+    if (_scope.selectedSegment == 0 && _table.sortDescriptors.count) [out sortUsingDescriptors:_table.sortDescriptors];
+    return out;
+}
 - (void)filter:(id)sender {
     (void)sender;
     NSString *selection = self.selected[@"key"];
-    _rows = _quick.state == NSControlStateValueOn ? _book.quick : [_book rowsMatching:_search.stringValue tag:_tags.selectedItem.representedObject];
+    BOOL quick = _scope.selectedSegment == 1;
+    _tags.enabled = !quick && _book.tags.count != 0;
+    _rows = [self sorted:quick ? _book.quick : [_book rowsMatching:_query ?: @"" tag:_tags.selectedItem.representedObject]];
     [_table reloadData]; [_table deselectAll:nil];
     NSUInteger index = selection ? [[_rows valueForKey:@"key"] indexOfObject:selection] : NSNotFound;
     if (index != NSNotFound) [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
+    [self updateEmptyState];
     [self updateSelection];
 }
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)table { (void)table; return _rows.count; }
+- (void)updateEmptyState {
+    BOOL filtered = _query.length || _tags.selectedItem.representedObject;
+    _empty.hidden = _rows.count != 0;
+    if (_rows.count) return;
+    if (!_book) { _emptyTitle.stringValue = @"Opening Address Book…"; _emptyDetail.stringValue = @""; }
+    else if (_book.unavailable) { _emptyTitle.stringValue = @"Address Book Unavailable"; _emptyDetail.stringValue = @"See the message above for what to do next."; }
+    else if (_scope.selectedSegment == 1) { _emptyTitle.stringValue = @"No Favorites or Recent Hosts"; _emptyDetail.stringValue = @"Mark a host as a favorite in Edit, or connect to one, and it appears here."; }
+    else if (filtered) { _emptyTitle.stringValue = @"No Matching Hosts"; _emptyDetail.stringValue = @"Try a different search or tag."; }
+    else { _emptyTitle.stringValue = @"No Saved Hosts"; _emptyDetail.stringValue = @"Enter a host above and choose Save Host in its review, or import a hosts file."; }
+}
+- (void)tableView:(NSTableView *)table sortDescriptorsDidChange:(NSArray<NSSortDescriptor *> *)old {
+    (void)table; (void)old;
+    if (_scope.selectedSegment == 1 && _table.sortDescriptors.count) _scope.selectedSegment = 0;
+    [self filter:nil];
+}
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)table { (void)table; return (NSInteger)_rows.count; }
 - (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    NSDictionary *r = _rows[(NSUInteger)row];
+    NSString *identifier = column.identifier;
+    if ([identifier isEqual:@"Favorite"]) {
+        NSTableCellView *cell = [table makeViewWithIdentifier:@"FavoriteCell" owner:nil];
+        if (!cell) {
+            cell = [NSTableCellView new]; cell.identifier = @"FavoriteCell";
+            NSImageView *image = [NSImageView new];
+            image.translatesAutoresizingMaskIntoConstraints = NO; image.contentTintColor = NSColor.systemYellowColor;
+            [cell addSubview:image]; cell.imageView = image;
+            [image.centerXAnchor constraintEqualToAnchor:cell.centerXAnchor].active = YES;
+            [image.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor].active = YES;
+        }
+        BOOL favorite = [r[@"favorite"] boolValue];
+        cell.imageView.image = favorite ? [NSImage imageWithSystemSymbolName:@"star.fill" accessibilityDescription:@"Favorite"] : nil;
+        cell.accessibilityLabel = favorite ? @"Favorite" : @"Not a favorite";
+        return cell;
+    }
+    if ([identifier isEqual:@"Name"]) return MDCell(table, @"NameCell", r[@"title"]);
+    if ([identifier isEqual:@"Alias"]) return MDCell(table, @"AliasCell", [r[@"alias"] length] ? r[@"alias"] : @"—");
+    if ([identifier isEqual:@"Tags"]) return MDCell(table, @"TagsCell", MDHostBoundText(r[@"tagText"], 512));
+    NSString *when = @"Never";
+    if ([r[@"lastConnected"] longLongValue] > 0) {
+        NSDate *date = [NSDate dateWithTimeIntervalSince1970:[r[@"lastConnected"] doubleValue]];
+        when = [NSDateFormatter localizedStringFromDate:date dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterShortStyle];
+    }
+    NSTableCellView *cell = MDCell(table, @"LastCell", when);
+    cell.textField.textColor = [r[@"lastConnected"] longLongValue] > 0 ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    return cell;
+}
+- (NSString *)tableView:(NSTableView *)table typeSelectStringForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
     (void)table; (void)column;
-    NSDictionary *r = _rows[row];
-    NSString *title = [r[@"favorite"] boolValue] ? [@"★  " stringByAppendingString:r[@"title"]] : r[@"title"];
-    NSTextField *view = Label(title); view.maximumNumberOfLines = 1;
-    return view;
+    return _rows[(NSUInteger)row][@"title"];
 }
 - (void)tableViewSelectionDidChange:(NSNotification *)notification {
     (void)notification;
     [self updateSelection];
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    (void)menu;
+    NSInteger clicked = _table.clickedRow;
+    if (clicked >= 0 && ![_table isRowSelected:clicked])
+        [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)clicked] byExtendingSelection:NO];
 }
 - (void)updateSelection {
     NSDictionary *row = self.selected;
     _saved.enabled = _review.enabled && row && [_book addressForKey:row[@"key"]];
     _edit.enabled = !_busy && _book.canEdit && row;
     _copyKey.enabled = row != nil;
-    if (!row) { _detail.stringValue = @""; return; }
-    NSMutableArray *lines = [NSMutableArray arrayWithObject:MDHostNpub(row[@"key"]) ?: @"Unknown public key"];
-    for (NSString *field in @[@"alias", @"notes"]) if ([row[field] length]) [lines addObject:row[field]];
-    NSArray *tags = row[@"tags"];
-    if (tags.count) [lines addObject:[@"Tags: " stringByAppendingString:MDHostBoundText([tags componentsJoinedByString:@", "], 512)]];
-    if ([row[@"lastConnected"] longLongValue] > 0) {
-        NSDate *when = [NSDate dateWithTimeIntervalSince1970:[row[@"lastConnected"] doubleValue]];
-        [lines addObject:[@"Last connected on this device: " stringByAppendingString:[NSDateFormatter localizedStringFromDate:when dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterShortStyle]]];
-    }
-    _detail.stringValue = [lines componentsJoinedByString:@"\n"];
+    _details.hidden = !row;
+    if (!row) return;
+    _detailKey.stringValue = MDHostNpub(row[@"key"]) ?: @"Unknown public key";
+    _detailKey.toolTip = _detailKey.stringValue;
+    _detailFingerprint.stringValue = MDHostFingerprint(row[@"key"]) ?: @"";
+    _detailNotes.stringValue = [row[@"notes"] length] ? row[@"notes"] : @"None";
+    _detailNotes.toolTip = [row[@"notes"] length] ? row[@"notes"] : nil;
+    _detailNotes.textColor = [row[@"notes"] length] ? NSColor.labelColor : NSColor.secondaryLabelColor;
 }
+/* Copy Public Key and Edit > Copy with a host selected put that host's npub
+ * on the pasteboard; only ever in response to the user's command. */
 - (void)copyPublicKey:(id)sender {
     (void)sender;
     NSString *npub = MDHostNpub(self.selected[@"key"]);
     if (npub) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:npub forType:NSPasteboardTypeString]; }
 }
+- (void)copy:(id)sender { [self copyPublicKey:sender]; }
 /* A secret key is cleared without being echoed, and the undo stack that held
  * the typed or pasted text is discarded so Undo cannot bring it back. */
 - (BOOL)rejectSecret:(NSTextField *)field input:(MDHostInput)input {
@@ -337,7 +504,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }
     [field.window.undoManager removeAllActions];
     field.stringValue = @"";
-    _error.stringValue = @"Private keys are not host addresses. Use a public host identity.";
+    [self note:@"Private keys are not host addresses, so the field was cleared. Enter the host’s public npub, nprofile or NIP-05 name." kind:MDStatusError];
     return YES;
 }
 - (void)controlTextDidChange:(NSNotification *)note {
@@ -346,7 +513,6 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         NSTextView *editor = (NSTextView *)field.currentEditor;
         [self rejectSecret:field input:MDClassifyHostInput(editor ? editor.string : field.stringValue)];
     }
-    if (note.object == _search) [self filter:nil];
 }
 - (void)refresh:(id)sender {
     (void)sender;
@@ -356,12 +522,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     (void)sender;
     if (_address.enabled) [self.view.window makeFirstResponder:_address];
 }
-- (void)focusSearch:(id)sender {
-    (void)sender;
-    [self.view.window makeFirstResponder:_search];
-}
+- (void)focusSearch:(id)sender { (void)sender; }
 - (void)setSearchText:(NSString *)text {
-    _search.stringValue = text ?: @"";
+    _query = text ?: @"";
     [self filter:nil];
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
@@ -369,12 +532,37 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
     SEL action = item.action;
     BOOL idle = !_busy && !_roleEditing && !self.closing;
-    if (action == @selector(refresh:)) return idle;
+    if (action == @selector(refresh:) || action == @selector(editRelays:)) return idle;
     if (action == @selector(focusHostEntry:) || action == @selector(focusSearch:)) return !self.closing;
     if (action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
     if (action == @selector(importHosts:)) return idle && _book.canEdit;
     if (action == @selector(exportHosts:)) return idle && _book.canExport;
+    if (action == @selector(copy:) || action == @selector(copyPublicKey:)) return self.selected != nil;
+    if (action == @selector(edit:)) return idle && _book.canEdit && self.selected;
+    if (action == @selector(reviewSaved:)) return _saved.enabled;
     return [self respondsToSelector:action];
+}
+- (void)editRelays:(id)sender {
+    (void)sender;
+    NSWindow *window = self.view.window;
+    if (_busy || _roleEditing || self.closing || !window || window.attachedSheet) return;
+    MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Address Book Relays"
+        message:@"Metadesk syncs your encrypted address book through these bootstrap relays. Separate several with spaces. "
+                @"Nothing is used unless you list it here; ws:// addresses are unencrypted." width:520];
+    NSTextField *relays = MDKeyField(@"wss://relay.example.com", @"Bootstrap relays");
+    relays.stringValue = _relayDraft ?: @"";
+    NSTextField *directory = MDKeyField(@"Default", @"Private state folder");
+    directory.stringValue = _directoryDraft ?: @"";
+    NSTextField *hint = MDNote(@"Leave the state folder empty unless you keep a separate private cache. International hostnames must be entered in their xn-- form.");
+    sheet.accessory = MDForm(@[@[@"Relays", relays], @[@"State folder", directory], @[NSNull.null, hint]]);
+    sheet.initialFirstResponder = relays;
+    [sheet addButton:@"Save and Sync" role:MDSheetDefault response:NSAlertFirstButtonReturn];
+    [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertSecondButtonReturn];
+    [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn || self.closing) return;
+        self->_relayDraft = relays.stringValue; self->_directoryDraft = directory.stringValue;
+        [self reloadBook:YES];
+    }];
 }
 - (void)reloadBook:(BOOL)refresh {
     [self reloadBook:refresh replaceUnreadable:NO];
@@ -382,10 +570,10 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)reloadBook:(BOOL)refresh replaceUnreadable:(BOOL)replace {
     if (_busy || _roleEditing || self.closing) return;
     NSUInteger generation = ++_generation;
-    NSString *draft = _relays.stringValue;
+    NSString *draft = _relayDraft ?: @"";
     BOOL edited = ![draft isEqual:_savedBootstrap ?: @""];
-    NSString *directory = MDHostTrim(_directory.stringValue);
-    _error.stringValue = @"";
+    NSString *directory = MDHostTrim(_directoryDraft ?: @"");
+    [self note:nil kind:MDStatusNone];
     [self run:^id(MDHostsWorker *worker) {
         NSString *configError = nil, *cacheError = nil;
         NSString *saved = MDHostsBootstrap(nil, &configError);
@@ -403,9 +591,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             cacheError = @"Could not configure address book relays. Cached data remains available.";
         return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing)];
     } done:^(NSArray *result) {
-        if (result[0] != NSNull.null) self->_relays.stringValue = self->_savedBootstrap = result[0];
+        if (result[0] != NSNull.null) self->_relayDraft = self->_savedBootstrap = result[0];
         self->_syncPaused = [result[3] boolValue];
-        self->_error.stringValue = result[1];
+        [self note:result[1] kind:MDStatusError];
         [self render];
         NSWindow *window = self.view.window;
         if (![result[2] boolValue] || !window || window.attachedSheet) return;
@@ -430,21 +618,21 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (rejected) return;
     if (fromImage) {
         address = MDHostQRProfile(address);
-        if (!address) { _error.stringValue = @"The QR code must contain an nprofile."; return; }
+        if (!address) { [self note:@"That QR code doesn’t contain a host’s public nprofile, so nothing was reviewed." kind:MDStatusError]; return; }
         input = MDHostPublic;
     }
     if (input != MDHostPublic && input != MDHostName) {
-        _error.stringValue = @"Enter an npub, nprofile, lowercase public key or NIP-05 name. An IP address is only a route hint."; return;
+        [self note:@"Enter the host’s npub, nprofile, lowercase hex public key or NIP-05 name. An IP address goes in Route hint." kind:MDStatusError]; return;
     }
     NSString *route = MDHostTrim(_route.stringValue);
-    if (!MDHostRouteValid(route)) { _error.stringValue = @"Enter an IPv4 or IPv6 route hint."; return; }
+    if (!MDHostRouteValid(route)) { [self note:@"The route hint must be an IPv4 or IPv6 address, or empty." kind:MDStatusError]; return; }
     if (fromImage) _address.stringValue = MDHostTrim(address);
     [self resolve:address route:route];
 }
 - (void)scanQR:(id)sender {
     (void)sender;
     NSWindow *window = self.view.window;
-    if (!_scan.enabled || self.closing || !window || window.attachedSheet) return;
+    if (!_scan.enabled || _busy || self.closing || !window || window.attachedSheet) return;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
@@ -456,7 +644,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [self run:^id(MDHostsWorker *worker) { (void)worker; return MDReadHostQR(url); }
              done:^(NSString *value) {
             if (generation != self->_generation) return;
-            if (!value.length) self->_error.stringValue = @"Choose a supported image containing exactly one QR code.";
+            if (!value.length) [self note:@"No single QR code was found in that image. Choose an image that contains exactly one QR code." kind:MDStatusError];
             else [self reviewInput:value fromImage:YES];
         }];
     }];
@@ -468,13 +656,13 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)resolve:(NSString *)address route:(NSString *)route {
     if (!_book.canReview || _launched) return;
-    _error.stringValue = @"Checking host identity…";
+    [self note:@"Checking the host’s identity…" kind:MDStatusWorking];
     [self run:^id(MDHostsWorker *worker) {
         NSString *error = nil;
         MDHostReview *review = [worker resolve:address route:route cancelled:IsClosing data:(__bridge void *)self error:&error];
         return review ?: (id)error;
     } done:^(id value) {
-        self->_error.stringValue = [value isKindOfClass:NSString.class] ? value : @"";
+        if ([value isKindOfClass:NSString.class]) [self note:value kind:MDStatusError]; else [self note:nil kind:MDStatusNone];
         if ([value isKindOfClass:MDHostReview.class]) [self presentReview:value];
     }];
 }
@@ -505,10 +693,10 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         if (mismatch ? response == NSAlertSecondButtonReturn && canSave : response == NSAlertThirdButtonReturn && canSave) {
             NSString *value = confirmation.stringValue;
             if (mismatch && ![self->_book canConfirmReview:review fingerprint:value]) {
-                self->_error.stringValue = @"The saved key was kept. Replacement requires the exact new fingerprint."; return;
+                [self note:@"The saved key was kept. Replacement requires the exact new fingerprint." kind:MDStatusError]; return;
             }
             [self run:^id(MDHostsWorker *worker) { return [worker saveReview:review confirmation:value]; }
-                done:^(NSString *message) { self->_error.stringValue = message.length ? message : mismatch ? @"Key replaced. Review it again to connect." : @"Host saved."; }];
+                done:^(NSString *message) { [self noteResult:message success:mismatch ? @"Key replaced. Review it again to connect." : @"Host saved."]; }];
         } else if (!mismatch && response == NSAlertSecondButtonReturn) [self startLaunch:review];
     }];
 }
@@ -519,11 +707,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         NSMutableData *config = [NSMutableData dataWithLength:sizeof(MdManagedLaunch)];
         return [worker launchConfig:config.mutableBytes review:review error:&error] ? config : (id)error;
     } done:^(id value) {
-        if (![value isKindOfClass:NSData.class]) { self->_error.stringValue = value ?: @"Connection unavailable."; return; }
+        if (![value isKindOfClass:NSData.class]) { [self note:value ?: @"Connection unavailable." kind:MDStatusError]; return; }
         NSData *data = value; const MdManagedLaunch *config = data.bytes;
-        self->_launched = YES; self->_phase = 0;
-        self->_control.title = @"Cancel Connection"; self->_control.hidden = NO;
-        self->_progress.stringValue = MDHostLaunchText(0, 0); self->_diagnostic.stringValue = @"";
+        self->_launched = YES; self->_phase = 0; self->_diagnosticText = nil;
+        self->_control.title = @"Cancel Connection";
+        [self note:nil kind:MDStatusNone];
+        [self showConnection:MDHostLaunchText(0, 0) kind:MDStatusWorking];
         NSString *owner = self->_book.owner, *key = review.key;
         __weak MDHostsPage *weakSelf = self;
         NSUInteger launchGeneration = ++self->_launchGeneration;
@@ -538,21 +727,27 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (self.closing || !_launch || generation != _launchGeneration) return;
     if (m >= MD_LAUNCH_RELAY_AUTH) {
         NSString *reason = MDHostLaunchDiagnostic(m);
-        if (reason.length) _diagnostic.stringValue = [@[ _diagnostic.stringValue, reason ] componentsJoinedByString:@" "];
+        if (reason.length) {
+            _diagnosticText = _diagnosticText.length ? [@[_diagnosticText, reason] componentsJoinedByString:@" "] : reason;
+            [self showConnection:MDHostLaunchText(_phase, _phase) kind:_connection.kind];
+        }
         return;
     }
-    _progress.stringValue = MDHostLaunchText(m, _phase);
+    NSString *phase = MDHostLaunchText(m, _phase);
     if (m == MD_LAUNCH_CONNECTED || m == MD_LAUNCH_FAILED) {
         MdRecentOutcome outcome = MDHostLaunchOutcome(m, _phase);
         dispatch_async(_queue, ^{ @autoreleasepool {
             if (!self.closing) { [self->_worker recordKey:key owner:owner outcome:outcome]; [self signalChanged]; }
         } });
     }
-    if (m == MD_LAUNCH_CONNECTED) { _control.title = @"Disconnect"; _diagnostic.stringValue = @""; }
+    MDStatusKind kind = MDStatusWorking;
+    if (m == MD_LAUNCH_CONNECTED) { _control.title = @"Disconnect"; _diagnosticText = nil; kind = MDStatusOK; }
     else if (m >= MD_LAUNCH_FAILED) {
-        _control.hidden = YES; _launched = NO; [_launch close:nil]; _launch = nil;
-        if (m != MD_LAUNCH_FAILED) _diagnostic.stringValue = @"";
+        _launched = NO; [_launch close:nil]; _launch = nil;
+        if (m != MD_LAUNCH_FAILED) _diagnosticText = nil;
+        kind = m == MD_LAUNCH_FAILED ? MDStatusError : MDStatusInfo;
     }
+    [self showConnection:phase kind:kind];
     if (m <= MD_LAUNCH_CONNECTED) _phase = m;
     [self render];
 }
@@ -590,7 +785,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             NSSet *membership = [selection keys];
             [self run:^id(MDHostsWorker *worker) {
                 return [worker editKey:key book:book label:name notes:memo favorite:fav tagIDs:membership newTag:tag remove:remove];
-            } done:^(NSString *message) { self->_error.stringValue = message.length ? message : remove ? @"Host removed." : @"Host updated."; }];
+            } done:^(NSString *message) { [self noteResult:message success:remove ? @"Host removed." : @"Host updated."]; }];
         };
         if (response == NSAlertSecondButtonReturn) edit(NO);
         else if (response == NSAlertThirdButtonReturn && self.view.window) {
@@ -622,7 +817,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (_busy || !coordinate || ![entry[@"ready"] boolValue]) return;
     if ([entry[@"retry"] boolValue]) {
         [self run:^id(MDHostsWorker *worker) { return [worker retryIssue:coordinate book:book]; }
-            done:^(NSString *message) { self->_error.stringValue = message.length ? message : @"Pending edit synchronized."; }];
+            done:^(NSString *message) { [self noteResult:message success:@"Pending edit synced."]; }];
         return;
     }
     [self run:^id(MDHostsWorker *worker) { (void)worker; return [book conflictText:coordinate]; }
@@ -643,7 +838,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
             if (self.closing || (response != NSAlertSecondButtonReturn && response != NSAlertThirdButtonReturn)) return;
             [self run:^id(MDHostsWorker *worker) { return [worker resolveIssue:coordinate book:book reapply:response == NSAlertThirdButtonReturn]; }
-                done:^(NSString *message) { self->_error.stringValue = message.length ? message : @"Conflict resolved."; }];
+                done:^(NSString *message) { [self noteResult:message success:@"Conflict resolved."]; }];
         }];
     }];
 }
@@ -659,7 +854,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         NSURL *url = panel.URL;
         [self run:^id(MDHostsWorker *worker) { return [worker readImport:url book:book]; }
             done:^(NSArray *rows) {
-            if (!rows.count) { self->_error.stringValue = rows ? @"No new host keys in the file." : @"Not a supported metadesk-hosts/1 file, or the file could not be read."; return; }
+            if (!rows.count) { [self note:rows ? @"That file has no hosts you haven’t already saved." : @"That file isn’t a metadesk-hosts/1 hosts file, or it couldn’t be read." kind:rows ? MDStatusInfo : MDStatusError]; return; }
             [self reviewImport:rows book:book];
         }];
     }];
@@ -674,7 +869,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         if (response != NSAlertSecondButtonReturn || self.closing) return;
         NSSet *keys = selection.keys;
         [self run:^id(MDHostsWorker *worker) { return [worker applyImport:rows selected:keys book:book]; }
-            done:^(NSString *message) { self->_error.stringValue = message.length ? message : @"Selected hosts imported."; }];
+            done:^(NSString *message) { [self noteResult:message success:@"Selected hosts imported."]; }];
     }];
 }
 - (void)exportHosts:(id)sender {
@@ -691,7 +886,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (selected != NSModalResponseOK || self.closing || generation != self->_generation) return;
             NSURL *url = panel.URL;
             [self run:^id(MDHostsWorker *worker) { return [worker exportBook:book to:url]; }
-                done:^(NSString *message) { self->_error.stringValue = message; }];
+                done:^(NSString *message) { [self note:message kind:[message isEqual:@"Plaintext address book exported."] ? MDStatusOK : MDStatusError]; }];
         }];
     }];
 }

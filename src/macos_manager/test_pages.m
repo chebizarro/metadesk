@@ -276,13 +276,15 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     NSString *corrupt=@"not a relay preferences file";
     CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     [page activate]; CHECK(Await(^BOOL{ return review.enabled; }));
-    NSButton *refresh=Button(view,@"Save Relays and Refresh Address Book");
-    CHECK(Send(refresh) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    /* View > Refresh and the toolbar's Refresh reach the page as refresh:. */
+    NSMenuItem *refresh=MenuItem([MDManagerApp makeMainMenu],@selector(refresh:));
+    BOOL (^canRefresh)(void)=^BOOL{ return [page validateMenuItem:refresh]; };
+    CHECK(canRefresh() && [NSApp sendAction:@selector(refresh:) to:page from:refresh] && Await(^BOOL{ return window.attachedSheet!=nil; }));
     CHECK(EndSheet(window,NSAlertFirstButtonReturn));
     CHECK([corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
-    CHECK(Send(refresh) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+    CHECK(canRefresh() && [NSApp sendAction:@selector(refresh:) to:page from:refresh] && Await(^BOOL{ return window.attachedSheet!=nil; }));
     CHECK(EndSheet(window,NSAlertSecondButtonReturn));
-    CHECK(Await(^BOOL{ return refresh.enabled && !LabelContains(view,@"Could not read saved bootstrap"); }));
+    CHECK(Await(^BOOL{ return canRefresh() && !LabelContains(view,@"Could not read saved bootstrap"); }));
     CHECK(![corrupt isEqual:[NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]]);
     CHECK([@"[relays]\nbootstrap=wss://fixture.invalid/;\n" writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
     __block BOOL drained=NO;
@@ -300,7 +302,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
 
     [page reviewInput:@"desk@example.invalid" fromImage:YES];
     [page reviewInput:@KEY fromImage:YES];
-    CHECK(!worker.resolves && LabelContains(view,@"must contain an nprofile"));
+    CHECK(!worker.resolves && LabelContains(view,@"doesn’t contain a host’s public nprofile"));
     address.stringValue=@KEY;
     CHECK(Send(review) && !review.enabled && !worker.saves && !worker.launches);
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));

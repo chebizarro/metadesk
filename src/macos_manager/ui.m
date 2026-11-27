@@ -137,6 +137,7 @@ NSGridView *MDForm(NSArray<NSArray *> *rows) {
             [label isKindOfClass:NSString.class] ? MDFormLabel(label) : label;
         NSGridRow *r = [grid addRowWithViews:@[labelView, row[1]]];
         if (!Fills(row[1])) [r cellAtIndex:1].xPlacement = NSGridCellPlacementLeading;
+        else [(NSView *)row[1] setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
     }
     return grid;
 }
@@ -165,19 +166,26 @@ NSView *MDPage(NSArray<NSView *> *views, NSStackView **out) {
 }
 NSScrollView *MDTableScroll(NSTableView *table) {
     NSScrollView *scroll = [NSScrollView new];
-    scroll.hasVerticalScroller = YES; scroll.autohidesScrollers = YES; scroll.borderType = NSBezelBorder;
+    scroll.hasVerticalScroller = YES; scroll.hasHorizontalScroller = YES;
+    scroll.autohidesScrollers = YES; scroll.borderType = NSBezelBorder;
     scroll.documentView = table;
     table.usesAlternatingRowBackgroundColors = NO;
     table.style = NSTableViewStyleFullWidth;
     table.usesAutomaticRowHeights = YES;
     table.allowsTypeSelect = YES;
-    table.columnAutoresizingStyle = NSTableViewFirstColumnOnlyAutoresizingStyle;
     [scroll setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
     [scroll setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
     [scroll.heightAnchor constraintGreaterThanOrEqualToConstant:96].active = YES;
     return scroll;
 }
-NSView *MDEmptyOverlay(NSScrollView *scroll, NSTextField **title, NSTextField **detail) {
+NSView *MDTableArea(NSScrollView *scroll, NSView **overlayOut, NSTextField **title, NSTextField **detail) {
+    NSView *area = [NSView new];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    [area addSubview:scroll];
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.topAnchor constraintEqualToAnchor:area.topAnchor], [scroll.bottomAnchor constraintEqualToAnchor:area.bottomAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:area.leadingAnchor], [scroll.trailingAnchor constraintEqualToAnchor:area.trailingAnchor]]];
+    [area setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
     NSTextField *t = [NSTextField labelWithString:@""];
     t.font = [NSFont systemFontOfSize:NSFont.systemFontSize + 2 weight:NSFontWeightMedium];
     t.textColor = NSColor.secondaryLabelColor; t.alignment = NSTextAlignmentCenter;
@@ -185,23 +193,45 @@ NSView *MDEmptyOverlay(NSScrollView *scroll, NSTextField **title, NSTextField **
     NSStackView *overlay = [NSStackView stackViewWithViews:@[t, d]];
     overlay.orientation = NSUserInterfaceLayoutOrientationVertical; overlay.spacing = 4;
     overlay.translatesAutoresizingMaskIntoConstraints = NO;
-    [scroll addSubview:overlay positioned:NSWindowAbove relativeTo:nil];
+    [area addSubview:overlay positioned:NSWindowAbove relativeTo:scroll];
     [NSLayoutConstraint activateConstraints:@[
-        [overlay.centerXAnchor constraintEqualToAnchor:scroll.centerXAnchor],
-        [overlay.centerYAnchor constraintEqualToAnchor:scroll.centerYAnchor constant:8],
-        [overlay.widthAnchor constraintLessThanOrEqualToAnchor:scroll.widthAnchor constant:-40],
+        [overlay.centerXAnchor constraintEqualToAnchor:area.centerXAnchor],
+        [overlay.centerYAnchor constraintEqualToAnchor:area.centerYAnchor constant:12],
+        [overlay.widthAnchor constraintLessThanOrEqualToAnchor:area.widthAnchor constant:-40],
         [d.widthAnchor constraintLessThanOrEqualToConstant:360]]];
+    if (overlayOut) *overlayOut = overlay;
     if (title) *title = t;
     if (detail) *detail = d;
-    return overlay;
+    return area;
 }
 NSTableColumn *MDColumnNamed(NSTableView *table, NSString *identifier, NSString *title, CGFloat width, NSString *sortKey) {
     NSTableColumn *c = [[NSTableColumn alloc] initWithIdentifier:identifier];
     c.title = title; c.width = width; c.minWidth = MIN(width, 40);
     c.resizingMask = NSTableColumnAutoresizingMask | NSTableColumnUserResizingMask;
     if (sortKey) c.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:sortKey ascending:YES selector:@selector(localizedStandardCompare:)];
+    /* A table without a frame yet would shrink earlier columns as each is added. */
+    table.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
     [table addTableColumn:c];
     return c;
+}
+@implementation MDTable {
+    BOOL _armed;
+}
+- (void)arm { _armed = YES; }
+- (void)setFrameSize:(NSSize)size {
+    BOOL first = _armed && size.width > 1;
+    if (first) { _armed = NO; self.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle; }
+    [super setFrameSize:size];
+}
+@end
+void MDFinishColumns(NSTableView *table, NSString *flexible) {
+    for (NSTableColumn *c in table.tableColumns) {
+        if ([c.identifier isEqual:flexible]) c.resizingMask |= NSTableColumnAutoresizingMask;
+        else c.resizingMask &= ~NSTableColumnAutoresizingMask;
+    }
+    table.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
+    if ([table isKindOfClass:MDTable.class]) [(id)table arm];
+    else table.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
 }
 NSTableCellView *MDCell(NSTableView *table, NSString *identifier, NSString *text) {
     NSTableCellView *cell = [table makeViewWithIdentifier:identifier owner:nil];

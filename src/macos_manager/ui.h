@@ -42,8 +42,17 @@ NSBox *MDSeparator(void);
 NSView *MDPage(NSArray<NSView *> *views, NSStackView **stack);
 /* A bordered scroll view around a table, with an overlay for its empty state. */
 NSScrollView *MDTableScroll(NSTableView *table);
-NSView *MDEmptyOverlay(NSScrollView *scroll, NSTextField **title, NSTextField **detail);
+/* Wraps the scroll view in a container with a centered empty-state overlay.
+ * Returns the container (which takes the remaining height in an MDPage). */
+NSView *MDTableArea(NSScrollView *scroll, NSView **overlay, NSTextField **title, NSTextField **detail);
 NSTableColumn *MDColumnNamed(NSTableView *table, NSString *identifier, NSString *title, CGFloat width, NSString *sortKey);
+/* A table whose named flexible column alone absorbs width changes. Column
+ * autoresizing starts only once the table has a real width, so columns are
+ * not squeezed to their minimum while the view is still being assembled. */
+@interface MDTable : NSTableView
+@end
+/* After adding columns: only the named column absorbs width changes. */
+void MDFinishColumns(NSTableView *table, NSString *flexible);
 /* A reusable single-label table cell. */
 NSTableCellView *MDCell(NSTableView *table, NSString *identifier, NSString *text);
 
