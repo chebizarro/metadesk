@@ -8,13 +8,17 @@ Quitting it does not stop a host.
 
 ## Window, menus and editing
 
-The window remembers its size and position (only its frame; page content is
-never restored). Use the sidebar or View > Hosts … Relays (Command-1 to
+The window remembers its size and position (only its frame; page content and
+the selected section are never restored). It always opens on Hosts, where
+first-run guidance appears. Use the sidebar or View > Hosts … Relays (Command-1 to
 Command-5) to move between sections; View > Refresh (Command-R) or the toolbar's
 Refresh syncs Hosts, rechecks permissions in This Computer, reloads remembered
 clients in Access and reloads accounts in Identity. Edit > Find > Find Hosts
 (Command-F) searches saved hosts. File has Connect to Host (Command-K), Scan QR
-Code, Import Hosts and Export Hosts.
+Code, Import Hosts and Export Hosts. From any section they go to Hosts (opening
+it if needed) and then apply its usual checks there: Connect to Host focuses
+the Host field when Hosts is ready, or leaves you on its setup panel. They are
+unavailable while a sheet is open or the client role is being changed.
 
 Cut, Copy, Paste, Delete, Select All, Undo and Redo work in every field and in
 the contextual menu. With a saved host selected, Edit > Copy copies its public
@@ -144,7 +148,9 @@ role's standard [management socket](host-management.md#endpoint-and-peer-trust)
 automatically, and again whenever the host role is assigned, switched or
 removed in Identity (removing it disconnects). On a host-role change the old
 connection, its pending requests, remembered clients and any open approval
-or confirmation sheet are discarded before the new socket is looked up.
+or confirmation sheet are discarded before the new socket is looked up. A
+lookup that finds a different host role than Identity last reported is not
+connected to; the page asks you to try again.
 **Use a custom management socket** takes an absolute path instead; it is an
 explicit choice and works with or without a host role, over the same
 authenticated same-user connection, so a role change leaves it connected.

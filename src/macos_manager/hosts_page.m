@@ -137,6 +137,7 @@ typedef NS_ENUM(NSInteger, MDReload) { MDReloadOpen, MDReloadRefresh, MDReloadSa
     MDStatusView *_relayStatus, *_relayMessage;
     BOOL _relayRequest, _identityDirty; /* a save from the Relays section; accounts or roles changed */
     BOOL _relaysLoaded;                 /* the Relays page shows the persisted list */
+    BOOL _clientStale;                  /* Identity's client role differs from the open book's owner */
     NSString *_expectedClient;          /* client-role key from Identity's last reload ("" = none, nil = unknown) */
     NSInteger _accounts; /* signer accounts known on the worker; -1 unknown */
     MdLaunchMessage _phase;
@@ -284,6 +285,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
  * section is showing: Relays and the menu bar act on Hosts while it is not the
  * visible page. */
 - (NSWindow *)sheetWindow { return self.presentingWindow ?: self.view.window; }
+- (BOOL)canNavigate { return !self.closing && !_roleEditing; }
 - (BOOL)blocked {
     MDHostsState state = _book.state;
     return !_book || _roleEditing || state == MDHostsOpening || (state >= MDHostsNoClientRole && state <= MDHostsCacheUnavailable);
@@ -300,6 +302,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)identityChanged:(NSString *)clientKey {
     _expectedClient = clientKey; /* nil: accounts could not be read */
     _identityDirty = YES;
+    /* Once a mismatch is known, nothing the old book started may still
+     * present a review, save or start a client: reconcile first. */
+    BOOL stale = _book && clientKey && ![(_book.owner ?: @"") isEqual:clientKey];
+    if (stale && !_clientStale) ++_generation;
+    _clientStale = stale;
     [self reconcileIdentity];
 }
 - (void)reconcileIdentity {
@@ -311,7 +318,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [self suspendForRoleEdit:^{ [self resumeAfterRoleEdit]; }];
 }
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
-    _roleEditing = YES; ++_generation; _book = nil; [self render];
+    _roleEditing = YES; _clientStale = NO; ++_generation; _book = nil; [self render];
     if (_launch && _phase < MD_LAUNCH_CONNECTED) {
         [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO;
         [self showConnection:@"Unfinished connection cancelled before changing the client role." kind:MDStatusInfo];
@@ -369,6 +376,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (self.closing) return;
             self->_busy = NO;
             if (self->_roleEditing) return;
+            if (self->_clientStale) { [self reconcileIdentity]; return; } /* the old book's results are moot */
             if (book) [self showBook:book];
             if (done) done(result);
             if (self->_identityDirty) [self reconcileIdentity];

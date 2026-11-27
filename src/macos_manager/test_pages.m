@@ -1035,7 +1035,34 @@ static BOOL ComputerRole(MDManagerApp *app, MDLocalHostPages *local, FixtureLink
     dispatch_semaphore_signal(gateD);
     CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-b.sock"]; }));
     CHECK(![[link.paths subarrayWithRange:NSMakeRange(link.paths.count-2,2)] containsObject:@"/fixture/role-a.sock"]);
+    /* Round 5 #1: A connected; the saved role becomes B outside the manager
+     * and a fresh lookup (Connect, field empty) reads B but is held; the role
+     * goes back to A and Identity reports A before B's answer lands. The
+     * pending lookup means A can't be taken as unchanged, and B's answer
+     * disagrees with the latest role, so B is never connected to. */
+    custom.stringValue=@"";
+    local.discover=Answer(keyA,@"/fixture/role-a.sock",nil,nil,NULL);
+    [local hostRoleChanged:keyA];
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-a.sock"]; }));
+    dispatch_semaphore_t enteredE=dispatch_semaphore_create(0), gateE=dispatch_semaphore_create(0);
+    local.discover=Answer(keyB,@"/fixture/role-b2.sock",enteredE,gateE,NULL);
+    [NSApp sendAction:@selector(connect:) to:local from:nil];
+    CHECK(Entered(enteredE));
+    NSUInteger mark=link.paths.count;
+    local.discover=Answer(keyA,@"/fixture/role-a.sock",nil,nil,NULL);
+    [local hostRoleChanged:keyA];
+    dispatch_semaphore_signal(gateE);
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-a.sock"]; }));
+    CHECK(![[link.paths subarrayWithRange:NSMakeRange(mark,link.paths.count-mark)] containsObject:@"/fixture/role-b2.sock"]);
+    /* A lookup that answers with a role other than the one Identity last
+     * reported is rejected, not connected. */
+    local.discover=Answer(keyB,@"/fixture/role-b3.sock",nil,nil,NULL);
+    [NSApp sendAction:@selector(connect:) to:local from:nil];
+    CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"host role changed while looking"); }));
+    CHECK(![link.paths containsObject:@"/fixture/role-b3.sock"]);
     local.discover=Answer(nil,nil,nil,nil,NULL); /* later role changes answer at once */
+    [local hostRoleChanged:@""];
+    CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"doesn’t have a host role"); }));
     return YES;
 }
 /* B2: the Relays section's host identity field refuses secret keys too. */
@@ -1078,15 +1105,15 @@ static BOOL RelaysFirst(void) {
     MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
     local.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
     MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:@"/nonexistent" connect:Connect credentials:nil];
-    MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
-    NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
-    CHECK(![[hosts valueForKey:@"started"] boolValue]); /* opening the window doesn't open Hosts */
     /* Saved by MDHostsBootstrap itself, so the file is in its own format. */
     NSString *error=nil;
     CHECK([MDHostsBootstrap(@"wss://first.fixture.invalid/", &error) containsString:@"first.fixture.invalid"]);
     NSString *original=saved();
     CHECK(original.length);
-    [app showSection:@"Relays"];
+    MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
+    app.initialSection=@"Relays"; /* test hook: start on Relays without ever showing Hosts */
+    NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
+    CHECK([window.title isEqual:@"Relays"] && ![[hosts valueForKey:@"started"] boolValue]);
     NSView *root=window.contentView;
     NSTextField *relays=Field(root,@"Bootstrap relays");
     NSButton *save=Button(root,@"Save and Sync");
@@ -1159,6 +1186,118 @@ static BOOL ClientRole(MDManagerApp *app, MDHostsPage *hosts, FixtureHosts *work
     CHECK(worker.closes==closes+1);
     return YES;
 }
+/* Round 5 #4: a client-role mismatch learned while a Hosts operation is in
+ * flight suppresses that operation's review and reconciles first. */
+static BOOL ClientStale(MDManagerApp *app, MDHostsPage *hosts, FixtureHosts *worker, NSWindow *window) {
+    NSString *keyA=@"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", *keyB=@"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    NSString *saved=worker.owner;
+    worker.state=MDHostsSynced; worker.owner=keyA;
+    [app showSection:@"Hosts"];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)]; }));
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    NSButton *review=Button(hosts.view,@"Review and Connect…");
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && review.enabled; }));
+    [hosts identityChanged:keyA];
+    NSUInteger closes=worker.closes, resolves=worker.resolves;
+    /* Hold the review lookup in the worker. */
+    __block BOOL entered=NO;
+    worker.entered=^{ entered=YES; };
+    worker.proceed=dispatch_semaphore_create(0);
+    Field(hosts.view,@"Host npub").stringValue=@KEY;
+    CHECK(Send(review) && Await(^BOOL{ return entered; }) && worker.resolves==resolves+1);
+    /* Identity now reports client role B; then the lookup finishes. */
+    worker.owner=keyB;
+    [hosts identityChanged:keyB];
+    dispatch_semaphore_signal(worker.proceed);
+    CHECK(Await(^BOOL{ return worker.closes==closes+1 && [hosts canPerform:@selector(refresh:)] && review.enabled; }));
+    CHECK(!window.attachedSheet && !LabelContains(hosts.view,@"Checking the host"));
+    worker.entered=nil; worker.proceed=nil; worker.owner=saved;
+    [hosts identityChanged:nil];
+    return YES;
+}
+/* Round 5 #2: a fresh app opens on Hosts and starts it, showing the first-run
+ * panel; the section is never saved. */
+static BOOL LaunchOnHosts(void) {
+    for (int round=0; round<2; ++round) {
+        FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil]; worker.state=MDHostsNoClientRole;
+        MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
+        hosts.accountCount=^NSUInteger{ return 0; };
+        FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
+        MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
+        local.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
+        MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:@"/nonexistent" connect:Connect credentials:nil];
+        MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
+        NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
+        CHECK([window.title isEqual:@"Hosts"] && [[hosts valueForKey:@"started"] boolValue]);
+        CHECK(!link.paths.count); /* This Computer was not started */
+        MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(hosts.view);
+        CHECK(Await(^BOOL{ return Visible(panel) && [panel.titleLabel.stringValue isEqual:@"Add Your Signer Account"]; }));
+        [app showSection:@"Access"]; /* a second launch must not start here */
+        __block int pending=3;
+        [hosts close:^{ --pending; }]; [local close:^{ --pending; }]; [identity close:^{ --pending; }];
+        CHECK(Await(^BOOL{ return pending==0; }));
+        [window close];
+    }
+    return YES;
+}
+/* Round 5 #3: from another section, Connect to Host (⌘K) and the File-menu
+ * host commands go to Hosts and start it, then apply the page's own checks. */
+static BOOL HostCommands(void) {
+    FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil]; worker.state=MDHostsNoClientRole;
+    MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
+    hosts.accountCount=^NSUInteger{ return 0; };
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
+    MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
+    local.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
+    MDIdentityPage *identity=[[MDIdentityPage alloc] initWithHosts:hosts directory:@"/nonexistent" connect:Connect credentials:nil];
+    MDManagerApp *app=[[MDManagerApp alloc] initWithHosts:hosts local:local identity:identity];
+    app.initialSection=@"This Computer";
+    NSWindow *window=[app makeMainWindow]; window.alphaValue=0;
+    id delegate=NSApp.delegate; NSApp.delegate=app;
+    CHECK(![[hosts valueForKey:@"started"] boolValue]);
+    /* ⌘K starts Hosts and lands on its first-run panel. */
+    CHECK(Choose(window,@selector(connectToHost:)));
+    CHECK([window.title isEqual:@"Hosts"] && [[hosts valueForKey:@"started"] boolValue]);
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(hosts.view);
+    CHECK(Await(^BOOL{ return Visible(panel) && [hosts canPerform:@selector(refresh:)]; }));
+    /* Import from another section: goes to Hosts, where the page's own
+     * check (nothing to import into yet) stops it. On Hosts it's disabled. */
+    [app showSection:@"Access"];
+    CHECK(Enabled(window,@selector(importHosts:)) && Enabled(window,@selector(exportHosts:)) && Enabled(window,@selector(scanQR:)));
+    CHECK(Choose(window,@selector(importHosts:)));
+    Turn();
+    CHECK([window.title isEqual:@"Hosts"] && !window.attachedSheet);
+    CHECK(!Enabled(window,@selector(importHosts:)) && !Enabled(window,@selector(connectToHost:)));
+    /* Ready: ⌘K from another section focuses the Host field. */
+    worker.state=MDHostsSynced;
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    NSTextField *address=Field(hosts.view,@"Host npub");
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && Visible(address); }));
+    [app showSection:@"Identity"];
+    [window makeFirstResponder:nil];
+    CHECK(Choose(window,@selector(connectToHost:)));
+    CHECK([window.title isEqual:@"Hosts"] && address.currentEditor && window.firstResponder==address.currentEditor);
+    /* A sheet on the main window, or a client-role edit, disables them all. */
+    [app showSection:@"Access"];
+    NSAlert *alert=[NSAlert new]; alert.messageText=@"Fixture"; [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:window completionHandler:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    for (NSString *name in @[@"connectToHost:", @"scanQR:", @"importHosts:", @"exportHosts:"]) CHECK(!Enabled(window,NSSelectorFromString(name)));
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    __block BOOL drained=NO;
+    [hosts suspendForRoleEdit:^{ drained=YES; }];
+    CHECK(Await(^BOOL{ return drained; }));
+    for (NSString *name in @[@"connectToHost:", @"scanQR:", @"importHosts:", @"exportHosts:"]) CHECK(!Enabled(window,NSSelectorFromString(name)));
+    [app performSelector:@selector(connectToHost:) withObject:nil];
+    CHECK([window.title isEqual:@"Access"]);
+    [hosts resumeAfterRoleEdit];
+    NSApp.delegate=delegate; KeyWindowOverride=nil;
+    __block int pending=3;
+    [hosts close:^{ --pending; }]; [local close:^{ --pending; }]; [identity close:^{ --pending; }];
+    CHECK(Await(^BOOL{ return pending==0; }));
+    [window close];
+    return YES;
+}
 static BOOL Run(NSString *directory) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
@@ -1175,6 +1314,7 @@ static BOOL Run(NSString *directory) {
     }];
     /* The real main window and controller hierarchy, never ordered on screen. */
     FixtureApp *app=[[FixtureApp alloc] initWithHosts:hosts local:access identity:identity];
+    app.initialSection=@"This Computer"; /* BeforeActivation needs Hosts unstarted */
     NSWindow *window=[app makeMainWindow];
     window.alphaValue=0;
     KeyWindowOverride=window;
@@ -1193,6 +1333,7 @@ static BOOL Run(NSString *directory) {
     CHECK(ComputerRole(app,access,link,window,identity));
     CHECK(ClientRole(app,hosts,worker));
     CHECK(OpeningState(app,window,hosts,worker));
+    CHECK(ClientStale(app,hosts,worker,window));
     CHECK(RelaysField(app,window));
     CHECK(RelaysSave(app,window));
     MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
@@ -1207,6 +1348,8 @@ static BOOL Run(NSString *directory) {
     [window close];
     CHECK(LateBadge());
     CHECK(RelaysFirst());
+    CHECK(LaunchOnHosts());
+    CHECK(HostCommands());
     return YES;
 }
 int main(int argc,char **argv) {

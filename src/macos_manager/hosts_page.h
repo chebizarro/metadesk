@@ -18,6 +18,8 @@
 - (void)setSearchText:(NSString *)text;
 /* The single predicate for each command (menus, buttons and handlers). */
 - (BOOL)canPerform:(SEL)action;
+/* Commands may bring Hosts forward (not closing, no client-role edit). */
+@property(nonatomic, readonly) BOOL canNavigate;
 /* Relay setup, hosted by the Relays section (its one home). */
 - (NSView *)relaySettingsView;
 /* The main window: sheets are presented on it, and its attached sheet gates

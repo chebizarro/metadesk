@@ -224,7 +224,9 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
         [app->_hostsPage identityChanged:app->_identity.clientRoleKey];
         [app->_local hostRoleChanged:app->_identity.hostRoleKey];
     };
-    [_main showSection:@"This Computer"];
+    /* Hosts is the app's purpose and holds the first-run guidance: launch
+     * there, every time (the section is never saved). */
+    [_main showSection:self.initialSection ?: @"Hosts"];
     return _main.window;
 }
 - (void)sectionChanged:(NSString *)section {
@@ -278,11 +280,16 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     [_main showSection:section];
     [_main.window makeKeyAndOrderFront:nil];
 }
-/* Commands that act on the Hosts page work from any section. */
+/* Commands that act on the Hosts page work from any section: they go to
+ * Hosts (starting it if needed), then apply the page's own checks there. A
+ * sheet on the main window or a client-role edit blocks them. */
+- (BOOL)canNavigateToHosts {
+    return !_terminationPending && _hostsPage && _main && !_main.window.attachedSheet && _hostsPage.canNavigate;
+}
 - (BOOL)forwardToHosts:(SEL)action from:(id)sender {
-    if (_terminationPending || !_hostsPage || ![_hostsPage canPerform:action]) return NO;
+    if (!self.canNavigateToHosts) return NO;
     [self showSection:@"Hosts"];
-    return [NSApp sendAction:action to:_hostsPage from:sender];
+    return [_hostsPage canPerform:action] && [NSApp sendAction:action to:_hostsPage from:sender];
 }
 - (void)connectToHost:(id)sender { if ([self forwardToHosts:@selector(focusHostEntry:) from:sender]) return; }
 - (void)scanQR:(id)sender { [self forwardToHosts:@selector(scanQR:) from:sender]; }
@@ -321,8 +328,10 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     SEL hosts[] = {@selector(connectToHost:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(findHosts:)};
     SEL forwarded[] = {@selector(focusHostEntry:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(focusSearch:)};
     for (size_t i = 0; i < sizeof(hosts) / sizeof(*hosts); ++i) if (action == hosts[i]) {
-        if (!_hostsPage || !_main) return NO;
-        return [_hostsPage canPerform:forwarded[i]];
+        if (!self.canNavigateToHosts) return NO;
+        /* From another section the command takes you to Hosts; on Hosts the
+         * page decides. */
+        return ![self.currentSection isEqual:@"Hosts"] || [_hostsPage canPerform:forwarded[i]];
     }
     return [self respondsToSelector:action];
 }

@@ -13,6 +13,9 @@
  * offscreen snapshot renderer). */
 - (NSWindow *)makeMainWindow;
 - (NSArray<NSString *> *)sectionIdentifiers;
+/* Test hook: the section makeMainWindow shows first. nil (always, in the
+ * app) means Hosts. */
+@property(nonatomic, copy) NSString *initialSection;
 - (NSValue *)defaultContentSize;
 /* AppKit's final reply can be observed in process without exiting the test. */
 - (void)replyToTermination;

@@ -65,7 +65,8 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     NSString *_linkPath;             /* what the link was last asked to connect to */
     NSUInteger _discovery;           /* fences discovery completions from an earlier role */
     NSUInteger _linkEpoch;           /* fences decisions made against an earlier link */
-    NSString *_hostKey;              /* host-role key the standard socket was found for */
+    NSString *_hostKey;              /* host-role key the last completed lookup found */
+    NSString *_roleKey;              /* latest host-role key Identity reported (nil: unknown) */
     NSWindow *_decision;             /* open approval, edit or confirmation sheet */
     dispatch_queue_t _discoveryQueue; /* serial: requests are answered in order */
     BOOL _located, _noHostRole, _activated, _custom, _locating;
@@ -216,7 +217,17 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MDLocalHostPages *page = weakSelf;
             if (!page || page->_closed || epoch != page->_discovery) return; /* superseded */
-            page->_locating = NO; page->_located = YES; page->_noHostRole = !key;
+            page->_locating = NO; page->_located = YES;
+            /* Bound to the role: an answer that disagrees with the latest
+             * role Identity reported is stale, and is never connected to. */
+            NSString *expected = page->_roleKey;
+            if (expected && ![(key ?: @"") isEqual:expected]) {
+                page->_noHostRole = NO; page->_hostKey = nil;
+                if (page->_linkPath.length && !page->_custom) [page dropLink];
+                [page showStatus:@"The host role changed while looking for the host. Choose Try Again."]; [page render];
+                return;
+            }
+            page->_noHostRole = !key;
             page->_hostKey = key ?: @"";
             if (page->_custom) { [page showStatus:nil]; [page render]; return; }
             if (path) {
@@ -251,9 +262,13 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
  * is the user's explicit choice and stays, but the standard path learned for
  * the old role is forgotten, so leaving custom mode looks it up again. */
 - (void)hostRoleChanged:(NSString *)key {
-    if (_closed || !_activated) return;
+    if (_closed) return;
+    if (key) _roleKey = key;
+    if (!_activated) return;
     if (!key) { if (!_custom) [self locateAndConnect]; return; } /* unknown: discovery decides */
-    if (_hostKey && [key isEqual:_hostKey]) return; /* e.g. a label edit */
+    /* Unchanged (e.g. a label edit) only if no lookup is pending: a pending
+     * one may have read another role in the meantime. */
+    if (!_locating && _hostKey && [key isEqual:_hostKey]) return;
     _hostKey = nil; _located = NO;
     if (_custom) { [self showStatus:nil]; [self render]; return; }
     [self dropLink];
