@@ -4,11 +4,23 @@
 #import "hosts_page.h"
 #import "hosts_launch.h"
 #import "identity_page.h"
+#import "main_window.h"
+#import "ui.h"
 #include <signal.h>
 
-static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:title];
-    item.label = title; item.view = view; [tabs addTabViewItem:item];
+static NSString *const MDHelpURL = @"https://github.com/chebizarro/metadesk/blob/master/docs/manager-macos.md";
+static NSString *const MDIssuesURL = @"https://github.com/chebizarro/metadesk/issues";
+
+static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, NSString *key, NSEventModifierFlags mask) {
+    NSMenuItem *item = [menu addItemWithTitle:title action:action keyEquivalent:key ?: @""];
+    if (key.length) item.keyEquivalentModifierMask = mask;
+    return item;
+}
+static NSMenu *Submenu(NSMenu *bar, NSString *title) {
+    NSMenuItem *holder = [bar addItemWithTitle:title action:NULL keyEquivalent:@""];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+    holder.submenu = menu;
+    return menu;
 }
 
 @interface MDManagerApp ()
@@ -16,8 +28,10 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
 @end
 
 @implementation MDManagerApp {
-    NSWindow *_window;
+    MDMainWindowController *_main;
     NSTextField *_address, *_relay, *_routes;
+    NSButton *_preview;
+    id _secretObserver;
     MDHostsPage *_hostsPage;
     MDLocalHostPages *_local;
     MDIdentityPage *_identity;
@@ -34,34 +48,140 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     return self;
 }
 - (instancetype)init { return [self initWithHosts:nil local:nil identity:nil]; }
-- (NSView *)relays {
-    _address = [NSTextField textFieldWithString:@""]; _address.placeholderString = @"Host npub, nprofile or hex public key";
-    _relay = [NSTextField textFieldWithString:@""]; _relay.placeholderString = @"Explicit bootstrap URL (optional)";
-    _routes = [NSTextField wrappingLabelWithString:@"Offline identity and bootstrap preview. This tab does not change Hosts relay choices."];
-    NSButton *preview = [NSButton buttonWithTitle:@"Preview" target:self action:@selector(preview:)];
-    NSStackView *stack = [NSStackView stackViewWithViews:@[_address,_relay,preview,_routes]];
-    stack.translatesAutoresizingMaskIntoConstraints = NO; stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stack.alignment=NSLayoutAttributeLeading; stack.spacing=8;
-    for (NSView *v in @[_address,_relay,_routes]) [v.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active=YES;
-    NSView *root=[NSView new]; [root addSubview:stack];
-    [NSLayoutConstraint activateConstraints:@[[stack.topAnchor constraintEqualToAnchor:root.topAnchor constant:14],
-        [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:14], [stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-14]]];
-    return root;
+
+/* Standard macOS menu bar. Every item has a nil target so it travels the
+ * responder chain: the field editor handles editing, the window handles
+ * window commands, and this delegate handles section and page commands. */
++ (NSMenu *)makeMainMenu {
+    const NSEventModifierFlags cmd = NSEventModifierFlagCommand, shift = NSEventModifierFlagShift,
+        opt = NSEventModifierFlagOption, ctrl = NSEventModifierFlagControl;
+    NSString *app = @"Metadesk Manager";
+    NSMenu *bar = [[NSMenu alloc] initWithTitle:@"Main Menu"];
+
+    NSMenu *m = Submenu(bar, app);
+    Item(m, [@"About " stringByAppendingString:app], @selector(orderFrontStandardAboutPanel:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenu *services = [[NSMenu alloc] initWithTitle:@"Services"];
+    Item(m, @"Services", NULL, nil, 0).submenu = services;
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, [@"Hide " stringByAppendingString:app], @selector(hide:), @"h", cmd);
+    Item(m, @"Hide Others", @selector(hideOtherApplications:), @"h", cmd | opt);
+    Item(m, @"Show All", @selector(unhideAllApplications:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, [@"Quit " stringByAppendingString:app], @selector(terminate:), @"q", cmd);
+
+    m = Submenu(bar, @"File");
+    Item(m, @"Connect to Host…", @selector(connectToHost:), @"k", cmd);
+    Item(m, @"Scan QR Code…", @selector(scanQR:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Import Hosts…", @selector(importHosts:), nil, 0);
+    Item(m, @"Export Hosts…", @selector(exportHosts:), nil, 0);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Close Window", @selector(performClose:), @"w", cmd);
+
+    m = Submenu(bar, @"Edit");
+    Item(m, @"Undo", @selector(undo:), @"z", cmd);
+    Item(m, @"Redo", @selector(redo:), @"z", cmd | shift);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Cut", @selector(cut:), @"x", cmd);
+    Item(m, @"Copy", @selector(copy:), @"c", cmd);
+    Item(m, @"Paste", @selector(paste:), @"v", cmd);
+    Item(m, @"Delete", @selector(delete:), nil, 0);
+    Item(m, @"Select All", @selector(selectAll:), @"a", cmd);
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenu *find = [[NSMenu alloc] initWithTitle:@"Find"];
+    Item(m, @"Find", NULL, nil, 0).submenu = find;
+    Item(find, @"Find Hosts…", @selector(findHosts:), @"f", cmd);
+
+    m = Submenu(bar, @"View");
+    NSArray<NSString *> *sections = MDManagerApp.sectionTitles;
+    for (NSUInteger i = 0; i < sections.count; ++i) {
+        NSMenuItem *item = Item(m, sections[i], @selector(showSection:), [NSString stringWithFormat:@"%lu", (unsigned long)i + 1], cmd);
+        item.representedObject = sections[i];
+    }
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Refresh", @selector(refresh:), @"r", cmd);
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Show Sidebar", @selector(toggleSidebar:), @"s", cmd | ctrl);
+    Item(m, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", cmd | ctrl);
+
+    NSMenu *window = Submenu(bar, @"Window");
+    Item(window, @"Minimize", @selector(performMiniaturize:), @"m", cmd);
+    Item(window, @"Zoom", @selector(performZoom:), nil, 0);
+    [window addItem:NSMenuItem.separatorItem];
+    Item(window, @"Bring All to Front", @selector(arrangeInFront:), nil, 0);
+
+    NSMenu *help = Submenu(bar, @"Help");
+    Item(help, [app stringByAppendingString:@" Help"], @selector(openHelp:), @"?", cmd);
+    Item(help, @"Report an Issue…", @selector(reportIssue:), nil, 0);
+    return bar;
 }
-- (void)preview:(NSButton *)sender {
-    if (_terminationPending) return;
-    NSString *address=_address.stringValue,*relay=_relay.stringValue;
-    sender.enabled=NO;
++ (NSArray<NSString *> *)sectionTitles { return @[@"Hosts", @"This Computer", @"Access", @"Identity", @"Relays"]; }
++ (void)installMainMenu:(NSApplication *)app {
+    NSMenu *bar = [self makeMainMenu];
+    app.mainMenu = bar;
+    app.servicesMenu = [bar itemAtIndex:0].submenu.itemArray[2].submenu;
+    app.windowsMenu = [bar itemWithTitle:@"Window"].submenu;
+    app.helpMenu = [bar itemWithTitle:@"Help"].submenu;
+}
+/* Offline route preview: never contacts a relay or changes Hosts relays. */
+- (NSView *)relays {
+    _address = MDKeyField(@"npub, nprofile or hex public key", @"Host identity");
+    _relay = MDKeyField(@"wss://relay.example.com (optional)", @"Bootstrap relay");
+    _preview = MDButton(@"Preview", self, @selector(preview:));
+    _address.target = self; _address.action = @selector(preview:);
+    _relay.target = self; _relay.action = @selector(preview:);
+    _routes = MDWrappingValue(@"");
+    _routes.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    _routes.accessibilityLabel = @"Preview result";
+    NSGridView *form = MDForm(@[@[@"Host identity", _address], @[@"Bootstrap relay", _relay], @[NSNull.null, _preview]]);
+    NSStackView *stack = nil;
+    NSView *settings = [_hostsPage relaySettingsView];
+    NSStackView *result = MDRow(@[MDFormLabel(@"Result"), _routes]);
+    NSView *page = MDPage(@[settings, MDSeparator(), MDHeader(@"Test a Host Identity"),
+        MDNote(@"See which key and bootstrap relay a host identity resolves to, without contacting any relay or changing your relays."),
+        form, result], &stack);
+    NSMutableArray *forms = [NSMutableArray arrayWithObject:form];
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:settings];
+    while (queue.count) { NSView *v = queue.lastObject; [queue removeLastObject];
+        if ([v isKindOfClass:NSGridView.class]) [forms addObject:v]; else [queue addObjectsFromArray:v.subviews]; }
+    MDAlignForms(forms);
+    [stack setCustomSpacing:MDGroupSpacing afterView:settings];
+    [stack setCustomSpacing:MDGroupSpacing afterView:stack.arrangedSubviews[1]];
+    [stack setCustomSpacing:MDRowSpacing afterView:form];
+    _routes.stringValue = @"Enter a host identity and choose Preview.";
+    __weak MDManagerApp *weakSelf = self;
+    _secretObserver = [NSNotificationCenter.defaultCenter addObserverForName:MDSecretRefusedNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+        MDManagerApp *app = weakSelf;
+        if (app && (note.object == app->_address || note.object == app->_relay))
+            app->_routes.stringValue = @"That’s a private key, so it wasn’t entered. Enter a public npub, nprofile or hex key.";
+    }];
+    return MDScrollingPage(page);
+}
+- (void)preview:(id)sender {
+    (void)sender;
+    if (_terminationPending || !_preview.enabled) return;
+    NSString *address=MDHostTrim(_address.stringValue),*relay=MDHostTrim(_relay.stringValue);
+    if (MDContainsSecretKey(address) || MDContainsSecretKey(relay)) { /* submit-time backstop */
+        _address.stringValue=@""; _relay.stringValue=@"";
+        _routes.stringValue=@"That’s a private key, so it wasn’t used. Enter a public npub, nprofile or hex key.";
+        return;
+    }
+    NSButton *button=_preview;
+    button.enabled=NO;
     dispatch_async(_previewQueue, ^{ @autoreleasepool {
         NSString *text=MDRoutePreview(address,relay);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!self->_terminationPending) { self->_routes.stringValue=text; sender.enabled=YES; }
+            if (!self->_terminationPending) { self->_routes.stringValue=text; button.enabled=YES; }
         });
     } });
 }
-- (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    (void)notification;
-    NSTabView *tabs=[NSTabView new];
+- (NSArray<NSString *> *)sectionIdentifiers { return MDManagerApp.sectionTitles; }
+- (NSValue *)defaultContentSize { return [NSValue valueWithSize:MDMainWindowController.defaultContentSize]; }
+/* Builds the pages and the main window once. The snapshot renderer calls this
+ * directly; launching calls it from applicationDidFinishLaunching:. */
+- (NSWindow *)makeMainWindow {
+    if (_main) return _main.window;
     if (!_hostsPage) _hostsPage=[MDHostsPage new];
     if (!_local) {
         // Render the real local pages without querying notification settings.
@@ -70,24 +190,59 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         }] : [MDLocalHostPages new];
     }
     if (!_identity) _identity=[[MDIdentityPage alloc] initWithHosts:_hostsPage];
-    AddTab(tabs,@"Hosts",_hostsPage.view);
-    AddTab(tabs,@"This Computer",_local.computerView);
-    AddTab(tabs,@"Access",_local.accessView);
-    AddTab(tabs,@"Identity",_identity.view);
-    AddTab(tabs,@"Relays",[self relays]);
-    NSView *activity=[NSView new];
-    NSTextField *note=[NSTextField labelWithString:@"Live session status and disconnection are in This Computer. No activity history is stored here."];
-    note.translatesAutoresizingMaskIntoConstraints=NO; [activity addSubview:note];
-    [note.leadingAnchor constraintEqualToAnchor:activity.leadingAnchor constant:14].active=YES;
-    [note.topAnchor constraintEqualToAnchor:activity.topAnchor constant:14].active=YES;
-    AddTab(tabs,@"Activity",activity);
-    _window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,820,540)
-        styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable
-        backing:NSBackingStoreBuffered defer:NO];
-    _window.releasedWhenClosed=NO; _window.title=@"Metadesk Manager"; _window.restorable=NO;
-    _window.contentMinSize=NSMakeSize(650,410); _window.contentView=tabs;
-    [tabs selectTabViewItemAtIndex:1]; tabs.delegate=self;
-    [_window center];
+    MDSection *hosts=[MDSection section:@"Hosts" symbol:@"network" controller:_hostsPage view:nil];
+    hosts.refreshHelp=@"Sync the address book with its relays"; hosts.searchable=YES;
+    MDSection *computer=[MDSection section:@"This Computer" symbol:@"desktopcomputer" controller:nil view:_local.computerView];
+    computer.refreshHelp=@"Recheck the host’s permissions";
+    MDSection *access=[MDSection section:@"Access" symbol:@"lock.shield" controller:nil view:_local.accessView];
+    access.refreshHelp=@"Reload remembered clients";
+    MDSection *identity=[MDSection section:@"Identity" symbol:@"person.text.rectangle" controller:_identity view:nil];
+    identity.refreshHelp=@"Reload saved accounts";
+    (void)_hostsPage.view;
+    NSViewController *relays=[NSViewController new]; relays.view=[self relays];
+    MDSection *preview=[MDSection section:@"Relays" symbol:@"antenna.radiowaves.left.and.right" controller:relays view:nil];
+    _main=[[MDMainWindowController alloc] initWithSections:@[hosts,computer,access,identity,preview]];
+    __weak MDManagerApp *weakSelf=self;
+    _main.sectionChanged=^(NSString *section) { [weakSelf sectionChanged:section]; };
+    _main.searchChanged=^(NSString *text) { [weakSelf searchChanged:text]; };
+    _local.pendingChanged=^(NSUInteger count) {
+        MDManagerApp *app=weakSelf;
+        if (!app) return; /* a late timer tick after the app delegate is gone */
+        [app->_main setBadge:count ? [NSString stringWithFormat:@"%lu", (unsigned long)count] : nil forSection:@"Access"];
+    };
+    _hostsPage.presentingWindow=_main.window;
+    _hostsPage.showIdentity=^(BOOL add) {
+        MDManagerApp *app=weakSelf;
+        if (!app) return;
+        [app showSection:@"Identity"];
+        if (add) [app->_identity beginAddAccount];
+    };
+    _hostsPage.showRelays=^{ [weakSelf showSection:@"Relays"]; };
+    _identity.accountsChanged=^{
+        MDManagerApp *app=weakSelf;
+        if (!app) return;
+        [app->_hostsPage identityChanged:app->_identity.clientRoleKey];
+        [app->_local hostRoleChanged:app->_identity.hostRoleKey];
+    };
+    /* Hosts is the app's purpose and holds the first-run guidance: launch
+     * there, every time (the section is never saved). */
+    [_main showSection:self.initialSection ?: @"Hosts"];
+    return _main.window;
+}
+- (void)sectionChanged:(NSString *)section {
+    if (self.smokeQuit) return; // Don’t read or sync host/account state.
+    if ([section isEqual:@"Hosts"]) [_hostsPage activate];
+    if ([section isEqual:@"Relays"]) [_hostsPage relaysAppeared];
+    if ([section isEqual:@"Identity"]) [_identity activate];
+    if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local activate];
+}
+- (void)searchChanged:(NSString *)text {
+    if (MDContainsSecretKey(text)) { _main.searchField.stringValue=@""; text=@""; } /* backstop */
+    [_hostsPage setSearchText:text];
+}
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    (void)notification;
+    [self makeMainWindow];
     /* Publish readiness (the visible window) only once a terminal stop can be
      * observed. SIGTERM uses the same asynchronous drain path as Quit. */
     _terminate=dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,SIGTERM,0,dispatch_get_main_queue());
@@ -103,13 +258,14 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
     dispatch_activate(_terminate);
 }
 - (void)showWindow {
-    [_window makeKeyAndOrderFront:nil];
+    NSWindow *window=_main.window;
+    [window makeKeyAndOrderFront:nil];
     if (!self.smokeQuit) { [NSApp activateIgnoringOtherApps:YES]; return; }
     // Wait for an AppKit run-loop turn after showing the window. Then use
     // the normal termination delegate (including page and worker drain).
     [NSTimer scheduledTimerWithTimeInterval:0 repeats:NO block:^(NSTimer *timer) {
         (void)timer;
-        if (!NSApp.isRunning || !NSScreen.screens.count || !self->_window.isVisible) {
+        if (!NSApp.isRunning || !NSScreen.screens.count || !window.isVisible) {
             fputs("Manager smoke: no visible window in a running AppKit session\n", stderr);
             exit(EXIT_FAILURE);
         }
@@ -117,12 +273,69 @@ static void AddTab(NSTabView *tabs, NSString *title, NSView *view) {
         [NSApp terminate:nil];
     }];
 }
-- (void)tabView:(NSTabView *)tabs didSelectTabViewItem:(NSTabViewItem *)item {
-    (void)tabs;
-    if (self.smokeQuit) return; // Don’t read or sync host/account state.
-    if ([item.identifier isEqual:@"Hosts"]) [_hostsPage activate];
-    if ([item.identifier isEqual:@"Identity"]) [_identity activate];
+- (NSString *)currentSection { return _main.currentSection; }
+- (void)showSection:(id)sender {
+    NSString *section = [sender isKindOfClass:NSString.class] ? sender : [sender representedObject];
+    if (!_main || _main.window.attachedSheet || ![MDManagerApp.sectionTitles containsObject:section]) return;
+    [_main showSection:section];
+    [_main.window makeKeyAndOrderFront:nil];
 }
+/* Commands that act on the Hosts page work from any section: they go to
+ * Hosts (starting it if needed), then apply the page's own checks there. A
+ * sheet on the main window or a client-role edit blocks them. */
+- (BOOL)canNavigateToHosts {
+    return !_terminationPending && _hostsPage && _main && !_main.window.attachedSheet && _hostsPage.canNavigate;
+}
+- (BOOL)forwardToHosts:(SEL)action from:(id)sender {
+    if (!self.canNavigateToHosts) return NO;
+    [self showSection:@"Hosts"];
+    return [_hostsPage canPerform:action] && [NSApp sendAction:action to:_hostsPage from:sender];
+}
+- (void)connectToHost:(id)sender { if ([self forwardToHosts:@selector(focusHostEntry:) from:sender]) return; }
+- (void)scanQR:(id)sender { [self forwardToHosts:@selector(scanQR:) from:sender]; }
+- (void)importHosts:(id)sender { [self forwardToHosts:@selector(importHosts:) from:sender]; }
+- (void)exportHosts:(id)sender { [self forwardToHosts:@selector(exportHosts:) from:sender]; }
+- (void)findHosts:(id)sender {
+    (void)sender;
+    if (_terminationPending || !_main || _main.window.attachedSheet) return;
+    [self showSection:@"Hosts"];
+    [_main focusSearch];
+}
+- (void)refresh:(id)sender {
+    NSString *section = self.currentSection;
+    if ([section isEqual:@"Hosts"]) [NSApp sendAction:@selector(refresh:) to:_hostsPage from:sender];
+    else if ([section isEqual:@"Identity"]) [NSApp sendAction:@selector(refresh:) to:_identity from:sender];
+    else if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local refreshSection:section];
+}
+- (void)openHelp:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDHelpURL]]; }
+- (void)reportIssue:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDIssuesURL]]; }
+- (BOOL)validateMenuItem:(NSMenuItem *)item { return [self validateUserInterfaceItem:item]; }
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+    SEL action = item.action;
+    if (_terminationPending) return action == @selector(openHelp:) || action == @selector(reportIssue:);
+    if (action == @selector(showSection:)) {
+        if ([(id)item isKindOfClass:NSMenuItem.class])
+            ((NSMenuItem *)item).state = [[(NSMenuItem *)item representedObject] isEqual:self.currentSection] ? NSControlStateValueOn : NSControlStateValueOff;
+        return _main != nil && !_main.window.attachedSheet;
+    }
+    if (action == @selector(refresh:)) {
+        NSString *section = self.currentSection;
+        if ([section isEqual:@"Hosts"]) return [_hostsPage validateUserInterfaceItem:item];
+        if ([section isEqual:@"Identity"]) return [_identity validateUserInterfaceItem:item];
+        if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) return [_local canRefreshSection:section];
+        return NO;
+    }
+    SEL hosts[] = {@selector(connectToHost:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(findHosts:)};
+    SEL forwarded[] = {@selector(focusHostEntry:), @selector(scanQR:), @selector(importHosts:), @selector(exportHosts:), @selector(focusSearch:)};
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(*hosts); ++i) if (action == hosts[i]) {
+        if (!self.canNavigateToHosts) return NO;
+        /* From another section the command takes you to Hosts; on Hosts the
+         * page decides. */
+        return ![self.currentSection isEqual:@"Hosts"] || [_hostsPage canPerform:forwarded[i]];
+    }
+    return [self respondsToSelector:action];
+}
+- (BOOL)validateToolbarItem:(NSToolbarItem *)item { return [self validateUserInterfaceItem:item]; }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app { (void)app; return YES; }
 - (void)finishTermination {
     if (_terminationReplied) return;
@@ -182,10 +395,7 @@ int main(int argc, const char *argv[]) {
         signal(SIGPIPE,SIG_IGN); signal(SIGTERM,SIG_IGN);
         NSApplication *app=NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSMenu *menu=[NSMenu new]; NSMenuItem *appItem=[NSMenuItem new]; [menu addItem:appItem];
-        appItem.submenu=[[NSMenu alloc] initWithTitle:@"Metadesk Manager"];
-        [appItem.submenu addItemWithTitle:@"Quit Metadesk Manager" action:@selector(terminate:) keyEquivalent:@"q"];
-        app.mainMenu=menu;
+        [MDManagerApp installMainMenu:app];
         __attribute__((objc_precise_lifetime)) MDManagerApp *delegate=[MDManagerApp new];
         delegate.smokeQuit = argc == 2 && !strcmp(argv[1], "--smoke-quit");
         app.delegate=delegate; [app run];

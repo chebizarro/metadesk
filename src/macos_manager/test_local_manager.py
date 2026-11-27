@@ -112,7 +112,8 @@ with tempfile.TemporaryDirectory(prefix='md-local-', dir='/private/tmp') as root
         subprocess.run([sys.argv[2], '--accounts'], env=env, check=True, timeout=20)
     elif sys.argv[1] == '--pages':
         env.update(XDG_CONFIG_HOME=str(directory), XDG_STATE_HOME=str(directory), XDG_CACHE_HOME=str(directory))
-        sys.exit(subprocess.run([sys.argv[2], str(directory / 'accounts')], env=env, timeout=20).returncode)
+        # An optional third argument selects a part (e.g. "journeys"); the suite runs everything.
+        sys.exit(subprocess.run([sys.argv[2], str(directory / 'accounts'), *sys.argv[3:4]], env=env, timeout=60).returncode)
     else:
         path = directory / 'host.sock'
         with ThreadingHost(str(path), Handler) as host:

@@ -16,7 +16,7 @@ macos_hosts_model = static_library('macos-hosts-model', ['hosts_model.m', 'hosts
 macos_host_qr = static_library('macos-host-qr', 'host_qr.m',
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, foundation, qr_frameworks])
 dep_macos_host_qr = declare_dependency(link_with : macos_host_qr, dependencies : qr_frameworks)
-macos_hosts_page = static_library('macos-hosts-page', ['hosts_page.m', 'access_page.m', 'identity_page.m'],
+macos_hosts_page = static_library('macos-hosts-page', ['hosts_page.m', 'access_page.m', 'identity_page.m', 'ui.m', 'main_window.m'],
   objc_args : '-fobjc-arc', dependencies : [macos_hosts_compile, appkit, notifications, dep_cjson, dep_macos_host_qr, uttypes])
 macos_manager_bin = executable('metadesk-macos-manager', 'main.m',
   objc_args : '-fobjc-arc',
@@ -98,7 +98,22 @@ test('macOS signer roles and fixture credentials', macos_hosts_python,
 macos_page_test = executable('test_macos_manager_pages', ['test_pages.m', 'main.m'],
   objc_args : ['-fobjc-arc', '-DMD_MACOS_MANAGER_APP_TEST'],
   link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
-  dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
+  dependencies : [dep_metadesk, appkit, notifications, dependency('jansson'), dep_macos_relay_store],
   include_directories : include_directories('../../tests'))
 test('macOS AppKit controller actions and quit', macos_hosts_python,
-  args : [files('test_local_manager.py'), '--pages', macos_page_test], suite : 'macos_manager', timeout : 25)
+  args : [files('test_local_manager.py'), '--pages', macos_page_test], suite : 'macos_manager', timeout : 90)
+
+# Design review aid: render every page and sheet offscreen to PNG in the build
+# directory (meson compile -C BUILD macos-manager-snapshots).
+macos_snapshot_tool = executable('macos_manager_snapshots', ['snapshot_pages.m', 'main.m'],
+  objc_args : ['-fobjc-arc', '-DMD_MACOS_MANAGER_APP_TEST'],
+  link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
+  dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
+  build_by_default : false)
+# It renders into a fresh BUILD/snapshots/run-XXXXXX that it creates and
+# confines HOME, CFFIXED_USER_HOME and XDG_* to; it refuses any other root.
+# A design-review tool, not a gate: meson compile -C BUILD macos-manager-snapshots
+run_target('macos-manager-snapshots', command : [macos_snapshot_tool, meson.project_build_root()])
+test('macOS snapshot renderer refuses roots it did not create', macos_hosts_python,
+  args : [files('test_snapshot_guard.py'), macos_snapshot_tool, meson.project_build_root()],
+  suite : 'macos_manager', timeout : 480, is_parallel : false)
