@@ -73,13 +73,20 @@ BOOL MDContainsSecretKey(NSString *text) {
     return NO;
 }
 static BOOL LiteralCommand(SEL action) {
+    /* Look Up, Translate, Search With Google and Share hand the text to
+     * another service; Writing Tools and the selection replacers rewrite it. */
+    NSString *name = NSStringFromSelector(action);
+    if ([name hasPrefix:@"_rvMenuItem"] || [name hasPrefix:@"_searchWith"] || [name hasPrefix:@"_performStandardShare"] ||
+        [name containsString:@"WritingTools"] || [name containsString:@"lookUp"] || [name containsString:@"LookUp"]) return YES;
     SEL commands[] = {
         @selector(toggleAutomaticQuoteSubstitution:), @selector(toggleAutomaticDashSubstitution:),
         @selector(toggleAutomaticTextReplacement:), @selector(toggleAutomaticSpellingCorrection:),
         @selector(toggleContinuousSpellChecking:), @selector(toggleGrammarChecking:), @selector(toggleSmartInsertDelete:),
         @selector(toggleAutomaticLinkDetection:), @selector(toggleAutomaticDataDetection:), @selector(toggleAutomaticTextCompletion:),
         @selector(orderFrontSubstitutionsPanel:), @selector(uppercaseWord:), @selector(lowercaseWord:), @selector(capitalizeWord:),
-        @selector(checkSpelling:), @selector(showGuessPanel:), @selector(complete:)};
+        @selector(checkSpelling:), @selector(showGuessPanel:), @selector(complete:),
+        @selector(replaceQuotesInSelection:), @selector(replaceDashesInSelection:), @selector(replaceTextInSelection:),
+        @selector(showWritingTools:), @selector(quickLookPreviewItems:)};
     for (size_t i = 0; i < sizeof commands / sizeof *commands; ++i) if (commands[i] == action) return YES;
     return NO;
 }
@@ -112,7 +119,13 @@ NSMenu *MDLiteralMenu(NSMenu *menu, BOOL typedOnly) { if (menu) Filter(menu, typ
     self.automaticDashSubstitutionEnabled = NO; self.automaticTextReplacementEnabled = NO;
     self.automaticDataDetectionEnabled = NO; self.automaticLinkDetectionEnabled = NO;
     self.smartInsertDeleteEnabled = NO;
+    if (@available(macOS 15.0, *)) self.writingToolsBehavior = NSWritingToolsBehaviorNone;
 }
+- (void)quickLookWithEvent:(NSEvent *)event { (void)event; } /* no Look Up on keys */
+- (void)showWritingTools:(id)sender { (void)sender; }
+- (void)replaceQuotesInSelection:(id)sender { (void)sender; }
+- (void)replaceDashesInSelection:(id)sender { (void)sender; }
+- (void)replaceTextInSelection:(id)sender { (void)sender; }
 - (instancetype)initWithFrame:(NSRect)frame { if ((self = [super initWithFrame:frame])) [self configure]; return self; }
 - (BOOL)shouldChangeTextInRanges:(NSArray<NSValue *> *)ranges replacementStrings:(NSArray<NSString *> *)strings {
     if (strings.count == ranges.count) {

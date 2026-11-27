@@ -19,9 +19,10 @@ Code, Import Hosts and Export Hosts.
 Cut, Copy, Paste, Delete, Select All, Undo and Redo work in every field and in
 the contextual menu. With a saved host selected, Edit > Copy copies its public
 npub. The manager writes to the pasteboard only when you choose Copy, Cut or
-Copy Public Key. Fields that take a key, fingerprint, name, address or path
-accept text literally: no smart spaces, substitutions, correction or case
-changes, and the contextual menu doesn't offer them. They refuse any text
+Copy Public Key. Fields that take a key, fingerprint, name, address or path,
+including Search Hosts, accept text literally: no smart spaces, substitutions,
+correction, case changes or Writing Tools, and the contextual menu doesn't offer
+them, or Look Up, Translate, Search With Google or Share. They refuse any text
 containing a private key (`nsec`, `ncryptsec`, also after `nostr:`) before it
 is entered, however it arrives — typing, Paste, drag and drop or a Service — so
 it is never shown, stored or recoverable with Undo or Redo; the page says why.
@@ -83,7 +84,8 @@ same relay vectors and exchanges real files between both implementations.
    account, assign the client role, unlock the signer, re-import a remote
    signer pairing, or free the private cache. Relay setup lives in the
    **Relays** section (Hosts links to it): enter explicit bootstrap relay URLs
-   separated by spaces and choose **Save and Sync**. Afterwards View > Refresh
+   separated by spaces and choose **Save and Sync**. Confirmations and results
+   for that save appear in the Relays section. Afterwards View > Refresh
    syncs again. Without relays, or while they are unreachable or catching up,
    Hosts shows cached hosts and explains why reviewing and connecting wait. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
@@ -134,10 +136,13 @@ fingerprint. It does not contact the signer or check whether the host is running
 
 When you open This Computer or Access, the manager connects to the saved host
 role's standard [management socket](host-management.md#endpoint-and-peer-trust)
-automatically; **Use a custom management socket** takes an absolute path
-instead. Status comes from an authenticated live subscription. Choose **Try
-Again** (or View > Refresh) after a host restart or loss of the socket. Without
-a host role, the page says so and links to Identity.
+automatically, and again whenever the host role is assigned, switched or
+removed in Identity (removing it disconnects). **Use a custom management
+socket** takes an absolute path instead; it is an explicit choice and works
+with or without a host role, over the same authenticated same-user connection.
+Status comes from an authenticated live subscription. Choose **Try Again** (or
+View > Refresh) after a host restart or loss of the socket. Without a host role,
+the page says so and links to Identity.
 A reachable managed process is not proof of LaunchAgent registration, permission,
 or capture readiness. If unreachable, the agent's process state is unknown.
 **Disconnect Session** ends the slot without changing remembered access; an
@@ -265,7 +270,10 @@ replacement and the trust sheets' button roles; access defaults and stale
 requests; wrong-key signer refusal; and quit while a worker is active.
 `meson compile -C BUILD macos-manager-snapshots` renders every section, sheet
 and first-run state offscreen into a fresh `BUILD/snapshots/run-XXXXXX/out`
-for design review; it refuses any root but a meson build directory. It uses
+for design review; it refuses any root but a meson build directory and keeps
+its home, configuration, state and runtime directories inside that run. The
+suite's renderer guard performs one such isolated render and checks every
+artifact. It uses
 no synthetic input or permissions. The separate `account_keychain` test uses
 an explicit private file Keychain and checks it never appears in the search list.
 Neither fixture qualifies the signed or on-screen workflows above.

@@ -12,4 +12,6 @@
 - (void)refresh:(id)sender;
 /* Opens Add Signer Account now, or as soon as accounts have loaded. */
 - (void)beginAddAccount;
+/* Called on the main queue after any accounts or roles reload. */
+@property(nonatomic, copy) dispatch_block_t accountsChanged;
 @end

@@ -233,6 +233,7 @@ static NSString *SignerTitle(NSDictionary *a) {
                     [self render];
                     if (suspend) [self->_hosts resumeAfterRoleEdit];
                     if (self->_pendingAdd) { self->_pendingAdd = NO; [self add:nil]; }
+                    if (self.accountsChanged) self.accountsChanged();
                 }
                 dispatch_group_leave(self->_drain);
             });

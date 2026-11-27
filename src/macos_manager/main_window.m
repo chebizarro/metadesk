@@ -1,4 +1,5 @@
 #import "main_window.h"
+#import "ui.h"
 
 static NSString *const RefreshItem = @"dev.metadesk.manager.refresh";
 static NSString *const SearchItem = @"dev.metadesk.manager.search";
@@ -109,6 +110,7 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
 @end
 
 @implementation MDMainWindowController {
+    MDKeyEditor *_searchEditor;
     MDSidebarController *_sidebar;
     MDContentController *_content;
     NSSplitViewController *_split;
@@ -161,6 +163,14 @@ static NSString *const SearchItem = @"dev.metadesk.manager.search";
     return self;
 }
 - (NSString *)currentSection { return _current.identifier; }
+/* Search Hosts accepts keys and names, so it gets the same literal,
+ * secret-refusing field editor as every other key field. */
+- (id)windowWillReturnFieldEditor:(NSWindow *)sender toObject:(id)client {
+    (void)sender;
+    if (![client isKindOfClass:NSSearchField.class]) return nil;
+    if (!_searchEditor) _searchEditor = [[MDKeyEditor alloc] initWithFrame:NSZeroRect];
+    return _searchEditor;
+}
 - (NSSearchField *)searchField { return _search.searchField; }
 - (void)showSection:(NSString *)identifier {
     for (NSUInteger i = 0; i < _sections.count; ++i) if ([_sections[i].identifier isEqual:identifier]) {

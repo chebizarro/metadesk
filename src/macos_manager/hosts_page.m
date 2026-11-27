@@ -133,7 +133,8 @@ static NSTextField *Field(NSString *placeholder, NSString *value) {
     MDSetupPanel *_setup;
     NSView *_content, *_relayView;
     NSTextField *_relayField, *_directoryField, *_noSelection;
-    MDStatusView *_relayStatus;
+    MDStatusView *_relayStatus, *_relayMessage;
+    BOOL _relayRequest, _identityDirty; /* a save from the Relays section; accounts or roles changed */
     NSInteger _accounts; /* signer accounts known on the worker; -1 unknown */
     MdLaunchMessage _phase;
 }
@@ -276,8 +277,27 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(secretRefused:) name:MDSecretRefusedNotification object:nil];
     [self render];
 }
+/* Sheets and their "is a sheet open?" checks use the main window, whichever
+ * section is showing: Relays and the menu bar act on Hosts while it is not the
+ * visible page. */
+- (NSWindow *)sheetWindow { return self.presentingWindow ?: self.view.window; }
+- (BOOL)blocked {
+    MDHostsState state = _book.state;
+    return !_book || _roleEditing || (state >= MDHostsNoClientRole && state <= MDHostsCacheUnavailable);
+}
 - (void)activate {
     if (!_started) { _started = YES; [self reloadBook:NO]; }
+    else if (_identityDirty) [self identityChanged];
+}
+/* Accounts or roles changed in Identity. First-run guidance depends on them,
+ * so a blocked page reopens (an open, syncing book is left alone: role changes
+ * already suspend and resume it). */
+- (void)identityChanged {
+    _identityDirty = YES;
+    if (!_started || self.closing || _roleEditing) return;
+    if (_busy) return; /* run: rechecks when it finishes */
+    if (!_book || self.blocked) { _identityDirty = NO; [self reloadBook:NO]; }
+    else _identityDirty = NO;
 }
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
     _roleEditing = YES; ++_generation; _book = nil; [self render];
@@ -340,6 +360,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (self->_roleEditing) return;
             if (book) [self showBook:book];
             if (done) done(result);
+            if (self->_identityDirty) [self identityChanged];
             if (atomic_load(&self->_dirty)) [self scheduleSnapshot];
         });
     } });
@@ -398,7 +419,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (_accounts == 0)
                 [_setup showSymbol:@"person.crop.circle.badge.plus" title:@"Add Your Signer Account"
                     text:@"Metadesk reads your encrypted host list and connects using an account in your external signer, such as a remote (NIP-46) or local (NIP-5F) signer. Add that account’s public key to get started."
-                    primary:MDProminentButton(@"Add Signer Account…", self, @selector(addSignerAccount:)) secondary:nil working:NO];
+                    primary:MDProminentButton(@"Add Signer Account…", self, @selector(beginAddingSignerAccount:)) secondary:nil working:NO];
             else
                 [_setup showSymbol:@"person.crop.circle.badge.checkmark" title:@"Choose an Account for Connecting"
                     text:@"None of your signer accounts is set up for connecting yet. In Identity, select one and choose Use for Client; your signer will be asked to prove it holds the key."
@@ -638,7 +659,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)focusHostEntry:(id)sender {
     (void)sender;
-    if ([self canPerform:_cmd]) [self.view.window makeFirstResponder:_address];
+    if ([self canPerform:_cmd]) [self.sheetWindow makeFirstResponder:_address];
 }
 - (void)focusSearch:(id)sender { (void)sender; }
 - (void)setSearchText:(NSString *)text {
@@ -651,11 +672,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
  * handlers themselves (which also run when invoked from a menu or the app).
  * Buttons ignore the sheet check: a sheet already blocks their window. */
 - (BOOL)can:(SEL)action sheet:(BOOL)checkSheet {
-    BOOL open = !self.closing && !_roleEditing && !(checkSheet && self.view.window.attachedSheet);
+    BOOL open = !self.closing && !_roleEditing && !(checkSheet && self.sheetWindow.attachedSheet);
     BOOL idle = open && !_busy;
     NSDictionary *row = self.selected;
-    if (action == @selector(focusHostEntry:)) return open;
-    if (action == @selector(focusSearch:) || action == @selector(editRelays:)) return !self.closing;
+    if (action == @selector(focusHostEntry:)) return open && !self.blocked; /* the Host field is hidden behind a first-run panel */
+    if (action == @selector(focusSearch:) || action == @selector(editRelays:)) return !self.closing && !(checkSheet && self.sheetWindow.attachedSheet);
     if (action == @selector(refresh:)) return idle;
     if (action == @selector(reviewEntry:) || action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
     if (action == @selector(reviewSaved:)) return idle && !_launched && _book.canReview && row && [_book addressForKey:row[@"key"]];
@@ -670,11 +691,13 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 /* Relay setup has one home, the Relays section; Hosts links to it. */
 - (void)editRelays:(id)sender {
     (void)sender;
-    [NSApp sendAction:@selector(showSection:) to:nil from:@"Relays"];
+    if (self.showRelays) self.showRelays();
     if (_relayField.window) [_relayField.window makeFirstResponder:_relayField];
 }
-- (void)openIdentity:(id)sender { (void)sender; [NSApp sendAction:@selector(showSection:) to:nil from:@"Identity"]; }
-- (void)addSignerAccount:(id)sender { (void)sender; [NSApp sendAction:@selector(addSignerAccount:) to:nil from:self]; }
+/* First-run buttons call the app explicitly; a nil-target action could
+ * resolve back to this controller while it is the visible page. */
+- (void)openIdentity:(id)sender { (void)sender; if (self.showIdentity) self.showIdentity(NO); }
+- (void)beginAddingSignerAccount:(id)sender { (void)sender; if (self.showIdentity) self.showIdentity(YES); }
 - (NSView *)relaySettingsView {
     if (_relayView) return _relayView;
     _relayField = MDKeyField(@"wss://relay.example.com", @"Bootstrap relays");
@@ -682,12 +705,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _directoryField = MDKeyField(@"Default", @"Private state folder");
     _saveRelays = MDButton(@"Save and Sync", self, @selector(saveRelays:));
     _relayStatus = [MDStatusView new];
+    _relayMessage = [MDStatusView new];
     NSStackView *save = MDRow(@[_saveRelays]);
     NSGridView *form = MDForm(@[@[@"Relays", _relayField],
         @[NSNull.null, MDNote(@"Separate several relays with spaces. Nothing is used unless you list it; ws:// addresses are unencrypted. Enter international hostnames in their xn-- form.")],
         @[@"State folder", _directoryField],
         @[NSNull.null, MDNote(@"Leave empty unless you keep a separate private cache.")],
-        @[NSNull.null, save], @[NSNull.null, _relayStatus]]);
+        @[NSNull.null, save], @[NSNull.null, _relayMessage], @[NSNull.null, _relayStatus]]);
+    [_relayMessage setText:nil kind:MDStatusNone];
     _relayView = MDColumn(@[MDHeader(@"Address Book Relays"),
         MDNote(@"Your encrypted host list syncs through these bootstrap relays. The Linux Manager uses the same list."), form], MDRowSpacing);
     return _relayView;
@@ -696,6 +721,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     (void)sender;
     if (_busy || _roleEditing || self.closing) return;
     _relayDraft = _relayField.stringValue; _directoryDraft = _directoryField.stringValue;
+    _relayRequest = YES;
     [self reloadBook:YES];
 }
 - (void)reloadBook:(BOOL)refresh {
@@ -707,7 +733,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     NSString *draft = _relayDraft ?: @"";
     BOOL edited = ![draft isEqual:_savedBootstrap ?: @""];
     NSString *directory = MDHostTrim(_directoryDraft ?: @"");
+    BOOL fromRelays = _relayRequest; _relayRequest = NO;
     [self note:nil kind:MDStatusNone];
+    if (fromRelays) [_relayMessage setText:@"Saving relays…" kind:MDStatusWorking];
     [self run:^id(MDHostsWorker *worker) {
         NSString *configError = nil, *cacheError = nil;
         NSString *saved = MDHostsBootstrap(nil, &configError);
@@ -732,9 +760,13 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         }
         self->_accounts = [result[4] integerValue];
         self->_syncPaused = [result[3] boolValue];
-        [self note:result[1] kind:MDStatusError];
+        NSString *error = result[1];
+        if (fromRelays) [self->_relayMessage setText:error.length ? error : [result[2] boolValue] ? nil :
+            [result[0] isEqual:@""] ? @"Relays cleared. Nothing will sync until you add one." : @"Relays saved. Syncing…"
+            kind:error.length ? MDStatusError : MDStatusOK];
+        else [self note:error kind:MDStatusError];
         [self render];
-        NSWindow *window = self.view.window;
+        NSWindow *window = self.sheetWindow;
         if (![result[2] boolValue] || !window || window.attachedSheet) return;
         MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Replace Unreadable Relay Settings?"
             message:@"Metadesk couldn’t read the saved relay settings file. Replace it with the relays in Address Book Relays? If that list is empty, every saved relay is removed. "
@@ -744,8 +776,10 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [sheet addButton:@"Keep Existing File" role:MDSheetCancel response:NSAlertFirstButtonReturn];
         [sheet makeCancelAlsoDefault];
         [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
-            if (response == NSAlertSecondButtonReturn && generation == self->_generation)
+            if (response == NSAlertSecondButtonReturn && generation == self->_generation) {
+                self->_relayRequest = fromRelays;
                 [self reloadBook:YES replaceUnreadable:YES];
+            } else if (fromRelays) [self->_relayMessage setText:@"The saved relay file was kept unchanged." kind:MDStatusInfo];
         }];
     }];
 }
@@ -774,7 +808,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)scanQR:(id)sender {
     (void)sender;
-    NSWindow *window = self.view.window;
+    NSWindow *window = self.sheetWindow;
     if (![self canPerform:_cmd] || !window) return;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = NO;
@@ -816,7 +850,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
  * button answers Return; Escape cancels or keeps the saved key. A changed key
  * offers only Keep Old Key or Replace Key, which needs the exact fingerprint. */
 - (void)presentReview:(MDHostReview *)review {
-    NSWindow *window = self.view.window;
+    NSWindow *window = self.sheetWindow;
     if (!window || window.attachedSheet || self.closing) return;
     BOOL mismatch = review.oldKey != nil;
     NSUInteger generation = _generation;
@@ -943,7 +977,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)edit:(id)sender {
     (void)sender;
     NSDictionary *row = self.selected;
-    NSWindow *window = self.view.window;
+    NSWindow *window = self.sheetWindow;
     if (![self canPerform:_cmd] || !window) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
@@ -975,11 +1009,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             } done:^(NSString *message) { [self noteResult:message success:remove ? @"Host removed." : @"Host updated."]; }];
         };
         if (response == NSAlertSecondButtonReturn) edit(NO);
-        else if (response == NSAlertThirdButtonReturn && self.view.window) {
+        else if (response == NSAlertThirdButtonReturn && self.sheetWindow) {
             NSAlert *remove = MDAlert([NSString stringWithFormat:@"Remove “%@” from Your Hosts?", MDHostBoundText(row[@"title"], 64)],
                 @"This removes the saved host, its notes and its tags from your address book. It doesn’t revoke any access the host has given you.");
             MDAlertDestructive(remove, @"Remove Host");
-            [remove beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse confirm) {
+            [remove beginSheetModalForWindow:self.sheetWindow completionHandler:^(NSModalResponse confirm) {
                 if (confirm == NSAlertSecondButtonReturn && generation == self->_generation && !self.closing) edit(YES);
             }];
         }
@@ -1010,8 +1044,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }
     [self run:^id(MDHostsWorker *worker) { (void)worker; return [book conflictText:coordinate]; }
         done:^(NSString *text) {
-        if (!text || !self.view.window) return;
-        NSWindow *window = self.view.window;
+        if (!text || !self.sheetWindow) return;
+        NSWindow *window = self.sheetWindow;
         if (window.attachedSheet) return;
         MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Resolve a Sync Conflict"
             message:@"Your edit and a newer version from another device changed the same part of your address book. "
@@ -1043,14 +1077,14 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)importHosts:(id)sender {
     (void)sender;
-    if (![self canPerform:_cmd] || !self.view.window) return;
+    if (![self canPerform:_cmd] || !self.sheetWindow) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = NO; panel.allowsMultipleSelection = NO;
     panel.message = @"Choose a metadesk-hosts/1 file exported from Metadesk.";
     panel.prompt = @"Review";
-    [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
+    [panel beginSheetModalForWindow:self.sheetWindow completionHandler:^(NSModalResponse response) {
         if (response != NSModalResponseOK || self.closing || generation != self->_generation) return;
         NSURL *url = panel.URL;
         [self run:^id(MDHostsWorker *worker) { return [worker readImport:url book:book]; }
@@ -1061,7 +1095,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     }];
 }
 - (void)reviewImport:(NSArray *)rows book:(MDHostsBook *)book {
-    NSWindow *window = self.view.window;
+    NSWindow *window = self.sheetWindow;
     if (!window || window.attachedSheet) return;
     MDSheet *sheet = [[MDSheet alloc] initWithTitle:@"Import Hosts"
         message:@"Choose only hosts whose fingerprints you recognize. NIP-05 names in a file aren’t verified, and hosts you’ve already saved won’t change."
@@ -1083,18 +1117,18 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)exportHosts:(id)sender {
     (void)sender;
-    if (![self canPerform:_cmd] || !self.view.window) return;
+    if (![self canPerform:_cmd] || !self.sheetWindow) return;
     MDHostsBook *book = _book;
     NSUInteger generation = _generation;
     NSAlert *alert = MDAlert(@"Export Hosts as Plain Text?",
         @"Anyone who can read the file will see your hosts’ public keys, labels and notes. It doesn’t contain anything that lets someone connect, and no access grants.");
     MDAlertConfirm(alert, @"Export…");
-    [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse response) {
-        if (response != NSAlertFirstButtonReturn || self.closing || generation != self->_generation || !self.view.window) return;
+    [alert beginSheetModalForWindow:self.sheetWindow completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn || self.closing || generation != self->_generation || !self.sheetWindow) return;
         NSSavePanel *panel = [NSSavePanel savePanel]; panel.nameFieldStringValue = @"metadesk-hosts.json";
         panel.allowedContentTypes = @[UTTypeJSON];
         panel.message = @"The export is plain text.";
-        [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse selected) {
+        [panel beginSheetModalForWindow:self.sheetWindow completionHandler:^(NSModalResponse selected) {
             if (selected != NSModalResponseOK || self.closing || generation != self->_generation) return;
             NSURL *url = panel.URL;
             [self run:^id(MDHostsWorker *worker) { return [worker exportBook:book to:url]; }

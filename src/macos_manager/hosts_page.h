@@ -20,6 +20,14 @@
 - (BOOL)canPerform:(SEL)action;
 /* Relay setup, hosted by the Relays section (its one home). */
 - (NSView *)relaySettingsView;
+/* The main window: sheets are presented on it, and its attached sheet gates
+ * commands, whichever section is visible. */
+@property(nonatomic, weak) NSWindow *presentingWindow;
+/* First-run navigation, called explicitly (never through a nil target). */
+@property(nonatomic, copy) void (^showIdentity)(BOOL addAccount);
+@property(nonatomic, copy) dispatch_block_t showRelays;
+/* Accounts or roles changed: re-evaluate first-run guidance. */
+- (void)identityChanged;
 /* Test seam: counts saved signer accounts on the worker queue. */
 @property(nonatomic, copy) NSUInteger (^accountCount)(void);
 - (BOOL)validateToolbarItem:(NSToolbarItem *)item;

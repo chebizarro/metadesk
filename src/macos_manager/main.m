@@ -210,6 +210,20 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
         if (!app) return; /* a late timer tick after the app delegate is gone */
         [app->_main setBadge:count ? [NSString stringWithFormat:@"%lu", (unsigned long)count] : nil forSection:@"Access"];
     };
+    _hostsPage.presentingWindow=_main.window;
+    _hostsPage.showIdentity=^(BOOL add) {
+        MDManagerApp *app=weakSelf;
+        if (!app) return;
+        [app showSection:@"Identity"];
+        if (add) [app->_identity beginAddAccount];
+    };
+    _hostsPage.showRelays=^{ [weakSelf showSection:@"Relays"]; };
+    _identity.accountsChanged=^{
+        MDManagerApp *app=weakSelf;
+        if (!app) return;
+        [app->_hostsPage identityChanged];
+        [app->_local identityChanged];
+    };
     [_main showSection:@"This Computer"];
     return _main.window;
 }
@@ -219,7 +233,10 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     if ([section isEqual:@"Identity"]) [_identity activate];
     if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local activate];
 }
-- (void)searchChanged:(NSString *)text { [_hostsPage setSearchText:text]; }
+- (void)searchChanged:(NSString *)text {
+    if (MDContainsSecretKey(text)) { _main.searchField.stringValue=@""; text=@""; } /* backstop */
+    [_hostsPage setSearchText:text];
+}
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     [self makeMainWindow];
@@ -281,13 +298,6 @@ static NSMenu *Submenu(NSMenu *bar, NSString *title) {
     if ([section isEqual:@"Hosts"]) [NSApp sendAction:@selector(refresh:) to:_hostsPage from:sender];
     else if ([section isEqual:@"Identity"]) [NSApp sendAction:@selector(refresh:) to:_identity from:sender];
     else if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) [_local refreshSection:section];
-}
-/* First-run step from Hosts: open Identity and start adding an account. */
-- (void)addSignerAccount:(id)sender {
-    (void)sender;
-    if (_terminationPending || !_main) return;
-    [self showSection:@"Identity"];
-    [_identity beginAddAccount];
 }
 - (void)openHelp:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDHelpURL]]; }
 - (void)reportIssue:(id)sender { (void)sender; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:MDIssuesURL]]; }

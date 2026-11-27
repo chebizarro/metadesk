@@ -11,6 +11,12 @@
 - (BOOL)canRefreshSection:(NSString *)section;
 /* First shown: connect to the saved host role's standard socket. */
 - (void)activate;
+/* A host role may have changed: discover the standard socket again (unless the
+ * user chose a custom socket, which works with or without a host role). */
+- (void)identityChanged;
+/* Discovery seam (tests, renderer). Runs off the main queue; returns the
+ * standard socket path and sets *hasRole. Default reads the saved host role. */
+@property(nonatomic, copy) NSString *(^discover)(BOOL *hasRole);
 /* Opens the review for exactly this request token (a notification's), or
  * does nothing if it is no longer pending. */
 - (void)openRequest:(NSString *)token;

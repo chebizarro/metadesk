@@ -63,7 +63,10 @@ static const uint32_t Caps[] = {MD_CAP_VIDEO, MD_CAP_AGENT, MD_CAP_INPUT, MD_CAP
     NSButton *_retry, *_openIdentity, *_advanced;
     NSView *_customRow;
     NSString *_defaultPath;          /* standard socket for the saved host role */
-    BOOL _located, _noHostRole, _activated, _custom;
+    NSString *_linkPath;             /* what the link was last asked to connect to */
+    NSUInteger _discovery;           /* fences discovery completions from an earlier role */
+    dispatch_queue_t _discoveryQueue; /* serial: requests are answered in order */
+    BOOL _located, _noHostRole, _activated, _custom, _locating;
     id _policyGeneration;            /* remembered clients loaded for this generation */
     MDStatusView *_status, *_accessStatus, *_screen, *_ax;
     NSTableView *_requests, *_clients;
@@ -184,26 +187,50 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     _activated = YES;
     [self locateAndConnect];
 }
+/* Finds the saved host role's standard socket on a background queue. A newer
+ * request (after a role change) supersedes any discovery still running. */
+static NSString *DefaultDiscovery(BOOL *hasRole) {
+    MdAccounts *accounts = NULL; NSString *path = nil;
+    *hasRole = NO;
+    if (!md_accounts_open_snapshot(NULL, NULL, &accounts)) {
+        const MdAccount *host = md_accounts_role(accounts, MD_ACCOUNT_HOST);
+        char buffer[1024];
+        if (host) { *hasRole = YES; if (!md_management_path(host->pubkey, buffer, sizeof buffer)) path = @(buffer); }
+        md_accounts_destroy(accounts);
+    }
+    return path;
+}
 - (void)locateAndConnect {
-    if (_closed || _busy) return;
-    _busy = YES; [self showStatus:@"Looking for the host on this Mac…"]; [self render];
+    if (_closed) return;
+    NSUInteger epoch = ++_discovery;
+    _locating = YES;
+    if (!_snapshot) { [self showStatus:@"Looking for the host on this Mac…"]; [self render]; }
     __weak MDLocalHostPages *weakSelf = self;
-    dispatch_group_async(_qrWork, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
-        MdAccounts *accounts = NULL; NSString *path = nil; BOOL role = NO;
-        if (!md_accounts_open_snapshot(NULL, NULL, &accounts)) {
-            const MdAccount *host = md_accounts_role(accounts, MD_ACCOUNT_HOST);
-            char buffer[1024];
-            if (host) { role = YES; if (!md_management_path(host->pubkey, buffer, sizeof buffer)) path = @(buffer); }
-            md_accounts_destroy(accounts);
-        }
+    NSString *(^discover)(BOOL *) = self.discover;
+    if (!_discoveryQueue) _discoveryQueue = dispatch_queue_create("metadesk.manager.host-discovery", DISPATCH_QUEUE_SERIAL);
+    dispatch_group_async(_qrWork, _discoveryQueue, ^{ @autoreleasepool {
+        BOOL role = NO;
+        NSString *path = discover ? discover(&role) : DefaultDiscovery(&role);
         dispatch_async(dispatch_get_main_queue(), ^{
             MDLocalHostPages *page = weakSelf;
-            if (!page || page->_closed) return;
-            page->_busy = NO; page->_located = YES; page->_noHostRole = !role; page->_defaultPath = path;
-            if (path && !page->_custom) { page->_endpoint.placeholderString = path; [page connectTo:path]; }
-            else { [page showStatus:nil]; [page render]; }
+            if (!page || page->_closed || epoch != page->_discovery) return; /* superseded */
+            page->_locating = NO; page->_located = YES; page->_noHostRole = !role; page->_defaultPath = path;
+            if (page->_custom) { [page showStatus:nil]; [page render]; return; }
+            if (path) {
+                page->_endpoint.placeholderString = path;
+                if (![path isEqual:page->_linkPath] || !page->_snapshot) [page connectTo:path];
+            } else {
+                /* No host role now: drop a link that followed the previous role. */
+                if (page->_linkPath.length) { page->_snapshot = nil; page->_policy = nil; page->_permissions = nil; page->_linkPath = nil; [page->_link connect:@""]; }
+                [page showStatus:nil]; [page render];
+            }
         });
     } });
+}
+/* A host role may have been assigned, switched or removed. */
+- (void)identityChanged {
+    if (_closed || !_activated || _custom) return;
+    [self locateAndConnect];
 }
 - (void)reconnect:(id)sender {
     (void)sender;
@@ -362,7 +389,7 @@ static NSTableView *AccessTable(id owner, NSString *label) {
 - (void)showStatus:(NSString *)status {
     MDStatusKind kind = _busy ? MDStatusWorking : _snapshot ? MDStatusOK : status.length ? MDStatusWarning : MDStatusInfo;
     NSString *text = status;
-    if (!text.length) text = !_located ? @"Not connected." : _noHostRole ? @"This Mac doesn’t have a host role yet. Assign one in Identity to share this Mac."
+    if (!text.length) text = _locating && !_located ? @"Looking for the host on this Mac…" : !_located ? @"Not connected." : _noHostRole ? @"This Mac doesn’t have a host role yet. Assign one in Identity to share this Mac."
         : @"The host isn’t running, or isn’t reachable at its standard location.";
     if (_located && _noHostRole && !_snapshot && !_busy) kind = MDStatusInfo;
     [_status setText:text kind:kind];
@@ -374,7 +401,10 @@ static NSTableView *AccessTable(id owner, NSString *label) {
 - (void)received:(NSString *)status snapshot:(NSDictionary *)s policy:(NSDictionary *)p permissions:(NSDictionary *)perms busy:(BOOL)busy {
     if (_closed) return;
     _snapshot = s; _policy = p; _permissions = perms; _busy = busy;
-    [self showStatus:status];
+    /* A failed or dropped link is explained by the page's own state (no host
+     * role, or not reachable); the transport detail stays in the tooltip. */
+    [self showStatus:s || busy || !_located ? status : nil];
+    _status.toolTip = s || busy ? nil : status;
     [self render];
     /* Read remembered clients once per host generation, so Access is never
      * waiting on a manual reload. A read, never a change. */
@@ -391,6 +421,7 @@ static NSTableView *AccessTable(id owner, NSString *label) {
     [self connectTo:path.length ? path : _defaultPath ?: @""];
 }
 - (void)connectTo:(NSString *)path {
+    _linkPath = path;
     _snapshot = nil; _policy = nil; _permissions = nil; _busy = YES; _policyGeneration = nil;
     [self showStatus:@"Connecting to the host on this Mac…"];
     [self render]; [_link connect:path];

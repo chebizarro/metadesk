@@ -6,6 +6,7 @@
 #import "main_window.h"
 #import "ui.h"
 #include "md_test.h"
+#import <UserNotifications/UserNotifications.h>
 #include <stdatomic.h>
 #include <unistd.h>
 
@@ -182,6 +183,46 @@ static BOOL HasSecret(NSString *text) {
     NSString *lower = text.lowercaseString;
     return [lower containsString:@"nsec1"] || [lower containsString:@"ncryptsec1"];
 }
+static BOOL Visible(NSView *view) { return view && view.window && !view.isHiddenOrHasHiddenAncestor; }
+static NSView *SetupPanel(NSView *root) { return Find(root,^BOOL(NSView *v){ return [v isKindOfClass:MDSetupPanel.class]; }); }
+static BOOL MenuHasNamed(NSMenu *menu, NSString *prefix) {
+    for (NSMenuItem *item in menu.itemArray)
+        if ((item.action && [NSStringFromSelector(item.action) hasPrefix:prefix]) || (item.submenu && MenuHasNamed(item.submenu, prefix))) return YES;
+    return NO;
+}
+/* A drop driven through NSTextView's own drag-destination methods. It is a
+ * plain object passed as an argument; no event is posted. */
+@interface FixtureDrop : NSObject <NSDraggingInfo>
+@property(strong) NSPasteboard *pasteboard;
+@property(weak) NSWindow *window;
+@property NSPoint location;
+@end
+@implementation FixtureDrop
+@synthesize draggingFormation, animatesToDestination, numberOfValidItemsForDrop, springLoadingHighlight;
+- (NSWindow *)draggingDestinationWindow { return self.window; }
+- (NSDragOperation)draggingSourceOperationMask { return NSDragOperationCopy | NSDragOperationGeneric; }
+- (NSPoint)draggingLocation { return self.location; }
+- (NSPoint)draggedImageLocation { return self.location; }
+- (NSImage *)draggedImage { return nil; }
+- (NSPasteboard *)draggingPasteboard { return self.pasteboard; }
+- (id)draggingSource { return nil; }
+- (NSInteger)draggingSequenceNumber { return 1; }
+- (void)slideDraggedImageTo:(NSPoint)point { (void)point; }
+- (NSArray<NSString *> *)namesOfPromisedFilesDroppedAtDestination:(NSURL *)url { (void)url; return nil; }
+- (void)enumerateDraggingItemsWithOptions:(NSDraggingItemEnumerationOptions)o forView:(NSView *)v classes:(NSArray<Class> *)c
+    searchOptions:(NSDictionary<NSPasteboardReadingOptionKey, id> *)so usingBlock:(void (^)(NSDraggingItem *, NSInteger, BOOL *))b {
+    (void)o; (void)v; (void)c; (void)so; (void)b;
+}
+- (void)resetSpringLoading {}
+@end
+static BOOL Drop(NSTextView *editor, NSPasteboard *pb) {
+    FixtureDrop *drop = [FixtureDrop new]; drop.pasteboard = pb; drop.window = editor.window;
+    drop.location = [editor convertPoint:NSMakePoint(NSMaxX(editor.bounds) - 1, NSMidY(editor.bounds)) toView:nil];
+    if (!([editor draggingEntered:drop] & NSDragOperationCopy)) return NO;
+    BOOL accepted = [editor prepareForDragOperation:drop] && [editor performDragOperation:drop];
+    [editor concludeDragOperation:drop];
+    return accepted;
+}
 static BOOL MenuHas(NSMenu *menu, SEL action) {
     for (NSMenuItem *item in menu.itemArray) if (item.action == action || (item.submenu && MenuHas(item.submenu, action))) return YES;
     return NO;
@@ -192,6 +233,7 @@ static BOOL MenuHas(NSMenu *menu, SEL action) {
 static BOOL Editing(MDManagerApp *app, NSWindow *window, MDHostsPage *page) {
     [app showSection:@"Hosts"];
     NSTextField *address = Field(page.view, @"Host npub");
+    CHECK(Await(^BOOL{ return Visible(address); }));
     CHECK(address && [window makeFirstResponder:address]);
     MDKeyEditor *editor = (MDKeyEditor *)address.currentEditor;
     CHECK([editor isKindOfClass:MDKeyEditor.class] && editor.allowsUndo && window.firstResponder == editor);
@@ -233,8 +275,22 @@ static BOOL Editing(MDManagerApp *app, NSWindow *window, MDHostsPage *page) {
     /* An event object built only as an argument; it is never posted. */
     NSEvent *click = [NSEvent mouseEventWithType:NSEventTypeRightMouseDown location:NSZeroPoint modifierFlags:0 timestamp:0
         windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];
+    editor.string = @"npub1abc"; [editor setSelectedRange:NSMakeRange(0, 4)];
     NSMenu *ownMenu = click ? [editor menuForEvent:click] : nil;
     CHECK(ownMenu != nil);
+    /* P3: Look Up, Translate, Search, Share and Writing Tools are gone... */
+    for (NSString *name in @[@"_rvMenuItem", @"_searchWith", @"_performStandardShare", @"showWritingTools", @"replaceQuotesInSelection"])
+        CHECK(!MenuHasNamed(ownMenu, name));
+    /* ...while a stock field offers Look Up, so the check is meaningful. */
+    NSTextField *stock = [NSTextField textFieldWithString:@"npub1abc"];
+    [window.contentView addSubview:stock];
+    CHECK([window makeFirstResponder:stock]);
+    NSTextView *stockEditor = (NSTextView *)stock.currentEditor;
+    [stockEditor setSelectedRange:NSMakeRange(0, 4)];
+    CHECK(MenuHasNamed([stockEditor menuForEvent:click], @"_rvMenuItem"));
+    [window makeFirstResponder:nil]; [stock removeFromSuperview];
+    CHECK([window makeFirstResponder:address]);
+    editor = (MDKeyEditor *)address.currentEditor;
     for (size_t i = 0; ownMenu && i < sizeof toggles / sizeof *toggles; ++i) CHECK(!MenuHas(ownMenu, toggles[i]));
     editor.string = @""; [window.undoManager removeAllActions];
     [pb releaseGlobally]; MDSetEditingPasteboard(nil);
@@ -257,29 +313,45 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
     MDSetEditingPasteboard(pb);
     /* Setting the string directly bypasses undo; start from a clean stack. */
     editor.string = @""; [key.undoManager removeAllActions]; Turn();
+    /* The drop path is live: a legitimate drop is inserted. */
+    if (!editor.typedOnly) {
+        [pb clearContents]; [pb setString:@"xyz" forType:NSPasteboardTypeString];
+        CHECK(Drop(editor, pb) && [editor.string containsString:@"xyz"]);
+        Turn(); /* close the drop's undo group before clearing the stack */
+        editor.string = @""; [key.undoManager removeAllActions]; Turn();
+    }
     [editor insertText:@"abc" replacementRange:editor.selectedRange]; Turn();
     for (NSString *secret in @[@"nsec1fixturenotakey", @"  nostr:nsec1fixture", @"NSEC1FIXTURE", @"ncryptsec1fixture", @"npub1x nsec1fixture"]) {
         [editor insertText:secret replacementRange:editor.selectedRange];                 /* typing */
         [pb clearContents]; [pb setString:secret forType:NSPasteboardTypeString];
         Choose(key, @selector(paste:));                                                    /* Edit > Paste */
-        [editor readSelectionFromPasteboard:pb type:NSPasteboardTypeString];               /* drag and drop */
-        [editor readSelectionFromPasteboard:pb];                                           /* Services */
+        Drop(editor, pb);                                                                   /* drag and drop */
+        /* Services: readSelectionFromPasteboard: is the NSServicesMenuRequestor
+         * method AppKit calls to insert a Service's result. */
+        [editor readSelectionFromPasteboard:pb];
         Turn();
         CHECK(!HasSecret(editor.string) && !HasSecret(field.stringValue));
     }
     CHECK(!stored);
     if (message) CHECK(LabelContains(messageView, message));
     /* Undo and Redo both run, and neither restores the refused text. */
-    CHECK(Choose(key, @selector(undo:)) && !HasSecret(editor.string) && ![editor.string isEqual:@"abc"]);
-    Turn();
-    CHECK(Choose(key, @selector(redo:)) && [editor.string isEqual:@"abc"]);
-    Turn();
-    /* The only undoable change is the legitimate "abc": one more Undo
-     * empties the field and nothing older remains to restore. */
-    CHECK(Choose(key, @selector(undo:)) && !editor.string.length && !HasSecret(editor.string) && !stored);
-    Turn();
-    CHECK(!Enabled(key, @selector(undo:)));
-    CHECK(Choose(key, @selector(redo:)) && [editor.string isEqual:@"abc"] && !stored);
+    /* Undo walks back to before the legitimate "abc" and Redo forward again;
+     * refused insertions may leave empty undo groups, but no step ever shows
+     * the refused text. */
+    BOOL undone = NO, redone = NO;
+    for (int i = 0; i < 8 && !undone; ++i) {
+        CHECK(Choose(key, @selector(undo:))); Turn();
+        CHECK(!HasSecret(editor.string) && !stored);
+        undone = editor.string.length == 0;
+    }
+    CHECK(undone);
+    for (int i = 0; i < 8 && !redone; ++i) {
+        CHECK(Choose(key, @selector(redo:))); Turn();
+        CHECK(!HasSecret(editor.string) && !stored);
+        redone = [editor.string isEqual:@"abc"];
+    }
+    CHECK(redone);
+    while (Enabled(key, @selector(redo:))) { Choose(key, @selector(redo:)); Turn(); CHECK(!HasSecret(editor.string) && !stored); }
     [NSNotificationCenter.defaultCenter removeObserver:watch];
     editor.string = @""; [key.undoManager removeAllActions];
     [pb releaseGlobally]; MDSetEditingPasteboard(nil);
@@ -299,10 +371,13 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 - (uint8_t)caps { return MD_CAP_VIDEO; }
 @end
 @interface FixtureBook : MDHostsBook
+@property MDHostsState fixtureState;
 @end
 @implementation FixtureBook
-- (BOOL)canReview { return YES; }
-- (BOOL)canEdit { return YES; }
+/* An explicit state: the page shows its content only when ready. */
+- (MDHostsState)state { return self.fixtureState; }
+- (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
+- (BOOL)canEdit { return self.fixtureState == MDHostsSynced; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey!=nil; }
 - (BOOL)canConfirmReview:(MDHostReview *)review fingerprint:(NSString *)fingerprint {
     return [self canReplaceReview:review] && [review.fingerprint isEqual:fingerprint];
@@ -311,6 +386,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 @interface FixtureHosts : MDHostsWorker
 @property NSUInteger resolves,saves,launches,closes;
 @property BOOL mismatch,observeCancellation;
+@property MDHostsState state;
 @property(strong) NSString *input,*confirmation;
 @property(strong) MDHostReview *savedReview,*launchReview;
 @property(copy) dispatch_block_t entered;
@@ -318,7 +394,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 @end
 @implementation FixtureHosts
 - (BOOL)openDirectory:(NSString *)directory error:(NSString **)error { (void)directory; (void)error; return YES; }
-- (MDHostsBook *)snapshot { return [FixtureBook new]; }
+- (MDHostsBook *)snapshot { FixtureBook *b=[FixtureBook new]; b.fixtureState=self.state; return b; }
 - (BOOL)startRelays:(NSString *)urls { (void)urls; return YES; }
 - (MDHostReview *)resolve:(NSString *)value route:(NSString *)route cancelled:(bool (*)(void *))cancelled data:(void *)data error:(NSString **)error {
     (void)route; (void)error;
@@ -349,6 +425,11 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     NSTextField *address=Field(view,@"Host npub");
     NSButton *review=Button(view,@"Review and Connect…");
     CHECK(address && review);
+    /* P4: wait for the ready transition; the controls driven below are the
+     * visible ones, not the content hidden behind the opening panel. */
+    [page activate];
+    CHECK(Await(^BOOL{ return review.enabled && Visible(address); }));
+    CHECK(!Visible(SetupPanel(view)) && Visible(review));
     CHECK(Refuses(window, Field(view,@"Optional IPv4"), view, @"Private keys are not host addresses"));
     CHECK(Refuses(window, address, view, @"Private keys are not host addresses"));
     NSString *config=[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
@@ -451,6 +532,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
 @interface FixtureLink : MDHostLink
 @property(copy) MDHostUpdate push;
 @property(strong) NSMutableArray<NSDictionary *> *commands;
+@property(strong) NSMutableArray<NSString *> *paths;
 @property BOOL closed;
 @end
 @implementation FixtureLink
@@ -458,7 +540,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     MD_CHECK(cmd!=nil && !version); if (cmd) [self.commands addObject:cmd];
 }
 - (void)close:(dispatch_block_t)drained { self.closed=YES; drained(); }
-- (void)connect:(NSString *)path { (void)path; }
+- (void)connect:(NSString *)path { [self.paths addObject:path ?: @""]; }
 @end
 static NSDictionary *Snapshot(NSInteger revision,uint32_t requested, NSTimeInterval expiry, BOOL removed) {
     NSDictionary *r=@{@"request_id":@REQUEST,@"peer":@KEY,@"requested":@(requested),@"granted":@0,
@@ -470,6 +552,30 @@ static NSDictionary *Snapshot(NSInteger revision,uint32_t requested, NSTimeInter
     return @{@"v":@1,@"ok":@YES,@"generation":@GEN,@"revision":@(revision),@"session":NSNull.null,
         @"requests":removed?@[other]:@[r,other],@"supported":@(MD_CAP_VIDEO|MD_CAP_AGENT)};
 }
+/* Stands in for UNNotificationResponse: the delegate reads only these. */
+@interface FixtureRequest : NSObject
+@property(copy) NSString *identifier;
+@end
+@implementation FixtureRequest
+@end
+@interface FixtureNotification : NSObject
+@property(strong) FixtureRequest *request;
+@end
+@implementation FixtureNotification
+@end
+@interface FixtureResponse : NSObject
+@property(strong) FixtureNotification *notification;
+@property(copy) NSString *actionIdentifier;
++ (instancetype)responseWithToken:(NSString *)token opened:(BOOL)opened;
+@end
+@implementation FixtureResponse
++ (instancetype)responseWithToken:(NSString *)token opened:(BOOL)opened {
+    FixtureResponse *r=[FixtureResponse new]; r.notification=[FixtureNotification new];
+    r.notification.request=[FixtureRequest new]; r.notification.request.identifier=token;
+    r.actionIdentifier=opened ? UNNotificationDefaultActionIdentifier : UNNotificationDismissActionIdentifier;
+    return r;
+}
+@end
 static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) {
     NSButton *open=Button(page.accessView,@"Review Request…");
     CHECK(open && !open.enabled);
@@ -511,6 +617,20 @@ static BOOL Access(MDLocalHostPages *page, FixtureLink *link, NSWindow *window) 
     sheet=window.attachedSheet.contentView;
     CHECK(LabelContains(sheet,MDHostFingerprint(@OTHER)) && !LabelContains(sheet,MDHostFingerprint(@KEY)) && requests.selectedRow==1);
     CHECK(EndSheet(window,NSModalResponseCancel) && link.commands.count==1);
+    /* The notification callback itself: B's response opens B's review. */
+    [requests selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    __block BOOL completed=NO;
+    id response=[FixtureResponse responseWithToken:@GEN "/" REQUEST2 opened:YES];
+    [(id<UNUserNotificationCenterDelegate>)page userNotificationCenter:UNUserNotificationCenter.currentNotificationCenter
+        didReceiveNotificationResponse:response withCompletionHandler:^{ completed=YES; }];
+    CHECK(Await(^BOOL{ return completed && window.attachedSheet!=nil; }));
+    CHECK(LabelContains(window.attachedSheet.contentView,MDHostFingerprint(@OTHER)) && requests.selectedRow==1);
+    CHECK(EndSheet(window,NSModalResponseCancel) && link.commands.count==1);
+    /* A dismissed notification opens nothing. */
+    completed=NO;
+    [(id<UNUserNotificationCenterDelegate>)page userNotificationCenter:UNUserNotificationCenter.currentNotificationCenter
+        didReceiveNotificationResponse:(id)[FixtureResponse responseWithToken:@GEN "/" REQUEST2 opened:NO] withCompletionHandler:^{ completed=YES; }];
+    CHECK(Await(^BOOL{ return completed; }) && !window.attachedSheet);
     [requests selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
     [page openRequest:@GEN "/" "0123456789abcdef0123456789abcdef"];
     Turn();
@@ -693,6 +813,176 @@ static BOOL Persistence(MDManagerApp *app, NSWindow *window) {
     CHECK(search && !search.recentsAutosaveName.length && search.maximumRecents==0);
     return YES;
 }
+/* P4: before Hosts is shown it shows the opening panel and nothing is enabled. */
+static BOOL BeforeActivation(MDHostsPage *hosts) {
+    NSView *view=hosts.view;
+    NSButton *review=Button(view,@"Review and Connect…");
+    CHECK(review && !review.enabled && !Button(view,@"Scan QR Code…").enabled);
+    CHECK(!view.window || !Visible(Field(view,@"Host npub")));
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(view);
+    CHECK(panel && !panel.isHidden && [panel.titleLabel.stringValue containsString:@"Opening"]);
+    return YES;
+}
+/* F1: Save and Sync on the Relays page presents its own confirmation and
+ * reports into the Relays page, whichever section is not visible. */
+static BOOL RelaysSave(MDManagerApp *app, NSWindow *window) {
+    [app showSection:@"Relays"];
+    NSView *root=window.contentView;
+    NSTextField *relays=Field(root,@"Bootstrap relays");
+    NSButton *save=Button(root,@"Save and Sync");
+    CHECK(relays && save && Visible(save));
+    NSString *prefs=[[@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"] stringByAppendingPathComponent:@"manager-relays.ini"];
+    NSString *corrupt=@"not a relay preferences file";
+    CHECK([corrupt writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    NSString *(^saved)(void)=^NSString *{ return [NSString stringWithContentsOfFile:prefs encoding:NSUTF8StringEncoding error:NULL]; };
+    relays.stringValue=@"wss://relay-one.fixture.invalid/";
+    /* Cancel keeps the unreadable file. */
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }) && Button(window.attachedSheet.contentView,@"Keep Existing File"));
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    CHECK(Await(^BOOL{ return LabelContains(root,@"kept unchanged"); }) && [saved() isEqual:corrupt]);
+    /* Confirmed replacement writes the relays in the field. */
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    CHECK(EndSheet(window,NSAlertSecondButtonReturn));
+    CHECK(Await(^BOOL{ return [saved() containsString:@"relay-one.fixture.invalid"]; }));
+    CHECK(Await(^BOOL{ return LabelContains(root,@"Relays saved"); }));
+    /* Invalid input is explained in the Relays page and saves nothing. */
+    relays.stringValue=@"https://not-a-relay.fixture.invalid/";
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return LabelContains(root,@"Use ws:// or wss:// URLs"); }) && [saved() containsString:@"relay-one.fixture.invalid"]);
+    CHECK(!window.attachedSheet);
+    /* Clearing removes every relay. */
+    relays.stringValue=@"";
+    CHECK(Await(^BOOL{ return save.enabled; }));
+    [save performClick:nil];
+    CHECK(Await(^BOOL{ return LabelContains(root,@"Relays cleared"); }) && ![saved() containsString:@"relay-one"]);
+    return YES;
+}
+/* F2: first-run guidance follows accounts, and its buttons reach the app. */
+static BOOL Onboarding(MDManagerApp *app, NSWindow *window, MDHostsPage *hosts, FixtureHosts *worker, MDIdentityPage *identity, NSString *directory) {
+    hosts.accountCount=^NSUInteger{ return MDIdentityAccounts(directory,NULL).count; };
+    worker.state=MDHostsNoClientRole;
+    [app showSection:@"Hosts"];
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(hosts.view);
+    CHECK(Await(^BOOL{ return Visible(panel) && [panel.titleLabel.stringValue isEqual:@"Add Your Signer Account"]; }));
+    CHECK(!Visible(Field(hosts.view,@"Host npub")));
+    /* P2: Connect to Host can't focus a hidden field, so it is disabled. */
+    CHECK(!Enabled(window,@selector(connectToHost:)) && !Enabled(window,@selector(importHosts:)));
+    /* The panel's button opens Identity's Add Account sheet. */
+    [panel.primary performClick:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }) && [window.title isEqual:@"Identity"]);
+    NSWindow *sheet=window.attachedSheet;
+    NSTextField *key=Field(sheet.contentView,@"Public key");
+    CHECK(key && [sheet makeFirstResponder:key]);
+    [(NSTextView *)key.currentEditor insertText:@THIRD replacementRange:NSMakeRange(0,0)];
+    NSButton *add=Button(sheet.contentView,@"Add Account");
+    CHECK(add.enabled);
+    [add performClick:nil];
+    CHECK(Await(^BOOL{ return !window.attachedSheet && MDIdentityAccounts(directory,NULL).count==1; }));
+    KeyWindowOverride=window;
+    /* Not assigned yet: Hosts now asks to choose an account, without a visit. */
+    CHECK(Await(^BOOL{ return [panel.titleLabel.stringValue isEqual:@"Choose an Account for Connecting"]; }));
+    [app showSection:@"Hosts"];
+    CHECK(Visible(panel));
+    [panel.primary performClick:nil];
+    CHECK([window.title isEqual:@"Identity"]);
+    /* Back to the ready state for the remaining tests. */
+    static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
+    MdCredentialStore *store=md_credential_store_custom(&ops,NULL);
+    CHECK(!MDIdentityRemove(directory,store,MDIdentityAccounts(directory,NULL).firstObject).length);
+    md_credential_store_destroy(store);
+    [identity refresh:nil];
+    CHECK(Await(^BOOL{ return [identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; }));
+    worker.state=MDHostsSynced;
+    hosts.accountCount=nil;
+    [app showSection:@"Hosts"];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)]; }));
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    CHECK(Await(^BOOL{ return Visible(Field(hosts.view,@"Host npub")) && !Visible(panel); }));
+    return YES;
+}
+/* P1: Search Hosts uses the refusing field editor. P2: with a sheet open in
+ * another section, Hosts commands are disabled. */
+static BOOL SearchAndSheets(MDManagerApp *app, NSWindow *window) {
+    [app showSection:@"Hosts"];
+    MDMainWindowController *controller=window.windowController;
+    NSSearchField *search=controller.searchField;
+    CHECK(Refuses(window, search, nil, nil));
+    [app showSection:@"Identity"];
+    NSAlert *alert=[NSAlert new]; alert.messageText=@"Fixture"; [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:window completionHandler:nil];
+    CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
+    for (NSString *name in @[@"importHosts:", @"exportHosts:", @"scanQR:", @"connectToHost:", @"findHosts:"])
+        CHECK(!Enabled(window, NSSelectorFromString(name)));
+    CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    return YES;
+}
+/* F3: discovery follows host-role changes; late results from an earlier role
+ * are ignored; a custom socket works with no host role. */
+static BOOL ComputerRole(MDManagerApp *app, MDLocalHostPages *local, FixtureLink *link, NSWindow *window, MDIdentityPage *identity) {
+    [app showSection:@"This Computer"];
+    __block NSString *path=nil;
+    __block atomic_int finished=0, calls=0;
+    __block int slowCall=-1; __block NSString *slowAnswer=nil;
+    dispatch_semaphore_t slow=dispatch_semaphore_create(0);
+    /* Discovery requests are answered in order; the call numbered slowCall
+     * blocks until released and then answers slowAnswer. */
+    local.discover=^NSString *(BOOL *role) {
+        int index=atomic_fetch_add(&calls,1);
+        NSString *answer=path;
+        if (index==slowCall) { dispatch_semaphore_wait(slow, dispatch_time(DISPATCH_TIME_NOW, 4*NSEC_PER_SEC)); answer=slowAnswer; }
+        *role=answer!=nil;
+        atomic_fetch_add(&finished,1);
+        return answer;
+    };
+    /* Role changes arrive the way they do in the app: Identity reloads its
+     * accounts and roles, and the app tells This Computer. */
+    BOOL (^roleChanged)(void)=^BOOL{
+        if (!Await(^BOOL{ return [identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; })) return NO;
+        [identity refresh:nil];
+        return YES;
+    };
+    CHECK(roleChanged());
+    CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"doesn’t have a host role"); }));
+    [link.paths removeAllObjects];
+    path=@"/fixture/role-a.sock";
+    CHECK(roleChanged());
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-a.sock"]; }));
+    /* A slow discovery for role B is overtaken by role C. */
+    /* Role B's discovery is slow; the role changes to C before it answers.
+     * B's late answer must be dropped and C used. */
+    CHECK(Await(^BOOL{ return atomic_load(&finished)==atomic_load(&calls); }));
+    int before=atomic_load(&finished);
+    slowCall=atomic_load(&calls); slowAnswer=@"/fixture/role-b.sock";
+    [local identityChanged];
+    path=@"/fixture/role-c.sock";
+    [local identityChanged];
+    dispatch_semaphore_signal(slow);
+    CHECK(Await(^BOOL{ return atomic_load(&finished)==before+2; }));
+    for (int i=0;i<4;++i) Turn();
+    CHECK([link.paths.lastObject isEqual:@"/fixture/role-c.sock"]);
+    CHECK([link.paths.lastObject isEqual:@"/fixture/role-c.sock"] && ![link.paths containsObject:@"/fixture/role-b.sock"]);
+    /* Unassigning the role drops the link and says so. */
+    path=nil;
+    CHECK(roleChanged());
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@""] && LabelContains(local.computerView,@"doesn’t have a host role"); }));
+    /* A custom socket is an explicit choice that works without a host role. */
+    NSTextField *custom=Field(local.computerView,@"Management socket");
+    CHECK(custom);
+    custom.stringValue=@"/fixture/custom.sock";
+    [NSApp sendAction:@selector(connect:) to:local from:nil];
+    CHECK([link.paths.lastObject isEqual:@"/fixture/custom.sock"]);
+    [local identityChanged];
+    Turn();
+    CHECK([link.paths.lastObject isEqual:@"/fixture/custom.sock"]);
+    (void)window;
+    return YES;
+}
 /* B2: the Relays section's host identity field refuses secret keys too. */
 static BOOL RelaysField(MDManagerApp *app, NSWindow *window) {
     [app showSection:@"Relays"];
@@ -702,7 +992,7 @@ static BOOL RelaysField(MDManagerApp *app, NSWindow *window) {
 }
 /* S9: a late pending-request update after the app delegate is gone is ignored. */
 static BOOL LateBadge(void) {
-    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array];
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
     MDLocalHostPages *local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
     MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
@@ -725,10 +1015,12 @@ static BOOL Run(NSString *directory) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
     MDHostsPage *hosts=[[MDHostsPage alloc] initWithWorker:worker];
-    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array];
+    worker.state=MDHostsSynced;
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
     MDLocalHostPages *access=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) {
         link.push=update; return link;
     }];
+    access.discover=^NSString *(BOOL *role) { *role=NO; return nil; };
     FixtureIdentity *identity=[[FixtureIdentity alloc] initWithHosts:hosts directory:directory connect:Connect credentials:^{
         static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
         return md_credential_store_custom(&ops,NULL);
@@ -740,14 +1032,19 @@ static BOOL Run(NSString *directory) {
     KeyWindowOverride=window;
     NSApp.delegate=app; /* as in production: app-level commands resolve here */
     CHECK(Menus());
+    CHECK(BeforeActivation(hosts));
     CHECK(Persistence(app,window));
     [app showSection:@"Hosts"];
     CHECK(Hosts(hosts,worker,window));
     CHECK(Editing(app,window,hosts));
     CHECK(Commands(app,window,hosts));
+    CHECK(SearchAndSheets(app,window));
+    CHECK(Onboarding(app,window,hosts,worker,identity,directory));
     [app showSection:@"Access"];
     CHECK(Access(access,link,window));
+    CHECK(ComputerRole(app,access,link,window,identity));
     CHECK(RelaysField(app,window));
+    CHECK(RelaysSave(app,window));
     MdSignerType backend=MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 :
         MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F : MD_SIGNER_NIP55L;
     [app showSection:@"Identity"];
