@@ -110,6 +110,8 @@ macos_snapshot_tool = executable('macos_manager_snapshots', ['snapshot_pages.m',
   link_with : [macos_manager_model, macos_hosts_page, macos_hosts_model],
   dependencies : [dep_metadesk, appkit, dependency('jansson'), dep_macos_relay_store],
   build_by_default : false)
-test('macOS Manager offscreen snapshots', macos_hosts_python,
-  args : [files('snapshot_pages.py'), macos_snapshot_tool, meson.project_build_root() / 'snapshots' / 'current'],
-  suite : 'macos_manager_snapshots', timeout : 300, is_parallel : false)
+# It renders into a fresh BUILD/snapshots/run-XXXXXX that it creates and
+# confines HOME, CFFIXED_USER_HOME and XDG_* to; it refuses any other root.
+test('macOS Manager offscreen snapshots', macos_snapshot_tool,
+  args : [meson.project_build_root()],
+  suite : 'macos_manager_snapshots', timeout : 600, is_parallel : false)

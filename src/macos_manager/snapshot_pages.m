@@ -4,14 +4,20 @@
  * out at its default and minimum sizes in light and dark appearance, opens each
  * sheet, and renders everything to PNG with cacheDisplayInRect:. No window is
  * ordered on screen, nothing is activated, no pasteboard, Keychain, signer,
- * relay or host IPC is used. Run it through snapshot_pages.py, which gives it a
- * private HOME, CFFIXED_USER_HOME and XDG directories. */
+ * relay or host IPC is used. Usage: macos_manager_snapshots MESON_BUILD_DIR.
+ * It renders into a fresh BUILD/snapshots/run-XXXXXX that it creates itself
+ * and confines every home, config, state and output path to (see Launch). */
 #import "manager_app.h"
 #import "hosts_page.h"
 #import "hosts_model.h"
 #import "access_page.h"
 #import "identity_page.h"
+#import "ui.h"
 #include <stdatomic.h>
+#include <objc/message.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #define KEY1 "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 #define KEY2 "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
@@ -22,9 +28,7 @@
 
 static NSString *Out;
 static int Failures;
-static NSUInteger LabelCount(NSView *root);
 static NSString *Slug(NSString *section);
-static BOOL LabelContainsText(NSView *root, NSString *text);
 static NSMutableArray<NSString *> *Written;
 
 static BOOL Await(BOOL (^ready)(void)) {
@@ -108,7 +112,8 @@ static void Render(NSView *view, NSString *name) {
     }];
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
     NSString *path = [Out stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]];
-    if (!png || ![png writeToFile:path atomically:YES]) { fprintf(stderr, "FAIL: could not write %s\n", path.UTF8String); ++Failures; return; }
+    if ([NSFileManager.defaultManager fileExistsAtPath:path]) { fprintf(stderr, "FAIL: duplicate %s\n", name.UTF8String); ++Failures; return; }
+    if (!png || ![png writeToFile:path atomically:NO]) { fprintf(stderr, "FAIL: could not write %s\n", path.UTF8String); ++Failures; return; }
     [Written addObject:path.lastPathComponent];
 }
 /* The frame view includes the title bar and toolbar. */
@@ -128,6 +133,7 @@ static NSView *Frame(NSWindow *window) { return window.contentView.superview ?: 
 
 @interface SnapBook : MDHostsBook
 @property BOOL empty;
+@property MDHostsState fixtureState;
 @end
 @implementation SnapBook
 static NSArray *SnapRows(void) {
@@ -145,18 +151,42 @@ static NSArray *SnapRows(void) {
           @"tags":@[@"Linux"], @"tagIDs":@[@"t2"], @"favorite":@YES, @"lastConnected":@0},
     ];
 }
-- (NSArray *)rows { return self.empty ? @[] : SnapRows(); }
-- (NSArray *)quick { return self.empty ? @[] : @[SnapRows()[0], SnapRows()[3], SnapRows()[1]]; }
-- (NSArray *)tags { return self.empty ? @[] : @[@{@"id":@"t2", @"label":@"Linux"}, @{@"id":@"t1", @"label":@"Office"}]; }
+- (BOOL)blocked { return self.fixtureState >= MDHostsNoClientRole && self.fixtureState <= MDHostsCacheUnavailable; }
+- (BOOL)synced { return self.fixtureState == MDHostsSynced; }
+- (MDHostsState)state { return self.fixtureState; }
+- (NSArray *)rows { return self.empty || self.blocked ? @[] : SnapRows(); }
+- (NSArray *)quick { return self.empty || self.blocked ? @[] : @[SnapRows()[0], SnapRows()[3], SnapRows()[1]]; }
+- (NSArray *)tags { return self.empty || self.blocked ? @[] : @[@{@"id":@"t2", @"label":@"Linux"}, @{@"id":@"t1", @"label":@"Office"}]; }
 - (NSArray *)issues {
-    return self.empty ? @[] : @[@{@"coordinate":@"30078:" KEY1 ":metadesk-hosts", @"message":@"Your edit conflicts with a newer remote version.",
+    return !self.synced ? @[] : @[@{@"coordinate":@"30078:" KEY1 ":metadesk-hosts", @"message":@"Your edit conflicts with a newer remote version.",
         @"conflict":@YES, @"retry":@NO, @"ready":@YES}];
 }
-- (NSString *)status { return self.empty ? @"Offline — showing cached hosts. Add explicit bootstrap relays to sync." : @"Address book synced."; }
-- (NSString *)owner { return @KEY1; }
-- (BOOL)canReview { return !self.empty; }
-- (BOOL)canEdit { return !self.empty; }
-- (BOOL)canExport { return !self.empty; }
+- (NSString *)unavailable {
+    switch (self.fixtureState) {
+        case MDHostsNoClientRole: return @"Assign a client role with the account CLI, then refresh.";
+        case MDHostsSignerUnavailable: return @"Client signer unavailable: signer locked.";
+        case MDHostsCredentialFailed: return @"Local NIP-46 credential access failed: not found. Check Keychain and the saved pairing; no external signer was reached.";
+        case MDHostsCacheUnavailable: return @"The encrypted cache is unavailable. Check the private state directory and other manager instances.";
+        default: return nil;
+    }
+}
+- (NSString *)status {
+    switch (self.fixtureState) {
+        case MDHostsNoRelays: return @"Offline — showing cached hosts. Add explicit bootstrap relays to sync.";
+        case MDHostsSyncing: return @"Syncing address book…";
+        case MDHostsAuthPending: return @"Waiting for relay authentication…";
+        case MDHostsRelaysOffline: return @"Offline — showing cached hosts.";
+        case MDHostsRelayRefused: return @"An address book relay refused the subscription.";
+        case MDHostsReplayNeeded: return @"Address book catch-up was incomplete. Refresh to replay it.";
+        case MDHostsDocumentError: return @"An encrypted document is invalid and will not be overwritten.";
+        case MDHostsSynced: return @"Address book synced.";
+        default: return self.unavailable ?: @"Opening the address book…";
+    }
+}
+- (NSString *)owner { return self.blocked ? nil : @KEY1; }
+- (BOOL)canReview { return self.synced; }
+- (BOOL)canEdit { return self.synced; }
+- (BOOL)canExport { return !self.blocked && !self.empty; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey != nil; }
 - (BOOL)canConfirmReview:(MDHostReview *)review fingerprint:(NSString *)fingerprint {
     return review.oldKey && [review.fingerprint isEqual:fingerprint];
@@ -180,10 +210,14 @@ static NSArray *SnapRows(void) {
 
 @interface SnapHosts : MDHostsWorker
 @property BOOL empty;
+@property MDHostsState state;
 @end
 @implementation SnapHosts
 - (BOOL)openDirectory:(NSString *)directory error:(NSString **)error { (void)directory; (void)error; return YES; }
-- (MDHostsBook *)snapshot { SnapBook *b = [SnapBook new]; b.empty = self.empty; return b; }
+- (MDHostsBook *)snapshot {
+    if (self.state == MDHostsOpening) return nil;
+    SnapBook *b = [SnapBook new]; b.empty = self.empty; b.fixtureState = self.state; return b;
+}
 - (BOOL)startRelays:(NSString *)urls { (void)urls; return YES; }
 - (void)close {}
 @end
@@ -245,90 +279,61 @@ static NSDictionary *AccessPolicy(void) {
 }
 
 typedef struct { MDManagerApp *app; MDHostsPage *hosts; MDLocalHostPages *local; MDIdentityPage *identity;
-                 SnapHosts *worker; SnapLink *link; NSWindow *window; NSTabView *tabs; } Scene;
+                 SnapHosts *worker; SnapLink *link; NSWindow *window; } Scene;
 
-/* The pre-md-b9zo app had no window factory; rebuild its tab view exactly as
- * applicationDidFinishLaunching: did. */
-static NSWindow *LegacyWindow(Scene *s) {
-    NSTabView *tabs = [NSTabView new];
-    NSArray *pages = @[@[@"Hosts", s->hosts.view], @[@"This Computer", s->local.computerView], @[@"Access", s->local.accessView],
-                       @[@"Identity", s->identity.view], @[@"Relays", [s->app performSelector:@selector(relays)]]];
-    for (NSArray *p in pages) {
-        NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:p[0]];
-        item.label = p[0]; item.view = p[1]; [tabs addTabViewItem:item];
-    }
-    NSView *activity = [NSView new];
-    NSTextField *note = [NSTextField labelWithString:@"Live session status and disconnection are in This Computer. No activity history is stored here."];
-    note.translatesAutoresizingMaskIntoConstraints = NO; [activity addSubview:note];
-    [note.leadingAnchor constraintEqualToAnchor:activity.leadingAnchor constant:14].active = YES;
-    [note.topAnchor constraintEqualToAnchor:activity.topAnchor constant:14].active = YES;
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"Activity"];
-    item.label = @"Activity"; item.view = activity; [tabs addTabViewItem:item];
-    NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 820, 540)
-        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-        backing:NSBackingStoreBuffered defer:NO];
-    w.title = @"Metadesk Manager"; w.contentMinSize = NSMakeSize(650, 410); w.contentView = tabs;
-    s->tabs = tabs;
-    return w;
-}
-static NSArray<NSString *> *Sections(Scene *s) {
-    if ([s->app respondsToSelector:@selector(sectionIdentifiers)]) return [s->app performSelector:@selector(sectionIdentifiers)];
-    return [s->tabs.tabViewItems valueForKey:@"identifier"];
-}
 static void ShowSection(Scene *s, NSString *identifier) {
-    if (s->tabs) [s->tabs selectTabViewItemWithIdentifier:identifier];
-    else [s->app performSelector:@selector(showSection:) withObject:identifier];
+    [s->app performSelector:@selector(showSection:) withObject:identifier];
     if ([identifier isEqual:@"Hosts"]) [s->hosts activate];
     if ([identifier isEqual:@"Identity"]) [s->identity activate];
     Spin();
 }
-static Scene MakeScene(NSString *accounts, NSAppearanceName appearance, BOOL emptyHosts) {
+static Scene MakeScene(NSAppearanceName appearance, MDHostsState state, BOOL empty, NSInteger accounts) {
     Scene s = {0};
-    s.worker = [[SnapHosts alloc] initWithChange:nil]; s.worker.empty = emptyHosts;
+    s.worker = [[SnapHosts alloc] initWithChange:nil]; s.worker.state = state; s.worker.empty = empty;
     s.hosts = [[MDHostsPage alloc] initWithWorker:s.worker];
+    if (accounts >= 0) s.hosts.accountCount = ^NSUInteger { return (NSUInteger)accounts; };
     SnapLink *link = [[SnapLink alloc] initWithUpdate:nil]; s.link = link;
     s.local = [[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push = update; return link; }];
-    s.identity = [[MDIdentityPage alloc] initWithHosts:s.hosts directory:accounts connect:SnapConnect credentials:^{ return SnapStore(); }];
+    s.identity = [[MDIdentityPage alloc] initWithHosts:s.hosts directory:nil connect:SnapConnect credentials:^{ return SnapStore(); }];
     s.app = [[MDManagerApp alloc] initWithHosts:s.hosts local:s.local identity:s.identity];
-    s.window = [s.app respondsToSelector:@selector(makeMainWindow)] ? [s.app performSelector:@selector(makeMainWindow)] : LegacyWindow(&s);
+    s.window = [s.app makeMainWindow];
     s.window.releasedWhenClosed = NO; s.window.restorable = NO; s.window.alphaValue = 0;
     s.window.appearance = [NSAppearance appearanceNamed:appearance];
     return s;
 }
+/* Tear a scene down through the controllers' normal close paths. */
+static void Drain(Scene *s) {
+    __block int pending = 3;
+    dispatch_block_t done = ^{ --pending; };
+    while (s->window.attachedSheet) { [s->window endSheet:s->window.attachedSheet returnCode:NSModalResponseCancel]; Spin(); }
+    [s->hosts close:done]; [s->local close:done]; [s->identity close:done];
+    if (!Await(^BOOL{ return pending == 0; })) { fputs("FAIL: scene did not drain\n", stderr); ++Failures; }
+    [s->window close];
+    Spin();
+}
 static void Resize(NSWindow *window, NSSize content) {
-    NSRect frame = [window frameRectForContentRect:(NSRect){NSZeroPoint, content}];
-    [window setFrame:frame display:NO];
+    [window setFrame:[window frameRectForContentRect:(NSRect){NSZeroPoint, content}] display:NO];
     [window layoutIfNeeded];
 }
-static NSSize DefaultSize(Scene *s) {
-    if ([s->app respondsToSelector:@selector(defaultContentSize)]) {
-        NSValue *v = [s->app performSelector:@selector(defaultContentSize)]; return v.sizeValue;
-    }
-    return NSMakeSize(820, 540);
-}
-static void FeedAccess(Scene *s, BOOL connected) {
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    if (connected) s->link.push(@"Connected to the local host.", AccessSnapshot(now), AccessPolicy(),
-                                @{@"screen_recording":@YES, @"accessibility":@NO}, NO);
+static void FeedAccess(Scene *s) {
+    s->link.push(@"Connected to the local host.", AccessSnapshot(NSDate.date.timeIntervalSince1970), AccessPolicy(),
+                 @{@"screen_recording":@YES, @"accessibility":@NO}, NO);
     Spin();
 }
 
 static void CaptureSheet(Scene *s, NSString *name, void (^open)(void)) {
     NSWindow *window = s->window;
     open();
-    if (!Await(^BOOL{ return window.attachedSheet != nil; })) {
-        fprintf(stderr, "note: %s did not open a sheet\n", name.UTF8String); return;
-    }
+    if (!Await(^BOOL{ return window.attachedSheet != nil; })) { fprintf(stderr, "FAIL: %s did not open a sheet\n", name.UTF8String); ++Failures; return; }
     NSWindow *sheet = window.attachedSheet;
-    Spin();
-    [sheet layoutIfNeeded];
+    Spin(); [sheet layoutIfNeeded];
     Render(Frame(sheet), name);
     [window endSheet:sheet returnCode:NSModalResponseCancel];
     Await(^BOOL{ return window.attachedSheet == nil; });
     Spin();
 }
 static void Try(Scene *s, NSString *name, id target, SEL action) {
-    if (![target respondsToSelector:action]) { fprintf(stderr, "note: %s has no %s\n", name.UTF8String, sel_getName(action)); return; }
+    if (![target respondsToSelector:action]) { fprintf(stderr, "FAIL: %s has no %s\n", name.UTF8String, sel_getName(action)); ++Failures; return; }
     CaptureSheet(s, name, ^{
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
@@ -336,114 +341,136 @@ static void Try(Scene *s, NSString *name, id target, SEL action) {
 #pragma clang diagnostic pop
     });
 }
-static NSTableView *FirstTable(NSView *root) {
-    return (NSTableView *)Find(root, ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class] && ![v isKindOfClass:NSOutlineView.class]
-        && [((NSTableView *)v).tableColumns.firstObject.identifier isEqual:@"Host"] ; });
-}
-static NSTableView *HostsTable(NSView *root) {
-    NSTableView *t = FirstTable(root);
-    return t ?: (NSTableView *)Find(root, ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Saved hosts"]; });
+static NSTableView *Table(NSView *root, NSString *label) {
+    return (NSTableView *)Find(root, ^BOOL(NSView *v) { return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:label]; });
 }
 
 static void Sheets(Scene *s, NSString *suffix) {
     MDHostsPage *hosts = s->hosts;
     ShowSection(s, @"Hosts");
-    Await(^BOOL{ return HostsTable(hosts.view).numberOfRows > 0; });
-    NSTableView *table = HostsTable(hosts.view);
-    [table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    Await(^BOOL{ return Table(hosts.view, @"Saved hosts").numberOfRows > 0; });
+    [Table(hosts.view, @"Saved hosts") selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
     Spin();
     SnapReview *first = [SnapReview new], *changed = [SnapReview new]; changed.mismatch = YES;
-    CaptureSheet(s, [@"sheet-hosts-review-" stringByAppendingString:suffix], ^{ [hosts performSelector:@selector(presentReview:) withObject:first]; });
-    CaptureSheet(s, [@"sheet-hosts-key-changed-" stringByAppendingString:suffix], ^{ [hosts performSelector:@selector(presentReview:) withObject:changed]; });
-    Try(s, [@"sheet-hosts-edit-" stringByAppendingString:suffix], hosts, @selector(edit:));
+    NSString *(^n)(NSString *) = ^(NSString *base) { return [base stringByAppendingString:suffix]; };
+    CaptureSheet(s, n(@"sheet-hosts-review-"), ^{ [hosts performSelector:@selector(presentReview:) withObject:first]; });
+    CaptureSheet(s, n(@"sheet-hosts-key-changed-"), ^{ [hosts performSelector:@selector(presentReview:) withObject:changed]; });
+    Try(s, n(@"sheet-hosts-edit-"), hosts, @selector(edit:));
     NSArray *imports = @[
         @{@"key":@KEY3, @"npub":MDHostNpub(@KEY3), @"fingerprint":MDHostFingerprint(@KEY3), @"label":@"Lab iMac", @"alias":@"lab@example.invalid", @"caps":@"Video (view only)"},
         @{@"key":@KEY4, @"npub":MDHostNpub(@KEY4), @"fingerprint":MDHostFingerprint(@KEY4), @"label":@"Kiosk", @"alias":@"", @"caps":@"Video, input"}];
-    CaptureSheet(s, [@"sheet-hosts-import-" stringByAppendingString:suffix], ^{
-        [hosts performSelector:@selector(reviewImport:book:) withObject:imports withObject:[s->worker snapshot]];
-    });
-    Try(s, [@"sheet-hosts-export-" stringByAppendingString:suffix], hosts, @selector(exportHosts:));
-    Try(s, [@"sheet-hosts-conflict-" stringByAppendingString:suffix], hosts, @selector(handleIssue:));
-    Try(s, [@"sheet-hosts-relays-" stringByAppendingString:suffix], hosts, @selector(editRelays:));
-    /* Unreadable relay preferences ask before replacement. */
+    CaptureSheet(s, n(@"sheet-hosts-import-"), ^{ [hosts performSelector:@selector(reviewImport:book:) withObject:imports withObject:[s->worker snapshot]]; });
+    Try(s, n(@"sheet-hosts-export-"), hosts, @selector(exportHosts:));
+    Try(s, n(@"sheet-hosts-conflict-"), hosts, @selector(handleIssue:));
+    /* Unreadable relay settings: the fixture file is created here, inside the
+     * fixture config directory, exclusively, and removed only by this code. */
     NSString *config = [@(getenv("XDG_CONFIG_HOME")) stringByAppendingPathComponent:@"metadesk"];
-    [NSFileManager.defaultManager createDirectoryAtPath:config withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
+    mkdir(config.fileSystemRepresentation, 0700);
     NSString *prefs = [config stringByAppendingPathComponent:@"manager-relays.ini"];
-    [@"not a relay preferences file" writeToFile:prefs atomically:NO encoding:NSUTF8StringEncoding error:NULL];
-    Try(s, [@"sheet-hosts-unreadable-relays-" stringByAppendingString:suffix], hosts, @selector(refresh:));
-    [NSFileManager.defaultManager removeItemAtPath:prefs error:NULL];
+    int fd = open(prefs.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) { fputs("FAIL: fixture relay settings already exist\n", stderr); ++Failures; }
+    else {
+        static const char corrupt[] = "not a relay preferences file";
+        BOOL wrote = write(fd, corrupt, sizeof corrupt - 1) == (ssize_t)(sizeof corrupt - 1);
+        close(fd);
+        if (wrote) Try(s, n(@"sheet-hosts-unreadable-relays-"), hosts, @selector(refresh:));
+        unlink(prefs.fileSystemRepresentation);
+    }
     Spin();
 
     ShowSection(s, @"Access");
-    FeedAccess(s, YES);
-    Try(s, [@"sheet-access-review-" stringByAppendingString:suffix], s->local, @selector(review:));
-    Try(s, [@"sheet-access-edit-" stringByAppendingString:suffix], s->local, @selector(edit:));
-    Try(s, [@"sheet-access-revoke-" stringByAppendingString:suffix], s->local, @selector(revoke:));
-    Try(s, [@"sheet-access-kick-revoke-" stringByAppendingString:suffix], s->local, @selector(kickRevoke:));
+    FeedAccess(s);
+    Try(s, n(@"sheet-access-review-"), s->local, @selector(review:));
+    Try(s, n(@"sheet-access-edit-"), s->local, @selector(edit:));
+    Try(s, n(@"sheet-access-revoke-"), s->local, @selector(revoke:));
+    Try(s, n(@"sheet-access-kick-revoke-"), s->local, @selector(kickRevoke:));
     ShowSection(s, @"This Computer");
-    Try(s, [@"sheet-computer-disconnect-" stringByAppendingString:suffix], s->local, @selector(kick:));
-    Try(s, [@"sheet-computer-qr-" stringByAppendingString:suffix], s->local, @selector(showQR:));
+    Try(s, n(@"sheet-computer-disconnect-"), s->local, @selector(kick:));
+    Try(s, n(@"sheet-computer-qr-"), s->local, @selector(showQR:));
 
     ShowSection(s, @"Identity");
-    Await(^BOOL{ return LabelCount(s->identity.view) > 0; });
-    Try(s, [@"sheet-identity-add-" stringByAppendingString:suffix], s->identity, @selector(add:));
-    Try(s, [@"sheet-identity-label-" stringByAppendingString:suffix], s->identity, @selector(editLabel:));
-    Try(s, [@"sheet-identity-pairing-" stringByAppendingString:suffix], s->identity, @selector(importPairing:));
-    Try(s, [@"sheet-identity-remove-" stringByAppendingString:suffix], s->identity, @selector(remove:));
-}
-static NSUInteger LabelCount(NSView *root) {
-    __block NSUInteger n = 0;
-    Find(root, ^BOOL(NSView *v) {
-        if ([v isKindOfClass:NSPopUpButton.class] && [((NSPopUpButton *)v).titleOfSelectedItem length] &&
-            ![((NSPopUpButton *)v).titleOfSelectedItem isEqual:@"No saved accounts"]) ++n;
-        if ([v isKindOfClass:NSTableView.class]) n += (NSUInteger)((NSTableView *)v).numberOfRows;
-        return NO;
-    });
-    return n;
+    Await(^BOOL{ return Table(s->identity.view, @"Signer accounts").numberOfRows > 0; });
+    Try(s, n(@"sheet-identity-add-"), s->identity, @selector(add:));
+    Try(s, n(@"sheet-identity-label-"), s->identity, @selector(editLabel:));
+    Try(s, n(@"sheet-identity-pairing-"), s->identity, @selector(importPairing:));
+    Try(s, n(@"sheet-identity-remove-"), s->identity, @selector(remove:));
 }
 
-static void Pages(NSString *accounts, NSAppearanceName appearance, NSString *mode) {
-    Scene s = MakeScene(accounts, appearance, NO);
-    NSSize size = DefaultSize(&s);
-    NSSize sizes[2] = {size, s.window.contentMinSize};
+static void Pages(NSAppearanceName appearance, NSString *mode) {
+    Scene s = MakeScene(appearance, MDHostsSynced, NO, -1);
+    NSSize sizes[2] = {[MDManagerApp.new defaultContentSize].sizeValue, s.window.contentMinSize};
     NSString *names[2] = {@"default", @"minimum"};
-    /* Offline/disconnected first, then with fixture state. */
     Resize(s.window, sizes[0]);
     for (NSString *section in @[@"This Computer", @"Access"]) {
         ShowSection(&s, section);
-        Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-disconnected-%@-%@", Slug(section), names[0], mode]);
+        Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-disconnected-default-%@", Slug(section), mode]);
     }
     for (int z = 0; z < 2; ++z) {
         Resize(s.window, sizes[z]);
-        for (NSString *section in Sections(&s)) {
+        for (NSString *section in [s.app sectionIdentifiers]) {
             ShowSection(&s, section);
-            if ([section isEqual:@"Hosts"]) Await(^BOOL{ return HostsTable(s.hosts.view).numberOfRows > 0; });
-            if ([section isEqual:@"Identity"]) Await(^BOOL{ return LabelCount(s.identity.view) > 0; });
-            if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) FeedAccess(&s, YES);
+            if ([section isEqual:@"Hosts"]) Await(^BOOL{ return Table(s.hosts.view, @"Saved hosts").numberOfRows > 0; });
+            if ([section isEqual:@"Identity"]) Await(^BOOL{ return Table(s.identity.view, @"Signer accounts").numberOfRows > 0; });
+            if ([section isEqual:@"This Computer"] || [section isEqual:@"Access"]) FeedAccess(&s);
             if ([section isEqual:@"Hosts"]) {
-                NSTableView *t = HostsTable(s.hosts.view);
+                NSTableView *t = Table(s.hosts.view, @"Saved hosts");
                 if (t.numberOfRows) [t selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
                 Spin();
             }
             Render(Frame(s.window), [NSString stringWithFormat:@"page-%@-%@-%@", Slug(section), names[z], mode]);
         }
     }
-    Resize(s.window, size);
+    /* A connection in progress on Hosts. */
+    Resize(s.window, sizes[0]);
+    ShowSection(&s, @"Hosts");
+    [s.hosts setValue:@YES forKey:@"launched"];
+    [s.hosts performSelector:@selector(render)];
+    ((void (*)(id, SEL, NSString *, NSInteger))objc_msgSend)(s.hosts, @selector(showConnection:kind:), MDHostLaunchText(MD_LAUNCH_APPROVAL, MD_LAUNCH_RELAY), MDStatusWorking);
+    Render(Frame(s.window), [@"page-hosts-connecting-default-" stringByAppendingString:mode]);
+    [s.hosts setValue:@NO forKey:@"launched"];
+    ((void (*)(id, SEL, NSString *, NSInteger))objc_msgSend)(s.hosts, @selector(showConnection:kind:), nil, MDStatusNone);
     Sheets(&s, mode);
-    [s.window close];
-    /* Empty and offline Hosts state. */
-    Scene e = MakeScene(accounts, appearance, YES);
-    Resize(e.window, DefaultSize(&e));
-    ShowSection(&e, @"Hosts");
-    Await(^BOOL{ return LabelContainsText(e.hosts.view, @"Offline"); });
+    Drain(&s);
+
+    /* This Computer when the host can't be reached, and with no host role. */
+    Scene c = MakeScene(appearance, MDHostsSynced, NO, -1);
+    Resize(c.window, sizes[0]);
+    ShowSection(&c, @"This Computer");
+    [c.local activate];
+    Await(^BOOL{ return [[c.local valueForKey:@"located"] boolValue]; });
+    c.link.push(@"Host unreachable or socket not trusted. Agent process state is unknown.", nil, nil, nil, NO);
     Spin();
-    Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-empty-offline-default-%@", mode]);
-    [e.window close];
+    Render(Frame(c.window), [@"page-this-computer-unreachable-default-" stringByAppendingString:mode]);
+    [c.local setValue:@YES forKey:@"noHostRole"];
+    c.link.push(nil, nil, nil, nil, NO);
+    Spin();
+    Render(Frame(c.window), [@"page-this-computer-no-host-role-default-" stringByAppendingString:mode]);
+    Drain(&c);
+
+    /* Every unconfigured or degraded Hosts state a new install can meet. */
+    struct { MDHostsState state; NSInteger accounts; const char *name; BOOL empty; } states[] = {
+        {MDHostsOpening, 1, "opening", YES}, {MDHostsNoClientRole, 0, "no-signer-account", YES},
+        {MDHostsNoClientRole, 2, "no-client-role", YES}, {MDHostsSignerUnavailable, 2, "signer-unavailable", YES},
+        {MDHostsCredentialFailed, 2, "pairing-unavailable", YES}, {MDHostsCacheUnavailable, 2, "cache-unavailable", YES},
+        {MDHostsNoRelays, 2, "no-relays", YES}, {MDHostsSyncing, 2, "syncing", NO}, {MDHostsAuthPending, 2, "relay-sign-in", NO},
+        {MDHostsRelaysOffline, 2, "relays-offline", NO}, {MDHostsRelayRefused, 2, "relay-refused", NO},
+        {MDHostsReplayNeeded, 2, "catch-up-incomplete", NO}, {MDHostsDocumentError, 2, "unreadable", NO},
+    };
+    for (size_t i = 0; i < sizeof states / sizeof *states; ++i) {
+        Scene e = MakeScene(appearance, states[i].state, states[i].empty, states[i].accounts);
+        Resize(e.window, sizes[0]);
+        ShowSection(&e, @"Hosts");
+        if (states[i].state != MDHostsOpening) Await(^BOOL{ return [e.hosts valueForKey:@"book"] != nil; });
+        Spin();
+        Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-state-%s-default-%@", states[i].name, mode]);
+        if (i == 6 || i == 9) {
+            Resize(e.window, sizes[1]); Spin();
+            Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-state-%s-minimum-%@", states[i].name, mode]);
+        }
+        Drain(&e);
+    }
 }
 static NSString *Slug(NSString *section) { return [[section lowercaseString] stringByReplacingOccurrencesOfString:@" " withString:@"-"]; }
-static BOOL LabelContainsText(NSView *root, NSString *text) {
-    return Find(root, ^BOOL(NSView *v) { return [v isKindOfClass:NSTextField.class] && [((NSTextField *)v).stringValue containsString:text]; }) != nil;
-}
 
 static void DumpMenu(NSMenu *menu, NSMutableString *out, int depth) {
     for (NSMenuItem *item in menu.itemArray) {
@@ -456,12 +483,9 @@ static void DumpMenu(NSMenu *menu, NSMutableString *out, int depth) {
             NSEventModifierFlags m = item.keyEquivalentModifierMask;
             if (m & NSEventModifierFlagControl) [key appendString:@"⌃"];
             if (m & NSEventModifierFlagOption) [key appendString:@"⌥"];
-            BOOL upper = [item.keyEquivalent isEqual:item.keyEquivalent.uppercaseString] && ![item.keyEquivalent isEqual:item.keyEquivalent.lowercaseString];
-            if ((m & NSEventModifierFlagShift) || upper) [key appendString:@"⇧"];
+            if (m & NSEventModifierFlagShift) [key appendString:@"⇧"];
             if (m & NSEventModifierFlagCommand) [key appendString:@"⌘"];
-            NSString *k = item.keyEquivalent;
-            if ([k isEqual:@"\b"] || [k isEqual:@"\x7f"]) k = @"⌫";
-            [key appendString:k.uppercaseString];
+            [key appendString:item.keyEquivalent.uppercaseString];
             [line appendFormat:@"\t%@", key];
         }
         if (item.action) [line appendFormat:@"\t[%@]", NSStringFromSelector(item.action)];
@@ -470,9 +494,76 @@ static void DumpMenu(NSMenu *menu, NSMutableString *out, int depth) {
     }
 }
 
+/* ---- Fixture-root safety (md-b9zo B3) ----
+ * The renderer only ever reads and writes inside a run directory it creates
+ * itself with mkdtemp under BUILD/snapshots, where BUILD is a canonical meson
+ * build directory owned by this user. It then re-executes itself with HOME,
+ * CFFIXED_USER_HOME and XDG_* pointing into that run directory and refuses to
+ * render unless every one of them, and NSHomeDirectory(), is exactly that. */
+static NSString *Canonical(NSString *path) {
+    char resolved[PATH_MAX];
+    return path.isAbsolutePath && realpath(path.fileSystemRepresentation, resolved) ? @(resolved) : nil;
+}
+static BOOL OwnedDirectory(NSString *path) {
+    struct stat st;
+    return !lstat(path.fileSystemRepresentation, &st) && S_ISDIR(st.st_mode) && st.st_uid == geteuid();
+}
+static BOOL BuildRoot(NSString *root) {
+    struct stat st;
+    NSString *marker = [root stringByAppendingPathComponent:@"meson-private/coredata.dat"];
+    return [Canonical(root) isEqual:root] && OwnedDirectory(root) &&
+        !lstat(marker.fileSystemRepresentation, &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid();
+}
+static NSArray<NSString *> *FixtureDirectories(void) { return @[@"home", @"config", @"state", @"cache", @"out"]; }
+static int Launch(const char *self, NSString *root) {
+    if (!BuildRoot(root)) { fprintf(stderr, "refusing: %s is not a canonical meson build directory owned by you\n", root.UTF8String); return 2; }
+    NSString *parent = [root stringByAppendingPathComponent:@"snapshots"];
+    if (mkdir(parent.fileSystemRepresentation, 0700) && errno != EEXIST) return 2;
+    if (!OwnedDirectory(parent) || ![Canonical(parent) isEqual:parent]) { fputs("refusing: snapshots is not a plain directory\n", stderr); return 2; }
+    char run[PATH_MAX];
+    snprintf(run, sizeof run, "%s/run-XXXXXX", parent.fileSystemRepresentation);
+    if (!mkdtemp(run)) return 2;
+    NSString *dir = @(run);
+    for (NSString *sub in FixtureDirectories())
+        if (mkdir([dir stringByAppendingPathComponent:sub].fileSystemRepresentation, 0700)) return 2;
+    NSString *token = NSUUID.UUID.UUIDString;
+    int fd = open([dir stringByAppendingPathComponent:@".fixture-token"].fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0 || write(fd, token.UTF8String, token.length) != (ssize_t)token.length) return 2;
+    close(fd);
+    setenv("HOME", [dir stringByAppendingPathComponent:@"home"].fileSystemRepresentation, 1);
+    setenv("CFFIXED_USER_HOME", [dir stringByAppendingPathComponent:@"home"].fileSystemRepresentation, 1);
+    setenv("XDG_CONFIG_HOME", [dir stringByAppendingPathComponent:@"config"].fileSystemRepresentation, 1);
+    setenv("XDG_STATE_HOME", [dir stringByAppendingPathComponent:@"state"].fileSystemRepresentation, 1);
+    setenv("XDG_CACHE_HOME", [dir stringByAppendingPathComponent:@"cache"].fileSystemRepresentation, 1);
+    unsetenv("XDG_RUNTIME_DIR");
+    char *args[] = {(char *)self, "--fixture-run", run, (char *)token.UTF8String, NULL};
+    execv(self, args);
+    perror("execv"); return 2;
+}
+static NSString *CheckFixture(NSString *run, NSString *token) {
+    NSString *canonical = Canonical(run);
+    if (![canonical isEqual:run] || !OwnedDirectory(run)) return nil;
+    NSString *snapshots = run.stringByDeletingLastPathComponent;
+    if (![snapshots.lastPathComponent isEqual:@"snapshots"] || !BuildRoot(snapshots.stringByDeletingLastPathComponent) ||
+        ![run.lastPathComponent hasPrefix:@"run-"]) return nil;
+    NSData *stored = [NSData dataWithContentsOfFile:[run stringByAppendingPathComponent:@".fixture-token"] options:NSDataReadingUncached error:NULL];
+    if (![[[NSString alloc] initWithData:stored encoding:NSUTF8StringEncoding] isEqual:token]) return nil;
+    NSDictionary *want = @{@"HOME":@"home", @"CFFIXED_USER_HOME":@"home", @"XDG_CONFIG_HOME":@"config", @"XDG_STATE_HOME":@"state", @"XDG_CACHE_HOME":@"cache"};
+    for (NSString *name in want) {
+        const char *value = getenv(name.UTF8String);
+        NSString *expected = [run stringByAppendingPathComponent:want[name]];
+        if (!value || ![@(value) isEqual:expected] || ![Canonical(expected) isEqual:expected] || !OwnedDirectory(expected)) return nil;
+    }
+    if (![NSHomeDirectory() isEqual:[run stringByAppendingPathComponent:@"home"]]) return nil;
+    return [run stringByAppendingPathComponent:@"out"];
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc != 3) { fputs("usage: snapshot_pages ACCOUNTS_DIR OUTPUT_DIR\n", stderr); return 2; }
+        if (argc == 2) return Launch(argv[0][0] == '/' ? argv[0] : realpath(argv[0], NULL), @(argv[1]));
+        if (argc != 4 || strcmp(argv[1], "--fixture-run")) { fputs("usage: macos_manager_snapshots MESON_BUILD_DIR\n", stderr); return 2; }
+        Out = CheckFixture(@(argv[2]), @(argv[3]));
+        if (!Out) { fputs("refusing: not a fixture run directory created by this renderer\n", stderr); return 2; }
         CFDictionaryRef session = CGSessionCopyCurrentDictionary();
         if (!session || CGMainDisplayID() == kCGNullDirectDisplay) {
             if (session) CFRelease(session);
@@ -480,20 +571,22 @@ int main(int argc, char **argv) {
         }
         CFRelease(session);
         [NSApplication.sharedApplication setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        Out = @(argv[2]); Written = [NSMutableArray array];
-        [NSFileManager.defaultManager createDirectoryAtPath:Out withIntermediateDirectories:YES attributes:nil error:NULL];
-        NSString *accounts = @(argv[1]);
-        SeedAccounts(accounts);
-        Pages(accounts, NSAppearanceNameAqua, @"light");
-        Pages(accounts, NSAppearanceNameDarkAqua, @"dark");
-        if ([MDManagerApp respondsToSelector:@selector(makeMainMenu)]) {
-            NSMutableString *dump = [NSMutableString string];
-            DumpMenu([MDManagerApp performSelector:@selector(makeMainMenu)], dump, 0);
-            [dump writeToFile:[Out stringByAppendingPathComponent:@"menu.txt"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-            [Written addObject:@"menu.txt"];
-        }
+        Written = [NSMutableArray array];
+        SeedAccounts(nil);
+        Pages(NSAppearanceNameAqua, @"light");
+        Pages(NSAppearanceNameDarkAqua, @"dark");
+        NSMutableString *dump = [NSMutableString string];
+        DumpMenu([MDManagerApp makeMainMenu], dump, 0);
+        NSString *menu = [Out stringByAppendingPathComponent:@"menu.txt"];
+        if (![dump writeToFile:menu atomically:NO encoding:NSUTF8StringEncoding error:NULL]) ++Failures;
+        else [Written addObject:@"menu.txt"];
+        /* Every expected artifact must exist in this fresh directory. */
+        NSArray *files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:Out error:NULL];
+        /* Per appearance: 2 disconnected + 10 sections + 1 connecting + 17 sheets
+         * + 2 This Computer states + 13 Hosts states + 2 minimum Hosts states. */
+        const NSUInteger expected = 2 * (2 + 10 + 1 + 17 + 2 + 13 + 2) + 1;
+        if (files.count != Written.count || files.count != expected) { fprintf(stderr, "FAIL: %lu files, %lu written\n", (unsigned long)files.count, (unsigned long)Written.count); ++Failures; }
         printf("wrote %lu files to %s\n", (unsigned long)Written.count, Out.UTF8String);
         return Failures ? 1 : 0;
     }
 }
-
