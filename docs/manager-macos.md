@@ -150,7 +150,9 @@ removed in Identity (removing it disconnects). On a host-role change the old
 connection, its pending requests, remembered clients and any open approval
 or confirmation sheet are discarded before the new socket is looked up. A
 lookup that finds a different host role than Identity last reported is not
-connected to; the page asks you to try again.
+connected to; the page asks you to try again. **Try Again** first re-reads the
+saved host role and then looks up the host for it, so a role changed by
+another program is picked up without visiting Identity.
 **Use a custom management socket** takes an absolute path instead; it is an
 explicit choice and works with or without a host role, over the same
 authenticated same-user connection, so a role change leaves it connected.

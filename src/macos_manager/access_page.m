@@ -203,7 +203,11 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
     }
     return path;
 }
-- (void)locateAndConnect {
+- (void)locateAndConnect { [self locateAndConnect:NO]; }
+/* refreshRole (Try Again): first re-read the saved host role, which becomes
+ * the role the lookup must agree with, then look up. A role Identity reported
+ * earlier can't keep a correctly read newer role refused. */
+- (void)locateAndConnect:(BOOL)refreshRole {
     if (_closed) return;
     NSUInteger epoch = ++_discovery;
     _locating = YES;
@@ -212,12 +216,14 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
     NSString *(^discover)(NSString **) = self.discover;
     if (!_discoveryQueue) _discoveryQueue = dispatch_queue_create("metadesk.manager.host-discovery", DISPATCH_QUEUE_SERIAL);
     dispatch_group_async(_qrWork, _discoveryQueue, ^{ @autoreleasepool {
-        NSString *key = nil;
+        NSString *saved = nil, *key = nil;
+        if (refreshRole) { if (discover) discover(&saved); else DefaultDiscovery(&saved); }
         NSString *path = discover ? discover(&key) : DefaultDiscovery(&key);
         dispatch_async(dispatch_get_main_queue(), ^{
             MDLocalHostPages *page = weakSelf;
             if (!page || page->_closed || epoch != page->_discovery) return; /* superseded */
             page->_locating = NO; page->_located = YES;
+            if (refreshRole) page->_roleKey = saved ?: @"";
             /* Bound to the role: an answer that disagrees with the latest
              * role Identity reported is stale, and is never connected to. */
             NSString *expected = page->_roleKey;
@@ -278,7 +284,7 @@ static NSString *DefaultDiscovery(NSString **hostKey) {
 - (void)reconnect:(id)sender {
     (void)sender;
     if (_custom && MDHostTrim(_endpoint.stringValue).length) [self connect:nil];
-    else [self locateAndConnect];
+    else [self locateAndConnect:YES];
 }
 - (void)buildAccessView {
     _accessStatus = [MDStatusView new];

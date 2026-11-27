@@ -137,7 +137,7 @@ typedef NS_ENUM(NSInteger, MDReload) { MDReloadOpen, MDReloadRefresh, MDReloadSa
     MDStatusView *_relayStatus, *_relayMessage;
     BOOL _relayRequest, _identityDirty; /* a save from the Relays section; accounts or roles changed */
     BOOL _relaysLoaded;                 /* the Relays page shows the persisted list */
-    BOOL _clientStale;                  /* Identity's client role differs from the open book's owner */
+    NSUInteger _ownerEpoch;             /* advances when the book's owner is suspended, resumed or known stale */
     NSString *_expectedClient;          /* client-role key from Identity's last reload ("" = none, nil = unknown) */
     NSInteger _accounts; /* signer accounts known on the worker; -1 unknown */
     MdLaunchMessage _phase;
@@ -302,11 +302,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)identityChanged:(NSString *)clientKey {
     _expectedClient = clientKey; /* nil: accounts could not be read */
     _identityDirty = YES;
-    /* Once a mismatch is known, nothing the old book started may still
-     * present a review, save or start a client: reconcile first. */
-    BOOL stale = _book && clientKey && ![(_book.owner ?: @"") isEqual:clientKey];
-    if (stale && !_clientStale) ++_generation;
-    _clientStale = stale;
+    /* Once a mismatch is known, nothing the current owner's operations
+     * started may still present a review, save or start a client: they are
+     * fenced by the owner epoch, and their completion reconciles instead.
+     * Operations started after this (including the reload reconciliation
+     * starts) carry the new epoch and are always delivered. */
+    if (_book && clientKey && ![(_book.owner ?: @"") isEqual:clientKey]) { ++_ownerEpoch; ++_generation; }
     [self reconcileIdentity];
 }
 - (void)reconcileIdentity {
@@ -318,7 +319,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [self suspendForRoleEdit:^{ [self resumeAfterRoleEdit]; }];
 }
 - (void)suspendForRoleEdit:(dispatch_block_t)ready {
-    _roleEditing = YES; _clientStale = NO; ++_generation; _book = nil; [self render];
+    _roleEditing = YES; ++_ownerEpoch; ++_generation; _book = nil; [self render];
     if (_launch && _phase < MD_LAUNCH_CONNECTED) {
         [_launch close:nil]; _launch=nil; ++_launchGeneration; _launched=NO;
         [self showConnection:@"Unfinished connection cancelled before changing the client role." kind:MDStatusInfo];
@@ -329,7 +330,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     } });
 }
 - (void)resumeAfterRoleEdit {
-    _roleEditing=NO;
+    _roleEditing=NO; ++_ownerEpoch;
     if (!self.closing && _started) [self reloadBook:NO];
 }
 - (void)close:(dispatch_block_t)drained {
@@ -369,6 +370,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)run:(id (^)(MDHostsWorker *))work done:(void (^)(id))done {
     if (_busy || _roleEditing || self.closing) return;
     _busy = YES; [self render];
+    NSUInteger epoch = _ownerEpoch; /* the owner this operation belongs to */
     dispatch_async(_queue, ^{ @autoreleasepool {
         id result = self.closing ? nil : work(self->_worker);
         MDHostsBook *book = self.closing ? nil : [self->_worker snapshot];
@@ -376,7 +378,17 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (self.closing) return;
             self->_busy = NO;
             if (self->_roleEditing) return;
-            if (self->_clientStale) { [self reconcileIdentity]; return; } /* the old book's results are moot */
+            /* Started for an owner that has since been superseded: drop its
+             * results and reconcile (the change that advanced the epoch left
+             * reconciliation pending, since the page was busy). */
+            if (epoch != self->_ownerEpoch) {
+                if (self->_message.kind == MDStatusWorking) [self note:nil kind:MDStatusNone];
+                if (self->_relayMessage.kind == MDStatusWorking) {
+                    [self->_relayMessage setText:@"The client role changed while saving. The saved list is shown; save again if it isn’t what you want." kind:MDStatusInfo];
+                    [self relaysAppeared];
+                }
+                [self render]; [self reconcileIdentity]; return;
+            }
             if (book) [self showBook:book];
             if (done) done(result);
             if (self->_identityDirty) [self reconcileIdentity];

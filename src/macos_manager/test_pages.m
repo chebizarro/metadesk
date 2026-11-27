@@ -1060,6 +1060,24 @@ static BOOL ComputerRole(MDManagerApp *app, MDLocalHostPages *local, FixtureLink
     [NSApp sendAction:@selector(connect:) to:local from:nil];
     CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"host role changed while looking"); }));
     CHECK(![link.paths containsObject:@"/fixture/role-b3.sock"]);
+    /* Round 6 #2: Try Again re-reads the saved role (B, which the lookup
+     * also finds) instead of comparing with Identity's earlier A. */
+    NSButton *retry=Button(local.computerView,@"Try Again");
+    CHECK(retry && Visible(retry));
+    CHECK(Send(retry));
+    CHECK(Await(^BOOL{ return [link.paths.lastObject isEqual:@"/fixture/role-b3.sock"]; }));
+    /* The role changes between Try Again's read (C) and its lookup (B): the
+     * lookup disagrees with what was just read and is refused. */
+    __block atomic_int step=0;
+    NSArray *reads=@[@[keyC,@"/fixture/role-c2.sock"], @[keyB,@"/fixture/role-b4.sock"]];
+    local.discover=^NSString *(NSString **hostKey) {
+        NSUInteger index=(NSUInteger)atomic_fetch_add(&step,1); /* once: MIN may evaluate twice */
+        NSArray *answer=reads[index < reads.count ? index : reads.count-1];
+        *hostKey=answer[0]; return answer[1];
+    };
+    [NSApp sendAction:@selector(reconnect:) to:local from:nil];
+    CHECK(Await(^BOOL{ return atomic_load(&step)>=2 && LabelContains(local.computerView,@"host role changed while looking"); }));
+    CHECK(![link.paths containsObject:@"/fixture/role-b4.sock"] && ![link.paths containsObject:@"/fixture/role-c2.sock"]);
     local.discover=Answer(nil,nil,nil,nil,NULL); /* later role changes answer at once */
     [local hostRoleChanged:@""];
     CHECK(Await(^BOOL{ return LabelContains(local.computerView,@"doesn’t have a host role"); }));
@@ -1191,11 +1209,19 @@ static BOOL ClientRole(MDManagerApp *app, MDHostsPage *hosts, FixtureHosts *work
 static BOOL ClientStale(MDManagerApp *app, MDHostsPage *hosts, FixtureHosts *worker, NSWindow *window) {
     NSString *keyA=@"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", *keyB=@"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     NSString *saved=worker.owner;
-    worker.state=MDHostsSynced; worker.owner=keyA;
+    /* Round 6 #1 (targeted): from the no-client-role panel, Identity reports
+     * a newly assigned role. The reload reconciliation starts belongs to the
+     * new owner and must be delivered: Hosts leaves the panel, not busy. */
+    worker.state=MDHostsNoClientRole; worker.owner=nil;
     [app showSection:@"Hosts"];
     CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)]; }));
     [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && Visible(SetupPanel(hosts.view)); }));
+    worker.state=MDHostsSynced; worker.owner=keyA;
+    [hosts identityChanged:keyA];
     NSButton *review=Button(hosts.view,@"Review and Connect…");
+    CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && review.enabled && !Visible(SetupPanel(hosts.view)); }));
+    [NSApp sendAction:@selector(refresh:) to:hosts from:nil];
     CHECK(Await(^BOOL{ return [hosts canPerform:@selector(refresh:)] && review.enabled; }));
     [hosts identityChanged:keyA];
     NSUInteger closes=worker.closes, resolves=worker.resolves;
@@ -1298,6 +1324,282 @@ static BOOL HostCommands(void) {
     [window close];
     return YES;
 }
+/* ---- Round 6: the new user's journey, end to end, with fixtures ----
+ * JourneyHosts derives its state the way the real worker does, from the
+ * fixture identity directory (accounts and client role), the signer's
+ * availability and whether relays were started; JourneyConnect stands in for
+ * a signer that proves whichever key it is asked for. */
+@interface JourneyHosts : MDHostsWorker
+@property(copy) NSString *directory;
+@property(atomic) BOOL signerDown;
+@property(atomic) NSUInteger closes;
+@property(atomic, copy) dispatch_block_t entered;
+@property(atomic, strong) dispatch_semaphore_t proceed;
+@end
+@implementation JourneyHosts {
+    NSString *_owner, *_relays; MDHostsState _blocker; /* worker queue only */
+}
+- (BOOL)openDirectory:(NSString *)directory error:(NSString **)error {
+    (void)directory; (void)error;
+    NSString *client=nil;
+    for (NSDictionary *a in MDIdentityAccounts(self.directory,NULL)) if ([a[@"client"] boolValue]) client=a[@"key"];
+    NSString *owner=client && !self.signerDown ? client : nil;
+    if (![owner isEqual:_owner]) _relays=nil;
+    _owner=owner;
+    _blocker=!client ? MDHostsNoClientRole : self.signerDown ? MDHostsSignerUnavailable : MDHostsSynced;
+    return YES;
+}
+- (BOOL)startRelays:(NSString *)urls { if (_owner) _relays=urls; return YES; }
+- (MDHostsBook *)snapshot {
+    FixtureBook *b=[FixtureBook new];
+    b.fixtureState=_blocker!=MDHostsSynced ? _blocker : _relays.length ? MDHostsSynced : MDHostsNoRelays;
+    b.fixtureOwner=_owner; return b;
+}
+- (MDHostReview *)resolve:(NSString *)value route:(NSString *)route cancelled:(bool (*)(void *))cancelled data:(void *)data error:(NSString **)error {
+    (void)value; (void)route; (void)cancelled; (void)data; (void)error;
+    dispatch_block_t entered=self.entered; dispatch_semaphore_t proceed=self.proceed;
+    if (entered) { dispatch_async(dispatch_get_main_queue(),entered); dispatch_semaphore_wait(proceed,dispatch_time(DISPATCH_TIME_NOW,8*NSEC_PER_SEC)); }
+    return [FixtureReview new];
+}
+- (void)close { ++self.closes; _owner=nil; _relays=nil; }
+@end
+static int JourneyKey(MdSigner *s,char **key) { *key=strdup((const char *)s->backend); return *key?0:MD_SIGNER_ERR_INTERNAL; }
+static void JourneyDrop(MdSigner *s) { free(s->backend); }
+static int JourneyConnect(MdSignerType backend,const char *key,MdCredentialStore *store,MdSigner **out) {
+    (void)store;
+    static const MdSignerOps ops={.get_pubkey=JourneyKey,.destroy=JourneyDrop};
+    char *copy=strdup(key);
+    *out=copy ? md_signer_create_custom(backend,&ops,copy) : NULL;
+    if (!*out) { free(copy); return MD_SIGNER_ERR_INTERNAL; }
+    return 0;
+}
+static MdCredentialStore *JourneyStore(void) {
+    static const MdCredentialStoreOps ops={.get=GetPair,.put=PutPair,.remove=RemovePair};
+    return md_credential_store_custom(&ops,NULL);
+}
+@interface Journey : NSObject
+@property(strong) MDManagerApp *app; @property(strong) MDHostsPage *hosts; @property(strong) JourneyHosts *worker;
+@property(strong) MDIdentityPage *identity; @property(strong) MDLocalHostPages *local; @property(strong) NSWindow *window;
+@property(copy) NSString *directory; @property MdSignerType backend;
+@end
+@implementation Journey
+@end
+static Journey *OpenJourney(NSString *root, NSString *name, MdSignerType backend, BOOL signerDown) {
+    Journey *j=[Journey new]; j.backend=backend;
+    j.directory=[root stringByAppendingPathComponent:name];
+    [NSFileManager.defaultManager createDirectoryAtPath:j.directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
+    j.worker=[[JourneyHosts alloc] initWithChange:nil]; j.worker.directory=j.directory; j.worker.signerDown=signerDown;
+    j.hosts=[[MDHostsPage alloc] initWithWorker:j.worker];
+    NSString *directory=j.directory;
+    j.hosts.accountCount=^NSUInteger{ return MDIdentityAccounts(directory,NULL).count; };
+    FixtureLink *link=[[FixtureLink alloc] initWithUpdate:nil]; link.commands=[NSMutableArray array]; link.paths=[NSMutableArray array];
+    j.local=[[MDLocalHostPages alloc] initWithLinkFactory:^MDHostLink *(MDHostUpdate update) { link.push=update; return link; }];
+    j.local.discover=^NSString *(NSString **hostKey) { *hostKey=nil; return nil; };
+    j.identity=[[MDIdentityPage alloc] initWithHosts:j.hosts directory:directory connect:JourneyConnect credentials:^{ return JourneyStore(); }];
+    j.app=[[MDManagerApp alloc] initWithHosts:j.hosts local:j.local identity:j.identity];
+    j.window=[j.app makeMainWindow]; j.window.alphaValue=0;
+    KeyWindowOverride=j.window;
+    return j;
+}
+static BOOL CloseJourney(Journey *j) {
+    __block int pending=3;
+    [j.hosts close:^{ --pending; }]; [j.local close:^{ --pending; }]; [j.identity close:^{ --pending; }];
+    CHECK(Await(^BOOL{ return pending==0; }));
+    [j.window close]; KeyWindowOverride=nil;
+    NSString *error=nil; MDHostsBootstrap(@"",&error);
+    return YES;
+}
+/* Waits up to 6 s (the journey's steps chain several worker round trips). */
+static BOOL Eventually(BOOL (^ready)(void)) { return Await(ready) || Await(ready); }
+/* Hosts is showing the setup panel titled title, idle, its next-step button
+ * enabled, and the connect form hidden. */
+static BOOL ShowsPanel(Journey *j, NSString *title) {
+    [j.app showSection:@"Hosts"];
+    return Eventually(^BOOL{
+        MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(j.hosts.view);
+        return [j.hosts canPerform:@selector(refresh:)] && Visible(panel) && [panel.titleLabel.stringValue isEqual:title] &&
+            panel.primary.enabled && !Visible(Field(j.hosts.view,@"Host npub"));
+    });
+}
+/* Hosts is showing its page (no panel), idle, with the Host field enabled;
+ * Review and Connect is enabled exactly when ready; banner, if given, shows. */
+static BOOL ShowsPage(Journey *j, NSString *banner, BOOL ready) {
+    [j.app showSection:@"Hosts"];
+    return Eventually(^BOOL{
+        NSView *v=j.hosts.view; NSTextField *address=Field(v,@"Host npub");
+        return [j.hosts canPerform:@selector(refresh:)] && !Visible(SetupPanel(v)) && Visible(address) && address.enabled &&
+            [Button(v,@"Review and Connect…") isEnabled]==ready && (banner ? LabelContains(v,banner) : !LabelContains(v,@"Choose Relays"));
+    });
+}
+static BOOL IdentityIdle(Journey *j) {
+    return Eventually(^BOOL{ return [j.identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))]; });
+}
+/* From the first-run panel: its button opens Add Signer Account; add KEY. */
+static BOOL AddFirstAccount(Journey *j) {
+    CHECK(ShowsPanel(j,@"Add Your Signer Account"));
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(j.hosts.view);
+    [panel.primary performClick:nil];
+    CHECK(Eventually(^BOOL{ return [j.window.title isEqual:@"Identity"] && j.window.attachedSheet!=nil; }));
+    NSWindow *sheet=j.window.attachedSheet; NSView *form=sheet.contentView;
+    NSPopUpButton *picker=(NSPopUpButton *)Find(form,^BOOL(NSView *v){ return [v isKindOfClass:NSPopUpButton.class]; });
+    NSTextField *key=Field(form,@"Public key"), *label=Field(form,@"Public label");
+    CHECK(picker && key && label && [picker selectItemWithTag:j.backend]);
+    CHECK([sheet makeFirstResponder:key]);
+    [(NSTextView *)key.currentEditor insertText:@KEY replacementRange:NSMakeRange(0,0)];
+    label.stringValue=@"Journey";
+    NSButton *add=Button(form,@"Add Account");
+    CHECK(add.enabled);
+    [add performClick:nil];
+    CHECK(Eventually(^BOOL{ return j.window.attachedSheet==nil && LabelContains(j.identity.view,@"Account added"); }));
+    CHECK(IdentityIdle(j));
+    /* Hosts moves on to choosing an account for connecting. */
+    CHECK(ShowsPanel(j,@"Choose an Account for Connecting"));
+    return YES;
+}
+/* Relays are saved on the Relays page; Hosts reaches ready. */
+static BOOL SaveRelaysAndReady(Journey *j) {
+    [j.app showSection:@"Relays"];
+    NSView *root=j.window.contentView;
+    NSTextField *relays=Field(root,@"Bootstrap relays"); NSButton *save=Button(root,@"Save and Sync");
+    CHECK(Eventually(^BOOL{ return save.enabled; }));
+    relays.stringValue=@"wss://journey.fixture.invalid/";
+    [save performClick:nil];
+    CHECK(Eventually(^BOOL{ return LabelContains(root,@"Relays saved"); }));
+    CHECK(ShowsPage(j,nil,YES));
+    return YES;
+}
+static NSDictionary *AccountWithKey(Journey *j, NSString *key) {
+    for (NSDictionary *a in MDIdentityAccounts(j.directory,NULL)) if ([a[@"key"] isEqual:key]) return a;
+    return nil;
+}
+static NSString *ClientID(Journey *j) {
+    for (NSDictionary *a in MDIdentityAccounts(j.directory,NULL)) if ([a[@"client"] boolValue]) return a[@"id"];
+    return @"";
+}
+/* Another program assigns the client role (or unassigns it with key nil). */
+static BOOL BindOutside(Journey *j, NSString *key) {
+    MdCredentialStore *store=JourneyStore();
+    NSString *error=MDIdentityBind(j.directory,store,MD_ACCOUNT_CLIENT,key ? AccountWithKey(j,key) : nil,ClientID(j),NO,JourneyConnect,NULL,NULL,NULL);
+    md_credential_store_destroy(store);
+    CHECK(!error.length);
+    return YES;
+}
+/* Identity's View > Refresh picks the change up. */
+static BOOL RefreshIdentity(Journey *j, NSString *expected) {
+    CHECK(IdentityIdle(j));
+    [j.identity refresh:nil]; /* busy from here until the reload completes */
+    CHECK(Eventually(^BOOL{ return [j.identity validateMenuItem:MenuItem(NSApp.mainMenu,@selector(refresh:))] && [j.identity.clientRoleKey isEqual:expected]; }));
+    return YES;
+}
+/* a. First run entirely in the app. */
+static BOOL JourneyInApp(NSString *root, MdSignerType backend) {
+    Journey *j=OpenJourney(root,@"journey-in-app",backend,NO);
+    CHECK([j.window.title isEqual:@"Hosts"]);
+    CHECK(AddFirstAccount(j));
+    /* The role is assigned in Identity through the normal binding. */
+    [j.app showSection:@"Identity"];
+    NSButton *bind=Button(j.identity.view,@"Use for Client");
+    CHECK(Eventually(^BOOL{ return bind.enabled; }));
+    CHECK(Send(bind));
+    CHECK(Eventually(^BOOL{ return LabelContains(j.identity.view,@"Client role saved"); }) && IdentityIdle(j));
+    /* Hosts leaves the panel: no relays yet. */
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
+    CHECK(SaveRelaysAndReady(j));
+    return CloseJourney(j);
+}
+/* b. The same, with the role assigned outside the app; then c. from ready. */
+static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
+    Journey *j=OpenJourney(root,@"journey-outside",backend,NO);
+    CHECK(AddFirstAccount(j));
+    CHECK(BindOutside(j,@KEY));
+    CHECK(ShowsPanel(j,@"Choose an Account for Connecting")); /* not yet picked up */
+    CHECK(RefreshIdentity(j,@KEY));
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
+    CHECK(SaveRelaysAndReady(j));
+
+    /* c1. Switched in the app to a second account: Hosts reopens for it and
+     * waits for a sync (a client change doesn't sync on its own). */
+    CHECK(!MDIdentityAdd(j.directory,backend,@OTHER,@"Second").length);
+    CHECK(RefreshIdentity(j,@KEY));
+    [j.app showSection:@"Identity"];
+    NSTableView *accounts=(NSTableView *)Find(j.identity.view,^BOOL(NSView *v){ return [v isKindOfClass:NSTableView.class] && [v.accessibilityLabel isEqual:@"Signer accounts"]; });
+    NSUInteger row=[MDIdentityAccounts(j.directory,NULL) indexOfObjectPassingTest:^BOOL(NSDictionary *a, NSUInteger i, BOOL *stop) { (void)i; (void)stop; return [a[@"key"] isEqual:@OTHER]; }];
+    CHECK(row!=NSNotFound);
+    [accounts selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+    NSButton *bind=Button(j.identity.view,@"Use for Client");
+    NSUInteger closes=j.worker.closes;
+    CHECK(Eventually(^BOOL{ return bind.enabled; }) && Send(bind));
+    CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@OTHER]; }) && IdentityIdle(j));
+    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
+    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
+    CHECK(ShowsPage(j,nil,YES));
+
+    /* c2. Switched outside the app while Hosts is idle. */
+    closes=j.worker.closes;
+    CHECK(BindOutside(j,@KEY) && RefreshIdentity(j,@KEY));
+    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
+    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
+    CHECK(ShowsPage(j,nil,YES));
+
+    /* c3. Switched outside while a Hosts operation is held in flight: the
+     * old owner's review never appears; Hosts reopens for the new owner. */
+    __block BOOL entered=NO;
+    j.worker.proceed=dispatch_semaphore_create(0);
+    j.worker.entered=^{ entered=YES; };
+    Field(j.hosts.view,@"Host npub").stringValue=@KEY;
+    closes=j.worker.closes;
+    CHECK(Send(Button(j.hosts.view,@"Review and Connect…")) && Eventually(^BOOL{ return entered; }));
+    CHECK(BindOutside(j,@OTHER) && RefreshIdentity(j,@OTHER));
+    dispatch_semaphore_signal(j.worker.proceed);
+    j.worker.entered=nil;
+    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
+    CHECK(!j.window.attachedSheet && !LabelContains(j.hosts.view,@"Checking the host"));
+    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
+    CHECK(ShowsPage(j,nil,YES));
+
+    /* c4. Unassigned in the app: back to choosing an account. */
+    [j.app showSection:@"Identity"];
+    CHECK(IdentityIdle(j));
+    [j.identity performSelector:@selector(unbindClient:) withObject:nil];
+    CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@""]; }) && IdentityIdle(j));
+    CHECK(ShowsPanel(j,@"Choose an Account for Connecting"));
+    return CloseJourney(j);
+}
+/* d. Signer unavailable, then Try Again once it is available: ready. */
+static BOOL JourneySigner(NSString *root, MdSignerType backend) {
+    NSString *directory=[root stringByAppendingPathComponent:@"journey-signer"];
+    [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
+    CHECK(!MDIdentityAdd(directory,backend,@KEY,@"Journey").length);
+    MdCredentialStore *store=JourneyStore();
+    CHECK(!MDIdentityBind(directory,store,MD_ACCOUNT_CLIENT,MDIdentityAccounts(directory,NULL).firstObject,@"",NO,JourneyConnect,NULL,NULL,NULL).length);
+    md_credential_store_destroy(store);
+    NSString *error=nil;
+    CHECK(MDHostsBootstrap(@"wss://journey.fixture.invalid/",&error).length);
+    Journey *j=OpenJourney(root,@"journey-signer",backend,YES);
+    CHECK(ShowsPanel(j,@"Your Signer Isn’t Available"));
+    MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(j.hosts.view);
+    CHECK([panel.primary.title isEqual:@"Try Again"]);
+    j.worker.signerDown=NO;
+    [panel.primary performClick:nil];
+    CHECK(ShowsPage(j,nil,YES));
+    return CloseJourney(j);
+}
+static BOOL Journeys(NSString *directory, MdSignerType backend) {
+    if (!MDIdentitySupportsBackend(backend)) { puts("SKIP: no compiled external signer adapter for the journey fixtures"); return YES; }
+    CHECK(JourneyInApp(directory,backend));
+    CHECK(JourneyOutside(directory,backend));
+    CHECK(JourneySigner(directory,backend));
+    return YES;
+}
+static MdSignerType JourneyBackend(void) {
+    return MDIdentitySupportsBackend(MD_SIGNER_NIP46) ? MD_SIGNER_NIP46 : MDIdentitySupportsBackend(MD_SIGNER_NIP5F) ? MD_SIGNER_NIP5F : MD_SIGNER_NIP55L;
+}
+static BOOL RunJourneys(NSString *directory) {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    [MDManagerApp installMainMenu:NSApp];
+    [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
+    return Journeys(directory,JourneyBackend());
+}
 static BOOL Run(NSString *directory) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FixtureHosts *worker=[[FixtureHosts alloc] initWithChange:nil];
@@ -1350,11 +1652,12 @@ static BOOL Run(NSString *directory) {
     CHECK(RelaysFirst());
     CHECK(LaunchOnHosts());
     CHECK(HostCommands());
+    CHECK(Journeys(directory,backend));
     return YES;
 }
 int main(int argc,char **argv) {
     @autoreleasepool {
-        MD_CHECK(argc==2);
+        MD_CHECK(argc==2 || (argc==3 && !strcmp(argv[2],"journeys")));
         CFDictionaryRef session=CGSessionCopyCurrentDictionary();
         if (!session || CGMainDisplayID()==kCGNullDirectDisplay) {
             if (session) CFRelease(session);
@@ -1364,6 +1667,7 @@ int main(int argc,char **argv) {
         CFRelease(session);
         [TestApplication sharedApplication];
         if (argc==2) Run(@(argv[1]));
+        else if (argc==3) RunJourneys(@(argv[1])); /* the new-user journeys alone (mutation checks) */
         return md_test_report();
     }
 }
