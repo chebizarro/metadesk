@@ -360,7 +360,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 }
 
 @interface FixtureReview : MDHostReview
-@property BOOL mismatch;
+@property BOOL mismatch, fixtureOutdated;
 @end
 @implementation FixtureReview
 - (NSString *)key { return @KEY; }
@@ -369,6 +369,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 - (NSString *)oldKey { return self.mismatch ? @OTHER : nil; }
 - (NSString *)alias { return self.mismatch ? @"desk@example.invalid" : nil; }
 - (uint8_t)caps { return MD_CAP_VIDEO; }
+- (BOOL)cachedDetailsMayBeOutdated { return self.fixtureOutdated; }
 @end
 @interface FixtureBook : MDHostsBook
 @property MDHostsState fixtureState;
@@ -376,9 +377,13 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 @end
 @implementation FixtureBook
 - (NSString *)owner { return self.fixtureOwner; }
-/* An explicit state: the page shows its content only when ready. */
+/* Model fixture: a usable identity/cache is independent of sync. */
 - (MDHostsState)state { return self.fixtureState; }
+- (NSString *)status {
+    return self.fixtureState == MDHostsDocumentError ? @"An encrypted document is invalid and will not be overwritten." : [super status];
+}
 - (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
+- (BOOL)canReviewKey { return self.fixtureState > MDHostsNoRelays && self.fixtureState != MDHostsDocumentError; }
 - (BOOL)canEdit { return self.fixtureState == MDHostsSynced; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey!=nil; }
 - (BOOL)canConfirmReview:(MDHostReview *)review fingerprint:(NSString *)fingerprint {
@@ -407,7 +412,9 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
         if (dispatch_semaphore_wait(self.proceed,dispatch_time(DISPATCH_TIME_NOW,4*NSEC_PER_SEC))) return nil;
         self.observeCancellation=cancelled(data);
     }
-    FixtureReview *result=[FixtureReview new]; result.mismatch=self.mismatch; return result;
+    FixtureReview *result=[FixtureReview new]; result.mismatch=self.mismatch;
+    result.fixtureOutdated=self.state==MDHostsRelaysOffline;
+    return result;
 }
 - (BOOL)launchConfig:(MdManagedLaunch *)config review:(MDHostReview *)review error:(NSString **)error {
     (void)config; self.launchReview=review; ++self.launches;
@@ -457,7 +464,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     [page suspendForRoleEdit:^{ drained=YES; }];
     CHECK(Await(^BOOL{ return drained; }));
     [page resumeAfterRoleEdit];
-    CHECK(Await(^BOOL{ return LabelContains(view,@"Relay sync is paused"); }));
+    CHECK(Await(^BOOL{ return canRefresh() && worker.starts==starts+1; }));
 
     address.stringValue=@"  nostr:nsec1fixture-not-a-key";
     CHECK(Send(review));
@@ -474,6 +481,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
     NSView *sheet=window.attachedSheet.contentView;
     CHECK(Button(sheet,@"Connect").enabled && Button(sheet,@"Save Host").enabled);
+    CHECK(!LabelContains(sheet,@"Saved host details may be out of date"));
     CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Cancel")));
     CHECK([worker.input isEqual:@KEY] && worker.resolves==1 && !worker.saves && !worker.launches);
     CHECK(EndSheet(window,NSAlertFirstButtonReturn) && !worker.saves && !worker.launches);
@@ -486,6 +494,35 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return LabelContains(view,@"Fixture stopped before"); }));
     CHECK(worker.launches==1 && [worker.launchReview.key isEqual:@KEY]);
 
+    for (NSNumber *state in @[@(MDHostsSyncing), @(MDHostsRelaysOffline), @(MDHostsRelayRefused)]) {
+        worker.state=state.intValue;
+        CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
+        CHECK(Await(^BOOL{ return review.enabled && Visible(address) && !Visible(SetupPanel(view)) && LabelContains(view,@"To connect by name"); }));
+        NSUInteger resolves=worker.resolves, launches=worker.launches, saves=worker.saves;
+        address.stringValue=@"desk@example.invalid";
+        CHECK(Send(review) && LabelContains(view,@"before reviewing a NIP-05 name"));
+        CHECK(worker.resolves==resolves && !window.attachedSheet);
+        address.stringValue=@KEY;
+        CHECK(Send(review) && Await(^BOOL{ return window.attachedSheet!=nil; }));
+        sheet=window.attachedSheet.contentView;
+        CHECK(Button(sheet,@"Connect").enabled && Button(sheet,@"Save Host") && !Button(sheet,@"Save Host").enabled);
+        CHECK(LabelContains(sheet,@"Saving requires a synced, writable host list") && LabelContains(sheet,@"Fingerprint"));
+        CHECK(LabelContains(sheet,@"Saved host details may be out of date until sync completes.")==
+              (state.intValue==MDHostsRelaysOffline));
+        CHECK(worker.launches==launches && worker.saves==saves);
+        CHECK(EndSheet(window,NSAlertFirstButtonReturn));
+    }
+    worker.state=MDHostsDocumentError;
+    CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
+    CHECK(Await(^BOOL{ return canRefresh() && Visible(address) && !Visible(SetupPanel(view)) &&
+        LabelContains(view,@"Part of Your Host List Can’t Be Read"); }));
+    CHECK(!review.enabled && !Button(view,@"Scan QR Code…").enabled &&
+        !LabelContains(view,@"use the host’s public key") && LabelContains(view,@"Host review is unavailable"));
+    address.stringValue=@KEY;
+    CHECK(!Send(review) && !window.attachedSheet);
+    worker.state=MDHostsSynced;
+    CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
+    CHECK(Await(^BOOL{ return review.enabled; }));
     worker.mismatch=YES;
     CHECK(Send(review) && Await(^BOOL{ return window.attachedSheet!=nil; }));
     sheet=window.attachedSheet.contentView;
@@ -1371,6 +1408,8 @@ static BOOL HostCommands(void) {
  * the client role. Each signals its flag on the main queue first. */
 @property(atomic, strong) dispatch_semaphore_t closeGate, openGate;
 @property(atomic) BOOL closeHeld, openHeld;
+@property(atomic) NSUInteger starts;
+@property(atomic) MDHostsState syncState;
 @end
 static void Hold(JourneyHosts *w, dispatch_semaphore_t gate, BOOL close) {
     if (!gate) return;
@@ -1390,12 +1429,12 @@ static void Hold(JourneyHosts *w, dispatch_semaphore_t gate, BOOL close) {
     if (![owner isEqual:_owner]) _relays=nil;
     _owner=owner;
     _blocker=!client ? MDHostsNoClientRole : self.signerDown ? MDHostsSignerUnavailable : MDHostsSynced;
-    return YES;
+    return _owner != nil;
 }
-- (BOOL)startRelays:(NSString *)urls { if (_owner) _relays=urls; return YES; }
+- (BOOL)startRelays:(NSString *)urls { ++self.starts; if (_owner) _relays=urls; return YES; }
 - (MDHostsBook *)snapshot {
     FixtureBook *b=[FixtureBook new];
-    b.fixtureState=_blocker!=MDHostsSynced ? _blocker : _relays.length ? MDHostsSynced : MDHostsNoRelays;
+    b.fixtureState=_blocker!=MDHostsSynced ? _blocker : _relays.length ? (self.syncState ?: MDHostsSynced) : MDHostsNoRelays;
     b.fixtureOwner=_owner; return b;
 }
 - (MDHostReview *)resolve:(NSString *)value route:(NSString *)route cancelled:(bool (*)(void *))cancelled data:(void *)data error:(NSString **)error {
@@ -1480,13 +1519,14 @@ static BOOL ShowsPanel(Journey *j, NSString *title) {
     });
 }
 /* Hosts is showing its page (no panel), idle, with the Host field enabled;
- * Review and Connect is enabled exactly when ready; banner, if given, shows. */
+ * saved relays and a usable cache enable key review; ready checks name-based sync. */
 static BOOL ShowsPage(Journey *j, NSString *banner, BOOL ready) {
     [j.app showSection:@"Hosts"];
+    BOOL reviewEnabled = ![banner isEqual:@"Choose Relays to Sync Your Hosts"];
     return Within([NSString stringWithFormat:@"Hosts idle on its page (banner “%@”, ready %d)", banner ?: @"none", ready].UTF8String, __LINE__, ^BOOL{
         NSView *v=j.hosts.view; NSTextField *address=Field(v,@"Host npub");
         return [j.hosts canPerform:@selector(refresh:)] && !Visible(SetupPanel(v)) && Visible(address) && address.enabled &&
-            [Button(v,@"Review and Connect…") isEnabled]==ready && (banner ? LabelContains(v,banner) : !LabelContains(v,@"Choose Relays"));
+            [Button(v,@"Review and Connect…") isEnabled]==reviewEnabled && [[[j.hosts valueForKey:@"book"] valueForKey:@"canReview"] boolValue]==ready && (banner ? LabelContains(v,banner) : !LabelContains(v,@"Choose Relays"));
     });
 }
 static BOOL IdentityIdle(Journey *j) {
@@ -1514,8 +1554,8 @@ static BOOL AddFirstAccount(Journey *j) {
     CHECK(ShowsPanel(j,@"Choose an Account for Connecting"));
     return YES;
 }
-/* Relays are saved on the Relays page; Hosts reaches ready. */
-static BOOL SaveRelaysAndReady(Journey *j) {
+/* Relays are saved on the Relays page; Hosts starts sync. */
+static BOOL SaveJourneyRelays(Journey *j) {
     [j.app showSection:@"Relays"];
     NSView *root=j.window.contentView;
     NSTextField *relays=Field(root,@"Bootstrap relays"); NSButton *save=Button(root,@"Save and Sync");
@@ -1523,7 +1563,6 @@ static BOOL SaveRelaysAndReady(Journey *j) {
     relays.stringValue=@"wss://journey.fixture.invalid/";
     [save performClick:nil];
     CHECK(Eventually(^BOOL{ return LabelContains(root,@"Relays saved"); }));
-    CHECK(ShowsPage(j,nil,YES));
     return YES;
 }
 static NSDictionary *AccountWithKey(Journey *j, NSString *key) {
@@ -1560,9 +1599,22 @@ static BOOL JourneyInApp(NSString *root, MdSignerType backend) {
     CHECK(Eventually(^BOOL{ return bind.enabled; }));
     CHECK(Send(bind));
     CHECK(Eventually(^BOOL{ return LabelContains(j.identity.view,@"Client role saved"); }) && IdentityIdle(j));
-    /* Hosts leaves the panel: no relays yet. */
-    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
-    CHECK(SaveRelaysAndReady(j));
+    /* Hosts leaves the panel, but an entered key cannot review without relays. */
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO) && j.worker.starts==0);
+    Field(j.hosts.view,@"Host npub").stringValue=@KEY;
+    CHECK(!Send(Button(j.hosts.view,@"Review and Connect…")) && !j.window.attachedSheet);
+    j.worker.syncState=MDHostsSyncing;
+    CHECK(SaveJourneyRelays(j) && ShowsPage(j,@"Syncing Your Host List",NO) && j.worker.starts==1);
+    NSView *view=j.hosts.view;
+    NSTextField *address=Field(view,@"Host npub");
+    NSButton *review=Button(view,@"Review and Connect…");
+    address.stringValue=@"desk@example.invalid";
+    CHECK(Send(review) && LabelContains(view,@"before reviewing a NIP-05 name") && !j.window.attachedSheet);
+    address.stringValue=@KEY;
+    CHECK(Send(review) && Eventually(^BOOL{ return j.window.attachedSheet!=nil; }));
+    CHECK(Button(j.window.attachedSheet.contentView,@"Connect").enabled &&
+        !Button(j.window.attachedSheet.contentView,@"Save Host").enabled);
+    CHECK(EndSheet(j.window,NSAlertFirstButtonReturn));
     return CloseJourney(j);
 }
 /* b. The same, with the role assigned outside the app; then c. from ready. */
@@ -1572,11 +1624,11 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@KEY));
     CHECK(ShowsPanel(j,@"Choose an Account for Connecting")); /* not yet picked up */
     CHECK(RefreshIdentity(j,@KEY));
-    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
-    CHECK(SaveRelaysAndReady(j));
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO) && j.worker.starts==0);
+    CHECK(SaveJourneyRelays(j) && ShowsPage(j,nil,YES));
 
     /* c1. Switched in the app to a second account: Hosts reopens for it and
-     * waits for a sync (a client change doesn't sync on its own). */
+     * starts sync with the existing relay settings. */
     CHECK(!MDIdentityAdd(j.directory,backend,@OTHER,@"Second").length);
     CHECK(RefreshIdentity(j,@KEY));
     [j.app showSection:@"Identity"];
@@ -1588,16 +1640,12 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     NSUInteger closes=j.worker.closes;
     CHECK(Eventually(^BOOL{ return bind.enabled; }) && Send(bind));
     CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@OTHER]; }) && IdentityIdle(j));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
 
     /* c2. Switched outside the app while Hosts is idle. */
     closes=j.worker.closes;
     CHECK(BindOutside(j,@KEY) && RefreshIdentity(j,@KEY));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
 
     /* c3. Switched outside while a Hosts operation is held in flight: the
      * old owner's review never appears; Hosts reopens for the new owner. */
@@ -1610,10 +1658,8 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@OTHER) && RefreshIdentity(j,@OTHER));
     dispatch_semaphore_signal(j.worker.proceed);
     j.worker.entered=nil;
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
     CHECK(!j.window.attachedSheet && !LabelContains(j.hosts.view,@"Checking the host"));
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
 
     /* c4. Unassigned in the app: back to choosing an account. */
     [j.app showSection:@"Identity"];
@@ -1659,9 +1705,7 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     NSString *error=nil;
     CHECK(MDHostsBootstrap(@"wss://journey.fixture.invalid/",&error).length);
     Journey *j=OpenJourney(root,@"journey-reconcile",backend,NO);
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.starts==1);
     CHECK(RefreshIdentity(j,@KEY));
 
     /* 1. Overlapping suspensions. An external change to OTHER is picked up by
@@ -1688,10 +1732,8 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     dispatch_semaphore_t signer=JourneyBindGate; JourneyBindGate=nil;
     dispatch_semaphore_signal(signer);
     CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@KEY]; }) && IdentityIdle(j));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
-    CHECK(j.worker.opens==opens+1 && j.worker.closes==closes+1 && [BookOwner(j) isEqual:@KEY]);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
     CHECK(ShowsPage(j,nil,YES));
+    CHECK(j.worker.opens==opens+1 && j.worker.closes==closes+1 && [BookOwner(j) isEqual:@KEY]);
 
     /* 2. A role change reported during reconciliation's own reload: the
      * reload (which read OTHER) is held; Identity then reports KEY again.
@@ -1704,11 +1746,9 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@KEY) && RefreshIdentity(j,@KEY));
     gate=j.worker.openGate; j.worker.openGate=nil;
     dispatch_semaphore_signal(gate);
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
+    CHECK(ShowsPage(j,nil,YES));
     CHECK(Eventually(^BOOL{ return [BookOwner(j) isEqual:@KEY] && [j.hosts canPerform:@selector(refresh:)]; }));
     CHECK(j.worker.closes==closes+2 && j.worker.opens==opens+2);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
 
     /* 3. Quit during reconciliation: the close is held when Quit arrives.
      * Termination waits, then completes once; Hosts doesn't reopen. */
@@ -1738,12 +1778,12 @@ static BOOL JourneySigner(NSString *root, MdSignerType backend) {
     NSString *error=nil;
     CHECK(MDHostsBootstrap(@"wss://journey.fixture.invalid/",&error).length);
     Journey *j=OpenJourney(root,@"journey-signer",backend,YES);
-    CHECK(ShowsPanel(j,@"Your Signer Isn’t Available"));
+    CHECK(ShowsPanel(j,@"Your Signer Isn’t Available") && j.worker.starts==0);
     MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(j.hosts.view);
     CHECK([panel.primary.title isEqual:@"Try Again"]);
     j.worker.signerDown=NO;
     [panel.primary performClick:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.starts==1);
     return CloseJourney(j);
 }
 static BOOL Journeys(NSString *directory, MdSignerType backend) {

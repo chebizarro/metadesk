@@ -39,10 +39,10 @@ options = {o['name']: o['value'] for o in json.loads((build / 'meson-info' / 'in
 nip46 = bool(options.get('signer_nip46'))
 any_signer = nip46 or bool(options.get('signer_nip5f')) or bool(options.get('signer_nip55l'))
 # CHECK_RENDERER: light, default size: 2 disconnected + 5 sections + 1
-# connecting + 17 sheets + 2 This Computer states + 13 Hosts states, + menu.txt.
+# connecting + 18 sheets + 2 This Computer states + 13 Hosts states, + menu.txt.
 NOT_BUILT = (['sheet-identity-pairing-light.png'] if not nip46 else []) + \
             (['sheet-identity-add-light.png'] if not any_signer else [])
-EXPECTED = 2 + 5 + 1 + 17 + 2 + 13 + 1 - len(NOT_BUILT)
+EXPECTED = 2 + 5 + 1 + 18 + 2 + 13 + 1 - len(NOT_BUILT)
 
 
 def state(path):
@@ -160,7 +160,8 @@ try:
         fixture_runtime = produced[0].parent / 'runtime'
         assert fixture_runtime.is_dir() and not any(fixture_runtime.iterdir()), 'host socket discovery ran during the render'
         for required in ('page-hosts-state-no-signer-account-default-light.png', 'sheet-hosts-key-changed-light.png',
-                         'sheet-access-review-light.png', 'sheet-computer-qr-light.png', 'page-relays-default-light.png',
+                         'sheet-hosts-review-offline-light.png', 'sheet-access-review-light.png',
+                         'sheet-computer-qr-light.png', 'page-relays-default-light.png',
                          'page-identity-default-light.png', 'sheet-identity-label-light.png'):
             assert required in files, required
         # Scenes follow the configuration: present when built, otherwise

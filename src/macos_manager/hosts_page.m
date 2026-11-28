@@ -108,14 +108,13 @@ static NSTextField *Field(NSString *placeholder, NSString *value) {
 }
 @end
 
-typedef NS_ENUM(NSInteger, MDReload) { MDReloadOpen, MDReloadRefresh, MDReloadSave };
 @interface MDHostsPage () <NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate> {
     dispatch_queue_t _queue;
     MDHostsWorker *_worker;
     MDHostsBook *_book;
     MDHostsLaunch *_launch;
     atomic_bool _closing, _dirty, _wakeQueued;
-    BOOL _busy, _launched, _started, _roleEditing, _syncPaused;
+    BOOL _busy, _launched, _started, _roleEditing;
     NSUInteger _generation, _launchGeneration;
     NSArray<NSDictionary *> *_rows;
     NSString *_lastOwner, *_savedBootstrap, *_relayDraft, *_directoryDraft, *_query, *_diagnosticText;
@@ -292,7 +291,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     return !_book || _roleEditing || state == MDHostsOpening || (state >= MDHostsNoClientRole && state <= MDHostsCacheUnavailable);
 }
 - (void)activate {
-    if (!_started) { _started = YES; [self reloadBook:NO]; }
+    if (!_started) { _started = YES; [self reloadBook]; }
     else if (_identityDirty) [self reconcileIdentity];
 }
 /* Identity reloaded its accounts and roles. First-run guidance depends on
@@ -314,7 +313,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)reconcileIdentity {
     if (!_identityDirty || !_started || self.closing || _roleEditing || _busy) return; /* run: rechecks when it finishes */
     _identityDirty = NO;
-    if (self.blocked) { [self reloadBook:NO]; return; }
+    if (self.blocked) { [self reloadBook]; return; }
     NSString *owner = _book.owner ?: @"";
     if (_expectedClient && ![owner isEqual:_expectedClient])
         [self suspendForRoleEdit:^{ [self resumeAfterRoleEdit]; }];
@@ -338,7 +337,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)resumeAfterRoleEdit {
     if (!_suspensions || --_suspensions) return; /* another suspension is still outstanding */
     _roleEditing=NO; ++_ownerEpoch;
-    if (!self.closing && _started) [self reloadBook:NO];
+    if (!self.closing && _started) [self reloadBook];
 }
 - (void)close:(dispatch_block_t)drained {
     atomic_store(&_closing, true);
@@ -436,7 +435,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (_roleEditing) return MDStatusWorking;
     if (!_book || _book.unavailable) return _book ? MDStatusError : MDStatusWorking;
     NSString *status = _book.status;
-    if ([status isEqual:@"Address book synced."]) return _syncPaused && _savedBootstrap.length ? MDStatusWarning : MDStatusOK;
+    if ([status isEqual:@"Address book synced."]) return MDStatusOK;
     if ([status hasSuffix:@"…"]) return MDStatusWorking;
     return MDStatusWarning;
 }
@@ -447,7 +446,6 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
  * next step. Nothing here changes what the model allows. */
 - (void)renderState {
     MDHostsState state = _roleEditing || !_book ? MDHostsOpening : _book.state;
-    BOOL paused = state == MDHostsNoRelays && _syncPaused && _savedBootstrap.length;
     NSString *detail = MDHostBoundText(_book.unavailable ?: @"", 400);
     BOOL blocked = YES;
     switch (state) {
@@ -480,14 +478,11 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _setup.hidden = !blocked; _content.hidden = blocked;
     if (blocked) { [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]]; return; }
     BOOL can = _book.canReview;
-    NSString *then = can ? @"" : @" Reviewing and connecting to hosts are available once your host list has caught up.";
-    switch (paused ? MDHostsOpening : state) {
-        case MDHostsOpening:
-            [_banner showTitle:@"Sync Is Paused" text:@"Your relays are saved, but Metadesk doesn’t contact them until you ask. Sync now to review and connect to hosts."
-                kind:MDStatusInfo buttons:@[[self step:@"Sync Now" action:@selector(refresh:)]]]; break;
+    NSString *then = (can || !_book.canReviewKey) ? @"" : @" To connect by name, wait for sync. To connect sooner, use the host’s public key.";
+    switch (state) {
         case MDHostsNoRelays:
             [_banner showTitle:@"Choose Relays to Sync Your Hosts"
-                text:@"Your host list syncs through relays you choose; Metadesk never picks one for you. Until you add one, you can see cached hosts but can’t review or connect to a host."
+                text:@"Choose relays before reviewing or connecting to hosts. Metadesk never chooses a relay for you."
                 kind:MDStatusWarning buttons:@[[self step:@"Set Up Relays…" action:@selector(editRelays:)]]]; break;
         case MDHostsSyncing:
             [_banner showTitle:@"Syncing Your Host List…" text:[@"This usually takes a few seconds." stringByAppendingString:then] kind:MDStatusWorking buttons:@[]]; break;
@@ -503,17 +498,18 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         case MDHostsReplayNeeded:
             [_banner showTitle:@"Catch-Up Was Incomplete" text:[@"Some updates may be missing." stringByAppendingString:then]
                 kind:MDStatusWarning buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
-        case MDHostsDocumentError:
-            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:[MDHostBoundText(_book.status, 200) stringByAppendingFormat:@" Metadesk won’t overwrite it.%@", then]
+        case MDHostsDocumentError: {
+            NSString *message = MDHostBoundText(_book.status, 200);
+            if (!_book.canReviewKey)
+                message = [message stringByAppendingString:@" Host review is unavailable until your saved hosts and their details can be read."];
+            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:message
                 kind:MDStatusError buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
+        }
         default: [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]];
     }
-    for (NSButton *b in @[_review, _scan]) b.toolTip = can ? nil : @"Available once your host list has synced — see the message above.";
 }
 - (void)render {
     NSString *status = _book.status ?: @"Opening the address book…";
-    if (_syncPaused && _savedBootstrap.length)
-        status = [status stringByAppendingString:@" Relay sync is paused. Choose View > Refresh to resume."];
     if (_roleEditing) status = @"Reloading the client role…";
     [_sync setText:status kind:[self syncKind]];
     [_relayStatus setText:status kind:[self syncKind]];
@@ -693,7 +689,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 }
 - (void)refresh:(id)sender {
     (void)sender;
-    if ([self canPerform:_cmd]) [self reloadBook:YES];
+    if ([self canPerform:_cmd]) [self reloadBook];
 }
 - (void)focusHostEntry:(id)sender {
     (void)sender;
@@ -716,8 +712,9 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (action == @selector(focusHostEntry:)) return open && !self.blocked; /* the Host field is hidden behind a first-run panel */
     if (action == @selector(focusSearch:) || action == @selector(editRelays:)) return !self.closing && !(checkSheet && self.sheetWindow.attachedSheet);
     if (action == @selector(refresh:)) return idle;
-    if (action == @selector(reviewEntry:) || action == @selector(scanQR:)) return idle && !_launched && _book.canReview;
-    if (action == @selector(reviewSaved:)) return idle && !_launched && _book.canReview && row && [_book addressForKey:row[@"key"]];
+    if (action == @selector(reviewEntry:) || action == @selector(scanQR:)) return idle && !_launched && _book.canReviewKey;
+    if (action == @selector(reviewSaved:)) return idle && !_launched && _book.canReviewKey && row &&
+        [_book addressForKey:row[@"key"]] && (![row[@"alias"] length] || _book.canReview);
     if (action == @selector(importHosts:)) return idle && _book.canEdit;
     if (action == @selector(exportHosts:)) return idle && _book.canExport;
     if (action == @selector(edit:)) return idle && _book.canEdit && row;
@@ -784,16 +781,15 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _relayDraft = _relayField.stringValue; _directoryDraft = _directoryField.stringValue;
     _relayRequest = YES;
     _started = YES; /* the book is opened (and synced) by this save */
-    [self reloadBook:MDReloadSave replaceUnreadable:NO];
+    [self reloadBookSaving:YES replaceUnreadable:NO];
 }
-- (void)reloadBook:(BOOL)refresh {
-    [self reloadBook:refresh ? MDReloadRefresh : MDReloadOpen replaceUnreadable:NO];
+- (void)reloadBook {
+    [self reloadBookSaving:NO replaceUnreadable:NO];
 }
-- (void)reloadBook:(MDReload)mode replaceUnreadable:(BOOL)replace {
+- (void)reloadBookSaving:(BOOL)save replaceUnreadable:(BOOL)replace {
     if (_busy || _roleEditing || self.closing) return;
     NSUInteger generation = ++_generation;
     NSString *draft = _relayDraft ?: @"";
-    BOOL save = mode == MDReloadSave, refresh = mode != MDReloadOpen;
     NSString *directory = MDHostTrim(_directoryDraft ?: @"");
     BOOL fromRelays = _relayRequest; _relayRequest = NO;
     [self note:nil kind:MDStatusNone];
@@ -810,12 +806,12 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         }
         if (self.closing) return nil;
         BOOL opened = [worker openDirectory:directory error:&cacheError];
-        BOOL network = refresh && relays.length != 0; /* an empty list contacts nothing */
+        BOOL network = relays.length != 0; /* an empty list contacts nothing */
         BOOL syncing = opened && network && !self.closing && [worker startRelays:relays];
         if (opened && network && !syncing)
             cacheError = @"Could not configure address book relays. Cached data remains available.";
         NSInteger accounts = self.accountCount ? (NSInteger)self.accountCount() : (NSInteger)MDIdentityAccounts(nil, NULL).count;
-        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(!syncing), @(accounts)];
+        return @[relays ?: NSNull.null, configError ?: cacheError ?: @"", @(needsConfirmation), @(accounts)];
     } done:^(NSArray *result) {
         if (result[0] != NSNull.null) {
             /* Refresh keeps an unsaved edit in the field; Save shows what it wrote. */
@@ -824,8 +820,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             if (!self->_relayField.currentEditor && (save || unedited)) self->_relayField.stringValue = result[0];
             self->_relaysLoaded = YES;
         }
-        self->_accounts = [result[4] integerValue];
-        self->_syncPaused = [result[3] boolValue];
+        self->_accounts = [result[3] integerValue];
         NSString *error = result[1];
         if (fromRelays) [self->_relayMessage setText:error.length ? error : [result[2] boolValue] ? nil :
             [result[0] isEqual:@""] ? @"Relays cleared. Nothing will sync until you add one." : @"Relays saved. Syncing…"
@@ -844,7 +839,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
             if (response == NSAlertSecondButtonReturn && generation == self->_generation) {
                 self->_relayRequest = fromRelays;
-                [self reloadBook:MDReloadSave replaceUnreadable:YES];
+                [self reloadBookSaving:YES replaceUnreadable:YES];
             } else if (fromRelays) [self->_relayMessage setText:@"The saved relay file was kept unchanged." kind:MDStatusInfo];
         }];
     }];
@@ -897,11 +892,15 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
 - (void)reviewSaved:(id)sender {
     (void)sender;
     if (![self canPerform:_cmd]) return;
-    NSString *address = [_book addressForKey:self.selected[@"key"]];
-    if (address) [self resolve:address route:@""];
+    /* Resolve by the selected pin; the worker reuses its saved name/hints. */
+    [self resolve:self.selected[@"key"] route:@""];
 }
 - (void)resolve:(NSString *)address route:(NSString *)route {
-    if (!_book.canReview || _launched) return;
+    if (!_book.canReviewKey || _launched) return;
+    if (MDClassifyHostInput(address) == MDHostName && !_book.canReview) {
+        [self note:@"Wait for your host list to sync before reviewing a NIP-05 name." kind:MDStatusInfo];
+        return;
+    }
     [self note:@"Checking the host’s identity…" kind:MDStatusWorking];
     [self run:^id(MDHostsWorker *worker) {
         NSString *error = nil;
@@ -920,7 +919,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     if (!window || window.attachedSheet || self.closing) return;
     BOOL mismatch = review.oldKey != nil;
     NSUInteger generation = _generation;
-    BOOL canSave = _book.canEdit && (!mismatch || [_book canReplaceReview:review]);
+    BOOL canSave = _book.canReview && _book.canEdit && (!mismatch || [_book canReplaceReview:review]);
     NSString *alias = review.alias ? [MDHostBoundText(review.alias, 320) stringByAppendingString:@" — verified now"] : @"None";
     NSMutableArray *rows = [NSMutableArray array];
     NSTextField *confirmation = nil;
@@ -969,11 +968,15 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         }
     } else {
         [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
-        if (canSave) [sheet addButton:@"Save Host" role:MDSheetOther response:NSAlertThirdButtonReturn];
+        NSButton *save = [sheet addButton:@"Save Host" role:MDSheetOther response:NSAlertThirdButtonReturn];
+        save.enabled = canSave;
+        if (review.cachedDetailsMayBeOutdated)
+            [content addObject:MDNote(@"Saved host details may be out of date until sync completes.")];
+        if (!canSave) [content addObject:MDNote(@"Saving requires a synced, writable host list.")];
         [sheet addButton:@"Connect" role:MDSheetAction response:NSAlertSecondButtonReturn];
     }
     NSStackView *body = MDColumn(content, MDGroupSpacing);
-    if (content.count > 1) MDAlignForms(@[details, content[1]]);
+    if (confirmation) MDAlignForms(@[details, content[1]]);
     sheet.accessory = body;
     [sheet beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
         if (observer) [NSNotificationCenter.defaultCenter removeObserver:observer];

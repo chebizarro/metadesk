@@ -13,6 +13,7 @@ NSString *MDHostBoundText(NSString *value, NSUInteger limit);
 @interface MDHostReview : NSObject
 @property(nonatomic, readonly) NSString *key, *npub, *fingerprint, *alias, *oldKey, *route;
 @property(nonatomic, readonly) uint8_t caps;
+@property(nonatomic, readonly) BOOL cachedDetailsMayBeOutdated;
 @end
 
 /* Which condition the address book is in, for the UI to explain it and offer
@@ -35,7 +36,8 @@ typedef NS_ENUM(NSInteger, MDHostsState) {
 @interface MDHostsBook : NSObject
 @property(nonatomic, readonly) NSString *owner, *status, *unavailable;
 @property(nonatomic, readonly) MDHostsState state;
-@property(nonatomic, readonly) BOOL canReview, canEdit, canExport;
+/* canReview is the stricter, name-based catch-up gate. */
+@property(nonatomic, readonly) BOOL canReview, canReviewKey, canEdit, canExport;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *rows;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *quick;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *issues;

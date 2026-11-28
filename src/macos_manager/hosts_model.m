@@ -174,6 +174,7 @@ static json_t *Ensure(json_t *obj, const char *key) {
 @interface MDHostReview ()
 @property(nonatomic, readwrite) NSString *key, *npub, *fingerprint, *alias, *oldKey, *route;
 @property(nonatomic, readwrite) uint8_t caps;
+@property(nonatomic, readwrite) BOOL cachedDetailsMayBeOutdated;
 @property(nonatomic) NSString *address, *verifiedOwner;
 @property(nonatomic) NSArray<NSString *> *hints;
 @property(nonatomic) NSDictionary<NSString *, MDDoc *> *documents;
@@ -224,10 +225,13 @@ static json_t *HostMeta(MDHostsBook *b, NSString *key) { return key ? json_objec
 static BOOL Retired(MDHostsBook *b, NSString *key) {
     MDDoc *h = b.documents[Hosts], *m = b.documents[Meta];
     if (!h || !m) return YES;
-    BOOL inHosts = Member(h->winner, key) >= 0, inMeta = HostMeta(b, key) != NULL;
-    BOOL inHostsDraft = h->draft && Member(h->draft, key) >= 0;
-    BOOL inMetaDraft = m->draft && json_object_get(json_object_get(m->draft, "hosts"), key.UTF8String);
-    return (h->draft && inHosts != inHostsDraft) || (m->draft && inMeta != inMetaDraft);
+    json_t *record = HostMeta(b, key);
+    json_t *draftRecord = json_object_get(json_object_get(m->draft, "hosts"), key.UTF8String);
+    BOOL inHosts = Member(h->winner, key) >= 0;
+    BOOL inHostsDraft = Member(h->draft, key) >= 0;
+    NSString *alias = Field(record, "nip05") ?: @"", *draftAlias = Field(draftRecord, "nip05") ?: @"";
+    return (h->draft && inHosts != inHostsDraft) ||
+        (m->draft && ((record != NULL) != (draftRecord != NULL) || ![alias isEqual:draftAlias]));
 }
 static BOOL Visible(MDHostsBook *b, NSString *key) {
     MDDoc *d = b.documents[Hosts];
@@ -246,15 +250,23 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
 }
 
 @implementation MDHostsBook
+- (BOOL)canReviewKey {
+    return self.owner.length && !self.unavailable && self.hasRelays &&
+        Readable(self.documents[Hosts]) && Readable(self.documents[Meta]);
+}
 - (BOOL)canReview {
     MDDoc *h = self.documents[Hosts], *m = self.documents[Meta];
-    return self.hasRelays && Readable(h) && Readable(m) && h->reviewReady && m->reviewReady;
+    return self.canReviewKey && h->reviewReady && m->reviewReady;
 }
 - (BOOL)canEdit { return Writable(self.documents[Hosts]) && Writable(self.documents[Meta]); }
 - (BOOL)canExport { return Readable(self.documents[Hosts]) && Readable(self.documents[Meta]); }
 - (NSString *)status {
     if (self.unavailable) return self.unavailable;
-    if (!self.hasRelays) return @"Offline — showing cached hosts. Add explicit bootstrap relays to sync.";
+    if (!self.hasRelays) return @"Offline — choose relays to sync your host list and connect.";
+    for (NSString *coordinate in @[Hosts, Meta]) {
+        MDDoc *d = self.documents[coordinate];
+        if (d && !Readable(d)) return DocStatus(d);
+    }
     for (NSString *coordinate in Base()) {
         MDDoc *d = self.documents[coordinate];
         NSString *message = d ? DocStatus(d) : @"Opening the address book…";
@@ -266,6 +278,10 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
     if (self.unavailable) return self.blocker ?: MDHostsCacheUnavailable;
     if (!self.documents) return MDHostsOpening;
     if (!self.hasRelays) return MDHostsNoRelays;
+    for (NSString *coordinate in @[Hosts, Meta]) {
+        MDDoc *d = self.documents[coordinate];
+        if (d && !Readable(d)) return MDHostsDocumentError;
+    }
     for (NSString *coordinate in Base()) {
         MDDoc *d = self.documents[coordinate];
         if (!d) return MDHostsOpening;
@@ -356,7 +372,7 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
 }
 - (MDHostReview *)reviewIdentity:(const MdIdentity *)id alias:(NSString *)alias route:(NSString *)route error:(NSString **)error {
     NSString *key = Text(id->pubkey);
-    if (!self.canReview || !MDHostFingerprint(key) || Retired(self, key) ||
+    if (!self.canReviewKey || !MDHostFingerprint(key) || Retired(self, key) ||
         (Visible(self, key) != (HostMeta(self, key) != NULL))) {
         if (error) *error = @"Host review unavailable. Sync the book and reconcile pending changes.";
         return nil;
@@ -365,7 +381,12 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
         if (error) *error = @"The NIP-05 name could not be verified.";
         return nil;
     }
-    NSString *stored = Field(HostMeta(self, key), "nip05"), *pin = nil;
+    if (alias.length && !self.canReview) {
+        if (error) *error = @"Wait for your host list to sync before reviewing a NIP-05 name.";
+        return nil;
+    }
+    json_t *record = HostMeta(self, key);
+    NSString *stored = Field(record, "nip05"), *pin = nil;
     if (stored.length && ![stored isEqual:alias]) {
         if (error) *error = @"This key has a different saved NIP-05 name. Review the saved name instead.";
         return nil;
@@ -384,15 +405,21 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
         if (error) *error = @"The saved host pin is invalid.";
         return nil;
     }
-    NSMutableArray *hints = [NSMutableArray array];
+    NSMutableOrderedSet *hints = [NSMutableOrderedSet orderedSet];
     for (size_t i = 0; i < MIN(id->hint_count, MD_RELAY_TARGET_MAX); ++i) {
         NSString *hint = Text(id->hints[i]); if (hint) [hints addObject:hint];
+    }
+    for (NSString *hint in Hints(record)) {
+        if (hints.count == MD_RELAY_TARGET_MAX) break;
+        [hints addObject:hint];
     }
     MDHostReview *r = [MDHostReview new];
     r.key = key; r.npub = MDHostNpub(key); r.fingerprint = MDHostFingerprint(key); r.alias = alias; r.route = route ?: @"";
     r.oldKey = result == MD_RESOLVE_PIN_MISMATCH ? pin : nil;
-    r.hints = hints; r.address = Profile(key, hints); r.verifiedOwner = self.owner; r.documents = self.documents;
+    r.hints = hints.array; r.address = Profile(key, r.hints); r.verifiedOwner = self.owner; r.documents = self.documents;
     r.caps = Visible(self, key) ? Caps(json_object_get(HostMeta(self, key), "requested_caps")) : MD_CAP_VIDEO;
+    MDDoc *h = self.documents[Hosts], *m = self.documents[Meta];
+    r.cachedDetailsMayBeOutdated = !alias.length && record && (h->sync != MD_SYNC_READY || m->sync != MD_SYNC_READY);
     return r;
 }
 - (BOOL)canReplaceReview:(MDHostReview *)review {
@@ -593,10 +620,10 @@ static void ControllerChanged(void *context) {
             ok = NO; break;
         }
     }
-    if (ok) ok = md_store_controller_start(_store, plan.count ? &plan : NULL);
-    if (ok) { md_relay_plan_clear(&_relays); _relays = plan; }
-    else md_relay_plan_clear(&plan);
-    return ok;
+    if (!ok) { md_relay_plan_clear(&plan); return NO; }
+    md_relay_plan_clear(&_relays);
+    _relays = plan; /* Valid saved routes remain signaling candidates if sync fails. */
+    return md_store_controller_start(_store, _relays.count ? &_relays : NULL);
 }
 - (MDHostsBook *)snapshot {
     MDHostsBook *book = [MDHostsBook new];
@@ -623,9 +650,32 @@ static void ControllerChanged(void *context) {
         if (error) *error = @"Enter a public host identity and, optionally, an IPv4 or IPv6 route.";
         return nil;
     }
+    MDHostsBook *book = [self snapshot];
+    if (!book.canReviewKey || (input == MDHostName && !book.canReview)) {
+        if (error) *error = book.canReviewKey ? @"Wait for your host list to sync before reviewing a NIP-05 name." : book.status;
+        return nil;
+    }
     value = MDHostTrim(value);
     MdIdentity id = {0};
     MdResolveResult r = md_identity_resolve_cancellable(value.UTF8String, NULL, &id, cancelled, data);
+    if (r == MD_RESOLVE_OK && input == MDHostPublic) {
+        NSString *key = Text(id.pubkey);
+        NSString *savedName = Field(HostMeta(book, key), "nip05");
+        if (savedName.length && Visible(book, key)) {
+            md_identity_clear(&id);
+            if (MDClassifyHostInput(savedName) != MDHostName) {
+                if (error) *error = @"The saved NIP-05 name is invalid.";
+                return nil;
+            }
+            MDHostReview *named = [self resolve:savedName route:route cancelled:cancelled data:data error:error];
+            if (named && (![(named.oldKey ?: named.key) isEqual:key] ||
+                ![[[self snapshot] addressForKey:key] isEqual:savedName])) {
+                if (error) *error = Changed;
+                return nil;
+            }
+            return named;
+        }
+    }
     char *normalized = r == MD_RESOLVE_OK && id.hint_source == MD_HINT_NIP05 ? md_identity_normalize_nip05(value.UTF8String) : NULL;
     NSString *alias = Text(normalized); free(normalized);
     MDHostReview *review = r == MD_RESOLVE_OK ? [[self snapshot] reviewIdentity:&id alias:alias route:route error:error] : nil;
@@ -634,12 +684,13 @@ static void ControllerChanged(void *context) {
     return review;
 }
 - (BOOL)review:(MDHostReview *)r stillCurrent:(MDHostsBook *)book {
-    return r && [book.owner isEqual:r.verifiedOwner] && book.canReview && !Retired(book, r.key) &&
+    return r && [book.owner isEqual:r.verifiedOwner] && book.canReviewKey &&
+        (!r.alias || book.canReview) && !Retired(book, r.key) &&
         SameDoc(book.documents[Hosts], r.documents[Hosts]) && SameDoc(book.documents[Meta], r.documents[Meta]);
 }
 - (BOOL)launchConfig:(MdManagedLaunch *)c review:(MDHostReview *)r error:(NSString **)error {
     MDHostsBook *book = [self snapshot];
-    if (!c || ![self review:r stillCurrent:book] || r.oldKey || !_relays.count) {
+    if (!c || !_relays.count || ![self review:r stillCurrent:book] || r.oldKey) {
         if (error) *error = r.oldKey ? @"Host key changed. Keep the saved key or replace it after verifying the new fingerprint." : Changed;
         return NO;
     }
@@ -678,7 +729,7 @@ static void ControllerChanged(void *context) {
 - (NSString *)saveReview:(MDHostReview *)r confirmation:(NSString *)fingerprint {
     MDHostsBook *book = [self snapshot];
     if (![self review:r stillCurrent:book]) return Changed;
-    if (!book.canEdit) return Wait;
+    if (!book.canReview || !book.canEdit) return Wait;
     if (r.oldKey && ![book canConfirmReview:r fingerprint:fingerprint]) return @"Replacement requires the exact verified fingerprint and all memberships to be synced.";
     MDHostEdits *plan = [MDHostEdits new];
     json_t *meta = Ensure([plan edit:Meta base:book.documents[Meta]], "hosts");

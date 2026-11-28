@@ -19,8 +19,9 @@ from account_startup_fixture import Peer, Relay, matches
 # each start. Application history is a separate EOSE barrier. Don't charge
 # both starts, their backfill, and the edits against the first pipe watchdog.
 STEPS = (
-    'review-bridge-started', 'review-history-ready',
+    'offline-review-ready', 'review-bridge-started', 'review-before-eose', 'review-history-ready',
     'edit-bridge-started', 'edit-history-ready',
+    'cached-reopen', 'cached-bridge-started', 'cached-before-eose',
     'reject-hosts', 'reject-meta', 'event ', 'reject-meta', 'event ',
     'reload-bridge-started', 'event ',
 )
@@ -28,6 +29,10 @@ STEPS = (
 
 class HostsPeer(Peer):
     def send(self, value, opcode=1):
+        if (opcode == 1 and value[0] == 'EOSE' and self.server.document_gate
+                and any(f.get('#d') for f in self.subs.get(value[1], []))):
+            self.server.document_eoses.append((self, value))
+            return
         super().send(value, opcode)
         if opcode == 1 and value[0] == 'EOSE':
             self.server.trace.append(('EOSE sent', self.client_address[1], value[1]))
@@ -65,6 +70,7 @@ def run(binary, *, silent_discovery=False):
         relay.trace = deque(maxlen=32)
         relay.silent_phase = 'review' if silent_discovery else None
         relay.withheld = set()
+        relay.document_gate, relay.document_eoses = True, []
         thread = threading.Thread(target=relay.serve_forever)
         thread.start()
         try:
@@ -90,6 +96,13 @@ def run(binary, *, silent_discovery=False):
                                             peer.send(['EVENT', sid, event])
                             elif expected in ('reject-hosts', 'reject-meta'):
                                 relay.reject = 'metadesk-hosts' if expected == 'reject-hosts' else 'metadesk:management:v1'
+                            elif expected == 'cached-reopen':
+                                relay.document_gate = True
+                            elif expected in ('review-before-eose', 'cached-before-eose'):
+                                relay.document_gate = False
+                                for peer, eose in relay.document_eoses:
+                                    peer.send(eose)
+                                relay.document_eoses.clear()
                             elif silent_discovery:
                                 # Arm before ACK: the child can't begin the
                                 # next discovery until it receives that ACK.

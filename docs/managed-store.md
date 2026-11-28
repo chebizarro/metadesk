@@ -63,7 +63,10 @@ Open the cache first, then start a plan with explicit bootstrap relays. The
 controller watches hosts, favorites and app data; add exact tag coordinates
 as they become known. An offline read can still return cache. Writes require
 an EOSE boundary on every admitted fetch route in its current connection
-generation. A local admission failure needs a fresh scoped replay rather than
+generation. Managers also require catch-up on connected fetch routes to review
+NIP-05 names or keys with a saved NIP-05 name. Direct key review still needs
+readable host documents to enforce known pins and pending removals. Both
+paths require explicitly configured signaling relays. A local admission failure needs a fresh scoped replay rather than
 trusting the relay's reconnect cursor. AUTH and retryable CLOSED recovery
 remain owned by the bridge and nostrc. Use `flush` to send an already-staged
 edit; retry sends its original signed event, not a new replacement.
