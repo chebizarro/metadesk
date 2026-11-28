@@ -2,6 +2,7 @@
 #include "md_test.h"
 #include "nostr.h"
 #include "session.h"
+#include <nostr/nip19/nip19.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -91,13 +92,41 @@ static BOOL SendRemote(MdSigner *signer, NSString *owner, int version, time_t ad
     return ok;
 }
 
+static NSString *ProfileWith(NSString *key, char *hint) {
+    NostrProfilePointer ptr = {.public_key = (char *)key.UTF8String, .relays = &hint, .relays_count = 1};
+    char *encoded = NULL;
+    if (nostr_nip19_encode_nprofile(&ptr, &encoded)) return nil;
+    NSString *value = @(encoded);
+    free(encoded);
+    return value;
+}
 static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NSString *relay, NSString *unreachable, dispatch_semaphore_t changed) {
+    NSString *error = nil;
+    MdManagedLaunch launch;
+    CHECK([worker snapshot].canReviewKey && ![worker snapshot].canReview);
+    CHECK(![worker resolve:A route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"No usable signaling relay"]);
+    CHECK(![worker resolve:ProfileWith(A, "wss://127.0.0.1/") route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"No usable signaling relay"]);
+    /* Public numeric address exercises route validation without any relay connection. */
+    MDHostReview *hinted = [worker resolve:ProfileWith(A, "wss://93.184.216.34/") route:@"" cancelled:NULL data:NULL error:&error];
+    CHECK(hinted && [worker launchConfig:&launch review:hinted error:&error] && launch.relay_count == 0);
+    CHECK(!strcmp(launch.pin, A.UTF8String) && !strncmp(launch.address, "nprofile1", 9));
+    CHECK([worker saveReview:hinted confirmation:nil].length);
+    [worker startRelays:unreachable];
+    CHECK(![worker snapshot].canReview);
+    MDHostReview *offline = [worker resolve:MDHostNpub(A) route:@"" cancelled:NULL data:NULL error:&error];
+    CHECK(offline && [worker launchConfig:&launch review:offline error:&error] && launch.relay_count == 1);
+    CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"Wait for your host list"]);
+    CHECK(Signal(@"offline-review-ready"));
     CHECK(([worker startRelays:[NSString stringWithFormat:@"%@ %@", relay, unreachable]]));
     CHECK(Signal(@"review-bridge-started"));
+    CHECK(![worker snapshot].canReview);
+    MDHostReview *early = [worker resolve:A route:@"" cancelled:NULL data:NULL error:&error];
+    CHECK(early && [worker launchConfig:&launch review:early error:&error] && [worker saveReview:early confirmation:nil].length);
+    CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"Wait for your host list"]);
+    CHECK(Signal(@"review-before-eose"));
     MDHostsBook *book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canReview; });
     CHECK(book && !book.canEdit);
     MDHostReview *review = [worker resolve:A route:@"127.0.0.1" cancelled:NULL data:NULL error:NULL];
-    MdManagedLaunch launch;
     CHECK([worker launchConfig:&launch review:review error:NULL]);
     CHECK(launch.relay_count == 2 && !strcmp(launch.pin, A.UTF8String) && !strcmp(launch.route, "127.0.0.1") && launch.capabilities == MD_CAP_VIDEO);
     CHECK(Signal(@"review-history-ready"));
@@ -156,7 +185,7 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     NSSet *tags = [NSSet setWithArray:Row(book, B)[@"tagIDs"]];
     CHECK([[worker editKey:B book:book label:@"" notes:@"" favorite:NO tagIDs:tags newTag:@"" remove:YES] containsString:@"pending"]);
     book = [worker snapshot];
-    CHECK(!Row(book, B) && !Resolved(book, B, nil));
+    CHECK(!Row(book, B) && !Resolved(book, B, nil) && !Resolved(book, B, Name));
     CHECK([worker retryIssue:@MD_STORE_HOSTS book:book].length == 0);
     book = [worker snapshot];
     CHECK(!Row(book, B) && Row(book, C));
@@ -185,6 +214,8 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     CHECK(book && SendRemote(signer, book.owner, 2, 40, @"Unknown schema"));
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return [b.status containsString:@"read-only"]; });
     CHECK(book && !book.canReview && !book.canEdit && !book.canExport);
+    CHECK([worker resolve:A route:@"" cancelled:NULL data:NULL error:NULL]);
+    CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"Wait for your host list"]);
     return md_test_report();
 }
 

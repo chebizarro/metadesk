@@ -153,15 +153,15 @@ static void Render(NSView *view, NSString *name) {
 static NSView *Frame(NSWindow *window) { return window.contentView.superview ?: window.contentView; }
 
 @interface SnapReview : MDHostReview
-@property BOOL mismatch;
+@property BOOL mismatch, bare;
 @end
 @implementation SnapReview
-- (NSString *)key { return @KEY2; }
+- (NSString *)key { return self.bare ? @KEY3 : @KEY2; }
 - (NSString *)npub { return MDHostNpub(self.key); }
 - (NSString *)fingerprint { return MDHostFingerprint(self.key); }
 - (NSString *)oldKey { return self.mismatch ? @KEY3 : nil; }
-- (NSString *)alias { return @"render@example.invalid"; }
-- (uint8_t)caps { return MD_CAP_VIDEO | MD_CAP_INPUT; }
+- (NSString *)alias { return self.bare ? nil : @"render@example.invalid"; }
+- (uint8_t)caps { return self.bare ? MD_CAP_VIDEO : MD_CAP_VIDEO | MD_CAP_INPUT; }
 @end
 
 @interface SnapBook : MDHostsBook
@@ -218,6 +218,7 @@ static NSArray *SnapRows(void) {
 }
 - (NSString *)owner { return self.blocked ? nil : @KEY1; }
 - (BOOL)canReview { return self.synced; }
+- (BOOL)canReviewKey { return !self.blocked; }
 - (BOOL)canEdit { return self.synced; }
 - (BOOL)canExport { return !self.blocked && !self.empty; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey != nil; }
@@ -531,6 +532,12 @@ static void Pages(NSAppearanceName appearance, NSString *mode) {
             Resize(e.window, sizes[1]); Spin();
             Render(Frame(e.window), [NSString stringWithFormat:@"page-hosts-state-%s-minimum-%@", states[i].name, mode]);
         }
+        if (states[i].state == MDHostsRelaysOffline) {
+            SnapReview *review = [SnapReview new]; review.bare = YES;
+            CaptureSheet(&e, [@"sheet-hosts-review-offline-" stringByAppendingString:mode], ^{
+                [e.hosts performSelector:@selector(presentReview:) withObject:review];
+            });
+        }
         Drain(&e);
     }
 }
@@ -687,10 +694,10 @@ int main(int argc, char **argv) {
             if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) [files addObject:@(e->d_name)];
         if (listing) closedir(listing); else ++Failures;
         /* Per appearance: 2 disconnected + 5 sections per size + 1 connecting
-         * + 17 sheets + 2 This Computer states + 13 Hosts states + 2 minimum
+         * + 18 sheets + 2 This Computer states + 13 Hosts states + 2 minimum
          * Hosts states (minimum size only); less the scenes not built. */
         const NSUInteger appearances = CheckOnly ? 1 : 2, sizes = CheckOnly ? 1 : 2;
-        const NSUInteger expected = appearances * (2 + 5 * sizes + 1 + 17 + 2 + 13 + (sizes == 2 ? 2 : 0)) + 1 - Skipped;
+        const NSUInteger expected = appearances * (2 + 5 * sizes + 1 + 18 + 2 + 13 + (sizes == 2 ? 2 : 0)) + 1 - Skipped;
         if (files.count != Written.count || files.count != expected) {
             fprintf(stderr, "FAIL: %lu files, %lu written, %lu expected\n", (unsigned long)files.count, (unsigned long)Written.count, (unsigned long)expected); ++Failures;
         }

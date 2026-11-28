@@ -35,7 +35,8 @@ typedef NS_ENUM(NSInteger, MDHostsState) {
 @interface MDHostsBook : NSObject
 @property(nonatomic, readonly) NSString *owner, *status, *unavailable;
 @property(nonatomic, readonly) MDHostsState state;
-@property(nonatomic, readonly) BOOL canReview, canEdit, canExport;
+/* canReview is the stricter, name-based catch-up gate. */
+@property(nonatomic, readonly) BOOL canReview, canReviewKey, canEdit, canExport;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *rows;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *quick;
 @property(nonatomic, readonly) NSArray<NSDictionary *> *issues;

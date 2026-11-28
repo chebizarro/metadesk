@@ -95,7 +95,7 @@ same relay vectors and exchanges real files between both implementations.
    connects — and its confirmations and results appear in the Relays
    section. View > Refresh is separate: it syncs the saved list and never
    writes or offers to replace the file. Without relays, or while they are unreachable or catching up,
-   Hosts shows cached hosts and explains why reviewing and connecting wait. Both managers use the same
+   Hosts shows cached hosts and explains which actions can proceed. Both managers use the same
    per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
    `~/.config/metadesk`). GTK accepts international relay hostnames and writes
 ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
@@ -127,9 +127,13 @@ preferences requires confirmation. Clear the field and save to remove all choice
    whose fingerprints you recognize; the exact requested capabilities are shown. Existing pins are not overwritten. The explicit
    plaintext export contains public keys, labels and notes, not credentials or grants.
 
-Cached hosts remain viewable without a relay if the signer is available. Connect
-requires catch-up on connected fetch routes; edits require all required fetch
-routes. Resolve conflicts from the sync-issue row by reviewing both versions,
+Cached hosts remain viewable without a relay if the signer is available. NIP-05
+review and connection require catch-up on connected fetch routes, including when
+a typed key matches a saved NIP-05 record. For other keys, an open cache and
+verified client signer are enough to review if there is a signaling route:
+saved relays or public `wss://` relay hints from an `nprofile`. Profile hints do
+not start address-book sync or become saved relay settings. Save Host stays
+disabled until the book is writable and all required fetch routes are caught up. Resolve conflicts from the sync-issue row by reviewing both versions,
 then choosing **Keep Newer Version** or **Reapply My Edit**. Unknown schema and unreadable data are not treated as an
 empty book. Separate collections aren't atomic; review and retry any pending
 collections after partial acknowledgement.
