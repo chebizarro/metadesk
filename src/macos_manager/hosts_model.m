@@ -249,16 +249,23 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
 }
 
 @implementation MDHostsBook
-- (BOOL)canReviewKey { return self.owner.length && self.documents && !self.unavailable; }
+- (BOOL)canReviewKey {
+    return self.owner.length && !self.unavailable &&
+        Readable(self.documents[Hosts]) && Readable(self.documents[Meta]);
+}
 - (BOOL)canReview {
     MDDoc *h = self.documents[Hosts], *m = self.documents[Meta];
-    return self.canReviewKey && self.hasRelays && Readable(h) && Readable(m) && h->reviewReady && m->reviewReady;
+    return self.canReviewKey && self.hasRelays && h->reviewReady && m->reviewReady;
 }
 - (BOOL)canEdit { return Writable(self.documents[Hosts]) && Writable(self.documents[Meta]); }
 - (BOOL)canExport { return Readable(self.documents[Hosts]) && Readable(self.documents[Meta]); }
 - (NSString *)status {
     if (self.unavailable) return self.unavailable;
     if (!self.hasRelays) return @"Offline — showing cached hosts. Add explicit bootstrap relays to sync.";
+    for (NSString *coordinate in @[Hosts, Meta]) {
+        MDDoc *d = self.documents[coordinate];
+        if (d && !Readable(d)) return DocStatus(d);
+    }
     for (NSString *coordinate in Base()) {
         MDDoc *d = self.documents[coordinate];
         NSString *message = d ? DocStatus(d) : @"Opening the address book…";
@@ -270,6 +277,10 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
     if (self.unavailable) return self.blocker ?: MDHostsCacheUnavailable;
     if (!self.documents) return MDHostsOpening;
     if (!self.hasRelays) return MDHostsNoRelays;
+    for (NSString *coordinate in @[Hosts, Meta]) {
+        MDDoc *d = self.documents[coordinate];
+        if (d && !Readable(d)) return MDHostsDocumentError;
+    }
     for (NSString *coordinate in Base()) {
         MDDoc *d = self.documents[coordinate];
         if (!d) return MDHostsOpening;

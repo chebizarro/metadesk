@@ -213,9 +213,10 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canEdit; });
     CHECK(book && SendRemote(signer, book.owner, 2, 40, @"Unknown schema"));
     book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return [b.status containsString:@"read-only"]; });
-    CHECK(book && !book.canReview && !book.canEdit && !book.canExport);
-    CHECK([worker resolve:A route:@"" cancelled:NULL data:NULL error:NULL]);
-    CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"Wait for your host list"]);
+    CHECK(book && !book.canReviewKey && !book.canReview && !book.canEdit && !book.canExport);
+    /* An absent pin in unreadable metadata is not an unseen key. */
+    CHECK(![worker resolve:A route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"read-only"]);
+    CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"read-only"]);
     return md_test_report();
 }
 

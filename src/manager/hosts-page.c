@@ -438,11 +438,11 @@ static gboolean readable(const Doc *d) {
     return d->status == MD_STORE_OK || d->status == MD_STORE_PENDING || d->status == MD_STORE_PARTIAL;
 }
 static gboolean can_review_key(Hosts *p) {
-    return p->key && p->view && p->view->store;
+    return p->key && p->view && p->view->store &&
+        readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]);
 }
 static gboolean can_review(Hosts *p) {
     return can_review_key(p) && p->relays && *p->relays &&
-        readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]) &&
         p->view->doc[HOSTS].review_ready && p->view->doc[META].review_ready;
 }
 static gboolean retired_key(Hosts *p, const char *key) {
@@ -1105,6 +1105,9 @@ static void render(Hosts *p) {
     const char *status = !p->key ? "Assign a client account in Identity" :
         !p->view || !p->view->store ? "Address book unavailable — check the client signer" :
         !p->relays || !*p->relays ? "Offline — choose relays to sync, or use an nprofile with a public relay hint" : NULL;
+    if (!status && (!readable(&p->view->doc[HOSTS]) || !readable(&p->view->doc[META])))
+        status = "The saved hosts or their details could not be read. Host review is unavailable.";
+    gboolean sync_status = FALSE;
     if (!status) for (size_t i = 0; i < NDOCS; ++i) {
         Doc *d = &p->view->doc[i];
         switch (d->status) {
@@ -1124,9 +1127,9 @@ static void render(Hosts *p) {
         case MD_SYNC_REPLAY_NEEDED: status = "Address book catch-up was incomplete. Refresh to try again."; break;
         default: status = "Syncing address book…"; break;
         }
-        if (status) break;
+        if (status) { sync_status = TRUE; break; }
     }
-    g_autofree char *guidance = status && can_review_key(p) && p->relays && *p->relays && !can_review(p) ?
+    g_autofree char *guidance = sync_status && can_review_key(p) && p->relays && *p->relays && !can_review(p) ?
         g_strconcat(status, "\nWait for sync to connect by name, or use the host’s public key.", NULL) : NULL;
     adw_banner_set_title(p->banner, guidance ? guidance : status ? status : "");
     adw_banner_set_revealed(p->banner, status != NULL);

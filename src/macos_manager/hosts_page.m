@@ -478,7 +478,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     _setup.hidden = !blocked; _content.hidden = blocked;
     if (blocked) { [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]]; return; }
     BOOL can = _book.canReview;
-    NSString *then = can ? @"" : @" To connect by name, wait for sync. To connect sooner, use the host’s public key.";
+    NSString *then = (can || !_book.canReviewKey) ? @"" : @" To connect by name, wait for sync. To connect sooner, use the host’s public key.";
     switch (state) {
         case MDHostsNoRelays:
             [_banner showTitle:@"Choose Relays to Sync Your Hosts"
@@ -499,7 +499,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
             [_banner showTitle:@"Catch-Up Was Incomplete" text:[@"Some updates may be missing." stringByAppendingString:then]
                 kind:MDStatusWarning buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
         case MDHostsDocumentError:
-            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:[MDHostBoundText(_book.status, 200) stringByAppendingFormat:@" Metadesk won’t overwrite it.%@", then]
+            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:[MDHostBoundText(_book.status, 200) stringByAppendingString:@" Metadesk won’t overwrite it."]
                 kind:MDStatusError buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
         default: [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]];
     }

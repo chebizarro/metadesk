@@ -19,7 +19,16 @@
 #define MEMBERS "[[\"p\",\"" HOST "\"]]"
 static MdManagedLaunch launch_config;
 static unsigned launches;
-static gint sync_starts;
+static gint sync_starts, unreadable_meta;
+MdStoreResult __real_md_store_controller_read(MdStoreController *, const char *, char *, char **, char **);
+MdStoreResult __wrap_md_store_controller_read(MdStoreController *store, const char *coordinate, char *revision,
+    char **winner, char **draft) {
+    if (g_atomic_int_get(&unreadable_meta) && !strcmp(coordinate, MD_STORE_MANAGEMENT)) {
+        *revision = '\0'; *winner = NULL; *draft = NULL;
+        return MD_STORE_SIGNER;
+    }
+    return __real_md_store_controller_read(store, coordinate, revision, winner, draft);
+}
 bool __real_md_store_controller_start(MdStoreController *, const MdRelayPlan *);
 bool __wrap_md_store_controller_start(MdStoreController *store, const MdRelayPlan *plan) {
     g_assert_true(plan && plan->count);
@@ -153,6 +162,7 @@ static AdwAlertDialog *dialog(GtkWindow *window) {
     return ADW_ALERT_DIALOG(adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(window)));
 }
 static void submit(GtkWidget *address, GtkWidget *button, const char *value) {
+    g_assert_true(gtk_widget_is_sensitive(button));
     gtk_editable_set_text(GTK_EDITABLE(address), value);
     g_signal_emit_by_name(button, "clicked");
 }
@@ -372,6 +382,13 @@ int main(void) {
     g_assert_cmpint(g_atomic_int_get(&sync_starts), ==, previous_starts+1);
     submit(address, connect, name_key);
     g_assert_nonnull(find(page, NULL, "Reconcile pending or incomplete changes to this host before connecting."));
+    g_assert_null(dialog(window));
+    /* A signer refusal arriving during a review invalidates the metadata.
+     * Do not let the refreshed projection treat an unknown pin as absent. */
+    g_atomic_int_set(&unreadable_meta, TRUE);
+    submit(address, connect, HOST);
+    WAIT_UNTIL(find(page, NULL, "The saved hosts or their details could not be read. Host review is unavailable."));
+    g_assert_false(gtk_widget_is_sensitive(connect));
     g_assert_null(dialog(window));
     g_object_add_weak_pointer(G_OBJECT(page), (gpointer *)&page);
     md_manager_hosts_stop(page);

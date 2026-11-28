@@ -379,7 +379,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 /* Model fixture: a usable identity/cache is independent of sync. */
 - (MDHostsState)state { return self.fixtureState; }
 - (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
-- (BOOL)canReviewKey { return self.fixtureState >= MDHostsNoRelays; }
+- (BOOL)canReviewKey { return self.fixtureState >= MDHostsNoRelays && self.fixtureState != MDHostsDocumentError; }
 - (BOOL)canEdit { return self.fixtureState == MDHostsSynced; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey!=nil; }
 - (BOOL)canConfirmReview:(MDHostReview *)review fingerprint:(NSString *)fingerprint {
@@ -487,10 +487,10 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return LabelContains(view,@"Fixture stopped before"); }));
     CHECK(worker.launches==1 && [worker.launchReview.key isEqual:@KEY]);
 
-    for (NSNumber *state in @[@(MDHostsSyncing), @(MDHostsRelaysOffline), @(MDHostsRelayRefused), @(MDHostsDocumentError)]) {
+    for (NSNumber *state in @[@(MDHostsSyncing), @(MDHostsRelaysOffline), @(MDHostsRelayRefused)]) {
         worker.state=state.intValue;
         CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
-        CHECK(Await(^BOOL{ return review.enabled && LabelContains(view,@"To connect by name"); }));
+        CHECK(Await(^BOOL{ return review.enabled && Visible(address) && !Visible(SetupPanel(view)) && LabelContains(view,@"To connect by name"); }));
         NSUInteger resolves=worker.resolves, launches=worker.launches, saves=worker.saves;
         address.stringValue=@"desk@example.invalid";
         CHECK(Send(review) && LabelContains(view,@"before reviewing a NIP-05 name"));
@@ -503,6 +503,14 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
         CHECK(worker.launches==launches && worker.saves==saves);
         CHECK(EndSheet(window,NSAlertFirstButtonReturn));
     }
+    worker.state=MDHostsDocumentError;
+    CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
+    CHECK(Await(^BOOL{ return canRefresh() && Visible(address) && !Visible(SetupPanel(view)) &&
+        LabelContains(view,@"Part of Your Host List Can’t Be Read"); }));
+    CHECK(!review.enabled && !Button(view,@"Scan QR Code…").enabled &&
+        !LabelContains(view,@"use the host’s public key"));
+    address.stringValue=@KEY;
+    CHECK(!Send(review) && !window.attachedSheet);
     worker.state=MDHostsSynced;
     CHECK([NSApp sendAction:@selector(refresh:) to:page from:refresh]);
     CHECK(Await(^BOOL{ return review.enabled; }));
