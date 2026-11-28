@@ -38,7 +38,8 @@ typedef struct {
     View *view;
     MdIdentity identity;
     MdResolveResult resolution;
-    gboolean action_ok;
+    char review_hosts[65], review_meta[65];
+    gboolean action_ok, need_profile_route;
     MdStoreResult result;
 } Job;
 
@@ -231,6 +232,11 @@ static void work(GTask *task, gpointer source, gpointer data, GCancellable *canc
     }
     case RESOLVE:
         j->resolution = md_identity_resolve(j->address, NULL, &j->identity);
+        if (j->resolution == MD_RESOLVE_OK && j->need_profile_route) {
+            MdRelayPlan plan = {0};
+            j->action_ok = md_relay_plan_profile_bootstrap(&plan, &j->identity);
+            md_relay_plan_clear(&plan);
+        }
         break;
     case EDIT: {
         gboolean ready = p->store != NULL;
@@ -431,10 +437,25 @@ static const char *title_for(Hosts *p, const char *key, char fp[MD_KEY_FINGERPRI
 static gboolean readable(const Doc *d) {
     return d->status == MD_STORE_OK || d->status == MD_STORE_PENDING || d->status == MD_STORE_PARTIAL;
 }
+static gboolean can_review_key(Hosts *p) {
+    return p->key && p->view && p->view->store;
+}
 static gboolean can_review(Hosts *p) {
-    return p->key && p->relays && *p->relays && p->view && p->view->store &&
+    return can_review_key(p) && p->relays && *p->relays &&
         readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]) &&
         p->view->doc[HOSTS].review_ready && p->view->doc[META].review_ready;
+}
+static gboolean retired_key(Hosts *p, const char *key) {
+    const Doc *h = &p->view->doc[HOSTS], *m = &p->view->doc[META];
+    json_t *record = host_meta(p, key);
+    json_t *draft = json_object_get(json_object_get(m->draft, "hosts"), key);
+    return (h->draft && (member_index(h->winner, key) >= 0) != (member_index(h->draft, key) >= 0)) ||
+        (m->draft && ((record != NULL) != (draft != NULL) ||
+            g_strcmp0(string_field(record, "nip05"), string_field(draft, "nip05"))));
+}
+static gboolean reviewable_key(Hosts *p, const char *key) {
+    return !retired_key(p, key) &&
+        (member_index(p->view->doc[HOSTS].winner, key) >= 0) == (host_meta(p, key) != NULL);
 }
 static gboolean writable(Hosts *p, size_t i) {
     return p->view && p->view->store && p->view->doc[i].sync == MD_SYNC_READY && p->view->doc[i].status == MD_STORE_OK;
@@ -543,6 +564,21 @@ static char *nprofile(const char *key, char **hints, size_t count) {
     return out;
 }
 
+static size_t review_hints(const MdIdentity *id, json_t *record, char *hints[MD_RELAY_TARGET_MAX]) {
+    size_t n = MIN(id->hint_count, MD_RELAY_TARGET_MAX), i;
+    for (i = 0; i < n; ++i) hints[i] = id->hints[i];
+    json_t *item;
+    json_array_foreach(json_object_get(record, "relay_hints"), i, item) {
+        if (n == MD_RELAY_TARGET_MAX) break;
+        const char *hint = json_string_value(item);
+        if (!hint || !*hint) continue;
+        gboolean duplicate = FALSE;
+        for (size_t k = 0; k < n; ++k) if (!strcmp(hints[k], hint)) duplicate = TRUE;
+        if (!duplicate) hints[n++] = (char *)hint;
+    }
+    return n;
+}
+
 typedef struct {
     GtkWidget *page;
     guint generation;
@@ -572,7 +608,6 @@ static uint8_t requested_access(Hosts *p, const char *key) {
 }
 
 static void start_launch(Hosts *p, Review *r) {
-    if (!can_review(p)) return;
     MdManagedLaunch *c = g_new0(MdManagedLaunch, 1);
     g_strlcpy(c->address, r->address, sizeof(c->address));
     memcpy(c->pin, r->key, sizeof(c->pin));
@@ -582,7 +617,7 @@ static void start_launch(Hosts *p, Review *r) {
     json_int_t port = json_integer_value(json_object_get(meta, "port"));
     c->port = port > 0 && port <= UINT16_MAX ? (uint16_t)port : MD_STREAM_PORT;
     c->capabilities = requested_access(p, r->key);
-    for (size_t i = 0; i < MD_RELAY_TARGET_MAX && p->relays[i]; ++i) {
+    for (size_t i = 0; i < MD_RELAY_TARGET_MAX && p->relays && p->relays[i]; ++i) {
         g_strlcpy(c->relays[i], p->relays[i], sizeof(c->relays[i]));
         ++c->relay_count;
     }
@@ -616,7 +651,9 @@ static void review_response(AdwAlertDialog *dialog, const char *response, gpoint
     Review *r = data;
     Hosts *p = g_object_get_data(G_OBJECT(r->page), HOSTS_DATA);
     if (!strcmp(response, "cancel") || g_atomic_int_get(&p->closed)) return;
-    if (p->busy || r->generation != p->generation || !can_review(p) ||
+    if (p->busy || r->generation != p->generation || !can_review_key(p) ||
+        (r->alias && !can_review(p)) || !reviewable_key(p, r->key) ||
+        (*r->old && !reviewable_key(p, r->old)) ||
         strcmp(r->meta_revision, p->view->doc[META].revision) || strcmp(r->host_revision, p->view->doc[HOSTS].revision)) {
         gtk_label_set_text(p->error, "Saved keys or relay state changed. Review the host again.");
         return;
@@ -624,7 +661,8 @@ static void review_response(AdwAlertDialog *dialog, const char *response, gpoint
     if (!strcmp(response, "connect") && !*r->old) { start_launch(p, r); return; }
     gboolean replace = !strcmp(response, "replace");
     if (replace && (!r->confirmation || strcmp(gtk_editable_get_text(r->confirmation), r->fingerprint))) return;
-    if (!writable(p, HOSTS) || !writable(p, META)) return;
+    if ((!replace && strcmp(response, "save")) || (*r->old && !replace) ||
+        !can_review(p) || !writable(p, HOSTS) || !writable(p, META)) return;
     json_t *doc = copy_doc(p, META), *hosts = copy_doc(p, HOSTS);
     json_t *meta = ensure_object(doc, "hosts");
     json_t *record = json_object_get(meta, r->key);
@@ -681,8 +719,23 @@ static void confirmation_changed(GtkEditable *entry, gpointer data) {
 }
 
 static void present_review(Hosts *p, const Job *j) {
-    if (j->resolution != MD_RESOLVE_OK || !can_review(p)) {
-        gtk_label_set_text(p->error, j->resolution != MD_RESOLVE_OK ? md_resolve_error(j->resolution) : "The address book is not ready. Try again after it finishes syncing.");
+    if (j->resolution != MD_RESOLVE_OK || !can_review_key(p) ||
+        (j->identity.hint_source == MD_HINT_NIP05 && !can_review(p))) {
+        gtk_label_set_text(p->error, j->resolution != MD_RESOLVE_OK ? md_resolve_error(j->resolution) :
+            "Wait for the address book to sync before reviewing a NIP-05 name.");
+        return;
+    }
+    if (strcmp(j->review_hosts, p->view->doc[HOSTS].revision) ||
+        strcmp(j->review_meta, p->view->doc[META].revision)) {
+        gtk_label_set_text(p->error, "Saved keys changed. Review the host again.");
+        return;
+    }
+    if (!reviewable_key(p, j->identity.pubkey)) {
+        gtk_label_set_text(p->error, "Reconcile pending or incomplete changes to this host before connecting.");
+        return;
+    }
+    if (j->need_profile_route && !j->action_ok) {
+        gtk_label_set_text(p->error, "No usable signaling relay. Add a relay or use the host’s nprofile with a public relay hint.");
         return;
     }
     Review *r = g_new0(Review, 1);
@@ -702,7 +755,12 @@ static void present_review(Hosts *p, const Job *j) {
     const char *stored = string_field(host_meta(p, r->key), "nip05");
     gboolean ambiguous;
     const char *pin = alias_pin(p, r->alias, &ambiguous);
-    if (ambiguous || (!r->alias && stored && *stored)) {
+    if ((pin && !reviewable_key(p, pin)) || (j->key && g_strcmp0(pin, j->key))) {
+        gtk_label_set_text(p->error, "The saved host changed. Reconcile the address book before reviewing it again.");
+        free_review(r);
+        return;
+    }
+    if (ambiguous || (stored && *stored && g_strcmp0(stored, r->alias))) {
         gtk_label_set_text(p->error, ambiguous ? "This name has more than one saved key. Resolve the address book conflict first." :
             "This key has a saved NIP-05 name. Review the saved name before connecting.");
         free_review(r);
@@ -719,13 +777,18 @@ static void present_review(Hosts *p, const Job *j) {
     md_key_fingerprint(r->key, fp);
     r->fingerprint = g_strdup(fp);
     char *hints[MD_RELAY_TARGET_MAX];
-    size_t hint_count = MIN(j->identity.hint_count, MD_RELAY_TARGET_MAX);
-    for (size_t i = 0; i < hint_count; ++i) {
-        hints[i] = j->identity.hints[i];
-        json_array_append_new(r->hints, json_string(hints[i]));
-    }
+    size_t hint_count = review_hints(&j->identity, host_meta(p, r->key), hints);
+    for (size_t i = 0; i < hint_count; ++i) json_array_append_new(r->hints, json_string(hints[i]));
     r->address = nprofile(r->key, hints, hint_count);
-    if (!r->address) r->address = g_strdup(r->key);
+    if (!r->address || strlen(r->address) > MD_MANAGED_ADDRESS_MAX) {
+        g_clear_pointer(&r->address, g_free);
+        if (j->need_profile_route) {
+            gtk_label_set_text(p->error, "Could not preserve the signaling relay hints in the host profile.");
+            free_review(r);
+            return;
+        }
+        r->address = g_strdup(r->key);
+    }
     g_autofree char *npub = md_identity_npub(&j->identity);
     g_autoptr(GDateTime) verified = g_date_time_new_now_local();
     g_autofree char *when = g_date_time_format(verified, "%c");
@@ -759,7 +822,10 @@ static void present_review(Hosts *p, const Job *j) {
         adw_alert_dialog_set_response_enabled(dialog, "replace", FALSE);
         g_signal_connect(entry, "changed", G_CALLBACK(confirmation_changed), dialog);
     } else {
-        if (writable(p, HOSTS) && writable(p, META)) adw_alert_dialog_add_response(dialog, "save", "_Save Host");
+        gboolean can_save = can_review(p) && writable(p, HOSTS) && writable(p, META);
+        adw_alert_dialog_add_response(dialog, "save", "_Save Host");
+        adw_alert_dialog_set_response_enabled(dialog, "save", can_save);
+        if (!can_save) gtk_box_append(GTK_BOX(box), label("Saving requires a synced, writable address book."));
         adw_alert_dialog_add_response(dialog, "connect", "_Connect");
         adw_alert_dialog_set_response_appearance(dialog, "connect", ADW_RESPONSE_SUGGESTED);
     }
@@ -770,7 +836,7 @@ static void present_review(Hosts *p, const Job *j) {
 }
 
 static void resolve(Hosts *p, const char *address, const char *route) {
-    if (p->busy || !can_review(p)) return;
+    if (p->busy || !can_review_key(p)) return;
     g_autofree char *value = g_strstrip(g_strdup(address));
     g_autofree char *hint = g_strstrip(g_strdup(route ? route : ""));
     if (!*value || strlen(value) > MD_MANAGED_ADDRESS_MAX) {
@@ -780,9 +846,53 @@ static void resolve(Hosts *p, const char *address, const char *route) {
         g_autoptr(GInetAddress) ip = g_inet_address_new_from_string(hint);
         if (!ip) { gtk_label_set_text(p->error, "Enter an IPv4 or IPv6 address as the route hint"); return; }
     }
+    g_autofree char *saved_pin = NULL;
+    g_autofree char *alias = md_identity_normalize_nip05(value);
+    if (!alias) {
+        if (strchr(value, '@')) { gtk_label_set_text(p->error, md_resolve_error(MD_RESOLVE_INVALID)); return; }
+        /* Non-name identity parsing is local. Look up the saved record before
+         * the worker does any network resolution or relay validation. */
+        MdIdentity id = {0};
+        MdResolveResult result = md_identity_resolve(value, NULL, &id);
+        if (result != MD_RESOLVE_OK || !reviewable_key(p, id.pubkey)) {
+            gtk_label_set_text(p->error, result != MD_RESOLVE_OK ? md_resolve_error(result) :
+                "Reconcile pending or incomplete changes to this host before connecting.");
+            md_identity_clear(&id);
+            return;
+        }
+        json_t *record = host_meta(p, id.pubkey);
+        const char *stored = string_field(record, "nip05");
+        if (stored && *stored) {
+            alias = md_identity_normalize_nip05(stored);
+            if (!alias) {
+                gtk_label_set_text(p->error, "The saved NIP-05 name is invalid.");
+                md_identity_clear(&id);
+                return;
+            }
+            saved_pin = g_strdup(id.pubkey);
+        } else if (record) {
+            char *hints[MD_RELAY_TARGET_MAX];
+            size_t n = review_hints(&id, record, hints);
+            g_autofree char *profile = nprofile(id.pubkey, hints, n);
+            if (profile && strlen(profile) <= MD_MANAGED_ADDRESS_MAX) {
+                g_free(value);
+                value = g_steal_pointer(&profile);
+            }
+        }
+        md_identity_clear(&id);
+    }
+    if (alias && !can_review(p)) {
+        gtk_label_set_text(p->error, "Wait for the address book to sync before reviewing a NIP-05 name.");
+        return;
+    }
     gtk_label_set_text(p->error, "");
     Job *j = g_new0(Job, 1);
     j->action = RESOLVE;
+    memcpy(j->review_hosts, p->view->doc[HOSTS].revision, sizeof(j->review_hosts));
+    memcpy(j->review_meta, p->view->doc[META].revision, sizeof(j->review_meta));
+    j->key = g_steal_pointer(&saved_pin);
+    j->need_profile_route = !p->relays || !*p->relays;
+    if (alias) { g_free(value); value = g_steal_pointer(&alias); }
     j->address = g_steal_pointer(&value);
     j->route = g_steal_pointer(&hint);
     start(p, j);
@@ -808,18 +918,7 @@ static void review_entry(GtkWidget *widget, gpointer data) {
 static void review_saved(GtkWidget *button, gpointer data) {
     Hosts *p = data;
     const char *key = g_object_get_data(G_OBJECT(button), "host-key");
-    json_t *meta = host_meta(p, key);
-    const char *alias = string_field(meta, "nip05");
-    if (alias && *alias) resolve(p, alias, "");
-    else {
-        char *hints[MD_RELAY_TARGET_MAX];
-        size_t n = 0, i;
-        json_t *item;
-        json_array_foreach(json_object_get(meta, "relay_hints"), i, item)
-            if (n < MD_RELAY_TARGET_MAX && json_is_string(item)) hints[n++] = (char *)json_string_value(item);
-        g_autofree char *address = nprofile(key, hints, n);
-        resolve(p, address ? address : key, "");
-    }
+    resolve(p, key, "");
 }
 
 static void connect_control(GtkButton *button, gpointer data) {
@@ -943,7 +1042,8 @@ static void add_host_row(Hosts *p, GtkListBox *list, const char *key, const char
     g_string_free(desc, TRUE);
     GtkWidget *connect = button("_Connect…", G_CALLBACK(review_saved), p);
     g_object_set_data_full(G_OBJECT(connect), "host-key", g_strdup(key), g_free);
-    gtk_widget_set_sensitive(connect, can_review(p));
+    gtk_widget_set_sensitive(connect, can_review_key(p) && reviewable_key(p, key) &&
+        (!(alias && *alias) || can_review(p)));
     adw_action_row_add_suffix(row, connect);
     adw_action_row_set_activatable_widget(row, connect);
     if (list == p->saved) {
@@ -996,7 +1096,7 @@ static void document_action(Hosts *p, const char *coord, const Doc *d) {
         gtk_list_box_append(p->saved, label("An address book document is read-only and cannot be overwritten"));
 }
 static void render(Hosts *p) {
-    gtk_widget_set_sensitive(GTK_WIDGET(p->review), !p->busy && can_review(p));
+    gtk_widget_set_sensitive(GTK_WIDGET(p->review), !p->busy && can_review_key(p));
     gtk_widget_set_sensitive(GTK_WIDGET(p->export_button), !p->busy && p->view && p->view->store && readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]));
     gtk_widget_set_sensitive(GTK_WIDGET(p->import_button), !p->busy && writable(p, META) && writable(p, HOSTS));
 #ifdef MD_HAVE_MANAGER_QR
@@ -1004,14 +1104,14 @@ static void render(Hosts *p) {
 #endif
     const char *status = !p->key ? "Assign a client account in Identity" :
         !p->view || !p->view->store ? "Address book unavailable — check the client signer" :
-        !p->relays || !*p->relays ? "Offline — choose bootstrap relays in Relays to connect" : NULL;
+        !p->relays || !*p->relays ? "Offline — choose relays to sync, or use an nprofile with a public relay hint" : NULL;
     if (!status) for (size_t i = 0; i < NDOCS; ++i) {
         Doc *d = &p->view->doc[i];
         switch (d->status) {
         case MD_STORE_SIGNER: status = "Some documents are unavailable — check the client signer"; break;
         case MD_STORE_READ_ONLY: status = "Some address book data is read-only"; break;
         case MD_STORE_CONFLICT: status = "Address book changes need review"; break;
-        case MD_STORE_IO: status = "The encrypted address book cache could not be read"; break;
+        case MD_STORE_IO: case MD_STORE_INVALID: status = "Part of the address book could not be read"; break;
         default: break;
         }
         if (status) break;
@@ -1026,7 +1126,9 @@ static void render(Hosts *p) {
         }
         if (status) break;
     }
-    adw_banner_set_title(p->banner, status ? status : "");
+    g_autofree char *guidance = status && can_review_key(p) && p->relays && *p->relays && !can_review(p) ?
+        g_strconcat(status, "\nWait for sync to connect by name, or use the host’s public key.", NULL) : NULL;
+    adw_banner_set_title(p->banner, guidance ? guidance : status ? status : "");
     adw_banner_set_revealed(p->banner, status != NULL);
     clear_list(p->saved);
     clear_list(p->quick);
@@ -1469,6 +1571,7 @@ GtkWidget *md_manager_hosts_page_new(void) {
     gtk_widget_set_margin_top(content, 12); gtk_widget_set_margin_bottom(content, 12);
     adw_clamp_set_child(ADW_CLAMP(clamp), content);
     p->banner = ADW_BANNER(adw_banner_new(""));
+    gtk_widget_set_name(GTK_WIDGET(p->banner), "hosts-sync-status");
     gtk_box_append(p->content, GTK_WIDGET(p->banner));
     p->rotation = gtk_expander_new_with_mnemonic("Hosts to _Request Access From Again");
     gtk_widget_set_name(p->rotation, "client-key-rotation");

@@ -924,7 +924,8 @@ if host_os == 'linux' or host_os == 'darwin'
     timeout : 30)
   if get_option('signer_nip5f')
     if get_option('manager') and host_os == 'linux' and manager_dbus.found() and manager_xvfb.found()
-      manager_hosts_test = executable('test_manager_hosts', 'tests/test_manager_hosts.c', dependencies : dep_manager_ui)
+      manager_hosts_test = executable('test_manager_hosts', 'tests/test_manager_hosts.c', dependencies : dep_manager_ui,
+        link_args : ['-Wl,--wrap=md_identity_resolve', '-Wl,--wrap=md_manager_launch_start', '-Wl,--wrap=md_store_controller_start'])
       manager_xdotool = find_program('xdotool', required : false)
       if manager_xdotool.found()
         test('manager-hosts-offline', manager_python,

@@ -104,8 +104,12 @@ the window. Standard window decorations are retained.
   only. Use saved hosts, favorites, tag filtering and recent attempts to find
   a reviewed identity again. Last-connected timestamps stay on this device.
 - **Offline:** the signer can decrypt the cached address book without a relay.
-  Saving and connecting remain unavailable until the required subscriptions
-  have caught up. Conflicting documents offer Keep Remote and Reapply Draft;
+  With a verified client role, the manager starts sync as soon as the book opens
+  if relays are saved. Connecting by NIP-05 (including a typed key matching a
+  saved NIP-05 record) still requires catch-up. Other public keys can be reviewed
+  and used with saved signaling relays or validated public `wss://` hints in an
+  `nprofile`; neither path uses a default relay. Save Host requires a writable,
+  caught-up book. Conflicting documents offer Keep Remote and Reapply Draft;
   unknown or unreadable data is never overwritten. Refresh Address Book
   starts fresh scoped subscriptions after a delivery failure.
 - **Exchange:** import `metadesk-hosts/1` after reviewing each new key. Existing
