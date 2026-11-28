@@ -21,6 +21,7 @@ from account_startup_fixture import Peer, Relay, matches
 STEPS = (
     'offline-review-ready', 'review-bridge-started', 'review-before-eose', 'review-history-ready',
     'edit-bridge-started', 'edit-history-ready',
+    'cached-reopen', 'cached-bridge-started', 'cached-before-eose',
     'reject-hosts', 'reject-meta', 'event ', 'reject-meta', 'event ',
     'reload-bridge-started', 'event ',
 )
@@ -95,7 +96,9 @@ def run(binary, *, silent_discovery=False):
                                             peer.send(['EVENT', sid, event])
                             elif expected in ('reject-hosts', 'reject-meta'):
                                 relay.reject = 'metadesk-hosts' if expected == 'reject-hosts' else 'metadesk:management:v1'
-                            elif expected == 'review-before-eose':
+                            elif expected == 'cached-reopen':
+                                relay.document_gate = True
+                            elif expected in ('review-before-eose', 'cached-before-eose'):
                                 relay.document_gate = False
                                 for peer, eose in relay.document_eoses:
                                     peer.send(eose)

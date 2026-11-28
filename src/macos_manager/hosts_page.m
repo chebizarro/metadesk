@@ -498,9 +498,13 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         case MDHostsReplayNeeded:
             [_banner showTitle:@"Catch-Up Was Incomplete" text:[@"Some updates may be missing." stringByAppendingString:then]
                 kind:MDStatusWarning buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
-        case MDHostsDocumentError:
-            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:[MDHostBoundText(_book.status, 200) stringByAppendingString:@" Metadesk won’t overwrite it."]
+        case MDHostsDocumentError: {
+            NSString *message = MDHostBoundText(_book.status, 200);
+            if (!_book.canReviewKey)
+                message = [message stringByAppendingString:@" Host review is unavailable until your saved hosts and their details can be read."];
+            [_banner showTitle:@"Part of Your Host List Can’t Be Read" text:message
                 kind:MDStatusError buttons:@[[self step:@"Try Again" action:@selector(refresh:)]]]; break;
+        }
         default: [_banner showTitle:nil text:nil kind:MDStatusNone buttons:@[]];
     }
 }
@@ -966,6 +970,8 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
         [sheet addButton:@"Cancel" role:MDSheetCancel response:NSAlertFirstButtonReturn];
         NSButton *save = [sheet addButton:@"Save Host" role:MDSheetOther response:NSAlertThirdButtonReturn];
         save.enabled = canSave;
+        if (review.cachedDetailsMayBeOutdated)
+            [content addObject:MDNote(@"Saved host details may be out of date until sync completes.")];
         if (!canSave) [content addObject:MDNote(@"Saving requires a synced, writable host list.")];
         [sheet addButton:@"Connect" role:MDSheetAction response:NSAlertSecondButtonReturn];
     }

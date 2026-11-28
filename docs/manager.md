@@ -110,7 +110,9 @@ the window. Standard window decorations are retained.
   documents and saved relays, you can review and connect by public key before
   sync finishes. NIP-05 names, including a typed key matching a saved NIP-05
   record, still require catch-up. `nprofile` hints can supplement saved relays
-  but cannot replace them. Save Host requires a writable, caught-up book. Conflicting documents offer Keep Remote and Reapply Draft;
+  but cannot replace them. A key review using saved details warns when those
+  details may be out of date. Save Host requires a writable, caught-up book.
+  Conflicting documents offer Keep Remote and Reapply Draft;
   unknown or unreadable data is never overwritten. Refresh Address Book
   starts fresh scoped subscriptions after a delivery failure.
 - **Exchange:** import `metadesk-hosts/1` after reviewing each new key. Existing

@@ -94,21 +94,20 @@ same relay vectors and exchanges real files between both implementations.
    exactly the validated list shown — an empty list is saved and nothing
    connects — and its confirmations and results appear in the Relays
    section. View > Refresh is separate: it syncs the saved list and never
-   writes or offers to replace the file. Without relays, or while they are unreachable or catching up,
-   Hosts shows cached hosts and explains which actions can proceed. Both managers use the same
-   per-user `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default
-   `~/.config/metadesk`). GTK accepts international relay hostnames and writes
-ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
-international hostname, enter its `xn--` punycode form. macOS does not perform
-IDNA conversion. GTK's saved ASCII URLs can still be read by both. The app
-automatically starts sync with saved relays after opening the address book and
-   verifying the client role. A client-role change, made in Identity or by another
-   program, closes and reopens Hosts for the new key and starts sync again;
-   a label edit doesn't. A remote signer may ask to decrypt the address book
-   or sign in to a relay as soon as Hosts opens, without a click or refresh.
-   Replacing unreadable
-preferences requires confirmation. Clear the field and save to remove all choices; none
-   is preselected or used as a fallback. `ws://` is unencrypted.
+   writes or offers to replace the file. Without relays, or while they are
+   unreachable or catching up, Hosts shows any readable cached hosts and
+   explains which actions can proceed. Both managers use the same per-user
+   `$XDG_CONFIG_HOME/metadesk/manager-relays.ini` file (default `~/.config/metadesk`).
+   GTK writes international relay hostnames in ASCII form. macOS accepts only
+   ASCII hostnames on input and on load; enter the `xn--` punycode form for an
+   international hostname. GTK's saved ASCII URLs can be read by both.
+   The app automatically starts sync with saved relays after opening the
+   address book and verifying the client role. Changing the client role closes
+   and reopens Hosts for the new key and starts sync again; a label edit doesn't.
+   A remote signer may ask to decrypt the address book or sign in to a relay as
+   soon as Hosts opens, without a click or refresh. Replacing unreadable
+   preferences requires confirmation. Clear the field and save to remove all
+   choices; none is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name in
    **Host**. Enter an IPv4 or IPv6 address only in **Route hint**. **Review and
    Connect…** opens **Verify This Host**: check the fingerprint, full npub,
@@ -135,9 +134,11 @@ can review and connect by key before sync finishes. NIP-05 names still need
 catch-up on connected fetch routes, including when a typed key matches a saved
 NIP-05 record. An `nprofile` can provide additional discovered relay hints but
 cannot replace the saved relay list. Save Host stays disabled until the book is
-writable and all required fetch routes are caught up. Resolve conflicts from the sync-issue row by reviewing both versions,
-then choosing **Keep Newer Version** or **Reapply My Edit**. Unknown schema and unreadable data are not treated as an
-empty book. Separate collections aren't atomic; review and retry any pending
+writable and all required fetch routes are caught up. A key review using saved
+host details warns when those details may be out of date. Resolve conflicts from
+the sync-issue row by reviewing both versions, then choosing **Keep Newer
+Version** or **Reapply My Edit**. Unknown schema and unreadable data are not
+treated as an empty book. Separate collections aren't atomic; review and retry any pending
 collections after partial acknowledgement.
 
 The separate video client reports launch phases and typed relay AUTH, CLOSED,

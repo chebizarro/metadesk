@@ -715,10 +715,13 @@ static void confirmation_changed(GtkEditable *entry, gpointer data) {
 }
 
 static void present_review(Hosts *p, const Job *j) {
-    if (j->resolution != MD_RESOLVE_OK || !can_review_key(p) ||
-        (j->identity.hint_source == MD_HINT_NIP05 && !can_review(p))) {
-        gtk_label_set_text(p->error, j->resolution != MD_RESOLVE_OK ? md_resolve_error(j->resolution) :
-            "Wait for the address book to sync before reviewing a NIP-05 name.");
+    if (!can_review_key(p)) return; /* render() already explains why review is unavailable. */
+    if (j->resolution != MD_RESOLVE_OK) {
+        gtk_label_set_text(p->error, md_resolve_error(j->resolution));
+        return;
+    }
+    if (j->identity.hint_source == MD_HINT_NIP05 && !can_review(p)) {
+        gtk_label_set_text(p->error, "Wait for the address book to sync before reviewing a NIP-05 name.");
         return;
     }
     if (strcmp(j->review_hosts, p->view->doc[HOSTS].revision) ||
@@ -812,6 +815,9 @@ static void present_review(Hosts *p, const Job *j) {
         gboolean can_save = can_review(p) && writable(p, HOSTS) && writable(p, META);
         adw_alert_dialog_add_response(dialog, "save", "_Save Host");
         adw_alert_dialog_set_response_enabled(dialog, "save", can_save);
+        if (!r->alias && host_meta(p, r->key) &&
+            (p->view->doc[HOSTS].sync != MD_SYNC_READY || p->view->doc[META].sync != MD_SYNC_READY))
+            gtk_box_append(GTK_BOX(box), label("Saved host details may be out of date until sync completes."));
         if (!can_save) gtk_box_append(GTK_BOX(box), label("Saving requires a synced, writable address book."));
         adw_alert_dialog_add_response(dialog, "connect", "_Connect");
         adw_alert_dialog_set_response_appearance(dialog, "connect", ADW_RESPONSE_SUGGESTED);

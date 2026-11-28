@@ -174,6 +174,7 @@ static json_t *Ensure(json_t *obj, const char *key) {
 @interface MDHostReview ()
 @property(nonatomic, readwrite) NSString *key, *npub, *fingerprint, *alias, *oldKey, *route;
 @property(nonatomic, readwrite) uint8_t caps;
+@property(nonatomic, readwrite) BOOL cachedDetailsMayBeOutdated;
 @property(nonatomic) NSString *address, *verifiedOwner;
 @property(nonatomic) NSArray<NSString *> *hints;
 @property(nonatomic) NSDictionary<NSString *, MDDoc *> *documents;
@@ -417,6 +418,8 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
     r.oldKey = result == MD_RESOLVE_PIN_MISMATCH ? pin : nil;
     r.hints = hints.array; r.address = Profile(key, r.hints); r.verifiedOwner = self.owner; r.documents = self.documents;
     r.caps = Visible(self, key) ? Caps(json_object_get(HostMeta(self, key), "requested_caps")) : MD_CAP_VIDEO;
+    MDDoc *h = self.documents[Hosts], *m = self.documents[Meta];
+    r.cachedDetailsMayBeOutdated = !alias.length && record && (h->sync != MD_SYNC_READY || m->sync != MD_SYNC_READY);
     return r;
 }
 - (BOOL)canReplaceReview:(MDHostReview *)review {

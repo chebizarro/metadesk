@@ -13,6 +13,7 @@ NSString *MDHostBoundText(NSString *value, NSUInteger limit);
 @interface MDHostReview : NSObject
 @property(nonatomic, readonly) NSString *key, *npub, *fingerprint, *alias, *oldKey, *route;
 @property(nonatomic, readonly) uint8_t caps;
+@property(nonatomic, readonly) BOOL cachedDetailsMayBeOutdated;
 @end
 
 /* Which condition the address book is in, for the UI to explain it and offer

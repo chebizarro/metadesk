@@ -117,7 +117,7 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     CHECK(Signal(@"review-bridge-started"));
     CHECK(![worker snapshot].canReview);
     MDHostReview *early = [worker resolve:A route:@"" cancelled:NULL data:NULL error:&error];
-    CHECK(early && [worker launchConfig:&launch review:early error:&error] && [worker saveReview:early confirmation:nil].length);
+    CHECK(early && !early.cachedDetailsMayBeOutdated && [worker launchConfig:&launch review:early error:&error] && [worker saveReview:early confirmation:nil].length);
     CHECK(![worker resolve:Name route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"Wait for your host list"]);
     CHECK(Signal(@"review-before-eose"));
     MDHostsBook *book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canReview; });
@@ -168,7 +168,8 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     CHECK(import.count == 1 && [import[0][@"npub"] isEqual:MDHostNpub(C)] && [import[0][@"caps"] containsString:@"input"]);
     CHECK([worker applyImport:import selected:[NSSet setWithObject:C] book:book].length == 0);
     book = [worker snapshot];
-    CHECK(Resolved(book, C, nil).caps == (MD_CAP_INPUT | MD_CAP_VIDEO));
+    MDHostReview *current = Resolved(book, C, nil);
+    CHECK(current && current.caps == (MD_CAP_INPUT | MD_CAP_VIDEO) && !current.cachedDetailsMayBeOutdated);
     NSString *outPath = [directory stringByAppendingPathComponent:@"export.json"];
     CHECK([[worker exportBook:book to:[NSURL fileURLWithPath:outPath]] containsString:@"exported"]);
     struct stat st; CHECK(!stat(outPath.fileSystemRepresentation, &st) && (st.st_mode & 0777) == 0600);
@@ -177,6 +178,19 @@ static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NS
     book = [worker snapshot];
     CHECK([[book.quick valueForKey:@"key"] isEqual:(@[B, C])] && [Row(book, C)[@"lastConnected"] longLongValue] > 0);
 
+    /* Reopen with the same saved records but withhold this generation's EOSE. */
+    CHECK(Signal(@"cached-reopen"));
+    CHECK([worker startRelays:relay] && Signal(@"cached-bridge-started"));
+    book = [worker snapshot];
+    CHECK(book.canReviewKey && !book.canReview && [[book addressForKey:B] isEqual:Name]);
+    CHECK(![worker resolve:MDHostNpub(B) route:@"" cancelled:NULL data:NULL error:&error] &&
+        [error containsString:@"Wait for your host list to sync before reviewing a NIP-05 name"]);
+    MDHostReview *cached = [worker resolve:C route:@"" cancelled:NULL data:NULL error:&error];
+    CHECK(cached && cached.cachedDetailsMayBeOutdated && cached.caps == current.caps);
+    CHECK([worker launchConfig:&launch review:cached error:NULL] && launch.capabilities == current.caps);
+    CHECK(Signal(@"cached-before-eose"));
+    book = Await(worker, changed, ^BOOL(MDHostsBook *b) { return b.canEdit; });
+    CHECK(book && Resolved(book, C, nil) && !Resolved(book, C, nil).cachedDetailsMayBeOutdated);
     CHECK(Signal(@"reject-hosts"));
     NSSet *tags = [NSSet setWithArray:Row(book, B)[@"tagIDs"]];
     CHECK([[worker editKey:B book:book label:@"" notes:@"" favorite:NO tagIDs:tags newTag:@"" remove:YES] containsString:@"pending"]);

@@ -14,10 +14,11 @@
 #include <time.h>
 
 #define HOST "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+#define SAVED_KEY "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+#define OUTDATED "Saved host details may be out of date until sync completes."
 #define NAME "desk@example.invalid"
 #define TAG "86b09912-5e73-4bb0-a708-30c770882ace"
 #define MEMBERS "[[\"p\",\"" HOST "\"]]"
-static MdManagedLaunch launch_config;
 static unsigned launches;
 static gint sync_starts, unreadable_meta;
 MdStoreResult __real_md_store_controller_read(MdStoreController *, const char *, char *, char **, char **);
@@ -46,9 +47,8 @@ MdResolveResult __wrap_md_identity_resolve(const char *input, const char *pin, M
 }
 MdManagerLaunch *__wrap_md_manager_launch_start(const char *client, const MdManagedLaunch *config,
     MdManagerLaunchStatus status, gpointer data, GError **error) {
-    (void)client; (void)status; (void)data; (void)error;
+    (void)client; (void)config; (void)status; (void)data; (void)error;
     ++launches;
-    launch_config = *config;
     return NULL; /* A review fixture must never start a video client. */
 }
 static gboolean expired(gpointer data) { *(gboolean *)data = TRUE; return G_SOURCE_REMOVE; }
@@ -86,9 +86,10 @@ static void seed(void) {
     MdManagedStore *store = md_managed_store_open(startup.binding, state);
     g_assert_nonnull(store);
     const char *coords[] = {MD_STORE_HOSTS, MD_STORE_MANAGEMENT, MD_STORE_FAVORITES, MD_STORE_TAG_PREFIX TAG};
-    const char *plain[] = {MEMBERS,
+    const char *plain[] = {"[[\"p\",\"" HOST "\"],[\"p\",\"" SAVED_KEY "\"]]",
         "{\"schema_version\":1,\"tags\":{\"" TAG "\":{\"label\":\"Lab\"}},"
-        "\"hosts\":{\"" HOST "\":{\"label\":\"Cached Test Host\",\"notes\":\"Cached note\",\"nip05\":\"" NAME "\"}}}", MEMBERS, MEMBERS};
+        "\"hosts\":{\"" HOST "\":{\"label\":\"Cached Test Host\",\"notes\":\"Cached note\",\"nip05\":\"" NAME "\"},"
+        "\"" SAVED_KEY "\":{\"label\":\"Cached Key Only\",\"requested_caps\":[\"video\",\"input\"]}}}", MEMBERS, MEMBERS};
     for (size_t i = 0; i < G_N_ELEMENTS(coords); ++i) commit_doc(store, coords[i], plain[i]);
     g_assert_cmpint(md_managed_store_record(store, HOST, time(NULL), MD_RECENT_CONNECTED), ==, MD_STORE_OK);
     md_managed_store_close(store);
@@ -166,6 +167,16 @@ static void submit(GtkWidget *address, GtkWidget *button, const char *value) {
     gtk_editable_set_text(GTK_EDITABLE(address), value);
     g_signal_emit_by_name(button, "clicked");
 }
+static void review_saved_details(GtkWindow *window, GtkWidget *address, GtkWidget *button, gboolean outdated) {
+    submit(address, button, SAVED_KEY);
+    WAIT_UNTIL(dialog(window) != NULL);
+    AdwAlertDialog *review = dialog(window);
+    g_assert_nonnull(strstr(adw_alert_dialog_get_body(review), "Requested access: Video and input"));
+    g_assert_cmpint(find(GTK_WIDGET(review), NULL, OUTDATED) != NULL, ==, outdated);
+    WAIT_UNTIL(focus_inside(window, GTK_WIDGET(review)));
+    keyboard("Escape", TRUE);
+    WAIT_UNTIL(!dialog(window));
+}
 static void review_without_sync(GtkWindow *window, GtkWidget *page, GtkWidget *address, GtkWidget *button) {
     submit(address, button, NAME);
     g_assert_nonnull(find(page, NULL, "Wait for the address book to sync before reviewing a NIP-05 name."));
@@ -180,10 +191,12 @@ static void review_without_sync(GtkWindow *window, GtkWidget *page, GtkWidget *a
     g_assert_true(adw_alert_dialog_get_response_enabled(review, "connect"));
     g_assert_false(adw_alert_dialog_get_response_enabled(review, "save"));
     g_assert_nonnull(find(GTK_WIDGET(review), NULL, "Saving requires a synced, writable address book."));
+    g_assert_null(find(GTK_WIDGET(review), NULL, OUTDATED));
     g_assert_cmpuint(launches, ==, before);
     WAIT_UNTIL(focus_inside(window, GTK_WIDGET(review)));
     keyboard("Escape", TRUE);
     WAIT_UNTIL(!dialog(window));
+    review_saved_details(window, address, button, TRUE);
 }
 
 int main(void) {
@@ -302,6 +315,7 @@ int main(void) {
     GtkWidget *banner = find(page, "hosts-sync-status", NULL);
     g_assert_true(ADW_IS_BANNER(banner));
     WAIT_UNTIL(gtk_widget_get_sensitive(connect) && !adw_banner_get_revealed(ADW_BANNER(banner)));
+    review_saved_details(window, address, connect, FALSE);
     submit(address, connect, HOST);
     WAIT_UNTIL(dialog(window));
     g_assert_cmpstr(adw_alert_dialog_get_heading(dialog(window)), ==, "Host Key Changed");
@@ -374,6 +388,7 @@ int main(void) {
     submit(address, connect, HOST);
     WAIT_UNTIL(find(page, NULL, "The saved hosts or their details could not be read. Host review is unavailable."));
     g_assert_false(gtk_widget_is_sensitive(connect));
+    g_assert_null(find(page, NULL, "Wait for the address book to sync before reviewing a NIP-05 name."));
     g_assert_null(dialog(window));
     g_object_add_weak_pointer(G_OBJECT(page), (gpointer *)&page);
     md_manager_hosts_stop(page);

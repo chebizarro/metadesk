@@ -360,7 +360,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 }
 
 @interface FixtureReview : MDHostReview
-@property BOOL mismatch;
+@property BOOL mismatch, fixtureOutdated;
 @end
 @implementation FixtureReview
 - (NSString *)key { return @KEY; }
@@ -369,6 +369,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 - (NSString *)oldKey { return self.mismatch ? @OTHER : nil; }
 - (NSString *)alias { return self.mismatch ? @"desk@example.invalid" : nil; }
 - (uint8_t)caps { return MD_CAP_VIDEO; }
+- (BOOL)cachedDetailsMayBeOutdated { return self.fixtureOutdated; }
 @end
 @interface FixtureBook : MDHostsBook
 @property MDHostsState fixtureState;
@@ -378,6 +379,9 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 - (NSString *)owner { return self.fixtureOwner; }
 /* Model fixture: a usable identity/cache is independent of sync. */
 - (MDHostsState)state { return self.fixtureState; }
+- (NSString *)status {
+    return self.fixtureState == MDHostsDocumentError ? @"An encrypted document is invalid and will not be overwritten." : [super status];
+}
 - (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
 - (BOOL)canReviewKey { return self.fixtureState > MDHostsNoRelays && self.fixtureState != MDHostsDocumentError; }
 - (BOOL)canEdit { return self.fixtureState == MDHostsSynced; }
@@ -408,7 +412,9 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
         if (dispatch_semaphore_wait(self.proceed,dispatch_time(DISPATCH_TIME_NOW,4*NSEC_PER_SEC))) return nil;
         self.observeCancellation=cancelled(data);
     }
-    FixtureReview *result=[FixtureReview new]; result.mismatch=self.mismatch; return result;
+    FixtureReview *result=[FixtureReview new]; result.mismatch=self.mismatch;
+    result.fixtureOutdated=self.state==MDHostsRelaysOffline;
+    return result;
 }
 - (BOOL)launchConfig:(MdManagedLaunch *)config review:(MDHostReview *)review error:(NSString **)error {
     (void)config; self.launchReview=review; ++self.launches;
@@ -475,6 +481,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return window.attachedSheet!=nil; }));
     NSView *sheet=window.attachedSheet.contentView;
     CHECK(Button(sheet,@"Connect").enabled && Button(sheet,@"Save Host").enabled);
+    CHECK(!LabelContains(sheet,@"Saved host details may be out of date"));
     CHECK(NoDefault(sheet) && Escapes(Button(sheet,@"Cancel")));
     CHECK([worker.input isEqual:@KEY] && worker.resolves==1 && !worker.saves && !worker.launches);
     CHECK(EndSheet(window,NSAlertFirstButtonReturn) && !worker.saves && !worker.launches);
@@ -500,6 +507,8 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
         sheet=window.attachedSheet.contentView;
         CHECK(Button(sheet,@"Connect").enabled && Button(sheet,@"Save Host") && !Button(sheet,@"Save Host").enabled);
         CHECK(LabelContains(sheet,@"Saving requires a synced, writable host list") && LabelContains(sheet,@"Fingerprint"));
+        CHECK(LabelContains(sheet,@"Saved host details may be out of date until sync completes.")==
+              (state.intValue==MDHostsRelaysOffline));
         CHECK(worker.launches==launches && worker.saves==saves);
         CHECK(EndSheet(window,NSAlertFirstButtonReturn));
     }
@@ -508,7 +517,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     CHECK(Await(^BOOL{ return canRefresh() && Visible(address) && !Visible(SetupPanel(view)) &&
         LabelContains(view,@"Part of Your Host List Can’t Be Read"); }));
     CHECK(!review.enabled && !Button(view,@"Scan QR Code…").enabled &&
-        !LabelContains(view,@"use the host’s public key"));
+        !LabelContains(view,@"use the host’s public key") && LabelContains(view,@"Host review is unavailable"));
     address.stringValue=@KEY;
     CHECK(!Send(review) && !window.attachedSheet);
     worker.state=MDHostsSynced;

@@ -162,6 +162,7 @@ static NSView *Frame(NSWindow *window) { return window.contentView.superview ?: 
 - (NSString *)oldKey { return self.mismatch ? @KEY3 : nil; }
 - (NSString *)alias { return self.bare ? nil : @"render@example.invalid"; }
 - (uint8_t)caps { return self.bare ? MD_CAP_VIDEO : MD_CAP_VIDEO | MD_CAP_INPUT; }
+- (BOOL)cachedDetailsMayBeOutdated { return self.bare; }
 @end
 
 @interface SnapBook : MDHostsBook
