@@ -482,7 +482,7 @@ static bool IsClosing(void *context) { return [(__bridge MDHostsPage *)context c
     switch (state) {
         case MDHostsNoRelays:
             [_banner showTitle:@"Choose Relays to Sync Your Hosts"
-                text:@"Choose relays to sync your host list and connect by name. To connect without saved relays, use the host’s nprofile with a public relay hint."
+                text:@"Choose relays before reviewing or connecting to hosts. Metadesk never chooses a relay for you."
                 kind:MDStatusWarning buttons:@[[self step:@"Set Up Relays…" action:@selector(editRelays:)]]]; break;
         case MDHostsSyncing:
             [_banner showTitle:@"Syncing Your Host List…" text:[@"This usually takes a few seconds." stringByAppendingString:then] kind:MDStatusWorking buttons:@[]]; break;

@@ -250,18 +250,18 @@ static BOOL SameBook(MDHostsBook *a, MDHostsBook *b, BOOL all) {
 
 @implementation MDHostsBook
 - (BOOL)canReviewKey {
-    return self.owner.length && !self.unavailable &&
+    return self.owner.length && !self.unavailable && self.hasRelays &&
         Readable(self.documents[Hosts]) && Readable(self.documents[Meta]);
 }
 - (BOOL)canReview {
     MDDoc *h = self.documents[Hosts], *m = self.documents[Meta];
-    return self.canReviewKey && self.hasRelays && h->reviewReady && m->reviewReady;
+    return self.canReviewKey && h->reviewReady && m->reviewReady;
 }
 - (BOOL)canEdit { return Writable(self.documents[Hosts]) && Writable(self.documents[Meta]); }
 - (BOOL)canExport { return Readable(self.documents[Hosts]) && Readable(self.documents[Meta]); }
 - (NSString *)status {
     if (self.unavailable) return self.unavailable;
-    if (!self.hasRelays) return @"Offline — showing cached hosts. Add explicit bootstrap relays to sync.";
+    if (!self.hasRelays) return @"Offline — choose relays to sync your host list and connect.";
     for (NSString *coordinate in @[Hosts, Meta]) {
         MDDoc *d = self.documents[coordinate];
         if (d && !Readable(d)) return DocStatus(d);
@@ -676,18 +676,6 @@ static void ControllerChanged(void *context) {
     char *normalized = r == MD_RESOLVE_OK && id.hint_source == MD_HINT_NIP05 ? md_identity_normalize_nip05(value.UTF8String) : NULL;
     NSString *alias = Text(normalized); free(normalized);
     MDHostReview *review = r == MD_RESOLVE_OK ? [[self snapshot] reviewIdentity:&id alias:alias route:route error:error] : nil;
-    if (review && !review.oldKey && !_relays.count) {
-        MdIdentity pinned = {0};
-        MdRelayPlan plan = {0};
-        BOOL usable = md_identity_resolve(review.address.UTF8String, review.key.UTF8String, &pinned) == MD_RESOLVE_OK &&
-            md_relay_plan_profile_bootstrap(&plan, &pinned);
-        md_relay_plan_clear(&plan);
-        md_identity_clear(&pinned);
-        if (!usable) {
-            if (error) *error = @"No usable signaling relay. Add a relay or use the host’s nprofile with a public relay hint.";
-            review = nil;
-        }
-    }
     if (r != MD_RESOLVE_OK && error) *error = Text(md_resolve_error(r));
     md_identity_clear(&id);
     return review;
@@ -699,12 +687,8 @@ static void ControllerChanged(void *context) {
 }
 - (BOOL)launchConfig:(MdManagedLaunch *)c review:(MDHostReview *)r error:(NSString **)error {
     MDHostsBook *book = [self snapshot];
-    if (!c || ![self review:r stillCurrent:book] || r.oldKey) {
+    if (!c || !_relays.count || ![self review:r stillCurrent:book] || r.oldKey) {
         if (error) *error = r.oldKey ? @"Host key changed. Keep the saved key or replace it after verifying the new fingerprint." : Changed;
-        return NO;
-    }
-    if (!_relays.count && !r.hints.count) {
-        if (error) *error = @"No usable signaling relay. Add a relay or use the host’s nprofile with a public relay hint.";
         return NO;
     }
     memset(c, 0, sizeof(*c));

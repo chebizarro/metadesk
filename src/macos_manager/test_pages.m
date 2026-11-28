@@ -379,7 +379,7 @@ static BOOL Refuses(NSWindow *key, NSTextField *field, NSView *messageView, NSSt
 /* Model fixture: a usable identity/cache is independent of sync. */
 - (MDHostsState)state { return self.fixtureState; }
 - (BOOL)canReview { return self.fixtureState == MDHostsSynced; }
-- (BOOL)canReviewKey { return self.fixtureState >= MDHostsNoRelays && self.fixtureState != MDHostsDocumentError; }
+- (BOOL)canReviewKey { return self.fixtureState > MDHostsNoRelays && self.fixtureState != MDHostsDocumentError; }
 - (BOOL)canEdit { return self.fixtureState == MDHostsSynced; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey!=nil; }
 - (BOOL)canConfirmReview:(MDHostReview *)review fingerprint:(NSString *)fingerprint {
@@ -1510,13 +1510,14 @@ static BOOL ShowsPanel(Journey *j, NSString *title) {
     });
 }
 /* Hosts is showing its page (no panel), idle, with the Host field enabled;
- * a usable cache enables key review; ready checks the name-based sync gate. */
+ * saved relays and a usable cache enable key review; ready checks name-based sync. */
 static BOOL ShowsPage(Journey *j, NSString *banner, BOOL ready) {
     [j.app showSection:@"Hosts"];
+    BOOL reviewEnabled = ![banner isEqual:@"Choose Relays to Sync Your Hosts"];
     return Within([NSString stringWithFormat:@"Hosts idle on its page (banner “%@”, ready %d)", banner ?: @"none", ready].UTF8String, __LINE__, ^BOOL{
         NSView *v=j.hosts.view; NSTextField *address=Field(v,@"Host npub");
         return [j.hosts canPerform:@selector(refresh:)] && !Visible(SetupPanel(v)) && Visible(address) && address.enabled &&
-            [Button(v,@"Review and Connect…") isEnabled] && [[[j.hosts valueForKey:@"book"] valueForKey:@"canReview"] boolValue]==ready && (banner ? LabelContains(v,banner) : !LabelContains(v,@"Choose Relays"));
+            [Button(v,@"Review and Connect…") isEnabled]==reviewEnabled && [[[j.hosts valueForKey:@"book"] valueForKey:@"canReview"] boolValue]==ready && (banner ? LabelContains(v,banner) : !LabelContains(v,@"Choose Relays"));
     });
 }
 static BOOL IdentityIdle(Journey *j) {
@@ -1589,8 +1590,10 @@ static BOOL JourneyInApp(NSString *root, MdSignerType backend) {
     CHECK(Eventually(^BOOL{ return bind.enabled; }));
     CHECK(Send(bind));
     CHECK(Eventually(^BOOL{ return LabelContains(j.identity.view,@"Client role saved"); }) && IdentityIdle(j));
-    /* Hosts leaves the panel: no relays yet. */
+    /* Hosts leaves the panel, but an entered key cannot review without relays. */
     CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO) && j.worker.starts==0);
+    Field(j.hosts.view,@"Host npub").stringValue=@KEY;
+    CHECK(!Send(Button(j.hosts.view,@"Review and Connect…")) && !j.window.attachedSheet);
     j.worker.syncState=MDHostsSyncing;
     CHECK(SaveJourneyRelays(j) && ShowsPage(j,@"Syncing Your Host List",NO) && j.worker.starts==1);
     NSView *view=j.hosts.view;

@@ -13,9 +13,6 @@ KEY = 'ab' * 32
 SIGNER = 'cd' * 32
 CONFIG = dict(v=1, address=KEY, pin=KEY, signer=SIGNER, route='127.0.0.1',
               port=7700, caps=1, relays=['ws://127.0.0.1:1'])
-# KEY with a public numeric hint or a loopback hint. No relay is dialed.
-PUBLIC_PROFILE = 'nprofile1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cpz3mhxue69uhnjvewxyurgt3jxymzuve59u0ak3gm'
-PRIVATE_PROFILE = 'nprofile1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cpzpmhxue69uhnzv3h9cczuvpwxyhslz7k0p'
 FAILED = b'\x2a'
 RESOLVE = b'\x21'
 
@@ -54,12 +51,6 @@ with tempfile.TemporaryDirectory(prefix='md-launch-darwin-') as home:
     env = dict(os.environ, HOME=home, SDL_VIDEODRIVER='no-display-fixture')
     bad = b'invalid private Manager launch'
     managed(env, frame(CONFIG), RESOLVE + FAILED, b'no usable display')
-    hinted = dict(CONFIG, address=PUBLIC_PROFILE, relays=[])
-    managed(env, frame(hinted), RESOLVE + FAILED, b'no usable display')
-    managed(env, frame(dict(hinted, pin=SIGNER)), FAILED, bad)
-    managed(env, frame(dict(hinted, address=KEY)), FAILED, bad)
-    managed(env, frame(dict(hinted, relays={})), FAILED, bad)
-    managed(env, frame(dict(hinted, address=PRIVATE_PROFILE)), RESOLVE + FAILED, b'no usable signaling relay')
     managed(env, frame(dict(CONFIG, pin=SIGNER)), FAILED, bad)
     managed(env, frame(dict(CONFIG, address='127.0.0.1')), FAILED, bad)
     managed(env, frame(dict(CONFIG, v=2)), FAILED, bad)

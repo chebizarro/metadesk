@@ -39,7 +39,7 @@ typedef struct {
     MdIdentity identity;
     MdResolveResult resolution;
     char review_hosts[65], review_meta[65];
-    gboolean action_ok, need_profile_route;
+    gboolean action_ok;
     MdStoreResult result;
 } Job;
 
@@ -232,11 +232,6 @@ static void work(GTask *task, gpointer source, gpointer data, GCancellable *canc
     }
     case RESOLVE:
         j->resolution = md_identity_resolve(j->address, NULL, &j->identity);
-        if (j->resolution == MD_RESOLVE_OK && j->need_profile_route) {
-            MdRelayPlan plan = {0};
-            j->action_ok = md_relay_plan_profile_bootstrap(&plan, &j->identity);
-            md_relay_plan_clear(&plan);
-        }
         break;
     case EDIT: {
         gboolean ready = p->store != NULL;
@@ -438,11 +433,11 @@ static gboolean readable(const Doc *d) {
     return d->status == MD_STORE_OK || d->status == MD_STORE_PENDING || d->status == MD_STORE_PARTIAL;
 }
 static gboolean can_review_key(Hosts *p) {
-    return p->key && p->view && p->view->store &&
+    return p->key && p->relays && *p->relays && p->view && p->view->store &&
         readable(&p->view->doc[HOSTS]) && readable(&p->view->doc[META]);
 }
 static gboolean can_review(Hosts *p) {
-    return can_review_key(p) && p->relays && *p->relays &&
+    return can_review_key(p) &&
         p->view->doc[HOSTS].review_ready && p->view->doc[META].review_ready;
 }
 static gboolean retired_key(Hosts *p, const char *key) {
@@ -608,6 +603,7 @@ static uint8_t requested_access(Hosts *p, const char *key) {
 }
 
 static void start_launch(Hosts *p, Review *r) {
+    if (!can_review_key(p)) return;
     MdManagedLaunch *c = g_new0(MdManagedLaunch, 1);
     g_strlcpy(c->address, r->address, sizeof(c->address));
     memcpy(c->pin, r->key, sizeof(c->pin));
@@ -734,10 +730,6 @@ static void present_review(Hosts *p, const Job *j) {
         gtk_label_set_text(p->error, "Reconcile pending or incomplete changes to this host before connecting.");
         return;
     }
-    if (j->need_profile_route && !j->action_ok) {
-        gtk_label_set_text(p->error, "No usable signaling relay. Add a relay or use the host’s nprofile with a public relay hint.");
-        return;
-    }
     Review *r = g_new0(Review, 1);
     r->page = g_object_ref(p->page);
     r->generation = p->generation;
@@ -782,11 +774,6 @@ static void present_review(Hosts *p, const Job *j) {
     r->address = nprofile(r->key, hints, hint_count);
     if (!r->address || strlen(r->address) > MD_MANAGED_ADDRESS_MAX) {
         g_clear_pointer(&r->address, g_free);
-        if (j->need_profile_route) {
-            gtk_label_set_text(p->error, "Could not preserve the signaling relay hints in the host profile.");
-            free_review(r);
-            return;
-        }
         r->address = g_strdup(r->key);
     }
     g_autofree char *npub = md_identity_npub(&j->identity);
@@ -891,7 +878,6 @@ static void resolve(Hosts *p, const char *address, const char *route) {
     memcpy(j->review_hosts, p->view->doc[HOSTS].revision, sizeof(j->review_hosts));
     memcpy(j->review_meta, p->view->doc[META].revision, sizeof(j->review_meta));
     j->key = g_steal_pointer(&saved_pin);
-    j->need_profile_route = !p->relays || !*p->relays;
     if (alias) { g_free(value); value = g_steal_pointer(&alias); }
     j->address = g_steal_pointer(&value);
     j->route = g_steal_pointer(&hint);
@@ -1104,7 +1090,7 @@ static void render(Hosts *p) {
 #endif
     const char *status = !p->key ? "Assign a client account in Identity" :
         !p->view || !p->view->store ? "Address book unavailable — check the client signer" :
-        !p->relays || !*p->relays ? "Offline — choose relays to sync, or use an nprofile with a public relay hint" : NULL;
+        !p->relays || !*p->relays ? "Offline — choose relays to sync and connect" : NULL;
     if (!status && (!readable(&p->view->doc[HOSTS]) || !readable(&p->view->doc[META])))
         status = "The saved hosts or their details could not be read. Host review is unavailable.";
     gboolean sync_status = FALSE;
@@ -1129,7 +1115,7 @@ static void render(Hosts *p) {
         }
         if (status) { sync_status = TRUE; break; }
     }
-    g_autofree char *guidance = sync_status && can_review_key(p) && p->relays && *p->relays && !can_review(p) ?
+    g_autofree char *guidance = sync_status && can_review_key(p) && !can_review(p) ?
         g_strconcat(status, "\nWait for sync to connect by name, or use the host’s public key.", NULL) : NULL;
     adw_banner_set_title(p->banner, guidance ? guidance : status ? status : "");
     adw_banner_set_revealed(p->banner, status != NULL);

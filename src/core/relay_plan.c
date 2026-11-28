@@ -156,12 +156,6 @@ static void add_hints(MdRelayPlan *out, const MdIdentity *address) {
                           MD_RELAY_NIP05 : MD_RELAY_NPROFILE);
 }
 
-bool md_relay_plan_profile_bootstrap(MdRelayPlan *plan, const MdIdentity *address) {
-    if (!plan || plan->count || !address || address->hint_source != MD_HINT_NPROFILE) return false;
-    add_hints(plan, address);
-    return plan->count != 0;
-}
-
 static void add_nip65(MdRelayPlan *out, const MdRelayMetadata *metadata, bool read, bool write,
                       const MdRelayPlan *bootstrap) {
     NostrRelayList *list = NULL;

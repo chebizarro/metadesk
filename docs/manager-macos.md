@@ -104,7 +104,9 @@ IDNA conversion. GTK's saved ASCII URLs can still be read by both. The app
 automatically starts sync with saved relays after opening the address book and
    verifying the client role. A client-role change, made in Identity or by another
    program, closes and reopens Hosts for the new key and starts sync again;
-   a label edit doesn't. Replacing unreadable
+   a label edit doesn't. A remote signer may ask to decrypt the address book
+   or sign in to a relay as soon as Hosts opens, without a click or refresh.
+   Replacing unreadable
 preferences requires confirmation. Clear the field and save to remove all choices; none
    is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name in
@@ -127,13 +129,13 @@ preferences requires confirmation. Clear the field and save to remove all choice
    whose fingerprints you recognize; the exact requested capabilities are shown. Existing pins are not overwritten. The explicit
    plaintext export contains public keys, labels and notes, not credentials or grants.
 
-Cached hosts remain viewable without a relay if the signer is available. NIP-05
-review and connection require catch-up on connected fetch routes, including when
-a typed key matches a saved NIP-05 record. For other keys, an open cache and
-verified client signer are enough to review if there is a signaling route:
-saved relays or public `wss://` relay hints from an `nprofile`. Profile hints do
-not start address-book sync or become saved relay settings. Save Host stays
-disabled until the book is writable and all required fetch routes are caught up. Resolve conflicts from the sync-issue row by reviewing both versions,
+Cached hosts remain viewable without relays if the signer can read the cache.
+With a verified client signer, readable host documents, and saved relays, you
+can review and connect by key before sync finishes. NIP-05 names still need
+catch-up on connected fetch routes, including when a typed key matches a saved
+NIP-05 record. An `nprofile` can provide additional discovered relay hints but
+cannot replace the saved relay list. Save Host stays disabled until the book is
+writable and all required fetch routes are caught up. Resolve conflicts from the sync-issue row by reviewing both versions,
 then choosing **Keep Newer Version** or **Reapply My Edit**. Unknown schema and unreadable data are not treated as an
 empty book. Separate collections aren't atomic; review and retry any pending
 collections after partial acknowledgement.

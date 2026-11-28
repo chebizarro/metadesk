@@ -519,7 +519,7 @@ Remove runtime use of `MD_DEFAULT_RELAY`. An empty configuration means **“No r
 
 | Purpose | Targets |
 |---|---|
-| Bootstrap discovery | Explicit local bootstrap relays; for a managed connection with no saved relays, validated `nprofile` hints for that connection only |
+| Bootstrap discovery | Explicit local bootstrap relays |
 | Public relay-list discovery | Bootstrap relays plus validated address hints |
 | Own collections/app-data storage | Own NIP-65 write/read-write relays; explicit bootstrap relays as fallback only when no write list exists |
 | Fetch own stored documents | Bootstrap plus own NIP-65 read and write targets |
@@ -751,7 +751,7 @@ Accepted input: `npub`, `nprofile`, NIP-05 identifier, optionally prefixed with 
 
 1. Normalize input using NIP-19/NIP-05 APIs.
 2. Resolve a canonical key and relay hints.
-3. Require address-book catch-up for NIP-05 resolution, including a typed key matching a saved NIP-05 entry. Compare the result with the saved pin. Other keys can be reviewed without catch-up, but require an open cache, verified client role, and a usable signaling route.
+3. Require address-book catch-up for NIP-05 resolution, including a typed key matching a saved NIP-05 entry. Compare the result with the saved pin. Other keys can be reviewed without catch-up, but require readable cached host documents, a verified client role, and saved relays.
 4. On mismatch, block connection and offer a separate review/replacement action. Never silently repin.
 5. Show requested access; first-time host connections default to view-only.
 6. Check signer, local FIPS daemon, then target FIPS readiness.
@@ -763,7 +763,7 @@ NIP-05 network work is bounded to ten seconds and HTTPS with verified TLS. Do no
 
 #### No relay / offline
 
-- No configured relay: no address-book network activity. A reviewed public `nprofile` can supply validated one-off signaling hints; never use a default relay.
+- No configured relay: no address-book relay activity and no host review or connection. An `nprofile` can supplement configured relays but cannot replace them. Never use a default relay.
 - Cached contacts remain viewable; private data requires signer decryption.
 - Offline edits become signed encrypted pending events only if the signer works.
 - With no signer, permit viewing already-decrypted in-memory data and editing an in-memory draft; warn before discarding it.

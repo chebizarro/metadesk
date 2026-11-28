@@ -205,6 +205,13 @@ int main(void) {
     md_manager_hosts_configure(empty, directory, name_key, NULL);
     WAIT_UNTIL(find(empty, NULL, "Cached Test Host"));
     g_assert_cmpint(g_atomic_int_get(&sync_starts), ==, 0);
+    g_assert_nonnull(find(empty, NULL, "Offline — choose relays to sync and connect"));
+    GtkWidget *empty_connect = find(empty, NULL, "_Review and Connect…");
+    GtkWidget *empty_address = find(empty, "host-identity", NULL);
+    g_assert_nonnull(empty_connect);
+    g_assert_nonnull(empty_address);
+    gtk_editable_set_text(GTK_EDITABLE(empty_address), name_key);
+    g_assert_false(gtk_widget_is_sensitive(empty_connect));
     g_object_add_weak_pointer(G_OBJECT(empty), (gpointer *)&empty);
     md_manager_hosts_stop(empty);
     g_object_unref(empty);
@@ -223,37 +230,14 @@ int main(void) {
     review_without_sync(window, page, address, connect);
 
     md_manager_hosts_configure(page, directory, g_getenv("MD_FIXTURE_CLIENT"), NULL);
-    WAIT_UNTIL(gtk_widget_get_sensitive(connect) && find(page, NULL, "Cached Test Host"));
+    WAIT_UNTIL(find(page, NULL, "Cached Test Host"));
     g_assert_cmpint(gdk_surface_get_width(gtk_native_get_surface(GTK_NATIVE(window))), ==, 360);
-    g_assert_nonnull(find(page, NULL, "Offline — choose relays to sync, or use an nprofile with a public relay hint"));
+    g_assert_nonnull(find(page, NULL, "Offline — choose relays to sync and connect"));
     g_assert_cmpint(g_atomic_int_get(&sync_starts), ==, 1);
-    const char *no_route = "No usable signaling relay. Add a relay or use the host’s nprofile with a public relay hint.";
-    submit(address, connect, name_key);
-    WAIT_UNTIL(find(page, NULL, no_route));
+    gtk_editable_set_text(GTK_EDITABLE(address), name_key);
+    g_assert_false(gtk_widget_is_sensitive(connect));
     g_assert_null(dialog(window));
-    char *hints[] = {"wss://127.0.0.1/"};
-    NostrProfilePointer ptr = {.public_key = (char *)name_key, .relays = hints, .relays_count = 1};
-    char *profile = NULL;
-    g_assert_cmpint(nostr_nip19_encode_nprofile(&ptr, &profile), ==, 0);
-    submit(address, connect, profile);
-    free(profile); profile = NULL;
-    WAIT_UNTIL(find(page, NULL, no_route));
-    g_assert_null(dialog(window));
-    hints[0] = "wss://93.184.216.34/";
-    g_assert_cmpint(nostr_nip19_encode_nprofile(&ptr, &profile), ==, 0);
-    submit(address, connect, profile);
-    free(profile); profile = NULL;
-    WAIT_UNTIL(dialog(window));
     g_assert_cmpuint(launches, ==, 0);
-    WAIT_UNTIL(focus_inside(window, GTK_WIDGET(dialog(window))));
-    GtkWidget *approve = find(GTK_WIDGET(dialog(window)), NULL, "_Connect");
-    g_assert_nonnull(approve);
-    g_signal_emit_by_name(approve, "clicked");
-    WAIT_UNTIL(!dialog(window));
-    g_assert_cmpuint(launches, ==, 1);
-    g_assert_cmpuint(launch_config.relay_count, ==, 0);
-    g_assert_cmpstr(launch_config.pin, ==, name_key);
-    g_assert_true(g_str_has_prefix(launch_config.address, "nprofile1"));
     gtk_editable_set_text(GTK_EDITABLE(address), "");
     g_assert_true(gtk_widget_grab_focus(address));
     GtkWidget *before = gtk_window_get_focus(window);
@@ -355,7 +339,8 @@ int main(void) {
 #ifdef MD_HAVE_MANAGER_QR
     g_assert_nonnull(find(page, NULL, "Scan QR _Image…"));
     /* The same QR generator/scanner used by the page must round-trip. */
-    ptr = (NostrProfilePointer){.public_key = HOST};
+    NostrProfilePointer ptr = {.public_key = HOST};
+    char *profile = NULL;
     g_assert_cmpint(nostr_nip19_encode_nprofile(&ptr, &profile), ==, 0);
     g_autoptr(GdkTexture) texture = md_manager_qr_texture(profile);
     g_assert_nonnull(texture);

@@ -103,14 +103,10 @@ static NSString *ProfileWith(NSString *key, char *hint) {
 static int Live(MDHostsWorker *worker, MdSigner *signer, NSString *directory, NSString *relay, NSString *unreachable, dispatch_semaphore_t changed) {
     NSString *error = nil;
     MdManagedLaunch launch;
-    CHECK([worker snapshot].canReviewKey && ![worker snapshot].canReview);
-    CHECK(![worker resolve:A route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"No usable signaling relay"]);
-    CHECK(![worker resolve:ProfileWith(A, "wss://127.0.0.1/") route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"No usable signaling relay"]);
-    /* Public numeric address exercises route validation without any relay connection. */
-    MDHostReview *hinted = [worker resolve:ProfileWith(A, "wss://93.184.216.34/") route:@"" cancelled:NULL data:NULL error:&error];
-    CHECK(hinted && [worker launchConfig:&launch review:hinted error:&error] && launch.relay_count == 0);
-    CHECK(!strcmp(launch.pin, A.UTF8String) && !strncmp(launch.address, "nprofile1", 9));
-    CHECK([worker saveReview:hinted confirmation:nil].length);
+    CHECK([worker snapshot].state == MDHostsNoRelays && ![worker snapshot].canReviewKey);
+    CHECK(![worker resolve:A route:@"" cancelled:NULL data:NULL error:&error] && [error containsString:@"choose relays"]);
+    CHECK(![worker resolve:ProfileWith(A, "wss://93.184.216.34/") route:@"" cancelled:NULL data:NULL error:&error] &&
+        [error containsString:@"choose relays"]);
     [worker startRelays:unreachable];
     CHECK(![worker snapshot].canReview);
     MDHostReview *offline = [worker resolve:MDHostNpub(A) route:@"" cancelled:NULL data:NULL error:&error];

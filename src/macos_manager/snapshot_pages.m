@@ -218,7 +218,7 @@ static NSArray *SnapRows(void) {
 }
 - (NSString *)owner { return self.blocked ? nil : @KEY1; }
 - (BOOL)canReview { return self.synced; }
-- (BOOL)canReviewKey { return !self.blocked; }
+- (BOOL)canReviewKey { return !self.blocked && self.state != MDHostsNoRelays && self.state != MDHostsDocumentError; }
 - (BOOL)canEdit { return self.synced; }
 - (BOOL)canExport { return !self.blocked && !self.empty; }
 - (BOOL)canReplaceReview:(MDHostReview *)review { return review.oldKey != nil; }

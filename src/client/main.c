@@ -1615,7 +1615,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         return 1;
     }
 
-    if (managed && !launch && !relay_count) {
+    if (managed && !relay_count) {
         fprintf(stderr, "ERROR: no relays configured; select bootstrap relays before connecting\n");
         return 1;
     }
@@ -1625,7 +1625,7 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
         return 1;
     }
     bool configured_relays = relay_count > 0;
-    if (!managed && !relay_count) relay_urls[relay_count++] = MD_DEFAULT_RELAY; /* CLI only */
+    if (!relay_count) relay_urls[relay_count++] = MD_DEFAULT_RELAY; /* CLI only */
     for (int i = 0; i < relay_count; ++i) {
         if (!md_relay_plan_add(bootstrap, relay_urls[i], MD_RELAY_CONFIGURED)) {
             fprintf(stderr, "ERROR: invalid bootstrap relay URL\n");
@@ -1639,14 +1639,6 @@ static int client_run(int argc, char **argv, MdIdentity *identity, MdRelayPlan *
     if (resolution != MD_RESOLVE_OK) {
         fprintf(stderr, "ERROR: resolve: %s\n", md_resolve_error(resolution));
         return 1;
-    }
-    if (launch && !relay_count) {
-        if (!md_relay_plan_profile_bootstrap(bootstrap, identity)) {
-            fprintf(stderr, "ERROR: no usable signaling relay in the host profile\n");
-            return 1;
-        }
-        for (size_t i = 0; i < bootstrap->count; ++i)
-            relay_urls[relay_count++] = bootstrap->target[i].url;
     }
     npub = *canonical_npub;
 

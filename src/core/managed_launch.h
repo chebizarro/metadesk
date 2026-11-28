@@ -16,7 +16,7 @@ typedef struct {
     char signer[65];
     char route[46]; /* optional IPv4/IPv6 literal, never a host identity */
     char relays[MD_RELAY_TARGET_MAX][MD_RELAY_URL_MAX + 1];
-    size_t relay_count; /* zero only for a pinned nprofile with signaling hints */
+    size_t relay_count;
     uint16_t port;
     uint8_t capabilities; /* video is required; input and accessibility are opt-in */
 } MdManagedLaunch;
