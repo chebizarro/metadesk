@@ -101,9 +101,10 @@ same relay vectors and exchanges real files between both implementations.
 ASCII forms. macOS accepts only ASCII hostnames on input and on load; for an
 international hostname, enter its `xn--` punycode form. macOS does not perform
 IDNA conversion. GTK's saved ASCII URLs can still be read by both. The app
-loads the selection on entry but does not sync
-   until you refresh. A client-role change, made in Identity or by another
-   program, closes and reopens Hosts for the new key; a label edit doesn't. Replacing unreadable
+automatically starts sync with saved relays after opening the address book and
+   verifying the client role. A client-role change, made in Identity or by another
+   program, closes and reopens Hosts for the new key and starts sync again;
+   a label edit doesn't. Replacing unreadable
 preferences requires confirmation. Clear the field and save to remove all choices; none
    is preselected or used as a fallback. `ws://` is unencrypted.
 2. Enter an `npub`, `nprofile`, lowercase hex public key, or NIP-05 name in

@@ -457,7 +457,7 @@ static BOOL Hosts(MDHostsPage *page, FixtureHosts *worker, NSWindow *window) {
     [page suspendForRoleEdit:^{ drained=YES; }];
     CHECK(Await(^BOOL{ return drained; }));
     [page resumeAfterRoleEdit];
-    CHECK(Await(^BOOL{ return LabelContains(view,@"Relay sync is paused"); }));
+    CHECK(Await(^BOOL{ return canRefresh() && worker.starts==starts+1; }));
 
     address.stringValue=@"  nostr:nsec1fixture-not-a-key";
     CHECK(Send(review));
@@ -1371,6 +1371,7 @@ static BOOL HostCommands(void) {
  * the client role. Each signals its flag on the main queue first. */
 @property(atomic, strong) dispatch_semaphore_t closeGate, openGate;
 @property(atomic) BOOL closeHeld, openHeld;
+@property(atomic) NSUInteger starts;
 @end
 static void Hold(JourneyHosts *w, dispatch_semaphore_t gate, BOOL close) {
     if (!gate) return;
@@ -1390,9 +1391,9 @@ static void Hold(JourneyHosts *w, dispatch_semaphore_t gate, BOOL close) {
     if (![owner isEqual:_owner]) _relays=nil;
     _owner=owner;
     _blocker=!client ? MDHostsNoClientRole : self.signerDown ? MDHostsSignerUnavailable : MDHostsSynced;
-    return YES;
+    return _owner != nil;
 }
-- (BOOL)startRelays:(NSString *)urls { if (_owner) _relays=urls; return YES; }
+- (BOOL)startRelays:(NSString *)urls { ++self.starts; if (_owner) _relays=urls; return YES; }
 - (MDHostsBook *)snapshot {
     FixtureBook *b=[FixtureBook new];
     b.fixtureState=_blocker!=MDHostsSynced ? _blocker : _relays.length ? MDHostsSynced : MDHostsNoRelays;
@@ -1561,7 +1562,7 @@ static BOOL JourneyInApp(NSString *root, MdSignerType backend) {
     CHECK(Send(bind));
     CHECK(Eventually(^BOOL{ return LabelContains(j.identity.view,@"Client role saved"); }) && IdentityIdle(j));
     /* Hosts leaves the panel: no relays yet. */
-    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO) && j.worker.starts==0);
     CHECK(SaveRelaysAndReady(j));
     return CloseJourney(j);
 }
@@ -1572,11 +1573,11 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@KEY));
     CHECK(ShowsPanel(j,@"Choose an Account for Connecting")); /* not yet picked up */
     CHECK(RefreshIdentity(j,@KEY));
-    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO));
+    CHECK(ShowsPage(j,@"Choose Relays to Sync Your Hosts",NO) && j.worker.starts==0);
     CHECK(SaveRelaysAndReady(j));
 
     /* c1. Switched in the app to a second account: Hosts reopens for it and
-     * waits for a sync (a client change doesn't sync on its own). */
+     * starts sync with the existing relay settings. */
     CHECK(!MDIdentityAdd(j.directory,backend,@OTHER,@"Second").length);
     CHECK(RefreshIdentity(j,@KEY));
     [j.app showSection:@"Identity"];
@@ -1588,16 +1589,12 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     NSUInteger closes=j.worker.closes;
     CHECK(Eventually(^BOOL{ return bind.enabled; }) && Send(bind));
     CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@OTHER]; }) && IdentityIdle(j));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
 
     /* c2. Switched outside the app while Hosts is idle. */
     closes=j.worker.closes;
     CHECK(BindOutside(j,@KEY) && RefreshIdentity(j,@KEY));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
 
     /* c3. Switched outside while a Hosts operation is held in flight: the
      * old owner's review never appears; Hosts reopens for the new owner. */
@@ -1610,10 +1607,8 @@ static BOOL JourneyOutside(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@OTHER) && RefreshIdentity(j,@OTHER));
     dispatch_semaphore_signal(j.worker.proceed);
     j.worker.entered=nil;
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO) && j.worker.closes==closes+1);
+    CHECK(ShowsPage(j,nil,YES) && j.worker.closes==closes+1);
     CHECK(!j.window.attachedSheet && !LabelContains(j.hosts.view,@"Checking the host"));
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
 
     /* c4. Unassigned in the app: back to choosing an account. */
     [j.app showSection:@"Identity"];
@@ -1659,9 +1654,7 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     NSString *error=nil;
     CHECK(MDHostsBootstrap(@"wss://journey.fixture.invalid/",&error).length);
     Journey *j=OpenJourney(root,@"journey-reconcile",backend,NO);
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.starts==1);
     CHECK(RefreshIdentity(j,@KEY));
 
     /* 1. Overlapping suspensions. An external change to OTHER is picked up by
@@ -1688,10 +1681,8 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     dispatch_semaphore_t signer=JourneyBindGate; JourneyBindGate=nil;
     dispatch_semaphore_signal(signer);
     CHECK(Eventually(^BOOL{ return [j.identity.clientRoleKey isEqual:@KEY]; }) && IdentityIdle(j));
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
-    CHECK(j.worker.opens==opens+1 && j.worker.closes==closes+1 && [BookOwner(j) isEqual:@KEY]);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
     CHECK(ShowsPage(j,nil,YES));
+    CHECK(j.worker.opens==opens+1 && j.worker.closes==closes+1 && [BookOwner(j) isEqual:@KEY]);
 
     /* 2. A role change reported during reconciliation's own reload: the
      * reload (which read OTHER) is held; Identity then reports KEY again.
@@ -1704,11 +1695,9 @@ static BOOL JourneyReconcile(NSString *root, MdSignerType backend) {
     CHECK(BindOutside(j,@KEY) && RefreshIdentity(j,@KEY));
     gate=j.worker.openGate; j.worker.openGate=nil;
     dispatch_semaphore_signal(gate);
-    CHECK(ShowsPage(j,@"Sync Is Paused",NO));
+    CHECK(ShowsPage(j,nil,YES));
     CHECK(Eventually(^BOOL{ return [BookOwner(j) isEqual:@KEY] && [j.hosts canPerform:@selector(refresh:)]; }));
     CHECK(j.worker.closes==closes+2 && j.worker.opens==opens+2);
-    [NSApp sendAction:@selector(refresh:) to:j.hosts from:nil];
-    CHECK(ShowsPage(j,nil,YES));
 
     /* 3. Quit during reconciliation: the close is held when Quit arrives.
      * Termination waits, then completes once; Hosts doesn't reopen. */
@@ -1738,12 +1727,12 @@ static BOOL JourneySigner(NSString *root, MdSignerType backend) {
     NSString *error=nil;
     CHECK(MDHostsBootstrap(@"wss://journey.fixture.invalid/",&error).length);
     Journey *j=OpenJourney(root,@"journey-signer",backend,YES);
-    CHECK(ShowsPanel(j,@"Your Signer Isn’t Available"));
+    CHECK(ShowsPanel(j,@"Your Signer Isn’t Available") && j.worker.starts==0);
     MDSetupPanel *panel=(MDSetupPanel *)SetupPanel(j.hosts.view);
     CHECK([panel.primary.title isEqual:@"Try Again"]);
     j.worker.signerDown=NO;
     [panel.primary performClick:nil];
-    CHECK(ShowsPage(j,nil,YES));
+    CHECK(ShowsPage(j,nil,YES) && j.worker.starts==1);
     return CloseJourney(j);
 }
 static BOOL Journeys(NSString *directory, MdSignerType backend) {
