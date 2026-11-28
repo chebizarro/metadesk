@@ -12,6 +12,9 @@ from pathlib import Path
 CLIENT = sys.argv[1]
 KEY = "ab" * 32
 SIGNER = "cd" * 32
+# KEY with a public numeric hint or a loopback hint. No relay is dialed.
+PUBLIC_PROFILE = 'nprofile1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cpz3mhxue69uhnjvewxyurgt3jxymzuve59u0ak3gm'
+PRIVATE_PROFILE = 'nprofile1qqs2h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2cpzpmhxue69uhnzv3h9cczuvpwxyhslz7k0p'
 BASE = dict(v=1, address=KEY, pin=KEY, signer=SIGNER, route="127.0.0.1",
             port=7700, caps=1, relays=["ws://127.0.0.1:1"])
 
@@ -44,6 +47,11 @@ def managed(payload, expected):
 
 resolve, failed = b"\x01\x01", b"\x01\x0a"
 assert b"no usable display" in managed(json.dumps(BASE).encode(), [resolve, failed])
+hinted = dict(BASE, address=PUBLIC_PROFILE, relays=[])
+assert b"no usable display" in managed(json.dumps(hinted).encode(), [resolve, failed])
+for invalid in (dict(hinted, pin=SIGNER), dict(hinted, address=KEY), dict(hinted, relays={})):
+    assert b"invalid private Manager launch" in managed(json.dumps(invalid).encode(), [failed])
+assert b"no usable signaling relay" in managed(json.dumps(dict(hinted, address=PRIVATE_PROFILE)).encode(), [resolve, failed])
 assert b"invalid private Manager launch" in managed(json.dumps(dict(BASE, pin=SIGNER)).encode(), [failed])
 assert b"invalid private Manager launch" in managed(json.dumps(dict(BASE, address="127.0.0.1")).encode(), [failed])
 assert b"invalid private Manager launch" in managed(json.dumps(dict(BASE, v=2)).encode(), [failed])

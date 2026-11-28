@@ -83,7 +83,7 @@ static bool launch_valid(const MdManagedLaunch *c) {
     if (!c || !memchr(c->address, 0, sizeof(c->address)) ||
         !memchr(c->pin, 0, sizeof(c->pin)) || !memchr(c->signer, 0, sizeof(c->signer)) ||
         !memchr(c->route, 0, sizeof(c->route)) || !full_key(c->pin) || !full_key(c->signer) || !c->port ||
-        !c->relay_count || c->relay_count > MD_RELAY_TARGET_MAX ||
+        c->relay_count > MD_RELAY_TARGET_MAX ||
         !(c->capabilities & MD_CAP_VIDEO) || (c->capabilities & ~allowed) ||
         (*c->route && inet_pton(AF_INET, c->route, ip) != 1 &&
                       inet_pton(AF_INET6, c->route, ip) != 1)) return false;
@@ -93,8 +93,12 @@ static bool launch_valid(const MdManagedLaunch *c) {
         strncmp(c->address, "npub1", 5) && strncmp(c->address, "nprofile1", 9))) return false;
     MdIdentity id = {0};
     MdResolveResult r = md_identity_resolve(c->address, c->pin, &id);
+    /* With no configured relays the child must derive its one-off route
+     * from the pinned profile, and validate it as discovered, not configured. */
+    bool valid = r == MD_RESOLVE_OK &&
+        (c->relay_count || (id.hint_source == MD_HINT_NPROFILE && id.hint_count));
     md_identity_clear(&id);
-    return r == MD_RESOLVE_OK;
+    return valid;
 }
 
 bool md_managed_launch_write(int fd, const MdManagedLaunch *c) {
@@ -136,7 +140,7 @@ bool md_managed_launch_read(int fd, MdManagedLaunch *out) {
     json_int_t port = json_integer_value(json_object_get(j, "port"));
     out->relay_count = json_array_size(relays);
     json_int_t caps = json_integer_value(json_object_get(j, "caps"));
-    bool ok = json_object_size(j) == 8 && caps > 0 && caps <= UINT8_MAX &&
+    bool ok = json_object_size(j) == 8 && json_is_array(relays) && caps > 0 && caps <= UINT8_MAX &&
         json_integer_value(json_object_get(j, "v")) == MD_MANAGED_LAUNCH_VERSION &&
         port > 0 && port <= UINT16_MAX && out->relay_count <= MD_RELAY_TARGET_MAX &&
         copy_string(json_object_get(j, "address"), out->address, sizeof(out->address)) &&

@@ -33,6 +33,9 @@ bool md_relay_plan_add(MdRelayPlan *plan, const char *url, MdRelaySource source)
 /* Recheck immediately before pool admission. This is not the dial: DNS can
  * change between this check and nostrc's initial/reconnect resolution (md-dc2m). */
 bool md_relay_target_check(const MdRelayTarget *target, uint64_t deadline_ns);
+/* Seed an empty bootstrap plan for a single connection from public nprofile
+ * hints, retaining discovered (not configured) provenance. */
+bool md_relay_plan_profile_bootstrap(MdRelayPlan *plan, const MdIdentity *address);
 void md_relay_plan_clear(MdRelayPlan *plan);
 const char *md_relay_source_name(MdRelaySource source);
 
